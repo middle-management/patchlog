@@ -510,15 +510,14 @@ v0.82" (v0.81 Open 24).
 91. **Many writers of one document** (§7.2, §6.4.1, TOOLS §11.1). Every write
     names the head it was made on, so writers of one document queue behind one another and a
     lost race costs a whole request. Measured with the rate lifted (docs/CAPACITY.md, "Writes
-    to one document"): 8 writers retrying at once lost 84% of their attempts and 32 lost 95%;
-    a client-side backoff brings that to about 45% and 82% and can't make it fair.
+    to one document"): 8 writers retrying at once lost 85% of their attempts and 32 lost 96%;
+    a client-side backoff brings that to about 44% and 82% and can't make it fair.
 
     *What works today, and what the reference now recommends:* a resource per item in place
     of the shared document. Creates of different resources never collide, a repeated create
     is §7.2's retry, each item is validated on its own, and the namespace's log orders them.
-    The same writers then did 1,074 and 1,930 creates a second on Postgres (8 and 32 writers)
-    against 177 and 88 appends to a shared document, with even shares and a worst write of
-    49 ms. TOOLS §11.1's advice to split documents "along the lines of access, editing and size"
+    The same writers then did 940 and 1,420 creates a second on Postgres (8 and 32 writers)
+    against 155 and 64 appends to a shared document, with even shares and a p99 of 50 ms. TOOLS §11.1's advice to split documents "along the lines of access, editing and size"
     could say this outright: where several parties add to one list, make each entry a
     resource. What it gives up is a constraint across the items.
 
@@ -535,7 +534,7 @@ v0.82" (v0.81 Open 24).
     or `move`'s `from`, its `test`s) didn't overlap the writes since, a path through an array
     counting as the outermost array, except that two sides which only append to one array
     don't conflict. With the waiting writes of a document written in one transaction it did
-    3,440 and 3,670 appends a second on SQLite and 917 and 1,334 on Postgres, no attempt
+    3,270 and 3,450 appends a second on SQLite and 450 and 410 on Postgres, no attempt
     lost, shares even. What it showed, for whoever takes the idea up:
     - **Retries** need a key of their own. The prototype used the Durable Streams protocol's
       producer id, epoch and sequence number, stored with the write; a repeat was then

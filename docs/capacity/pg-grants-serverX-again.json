@@ -1,0 +1,155 @@
+{
+  "append_big_c1": {
+    "concurrency": 1,
+    "errors": 0,
+    "max_ms": 234.246,
+    "n": 2000,
+    "p50_ms": 4.371,
+    "p95_ms": 7.116,
+    "p99_ms": 11.247,
+    "per_second": 202.83190214287904
+  },
+  "append_big_c32": {
+    "concurrency": 32,
+    "errors": 0,
+    "max_ms": 68.669,
+    "n": 2000,
+    "p50_ms": 32.985,
+    "p95_ms": 48.621,
+    "p99_ms": 55.245,
+    "per_second": 928.1373618644232
+  },
+  "append_big_c8": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 39.858,
+    "n": 2000,
+    "p50_ms": 13.973,
+    "p95_ms": 20.154,
+    "p99_ms": 28.348,
+    "per_second": 548.9330753677971
+  },
+  "append_small_ns_c32": {
+    "concurrency": 32,
+    "errors": 0,
+    "max_ms": 239.583,
+    "n": 2000,
+    "p50_ms": 44.312,
+    "p95_ms": 111.508,
+    "p99_ms": 149.472,
+    "per_second": 613.4749298417954
+  },
+  "batch_1000_appends": {
+    "concurrency": 1,
+    "errors": 0,
+    "max_ms": 1233.888,
+    "n": 20,
+    "p50_ms": 629.842,
+    "p95_ms": 1231.4,
+    "p99_ms": 1231.4,
+    "per_second": 1.4011240113717403
+  },
+  "bootstrap_doc_fetch_c8": {
+    "documents": 20000,
+    "documents_per_second": 2428.550231092164,
+    "projected_seconds_for_namespace": 411.76829995,
+    "seconds": 8.235365999
+  },
+  "heads_page_random": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 152.827,
+    "n": 2000,
+    "p50_ms": 55.34,
+    "p95_ms": 88.441,
+    "p99_ms": 106.461,
+    "per_second": 139.94876715366743
+  },
+  "ns_log_page_random": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 141.923,
+    "n": 2000,
+    "p50_ms": 38.902,
+    "p95_ms": 60.107,
+    "p99_ms": 79.004,
+    "per_second": 200.12028754197866
+  },
+  "origin_vmhwm_mb": 175.50390625,
+  "origin_vmrss_mb": 175.50390625,
+  "profile": "grants",
+  "read_head_doc": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 22.313,
+    "n": 2000,
+    "p50_ms": 2.775,
+    "p95_ms": 6.12,
+    "p99_ms": 8.286,
+    "per_second": 2539.950390755747
+  },
+  "read_head_doc_cached_grants": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 9.264,
+    "n": 2000,
+    "p50_ms": 2.083,
+    "p95_ms": 5.526,
+    "p99_ms": 7.531,
+    "per_second": 3195.193008493376
+  },
+  "read_head_doc_fleet_warm": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 11.95,
+    "n": 2000,
+    "p50_ms": 1.921,
+    "p95_ms": 5.525,
+    "p99_ms": 7.47,
+    "per_second": 3327.1024191004026
+  },
+  "read_head_pointer": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 6.418,
+    "n": 2000,
+    "p50_ms": 1.173,
+    "p95_ms": 2.372,
+    "p99_ms": 3.305,
+    "per_second": 6181.407337389233
+  },
+  "read_old_revision": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 78.798,
+    "n": 2000,
+    "p50_ms": 6.215,
+    "p95_ms": 11.127,
+    "p99_ms": 14.107,
+    "per_second": 1165.690195480773
+  },
+  "read_small_ns_doc": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 14.093,
+    "n": 2000,
+    "p50_ms": 4.104,
+    "p95_ms": 7.768,
+    "p99_ms": 10.004,
+    "per_second": 1796.2905993772927
+  },
+  "scan_heads": {
+    "pages": 1000,
+    "resources": 1000000,
+    "resources_per_second": 56879.29635664051,
+    "seconds": 17.581089501
+  },
+  "scan_log": {
+    "entries": 4025081,
+    "entries_per_second": 38929.14660497173,
+    "pages": 5105,
+    "resource_entries": 5104001,
+    "seconds": 103.395048467
+  },
+  "total_seconds": 193.019878681
+}

@@ -5,33 +5,36 @@ document says whether the limit is **by design** (the spec's model; changing it 
 how data is laid out), a **gap** (this implementation; fixable without changing the spec) or
 **deployment** (hardware and configuration; buy or tune your way past it).
 
+Every figure here is from one set of runs on one host on 2026-11-13, at spec 0.82. See
+[What was measured, and on what](#what-was-measured-and-on-what).
+
 ## At a glance
 
-- **A small server handles about 1,000–1,600 reads a second and 590 single writes a second into
-  one namespace** (from 32 writers). The server is "server X": a 2 vCPU / 4 GB core and a
-  2 vCPU / 4 GB Postgres. See [The envelope](#the-envelope).
+- **A small server handles about 2,500–3,600 reads a second and about 1,000 single writes a
+  second into one namespace** (from 32 writers). The server is "server X": a 2 vCPU / 4 GB core
+  and a 2 vCPU / 4 GB Postgres. See [The envelope](#the-envelope).
 - **Data size doesn't slow requests.** A namespace of 1,000,000 documents and 5,000,000
   revisions answers like a small one. Size costs storage, full scans and memory. See
   [What data size costs](#what-data-size-costs).
-- **Postgres, not the core, limits server X.** Give Postgres the CPU first. See
-  [What limits server X](#what-limits-server-x).
+- **The core isn't what limits server X.** Halving it changes little. Give Postgres the CPU
+  first. See [What limits server X](#what-limits-server-x).
 - **Followers are cheapest through the CDN.** 5,000 followers of a public namespace cost the
-  origin 0.01 s of CPU a write. Private followers cost about 0.1–0.2 ms of core CPU each per
-  write. See [Long-poll followers and the CDN](#long-poll-followers-and-the-cdn).
-- **Large typed documents are slow to write**: up to about 225 ms an append at 3.5 MiB, ~60 ms
-  at the 1 MiB default. Keep a frequently edited typed document well under 100 KiB. See
+  origin no measurable CPU a write. Followers that reach the origin cost about 0.03–0.04 ms of
+  core CPU each per write. See [Long-poll followers and the CDN](#long-poll-followers-and-the-cdn).
+- **Large typed documents are slow to write**: about 170–190 ms an append at 3.5 MiB, ~55 ms at
+  the 1 MiB default. Keep a frequently edited typed document well under 100 KiB. See
   [Large documents, by shape and schema](#large-documents-by-shape-and-schema).
 - **One document takes about 10 writes a second in all by default**, however many writers share
-  it, and the writers collide: 8 writers together got 12 a second, 32 got 14. See
+  it, and the writers collide: 8 writers together got 12 a second, 32 got 12–16. See
   [Writes to one document](#writes-to-one-document).
-- **Make each list entry a resource of its own**: 1,930 writes a second from 32 writers on
-  Postgres, where the shared document did 88. Nothing collides. See
+- **Make each list entry a resource of its own**: 620–1,420 writes a second from 32 writers on
+  server X, where the shared document did 64. Nothing collides. See
   [One resource per item](#one-resource-per-item).
 - **A shared document is not fair between writers.** With a backoff some writers got no write in
-  at all. With a resource per item the shares differ by 2% at most. See
+  at all. With a resource per item the shares differ by 3% at most. See
   [Fairness between writers](#fairness-between-writers).
-- **One writer with many changes should batch them**: 1,000 steps to one document take 36–44 ms
-  on SQLite and 146–205 ms on Postgres. See [Batches](#batches).
+- **One writer with many changes should batch them**: 1,000 steps to one document take 70–74 ms
+  on SQLite and 150–220 ms on server X. See [Batches](#batches).
 - **A long history doesn't slow a document down**, measured up to 100,000 revisions. See
   [Long histories](#long-histories).
 
@@ -51,66 +54,75 @@ how data is laid out), a **gap** (this implementation; fixable without changing 
   - [A prototype that was set aside](#a-prototype-that-was-set-aside)
 - [Limits, by kind](#limits-by-kind)
 - [Recommended settings](#recommended-settings)
+- [Earlier measurements](#earlier-measurements)
 - [Rerunning](#rerunning)
 
 ## What was measured, and on what
 
 The numbers come from `cmd/capacity` (see [Rerunning](#rerunning)). They are taken over HTTP,
-from a load generator on the same host as the server, so they include the HTTP stack and are
-conservative.
+so they include the HTTP stack. The raw results are in [`capacity/`](capacity/).
 
-There are two test setups. **Numbers from one are not comparable with numbers from the other.**
+**One host, one day, one version.** Everything was run on 2026-11-13 at spec 0.82 on one
+4-vCPU / 15 GB host. Two databases were measured on it:
 
-### Server X (2026-10-15, spec 0.52)
+- **Server X** (the "Postgres" or "server X" figures):
+  - the core in a container limited to **2 vCPU / 4 GB**;
+  - Postgres 16 in a container limited to **2 vCPU / 4 GB** (`max_connections=300`, otherwise
+    default settings);
+  - **grants on**: the namespaces are private (`read: grant`), and every request carries a
+    signed grant. Rows that say "authentication off" ran the same core with `-dev`.
+- **SQLite** (the "SQLite" figures): the core with `-dev` and a SQLite file, in a container
+  with **no limit**, so it had the host's 4 vCPU. Its namespaces are public.
 
-Used for [the envelope](#the-envelope), [what limits server X](#what-limits-server-x) and
-[followers](#long-poll-followers-and-the-cdn). The raw results are in [`capacity/`](capacity/).
+So the two columns differ in more than the database: SQLite also had twice the CPU and no grant
+checks. Read the SQLite column as "one unconstrained instance on local disk", not as a
+like-for-like comparison of databases.
 
-- **Hardware:** the core at **2 vCPU / 4 GB**, Postgres 16 at **2 vCPU / 4 GB**, each in its own
-  container on one 4-vCPU host, which also ran the load generator.
-- **Grants on:** the namespaces are private (`read: grant`), and every request carries a signed
-  grant.
-- **Data:** 1,000 small namespaces (10 documents each) and one large namespace of
-  **1,000,000 documents** and **5,000,000 revisions**. The large namespace was made by 1M
-  creates (in 1,000-item batches) and 4M single appends of a small patch. Its documents are
-  about 500 bytes.
-- **Size on disk:** 6.2 GB in Postgres. The same data is 3.1 GB in SQLite.
+**The data.** 1,000 small namespaces (10 documents each) and one large namespace of
+**1,000,000 documents** and **5,000,000 revisions**. The large namespace was made by 1M creates
+(in 1,000-item batches) and 4M single appends of a small patch. Its documents are about 500
+bytes. Seeding took 45 minutes on server X and 39 on SQLite. On disk it is 6.8 GB in Postgres
+and 3.7 GB in SQLite.
 
-Some rows quote SQLite figures next to server X's; they say so.
+**What makes the numbers conservative, and what makes them vary:**
 
-### Host B (2026-11-12, spec 0.82)
-
-Used for [large documents](#large-documents-by-shape-and-schema) and [many writers](#many-writers).
-This is **not server X**. The large-document runs and the first runs of writes to one document
-are from 2026-11-12. The resource-per-item and fairness runs, and the runs with two instances,
-are from 2026-11-13 on the same host. The raw results of all of them are in
-[`capacity/`](capacity/) too, listed in its README.
-
-- **Hardware:** a 4-vCPU / 15 GB host that also ran the load generator.
-- **Core:** run with `-dev`, unconstrained.
-- **Databases:** SQLite, and Postgres 16 on the same host with default settings.
-
-Within these sections, compare SQLite with Postgres and one row with another. Do not compare
-them with the envelope.
+- The load generator ran on the same host, and so did Varnish. With the two server X containers
+  that is more work than the host has CPUs for, so the server X figures are a floor.
+- Requests went straight to the containers' addresses, not through a published port.
+- The measurements were taken twice on server X, an hour apart on the same data. Where the two
+  differ, both are given as a range. Most agree within 10–15%; writes spread over many
+  namespaces and creates from 32 writers varied more.
 
 ## The envelope
 
-At the data size above, server X answers as follows. These are origin numbers, before any CDN.
+At the data size above, the two setups answer as follows. These are origin numbers, before any
+CDN. Reads come from 8 concurrent clients.
 
-| Operation | Result on server X |
-|---|---|
-| Reads of a document or head pointer | 1,000–1,600/s at 8 concurrent, p50 4.6–6.6 ms, p99 ≤ 27 ms |
-| Cold reads of old revisions (folds) | 470/s, p50 15 ms |
-| Single writes to one namespace | 125/s from one writer (p50 7.5 ms), 310/s from 8, **590/s from 32** (p50 52 ms, p99 91 ms) |
-| Single writes spread over 1,000 namespaces | 420/s from 32 writers (p50 66 ms, p99 210 ms) |
-| A batch of 1,000 appends | 1.4 s |
-| Appends to a large document | p50 7 ms at 16 KiB, 15 ms at 1 MiB, 25 ms at 3.5 MiB |
-| A consumer's full catch-up of the large namespace | log: 4M entries in 2.4 min; `/heads`: 1M in 37 s; fetching 1M documents 8 at a time: ~10 min |
-| Long-poll followers of one **private** namespace | 5,000 followers: 0.3–1 s of core CPU and 0.35–0.7 s to deliver each write. The waiters share one read at the origin; there is no CDN collapse ([see below](#long-poll-followers-and-the-cdn)). Before the origin shared the read it was 3.7–4.1 s of CPU. |
-| Long-poll followers of one **public** namespace, behind the CDN | 5,000 followers: 0.01 s of core CPU, all delivered in 0.25 s (0.4 s on SQLite) |
+| Operation | Server X (Postgres, grants) | SQLite (4 vCPU, no grants) |
+|---|---|---|
+| Reads of a document, the grant not cached | 2,540–2,860/s, p50 2.6–2.8 ms, p99 6–8 ms | 13,300/s, p50 0.5 ms, p99 2 ms |
+| Reads of a document, the grant cached | 3,200–3,650/s, p50 2.0 ms, p99 6–8 ms | — |
+| Reads of a head pointer | 4,300–6,200/s, p50 1.2–1.7 ms | 16,600/s, p50 0.4 ms |
+| Cold reads of old revisions (folds) | 970–1,170/s, p50 6–7 ms | 3,560/s, p50 2.1 ms |
+| Single writes to one namespace, 1 writer | 200–240/s, p50 4 ms | 910/s, p50 0.8 ms |
+| Single writes to one namespace, 8 writers | 550–710/s, p50 10–14 ms | 1,440/s, p50 3.3 ms |
+| Single writes to one namespace, 32 writers | **930–1,000/s**, p50 26–33 ms, p99 55–97 ms | **1,500/s**, p50 25 ms, p99 35 ms |
+| Single writes spread over 1,000 namespaces, 32 writers | 610–920/s, p50 30–44 ms, p99 97–150 ms | 1,570/s, p50 22 ms, p99 40 ms |
+| A batch of 1,000 appends | 0.56–0.63 s | 0.38 s |
+| Appends to a large document | p50 4 ms at 16 KiB, 7 ms at 1 MiB, 16 ms at 3.5 MiB | 1.1 / 5.6 / 13 ms |
+| A page of 1,000 log entries, at a random place | 175–200/s, p50 39–46 ms | 360/s, p50 17 ms |
+| A consumer's full catch-up of the large namespace | log: 4M entries in 1.7 min; `/heads`: 1M in 18 s; fetching 1M documents 8 at a time: 6–7 min | log: 32 s; `/heads`: 14 s; documents: 1.3 min |
+| Long-poll followers | see [Long-poll followers and the CDN](#long-poll-followers-and-the-cdn) | |
 
 The large-document row is for documents of long strings without a `$schema`. Other shapes cost
 more: see [Large documents, by shape and schema](#large-documents-by-shape-and-schema).
+
+**Right after a restart the first minutes are slower.** One pass was taken minutes after
+Postgres had been restarted, before its cache had filled: the first read measurement did
+260 reads a second with a p99 of 0.57 s, and writes from 32 writers 440 a second. The
+measurements later in that same pass were back to the figures above. That pass is kept as
+`pg-grants-serverX-cold-start.json` and is not otherwise used here, except where a range says
+"three runs".
 
 ### What data size costs
 
@@ -120,42 +132,48 @@ indexes (see the fixes under Unreleased in the CHANGELOG). So a namespace of 1M 
 
 What does grow with size:
 
-- **Storage:** about 1.2 KB a revision on Postgres and 620 B on SQLite, for these small
+- **Storage:** about 1.4 KB a revision on Postgres and 750 B on SQLite, for these small
   documents.
 - **Full scans:** catch-up, bootstrap and bundle export.
 - **Memory:** see [Deployment](#deployment).
 
 ## What limits server X
 
-**The core isn't server X's bottleneck; Postgres is.**
+**The core isn't server X's bottleneck.**
 
 The same data was measured again with different cores. Grants are on unless noted. Reads come
 from 8 concurrent clients. Writes go to the large namespace from 32 writers.
 
-| Core | Reads, uncached grants | Reads, cached grants | Writes, one namespace | Writes, 1,000 namespaces | Bootstrap fetches |
+| Core | Reads, grant not cached | Reads, grant cached | Writes, one namespace | Writes, 1,000 namespaces | Bootstrap fetches |
 |---|---|---|---|---|---|
-| 2 vCPU, authentication off | 1,840/s, p50 3.9 ms | — | 750/s, p50 41 ms | 460/s | 1,920/s |
-| 2 vCPU | 1,030/s, p50 6.6 ms | 1,630/s, p50 4.6 ms | 590/s, p50 52 ms | 420/s | 1,620/s |
-| 1 vCPU | 1,130/s, p50 5.3 ms | 2,070/s, p50 3.3 ms | 790/s, p50 40 ms | 400/s | 1,220/s |
-| 2 × 1 vCPU, writes routed by namespace | 1,110/s, p50 6.4 ms | 1,510/s, p50 4.8 ms | 700/s, p50 45 ms | 380/s | 1,440/s |
+| 2 vCPU, authentication off | 3,640/s, p50 1.5 ms | — | 910/s, p50 33 ms | 740/s | 2,840/s |
+| 2 vCPU (two runs) | 2,540–2,860/s, p50 2.6–2.8 ms | 3,200–3,650/s, p50 2.0 ms | 930–1,000/s, p50 26–33 ms | 610–920/s | 2,430–2,830/s |
+| 1 vCPU | 2,470/s, p50 2.4 ms | 3,340/s, p50 1.9 ms | 1,220/s, p50 25 ms | 660/s | 3,830/s |
+| 2 × 1 vCPU, writes routed by namespace | 2,570/s, p50 2.6 ms | 3,010/s, p50 2.3 ms | 860/s, p50 29 ms | 660/s | 2,700/s |
 
 What the table shows:
 
-- **Halving the core changes little, and a second instance adds nothing.** The 2-vCPU Postgres
-  (at ~1.3 vCPU and 3.4 GB under these loads) and its round trips set the pace.
+- **Halving the core changes nothing that is outside the run-to-run range, and a second
+  instance adds nothing.** So the core's CPU is not what sets these numbers. What is left is
+  Postgres and the round trips to it, and in this test the host, which the load generator
+  shared.
 - **On server X, give Postgres the CPU first.** More core instances pay off once the core's own
   CPU is the limit. That happens with grant checks at fleet scale, with large documents, and
-  with uncollapsed followers that are CPU-bound rather than database-bound.
-- **Grants cost ~40% of read throughput when the grant isn't cached** (1,030/s against 1,840/s
-  without authentication). Most of that is verification. With grants in the core's bearer cache,
-  reads are within ~10% of unauthenticated ones.
+  with followers that reach the origin.
+- **Grants cost 20–30% of read throughput when the grant isn't cached** (2,540–2,860/s against
+  3,640/s without authentication). Most of that is verification. With grants in the core's
+  bearer cache, reads are within about 10% of unauthenticated ones.
 - **Write throughput into one namespace doesn't depend on the core's size here.** The
   namespace's log (one append at a time, grouped) and Postgres set it.
 
+Postgres's CPU was not recorded during these runs. Its container held 3.3 of its 4 GB when
+they ended.
+
 ## Long-poll followers and the CDN
 
-**Followers of a public namespace cost the origin almost nothing behind the CDN. Followers of a
-private namespace each cost an origin connection, and about 0.1–0.2 ms of core CPU per write.**
+**Followers of a public namespace cost the origin almost nothing behind the CDN. Followers that
+reach the origin (those of a private namespace, or any without a CDN) each cost an origin
+connection, and about 0.03–0.04 ms of core CPU per write.**
 
 ### Public namespaces: the CDN collapses followers
 
@@ -168,8 +186,7 @@ It works like this:
 - The answer is cached for the interval.
 
 The origin's cost is then one request per namespace, interval and CDN node, whatever the number
-of followers. Measured with the repository's Varnish configuration
-(`deploy/varnish/default.vcl`): 1,100 followers made 4 origin requests.
+of followers.
 
 ### Private namespaces: no collapse at the CDN
 
@@ -190,59 +207,60 @@ The origin shares the reads of the followers it wakes (`internal/core/live.go`):
 - The decision holds as long as there has been no configuration change, purge or other change to
   what reads may return since, the grant has not expired, and no rule reads `/now`.
 
-Before this, each woken waiter read the log in a transaction of its own.
-
 ### Measured
 
 Each cell is the time until every follower had the write, and the core's CPU time for it
-(CPU-s).
+(CPU-s). The CDN is the repository's Varnish configuration (`deploy/varnish/default.vcl`) in a
+container on the same host. Server X, except where SQLite is named.
 
-| Followers of one namespace | public, via CDN | private, direct, before | private, direct, origin collapse | private, via Varnish, origin collapse |
-|---|---|---|---|---|
-| 100 | 7 ms, ~0 CPU-s | 0.3–0.4 s, 0.06–0.07 CPU-s | 0.03–0.5 s, 0.02–0.03 CPU-s | 0.24–0.41 s, 0.02–0.03 CPU-s |
-| 1,000 | 46 ms, ~0 CPU-s | 0.63–0.71 s, 0.7–0.8 CPU-s | **0.08 s, 0.10–0.12 CPU-s** | 0.53–0.60 s, 0.08–0.11 CPU-s |
-| 5,000 | 0.25–0.39 s, 0.01 CPU-s | 3.1 s, 3.7–4.1 CPU-s | **0.35–0.69 s, 0.33–0.98 CPU-s** | 2.8–3.0 s, 1.25–2.2 CPU-s |
+| Followers of one namespace | public, via the CDN | straight to the origin (public or private) | private, via Varnish (not collapsed there) |
+|---|---|---|---|
+| 100 | 9–18 ms, ~0 CPU-s (SQLite: 5 ms) | 15–21 ms, 0.01 CPU-s | 22–27 ms, 0.01 CPU-s |
+| 1,000 | 44–48 ms, ~0 CPU-s (SQLite: 48 ms) | 24–31 ms, 0.03–0.04 CPU-s | 0.11–0.13 s, 0.05 CPU-s |
+| 5,000 | **0.18–0.28 s, ~0 CPU-s** (SQLite: 0.21 s, 0.02 CPU-s) | **0.09–0.14 s, 0.16–0.18 CPU-s** | 1.5–1.6 s, 0.6–0.7 CPU-s |
 
-- **Private columns:** server X (Postgres, the core at 2 vCPU), grants, two runs each, the core
-  idle before the write.
-- **Public column:** SQLite and server X.
+- **Via the CDN:** two runs on server X with authentication off and a public namespace, and one
+  on SQLite.
+- **Straight to the origin:** a private namespace with grants, a public one without, and SQLite.
+  All three agree, so they share a column.
+- **Private, via Varnish:** two runs with grants.
 
 What the table shows:
 
-- **With the collapse, a write costs about 0.1–0.2 ms of core CPU per private follower.** Before
-  it cost 1 ms: a transaction and a log query each.
-- **Server X therefore delivers roughly 5,000–15,000 follower-writes a second**, against ~1,000
-  before.
-- **Through Varnish, the rest of the time is Varnish** passing 5,000 private connections on the
-  same host.
+- **Through the CDN, followers of a public namespace cost the origin nothing that the
+  measurement can see.**
+- **At the origin, a write costs about 0.03–0.04 ms of core CPU per follower** (0.17 CPU-s for
+  5,000), and all 5,000 have it in about 0.1 s.
+- **Through Varnish, private followers take longer and cost the core more** (0.12–0.14 ms each).
+  Varnish passes 5,000 private connections one by one, on the same host. It adds nothing for
+  private followers until an edge verifies their grants.
 
-The repository's VCL no longer queues a long-poll with credentials behind an identical one in
-flight (`hash_ignore_busy`). It used to hold them until the next write and then send them to the
-origin a few at a time, as new requests that share nothing.
+The repository's VCL does not queue a long-poll with credentials behind an identical one in
+flight (`hash_ignore_busy`).
 
 ### Planning rule
 
-For private followers without a verifying edge:
+For followers that reach the origin:
 
-- Plan for `followers × writes/s` up to ~5,000/s on server X.
+- Plan for `followers × writes/s` up to ~25,000/s on server X. That is half of what the CPU
+  figure above allows a 2-vCPU core that does nothing else.
 - Every follower is a connection the origin holds open. (A CDN in front holds them instead when
   it verifies edge grants.)
 
 ## Large documents, by shape and schema
 
 **Every write works on the whole document, so a small patch to a large document costs the
-document's size. The shape matters more than the bytes: many small values cost 3–5× a document
-of long strings, and a schema that types them about 3× more again.** Keep a frequently edited
+document's size. The shape matters more than the bytes: many small values cost 3–4× a document
+of long strings, and a schema that types them 2–3× more again.** Keep a frequently edited
 typed document well under 100 KiB if its appends should stay under 10 ms.
 
-Measured on [host B](#host-b-2026-11-12-spec-082) on 2026-11-12 at spec 0.82, with
-`cmd/capacity -only large,single`. Each figure is the median of 60 appends of
-`[{"op":"replace","path":"/n","value":i}]`, one after another, to one document.
+Each figure is the median of 60 appends of `[{"op":"replace","path":"/n","value":i}]`, one
+after another, to one document.
 
 Three documents were measured at each size:
 
 - **strings**: `{ n, items }` with `items` an array of 1,000-character strings, no `$schema`.
-  This is the shape the envelope's numbers used.
+  This is the shape the envelope's row used.
 - **structured**: `{ n, items }` with `items` an array of objects of about 110 bytes
   (`{ id, name, score, tags: [..], at, ok }`), no `$schema`. That is about 9,500 objects a MiB.
 - **schema**: the structured document with `$schema` pinned to a schema revision in the same
@@ -252,24 +270,29 @@ Three documents were measured at each size:
 
 | Append p50 | 16 KiB | 256 KiB | 1 MiB | 3.5 MiB |
 |---|---|---|---|---|
-| SQLite, strings | 1.2 ms | 2.0 ms | 5.0 ms | 14 ms |
-| SQLite, structured | 1.4 ms | 6.5 ms | 22 ms | 73 ms |
-| SQLite, schema | 2.5 ms | 17 ms | 58 ms | 225 ms |
-| Postgres, strings | 4.8 ms | 5.5 ms | 9.1 ms | 17 ms |
-| Postgres, structured | 4.9 ms | 11 ms | 27 ms | 75 ms |
-| Postgres, schema | 5.9 ms | 21 ms | 68 ms | 220 ms |
+| SQLite, strings | 1.1 ms | 2.6 ms | 5.6 ms | 13 ms |
+| SQLite, structured | 1.4 ms | 5.8 ms | 19 ms | 59 ms |
+| SQLite, schema | 1.9 ms | 14 ms | 52 ms | 172 ms |
+| Server X, strings | 4.0 ms | 5.2 ms | 7.4 ms | 16 ms |
+| Server X, structured | 4.2 ms | 8.7 ms | 26 ms | 63 ms |
+| Server X, schema | 5.7 ms | 19 ms | 55 ms | 187 ms |
 
 What the table shows:
 
-- **The shape matters more than the bytes.** The same bytes as many small values cost 3–5× a
-  document of long strings. Parsing, applying and canonicalising all work per value.
-- **Validation roughly triples it again.** It adds about 40 ms a MiB of small typed objects on
+- **The shape matters more than the bytes.** The same bytes as many small values cost 3–4× a
+  document of long strings at 1 MiB and above. Parsing, applying and canonicalising all work
+  per value.
+- **Validation costs 2–3× more again.** It adds about 30–35 ms a MiB of small typed objects on
   top of about 20 ms a MiB without a schema. At the 1 MiB default a typed document of this shape
-  takes ~60 ms an append. At 3.5 MiB it takes ~220 ms, p99 ~300 ms.
-- **The database adds a constant** (3–4 ms on this Postgres). The rest is the core's CPU, which
-  is why the two databases agree at the large sizes.
-- **Creating the document costs about what two appends do**: 190 ms at 1 MiB and 530 ms at
-  3.5 MiB with the schema.
+  takes ~55 ms an append. At 3.5 MiB it takes 170–190 ms, p99 ~230 ms.
+- **The database adds a constant** (3–4 ms on server X). The rest is the core's CPU, which is
+  why the two agree at the large sizes even though one core has half the CPU: an append uses one
+  thread.
+- **Creating the document costs about what two appends do**: about 110 ms at 1 MiB and
+  400–470 ms at 3.5 MiB with the schema.
+
+Server X's large documents were measured three times (twice with grants, once without). The
+three agree within a third at worst.
 
 ## Many writers
 
@@ -286,17 +309,11 @@ What to do instead:
 - **Where one writer does need more than 10 writes a second on a small document**, raise the
   deployment maximum (`serve -max-rate-per-resource`) and set `ratePerResource` in that
   namespace's `limits`. Leave it at the default where documents are large: a typed 1 MiB
-  document already costs ~60 ms of CPU an append
+  document already costs ~55 ms of CPU an append
   ([above](#large-documents-by-shape-and-schema)).
 - **Clients that do share a document** should retry with `AppendLatest` or its like, not at once.
 
-The runs in this section are from [host B](#host-b-2026-11-12-spec-082). The tables under
-[Writes to one document](#writes-to-one-document) are 15-second runs of 2026-11-12. The tables
-under [One resource per item](#one-resource-per-item) and
-[Fairness between writers](#fairness-between-writers) are 10-second runs of 2026-11-13, which
-measured the shared document again beside the resource per item. That is why the shared
-document's figures differ a little between them (588 and 600 writes a second for 8 writers on
-SQLite, for instance): they are two runs, and they vary this much.
+Every run in this section lasts 15 seconds, on a document (or items) of about 500 bytes.
 
 Terms used below:
 
@@ -311,9 +328,8 @@ Terms used below:
 **At the default limits a shared document takes about one writer's rate, however many writers
 share it. With the rate lifted, more writers make it slower than one writer, not faster.**
 
-Same host and day as the large documents (2026-11-12), with a document of about 500 bytes. Each
-writer is a principal of its own. It appends in a loop for 15 seconds without pausing, with
-`If-Match` on the head it last saw, and shares nothing with the others.
+Each writer is a principal of its own. It appends in a loop without pausing, with `If-Match` on
+the head it last saw, and shares nothing with the others.
 
 Two ways of retrying were measured:
 
@@ -330,21 +346,22 @@ collide less in proportion.
 The per-resource rate is the ceiling. §6.6 allows 10 writes a second (burst 20) per resource and
 principal, and an allowance doesn't lift it.
 
-| Writers | Retry | Appends/s (SQLite / Postgres) | Attempts `412` | Attempts `429` | Fewest and most appends by one writer (SQLite) |
+| Writers | Retry | Appends/s (SQLite / server X) | Attempts `412` | Attempts `429` | Fewest and most appends by one writer (SQLite / server X) |
 |---|---|---|---|---|---|
 | 1 | | 11 / 11 | 0 | 46% | |
-| 8 | at once | 12 / 12 | 46% | 46% | 8 and 47 |
-| 8 | backoff | 16 / 13 | 43% | 46% | 24 and 46 |
-| 32 | at once | 14 / 14 | 51% | 46% | 0 and 40 |
-| 32 | backoff | 28 / 19 | 49% | 46% | 4 and 36 |
+| 8 | at once | 12 / 12 | 47% | 45% | 10 and 30 / 0 and 71 |
+| 8 | backoff | 16 / 13 | 45% | 47% | 24 and 38 / 8 and 46 |
+| 32 | at once | 12 / 16 | 52% | 45% | 0 and 41 / 0 and 18 |
+| 32 | backoff | 21 / 26–70 | 43–50% | 46% | 2 and 25 / 2 and 143 |
 
 - **The document takes about one writer's rate however many write it.** So 8 writers together do
-  12 a second, and 32 do 14. Two things cause this:
+  12 a second, and 32 do 12–16. Two things cause this:
   - Each principal has a bucket of its own, but a write refused with `412` has still drawn its
     tokens. (The buckets are drawn before the precondition is compared.)
   - A writer that waited for a token usually holds a stale head by then.
-- **The backoff helps a little**: up to twice the appends at 32 writers, spread more evenly. But
-  about half the attempts are still `412`s. The rate, not the retry policy, decides.
+- **The backoff helps a little, and unevenly**: 32 writers did 21 a second on SQLite and between
+  26 and 70 on server X over three runs. About half the attempts are still `412`s. The rate,
+  not the retry policy, decides.
 
 #### With the rate lifted
 
@@ -354,26 +371,25 @@ Here nothing is rate limited, and the core and the database set the pace. The se
 - a namespace whose `limits` set both that high;
 - `capacity -single-rate 1000000`.
 
-| Writers | Retry | Appends/s (SQLite / Postgres) | Attempts `412` (SQLite / Postgres) | One write, retries included, p50 / p95 / p99 (SQLite) | Fewest and most appends by one writer (SQLite / Postgres) |
+| Writers | Retry | Appends/s (SQLite / server X) | Attempts `412` (SQLite / server X) | One write, retries included, p50 / p95 / p99 (SQLite) | Fewest and most appends by one writer (SQLite / server X) |
 |---|---|---|---|---|---|
-| 1 | | 1,130 / 295 | 0 | 0.7 / 1.1 / 9.7 ms | |
-| 8 | at once | 600 / 175 | 84% / 86% | 1.7 / 72 / 128 ms | 1,025 and 1,244 / 231 and 447 |
-| 8 | backoff | 1,000 / 284 | 44% / 70% | 0.8 / 1.4 / 227 ms | 1,517 and 2,299 / 0 and 1,591 |
-| 32 | at once | 236 / 87 | 95% / 96% | 19 / 580 / 947 ms | 62 and 152 / 19 and 59 |
-| 32 | backoff | 764 / 128 | 81% / 95% | 1.0 / 3.5 ms / 1.4 s | 105 and 630 / 0 and 175 |
+| 1 | | 1,150 / 330 | 0 | 0.7 / 1.0 / 10 ms | |
+| 8 | at once | 526 / 155 | 85% / 87% | 2.0 / 82 / 153 ms | 908 and 1,073 / 181 and 463 |
+| 8 | backoff | 1,029 / 281 | 44% / 70% | 0.8 / 1.4 / 175 ms | 1,349 and 2,699 / 0 and 2,674 |
+| 32 | at once | 177 / 64 | 96% / 96% | 6.8 / 870 ms / 1.7 s | 46 and 119 / 14 and 45 |
+| 32 | backoff | 752 / 84 | 82% / 96% | 1.0 / 3.3 ms / 1.2 s | 104 and 798 / 0 and 131 |
 
-- **One writer in a loop does about 1,100 appends a second on SQLite and 300 on Postgres** to a
+- **One writer in a loop does about 1,150 appends a second on SQLite and 330 on server X** to a
   small document. On SQLite that is about a hundred times the default rate.
 - **More writers make it slower, not faster.** Every append needs the head the last one made, so
   the writers queue behind one another whatever the server does. Retrying at once, 8 writers
-  get half of what one does and 32 a fifth, with 84–96% of their requests wasted.
-- **Backing off recovers most of the throughput.** On SQLite 8 writers do 1,000 a second with
-  44% of attempts lost, and 32 do 764.
+  get half of what one does and 32 a fifth or less, with 85–96% of their requests wasted.
+- **Backing off recovers most of the throughput where a write is fast.** On SQLite 8 writers do
+  1,030 a second with 44% of attempts lost, and 32 do 750. On server X, where a write takes
+  3 ms, 8 writers get back to 280 and 32 only to 84.
 - **Backing off doesn't make the document fair.** The writer that just won holds the newest head
-  and waits for nothing, so it tends to win again. On Postgres a write takes longer than the
+  and waits for nothing, so it tends to win again. On server X a write takes longer than the
   backoff's ceiling spreads the losers, and some writers got no append in at all in 15 seconds.
-- **A longer ceiling loses fewer requests and is less fair still.** At 250 ms one of 8 writers
-  did more than half the appends and another none.
 
 What the retry policy can't change is that a lost race costs a whole request. The remedies are
 structural, and are listed at the top of [Many writers](#many-writers).
@@ -385,20 +401,23 @@ share, and throughput grows with the number of writers.**
 
 The same writers as above. Each now creates resources of its own in the namespace
 (`If-None-Match: *`, a name the client chose, a 450-byte document) where before they appended to
-one shared document. No experimental code. The rate is lifted as above. Each run is 10 seconds.
+one shared document. No experimental code. The rate is lifted as above.
 
-| Writers | Creates/s (SQLite / Postgres) | Attempts `412` | Fewest and most by one writer (Postgres) | One write p50 / p99 / max (Postgres) |
+| Writers | Creates/s (SQLite / server X) | Attempts `412` | Fewest and most by one writer (server X) | One write p50 / p99 / max (server X) |
 |---|---|---|---|---|
-| 1 | 1,254 / 369 | 0 | | 2.6 / 4.2 / 36 ms |
-| 8 | 2,121 / 1,074 | 0 | 1,340 and 1,345 | 7.2 / 13 / 33 ms |
-| 32 | 2,200 / 1,930 | 0 | 599 and 608 | 16 / 31 / 49 ms |
+| 1 | 1,120 / 300 | 0 | | 3.2 / 5.9 / 29 ms |
+| 8 | 1,830 / 940 | 0 | 1,768 and 1,774 | 7.8 / 15 / 626 ms |
+| 32 | 1,970 / 1,420 | 0 | 660 and 670 | 20 / 50 / 98 ms |
 
 - **Nothing collides.** Creates of different resources share no head, so there is no `412` to
   lose a request to, and every writer gets the same share. The worst write of 32 writers took
-  49 ms, against seconds on the shared document.
-- **It scales with writers.** On Postgres 32 writers do five times what one does. The reason is
-  group commit (D.8): the core writes the resources of several requests in one transaction. On
-  SQLite 32 writers do 1.8 times one writer's.
+  98 ms, against seconds on the shared document.
+- **It scales with writers.** On server X 32 writers do almost five times what one does. The
+  reason is group commit (D.8): the core writes the resources of several requests in one
+  transaction. On SQLite 32 writers do 1.8 times one writer's.
+- **It varies between runs on server X.** A second run, with authentication off, did 290, 740
+  and 620 creates a second from 1, 8 and 32 writers. Even that is ten times the shared
+  document's 64.
 - **A repeat is safe as it is.** The same create sent again is §7.2's retry, answered with the
   first attempt's revision.
 - **Each item is still checked and ordered.** Each item is validated on its own (`$schema`,
@@ -406,6 +425,10 @@ one shared document. No experimental code. The rate is lifted as above. Each run
 - **What is given up is the aggregate.** A constraint across items (a maximum count, uniqueness)
   isn't the server's to check. The list is read as the namespace's heads under a prefix, or from
   an index, not as one document.
+
+**At the default limits the principal's and the namespace's rates cap it, not collisions.** One
+writer did 56 creates a second (`ratePerPrincipal` is 50), 8 writers 440, and 32 writers
+410–560 (`ratePerNamespace` is 500). Refusals are `429`s with a `Retry-After`, never `412`s.
 
 ### Fairness between writers
 
@@ -416,43 +439,40 @@ Whether every writer gets its share matters as much as the total: a document tha
 writes a second is of little use to the writer who gets none of them.
 
 Fairness is measured as the writes the least-served and the most-served writer got in one run.
-Every writer sends as fast as it can, so an even split is the fair outcome. These tables are
-from the same run as the [One resource per item](#one-resource-per-item) table: the rate lifted,
-10 seconds.
+Every writer sends as fast as it can, so an even split is the fair outcome. These are the runs
+of the two tables above (the rate lifted, 15 seconds), set side by side.
 
 | 8 writers | Writes/s | Fewest and most by one writer | Most ÷ fewest | Worst write |
 |---|---|---|---|---|
-| SQLite, shared document, retry at once | 588 | 660 and 828 | 1.3 | 0.3 s |
-| SQLite, shared document, backoff | 986 | 674 and 1,667 | 2.5 | 2.9 s |
-| SQLite, a resource per item | 2,121 | 2,626 and 2,681 | 1.02 | 39 ms |
-| Postgres, shared document, retry at once | 177 | 170 and 285 | 1.7 | 1.2 s |
-| Postgres, shared document, backoff | 320 | 0 and 1,823 | one writer got nothing | 5.4 s |
-| Postgres, a resource per item | 1,074 | 1,340 and 1,345 | 1.004 | 33 ms |
+| SQLite, shared document, retry at once | 526 | 908 and 1,073 | 1.2 | 0.4 s |
+| SQLite, shared document, backoff | 1,029 | 1,349 and 2,699 | 2.0 | 2.7 s |
+| SQLite, a resource per item | 1,830 | 3,407 and 3,454 | 1.01 | 57 ms |
+| Server X, shared document, retry at once | 155 | 181 and 463 | 2.6 | 3.6 s |
+| Server X, shared document, backoff | 281 | 0 and 2,674 | one writer got nothing | 12.9 s |
+| Server X, a resource per item | 940 | 1,768 and 1,774 | 1.003 | 0.6 s (p99 15 ms) |
 
 | 32 writers | Writes/s | Fewest and most by one writer | Most ÷ fewest | Worst write |
 |---|---|---|---|---|
-| SQLite, shared document, retry at once | 263 | 46 and 114 | 2.5 | 1.5 s |
-| SQLite, shared document, backoff | 958 | 2 and 660 | 330 | 8.0 s |
-| SQLite, a resource per item | 2,200 | 683 and 697 | 1.02 | 47 ms |
-| Postgres, shared document, retry at once | 88 | 14 and 42 | 3 | 4.2 s |
-| Postgres, shared document, backoff | 137 | 0 and 213 | some writers got nothing | 9.4 s |
-| Postgres, a resource per item | 1,930 | 599 and 608 | 1.02 | 49 ms |
+| SQLite, shared document, retry at once | 177 | 46 and 119 | 2.6 | 2.9 s |
+| SQLite, shared document, backoff | 752 | 104 and 798 | 7.7 | 9.5 s |
+| SQLite, a resource per item | 1,970 | 911 and 938 | 1.03 | 45 ms |
+| Server X, shared document, retry at once | 64 | 14 and 45 | 3.2 | 7.8 s |
+| Server X, shared document, backoff | 84 | 0 and 131 | some writers got nothing | 12.0 s |
+| Server X, a resource per item | 1,420 | 660 and 670 | 1.02 | 98 ms |
 
 - **On a shared document the retry policy trades fairness for throughput.**
-  - Retrying at once wastes most requests but spreads what gets through within a factor of 1.3
-    to 3.
-  - The backoff gets far more through, to fewer writers. Whoever just won holds the newest head
+  - Retrying at once wastes most requests but spreads what gets through within a factor of 1.2
+    to 3.2.
+  - The backoff gets more through, to fewer writers. Whoever just won holds the newest head
     and waits for nothing, while each loser waits longer after each loss.
-  - In these runs one of 8 writers on Postgres made no write at all in 10 seconds, and on SQLite
-    one of 32 made two.
+  - In these runs one of 8 writers on server X made no write at all in 15 seconds while another
+    made 2,674.
 - **A resource per item is fair without trying.** Nobody's write depends on anybody else's, so
-  the shares differ by 2% at most and the worst write is under 50 ms.
+  the shares differ by 3% at most.
 - **At the default limits the shared document is unfair either way**, since a lost race has
-  still spent a token. These figures are from the earlier 15-second run
-  ([At the default limits](#at-the-default-limits)), on SQLite:
-  - 8 writers retrying at once: 8 and 47 writes by the least and the most served. With the
-    backoff: 24 and 46.
-  - 32 writers retrying at once: 0 and 40. With the backoff: 4 and 36.
+  still spent a token. The last column of the table under
+  [At the default limits](#at-the-default-limits) has the figures: retrying at once, one of 8
+  writers on server X got nothing while another got 71.
 
 **What these runs don't show:**
 
@@ -460,7 +480,7 @@ from the same run as the [One resource per item](#one-resource-per-item) table: 
   between writers. A resource per item and the namespace's log serve requests as they arrive,
   so a writer that sends twice as often gets twice the writes.
 - What caps a greedy writer is its own rate (`ratePerPrincipal`, 50 a second by default) and the
-  namespace's (`ratePerNamespace`). This run lifted both, and the per-resource rate with them.
+  namespace's (`ratePerNamespace`). These runs lifted both, and the per-resource rate with them.
 - Writers that pause between writes collide less on a shared document, so its unfairness shrinks
   with load. These runs are the worst case.
 
@@ -469,24 +489,28 @@ from the same run as the [One resource per item](#one-resource-per-item) table: 
 **A batch writes many steps to one document at once** (§7.5: one item, many steps, one token).
 This is the way for one writer to make many changes to one document.
 
-| One item of | SQLite | Postgres |
+| One item of | SQLite | Server X |
 |---|---|---|
-| 100 steps | 4–5 ms | 18 ms (152 ms as the first batch on a cold connection) |
-| 1,000 steps | 36–44 ms (23,000–28,000 steps/s) | 146–205 ms (4,900–6,800 steps/s) |
+| 100 steps | 5 ms | 20–28 ms |
+| 1,000 steps | 70–74 ms (13,600–14,400 steps/s) | 150–220 ms (4,600–6,700 steps/s) |
+
+Four runs on server X and two on SQLite. As the first batch after a restart, 100 steps took
+115 ms on server X.
 
 ### Long histories
 
 **A long history doesn't slow a document down.** One document was grown to 100,000 revisions:
 
-| Revisions | Append p50 (SQLite / Postgres) | Head read | Document at head | Document at its first revision |
-|---|---|---|---|---|
-| 1,000 | 0.9 / 3.3 ms | 0.2 ms | 0.2–0.3 ms | 0.2 ms |
-| 10,000 | 1.1 / 4.4 ms | 0.2 ms | 0.2 ms | 0.2 ms |
-| 100,000 | 1.4 / 4.1 ms | 0.2 ms | 0.2–0.4 ms | 0.2 ms |
+| Revisions | Append p50 (SQLite / server X) | Head read, document at head, document at its first revision (SQLite / server X) |
+|---|---|---|
+| 1,000 | 0.7–0.8 / 3.0–7.6 ms | 0.15–0.19 / 0.46–0.60 ms |
+| 10,000 | 0.7–1.5 / 2.9–7.8 ms | 0.15–0.23 / 0.42–0.61 ms |
+| 100,000 | 0.6–1.1 / 3.2–3.8 ms | 0.13–0.20 / 0.48–0.54 ms |
 
-The reads were made right after the writes, from warm caches, 20 samples each. They show that
-nothing scans the history. They do not show what a cold read of an old revision costs; the
-"cold reads of old revisions" row of [the envelope](#the-envelope) does.
+The ranges are over two runs each. The reads were made right after the writes, from warm
+caches, 20 samples each. They show that nothing scans the history. They do not show what a cold
+read of an old revision costs; the "cold reads of old revisions" row of
+[the envelope](#the-envelope) does.
 
 ### A prototype that was set aside
 
@@ -499,14 +523,17 @@ the rules and what it left open. It let the server:
 - write the waiting appends of a document in one transaction;
 - recognise repeats by a producer key.
 
-What it showed on the shared document:
+It was measured on the same setup as everything else here, each writer replacing a member of
+its own in the shared document. What it showed:
 
-- **It removed the `412`s and shared the document evenly.** 3,440 and 3,670 appends a second
-  from 8 and 32 writers on SQLite, 917 and 1,334 on Postgres. That is more than a resource per
-  item on SQLite and less on Postgres.
-- **It was fair**, as long as the document's writes went to one instance: 417 and 418 appends by
-  the least and the most served of 32 writers on Postgres. Spread over two instances: 23 and 546.
-- **Throughput halved again** when a document's writers were spread over two instances.
+- **It removed the `412`s and shared the document evenly.** 3,270 and 3,450 appends a second
+  from 8 and 32 writers on SQLite, 450 and 410 on server X. That is more than a resource per
+  item on SQLite (1,830 and 1,970) and less on server X (940 and 1,420).
+- **It was fair**: 192 and 193 appends by the least and the most served of 32 writers on
+  server X.
+- **It needed a document's writes to go to one instance.** An earlier measurement on another
+  setup (in the prototype's pull request) had throughput halve and the shares come apart when a
+  document's writers were spread over two instances. That was not measured again here.
 - **It cost** about 900 lines in the write path, a table and a change to §7.2's contract.
 
 A resource per item needs none of that, so the prototype is not in this code.
@@ -526,8 +553,8 @@ Each limit is one of three kinds:
 
 - *Limit:* every write appends to its namespace's hash chain (§3.5). So writes to one namespace
   commit one at a time. On Postgres they commit one group of up to 32 at a time.
-- *Measured:* one namespace takes ~590 single writes/s on server X from 32 writers, and
-  700–1,000/s on SQLite (4 vCPU).
+- *Measured:* one namespace takes 930–1,000 single writes/s on server X from 32 writers, and
+  1,500/s on SQLite (4 vCPU).
 - *Lever:* spread write-heavy data over namespaces. Writes to different namespaces run in
   parallel, across instances too. A sign-in storm writing per-user items belongs in many
   namespaces, not one.
@@ -548,9 +575,9 @@ Each limit is one of three kinds:
 
 - *Limit:* the result of a write is canonicalised, checked against the limits and validated
   against its `$schema` in full. A small patch to a large document costs the document's size.
-- *Measured:* append p50 is 7 ms at 16 KiB, 15 ms at 1 MiB and 25 ms at 3.5 MiB on server X, and
-  1.7 / 7 / 19 ms on SQLite. Those are documents of long strings without a `$schema`. Many small
-  values cost 3–5× more, and a schema that types them about 3× more again
+- *Measured:* append p50 is 4 ms at 16 KiB, 7 ms at 1 MiB and 16 ms at 3.5 MiB on server X, and
+  1.1 / 5.6 / 13 ms on SQLite. Those are documents of long strings without a `$schema`. Many
+  small values cost 3–4× more, and a schema that types them 2–3× more again
   ([Large documents, by shape and schema](#large-documents-by-shape-and-schema)).
 - *Lever:* keep frequently edited documents small. Split large aggregates into resources. Keep a
   frequently edited typed document well under 100 KiB if its appends should stay under 10 ms.
@@ -563,7 +590,7 @@ Each limit is one of three kinds:
   - 10/s a resource (burst 20).
   - Since v0.73 the instances of a Postgres deployment share the buckets (`rate_buckets`, about
     +1.2 ms a write). They are per instance only with `serve -local-rate-buckets`.
-- *Measured:* 500/s a namespace is ~85% of server X's single-namespace ceiling.
+- *Measured:* 500/s a namespace is about half of server X's single-namespace ceiling.
 - *Lever:* allowances (§6.6) replace a principal's and its namespace's buckets, for loaders and
   importers. The per-resource rate always applies.
 
@@ -578,7 +605,7 @@ Each limit is one of three kinds:
 **Consumers read over HTTP.**
 
 - *Limit:* a consumer catches up from the log and fetches each changed document (§10).
-- *Measured:* catch-up of 4M entries takes 2.4 min. Bootstrap of 1M documents takes ~11 min on
+- *Measured:* catch-up of 4M entries takes 1.7 min. Bootstrap of 1M documents takes 6–7 min on
   server X.
 - *Lever:* consumer throughput is the consumer's (see the gaps below). The origin side scales
   with instances.
@@ -587,11 +614,11 @@ Each limit is one of three kinds:
 
 | Gap | Effect | Fix |
 |---|---|---|
-| **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request. The origin shares their reads ([Origin-side collapse](#origin-side-collapse)), at ~0.1–0.2 ms of core CPU per follower per write. | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
+| **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request. The origin shares their reads ([Origin-side collapse](#origin-side-collapse)), at ~0.03–0.04 ms of core CPU per follower per write (0.12–0.14 ms through Varnish). | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
 | **No read replicas, and one `-db` for everything.** The core runs migrations, the tailer and leader jobs, so it can't run on a read-only database. | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
-| **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: ~11 min on server X (fetches at 1,600/s); 2.6 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
+| **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: 6–7 min on server X (fetches at 2,400–2,800/s); 1.3 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
-| **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.5–1.8 GB on the instance that served the full scans of the large namespace (steady 0.5–0.8 GB); the second instance, which didn't, peaked at 0.2 GB. | Run with `GOMEMLIMIT` under container limits; profile the scans (an opt-in pprof listener would help). |
+| **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.0 GB on server X and 1.4 GB on SQLite over a whole run. Scans, reads and small writes alone peaked at 0.2–0.3 GB; the rest came with 3.5 MiB documents and 5,000 followers. | Run with `GOMEMLIMIT` under container limits; profile the large-document path (an opt-in pprof listener would help). |
 
 ### Fixed in this branch
 
@@ -602,9 +629,8 @@ These were limits and are not any more:
   batch counting as its items.
 - **The bearer grant cache** held 1,024 grants and emptied itself when full. So a fleet of 5,000
   devices with grants of their own verified on nearly every request. Now it holds 65,536, least
-  recently used out first. The warm fleet's reads went from 1,490/s, p50 4.9 ms, to
-  1,710–1,770/s, p50 3.2–4.4 ms on server X, where Postgres rather than verification is the
-  bottleneck.
+  recently used out first. ([Earlier measurements](#earlier-measurements) has the before and
+  after.)
 - **The document cache** was bounded by count: 4,096 documents, which is up to 16 GiB of 4 MiB
   ones. Now it is bounded at 256 MiB.
 - **The read cache** emptied itself when full. Now it evicts a quarter.
@@ -613,7 +639,8 @@ These were limits and are not any more:
 - **Compiled schemas and their documents** were kept forever. Now the 512 and 2,048 most
   recently used are kept.
 - **Long-polls of a namespace** each read the log on their own when woken. Now the read is
-  shared ([Origin-side collapse](#origin-side-collapse)).
+  shared ([Origin-side collapse](#origin-side-collapse);
+  [Earlier measurements](#earlier-measurements) has the before and after).
 - **Namespace log pages** scanned and sorted the whole namespace, and the config-retry lookup
   scanned the whole log. Now both are indexed (CHANGELOG, Unreleased).
 - **A consumer's snapshot bootstrap** held the whole `/heads` listing in memory and one
@@ -623,11 +650,11 @@ These were limits and are not any more:
 
 | Resource | Measured | Notes |
 |---|---|---|
-| **Core CPU** | Grant checks, canonicalisation, validation, folds and page serialisation are core CPU. On server X a 1-vCPU core kept up with everything measured. | Scales with instances once it is the limit (it wasn't on server X). |
-| **Postgres round trips** | A single write is ~13 statements; on server X one writer did 125 writes/s (7.5 ms each), neither container saturated. | Keep the core near Postgres (sub-millisecond); concurrency, not speed, is what instances add. |
-| **Postgres CPU and memory** | ~1.3 of 2 vCPU and 3.4 of 4 GB under the read measurements; the limit on server X. | Size Postgres first; a read replica takes bulk reads and private followers' log reads (a gap, above). |
-| **Storage** | 6.2 GB on Postgres, 3.1 GB on SQLite for 5M revisions of ~500-byte documents. | Linear in revisions; pruning (§8.6) bounds it. |
-| **Memory** | Core: 0.5–0.8 GB steady, 1.5–1.8 GB peak during full scans. The caches are bounded: up to 256 MiB of documents, 64 MiB of read-cache revisions and 65,536 grants (a few hundred MB at most) by default. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves catch-ups; size the caches with `serve -doc-cache-size`, `-read-cache-size` and `-grant-cache`. |
+| **Core CPU** | Grant checks, canonicalisation, validation, folds and page serialisation are core CPU. On server X a 1-vCPU core kept up with the reads, writes and scans measured. | Scales with instances once it is the limit (it wasn't on server X). |
+| **Postgres round trips** | A single write is ~13 statements; on server X one writer did 200–240 writes/s (about 4 ms each). | Keep the core near Postgres (sub-millisecond); concurrency, not speed, is what instances add. |
+| **Postgres CPU and memory** | 3.3 of 4 GB at the end of the runs; CPU not recorded. Resizing the core changed little, so Postgres is where to add first. | Size Postgres first; a read replica takes bulk reads and private followers' log reads (a gap, above). |
+| **Storage** | 6.8 GB on Postgres, 3.7 GB on SQLite for 5M revisions of ~500-byte documents. | Linear in revisions; pruning (§8.6) bounds it. |
+| **Memory** | Core: 0.2–0.3 GB through scans, reads and small writes, 0.4–0.6 GB after a whole run, 1.0 GB peak (1.4 GB on SQLite) with 3.5 MiB documents and 5,000 followers. The caches are bounded: up to 256 MiB of documents, 64 MiB of read-cache revisions and 65,536 grants (a few hundred MB at most) by default. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves large documents or many followers; size the caches with `serve -doc-cache-size`, `-read-cache-size` and `-grant-cache`. |
 | **Upgrades** | Schema migrations run in a transaction at start (README "Schema migrations"); one that builds an index on a large table blocks writes to it while the index builds. | Create the index `CONCURRENTLY` beforehand under the same name: migrations are written with `IF NOT EXISTS`, so they then find it. |
 
 ## Recommended settings
@@ -638,19 +665,40 @@ Changes to limits that these measurements recommend. Most are done.
 |---|---|---|
 | **Bearer cache** | Done | 65,536 grants, at most 32 MiB of tokens, least recently used out first (`serve -grant-cache`). |
 | **Document and read caches** | Done | 256 MiB and 64 MiB, evicting gradually (`serve -doc-cache-size`, `-read-cache-size`). |
-| **`documentSize`** | Done | 1 MiB by default, 4 MiB a namespace may set (`serve -document-size`, `-max-document-size`). Appends at 3.5 MiB are 3–4× slower than at 16 KiB for documents of long strings on server X, and far more for typed documents of small values ([above](#large-documents-by-shape-and-schema)); every revision of a large document weighs on the caches. |
+| **`documentSize`** | Done | 1 MiB by default, 4 MiB a namespace may set (`serve -document-size`, `-max-document-size`). Appends at 3.5 MiB are 4× slower than at 16 KiB for documents of long strings on server X, and far more for typed documents of small values ([above](#large-documents-by-shape-and-schema)); every revision of a large document weighs on the caches. |
 | **Per-resource and per-principal maximums** | Done | `serve -max-rate-per-resource` and `-max-rate-per-principal` let a namespace set its own above the defaults (10/s and 50/s), for small documents one writer writes often. The defaults stay. |
 | **Log pages** | Recommended | Bound items or bytes as well as entries. |
-| **The rates** | Keep | 500/s a namespace is just under one namespace's ceiling on server X. |
+| **The rates** | Keep | 500/s a namespace is about half of one namespace's ceiling on server X, which leaves room for reads. |
 | **`itemsPerBatch`** | Keep | 1,000. Batches are for imports; give importers allowances. |
 | **The snapshot cadence, the long-poll interval and the log page size** | Keep | |
+
+## Earlier measurements
+
+The first measurements were taken on 2026-10-15 at spec 0.52, on another host, with the same
+data and the same container sizes. Their raw results are in
+[`capacity/2026-10-15/`](capacity/2026-10-15/).
+
+**Their absolute figures are not comparable with this document's.** They were about half of
+today's (1,000–1,600 reads a second and 590 writes a second into one namespace). The host, the
+network path (a published port then, container addresses now) and thirty spec versions all
+differ, and nothing here separates their effects.
+
+What they are still good for is before and after, since each pair was taken on that one host
+on that one day:
+
+- **Sharing the followers' read at the origin**: a write to 5,000 private followers went from
+  3.7–4.1 s of core CPU and 3.1 s to deliver, to 0.3–1 s of CPU and 0.35–0.7 s. That is from
+  about 1 ms of CPU per follower to 0.1–0.2 ms. (Today's 0.03–0.04 ms is on the faster host.)
+- **The bearer grant cache**: a warm fleet of 5,000 readers went from 1,490 reads a second,
+  p50 4.9 ms, to 1,710–1,770, p50 3.2–4.4 ms.
+- **The CDN collapse, counted**: 1,100 followers of a public namespace made 4 origin requests.
 
 ## Rerunning
 
 ```sh
 go build -o patchlog ./cmd/patchlog && go build -o capacity ./cmd/capacity
 ./patchlog serve -dev -addr :9080 -db cap.db -origin http://localhost:8080 -max-rate-per-namespace 1e9,1e9 &
-./capacity -url http://127.0.0.1:9080 -pid $! -json result.json   # 1M docs, 5M revisions: about 1-1.5 h to seed
+./capacity -url http://127.0.0.1:9080 -pid $! -json result.json   # 1M docs, 5M revisions: about 40 min to seed
 ```
 
 Why `-max-rate-per-namespace 1e9,1e9` is needed:
@@ -679,5 +727,12 @@ Options:
     principal. The core then needs `-max-rate-per-resource N,N -max-rate-per-principal N,N`.
   - `-only single` also measures the writers each creating resources of their own
     (`single_ns_items_writers_N`).
+- **Server X**: run the core and Postgres in containers with `--cpus 2 --memory 4g` each
+  (Postgres with `-c max_connections=300`), the core with `-operator-key`, and point `-url` at
+  the core container's address. `-pid` takes the core's process id on the host
+  (`docker inspect -f '{{.State.Pid}}'`), which is where the CPU and memory figures come from.
+- **A public namespace's followers** need a namespace made without grants: run the core with
+  `-dev` and give `-ns` a name not used before, since `-only live` reuses `<ns>-live` if it
+  exists.
 - **Sizes**: `-docs`, `-revs`, `-namespaces`, `-doc-size`, `-append-batch`. `-help` lists the
   rest.

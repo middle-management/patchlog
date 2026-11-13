@@ -35,14 +35,14 @@
   `$schema` that types every member, and a new `single` phase measures writers contending for
   one document, a batch item of many steps, and a document with up to 100,000 revisions.
   [docs/CAPACITY.md](docs/CAPACITY.md) has the results: the earlier large-document figures were
-  for long strings without a schema; small typed values cost about ten times more (58 ms an
-  append at 1 MiB, 225 ms at 3.5 MiB), and one document takes about 10 writes a second per
+  for long strings without a schema; small typed values cost about ten times more (about 55 ms
+  an append at 1 MiB, 170–190 ms at 3.5 MiB), and one document takes about 10 writes a second per
   principal, the per-resource rate, and about that in all when several writers contend.
 - **`serve -max-rate-per-resource` and `-max-rate-per-principal`** (`RATE,BURST`) raise the
   deployment maximums of `ratePerResource` and `ratePerPrincipal`, which were fixed at the
   defaults, so a namespace's `limits` can allow more on small documents that one writer writes
   often. The defaults (10/s and 50/s) are unchanged. With the rate lifted one writer appends
-  about 1,000 times a second to a small document on SQLite and 270 on Postgres; more writers on
+  about 1,150 times a second to a small document on SQLite and 330 on Postgres; more writers on
   the same document get less in total, not more. `capacity -single-rate N` measures it.
   SPEC-FEEDBACK notes 89 and 90 ask about the per-resource rate under an allowance and about a
   `412` drawing a token.
@@ -50,14 +50,14 @@
   it retries on the head the refusal names, without reading it again, after a random wait that
   grows with each loss in a row (2 ms to 16 ms by default); after a `429` it waits the
   `Retry-After` and reads the head again. With the rate lifted it took 8 writers on one document
-  from 600 to 1,000 appends a second on SQLite and from 84% to 44% of attempts lost; at 32
+  from 526 to 1,029 appends a second on SQLite and from 85% to 44% of attempts lost; at 32
   writers, and on Postgres, most attempts are still lost, and it doesn't make a document fair
   between writers that never pause. At the default limits a contended document takes about 10
   writes a second in all, whatever the retry.
 - **Capacity: a resource per item.** The same writers each creating resources of their own, in
-  place of appending to one shared document, did 1,074 and 1,930 creates a second on Postgres
-  from 8 and 32 writers (2,121 and 2,200 on SQLite), with no `412`, even shares and a worst
-  write of 49 ms: [docs/CAPACITY.md](docs/CAPACITY.md), "One resource per item". A prototype
+  place of appending to one shared document, did 940 and 1,420 creates a second on Postgres
+  from 8 and 32 writers (1,830 and 1,970 on SQLite), with no `412`, even shares and a p99 of
+  50 ms: [docs/CAPACITY.md](docs/CAPACITY.md), "One resource per item". A prototype
   of a server-side rebase for the shared document was built, measured and set aside (branch
   `capacity-schema-single`); SPEC-FEEDBACK note 91 has what it showed.
 
