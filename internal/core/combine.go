@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"errors"
+	"os"
 	"sync"
 )
 
@@ -21,6 +22,12 @@ import (
 // writes nothing; the others are unaffected. Any other error rolls the
 // transaction back, and every write of it then runs alone.
 const combineMax = 64
+
+// combineAll, for tests (PATCHLOG_TEST_COMBINE_ALL=1), sends every single
+// resource write through the combined transaction, a group of one
+// included, whether or not it asks for a rebase: the whole test suite then
+// exercises several writes per transaction with their ordinary meaning.
+var combineAll = os.Getenv("PATCHLOG_TEST_COMBINE_ALL") == "1"
 
 type combiner struct {
 	mu sync.Mutex
@@ -90,16 +97,38 @@ func (e *Engine) runCombined(group []*combined) {
 	alone := func(p *combined) {
 		p.res, p.err = e.writeOptimistic(p.ctx, p.req, []Item{p.item}, nil, false)
 	}
-	if len(group) == 1 {
+	if len(group) == 1 && !combineAll {
 		alone(group[0])
 		return
 	}
-	// The transaction outlives any one request of the group.
-	ctx := context.WithoutCancel(group[0].ctx)
+	// A group's transaction outlives any one of its requests; a write
+	// whose request is cancelled before its turn is skipped. A write on
+	// its own runs under its request, so cancelling it rolls it back.
+	ctx := group[0].ctx
+	if len(group) > 1 {
+		ctx = context.WithoutCancel(ctx)
+	}
 	err := e.update(ctx, func(t *tx) error {
+		// A transaction run again starts over.
+		t.combining, t.movedRes, t.ownDocs = true, nil, nil
+		if t.logHeads == nil {
+			// The chain's head, once this transaction holds its log lock,
+			// is the entry it appended last (appendNS).
+			t.logHeads = map[int64]logHead{}
+		}
 		for _, p := range group {
 			p.res, p.err = nil, nil // a transaction run again starts over
-			res, err := t.writeItems(p.req, []Item{p.item}, nil, nil, false, false, false)
+			if len(group) > 1 && p.ctx.Err() != nil {
+				p.err = p.ctx.Err()
+				continue
+			}
+			// The whole gate of §6.2, as writeItems, with the plan's patch
+			// sets compressed before the insert as on every other path.
+			plan, res, err := t.checkItems(p.req, []Item{p.item}, nil, nil, false, false, false)
+			if err == nil && res == nil {
+				t.e.packPlan(plan)
+				res = t.insertPlan(p.req, plan)
+			}
 			if err != nil {
 				var ae *Error
 				if !errors.As(err, &ae) {
@@ -113,6 +142,15 @@ func (e *Engine) runCombined(group []*combined) {
 		return nil
 	})
 	if err != nil {
+		if len(group) == 1 && group[0].ctx.Err() != nil {
+			// Its own transaction, under its own request, which was
+			// cancelled: that is its answer.
+			group[0].res, group[0].err = nil, err
+			return
+		}
+		// Anything else, such as losing a race to insert to a writer on
+		// another instance (a unique violation), is settled on the path a
+		// write takes alone, which re-checks and answers 412.
 		for _, p := range group {
 			alone(p)
 		}

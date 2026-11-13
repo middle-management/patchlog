@@ -736,7 +736,15 @@ type tx struct {
 	memo    memo
 	dirty   bool
 	ownRevs map[int64]revRow
-	revIDs  map[int64]ids.ID
+	// combining marks the transaction of a group of writes to one
+	// document (combine.go). It remembers the resource rows it moved the
+	// heads of (movedRes) and the documents of the revisions it inserted
+	// (ownDocs), so the next write of the group reads neither again: the
+	// rows are its own, locked until it ends, as ownRevs are.
+	combining bool
+	movedRes  map[resKey]*resRow
+	ownDocs   map[int64][]byte
+	revIDs    map[int64]ids.ID
 	// grants maps an author authenticated in this transaction under a
 	// grant to that grant (actorID): the namespace entries written for it
 	// record the grant's id (§5, §7.4, §C.3), unless serverWrites > 0,

@@ -786,7 +786,9 @@ func TestPGGroupCommitStress(t *testing.T) {
 			if slowest >= deadlockWait/2 {
 				t.Errorf("a write took %v: it waited for a deadlock to be detected", slowest)
 			}
-			if size > 1 && a.groups.committed.Load()+b.groups.committed.Load() == 0 {
+			// Under PATCHLOG_TEST_COMBINE_ALL single writes take the combined
+			// path (combine.go), not group commit: the chain is still checked.
+			if size > 1 && !combineAll && a.groups.committed.Load()+b.groups.committed.Load() == 0 {
 				t.Errorf("no group committed")
 			}
 			if xids := checkChain(t, a, "n"); len(xids) != 1+entries {

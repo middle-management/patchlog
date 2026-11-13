@@ -572,10 +572,11 @@ v0.82" (v0.81 Open 24).
       rebased write no longer depends on the head it named, the server can take the writes
       of a document that are waiting together and write them in one transaction, each through
       the whole gate on the result of the one before, and commit once
-      (`-experimental-combine`). On SQLite 8 writers then get 2,870 appends a second and 32
-      get 2,380, against 1,060 for one writer alone and under 900 before; on Postgres 399 and
-      243 against 330 for one writer, limited by round trips per write, which inserting the
-      group's rows together would address. Shares stayed even and the worst write was 46 ms.
+      (`-experimental-combine`), reading nothing twice inside it. On SQLite 8 and 32 writers
+      then both get 3,600 appends a second, against 1,230 for one writer alone and under 900
+      before; on Postgres 609 and 674 against 365–385 for one writer, the rest being about
+      seven statements per write that inserting the group's rows together would cut further.
+      Shares stayed even and the worst write of 32 writers was 44 ms (77 ms on Postgres).
       This is an implementation matter, but it is the argument for the feature: with plain
       `If-Match` a server can never do it, since every write but one in such a group is stale
       by construction.

@@ -310,25 +310,44 @@ share of attempts answered `412`:
 
   | Appends/s, 8 and 32 writers | SQLite | Postgres |
   |---|---|---|
-  | One writer, for scale | 1,060 | 330 |
+  | One writer, for scale (it varied this much between the runs) | 1,060–1,290 | 330–385 |
   | First prototype | 830–890 and 550–620 | 250–260 and 146–150 |
   | Remembering what each revision touched | 936 and 681 | 261 and 148 |
   | And writing the waiting writes of a document in one transaction (`-experimental-combine`) | 2,870 and 2,380 | 399 and 243 |
+  | And reading nothing twice in that transaction | 3,610 and 3,620 | 609 and 674 |
 
   - **Remembering what revisions touched** (by revision id, in memory, with the parent's id,
     so a known chain is walked without the database) helps a little: the fold wasn't the main
     cost.
-  - **One transaction for the writes that wait together** is the large one on SQLite: 2.7
-    times one writer's rate with 8 writers and 2.2 times with 32, where every earlier form
-    stayed under it. Each write still goes through the whole gate on the result of the one
-    before it; a refused one is answered with its refusal and the others land; they commit
-    once. Shares stay even (3,583 and 3,601 appends by the least and the most served of 8;
-    739 and 746 of 32) and the worst write took 46 ms with 32 writers.
-  - **On Postgres it gains 50–65% over the earlier prototype**, to 400 a second with 8 writers
-    (one writer alone does 330), and still falls with 32.
-    There a write costs about a dozen round trips to the database whatever it shares its
-    commit with; the next step would be inserting the group's rows in one statement per
-    table, as group commit does for writes of different documents (D.8). Not done.
+  - **One transaction for the writes that wait together**: each write still goes through the
+    whole gate on the result of the one before it; a refused one is answered with its refusal
+    and the others land; they commit once. On SQLite that alone gave 2.7 times one writer's
+    rate. On Postgres it gave little, and timing the transaction showed why: the commit a
+    group shares costs 0.4–0.7 ms, while each write's own statements cost 1.9–2.7 ms. A single
+    append is about 15 statements, each a round trip: a rate draw, reads of the namespace, the
+    resource's row, its head revision (twice), its head document and its blob references, the
+    inserts of the revision and the head document, the head's move, and the log's head and
+    append.
+  - **Reading nothing twice**: in such a transaction the resource's row, its head revision and
+    its document are what the write before just made, so they are kept in memory, and the
+    log's head is the entry appended last. Postgres then does 609 appends a second from 8
+    writers and 674 from 32, twice one writer's 365–385, and no longer falls as writers are
+    added; SQLite does 3,600 from 8 and from 32, three times one writer's.
+  - Shares stay even (4,502 and 4,534 appends by the least and the most served of 8 on
+    SQLite, 1,125 and 1,138 of 32; 210 and 211 of 32 on Postgres), and the worst write of 32
+    writers took 44 ms on SQLite and 77 ms on Postgres.
+  - **Still per write on Postgres**: about seven statements (the rate draw, the namespace's
+    row, the blob references, three inserts or updates and the log's append). Inserting a
+    group's rows in one statement per table, as group commit does for writes of different
+    documents (D.8), would leave a few per group. Not done: the rows' sequence numbers come
+    back from the inserts, and later writes of the group need them.
+  - **How it was tested.** `PATCHLOG_TEST_COMBINE_ALL=1` sends every single resource write of
+    the test suites through this transaction, a group of one included, with its ordinary
+    meaning. The core, server, client, merge and bundle suites pass that way on SQLite, the
+    core, server, client and merge suites on Postgres, and the core suite under the race
+    detector. The first runs found three faults, since fixed: patch sets weren't compressed on
+    this path, a cancelled request's write wasn't rolled back, and losing a race to a writer
+    on another instance surfaced as a database error in place of a `412`.
 - **A repeated rebased write is applied again** unless it carries a retry key: §7.2 recognises a
   retry by its parent, which the server chose here. The prototype takes
   `X-Experimental-Producer: {id};{epoch};{seq}`, after the Durable Streams protocol's idempotent

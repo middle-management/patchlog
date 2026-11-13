@@ -355,6 +355,11 @@ func (e *Engine) WriteResource(ctx context.Context, req Request, item Item) (*Wr
 	if e.opt.ExperimentalRebase && e.opt.ExperimentalCombine && item.Rebase && len(item.Steps) == 1 && !item.Steps[0].Delete {
 		return e.writeCombined(ctx, req, item)
 	}
+	if combineAll && e.opt.BeforeWriteLock == nil {
+		// Not where a test hooks the gap between a write's check and its
+		// lock, which this path doesn't have.
+		return e.writeCombined(ctx, req, item)
+	}
 	res, err := e.writeOptimistic(ctx, req, []Item{item}, nil, false)
 	if err != nil {
 		return nil, err
@@ -1967,6 +1972,12 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 				canon = jsonv.Canonical(step.doc)
 			}
 			t.cacheDoc(step.id, canon)
+			if t.combining {
+				if t.ownDocs == nil {
+					t.ownDocs = map[int64][]byte{}
+				}
+				t.ownDocs[seq] = canon
+			}
 			if step.parentID == nil && genesisDocCanon(step) != nil {
 				// A genesis that adds the whole document holds it as a
 				// snapshot would (docBytesAt reads it as one): the count
@@ -2013,6 +2024,18 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			old = it.own.headSeq.Int64
 		}
 		moves = append(moves, []any{it.last, state, it.snapRevs, it.snapBytes, it.res, old})
+		if t.combining && it.own != nil {
+			// The row as the move below leaves it.
+			row := *it.own
+			row.headSeq = sql.NullInt64{Int64: it.last, Valid: true}
+			row.state = state
+			row.snapRevs = sql.NullInt64{Int64: it.snapRevs, Valid: true}
+			row.snapBytes = sql.NullInt64{Int64: it.snapBytes, Valid: true}
+			if t.movedRes == nil {
+				t.movedRes = map[resKey]*resRow{}
+			}
+			t.movedRes[resKey{row.ns, row.name}] = &row
+		}
 		// heads caches the last live document, which reads and restores
 		// need, but only for small documents (D.4): rewriting a large one on
 		// every save costs its whole size each time. Larger ones fold from
