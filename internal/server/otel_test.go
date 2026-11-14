@@ -112,6 +112,30 @@ func TestTelemetry(t *testing.T) {
 	if tx := byName("core.db.update"); len(tx) == 0 || tx[0].SpanContext().TraceID() != srv[0].SpanContext().TraceID() {
 		t.Fatalf("no transaction span in the write's trace: %v", names(rec.Ended()))
 	}
+	// A typed write: its validation is a span of its own in the write's
+	// trace, with the schema and the document's size and node count.
+	sid := traced.create("docs", "schema", map[string]any{"$schema": dialect, "type": "object", "properties": map[string]any{"tags": map[string]any{"type": "array", "maxItems": 2.0}}})
+	ref := "/r/docs/schema/rev/" + sid
+	rec.Reset()
+	typedID := traced.create("docs", "typed", map[string]any{"$schema": ref, "tags": []any{"a", "b"}})
+	vs := byName("core.schema.validate")
+	if len(vs) != 1 || vs[0].SpanContext().TraceID() != byName("core.WriteResource")[0].SpanContext().TraceID() {
+		t.Fatalf("validation span: %v", names(rec.Ended()))
+	}
+	if spanAttr(vs[0], "patchlog.schema") != ref || spanAttr(vs[0], "patchlog.document.nodes") != "5" || spanAttr(vs[0], "patchlog.schema.valid") != "true" || spanAttr(vs[0], "patchlog.document.size") == "" {
+		t.Fatalf("validation span attributes %v", vs[0].Attributes())
+	}
+	// A refusal by a limit names the limit, what was measured and the
+	// limit in force.
+	rec.Reset()
+	big := make([]any, 1001)
+	for i := range big {
+		big[i] = op("add", "/x", float64(i))
+	}
+	expectCode(t, traced.write("PATCH", "docs", "typed", typedID, big), 422, "limit")
+	if ws := byName("core.WriteResource"); len(ws) != 1 || spanAttr(ws[0], "patchlog.outcome") != "limit" || spanAttr(ws[0], "patchlog.limit") != "opsPerSet" || spanAttr(ws[0], "patchlog.limit.measured") != "1001" || spanAttr(ws[0], "patchlog.limit.max") != "1000" {
+		t.Fatalf("limit span: %v", names(rec.Ended()))
+	}
 	// A conflict is an outcome, not a span error.
 	expect(t, traced.write("PATCH", "docs", "b", r1, []any{}), 412)
 	var rm metricdata.ResourceMetrics
@@ -134,7 +158,7 @@ func TestTelemetry(t *testing.T) {
 			}
 		}
 	}
-	if counts["resource/created"] != 1 || counts["resource/stale"] != 1 {
+	if counts["resource/created"] != 3 || counts["resource/limit"] != 1 || counts["resource/stale"] != 1 {
 		t.Fatalf("patchlog.writes %v", counts)
 	}
 

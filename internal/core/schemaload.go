@@ -51,7 +51,7 @@ import (
 func (t *tx) validateStep(step *stepState, sc *schemaCtx, pending map[string]any) (string, *Error) {
 	rules := t.docRules(step.id, step.doc, sc)
 	step.legacy = rules == schema.Legacy
-	return t.validateDoc(step.doc, rules, sc, pending)
+	return t.validateDoc(step.doc, len(step.docCanon), rules, sc, pending)
 }
 
 // rulesColumn is the revisions.rules value of the revision a step writes,
@@ -180,7 +180,7 @@ func (t *tx) schemaRules(ref schema.Ref, sc *schemaCtx, pending map[string]any) 
 // validateDoc is step 5: resolve $schema and validate (§6.1) under rules,
 // the marker of the revision written, for a schema document. It returns
 // the document's $schema, if typed.
-func (t *tx) validateDoc(doc any, rules schema.Rules, sc *schemaCtx, pending map[string]any) (string, *Error) {
+func (t *tx) validateDoc(doc any, size int, rules schema.Rules, sc *schemaCtx, pending map[string]any) (string, *Error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
 		return "", nil
@@ -228,7 +228,10 @@ func (t *tx) validateDoc(doc any, rules schema.Rules, sc *schemaCtx, pending map
 		_, _ = load(r)
 		return t.schemaRules(r, sc, pending)
 	}
-	if err := t.e.validator.ValidateMarked(doc, load, rules, rulesOf); err != nil {
+	span := validateSpan(t.ctx, s, doc, size)
+	err := t.e.validator.ValidateMarked(doc, load, rules, rulesOf)
+	endValidateSpan(span, err)
+	if err != nil {
 		return "", schemaErr(err, s)
 	}
 	return s, nil

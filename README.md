@@ -1045,8 +1045,16 @@ What is instrumented:
   `remote_registration`, `purge`, `purge_ns`, `prune`, `blob`), `patchlog.outcome` (`created`,
   `ok`, `replayed`, `dry_run`, or the error code: `stale`, `forbidden`, …), `patchlog.status`
   and for batches `patchlog.batch.items`, `patchlog.dry_run`. A refusal (4xx) is an outcome,
-  not a span error. Metrics `patchlog.writes` (count) and `patchlog.write.duration` (s), by kind
+  not a span error. A refusal by a limit (`limit`, `rate`) also carries `patchlog.limit` (§6.6's
+  key, such as `documentSize`) and, where the error has them, `patchlog.limit.measured` and
+  `patchlog.limit.max`. Metrics `patchlog.writes` (count) and `patchlog.write.duration` (s), by kind
   and outcome; the namespace is never a metric attribute.
+- **Schema validation**: `core.schema.validate`, one per typed document a write validates,
+  with `patchlog.schema` (its `$schema`), `patchlog.document.size` (canonical bytes),
+  `patchlog.document.nodes` (values in the document, containers included) and
+  `patchlog.schema.valid`. Validation runs in the write's check phase, inside its read
+  transaction and outside the write lock, so without this span its time read as a slow
+  `core.db.read`. Loading the schemas is not part of it.
 - **Database transactions**: `core.db.read` and `core.db.update` (with `db.system.name`) inside
   a trace, so a read served from the read cache has none, and Postgres write retries show in
   one `core.db.update`. Background jobs (the tailer, retention, remote follows) are not traced.

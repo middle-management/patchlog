@@ -30,6 +30,15 @@
   `config` change in the batch isn't offered. A second merge of the same branch re-conflicts on
   replayed resources unless the base lists the merger in `merge.authors` (§F.3).
 
+- **Telemetry: a span for schema validation, and the limit on a refusal.** Each typed document
+  a write validates gets a `core.schema.validate` span with `patchlog.schema`,
+  `patchlog.document.size`, `patchlog.document.nodes` and `patchlog.schema.valid`; validation
+  runs in the write's check phase, inside its read transaction, so slow validation used to read
+  as a slow `core.db.read`. A write refused by a limit (`patchlog.outcome` `limit` or `rate`) now also
+  carries `patchlog.limit`, and `patchlog.limit.measured` and `patchlog.limit.max` where the
+  error has them. [docs/CAPACITY.md](docs/CAPACITY.md), "A recursive union schema", has what
+  prompted it: a `oneOf` whose branches each recurse validates in exponential time (7.3 s for
+  1,023 nodes), and the schema shape that avoids it.
 - **Capacity: large documents with a schema, and writes to one document.** `cmd/capacity`'s
   `large` phase now also measures a document of many small objects, with and without a
   `$schema` that types every member, and a new `single` phase measures writers contending for
