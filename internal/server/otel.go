@@ -32,6 +32,12 @@ const (
 	attrStatus  = attribute.Key("patchlog.status")
 	attrItems   = attribute.Key("patchlog.batch.items")
 	attrDryRun  = attribute.Key("patchlog.dry_run")
+
+	// Of a refusal by a limit (outcome limit or rate): §6.6's key, what
+	// was measured and the limit in force.
+	attrLimit         = attribute.Key("patchlog.limit")
+	attrLimitMeasured = attribute.Key("patchlog.limit.measured")
+	attrLimitMax      = attribute.Key("patchlog.limit.max")
 )
 
 type serverInst struct {
@@ -91,6 +97,7 @@ func (o *writeOp) end(status int, replayed, dryRun bool, err error) {
 	switch {
 	case err != nil:
 		outcome, status = errOutcome(err)
+		o.span.SetAttributes(limitAttrs(err)...)
 	case dryRun:
 		outcome = "dry_run"
 	case replayed:
@@ -127,6 +134,27 @@ func errOutcome(err error) (string, int) {
 		return "canceled", 0
 	}
 	return "error", 0
+}
+
+// limitAttrs names the limit a refusal was for (limit, rate), with what
+// was measured and the limit in force where the error carries them.
+func limitAttrs(err error) []attribute.KeyValue {
+	var ce *core.Error
+	if !errors.As(err, &ce) {
+		return nil
+	}
+	key, ok := ce.Body["limit"].(string)
+	if !ok || key == "" {
+		return nil
+	}
+	attrs := []attribute.KeyValue{attrLimit.String(key)}
+	if n, ok := ce.Body["measured"].(int64); ok {
+		attrs = append(attrs, attrLimitMeasured.Int64(n))
+	}
+	if n, ok := ce.Body["max"].(int64); ok {
+		attrs = append(attrs, attrLimitMax.Int64(n))
+	}
+	return attrs
 }
 
 func (o *writeOp) endResult(res *core.WriteResult, dryRun bool, err error) {

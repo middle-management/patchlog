@@ -15,7 +15,8 @@ import (
 
 // OpenTelemetry in the engine, kept light: a span per database
 // transaction ("core.db.read", "core.db.update": what a request costs
-// beyond the read cache), the sizes of group commits and the time spent
+// beyond the read cache), a span per schema validation
+// ("core.schema.validate"), the sizes of group commits and the time spent
 // waiting for Postgres advisory locks. Nothing is recorded while telemetry
 // is off (telemetry.Instruments.Get is nil). Engine-level spans of writes
 // are made by its HTTP caller (internal/server/otel.go).
@@ -43,6 +44,11 @@ var inst = telemetry.NewInstruments("internal/core", func(t trace.Tracer, m metr
 var (
 	attrDBSystem = attribute.Key("db.system.name")
 	attrLock     = attribute.Key("patchlog.lock")
+
+	attrSchema      = attribute.Key("patchlog.schema")
+	attrSchemaValid = attribute.Key("patchlog.schema.valid")
+	attrDocSize     = attribute.Key("patchlog.document.size")
+	attrDocNodes    = attribute.Key("patchlog.document.nodes")
 )
 
 // dbSpan starts the span of a database transaction (nil while off). Only
@@ -72,6 +78,52 @@ func endDBSpan(span trace.Span, err error) {
 		span.SetStatus(codes.Error, "")
 	}
 	span.End()
+}
+
+// validateSpan starts the span of one document's schema validation
+// ("core.schema.validate", nil while off or outside a trace), so its time
+// is not read as the enclosing database transaction's. The schemas of the
+// closure are loaded before it starts. schemaRef is the document's
+// $schema, size its canonical size in bytes (0 when not computed) and the
+// node count every value in it, containers included.
+func validateSpan(ctx context.Context, schemaRef string, doc any, size int) trace.Span {
+	in := inst.Get()
+	if in == nil || !trace.SpanContextFromContext(ctx).IsValid() {
+		return nil
+	}
+	attrs := []attribute.KeyValue{attrSchema.String(schemaRef), attrDocNodes.Int(countNodes(doc))}
+	if size > 0 {
+		attrs = append(attrs, attrDocSize.Int(size))
+	}
+	_, span := in.tracer.Start(ctx, "core.schema.validate", trace.WithSpanKind(trace.SpanKindInternal), trace.WithAttributes(attrs...))
+	return span
+}
+
+// endValidateSpan ends span: a document that doesn't validate is an
+// outcome (patchlog.schema.valid false), not a span error.
+func endValidateSpan(span trace.Span, err error) {
+	if span == nil {
+		return
+	}
+	span.SetAttributes(attrSchemaValid.Bool(err == nil))
+	span.End()
+}
+
+// countNodes counts the values of a decoded JSON document: each scalar,
+// object and array.
+func countNodes(v any) int {
+	n := 1
+	switch x := v.(type) {
+	case map[string]any:
+		for _, c := range x {
+			n += countNodes(c)
+		}
+	case []any:
+		for _, c := range x {
+			n += countNodes(c)
+		}
+	}
+	return n
 }
 
 // observeGroup records the size of a group commit.
