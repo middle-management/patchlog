@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Capacity: large documents measured again** with the server's own validator, on the
+  containers of the earlier runs ([docs/CAPACITY.md](docs/CAPACITY.md), "Large documents, by
+  shape and schema"). A one-member patch to a typed 1 MiB document of small objects takes
+  24 ms on server X where it took 55 ms, and 70 ms at 3.5 MiB where it took 187 ms: what the same
+  document costs without a schema. `cmd/capacity`'s `large` phase also measures a patch that
+  changes the document's large array (`append_large_schema_array`), which is validated in full:
+  31 ms and 90 ms.
 - **A patch is validated where it changes the document.** A patch to a typed document used to
   validate the whole document it resulted in. Now, when this instance has itself validated the
   document the patch applies to against the same schema revision, it validates only what the
@@ -92,7 +99,8 @@
   one document, a batch item of many steps, and a document with up to 100,000 revisions.
   [docs/CAPACITY.md](docs/CAPACITY.md) has the results: the earlier large-document figures were
   for long strings without a schema; small typed values cost about ten times more (about 55 ms
-  an append at 1 MiB, 170–190 ms at 3.5 MiB), and one document takes about 10 writes a second per
+  an append at 1 MiB, 170–190 ms at 3.5 MiB, with the validator of the time; see the entries
+  above), and one document takes about 10 writes a second per
   principal, the per-resource rate, and about that in all when several writers contend.
 - **`serve -max-rate-per-resource` and `-max-rate-per-principal`** (`RATE,BURST`) raise the
   deployment maximums of `ratePerResource` and `ratePerPrincipal`, which were fixed at the

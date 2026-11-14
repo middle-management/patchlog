@@ -23,6 +23,7 @@ runs, which started from a new, empty one.
 | `pg-public-serverX-cdn-longpoll-{1,2}.json` | `-dev`, a new public namespace, `-only live` through Varnish: the CDN collapse |
 | `pg-public-serverX-direct-longpoll.json` | the same straight to the core |
 | `pg-grants-serverX-cold-start.json` | a pass taken minutes after Postgres was restarted on the seeded data, before its cache had filled: the first read and write measurements are slow. Kept as a record of a cold start |
+| `{pg-grants-serverX,sqlite-public-4vcpu}-large-{change,full}.json` | 2026-11-14, the same host and containers, an empty database, `-only large` with the server's own validator: `change` is the default (a patch validated where it changes the document), `full` the core with `-full-validation`. These supersede the `append_large_*` figures of the two full runs |
 | `sqlite-public-4vcpu.json` | SQLite: seeding and every measurement; long-polls through Varnish |
 | `sqlite-public-4vcpu-single-unlimited.json`, `sqlite-public-4vcpu-direct-longpoll.json` | as the server X files of those names |
 | `{pg-grants-serverX,sqlite-public-4vcpu}-prototype-member.json` | the prototype of branch `capacity-schema-single` on the same setup: its core with `-experimental-rebase -experimental-combine`, its harness with `-only single -single-rate 1000000 -single-rebase -single-workload member`. `_rebase` are the writes sent with `X-Experimental-Rebase`, `_rebase_producer` those that also carry a producer key |
