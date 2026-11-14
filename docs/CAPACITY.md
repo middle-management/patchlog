@@ -7,7 +7,7 @@ how data is laid out), a **gap** (this implementation; fixable without changing 
 
 Every figure here is from one set of runs on one host on 2026-11-13, at spec 0.82, except those
 under [Earlier measurements](#earlier-measurements) and
-[A recursive union schema](#a-recursive-union-schema). See
+[A recursive union schema](#a-recursive-union-schema), and the dated notes. See
 [What was measured, and on what](#what-was-measured-and-on-what).
 
 ## At a glance
@@ -22,8 +22,9 @@ under [Earlier measurements](#earlier-measurements) and
 - **Followers are cheapest through the CDN.** 5,000 followers of a public namespace cost the
   origin no measurable CPU a write. Followers that reach the origin cost about 0.03–0.04 ms of
   core CPU each per write. See [Long-poll followers and the CDN](#long-poll-followers-and-the-cdn).
-- **Large typed documents are slow to write**: about 170–190 ms an append at 3.5 MiB, ~55 ms at
-  the 1 MiB default. Keep a frequently edited typed document well under 100 KiB. See
+- **Large documents of many small values are slow to write**: about 24 ms an append at the
+  1 MiB default and 70 ms at 3.5 MiB, with or without a schema. Keep a frequently edited one
+  under about 250 KiB. See
   [Large documents, by shape and schema](#large-documents-by-shape-and-schema).
 - **One document takes about 10 writes a second in all by default**, however many writers share
   it, and the writers collide: 8 writers together got 12 a second, 32 got 12–16 (up to 70 with a
@@ -263,11 +264,13 @@ For followers that reach the origin:
 
 **Every write works on the whole document, so a small patch to a large document costs the
 document's size. The shape matters more than the bytes: many small values cost 3–4× a document
-of long strings, and a schema that types them 2–3× more again.** Keep a frequently edited
-typed document well under 100 KiB if its appends should stay under 10 ms.
+of long strings. A schema that types them adds little: nothing measurable for a patch to one
+member, and about a quarter when the patch changes a large array.** Keep a frequently edited
+document of many small values under about 250 KiB if its appends should stay near 10 ms.
 
-Each figure is the median of 60 appends of `[{"op":"replace","path":"/n","value":i}]`, one
-after another, to one document.
+This section was measured again on 2026-11-14, on the same host and containers as the rest,
+after the server got its own schema validator (`internal/jsv`). Each figure is the median of 60
+appends, one after another, to one document.
 
 Three documents were measured at each size:
 
@@ -280,56 +283,79 @@ Three documents were measured at each size:
   objects (`additionalProperties: false`), a `pattern` on `name`, `minimum`/`maximum`,
   `maxItems` and `maxLength`, and `format: date-time` on `at`.
 
+And three patches to the schema document:
+
+- **one member**: `[{"op":"replace","path":"/n","value":i}]`, as for the other two documents.
+  The server validates a patch where it changes the document, so this checks `/n` alone.
+- **the array**: an item added at the end of `items` and one removed at its start. The array
+  itself changed, so all of it is validated again.
+- **in full**: the one-member patch with the core run with `-full-validation`, which validates
+  the whole document on every write.
+
 | Append p50 | 16 KiB | 256 KiB | 1 MiB | 3.5 MiB |
 |---|---|---|---|---|
-| SQLite, strings | 1.1 ms | 2.6 ms | 5.6 ms | 13 ms |
-| SQLite, structured | 1.4 ms | 5.8 ms | 19 ms | 59 ms |
-| SQLite, schema | 1.9 ms | 14 ms | 52 ms | 172 ms |
-| Server X, strings | 4.0 ms | 5.2 ms | 7.4 ms | 16 ms |
-| Server X, structured | 4.2 ms | 8.7 ms | 26 ms | 63 ms |
-| Server X, schema | 5.7 ms | 19 ms | 55 ms | 187 ms |
+| SQLite, strings | 1.3 ms | 2.0 ms | 5.3 ms | 13 ms |
+| SQLite, structured | 1.6 ms | 6.1 ms | 21 ms | 66 ms |
+| SQLite, schema, one member | 1.7 ms | 6.1 ms | 20 ms | 69 ms |
+| SQLite, schema, the array | 1.8 ms | 8.3 ms | 24 ms | 81 ms |
+| SQLite, schema, in full | 1.8 ms | 7.8 ms | 27 ms | 82 ms |
+| Server X, strings | 5.1 ms | 6.1 ms | 8.8 ms | 16 ms |
+| Server X, structured | 5.0 ms | 11 ms | 24 ms | 69 ms |
+| Server X, schema, one member | 6.0 ms | 10 ms | 24 ms | 70 ms |
+| Server X, schema, the array | 5.5 ms | 13 ms | 31 ms | 90 ms |
+| Server X, schema, in full | 5.6 ms | 12 ms | 29 ms | 88 ms |
 
 What the table shows:
 
 - **The shape matters more than the bytes.** The same bytes as many small values cost 3–4× a
   document of long strings at 1 MiB and above. Parsing, applying and canonicalising all work
   per value.
-- **Validation costs 2–3× more again.** It adds about 30–35 ms a MiB of small typed objects on
-  top of about 20 ms a MiB without a schema. At the 1 MiB default a typed document of this shape
-  takes ~55 ms an append. At 3.5 MiB it takes 170–190 ms, p99 ~230 ms.
+- **A patch to one member of a typed document costs what it does without a schema.** Only what
+  the patch changed is validated, and the constraints of the objects and arrays above it.
+- **Validating in full adds about a quarter**: 5–6 ms a MiB of small typed objects on top of
+  about 20 ms a MiB without a schema. That is what a patch that changes the large array pays,
+  and what every append pays under `-full-validation`.
 - **The database adds a constant** (3–4 ms on server X). The rest is the core's CPU, which is
   why the two agree at the large sizes even though one core has half the CPU: an append uses one
   thread.
-- **Creating the document costs about what two appends do**: about 110 ms at 1 MiB and
-  400–470 ms at 3.5 MiB with the schema.
+- **Creating the document costs four to five appends, typed or not**: 100–130 ms at 1 MiB and
+  340–420 ms at 3.5 MiB with the schema, against 100–190 ms and 280–350 ms without.
+- **What is left is the work every write does on the whole document**: parsing the stored head
+  (about 35–40% of an append in a profile) and serialising and measuring the result (about
+  40%).
+
+**Before the server had its own validator** (the runs of 2026-11-13, with a third-party
+library and the whole document validated on every write), the one-member append to the schema
+document took 19 / 55 / 187 ms at 256 KiB / 1 MiB / 3.5 MiB on server X, and 14 / 52 / 172 ms
+on SQLite. Those results are `pg-grants-serverX.json` and `sqlite-public-4vcpu.json`; the new
+ones are the `*-large-change.json` and `*-large-full.json` files.
 
 ### A recursive union schema
 
-**A schema whose `oneOf` branches each recurse costs exponential time in the document's depth.**
-The validator checks every branch in full, children included, even where the branch's
-discriminator has already failed. So a node at depth *d* is validated once per branch per
-level above it.
+**A schema whose `oneOf` branches each recurse no longer costs exponential time, and validation
+work is bounded.** The third-party validator the server used until 2026-11-14 checked every branch in
+full, children included, even where the branch's discriminator had already failed, so a node at
+depth *d* was validated once per branch per level above it. The server now validates with its
+own validator (`internal/jsv`), which stops a branch at its first failure and checks a value's
+own keywords and scalar members before its objects and arrays.
 
-Measured on 2026-11-14 on a development machine, in the validator alone: a binary tree whose
-nodes are one of 4 kinds, against two schemas that accept the same documents.
+Measured on 2026-11-14 on a development machine, in the validator alone, not through the
+server: a binary tree whose nodes are one of 4 kinds, against a `oneOf` of 4 node schemas, each
+with `children`.
 
-| Tree depth (nodes) | `oneOf` of 4 node schemas, each with `children` | `children` once, beside a `oneOf` of the kinds' own members |
+| | Before | Now |
 |---|---|---|
-| 6 (63) | 19 ms | 1.4 ms |
-| 8 (255) | 259 ms | 0.6 ms |
-| 10 (1,023) | 7.3 s | 4.6 ms |
+| Tree of depth 10 (1,023 nodes) | 4.2 s (7.3 s when first measured, on another machine) | 0.39 ms, 14,833 steps |
+| The 1 MiB **schema** document of [the section above](#large-documents-by-shape-and-schema) (9,500 typed objects) | 43 ms | 4.2 ms, 85,503 steps |
 
-- **Keep the recursion out of the union.** Declare the recursive member (`children`, with its
-  `$ref` back to the node) once on the node schema, and let the `oneOf` branches hold only the
-  discriminator and each kind's own members.
-- **Nothing bounds validation time.** It runs in the write's check phase: inside a read
-  transaction, outside the write lock, so it holds a database connection and a core thread but
-  does not block other writers. A schema of the first shape makes every write to its documents
-  slow, and on a trace it used to read as a slow database read. The `core.schema.validate` span now shows it (README, "Telemetry").
-  A bound is a [gap](#gaps-in-this-implementation).
+- **Validation is bounded by steps**, a step being one schema applied to one value: 5,000,000
+  for a document unless `serve -max-validation-steps` says otherwise. A write that needs more is
+  refused `422`, `limit: "validationSteps"`. The `core.schema.validate` span carries the count
+  (README, "Telemetry").
+- Keeping the recursion out of the union (declaring `children` once on the node schema, with
+  only the discriminator and each kind's own members in the branches) is still the cheaper
+  schema, but no longer needed to stay out of trouble.
 
-Server X's large documents were measured three times (twice with grants, once without). The
-three agree within a third at worst.
 
 ## Many writers
 
@@ -346,8 +372,8 @@ What to do instead:
 - Or collect one writer's changes into batch steps ([Batches](#batches)).
 - **Where one writer does need more than 10 writes a second on a small document**, raise the
   deployment maximum (`serve -max-rate-per-resource`) and set `ratePerResource` in that
-  namespace's `limits`. Leave it at the default where documents are large: a typed 1 MiB
-  document already costs ~55 ms of CPU an append
+  namespace's `limits`. Leave it at the default where documents are large: a 1 MiB
+  document of small values already costs ~24 ms of CPU an append
   ([above](#large-documents-by-shape-and-schema)).
 - **Clients that do share a document** should retry with `AppendLatest` or its like, not at once.
 
@@ -613,14 +639,16 @@ Each limit is one of three kinds:
 
 **Whole-document work on every write.**
 
-- *Limit:* the result of a write is canonicalised, checked against the limits and validated
-  against its `$schema` in full. A small patch to a large document costs the document's size.
-- *Measured:* append p50 is 4 ms at 16 KiB, 7 ms at 1 MiB and 16 ms at 3.5 MiB on server X, and
-  1.1 / 5.6 / 13 ms on SQLite. Those are documents of long strings without a `$schema`. Many
-  small values cost 3–4× more, and a schema that types them 2–3× more again
+- *Limit:* the head is parsed and the result of a write is canonicalised and checked against
+  the limits in full; only validation against its `$schema` follows the patch. A small patch to
+  a large document costs the document's size.
+- *Measured:* append p50 is 5 ms at 16 KiB, 9 ms at 1 MiB and 16 ms at 3.5 MiB on server X, and
+  1.3 / 5.3 / 13 ms on SQLite. Those are documents of long strings. Many small values cost
+  3–4× more, with or without a schema
   ([Large documents, by shape and schema](#large-documents-by-shape-and-schema)).
 - *Lever:* keep frequently edited documents small. Split large aggregates into resources. Keep a
-  frequently edited typed document well under 100 KiB if its appends should stay under 10 ms.
+  frequently edited document of many small values under about 250 KiB if its appends should
+  stay near 10 ms.
 
 **Default rates** (§6.6).
 
@@ -657,7 +685,7 @@ Each limit is one of three kinds:
 | **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request. The origin shares their reads ([Origin-side collapse](#origin-side-collapse)), at ~0.03–0.04 ms of core CPU per follower per write (0.12–0.14 ms through Varnish). | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
 | **No read replicas, and one `-db` for everything.** The core runs migrations, the tailer and leader jobs, so it can't run on a read-only database. | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
 | **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: 6–7 min on server X (fetches at 2,400–2,800/s); 1.3 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
-| **Nothing bounds schema validation time**, and the validator evaluates every `oneOf`/`anyOf` branch in full. | A recursive union schema takes seconds on a document of a thousand nodes ([A recursive union schema](#a-recursive-union-schema)), on a core thread and a database connection for as long. | A time or step budget for validation, refused as a limit; a validator that stops a branch at its first failure, or remembers what it has checked. |
+| **Rule `test`s with a `schema` and annotation walks are not counted** against `validationSteps`, and listing an invalid document's failures gets the budget anew. | A rule's schema fragment, or a schema's annotations, can still be made expensive to evaluate; an invalid document can cost twice the limit. | Count them against the same budget. |
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
 | **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.0 GB on server X and 1.4 GB on SQLite over a whole run. Scans, reads and small writes alone peaked at 0.2–0.3 GB; the rest came with 3.5 MiB documents and 5,000 followers. | Run with `GOMEMLIMIT` under container limits; profile the large-document path (an opt-in pprof listener would help). |
 
@@ -677,6 +705,10 @@ These were limits and are not any more:
 - **The read cache** emptied itself when full. Now it evicts a quarter.
 - **Rate-limit buckets**, one per (namespace, resource, principal) written, were never dropped.
   Now they are swept once full again, which is the same as new.
+- **Nothing bounded schema validation time**, and the validator evaluated every `oneOf`/`anyOf`
+  branch in full, so a recursive union schema took seconds on a document of a thousand nodes.
+  Now validation stops a branch at its first failure and is bounded by steps
+  ([A recursive union schema](#a-recursive-union-schema)).
 - **Compiled schemas and their documents** were kept forever. Now the 512 and 2,048 most
   recently used are kept.
 - **Long-polls of a namespace** each read the log on their own when woken. Now the read is
@@ -706,7 +738,7 @@ Changes to limits that these measurements recommend. Most are done.
 |---|---|---|
 | **Bearer cache** | Done | 65,536 grants, at most 32 MiB of tokens, least recently used out first (`serve -grant-cache`). |
 | **Document and read caches** | Done | 256 MiB and 64 MiB, evicting gradually (`serve -doc-cache-size`, `-read-cache-size`). |
-| **`documentSize`** | Done | 1 MiB by default, 4 MiB a namespace may set (`serve -document-size`, `-max-document-size`). Appends at 3.5 MiB are 4× slower than at 16 KiB for documents of long strings on server X, and far more for typed documents of small values ([above](#large-documents-by-shape-and-schema)); every revision of a large document weighs on the caches. |
+| **`documentSize`** | Done | 1 MiB by default, 4 MiB a namespace may set (`serve -document-size`, `-max-document-size`). Appends at 3.5 MiB are 4× slower than at 16 KiB for documents of long strings on server X, and 14× for documents of many small values ([above](#large-documents-by-shape-and-schema)); every revision of a large document weighs on the caches. |
 | **Per-resource and per-principal maximums** | Done | `serve -max-rate-per-resource` and `-max-rate-per-principal` let a namespace set its own above the defaults (10/s and 50/s), for small documents one writer writes often. The defaults stay. |
 | **Log pages** | Recommended | Bound items or bytes as well as entries. |
 | **The rates** | Keep | 500/s a namespace is about half of one namespace's ceiling on server X, which leaves room for reads. |

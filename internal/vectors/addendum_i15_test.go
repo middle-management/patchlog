@@ -25,8 +25,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/santhosh-tekuri/jsonschema/v6"
-
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
@@ -34,6 +32,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/jsv"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/merge"
 	"github.com/middle-management/patchlog/internal/schema"
@@ -227,21 +226,16 @@ func TestI18Hostnames(t *testing.T) {
 	if len(rows) != 4 {
 		t.Fatalf("%d rows in addendum_i.json, want 4", len(rows))
 	}
-	compile := func(format string) *jsonschema.Schema {
-		c := jsonschema.NewCompiler()
-		schema.V073.Configure(c)
-		if err := c.AddResource("x.json", map[string]any{"format": format}); err != nil {
-			t.Fatal(err)
-		}
-		s, err := c.Compile("x.json")
+	compile := func(format string) *jsv.Schema {
+		s, err := jsv.Compile(map[string]any{"format": format}, "", schema.V073.Options())
 		if err != nil {
 			t.Fatal(err)
 		}
 		return s
 	}
 	host, idn := compile("hostname"), compile("idn-hostname")
-	verdict := func(s *jsonschema.Schema, v any) string {
-		if s.Validate(v) != nil {
+	verdict := func(s *jsv.Schema, v any) string {
+		if s.Validate(v, jsv.ValidateOptions{}) != nil {
 			return "422"
 		}
 		return "accept"

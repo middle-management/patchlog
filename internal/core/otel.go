@@ -47,6 +47,8 @@ var (
 
 	attrSchema      = attribute.Key("patchlog.schema")
 	attrSchemaValid = attribute.Key("patchlog.schema.valid")
+	attrSchemaSteps = attribute.Key("patchlog.schema.steps")
+	attrSchemaMode  = attribute.Key("patchlog.schema.mode")
 	attrDocSize     = attribute.Key("patchlog.document.size")
 	attrDocNodes    = attribute.Key("patchlog.document.nodes")
 )
@@ -100,12 +102,15 @@ func validateSpan(ctx context.Context, schemaRef string, doc any, size int) trac
 }
 
 // endValidateSpan ends span: a document that doesn't validate is an
-// outcome (patchlog.schema.valid false), not a span error.
-func endValidateSpan(span trace.Span, err error) {
+// outcome (patchlog.schema.valid false), not a span error. steps is the
+// validator's count of schemas applied to values, what
+// Options.MaxValidationSteps bounds, and mode how it was validated: "full",
+// or "change" for a patch validated where it changed the document.
+func endValidateSpan(span trace.Span, err error, steps int, mode string) {
 	if span == nil {
 		return
 	}
-	span.SetAttributes(attrSchemaValid.Bool(err == nil))
+	span.SetAttributes(attrSchemaValid.Bool(err == nil), attrSchemaSteps.Int(steps), attrSchemaMode.String(mode))
 	span.End()
 }
 

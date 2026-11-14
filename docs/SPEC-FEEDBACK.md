@@ -16,10 +16,11 @@ implementers' and reviewers' notes are merged here, each case once. Notes from v
 leaves open are carried in place, by subject, marked "was v0.81 Open n" and cut to what
 remains. The order is: sealed forms and end-to-end reads (1–31), access and coverage (32–65),
 tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87), index (88),
-rates and contended writes (89–91, from capacity measurements after the v0.82 work).
+rates and contended writes (89–91, from capacity measurements after the v0.82 work),
+validation work (92, from replacing the validator).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
-91 are open: 61 from this version's work and 30 carried.
+92 are open: 62 from this version's work and 30 carried.
 
 The spec's own question to the reference, "what is a shadow?", is answered under "Settled in
 v0.82" (v0.81 Open 24).
@@ -557,6 +558,17 @@ v0.82" (v0.81 Open 24).
     It is less than a resource per item gives on Postgres, for much more machinery, so the
     reference doesn't carry it. *Question:* should TOOLS §11.1 say that a list several
     parties add to wants a resource per entry; and is an apply-on-head write of interest?
+
+92. **No limit on validation work** (§6.6, §6.2 step 5). §6.6 bounds a document's size, depth
+    and values, but not what validating it costs, and a schema can make that far more than
+    the document's size: a `oneOf` whose branches each recurse, or nested `anyOf`s that a
+    validator must try in turn. The reference adds a limit, `validationSteps`: validating one
+    document may take 5,000,000 steps, a step being one schema applied to one value
+    (`serve -max-validation-steps`), and a write that needs more is refused `422` with
+    `code: "limit"`, `limit: "validationSteps"`, `measured` and `max`. It is a deployment
+    setting; a namespace cannot set it. *Question:* should §6.6 name such a limit, and if so
+    in what unit, given that a count of steps is one implementation's and a time is not
+    reproducible?
 
 ## Settled in v0.82
 

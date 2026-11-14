@@ -15,6 +15,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/rules"
+	"github.com/middle-management/patchlog/internal/schema"
 )
 
 // Step is one step of a write: a patch set, or a delete.
@@ -251,6 +252,18 @@ type stepState struct {
 	// legacy marks a revision written under the Legacy schema rules: a
 	// copy of a schema revision stored under them (validateStep, §6.1).
 	legacy bool
+	// prev is what step 5 needs of the document the step applied to, to
+	// validate the result by its changes (changedPaths).
+	prev prevDoc
+}
+
+// prevDoc is what is kept of the document a step's patch set applied to,
+// read before the patch changed it in place: its $schema, if a string, and
+// whether step 5 left its $nonce and $successor out of the instance (as
+// it does one that is absent).
+type prevDoc struct {
+	schema                 string
+	nonceOut, successorOut bool
 }
 
 type itemState struct {
@@ -1491,6 +1504,11 @@ func (t *tx) applySteps(s *itemState) *Error {
 			if m, ok := doc.(map[string]any); ok {
 				// Before the patches apply: in place, they change doc.
 				ss.prevNonce, _ = m["$nonce"].(string)
+				ss.prev.schema, _ = m["$schema"].(string)
+				nv, hasN := m["$nonce"]
+				sv, hasS := m["$successor"]
+				ss.prev.nonceOut = !hasN || schema.LeftOut("$nonce", nv)
+				ss.prev.successorOut = !hasS || schema.LeftOut("$successor", sv)
 			}
 			// A create's patches apply to the document null, not to "no
 			// document": test "" null, and a root replace, copy or move,

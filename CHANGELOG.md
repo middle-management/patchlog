@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+- **Capacity: large documents measured again** with the server's own validator, on the
+  containers of the earlier runs ([docs/CAPACITY.md](docs/CAPACITY.md), "Large documents, by
+  shape and schema"). A one-member patch to a typed 1 MiB document of small objects takes
+  24 ms on server X where it took 55 ms, and 70 ms at 3.5 MiB where it took 187 ms: what the same
+  document costs without a schema. `cmd/capacity`'s `large` phase also measures a patch that
+  changes the document's large array (`append_large_schema_array`), which is validated in full:
+  31 ms and 90 ms.
+- **A patch is validated where it changes the document.** A patch to a typed document used to
+  validate the whole document it resulted in. Now, when this instance has itself validated the
+  document the patch applies to against the same schema revision, it validates only what the
+  patch can have changed the verdict of: the changed values in full, and on the way to them
+  each schema's own keywords (`required`, `maxProperties`, `uniqueItems`, `oneOf`, `contains`
+  and the like), which a change below can break. The answer is the same as validating in
+  full, and an invalid document's `422` still lists every failure of the whole document.
+  - **In full, as before:** a create, a restore, a patch that changes or touches `$schema` or
+    replaces or removes at the root, a schema document, and the first patch to a document
+    after a restart. What has been validated is remembered in memory only, since a stored
+    revision is no proof: a remote branch mirrors revisions another deployment validated.
+  - **`serve -full-validation`** turns it off. The `core.schema.validate` span says which was
+    done in `patchlog.schema.mode` (`full` or `change`).
+  - Measured through the HTTP handler on SQLite, on a development machine: an append of a
+    one-field patch to a 1 MiB document of 9,500 small typed objects takes about 20 ms, as
+    one to the same document without a schema does; it took about 56 ms with the old
+    validator, and takes about 24 ms validated in full with the new one (docs/CAPACITY.md).
+  - `PATCHLOG_TEST_VALIDATE_BOTH=1 go test ./...` validates every such step both ways and
+    panics if they disagree.
+
+- **A validator of our own, and a limit on validation work.** JSON Schema validation is now
+  done by `internal/jsv`, written for this server, in place of the
+  `santhosh-tekuri/jsonschema` library, which is no longer a dependency. It compiles a schema
+  once, stops at the first failure, checks a value's own keywords and scalar members before it
+  looks into objects and arrays, and allocates nothing for a valid document. In the validator
+  alone, on a development machine: a 1 MiB document of 9,500 small typed objects validates in
+  4.2 ms where it took 43 ms, and a recursive union schema over a tree of 1,023 nodes in
+  0.39 ms where it took seconds (docs/CAPACITY.md).
+  - **New limit `validationSteps`.** Validating one document may take 5,000,000 steps, a step
+    being one schema applied to one value; `serve -max-validation-steps N` changes it and `0`
+    lifts it. A write that needs more is refused `422` with `code: "limit"`,
+    `limit: "validationSteps"`, `measured` the steps taken when it stopped and `max` the
+    limit. §6.6 has no such limit (docs/SPEC-FEEDBACK.md, v0.82 Open 92). The
+    `core.schema.validate` span carries the steps as `patchlog.schema.steps`.
+  - **`422 invalid` still lists every failure**, sorted by pointer and message. The wording of
+    some messages changed, and so did what is listed in three cases: a failed `contains` is
+    one entry at the array, not one per item; an object closed by `unevaluatedProperties:
+    false` names the members in one entry at the object; and of a `oneOf` or `anyOf` that
+    nothing matches, only the branches whose tag fits the value (its type, and the `const` or
+    `enum` of its scalar members) are listed, where every branch was.
+  - **Formats are read strictly where they have digits**: a sign in a field of a `time` or
+    `date-time`, or in a part of an `ipv4` (`"+2:00:00Z"`, `"+1.2.3.4"`), is refused; the
+    library took it.
+  - **A rule's schema fragment stored before v0.73** that uses `dependencies` or
+    `$recursiveRef` no longer compiles; the library applied both. Schema documents and
+    fragments written since were already refused for them.
+
 - **Playground: less on screen at once.** Cards collapse: each tab opens with its one or two
   main cards (Namespace: status and document; Resource: document and patch) and the rest as
   header lines that open on click, with Branches and Problems showing a count. A flow that leads
@@ -45,7 +99,8 @@
   one document, a batch item of many steps, and a document with up to 100,000 revisions.
   [docs/CAPACITY.md](docs/CAPACITY.md) has the results: the earlier large-document figures were
   for long strings without a schema; small typed values cost about ten times more (about 55 ms
-  an append at 1 MiB, 170–190 ms at 3.5 MiB), and one document takes about 10 writes a second per
+  an append at 1 MiB, 170–190 ms at 3.5 MiB, with the validator of the time; see the entries
+  above), and one document takes about 10 writes a second per
   principal, the per-resource rate, and about that in all when several writers contend.
 - **`serve -max-rate-per-resource` and `-max-rate-per-principal`** (`RATE,BURST`) raise the
   deployment maximums of `ratePerResource` and `ratePerPrincipal`, which were fixed at the

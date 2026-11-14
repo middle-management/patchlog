@@ -4,7 +4,8 @@
 // Schemas are addressed only by revision path (/r/{ns}/{name}/rev/{id}). The
 // underlying library never touches the network or the file system: revision
 // paths are served through a caller-supplied Loader under a synthetic base URL,
-// and dialect meta-schemas come from the library's embedded copies.
+// and dialect meta-schemas come from the validator's embedded copies
+// (internal/jsv).
 package schema
 
 import (
@@ -12,17 +13,14 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"unicode/utf8"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/jsv"
 	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/pointer"
-	"github.com/santhosh-tekuri/jsonschema/v6"
-	"golang.org/x/text/language"
-	"golang.org/x/text/message"
 )
 
 // RefPattern is the only accepted form of a schema revision reference (§6.1).
@@ -228,7 +226,17 @@ func RefPath(err error) string {
 	return ""
 }
 
-var printer = message.NewPrinter(language.English)
+// BudgetError reports that validating a document took more steps than
+// the caller allowed (§6.6's limits have none for this; the reference adds
+// validationSteps). A step is one schema applied to one value.
+type BudgetError struct {
+	Steps  int // taken when validation stopped: a lower bound of what it needs
+	Budget int
+}
+
+func (e *BudgetError) Error() string {
+	return fmt.Sprintf("validation took more than %d steps", e.Budget)
+}
 
 // Validator compiles and caches schemas by revision path. Safe for concurrent use.
 //
@@ -243,9 +251,9 @@ var printer = message.NewPrinter(language.English)
 // compiles one way and is kept by path alone (§6.1 "Validator cache").
 type Validator struct {
 	mu       sync.Mutex
-	compiled lru.Cache[string, *jsonschema.Schema] // revision path -> compiled root
-	docs     lru.Cache[string, any]                // revision path -> checked schema document
-	meta     *jsonschema.Schema                    // draft 2020-12 meta-schema
+	compiled lru.Cache[string, *jsv.Schema] // revision path -> compiled root
+	docs     lru.Cache[string, any]         // revision path -> checked schema document
+	meta     *jsv.Schema                    // draft 2020-12 meta-schema
 }
 
 // The schemas kept: compiled, and their documents (a compiled schema's
@@ -258,7 +266,7 @@ const (
 // NewValidator returns an empty Validator.
 func NewValidator() *Validator {
 	return &Validator{
-		compiled: lru.Cache[string, *jsonschema.Schema]{MaxEntries: maxCompiledSchemas},
+		compiled: lru.Cache[string, *jsv.Schema]{MaxEntries: maxCompiledSchemas},
 		docs:     lru.Cache[string, any]{MaxEntries: maxSchemaDocs},
 		meta:     metaSchema(),
 	}
@@ -266,8 +274,8 @@ func NewValidator() *Validator {
 
 // metaSchema compiles the draft 2020-12 meta-schema under this version's
 // rules.
-func metaSchema() *jsonschema.Schema {
-	meta, err := newCompiler(nil).Compile(Dialect2020)
+func metaSchema() *jsv.Schema {
+	meta, err := jsv.MetaSchema(current.Options())
 	if err != nil {
 		panic("schema: compiling bundled meta-schema: " + err.Error())
 	}
@@ -276,19 +284,19 @@ func metaSchema() *jsonschema.Schema {
 
 type urlLoaderFunc func(url string) (any, error)
 
-func (f urlLoaderFunc) Load(url string) (any, error) { return f(url) }
-
 // newCompiler returns a compiler set up as every schema compiles: under
 // this version's rules (current), whatever version stored it (§6.1).
-func newCompiler(load urlLoaderFunc) *jsonschema.Compiler {
-	c := jsonschema.NewCompiler()
-	current.Configure(c)
+func newCompiler(load urlLoaderFunc) *jsv.Compiler {
+	o := current.Options()
 	if load == nil {
 		load = func(url string) (any, error) { return nil, fmt.Errorf("refusing to load %q", url) }
 	}
-	c.UseLoader(load)
-	return c
+	o.Load = load
+	return jsv.NewCompiler(o)
 }
+
+// compileMsg is a compile failure as a SchemaError says it.
+func compileMsg(err error) string { return strings.TrimPrefix(err.Error(), "jsv: ") }
 
 // freshNonce is the fresh-nonce form of §6.4.1: 128 bits as 26 base32
 // characters.
@@ -374,14 +382,57 @@ func Instance(doc any) any {
 // A stored revision that no longer passes makes the schema invalid
 // (*SchemaError), as for any invalid schema.
 func (v *Validator) Validate(doc any, load Loader) error {
-	return v.validate(doc, load)
+	_, err := v.validate(doc, load, 0)
+	return err
+}
+
+// ValidateBudget is Validate within budget steps (0: no limit), a step
+// being one schema applied to one value. It returns the steps taken, and
+// a *BudgetError if they ran out before a verdict.
+func (v *Validator) ValidateBudget(doc any, load Loader, budget int) (steps int, err error) {
+	return v.validate(doc, load, budget)
+}
+
+// ValidateChangeBudget is ValidateBudget for a document typed by a schema
+// revision that was made by changing one known to be valid against that
+// same revision, as this Validator compiles it: changed holds JSON
+// Pointers into Instance(doc) to everything that may differ, as
+// jsv.ValidateChange defines them, and only what those changes can have
+// affected is validated. An invalid document's failures are listed from
+// the whole document, as ValidateBudget lists them. A document that is a
+// schema, or not typed, is validated as by ValidateBudget.
+func (v *Validator) ValidateChangeBudget(doc any, load Loader, changed []string, budget int) (steps int, err error) {
+	obj, _ := doc.(map[string]any)
+	s, _ := obj["$schema"].(string)
+	ref, ok := ParseRef(s)
+	if !ok {
+		return v.validate(doc, load, budget)
+	}
+	sch, err := v.compile(ref, load)
+	if err != nil {
+		return 0, err
+	}
+	inst := Instance(doc)
+	var st jsv.Stats
+	err = sch.ValidateChange(inst, changed, jsv.ValidateOptions{Budget: budget, Stats: &st})
+	if err == nil {
+		return st.Steps, nil
+	}
+	if errors.Is(err, jsv.ErrBudget) {
+		return st.Steps, &BudgetError{Steps: st.Steps, Budget: budget}
+	}
+	var ve *jsv.ValidationError
+	if !errors.As(err, &ve) {
+		return st.Steps, &SchemaError{Msg: compileMsg(err)}
+	}
+	return st.Steps, Failures(sch, inst, budget, ve)
 }
 
 // ValidateRules is Validate: rules, the marker of the revision written,
 // selects nothing, since every schema compiles under this version (§6.1).
 // It is kept for callers that still carry markers.
 func (v *Validator) ValidateRules(doc any, load Loader, rules Rules) error {
-	return v.validate(doc, load)
+	return v.Validate(doc, load)
 }
 
 // ValidateMarked is Validate: neither rules nor rulesOf, the markers of
@@ -389,34 +440,34 @@ func (v *Validator) ValidateRules(doc any, load Loader, rules Rules) error {
 // anything, since every schema compiles under this version (§6.1). It is
 // kept for callers that still carry markers; rulesOf is never called.
 func (v *Validator) ValidateMarked(doc any, load Loader, rules Rules, rulesOf func(Ref) Rules) error {
-	return v.validate(doc, load)
+	return v.Validate(doc, load)
 }
 
-func (v *Validator) validate(doc any, load Loader) error {
+func (v *Validator) validate(doc any, load Loader, budget int) (int, error) {
 	obj, ok := doc.(map[string]any)
 	if !ok {
-		return nil
+		return 0, nil
 	}
 	raw, ok := obj["$schema"]
 	if !ok {
-		return nil
+		return 0, nil
 	}
 	s, ok := raw.(string)
 	if !ok {
-		return &RefError{Msg: "$schema must be a string"}
+		return 0, &RefError{Msg: "$schema must be a string"}
 	}
 	if IsDialect(s) {
-		return v.validateSchemaDocument(doc, load)
+		return v.validateSchemaDocument(doc, load, budget)
 	}
 	ref, ok := ParseRef(s)
 	if !ok {
-		return &RefError{Msg: fmt.Sprintf("$schema %q is neither a schema revision path nor a supported dialect", s)}
+		return 0, &RefError{Msg: fmt.Sprintf("$schema %q is neither a schema revision path nor a supported dialect", s)}
 	}
 	sch, err := v.compile(ref, load)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return toValidationError(sch.Validate(Instance(doc)))
+	return check(sch, Instance(doc), budget)
 }
 
 // validateSchemaDocument checks a document whose $schema is a dialect URL
@@ -424,13 +475,14 @@ func (v *Validator) validate(doc any, load Loader) error {
 // top-level $nonce or $successor that step 5 leaves out isn't a keyword:
 // it is left out before the document is checked against its dialect,
 // checked and compiled (§6.5).
-func (v *Validator) validateSchemaDocument(doc any, load Loader) error {
+func (v *Validator) validateSchemaDocument(doc any, load Loader, budget int) (int, error) {
 	doc = leaveOut(doc)
-	if err := toValidationError(v.meta.Validate(doc)); err != nil {
-		return err
+	steps, err := check(v.meta, doc, budget)
+	if err != nil {
+		return steps, err
 	}
 	if err := (checker{}).check(doc, pointer.Pointer{}); err != nil {
-		return err
+		return steps, err
 	}
 	// Compile it too, so unresolvable fragments, plain names no anchor
 	// defines and unavailable revisions are caught now rather than when a
@@ -438,19 +490,20 @@ func (v *Validator) validateSchemaDocument(doc any, load Loader) error {
 	// $ref closure compile under current as it does.
 	var loadErr error
 	c := newCompiler(v.urlLoader(load, &loadErr))
-	if err := c.AddResource(newSchemaURL, doc); err != nil {
-		return &SchemaError{Msg: err.Error()}
+	err = c.AddResource(newSchemaURL, doc)
+	if err == nil {
+		_, err = c.Compile(newSchemaURL)
 	}
-	if _, err := c.Compile(newSchemaURL); err != nil {
+	if err != nil {
 		if loadErr != nil {
-			return loadErr
+			return steps, loadErr
 		}
-		return &SchemaError{Msg: err.Error()}
+		return steps, &SchemaError{Msg: compileMsg(err)}
 	}
-	return nil
+	return steps, nil
 }
 
-func (v *Validator) compile(ref Ref, load Loader) (*jsonschema.Schema, error) {
+func (v *Validator) compile(ref Ref, load Loader) (*jsv.Schema, error) {
 	path := ref.Path()
 	v.mu.Lock()
 	sch, _ := v.compiled.Get(path)
@@ -465,7 +518,7 @@ func (v *Validator) compile(ref Ref, load Loader) (*jsonschema.Schema, error) {
 		if loadErr != nil {
 			return nil, loadErr
 		}
-		return nil, &SchemaError{Msg: err.Error()}
+		return nil, &SchemaError{Msg: compileMsg(err)}
 	}
 	v.mu.Lock()
 	if prev, _ := v.compiled.Get(path); prev != nil {
@@ -558,40 +611,38 @@ func checkStoredSchema(doc any, path string) error {
 	return nil
 }
 
-// toValidationError flattens a library validation error into leaf Details.
-func toValidationError(err error) error {
+// check validates inst against sch within budget steps (0: no limit) and
+// returns the steps taken. A document that does not validate is validated
+// once more to list every failure (*ValidationError): first fast, to the
+// first failure, as most documents are valid; then collecting.
+func check(sch *jsv.Schema, inst any, budget int) (int, error) {
+	var st jsv.Stats
+	err := sch.Validate(inst, jsv.ValidateOptions{Budget: budget, Stats: &st})
 	if err == nil {
-		return nil
+		return st.Steps, nil
 	}
-	var ve *jsonschema.ValidationError
+	if errors.Is(err, jsv.ErrBudget) {
+		return st.Steps, &BudgetError{Steps: st.Steps, Budget: budget}
+	}
+	var ve *jsv.ValidationError
 	if !errors.As(err, &ve) {
-		return &SchemaError{Msg: err.Error()}
+		return st.Steps, &SchemaError{Msg: compileMsg(err)}
 	}
-	seen := map[Detail]bool{}
-	var out []Detail
-	var walk func(e *jsonschema.ValidationError)
-	walk = func(e *jsonschema.ValidationError) {
-		if len(e.Causes) == 0 {
-			d := Detail{
-				Pointer: pointer.Pointer(e.InstanceLocation).String(),
-				Message: e.ErrorKind.LocalizedString(printer),
-			}
-			if !seen[d] {
-				seen[d] = true
-				out = append(out, d)
-			}
-			return
-		}
-		for _, c := range e.Causes {
-			walk(c)
-		}
+	return st.Steps, Failures(sch, inst, budget, ve)
+}
+
+// Failures lists every failure of inst against sch, which ve says it
+// fails, as a *ValidationError: its details sorted by pointer, then
+// message, without repeats. Listing them has the budget anew; if that runs
+// out, the document is still invalid, and ve alone says why.
+func Failures(sch *jsv.Schema, inst any, budget int, ve *jsv.ValidationError) *ValidationError {
+	fs, err := sch.Collect(inst, jsv.ValidateOptions{Budget: budget})
+	if err != nil || len(fs) == 0 {
+		return &ValidationError{Errors: []Detail{{Pointer: ve.InstancePath, Message: ve.Message}}}
 	}
-	walk(ve)
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Pointer != out[j].Pointer {
-			return out[i].Pointer < out[j].Pointer
-		}
-		return out[i].Message < out[j].Message
-	})
+	out := make([]Detail, len(fs))
+	for i, f := range fs {
+		out[i] = Detail{Pointer: f.InstancePath, Message: f.Message}
+	}
 	return &ValidationError{Errors: out}
 }

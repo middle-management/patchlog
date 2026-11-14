@@ -221,8 +221,10 @@ func TestV076V06MemberRestartsFresh(t *testing.T) {
 	w.x = x
 	x.caughtUp("matches")
 	li := w.reader("user:li", []any{"fans"})
-	w.pointer("/matches", li)
+	// The catalog first: a read before the index has followed it is 503
+	// behind (§A.4), which a loaded machine reaches.
 	waitFor(t, "cat-season followed to its head", func() bool { return x.ix.Members()["cat-season"] == w.head("cat-season") })
+	w.pointer("/matches", li)
 	c1 := w.head("cat-season")
 	followed := func() bool { _, ok := x.ix.Members()["cat-season"]; return ok }
 	v06Catalogs(t, w, x, "remove", nil)

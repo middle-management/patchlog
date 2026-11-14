@@ -155,6 +155,8 @@ func serve(args []string) {
 	maxBatch := fs.String("max-batch-size", "", "deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB); allowances may go up to it (§6.6)")
 	docSize := fs.String("document-size", "", "default documentSize of namespaces that don't set one, e.g. \"4 MiB\" (default 1 MiB, where §6.6 says 4 MiB; see docs/CAPACITY.md), at most -max-document-size")
 	maxDocSize := fs.String("max-document-size", "", "deployment maximum documentSize, which namespaces may set in their limits, e.g. \"8 MiB\" (default 4 MiB, §6.6's default)")
+	maxSteps := fs.Int("max-validation-steps", core.DefaultMaxValidationSteps, "steps validating one document against its schema may take, a step being one schema applied to one value; a write that needs more is refused (422 limit, validationSteps); 0 for no limit")
+	fullValidation := fs.Bool("full-validation", false, "validate the whole document on every write; by default a patch to a document this instance has validated against the same schema revision is validated only where it can have changed the verdict")
 	grantCache := fs.Int("grant-cache", 0, "verified bearer grants kept per instance, the least recently used evicted (default 65536; every request whose grant isn't kept verifies it, docs/CAPACITY.md)")
 	docCache := fs.String("doc-cache-size", "", "documents kept in memory by revision id, e.g. \"1 GiB\" (default 256 MiB)")
 	readCache := fs.String("read-cache-size", "", "revisions the read cache keeps, served without a transaction, e.g. \"256 MiB\" (default 64 MiB)")
@@ -371,6 +373,10 @@ func serve(args []string) {
 		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke, PurgeRaisedE2E: *purgeRaised, GroupCommit: *groupCommit, GroupCommitWait: *groupWait, LocalRateBuckets: *localRate, StoreCompression: *storeCompression}
 	if opt.GroupCommit < 1 {
 		opt.GroupCommit = 1 // off
+	}
+	opt.FullValidation = *fullValidation
+	if opt.MaxValidationSteps = *maxSteps; *maxSteps <= 0 {
+		opt.MaxValidationSteps = -1 // no limit
 	}
 	if opt.GroupCommitWait <= 0 {
 		opt.GroupCommitWait = -1 // none

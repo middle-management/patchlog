@@ -715,7 +715,7 @@ func (r *runner) largeDocs() {
 		fail(fmt.Errorf("creating the schema: %w", err))
 	}
 	schemaRef := fmt.Sprintf("/r/%s/schema-%d/rev/%s", ns, stamp, sw.ID)
-	strs, structured, typed := map[string]any{}, map[string]any{}, map[string]any{}
+	strs, structured, typed, pushed := map[string]any{}, map[string]any{}, map[string]any{}, map[string]any{}
 	for _, s := range strings.Split(r.c.large, ",") {
 		var size int
 		if _, err := fmt.Sscan(s, &size); err != nil {
@@ -732,10 +732,19 @@ func (r *runner) largeDocs() {
 		strs[fmt.Sprint(size)] = r.appendsTo(ns, fmt.Sprintf("large-%d-%d", size, stamp), doc)
 		structured[fmt.Sprint(size)] = r.appendsTo(ns, fmt.Sprintf("structured-%d-%d", size, stamp), structuredDoc(size, ""))
 		typed[fmt.Sprint(size)] = r.appendsTo(ns, fmt.Sprintf("typed-%d-%d", size, stamp), structuredDoc(size, schemaRef))
+		// A patch that changes the items array itself (an item added and
+		// one removed, so the size holds): the array is validated again
+		// in full, where a patch to /n or to one item is validated only
+		// there.
+		pushed[fmt.Sprint(size)] = r.patchesTo(ns, fmt.Sprintf("typed-push-%d-%d", size, stamp), structuredDoc(size, schemaRef), func(i int) []any {
+			item := map[string]any{"id": i, "name": fmt.Sprintf("item-%06d", i), "score": 1, "tags": []any{"a"}, "at": "2026-10-15T12:00:00Z", "ok": true}
+			return []any{map[string]any{"op": "add", "path": "/items/-", "value": item}, map[string]any{"op": "remove", "path": "/items/0"}}
+		})
 	}
 	r.record("append_large_doc", strs)
 	r.record("append_large_structured", structured)
 	r.record("append_large_schema", typed)
+	r.record("append_large_schema_array", pushed)
 }
 
 // structuredItemBytes is about what one item of structuredDoc takes as
@@ -786,6 +795,14 @@ func structuredSchema() map[string]any {
 // appendsTo creates ns/name as doc and times 60 appends of a small patch
 // to it, one after another.
 func (r *runner) appendsTo(ns, name string, doc map[string]any) map[string]any {
+	return r.patchesTo(ns, name, doc, func(i int) []any {
+		return []any{map[string]any{"op": "replace", "path": "/n", "value": i}}
+	})
+}
+
+// patchesTo creates ns/name as doc and times 60 appends of patch(i) to
+// it, one after another.
+func (r *runner) patchesTo(ns, name string, doc map[string]any, patch func(i int) []any) map[string]any {
 	t := time.Now()
 	w, err := r.w(ns).CreateDoc(r.ctx, ns, name, doc)
 	if err != nil {
@@ -796,7 +813,7 @@ func (r *runner) appendsTo(ns, name string, doc map[string]any) map[string]any {
 	var lat []time.Duration
 	for i := 1; i <= 60; i++ {
 		t := time.Now()
-		w, err := r.w(ns).Append(r.ctx, ns, name, id, []any{map[string]any{"op": "replace", "path": "/n", "value": i}})
+		w, err := r.w(ns).Append(r.ctx, ns, name, id, patch(i))
 		if ae, ok := client.AsAPIError(err); ok && ae.Status == 429 {
 			time.Sleep(200 * time.Millisecond) // the resource's rate (10/s)
 			i--

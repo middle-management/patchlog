@@ -18,6 +18,12 @@
 // a minimum size (default: the option's), or with -1 every patch set,
 // whether it shrinks or not. On Postgres, which refuses the option, it
 // does nothing.
+//
+//	PATCHLOG_TEST_VALIDATE_BOTH=1 go test ./...
+//
+// is read by the core itself, once: every write step that is validated by
+// its patch's changes is also validated in full, and the process panics if
+// the two disagree (core, validateBoth).
 package testenv
 
 import (

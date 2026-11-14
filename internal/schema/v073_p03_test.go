@@ -4,8 +4,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-
-	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 const d073 = `"$schema":"https://json-schema.org/draft/2020-12/schema"`
@@ -401,7 +399,7 @@ func TestV073SchemaSuccessor(t *testing.T) {
 	}
 }
 
-// CheckFragment holds a rule's schema to §6.4.2; Configure compiles it
+// CheckFragment holds a rule's schema to §6.4.2; Options compile it
 // (P20).
 func TestV073CheckFragment(t *testing.T) {
 	for _, f := range []string{
@@ -434,15 +432,7 @@ func TestV073CheckFragment(t *testing.T) {
 			t.Errorf("%s: got %T %v, want SchemaError", f, err, err)
 		}
 	}
-	c := jsonschema.NewCompiler()
-	V073.Configure(c)
-	if err := c.AddResource("urn:rule", j(`{"properties":{"a":{"pattern":"^\\u00e9$"},"e":{"format":"idn-email"}}}`)); err != nil {
-		t.Fatal(err)
-	}
-	sch, err := c.Compile("urn:rule")
-	if err != nil {
-		t.Fatal(err)
-	}
+	sch := compileOpts(t, V073.Options(), j(`{"properties":{"a":{"pattern":"^\\u00e9$"},"e":{"format":"idn-email"}}}`))
 	if err := sch.Validate(map[string]any{"a": "é", "e": "ü@example.com"}); err != nil {
 		t.Errorf("valid: %v", err)
 	}
