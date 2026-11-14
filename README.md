@@ -1052,8 +1052,9 @@ What is instrumented:
 - **Schema validation**: `core.schema.validate`, one per typed document a write validates,
   with `patchlog.schema` (its `$schema`), `patchlog.document.size` (canonical bytes),
   `patchlog.document.nodes` (values in the document, containers included) and
-  `patchlog.schema.valid`. Validation runs inside the write's transaction, so without this span
-  its time read as a slow `core.db.update`. Loading the schemas is not part of it.
+  `patchlog.schema.valid`. Validation runs in the write's check phase, inside its read
+  transaction and outside the write lock, so without this span its time read as a slow
+  `core.db.read`. Loading the schemas is not part of it.
 - **Database transactions**: `core.db.read` and `core.db.update` (with `db.system.name`) inside
   a trace, so a read served from the read cache has none, and Postgres write retries show in
   one `core.db.update`. Background jobs (the tailer, retention, remote follows) are not traced.

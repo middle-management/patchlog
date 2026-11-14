@@ -33,8 +33,8 @@
 - **Telemetry: a span for schema validation, and the limit on a refusal.** Each typed document
   a write validates gets a `core.schema.validate` span with `patchlog.schema`,
   `patchlog.document.size`, `patchlog.document.nodes` and `patchlog.schema.valid`; validation
-  runs inside the write's transaction, so slow validation used to read as a slow
-  `core.db.update`. A write refused by a limit (`patchlog.outcome` `limit` or `rate`) now also
+  runs in the write's check phase, inside its read transaction, so slow validation used to read
+  as a slow `core.db.read`. A write refused by a limit (`patchlog.outcome` `limit` or `rate`) now also
   carries `patchlog.limit`, and `patchlog.limit.measured` and `patchlog.limit.max` where the
   error has them. [docs/CAPACITY.md](docs/CAPACITY.md), "A recursive union schema", has what
   prompted it: a `oneOf` whose branches each recurse validates in exponential time (7.3 s for

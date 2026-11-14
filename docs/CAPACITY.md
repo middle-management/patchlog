@@ -322,9 +322,10 @@ nodes are one of 4 kinds, against two schemas that accept the same documents.
 - **Keep the recursion out of the union.** Declare the recursive member (`children`, with its
   `$ref` back to the node) once on the node schema, and let the `oneOf` branches hold only the
   discriminator and each kind's own members.
-- **Nothing bounds validation time.** It runs inside the write's transaction, so a schema of the
-  first shape makes every write to its documents slow, and on a trace it used to read as a slow
-  database transaction. The `core.schema.validate` span now shows it (README, "Telemetry").
+- **Nothing bounds validation time.** It runs in the write's check phase: inside a read
+  transaction, outside the write lock, so it holds a database connection and a core thread but
+  does not block other writers. A schema of the first shape makes every write to its documents
+  slow, and on a trace it used to read as a slow database read. The `core.schema.validate` span now shows it (README, "Telemetry").
   A bound is a [gap](#gaps-in-this-implementation).
 
 Server X's large documents were measured three times (twice with grants, once without). The
@@ -656,7 +657,7 @@ Each limit is one of three kinds:
 | **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request. The origin shares their reads ([Origin-side collapse](#origin-side-collapse)), at ~0.03–0.04 ms of core CPU per follower per write (0.12–0.14 ms through Varnish). | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
 | **No read replicas, and one `-db` for everything.** The core runs migrations, the tailer and leader jobs, so it can't run on a read-only database. | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
 | **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: 6–7 min on server X (fetches at 2,400–2,800/s); 1.3 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
-| **Nothing bounds schema validation time**, and the validator evaluates every `oneOf`/`anyOf` branch in full. | A recursive union schema takes seconds on a document of a thousand nodes ([A recursive union schema](#a-recursive-union-schema)), inside the write's transaction. | A time or step budget for validation, refused as a limit; a validator that stops a branch at its first failure, or remembers what it has checked. |
+| **Nothing bounds schema validation time**, and the validator evaluates every `oneOf`/`anyOf` branch in full. | A recursive union schema takes seconds on a document of a thousand nodes ([A recursive union schema](#a-recursive-union-schema)), on a core thread and a database connection for as long. | A time or step budget for validation, refused as a limit; a validator that stops a branch at its first failure, or remembers what it has checked. |
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
 | **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.0 GB on server X and 1.4 GB on SQLite over a whole run. Scans, reads and small writes alone peaked at 0.2–0.3 GB; the rest came with 3.5 MiB documents and 5,000 followers. | Run with `GOMEMLIMIT` under container limits; profile the large-document path (an opt-in pprof listener would help). |
 
