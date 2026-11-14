@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 )
 
 // structuredDoc is the "structured 1 MiB" document: about 9,500 small
@@ -141,43 +140,13 @@ func TestBudget(t *testing.T) {
 	}
 }
 
-// TestLibraryUnionTime times the library on the recursive union once: it
-// is too slow to benchmark by default. Run with -run TestLibraryUnionTime -v.
-func TestLibraryUnionTime(t *testing.T) {
-	if testing.Short() || !testing.Verbose() {
-		t.Skip("slow: run with -v")
-	}
-	lib, err := libCompile(mustJSON(benchUnionSchema), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tree := unionTree(0, 10)
-	start := time.Now()
-	if err := lib.Validate(tree); err != nil {
-		t.Fatal(err)
-	}
-	t.Logf("library, recursive union, 1,023 nodes: %v", time.Since(start))
-}
-
 func BenchmarkStructured(b *testing.B) {
 	raw := mustJSON(structuredSchema)
 	doc := structuredDoc(structuredItems)
-	lib, err := libCompile(raw, nil)
-	if err != nil {
-		b.Fatal(err)
-	}
 	sch, err := Compile(raw, "", repoOptions(nil))
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Run("library-full", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			if err := lib.Validate(doc); err != nil {
-				b.Fatal(err)
-			}
-		}
-	})
 	run := func(name string, changed []string) {
 		b.Run(name, func(b *testing.B) {
 			b.ReportAllocs()
@@ -202,8 +171,8 @@ func BenchmarkStructured(b *testing.B) {
 	run("jsv-change-score", []string{"/items/5000/score"})
 }
 
-// BenchmarkUnion is the recursive union on a binary tree of depth 10. The
-// library takes seconds per validation: -bench 'Union/jsv' leaves it out.
+// BenchmarkUnion is the recursive union on a binary tree of depth 10 (the
+// library this package replaced took 4 s per validation of it).
 func BenchmarkUnion(b *testing.B) {
 	raw := mustJSON(benchUnionSchema)
 	tree := unionTree(0, 10)
@@ -233,19 +202,6 @@ func BenchmarkUnion(b *testing.B) {
 	run("jsv-full", nil)
 	leaf := strings.Repeat("/children/1", 9)
 	run("jsv-change-leaf", []string{leaf + "/kind"})
-	b.Run("library-full", func(b *testing.B) {
-		lib, err := libCompile(raw, nil)
-		if err != nil {
-			b.Fatal(err)
-		}
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			if err := lib.Validate(tree); err != nil {
-				b.Fatal(err)
-			}
-		}
-	})
 }
 
 // BenchmarkCompile compiles the structured schema, with and without the
@@ -266,12 +222,4 @@ func BenchmarkCompile(b *testing.B) {
 			}
 		})
 	}
-	b.Run("library", func(b *testing.B) {
-		b.ReportAllocs()
-		for i := 0; i < b.N; i++ {
-			if _, err := libCompile(raw, nil); err != nil {
-				b.Fatal(err)
-			}
-		}
-	})
 }

@@ -87,6 +87,7 @@ func runSuiteFile(t testing.TB, dir, path string, assertFormat bool) (passed int
 		}
 		for _, tc := range c.Tests {
 			err := sch.Validate(tc.Data, ValidateOptions{})
+			checkCollect(t, sch, tc.Data, err)
 			if (err == nil) == tc.Valid {
 				passed++
 				continue

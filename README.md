@@ -1051,8 +1051,9 @@ What is instrumented:
   and outcome; the namespace is never a metric attribute.
 - **Schema validation**: `core.schema.validate`, one per typed document a write validates,
   with `patchlog.schema` (its `$schema`), `patchlog.document.size` (canonical bytes),
-  `patchlog.document.nodes` (values in the document, containers included) and
-  `patchlog.schema.valid`. Validation runs in the write's check phase, inside its read
+  `patchlog.document.nodes` (values in the document, containers included),
+  `patchlog.schema.valid` and `patchlog.schema.steps` (schemas applied to values, what the
+  `validationSteps` limit counts). Validation runs in the write's check phase, inside its read
   transaction and outside the write lock, so without this span its time read as a slow
   `core.db.read`. Loading the schemas is not part of it.
 - **Database transactions**: `core.db.read` and `core.db.update` (with `db.system.name`) inside
@@ -4591,6 +4592,11 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   objects must be well-formed and name available blobs that match their type, size and nonce
   (`422`, `code: "blob"`). Allowances may also set `blobRate` and `blobPending`; the deployment
   maximums are set with `serve -max-blob-size` and `-max-blob-pending`.
+- **Validating a document may take 5,000,000 steps** (`validationSteps`), a step being one
+  schema applied to one value: a 1 MiB document of 9,500 small typed objects takes 85,503. A
+  write that needs more is refused `422` with `code: "limit"`, `limit: "validationSteps"`,
+  `measured` and `max`. §6.6 has no such limit; `serve -max-validation-steps` changes it and
+  `0` lifts it. Rule `test`s with a `schema` and annotation walks are not counted.
 - **`documentSize` is 1 MiB by default**, where §6.6 says 4 MiB, and a namespace may set it up to
   the deployment maximum, 4 MiB unless `serve -max-document-size` says otherwise;
   `serve -document-size` changes the default (at most the maximum). Every write re-serialises,
@@ -4862,6 +4868,7 @@ internal/ids        content-addressed ids (§3.2–§3.5)
 internal/pointer    JSON Pointer
 internal/patch      JSON Patch and the `writes` of §6.4.1
 internal/rules      the rule language of §6.4.2
+internal/jsv        JSON Schema draft 2020-12 validator: compile, validate, list failures, validate a change
 internal/schema     $schema resolution and JSON Schema validation
 internal/schemaimport external JSON Schemas into a namespace, refs pinned (schema import)
 internal/grant      grants, keys, roles and verification (Addendum C)

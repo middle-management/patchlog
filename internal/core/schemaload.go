@@ -159,24 +159,6 @@ func (t *tx) prefetchRules(seqs []int64) {
 	t.must(rows.Err())
 }
 
-// schemaRules is the rules marker of the schema revision ref resolved to
-// for the writer of sc (loadSchema): an earlier item's of the same write,
-// as docRules fixes it, or that of the row it was read from.
-func (t *tx) schemaRules(ref schema.Ref, sc *schemaCtx, pending map[string]any) schema.Rules {
-	if d, ok := pending[ref.Path()]; ok {
-		id, err := ids.Parse(ref.Rev)
-		if err != nil {
-			return schema.V073
-		}
-		return t.docRules(id, d, sc)
-	}
-	l, ok := t.schemas[schemaKey{sc: sc, path: ref.Path()}]
-	if !ok || l.seq == 0 {
-		return schema.Legacy
-	}
-	return t.rowRules(l.seq)
-}
-
 // validateDoc is step 5: resolve $schema and validate (§6.1) under rules,
 // the marker of the revision written, for a schema document. It returns
 // the document's $schema, if typed.
@@ -221,16 +203,11 @@ func (t *tx) validateDoc(doc any, size int, rules schema.Rules, sc *schemaCtx, p
 		}
 	}
 	// Each revision of the closure compiles under this version's rules,
-	// whatever its marker (§6.1): ValidateMarked never calls rulesOf, kept
-	// for its signature. Every revision was resolved above, so its marker
-	// is known (t.schemas); loading again only finds it there.
-	rulesOf := func(r schema.Ref) schema.Rules {
-		_, _ = load(r)
-		return t.schemaRules(r, sc, pending)
-	}
+	// whatever its marker (§6.1), so neither rules nor the markers of the
+	// closure select anything.
 	span := validateSpan(t.ctx, s, doc, size)
-	err := t.e.validator.ValidateMarked(doc, load, rules, rulesOf)
-	endValidateSpan(span, err)
+	steps, err := t.e.validator.ValidateBudget(doc, load, max(t.e.opt.MaxValidationSteps, 0))
+	endValidateSpan(span, err, steps)
 	if err != nil {
 		return "", schemaErr(err, s)
 	}
@@ -281,7 +258,10 @@ func schemaErr(err error, path string) *Error {
 	var ue *schema.UnavailableError
 	var ve *schema.ValidationError
 	var se *schema.SchemaError
+	var be *schema.BudgetError
 	switch {
+	case errors.As(err, &be):
+		return limitErr(422, "validationSteps", int64(be.Steps), int64(be.Budget), "validating the document against its schema takes too many steps")
 	case errors.As(err, &re):
 		return apiErr(422, "schema_ref", "message", re.Msg)
 	case errors.Is(err, schema.ErrBranch):

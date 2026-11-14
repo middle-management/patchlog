@@ -135,6 +135,12 @@ type Options struct {
 	// once (group commit, D.8; groupcommit.go). Zero means 32; 1 or less
 	// turns group commit off, so every write commits on its own.
 	GroupCommit int
+	// MaxValidationSteps bounds the work of validating one document
+	// against its schema (§6.2 step 5): a step is one schema applied to
+	// one value, and a document that takes more is refused with the limit
+	// validationSteps (§6.6 has none for this). Zero means
+	// DefaultMaxValidationSteps; negative, no limit.
+	MaxValidationSteps int
 	// GroupCommitWait is at most how long a group waits for writes of its
 	// namespace still in their check phase (zero means 200µs; negative,
 	// no wait). Writes that find no group of their namespace never wait.
@@ -417,6 +423,9 @@ func Open(opt Options) (*Engine, error) {
 	}
 	if opt.GroupCommit == 0 {
 		opt.GroupCommit = defaultGroupCommit
+	}
+	if opt.MaxValidationSteps == 0 {
+		opt.MaxValidationSteps = DefaultMaxValidationSteps
 	}
 	if opt.GroupCommitWait == 0 {
 		opt.GroupCommitWait = defaultGroupCommitWait

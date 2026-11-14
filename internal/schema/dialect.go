@@ -1,14 +1,15 @@
 package schema
 
 import (
+	"fmt"
 	"net/netip"
 	"regexp"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/middle-management/patchlog/internal/jsv"
 	"github.com/middle-management/patchlog/internal/pattern"
-	"github.com/santhosh-tekuri/jsonschema/v6"
 	"golang.org/x/net/idna"
 )
 
@@ -77,60 +78,117 @@ func init() {
 	}
 }
 
-// idnFormats are the two formats of draft 2020-12 the library lacks.
-var idnFormats = []*jsonschema.Format{
-	{Name: "idn-email", Validate: validateIDNEmail},
-	{Name: "idn-hostname", Validate: validateIDNHostname},
+// idnFormats are the two formats of draft 2020-12 the validator
+// (internal/jsv) leaves to its caller.
+var idnFormats = map[string]func(string) bool{
+	"idn-email":    func(s string) bool { return validateIDNEmail(s) == nil },
+	"idn-hostname": func(s string) bool { return validateIDNHostname(s) == nil },
 }
 
-// v073Formats are the formats V073 registers over the library's own: the
-// two it lacks, and the two it asserts that draft 2020-12 doesn't define,
-// which are annotations there.
-var v073Formats = append([]*jsonschema.Format{
-	{Name: "semver", Validate: func(any) error { return nil }},
-	{Name: "period", Validate: func(any) error { return nil }},
-}, idnFormats...)
+// legacyFormats are the two formats v0.55 asserted that draft 2020-12
+// doesn't define, which a rule fragment stored then is still read with
+// (Legacy); they are annotations under V073.
+var legacyFormats = map[string]func(string) bool{
+	"semver": validSemver,
+	"period": validPeriod,
+}
 
-// Configure sets c up to compile schemas as r says: draft 2020-12 unless a
-// schema names another, format assertions on, the formats r asserts, and
-// patterns read as §6.6 says. Every schema compiles as V073 says (§6.1);
-// a caller compiling one itself, as the annotation walks do, configures
-// with V073. Rule schema fragments (§6.4.2) compile by ConfigureFragment.
-func (r Rules) Configure(c *jsonschema.Compiler) {
-	c.DefaultDraft(jsonschema.Draft2020)
-	c.AssertFormat()
-	c.UseRegexpEngine(r.regexpEngine)
-	if r == V073 {
-		for _, f := range v073Formats {
-			c.RegisterFormat(f)
-		}
+// Options are the validator options that compile schemas as r says: draft
+// 2020-12, format assertions on, the formats r asserts, and patterns read
+// as §6.6 says. Every schema compiles as V073 says (§6.1); a caller
+// compiling one itself, as the annotation walks do, takes V073's. Rule
+// schema fragments (§6.4.2) compile by FragmentOptions. The caller sets
+// Load.
+func (r Rules) Options() jsv.Options {
+	o := jsv.Options{
+		AssertFormat: true,
+		Formats:      map[string]func(string) bool{},
+		Regexp: func(s string) (jsv.Matcher, error) {
+			re, err := r.CompileRegexp(s)
+			if err != nil {
+				return nil, err
+			}
+			return re, nil
+		},
 	}
+	fs := idnFormats
+	if r != V073 {
+		fs = legacyFormats
+	}
+	for name, f := range fs {
+		o.Formats[name] = f
+	}
+	return o
 }
 
-// ConfigureFragment is Configure for a rule's schema fragment, which is
+// FragmentOptions is Options for a rule's schema fragment, which is
 // applied with format assertions as at step 5 of §6.2 whenever it was
 // written (§6.4.2): §6.1's "compiled as that version did" is a schema
 // document's. Under Legacy, a fragment stored before, idn-email and
-// idn-hostname are asserted too, as under V073, and the library's other
-// formats as v0.55 asserted them, semver and period included. So a
-// fragment written now evaluates alike under either marker.
-func (r Rules) ConfigureFragment(c *jsonschema.Compiler) {
-	r.Configure(c)
+// idn-hostname are asserted too, as under V073, and semver and period as
+// v0.55 asserted them. So a fragment written now evaluates alike under
+// either marker.
+func (r Rules) FragmentOptions() jsv.Options {
+	o := r.Options()
 	if r == Legacy {
-		for _, f := range idnFormats {
-			c.RegisterFormat(f)
+		for name, f := range idnFormats {
+			o.Formats[name] = f
 		}
 	}
+	return o
 }
 
-// regexpEngine compiles the patterns of pattern, patternProperties and the
-// regex format, and of the meta-schema's checks of them.
-func (r Rules) regexpEngine(s string) (jsonschema.Regexp, error) {
-	re, err := r.CompileRegexp(s)
-	if err != nil {
-		return nil, err
+// validSemver reads a semantic version (semver.org's grammar).
+func validSemver(s string) bool {
+	if i := strings.IndexByte(s, '+'); i >= 0 {
+		for _, id := range strings.Split(s[i+1:], ".") {
+			if id == "" || strings.Trim(id, "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-") != "" {
+				return false
+			}
+		}
+		s = s[:i]
 	}
-	return sourced{re, s}, nil
+	if i := strings.IndexByte(s, '-'); i >= 0 {
+		for _, id := range strings.Split(s[i+1:], ".") {
+			if id == "" || strings.Trim(id, "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-") != "" {
+				return false
+			}
+			if len(id) > 1 && id[0] == '0' && strings.Trim(id, "0123456789") == "" {
+				return false
+			}
+		}
+		s = s[:i]
+	}
+	core := strings.Split(s, ".")
+	if len(core) != 3 {
+		return false
+	}
+	for _, n := range core {
+		if n == "" || len(n) > 1 && n[0] == '0' || strings.Trim(n, "0123456789") != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// validPeriod reads an ISO 8601 period as RFC 3339 Appendix A writes it:
+// two date-times, or a date-time and a duration either way round.
+func validPeriod(s string) bool {
+	start, end, ok := strings.Cut(s, "/")
+	if !ok {
+		return false
+	}
+	is := func(format, v string) bool { return jsv.Format(format)(v) }
+	if strings.HasPrefix(start, "P") {
+		return is("duration", start) && is("date-time", end)
+	}
+	if !is("date-time", start) {
+		return false
+	}
+	if strings.HasPrefix(end, "P") {
+		return is("duration", end)
+	}
+	return is("date-time", end)
 }
 
 // CompileRegexp compiles a schema's pattern s as §6.6 reads it: RE2, with
@@ -150,15 +208,6 @@ func (r Rules) CompileRegexp(s string) (*regexp.Regexp, error) {
 	return re, err
 }
 
-// sourced is a compiled pattern that names itself as written, so messages
-// quote the schema's pattern, not its translation.
-type sourced struct {
-	*regexp.Regexp
-	src string
-}
-
-func (s sourced) String() string { return s.src }
-
 // idnHost checks host names as RFC 5890 defines them, without UTS 46
 // mapping (§6.2 step 5): IDNA2008's registration rules (RFC 5891 §4),
 // which refuse any code point UTS 46 would map (an uppercase or fullwidth
@@ -174,18 +223,14 @@ var idnHost = idna.New(idna.ValidateForRegistration())
 // passes as example.com does, and an A-label in any case must decode to a
 // valid U-label; a label with any other code point must be a U-label as
 // written.
-func validateIDNHostname(v any) error {
-	s, ok := v.(string)
-	if !ok {
-		return nil
-	}
+func validateIDNHostname(s string) error {
 	f := foldLDH(s)
 	if _, err := idnHost.ToASCII(f); err != nil {
-		return jsonschema.LocalizableError("%v", err)
+		return fmt.Errorf("%v", err)
 	}
 	u, err := idnHost.ToUnicode(f)
 	if err != nil {
-		return jsonschema.LocalizableError("%v", err)
+		return fmt.Errorf("%v", err)
 	}
 	for _, l := range strings.Split(u, ".") {
 		if err := contextO(l); err != nil {
@@ -233,11 +278,11 @@ func contextO(label string) error {
 			ok = kana
 		}
 		if !ok {
-			return jsonschema.LocalizableError("idna: %+q in label %q breaks its CONTEXTO rule (RFC 5892)", r, label)
+			return fmt.Errorf("idna: %+q in label %q breaks its CONTEXTO rule (RFC 5892)", r, label)
 		}
 	}
 	if arabic && extended {
-		return jsonschema.LocalizableError("idna: label %q mixes Arabic-Indic and extended Arabic-Indic digits (RFC 5892)", label)
+		return fmt.Errorf("idna: label %q mixes Arabic-Indic and extended Arabic-Indic digits (RFC 5892)", label)
 	}
 	return nil
 }
@@ -271,34 +316,30 @@ func isASCII(s string) bool {
 // validateIDNEmail asserts idn-email (RFC 6531): an address whose local
 // part may hold UTF-8 beyond ASCII, at an internationalised host name or
 // an address literal.
-func validateIDNEmail(v any) error {
-	s, ok := v.(string)
-	if !ok {
-		return nil
-	}
+func validateIDNEmail(s string) error {
 	at := strings.LastIndexByte(s, '@')
 	if at == -1 {
-		return jsonschema.LocalizableError("missing @")
+		return fmt.Errorf("missing @")
 	}
 	local, domain := s[:at], s[at+1:]
 	if local == "" {
-		return jsonschema.LocalizableError("empty local part")
+		return fmt.Errorf("empty local part")
 	}
 	if len(local) > 64 {
-		return jsonschema.LocalizableError("local part more than 64 octets long")
+		return fmt.Errorf("local part more than 64 octets long")
 	}
 	if !utf8.ValidString(local) {
-		return jsonschema.LocalizableError("local part is not UTF-8")
+		return fmt.Errorf("local part is not UTF-8")
 	}
 	if len(local) > 1 && strings.HasPrefix(local, `"`) && strings.HasSuffix(local, `"`) {
 		for _, ch := range local[1 : len(local)-1] {
 			if ch == '\\' || ch == '"' || ch < 0x20 || ch == 0x7f {
-				return jsonschema.LocalizableError("invalid character %q in quoted local part", ch)
+				return fmt.Errorf("invalid character %q in quoted local part", ch)
 			}
 		}
 	} else {
 		if strings.HasPrefix(local, ".") || strings.HasSuffix(local, ".") || strings.Contains(local, "..") {
-			return jsonschema.LocalizableError("misplaced dot in local part")
+			return fmt.Errorf("misplaced dot in local part")
 		}
 		for _, ch := range local {
 			switch {
@@ -306,24 +347,24 @@ func validateIDNEmail(v any) error {
 			case strings.ContainsRune(".!#$%&'*+-/=?^_`{|}~", ch):
 			case ch >= 0x80 && !unicode.IsControl(ch): // UTF8-non-ascii (RFC 6531 §3.3)
 			default:
-				return jsonschema.LocalizableError("invalid character %q", ch)
+				return fmt.Errorf("invalid character %q", ch)
 			}
 		}
 	}
 	if lit, ok := strings.CutPrefix(domain, "["); ok {
 		lit, ok = strings.CutSuffix(lit, "]")
 		if !ok {
-			return jsonschema.LocalizableError("unclosed address literal")
+			return fmt.Errorf("unclosed address literal")
 		}
 		v6, isV6 := strings.CutPrefix(lit, "IPv6:")
 		a, err := netip.ParseAddr(v6)
 		if err != nil || a.Zone() != "" || a.Is4() == isV6 {
-			return jsonschema.LocalizableError("invalid address literal %q", lit)
+			return fmt.Errorf("invalid address literal %q", lit)
 		}
 		return nil
 	}
 	if err := validateIDNHostname(domain); err != nil {
-		return jsonschema.LocalizableError("invalid domain: %v", err)
+		return fmt.Errorf("invalid domain: %v", err)
 	}
 	return nil
 }

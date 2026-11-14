@@ -129,6 +129,9 @@ func (s *state) change(n *node, v any, c *change) bool {
 	if c.full || n.uneval || n.boolean != 0 {
 		return s.eval(n, v, nil)
 	}
+	if s.over {
+		return false // the count stays where the budget ran out
+	}
 	s.steps++
 	if s.budget > 0 && s.steps > s.budget {
 		s.over = true

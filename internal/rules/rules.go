@@ -10,9 +10,9 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/jsv"
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/schema"
-	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // Rule is a compiled rule.
@@ -392,7 +392,7 @@ type testNode struct {
 	kind   string // value, exists, schema
 	value  any
 	exists bool
-	schema *jsonschema.Schema
+	schema *jsv.Schema
 }
 
 func compileTest(m map[string]any, strict bool) (node, error) {
@@ -433,12 +433,6 @@ func compileTest(m map[string]any, strict bool) (node, error) {
 	return n, nil
 }
 
-type refuseLoader struct{}
-
-func (refuseLoader) Load(url string) (any, error) {
-	return nil, fmt.Errorf("remote schema references are not allowed (%s)", url)
-}
-
 const schemaURL = "urn:patchlog:rule"
 
 // compileSchema compiles a test's schema fragment with format assertions
@@ -446,8 +440,8 @@ const schemaURL = "urn:patchlog:rule"
 // compiles it under schema.V073 (CompileStrict); otherwise it compiles
 // as stored, under schema.Legacy, as v0.55 did, but for patterns with
 // \uXXXX, which RE2 refused then, and idn-email and idn-hostname, which
-// it didn't assert (schema.Rules.ConfigureFragment).
-func compileSchema(v any, strict bool) (*jsonschema.Schema, error) {
+// it didn't assert (schema.Rules.FragmentOptions).
+func compileSchema(v any, strict bool) (*jsv.Schema, error) {
 	switch v.(type) {
 	case map[string]any, bool:
 	default:
@@ -460,15 +454,13 @@ func compileSchema(v any, strict bool) (*jsonschema.Schema, error) {
 		}
 		rs = schema.V073
 	}
-	c := jsonschema.NewCompiler()
-	rs.ConfigureFragment(c)
-	c.UseLoader(refuseLoader{})
-	if err := c.AddResource(schemaURL, jsonv.Clone(v)); err != nil {
-		return nil, fmt.Errorf("invalid schema: %w", err)
+	o := rs.FragmentOptions()
+	o.Load = func(url string) (any, error) {
+		return nil, fmt.Errorf("remote schema references are not allowed (%s)", url)
 	}
-	s, err := c.Compile(schemaURL)
+	s, err := jsv.Compile(jsonv.Clone(v), schemaURL, o)
 	if err != nil {
-		return nil, fmt.Errorf("invalid schema: %w", err)
+		return nil, fmt.Errorf("invalid schema: %s", strings.TrimPrefix(err.Error(), "jsv: "))
 	}
 	return s, nil
 }
@@ -487,7 +479,7 @@ func (n *testNode) eval(env map[string]any, unk blind) Tri {
 		if !ok {
 			return False
 		}
-		return tri(n.schema.Validate(v) == nil)
+		return tri(n.schema.Validate(v, jsv.ValidateOptions{}) == nil)
 	}
 }
 func (n *testNode) failPath(map[string]any, blind) string { return "" }

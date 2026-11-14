@@ -7,7 +7,7 @@ how data is laid out), a **gap** (this implementation; fixable without changing 
 
 Every figure here is from one set of runs on one host on 2026-11-13, at spec 0.82, except those
 under [Earlier measurements](#earlier-measurements) and
-[A recursive union schema](#a-recursive-union-schema). See
+[A recursive union schema](#a-recursive-union-schema), and the dated notes. See
 [What was measured, and on what](#what-was-measured-and-on-what).
 
 ## At a glance
@@ -305,28 +305,31 @@ What the table shows:
 
 ### A recursive union schema
 
-**A schema whose `oneOf` branches each recurse costs exponential time in the document's depth.**
-The validator checks every branch in full, children included, even where the branch's
-discriminator has already failed. So a node at depth *d* is validated once per branch per
-level above it.
+**A schema whose `oneOf` branches each recurse no longer costs exponential time, and validation
+work is bounded.** The validator the tables above were measured with checked every branch in
+full, children included, even where the branch's discriminator had already failed, so a node at
+depth *d* was validated once per branch per level above it. The server now validates with its
+own validator (`internal/jsv`), which stops a branch at its first failure and checks a value's
+own keywords and scalar members before its objects and arrays.
 
-Measured on 2026-11-14 on a development machine, in the validator alone: a binary tree whose
-nodes are one of 4 kinds, against two schemas that accept the same documents.
+Measured on 2026-11-14 on a development machine, in the validator alone, not through the
+server: a binary tree whose nodes are one of 4 kinds, against a `oneOf` of 4 node schemas, each
+with `children`.
 
-| Tree depth (nodes) | `oneOf` of 4 node schemas, each with `children` | `children` once, beside a `oneOf` of the kinds' own members |
+| | Before | Now |
 |---|---|---|
-| 6 (63) | 19 ms | 1.4 ms |
-| 8 (255) | 259 ms | 0.6 ms |
-| 10 (1,023) | 7.3 s | 4.6 ms |
+| Tree of depth 10 (1,023 nodes) | 4.2 s (7.3 s when first measured, on another machine) | 0.39 ms, 14,833 steps |
+| The 1 MiB **schema** document above (9,500 typed objects) | 43 ms | 4.2 ms, 85,503 steps |
 
-- **Keep the recursion out of the union.** Declare the recursive member (`children`, with its
-  `$ref` back to the node) once on the node schema, and let the `oneOf` branches hold only the
-  discriminator and each kind's own members.
-- **Nothing bounds validation time.** It runs in the write's check phase: inside a read
-  transaction, outside the write lock, so it holds a database connection and a core thread but
-  does not block other writers. A schema of the first shape makes every write to its documents
-  slow, and on a trace it used to read as a slow database read. The `core.schema.validate` span now shows it (README, "Telemetry").
-  A bound is a [gap](#gaps-in-this-implementation).
+- **Validation is bounded by steps**, a step being one schema applied to one value: 5,000,000
+  for a document unless `serve -max-validation-steps` says otherwise. A write that needs more is
+  refused `422`, `limit: "validationSteps"`. The `core.schema.validate` span carries the count
+  (README, "Telemetry").
+- **The tables above predate this** and still include the old validator's time. They have not
+  been rerun on server X.
+- Keeping the recursion out of the union (declaring `children` once on the node schema, with
+  only the discriminator and each kind's own members in the branches) is still the cheaper
+  schema, but no longer needed to stay out of trouble.
 
 Server X's large documents were measured three times (twice with grants, once without). The
 three agree within a third at worst.
@@ -657,7 +660,6 @@ Each limit is one of three kinds:
 | **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request. The origin shares their reads ([Origin-side collapse](#origin-side-collapse)), at ~0.03–0.04 ms of core CPU per follower per write (0.12–0.14 ms through Varnish). | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
 | **No read replicas, and one `-db` for everything.** The core runs migrations, the tailer and leader jobs, so it can't run on a read-only database. | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
 | **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: 6–7 min on server X (fetches at 2,400–2,800/s); 1.3 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
-| **Nothing bounds schema validation time**, and the validator evaluates every `oneOf`/`anyOf` branch in full. | A recursive union schema takes seconds on a document of a thousand nodes ([A recursive union schema](#a-recursive-union-schema)), on a core thread and a database connection for as long. | A time or step budget for validation, refused as a limit; a validator that stops a branch at its first failure, or remembers what it has checked. |
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
 | **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.0 GB on server X and 1.4 GB on SQLite over a whole run. Scans, reads and small writes alone peaked at 0.2–0.3 GB; the rest came with 3.5 MiB documents and 5,000 followers. | Run with `GOMEMLIMIT` under container limits; profile the large-document path (an opt-in pprof listener would help). |
 
@@ -677,6 +679,11 @@ These were limits and are not any more:
 - **The read cache** emptied itself when full. Now it evicts a quarter.
 - **Rate-limit buckets**, one per (namespace, resource, principal) written, were never dropped.
   Now they are swept once full again, which is the same as new.
+- **Nothing bounded schema validation time**, and the validator evaluated every `oneOf`/`anyOf`
+  branch in full, so a recursive union schema took seconds on a document of a thousand nodes.
+  Now validation stops a branch at its first failure and is bounded by steps
+  ([A recursive union schema](#a-recursive-union-schema)). Rule `test`s with a `schema`, and
+  annotation walks, are not bounded.
 - **Compiled schemas and their documents** were kept forever. Now the 512 and 2,048 most
   recently used are kept.
 - **Long-polls of a namespace** each read the log on their own when woken. Now the read is

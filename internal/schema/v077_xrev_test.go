@@ -2,8 +2,6 @@ package schema
 
 import (
 	"testing"
-
-	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // Cross-review (conformance lens): v0.77's vectors, now §I.18 (§6.2 step 5):
@@ -54,14 +52,6 @@ func TestV077XconfHostnameVectors(t *testing.T) {
 // v077xFormat validates v against {"format": f} compiled as V073 does.
 func v077xFormat(t *testing.T, f string, v any) error {
 	t.Helper()
-	c := jsonschema.NewCompiler()
-	V073.Configure(c)
-	if err := c.AddResource("x.json", map[string]any{"format": f}); err != nil {
-		t.Fatal(err)
-	}
-	sch, err := c.Compile("x.json")
-	if err != nil {
-		t.Fatal(err)
-	}
+	sch := compileOpts(t, V073.Options(), map[string]any{"format": f})
 	return sch.Validate(v)
 }

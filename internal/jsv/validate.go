@@ -186,6 +186,9 @@ func (s *state) upItem(i int, kw string, kwIdx int) bool {
 // properties and items of v were evaluated, for an unevaluated* keyword of
 // a schema applied to the same instance.
 func (s *state) eval(n *node, v any, ev *evals) bool {
+	if s.over {
+		return false // the count stays where the budget ran out
+	}
 	s.steps++
 	if s.budget > 0 && s.steps > s.budget {
 		s.over = true
@@ -200,7 +203,7 @@ func (s *state) eval(n *node, v any, ev *evals) bool {
 	if s.sch.cyclic {
 		// A schema that comes back to itself on the same instance fails
 		// there, as a reference cycle does in the library this package
-		// is measured against: {"$ref": "#"} admits nothing.
+		// replaced: {"$ref": "#"} admits nothing.
 		for _, on := range s.chain[s.base:] {
 			if on == n {
 				return s.fail(n, "cycle", v)

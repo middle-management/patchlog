@@ -26,10 +26,10 @@ func TestValidationError(t *testing.T) {
 		{`5`, "", "/type", "got integer, want object"},
 		{`{"list": [1]}`, "/list/0", "/properties/list/prefixItems/0/type", "got integer, want string"},
 		{`{"list": ["x", {"id": 1}, {"id": 0}]}`, "/list/2/id", "/properties/list/items/$ref/properties/id/minimum", "minimum: got 0, want 1"},
-		{`{"list": ["x", {}]}`, "/list/1", "/properties/list/items/$ref/required", `missing property "id"`},
+		{`{"list": ["x", {}]}`, "/list/1", "/properties/list/items/$ref/required", "missing property 'id'"},
 		{`{"a/b": 4}`, "/a~1b", "/properties/a~1b/allOf/1/maximum", "maximum: got 4, want 3"},
-		{`{"u": 1}`, "/u", "/properties/u/anyOf", "anyOf failed, none matched"},
-		{`{"zz": 1}`, "", "/additionalProperties", `additional property "zz" not allowed`},
+		{`{"u": 1}`, "/u", "/properties/u/anyOf", "'anyOf' failed, none matched"},
+		{`{"zz": 1}`, "", "/additionalProperties", "additional properties 'zz' not allowed"},
 	} {
 		err := sch.Validate(mustJSON(tc.doc), ValidateOptions{})
 		var ve *ValidationError
@@ -204,4 +204,109 @@ func TestConcurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestCollect(t *testing.T) {
+	sch, err := Compile(mustJSON(`{
+		"type": "object",
+		"required": ["id", "name"],
+		"properties": {
+			"id": {"type": "integer", "minimum": 1},
+			"name": {"type": "string", "minLength": 2, "pattern": "^[a-z]+$"},
+			"tags": {"type": "array", "uniqueItems": true, "maxItems": 2, "contains": {"const": "core"}, "items": {"type": "string"}},
+			"shape": {"oneOf": [
+				{"type": "object", "required": ["kind", "r"], "properties": {"kind": {"const": "circle"}, "r": {"type": "number"}}},
+				{"type": "object", "required": ["kind", "w"], "properties": {"kind": {"const": "rect"}, "w": {"type": "number"}}}
+			]},
+			"either": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+			"both": {"oneOf": [{"type": "integer"}, {"minimum": 0}]},
+			"names": {"propertyNames": {"maxLength": 2}},
+			"closed": {"properties": {"a": true}, "unevaluatedProperties": false},
+			"no": {"not": {"type": "null"}}
+		},
+		"additionalProperties": false
+	}`), "", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		doc  string
+		want []string // pointer: message
+	}{
+		{`{"id": 1, "name": "ab"}`, nil},
+		{`[]`, []string{": got array, want object"}},
+		{`{"x": 1, "y": 2}`, []string{": additional properties 'x', 'y' not allowed", ": missing properties 'id', 'name'"}},
+		{`{"id": 0, "name": "A"}`, []string{"/id: minimum: got 0, want 1", "/name: 'A' does not match pattern '^[a-z]+$'", "/name: minLength: got 1, want 2"}},
+		{`{"id": 1, "name": "ab", "tags": ["a", "a", 3]}`, []string{
+			"/tags: items at 0 and 1 are equal", "/tags: maxItems: got 3, want 2", "/tags: no items match contains schema", "/tags/2: got integer, want string"}},
+		// The branch whose tag fits says what is wrong; the other is left out.
+		{`{"id": 1, "name": "ab", "shape": {"kind": "rect", "w": "wide"}}`, []string{"/shape/w: got string, want number"}},
+		{`{"id": 1, "name": "ab", "shape": {"kind": "rect"}}`, []string{"/shape: missing property 'w'"}},
+		// No tag fits: what refutes each branch.
+		{`{"id": 1, "name": "ab", "shape": {"kind": "oval"}}`, []string{
+			"/shape: missing property 'r'", "/shape: missing property 'w'", "/shape/kind: value must be 'circle'", "/shape/kind: value must be 'rect'"}},
+		{`{"id": 1, "name": "ab", "either": 5}`, []string{"/either: got integer, want null", "/either: got integer, want string"}},
+		{`{"id": 1, "name": "ab", "both": 5}`, []string{"/both: 'oneOf' failed, subschemas 0, 1 matched"}},
+		{`{"id": 1, "name": "ab", "names": {"abc": 1, "ab": 2}}`, []string{"/names: invalid propertyName 'abc'"}},
+		{`{"id": 1, "name": "ab", "closed": {"a": 1, "b": 2, "c": 3}}`, []string{"/closed: unevaluated properties 'b', 'c' not allowed"}},
+		{`{"id": 1, "name": "ab", "no": null}`, []string{"/no: 'not' failed"}},
+	} {
+		doc := mustJSON(tc.doc)
+		fs, err := sch.Collect(doc, ValidateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, f := range fs {
+			got = append(got, f.InstancePath+": "+f.Message)
+		}
+		if strings.Join(got, "\n") != strings.Join(tc.want, "\n") {
+			t.Errorf("%s:\n  got  %q\n  want %q", tc.doc, got, tc.want)
+		}
+		checkCollect(t, sch, doc, sch.Validate(doc, ValidateOptions{}))
+	}
+}
+
+// TestCollectUnion: listing the failures of a deep document of a tagged
+// union follows the branch each tag names, so it is no slower than
+// validating; with every tag wrong it is bounded by the budget.
+func TestCollectUnion(t *testing.T) {
+	sch, err := Compile(mustJSON(benchUnionSchema), "", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := unionTree(0, 10)
+	leaf, _ := lookup(tree, strings.Repeat("/children/1", 9))
+	leaf.(map[string]any)["children"] = "none"
+	var full, st Stats
+	if err := sch.Validate(tree, ValidateOptions{Stats: &full}); err == nil {
+		t.Fatal("valid")
+	}
+	fs, err := sch.Collect(tree, ValidateOptions{Stats: &st})
+	if err != nil || len(fs) != 1 || fs[0].InstancePath != strings.Repeat("/children/1", 9)+"/children" || fs[0].Message != "got string, want array" {
+		t.Errorf("Collect = %v, %v", fs, err)
+	}
+	t.Logf("Validate: %d steps; Collect: %d steps", full.Steps, st.Steps)
+	if st.Steps > 3*14833 {
+		t.Errorf("Collect took %d steps", st.Steps)
+	}
+
+	var wrong func(v any)
+	wrong = func(v any) {
+		m := v.(map[string]any)
+		m["kind"] = "k9"
+		if kids, ok := m["children"].([]any); ok {
+			for _, k := range kids {
+				wrong(k)
+			}
+		}
+	}
+	wrong(tree)
+	if _, err := sch.Collect(tree, ValidateOptions{Budget: 5_000_000, Stats: &st}); err != nil && !errors.Is(err, ErrBudget) {
+		t.Errorf("every tag wrong: %v", err)
+	}
+	t.Logf("every tag wrong: Collect took %d steps", st.Steps)
+	if st.Steps > 5_000_001 {
+		t.Errorf("Collect took %d steps past its budget", st.Steps)
+	}
 }

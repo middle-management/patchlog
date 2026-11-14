@@ -366,6 +366,7 @@ func TestValidateChangeProperty(t *testing.T) {
 					ops, next := pg.patch(doc)
 					var full, part Stats
 					want := sch.Validate(next, ValidateOptions{Stats: &full})
+					checkCollect(t, sch, next, want)
 					if want == nil {
 						valid++
 					} else {

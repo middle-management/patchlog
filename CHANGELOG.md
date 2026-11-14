@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **A validator of our own, and a limit on validation work.** JSON Schema validation is now
+  done by `internal/jsv`, written for this server, in place of the
+  `santhosh-tekuri/jsonschema` library, which is no longer a dependency. It compiles a schema
+  once, stops at the first failure, checks a value's own keywords and scalar members before it
+  looks into objects and arrays, and allocates nothing for a valid document. In the validator
+  alone, on a development machine: a 1 MiB document of 9,500 small typed objects validates in
+  4.2 ms where it took 43 ms, and a recursive union schema over a tree of 1,023 nodes in
+  0.39 ms where it took seconds (docs/CAPACITY.md).
+  - **New limit `validationSteps`.** Validating one document may take 5,000,000 steps, a step
+    being one schema applied to one value; `serve -max-validation-steps N` changes it and `0`
+    lifts it. A write that needs more is refused `422` with `code: "limit"`,
+    `limit: "validationSteps"`, `measured` the steps taken when it stopped and `max` the
+    limit. §6.6 has no such limit (docs/SPEC-FEEDBACK.md, v0.82 Open 92). The
+    `core.schema.validate` span carries the steps as `patchlog.schema.steps`.
+  - **`422 invalid` still lists every failure**, sorted by pointer and message. The wording of
+    some messages changed, and so did what is listed in three cases: a failed `contains` is
+    one entry at the array, not one per item; an object closed by `unevaluatedProperties:
+    false` names the members in one entry at the object; and of a `oneOf` or `anyOf` that
+    nothing matches, only the branches whose tag fits the value (its type, and the `const` or
+    `enum` of its scalar members) are listed, where every branch was.
+  - **Formats are read strictly where they have digits**: a sign in a field of a `time` or
+    `date-time`, or in a part of an `ipv4` (`"+2:00:00Z"`, `"+1.2.3.4"`), is refused; the
+    library took it.
+  - **A rule's schema fragment stored before v0.73** that uses `dependencies` or
+    `$recursiveRef` no longer compiles; the library applied both. Schema documents and
+    fragments written since were already refused for them.
+
 - **Playground: less on screen at once.** Cards collapse: each tab opens with its one or two
   main cards (Namespace: status and document; Resource: document and patch) and the rest as
   header lines that open on click, with Branches and Problems showing a count. A flow that leads

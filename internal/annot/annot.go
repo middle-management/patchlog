@@ -9,9 +9,9 @@
 // additionalProperties, prefixItems, items, contains, allOf, anyOf, oneOf,
 // if/then/else and dependentSchemas, and dropped from any subschema that failed
 // (a non-matching anyOf/oneOf branch, the untaken if/then/else branch, a
-// non-matching contains item). The santhosh-tekuri library validates but does
+// non-matching contains item). The validator (internal/jsv) validates but does
 // not expose annotations, so this package walks schema and instance together
-// and uses the library only to decide validity of individual subschemas.
+// and uses it only to decide validity of individual subschemas.
 package annot
 
 import (
@@ -24,15 +24,10 @@ import (
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/jsv"
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/schema"
-	"github.com/santhosh-tekuri/jsonschema/v6"
-	"github.com/santhosh-tekuri/jsonschema/v6/kind"
-	"golang.org/x/text/language"
-	"golang.org/x/text/message"
 )
-
-var printer = message.NewPrinter(language.English)
 
 // Annotation is one x-* keyword that applies to a location in the instance.
 type Annotation struct {
@@ -106,7 +101,7 @@ func CollectWith(root any, rootPath string, doc any, load schema.Loader, keyword
 	c.rootLabel = rootPath
 	root = jsonv.Clone(root)
 	if err := c.comp.AddResource(base, root); err != nil {
-		return nil, &schema.SchemaError{Msg: err.Error()}
+		return nil, &schema.SchemaError{Msg: compileMsg(err)}
 	}
 	c.docs[base] = root
 	return c.run(base, schema.Instance(doc))
@@ -115,9 +110,9 @@ func CollectWith(root any, rootPath string, doc any, load schema.Loader, keyword
 type collector struct {
 	load      schema.Loader
 	filter    map[string]bool
-	comp      *jsonschema.Compiler
-	docs      map[string]any                // base URL -> schema document
-	compiled  map[string]*jsonschema.Schema // base#fragment -> validator
+	comp      *jsv.Compiler
+	docs      map[string]any         // base URL -> schema document
+	compiled  map[string]*jsv.Schema // base#fragment -> validator
 	regexps   map[string]*regexp.Regexp
 	loadErr   error
 	rootLabel string
@@ -142,7 +137,7 @@ func newCollector(load schema.Loader, keywords []string) *collector {
 	c := &collector{
 		load:     load,
 		docs:     map[string]any{},
-		compiled: map[string]*jsonschema.Schema{},
+		compiled: map[string]*jsv.Schema{},
 		regexps:  map[string]*regexp.Regexp{},
 		seen:     map[[3]string]bool{},
 	}
@@ -152,16 +147,14 @@ func newCollector(load schema.Loader, keywords []string) *collector {
 			c.filter[k] = true
 		}
 	}
-	comp := jsonschema.NewCompiler()
-	schema.V073.Configure(comp) // as every schema compiles (§6.1)
-	comp.UseLoader(urlLoader(func(u string) (any, error) { return c.doc(u) }))
-	c.comp = comp
+	o := schema.V073.Options() // as every schema compiles (§6.1)
+	o.Load = c.doc
+	c.comp = jsv.NewCompiler(o)
 	return c
 }
 
-type urlLoader func(string) (any, error)
-
-func (f urlLoader) Load(u string) (any, error) { return f(u) }
+// compileMsg is a compile failure as a SchemaError says it.
+func compileMsg(err error) string { return strings.TrimPrefix(err.Error(), "jsv: ") }
 
 // doc returns the schema document at base URL u, loading revision paths.
 func (c *collector) doc(u string) (any, error) {
@@ -248,18 +241,20 @@ func fragment(p pointer.Pointer) string {
 
 // validates reports whether the subschema at l accepts inst.
 func (c *collector) validates(l loc, inst any) (bool, error) {
-	err := c.validate(l, inst)
-	if err == nil {
-		return true, nil
+	sch, err := c.schemaAt(l)
+	if err != nil {
+		return false, err
 	}
-	var ve *jsonschema.ValidationError
-	if errors.As(err, &ve) {
-		return false, nil
+	err = sch.Validate(inst, jsv.ValidateOptions{})
+	var ve *jsv.ValidationError
+	if err == nil || errors.As(err, &ve) {
+		return err == nil, nil
 	}
 	return false, err
 }
 
-func (c *collector) validate(l loc, inst any) error {
+// schemaAt compiles the subschema at l, once.
+func (c *collector) schemaAt(l loc) (*jsv.Schema, error) {
 	key := l.id()
 	sch := c.compiled[key]
 	if sch == nil {
@@ -267,26 +262,35 @@ func (c *collector) validate(l loc, inst any) error {
 		sch, err = c.comp.Compile(l.base + "#" + fragment(l.ptr))
 		if err != nil {
 			if c.loadErr != nil {
-				return c.loadErr
+				return nil, c.loadErr
 			}
-			return &schema.SchemaError{Msg: err.Error()}
+			return nil, &schema.SchemaError{Msg: compileMsg(err)}
 		}
 		c.compiled[key] = sch
 	}
-	return sch.Validate(inst)
+	return sch, nil
 }
 
 func (c *collector) run(base string, doc any) ([]Annotation, error) {
 	root := loc{base: base}
-	if err := c.validate(root, doc); err != nil {
-		var ve *jsonschema.ValidationError
-		if errors.As(err, &ve) {
-			if msg, ok := refCycle(ve); ok {
-				return nil, &schema.SchemaError{Msg: msg}
-			}
-			return nil, toValidationError(ve)
-		}
+	sch, err := c.schemaAt(root)
+	if err != nil {
 		return nil, err
+	}
+	if err := sch.Validate(doc, jsv.ValidateOptions{}); err != nil {
+		var ve *jsv.ValidationError
+		if !errors.As(err, &ve) {
+			return nil, err
+		}
+		// A reference cycle is found when validating; it is a defect of
+		// the schema, not of the document.
+		fs, _ := sch.Collect(doc, jsv.ValidateOptions{})
+		for _, f := range fs {
+			if f.Cycle != "" {
+				return nil, &schema.SchemaError{Msg: f.Message}
+			}
+		}
+		return nil, schema.Failures(sch, doc, 0, ve)
 	}
 	if err := c.walk(root, doc, nil, 0, nil); err != nil {
 		return nil, err
@@ -650,49 +654,4 @@ func (c *collector) walk(l loc, inst any, key []tok, depth int, refs map[string]
 		}
 	}
 	return nil
-}
-
-// refCycle reports a reference cycle, which the library detects at
-// validation time; it is a defect of the schema, not of the document.
-func refCycle(ve *jsonschema.ValidationError) (string, bool) {
-	if rc, ok := ve.ErrorKind.(*kind.RefCycle); ok {
-		return ve.ErrorKind.LocalizedString(printer) + " (" + rc.URL + ")", true
-	}
-	for _, c := range ve.Causes {
-		if msg, ok := refCycle(c); ok {
-			return msg, true
-		}
-	}
-	return "", false
-}
-
-// toValidationError flattens a library validation error into leaf details.
-func toValidationError(ve *jsonschema.ValidationError) error {
-	seen := map[schema.Detail]bool{}
-	var out []schema.Detail
-	var rec func(e *jsonschema.ValidationError)
-	rec = func(e *jsonschema.ValidationError) {
-		if len(e.Causes) == 0 {
-			d := schema.Detail{
-				Pointer: pointer.Pointer(e.InstanceLocation).String(),
-				Message: e.ErrorKind.LocalizedString(printer),
-			}
-			if !seen[d] {
-				seen[d] = true
-				out = append(out, d)
-			}
-			return
-		}
-		for _, cause := range e.Causes {
-			rec(cause)
-		}
-	}
-	rec(ve)
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].Pointer != out[j].Pointer {
-			return out[i].Pointer < out[j].Pointer
-		}
-		return out[i].Message < out[j].Message
-	})
-	return &schema.ValidationError{Errors: out}
 }

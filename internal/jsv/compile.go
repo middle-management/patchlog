@@ -370,6 +370,8 @@ type compiler struct {
 	resList   []*resource
 	nodes     map[string]*node
 	dynamic   bool
+	isCyclic  bool // cyclic(), as of cyclicAt nodes
+	cyclicAt  int
 }
 
 //go:embed metaschemas
@@ -423,6 +425,21 @@ func Compile(root any, baseURI string, opts Options) (*Schema, error) {
 	if i := strings.IndexByte(baseURI, '#'); i >= 0 {
 		baseURI = baseURI[:i]
 	}
+	c := NewCompiler(opts)
+	if err := c.AddResource(baseURI, root); err != nil {
+		return nil, err
+	}
+	return c.Compile(baseURI)
+}
+
+// Compiler compiles several schemas over the same documents: the
+// documents are loaded and checked once, and what the schemas share is
+// compiled once. It is not safe for concurrent use; the schemas it
+// returns are.
+type Compiler struct{ c *compiler }
+
+// NewCompiler returns a Compiler with no documents.
+func NewCompiler(opts Options) *Compiler {
 	c := &compiler{
 		opts:      opts,
 		regexp:    opts.Regexp,
@@ -440,11 +457,24 @@ func Compile(root any, baseURI string, opts Options) (*Schema, error) {
 	for name, f := range opts.Formats {
 		c.formats[name] = f
 	}
-	doc, err := c.addDoc(baseURI, root)
-	if err != nil {
-		return nil, err
+	return &Compiler{c}
+}
+
+// AddResource makes doc the document at uri (absolute, no fragment), so
+// that it is not asked of Options.Load.
+func (cc *Compiler) AddResource(uri string, doc any) error {
+	if cc.c.docs[uri] != nil {
+		return &CompileError{Location: uri, Msg: "the document is already added"}
 	}
-	n, err := c.compileAt(doc, "", root)
+	_, err := cc.c.addDoc(uri, doc)
+	return err
+}
+
+// Compile compiles the schema at uri: a document, or with a fragment a
+// JSON Pointer or an anchor into one.
+func (cc *Compiler) Compile(uri string) (*Schema, error) {
+	c := cc.c
+	n, _, err := c.resolveRef(&resource{}, uri, uri)
 	if err != nil {
 		return nil, err
 	}
@@ -453,6 +483,9 @@ func Compile(root any, baseURI string, opts Options) (*Schema, error) {
 		// scope, so compile them all. Compiling can load more documents.
 		for i := 0; i < len(c.resList); i++ {
 			r := c.resList[i]
+			if len(r.dynNodes) == len(r.dynAnchors) {
+				continue
+			}
 			names := make([]string, 0, len(r.dynAnchors))
 			for name := range r.dynAnchors {
 				names = append(names, name)
@@ -472,7 +505,13 @@ func Compile(root any, baseURI string, opts Options) (*Schema, error) {
 			}
 		}
 	}
-	return &Schema{root: n, dynamic: c.dynamic, cyclic: c.dynamic || c.cyclic(), nodes: len(c.nodes), regexp: c.regexp}, nil
+	// Nodes compiled for an earlier schema may be shared with this one,
+	// so both flags are those of everything compiled so far: a schema
+	// compiled before a $dynamicRef or a cycle appeared reaches neither.
+	if len(c.nodes) != c.cyclicAt {
+		c.cyclicAt, c.isCyclic = len(c.nodes), c.cyclic()
+	}
+	return &Schema{root: n, dynamic: c.dynamic, cyclic: c.dynamic || c.isCyclic, nodes: len(c.nodes), regexp: c.regexp}, nil
 }
 
 // getDoc returns the document at uri, loading it if need be.
@@ -514,7 +553,7 @@ func (c *compiler) addDoc(uri string, root any) (*document, error) {
 
 // checkMeta validates a schema document against the draft 2020-12
 // meta-schema, formats asserted (regex with the caller's engine), as the
-// library this package is measured against does when it compiles. It finds
+// library this package replaced does when it compiles. It finds
 // what compiling does not look at: a malformed schema nothing refers to, a
 // keyword that is only an annotation here. A document of a dialect with
 // its own meta-schema is not checked against that one.
@@ -542,7 +581,7 @@ var (
 	schemaKeywords = []string{"additionalProperties", "items", "contains", "propertyNames", "not", "if", "then", "else",
 		"unevaluatedItems", "unevaluatedProperties", "contentSchema"}
 	schemaArrayKeywords = []string{"allOf", "anyOf", "oneOf", "prefixItems"}
-	schemaMapKeywords   = []string{"$defs", "definitions", "properties", "patternProperties", "dependentSchemas", "dependencies"}
+	schemaMapKeywords   = []string{"$defs", "definitions", "properties", "patternProperties", "dependentSchemas"}
 )
 
 // index finds the resources ($id) and anchors of a document, visiting only
@@ -631,9 +670,6 @@ func (c *compiler) index(d *document, raw any, ptr string, res *resource) error 
 	for _, kw := range schemaMapKeywords {
 		if obj, ok := m[kw].(map[string]any); ok {
 			for k, sub := range obj {
-				if _, isList := sub.([]any); isList {
-					continue // a list of names in dependencies
-				}
 				if err := c.index(d, sub, ptr+"/"+kw+"/"+escapeToken(k), res); err != nil {
 					return err
 				}
@@ -988,10 +1024,16 @@ func (b *builder) build() error {
 			c.dynamic = true
 		}
 	}
-	if _, ok := m["$recursiveRef"]; ok {
-		// Not a draft 2020-12 keyword, so by the letter it is ignored; but
-		// the library this package is measured against still applies it.
-		return &UnsupportedError{Location: n.loc, Keyword: "$recursiveRef", Msg: "use $dynamicRef"}
+	// Keywords of earlier drafts that draft 2020-12 replaced: ignoring
+	// them, as unknown keywords are, would quietly drop a constraint the
+	// author meant, so they are refused.
+	for kw, use := range map[string]string{
+		"$recursiveRef": "$dynamicRef",
+		"dependencies":  "dependentRequired and dependentSchemas",
+	} {
+		if _, ok := m[kw]; ok {
+			return &UnsupportedError{Location: n.loc, Keyword: kw, Msg: "not a draft 2020-12 keyword; use " + use}
+		}
 	}
 	if vocab&vValidation != 0 {
 		if err = b.validation(); err != nil {
@@ -1212,35 +1254,6 @@ func (b *builder) applicators() error {
 	if n.depSchemas, err = b.subMap("dependentSchemas"); err != nil {
 		return err
 	}
-	// dependencies, which draft 2019-09 split into dependentRequired and
-	// dependentSchemas, still has its meaning: the library this package is
-	// measured against keeps it, so schemas stored with it rely on it.
-	if dv, ok := b.m["dependencies"]; ok {
-		obj, ok := dv.(map[string]any)
-		if !ok {
-			return b.errf("dependencies", "must be an object")
-		}
-		keys := make([]string, 0, len(obj))
-		for k := range obj {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if _, isList := obj[k].([]any); isList {
-				need, err := b.strings("dependencies", obj[k])
-				if err != nil {
-					return err
-				}
-				n.depRequired = append(n.depRequired, depRequired{key: k, need: need})
-				continue
-			}
-			sub, err := b.c.compileAt(b.d, b.ptr+"/dependencies/"+escapeToken(k), obj[k])
-			if err != nil {
-				return err
-			}
-			n.depSchemas = append(n.depSchemas, prop{key: k, n: sub})
-		}
-	}
 	if n.prefix, err = b.subList("prefixItems"); err != nil {
 		return err
 	}
@@ -1312,6 +1325,9 @@ func (n *node) inPlace(f func(*node) error) error {
 // Validation then watches for it; most schemas need not.
 func (c *compiler) cyclic() bool {
 	errCycle := errors.New("cycle")
+	for _, n := range c.nodes {
+		n.mark = 0
+	}
 	var visit func(n *node) error
 	visit = func(n *node) error {
 		switch n.mark {
@@ -1354,4 +1370,11 @@ func kindOf(v any) string {
 		return "object"
 	}
 	return fmt.Sprintf("%T", v)
+}
+
+// MetaSchema compiles the draft 2020-12 meta-schema with opts, to validate
+// schema documents with: Collect then says all that is wrong with one.
+func MetaSchema(opts Options) (*Schema, error) {
+	opts.SkipMetaSchema = true
+	return Compile(embedded(Draft2020), Draft2020, opts)
 }

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"testing"
 )
 
 func mustJSON(s string) any {
@@ -180,13 +181,14 @@ var openTreeSchema = strings.Replace(dynamicSchema, `"unevaluatedProperties": fa
 var testSchemas = []struct {
 	name, schema string
 	local        bool
+	valid        int // of the 3000 documents TestGeneratedDocuments makes
 }{
-	{"structured", structuredSchema, true},
-	{"mixed", mixedSchema, true},
-	{"union", unionSchema, true},
-	{"dynamic", dynamicSchema, false},
-	{"open-tree", openTreeSchema, true},
-	{"tagged", taggedSchema, false},
+	{"structured", structuredSchema, true, 2007},
+	{"mixed", mixedSchema, true, 748},
+	{"union", unionSchema, true, 2128},
+	{"dynamic", dynamicSchema, false, 2090},
+	{"open-tree", openTreeSchema, true, 2090},
+	{"tagged", taggedSchema, false, 1456},
 }
 
 // generator makes a document from a schema, as well as a handful of
@@ -383,4 +385,29 @@ func pointers(doc any) []string {
 	}
 	walk(doc, "")
 	return out
+}
+
+// checkCollect holds Collect to Validate: failures if and only if invalid,
+// sorted, without repeats, and the first failure Validate found among the
+// locations Collect names or above one.
+func checkCollect(t testing.TB, sch *Schema, doc any, verdict error) {
+	t.Helper()
+	fs, err := sch.Collect(doc, ValidateOptions{})
+	if err != nil {
+		t.Fatalf("Collect(%s): %v", jsonText(doc), err)
+	}
+	if (len(fs) == 0) != (verdict == nil) {
+		t.Fatalf("Collect(%s) = %v, Validate = %v", jsonText(doc), fs, verdict)
+	}
+	for i := 1; i < len(fs); i++ {
+		a, b := fs[i-1], fs[i]
+		if a.InstancePath > b.InstancePath || a.InstancePath == b.InstancePath && a.Message >= b.Message {
+			t.Fatalf("Collect(%s): not sorted or repeated: %v", jsonText(doc), fs)
+		}
+	}
+	for _, f := range fs {
+		if f.Message == "" {
+			t.Fatalf("Collect(%s): empty message: %v", jsonText(doc), fs)
+		}
+	}
 }
