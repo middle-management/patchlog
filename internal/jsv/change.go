@@ -134,10 +134,13 @@ func (s *state) change(n *node, v any, c *change) bool {
 		s.over = true
 		return false
 	}
-	s.hop++
-	if s.hop > s.maxHop {
-		s.loop = true
-		return false
+	if s.sch.cyclic {
+		for _, on := range s.chain[s.base:] {
+			if on == n {
+				return s.fail(n, "cycle", v)
+			}
+		}
+		s.chain = append(s.chain, n)
 	}
 	var ok bool
 	// The dynamic scope is kept as full validation would have it here.
@@ -148,15 +151,17 @@ func (s *state) change(n *node, v any, c *change) bool {
 	} else {
 		ok = s.changeBody(n, v, c)
 	}
-	s.hop--
+	if s.sch.cyclic {
+		s.chain = s.chain[:len(s.chain)-1]
+	}
 	return ok
 }
 
 func (s *state) changeChild(n *node, v any, c *change) bool {
-	h := s.hop
-	s.hop = 0
+	b := s.base
+	s.base = len(s.chain)
 	ok := s.change(n, v, c)
-	s.hop = h
+	s.base = b
 	return ok
 }
 
@@ -225,8 +230,8 @@ func (s *state) changeBody(n *node, v any, c *change) bool {
 				return s.upKw("$dynamicRef")
 			}
 			if n.anyOf != nil {
-				if i := s.soleBranch(n.anyOf, v, c); i < 0 {
-					if !s.anyOfOK(n, v, nil) {
+				if i, refuted := s.soleBranch(n.anyOf, v, c); i < 0 {
+					if !s.anyOfOK(n, v, nil, refuted) {
 						return false
 					}
 				} else if !s.change(n.anyOf[i], v, c) {
@@ -234,8 +239,8 @@ func (s *state) changeBody(n *node, v any, c *change) bool {
 				}
 			}
 			if n.oneOf != nil {
-				if i := s.soleBranch(n.oneOf, v, c); i < 0 {
-					if !s.oneOfOK(n, v, nil) {
+				if i, refuted := s.soleBranch(n.oneOf, v, c); i < 0 {
+					if !s.oneOfOK(n, v, nil, refuted) {
 						return false
 					}
 				} else if !s.change(n.oneOf[i], v, c) {
@@ -255,22 +260,30 @@ func (s *state) changeBody(n *node, v any, c *change) bool {
 // one held, and the keyword's verdict now is that branch's, which the
 // changes alone decide. This is what keeps a tagged union from being
 // evaluated whole at every level. It returns -1 if more than one branch,
-// or none, is left.
-func (s *state) soleBranch(branches []*node, v any, c *change) int {
-	sole := -1
+// or none, is left, and in any case the branches refuted (the first 64,
+// as a bit set), which fail now as they did and need no evaluation.
+func (s *state) soleBranch(branches []*node, v any, c *change) (sole int, refuted uint64) {
+	sole = -1
+	left := 0
 	s.quiet++
 	for i, b := range branches {
-		if s.refuted(b, v, c, 0) {
+		if s.refuted(b, v, c, 0) && !s.over {
+			if i < 64 {
+				refuted |= 1 << i
+			}
 			continue
 		}
-		if sole >= 0 || s.over || s.loop {
-			sole = -1
-			break
-		}
+		left++
 		sole = i
+		if left > 1 {
+			break // no sole branch: what is refuted so far still serves
+		}
 	}
 	s.quiet--
-	return sole
+	if left != 1 || s.over {
+		sole = -1
+	}
+	return sole, refuted
 }
 
 // refuted reports whether n certainly fails on v because of something
@@ -283,8 +296,8 @@ func (s *state) refuted(n *node, v any, c *change, depth int) bool {
 	if n.boolean != 0 {
 		return n.boolean < 0
 	}
-	if depth > s.maxHop {
-		return false
+	if depth > s.sch.nodes {
+		return false // a cycle of $ref and allOf
 	}
 	pushed := s.sch.dynamic && (len(s.scope) == 0 || s.scope[len(s.scope)-1] != n.res)
 	if pushed {
@@ -300,7 +313,7 @@ func (s *state) refuted(n *node, v any, c *change, depth int) bool {
 			if !ok || isContainer(pv) || c.kids[p.key] != nil {
 				continue
 			}
-			dead = !s.child(p.n, pv) && !s.over && !s.loop
+			dead = !s.child(p.n, pv) && !s.over
 		}
 	case []any:
 		dead = n.types != 0 && n.types&tArray == 0

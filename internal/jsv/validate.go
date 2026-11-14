@@ -14,11 +14,6 @@ import (
 // reaching a verdict.
 var ErrBudget = errors.New("jsv: validation step budget exhausted")
 
-// ErrLoop reports a schema that kept applying itself to the same instance
-// through $dynamicRef. References known at compile time are checked by
-// Compile.
-var ErrLoop = errors.New("jsv: schema applies itself to the same instance without end")
-
 // ValidateOptions bound and observe one validation.
 type ValidateOptions struct {
 	// Budget is the number of steps validation may take, 0 for no limit.
@@ -63,10 +58,12 @@ type state struct {
 	steps  int
 	budget int
 	over   bool // budget exhausted: every evaluation now fails
-	loop   bool
-	hop    int // evaluations in a row on the same instance
-	maxHop int
-	quiet  int // > 0 inside a branch whose failure is not the verdict
+	quiet  int  // > 0 inside a branch whose failure is not the verdict
+
+	// The schemas being evaluated against the current instance, from base
+	// on; kept only if sch.cyclic. A schema met again there fails.
+	chain []*node
+	base  int
 
 	failed  bool // a failure is recorded, and being unwound
 	errNode *node
@@ -77,7 +74,8 @@ type state struct {
 	ipath   []tok // innermost first
 	kpath   []tok
 
-	scope  []*resource // dynamic scope, outermost first; only if sch.dynamic
+	regexp func(string) (Matcher, error) // for the regex format
+	scope  []*resource                   // dynamic scope, outermost first; only if sch.dynamic
 	evFree []*evals
 	hashes []hashed // scratch for uniqueItems
 }
@@ -86,12 +84,11 @@ var statePool = sync.Pool{New: func() any { return new(state) }}
 
 func (sc *Schema) newState(o ValidateOptions) *state {
 	s := statePool.Get().(*state)
-	s.sch = sc
+	s.sch, s.regexp = sc, sc.regexp
 	s.steps, s.budget = 0, o.Budget
-	s.over, s.loop, s.failed = false, false, false
-	s.hop, s.quiet = 0, 0
-	s.maxHop = sc.nodes + 8
-	s.ipath, s.kpath, s.scope = s.ipath[:0], s.kpath[:0], s.scope[:0]
+	s.over, s.failed = false, false
+	s.quiet, s.base = 0, 0
+	s.ipath, s.kpath, s.scope, s.chain = s.ipath[:0], s.kpath[:0], s.scope[:0], s.chain[:0]
 	return s
 }
 
@@ -104,15 +101,14 @@ func (s *state) finish(ok bool, o ValidateOptions) error {
 	switch {
 	case s.over:
 		err = ErrBudget
-	case s.loop:
-		err = ErrLoop
 	case !ok:
 		err = s.validationError()
 	}
-	s.errNode, s.errVal, s.sch = nil, nil, nil
+	s.errNode, s.errVal, s.sch, s.regexp = nil, nil, nil, nil
 	clear(s.ipath)
 	clear(s.kpath)
 	clear(s.scope)
+	clear(s.chain[:cap(s.chain)])
 	statePool.Put(s)
 	return err
 }
@@ -127,14 +123,14 @@ func (sc *Schema) Validate(v any, o ValidateOptions) error {
 // fail records the failure of keyword kw of n on v, unless a branch is
 // being tried, and returns false.
 func (s *state) fail(n *node, kw string, v any) bool {
-	if s.quiet == 0 && !s.failed && !s.over && !s.loop {
+	if s.quiet == 0 && !s.failed && !s.over {
 		s.failed, s.errNode, s.errKw, s.errVal, s.errArg = true, n, kw, v, ""
 	}
 	return false
 }
 
 func (s *state) failArg(n *node, kw string, v any, arg string, num int) bool {
-	if s.quiet == 0 && !s.failed && !s.over && !s.loop {
+	if s.quiet == 0 && !s.failed && !s.over {
 		s.failed, s.errNode, s.errKw, s.errVal, s.errArg, s.errNum = true, n, kw, v, arg, num
 	}
 	return false
@@ -201,29 +197,41 @@ func (s *state) eval(n *node, v any, ev *evals) bool {
 		}
 		return s.fail(n, "false", v)
 	}
-	s.hop++
-	if s.hop > s.maxHop {
-		s.loop = true
-		return false
+	if s.sch.cyclic {
+		// A schema that comes back to itself on the same instance fails
+		// there, as a reference cycle does in the library this package
+		// is measured against: {"$ref": "#"} admits nothing.
+		for _, on := range s.chain[s.base:] {
+			if on == n {
+				return s.fail(n, "cycle", v)
+			}
+		}
+		s.chain = append(s.chain, n)
 	}
-	var ok bool
+	ok := s.scoped(n, v, ev)
+	if s.sch.cyclic {
+		s.chain = s.chain[:len(s.chain)-1]
+	}
+	return ok
+}
+
+// scoped evaluates n with its resource in the dynamic scope.
+func (s *state) scoped(n *node, v any, ev *evals) bool {
 	if s.sch.dynamic && (len(s.scope) == 0 || s.scope[len(s.scope)-1] != n.res) {
 		s.scope = append(s.scope, n.res)
-		ok = s.evalNode(n, v, ev)
+		ok := s.evalNode(n, v, ev)
 		s.scope = s.scope[:len(s.scope)-1]
-	} else {
-		ok = s.evalNode(n, v, ev)
+		return ok
 	}
-	s.hop--
-	return ok
+	return s.evalNode(n, v, ev)
 }
 
 // child evaluates n against a child of the current instance.
 func (s *state) child(n *node, v any) bool {
-	h := s.hop
-	s.hop = 0
+	b := s.base
+	s.base = len(s.chain)
 	ok := s.eval(n, v, nil)
-	s.hop = h
+	s.base = b
 	return ok
 }
 
@@ -398,7 +406,7 @@ func (s *state) str(n *node, x string, v any) bool {
 		return s.fail(n, "format", v)
 	}
 	if n.formatRegex {
-		if _, err := s.sch.regexp(x); err != nil {
+		if _, err := s.regexp(x); err != nil {
 			return s.fail(n, "format", v)
 		}
 	}
@@ -628,10 +636,10 @@ func (s *state) inPlaceRest(n *node, v any, ev *evals) bool {
 	if n.dynRef != nil && !s.eval(s.dynTarget(n), v, ev) {
 		return s.upKw("$dynamicRef")
 	}
-	if n.anyOf != nil && !s.anyOfOK(n, v, ev) {
+	if n.anyOf != nil && !s.anyOfOK(n, v, ev, 0) {
 		return false
 	}
-	if n.oneOf != nil && !s.oneOfOK(n, v, ev) {
+	if n.oneOf != nil && !s.oneOfOK(n, v, ev, 0) {
 		return false
 	}
 	return s.conditionals(n, v, ev)
@@ -651,11 +659,16 @@ func (s *state) dynTarget(n *node) *node {
 	return n.dynRef
 }
 
-func (s *state) anyOfOK(n *node, v any, ev *evals) bool {
+// anyOfOK applies anyOf. The branches in the bit set skip are known to
+// fail and are not evaluated.
+func (s *state) anyOfOK(n *node, v any, ev *evals, skip uint64) bool {
 	found := false
 	s.quiet++
 	if ev == nil {
-		for _, sub := range n.anyOf {
+		for i, sub := range n.anyOf {
+			if i < 64 && skip&(1<<i) != 0 {
+				continue
+			}
 			if s.eval(sub, v, nil) {
 				found = true
 				break
@@ -680,14 +693,18 @@ func (s *state) anyOfOK(n *node, v any, ev *evals) bool {
 	return true
 }
 
-func (s *state) oneOfOK(n *node, v any, ev *evals) bool {
+// oneOfOK applies oneOf, skip as for anyOfOK.
+func (s *state) oneOfOK(n *node, v any, ev *evals, skip uint64) bool {
 	count := 0
 	var tmp *evals
 	if ev != nil {
 		tmp = s.getEvals()
 	}
 	s.quiet++
-	for _, sub := range n.oneOf {
+	for i, sub := range n.oneOf {
+		if i < 64 && skip&(1<<i) != 0 {
+			continue
+		}
 		if tmp != nil {
 			tmp.reset()
 		}

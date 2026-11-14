@@ -72,6 +72,11 @@ func TestCompileErrors(t *testing.T) {
 		`{"$ref": "#nowhere"}`,
 		`{"$ref": "https://elsewhere.test/schema"}`,
 		`{"$defs": {"a": {"type": "nope"}}}`,
+		`{"type": []}`,
+		`{"required": ["a", "a"]}`,
+		`{"title": 5}`,
+		`{"$id": "https://x.test/a#frag"}`,
+		`{"$anchor": "a", "$defs": {"x": {"$anchor": "a"}}}`,
 		`{"$schema": "https://elsewhere.test/dialect"}`,
 	} {
 		if _, err := Compile(mustJSON(schema), "", Options{}); !errors.As(err, &ce) {

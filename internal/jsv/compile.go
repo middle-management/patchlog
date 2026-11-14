@@ -14,6 +14,7 @@ package jsv
 import (
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/url"
@@ -21,6 +22,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Draft2020 is the dialect this package implements.
@@ -47,6 +49,10 @@ type Options struct {
 	// AssertFormat makes format an assertion. It is one anyway in a schema
 	// whose meta-schema requires the format-assertion vocabulary.
 	AssertFormat bool
+	// SkipMetaSchema leaves out the validation of each schema document
+	// against the draft 2020-12 meta-schema, for documents checked before.
+	// Keywords are still checked for what compiling them needs.
+	SkipMetaSchema bool
 }
 
 // CompileError reports a schema that cannot be compiled: a keyword of the
@@ -84,6 +90,7 @@ func (e *UnsupportedError) Error() string {
 type Schema struct {
 	root    *node
 	dynamic bool // some $dynamicRef resolves by dynamic scope
+	cyclic  bool // some schema may come back to itself on the same instance
 	nodes   int
 	regexp  func(string) (Matcher, error)
 }
@@ -368,21 +375,43 @@ type compiler struct {
 //go:embed metaschemas
 var metaFS embed.FS
 
-// embedded returns a draft 2020-12 meta-schema document, or nil.
-func embedded(uri string) any {
-	rest, ok := strings.CutPrefix(uri, "https://json-schema.org/draft/2020-12/")
-	if !ok {
-		return nil
+var metaDocs = sync.OnceValue(func() map[string]any {
+	docs := map[string]any{}
+	for _, name := range []string{"schema", "meta/core", "meta/applicator", "meta/unevaluated", "meta/validation",
+		"meta/format-annotation", "meta/format-assertion", "meta/content", "meta/meta-data"} {
+		data, err := metaFS.ReadFile("metaschemas/" + name + ".json")
+		if err != nil {
+			panic("jsv: embedded meta-schema " + name + ": " + err.Error())
+		}
+		var v any
+		if err := json.Unmarshal(data, &v); err != nil {
+			panic("jsv: embedded meta-schema " + name + ": " + err.Error())
+		}
+		docs["https://json-schema.org/draft/2020-12/"+name] = v
 	}
-	data, err := metaFS.ReadFile("metaschemas/" + rest + ".json")
-	if err != nil {
-		return nil
-	}
-	var v any
-	if err := json.Unmarshal(data, &v); err != nil {
-		panic("jsv: embedded meta-schema " + uri + ": " + err.Error())
-	}
-	return v
+	return docs
+})
+
+// embedded returns a draft 2020-12 meta-schema document, or nil. The
+// documents are shared and never modified.
+func embedded(uri string) any { return metaDocs()[uri] }
+
+var (
+	metaOnce     sync.Once
+	metaCompiled *Schema
+)
+
+// metaSchema returns the draft 2020-12 meta-schema, compiled with formats
+// asserted.
+func metaSchema() *Schema {
+	metaOnce.Do(func() {
+		meta, err := Compile(embedded(Draft2020), Draft2020, Options{AssertFormat: true, SkipMetaSchema: true})
+		if err != nil {
+			panic("jsv: compiling the embedded meta-schema: " + err.Error())
+		}
+		metaCompiled = meta
+	})
+	return metaCompiled
 }
 
 // Compile compiles the schema document root, whose base URI is baseURI (the
@@ -443,10 +472,7 @@ func Compile(root any, baseURI string, opts Options) (*Schema, error) {
 			}
 		}
 	}
-	if err := c.checkCycles(); err != nil {
-		return nil, err
-	}
-	return &Schema{root: n, dynamic: c.dynamic, nodes: len(c.nodes), regexp: c.regexp}, nil
+	return &Schema{root: n, dynamic: c.dynamic, cyclic: c.dynamic || c.cyclic(), nodes: len(c.nodes), regexp: c.regexp}, nil
 }
 
 // getDoc returns the document at uri, loading it if need be.
@@ -480,7 +506,35 @@ func (c *compiler) addDoc(uri string, root any) (*document, error) {
 	if err := c.index(d, root, "", r); err != nil {
 		return nil, err
 	}
+	if err := c.checkMeta(d); err != nil {
+		return nil, err
+	}
 	return d, nil
+}
+
+// checkMeta validates a schema document against the draft 2020-12
+// meta-schema, formats asserted (regex with the caller's engine), as the
+// library this package is measured against does when it compiles. It finds
+// what compiling does not look at: a malformed schema nothing refers to, a
+// keyword that is only an annotation here. A document of a dialect with
+// its own meta-schema is not checked against that one.
+func (c *compiler) checkMeta(d *document) error {
+	if c.opts.SkipMetaSchema || embedded(d.url) != nil {
+		return nil
+	}
+	if m, ok := d.root.(map[string]any); ok {
+		if s, ok := m["$schema"].(string); ok && strings.TrimSuffix(s, "#") != Draft2020 {
+			return nil
+		}
+	}
+	s := metaSchema().newState(ValidateOptions{})
+	s.regexp = c.regexp
+	err := s.finish(s.eval(s.sch.root, d.root, nil), ValidateOptions{})
+	var ve *ValidationError
+	if errors.As(err, &ve) {
+		return &CompileError{Location: d.url + "#" + ve.InstancePath, Msg: "not a valid schema: " + ve.Message}
+	}
+	return err
 }
 
 // Where subschemas are.
@@ -939,14 +993,6 @@ func (b *builder) build() error {
 		// the library this package is measured against still applies it.
 		return &UnsupportedError{Location: n.loc, Keyword: "$recursiveRef", Msg: "use $dynamicRef"}
 	}
-	// Subschemas that are only referenced must still be well-formed where
-	// they are declared.
-	for _, kw := range [...]string{"$defs", "definitions"} {
-		if _, err = b.subMap(kw); err != nil {
-			return err
-		}
-	}
-
 	if vocab&vValidation != 0 {
 		if err = b.validation(); err != nil {
 			return err
@@ -1261,14 +1307,16 @@ func (n *node) inPlace(f func(*node) error) error {
 	return nil
 }
 
-// checkCycles refuses a schema that applies itself to the same instance,
-// as {"$ref": "#"} does: validating with it would never end.
-func (c *compiler) checkCycles() error {
+// cyclic reports whether some schema applies itself to the same instance
+// through references known at compile time, as {"$ref": "#"} does.
+// Validation then watches for it; most schemas need not.
+func (c *compiler) cyclic() bool {
+	errCycle := errors.New("cycle")
 	var visit func(n *node) error
 	visit = func(n *node) error {
 		switch n.mark {
 		case 1:
-			return &CompileError{Location: n.loc, Msg: "the schema applies itself to the same instance without end"}
+			return errCycle
 		case 2:
 			return nil
 		}
@@ -1279,17 +1327,12 @@ func (c *compiler) checkCycles() error {
 		n.mark = 2
 		return nil
 	}
-	keys := make([]string, 0, len(c.nodes))
-	for k := range c.nodes {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		if err := visit(c.nodes[k]); err != nil {
-			return err
+	for _, n := range c.nodes {
+		if visit(n) != nil {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 func kindOf(v any) string {

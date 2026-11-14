@@ -18,7 +18,7 @@ func (s *state) validationError() *ValidationError {
 	}
 	kw := s.errKw
 	switch kw {
-	case "false", "value":
+	case "false", "value", "cycle":
 		kw = ""
 	}
 	e.KeywordPath = pathString(s.kpath, kw)
@@ -63,6 +63,8 @@ func (s *state) message() string {
 		return "false schema"
 	case "value":
 		return fmt.Sprintf("not a JSON value: %T", v)
+	case "cycle":
+		return "reference cycle: " + n.loc + " applies itself to the same value"
 	case "type":
 		return fmt.Sprintf("got %s, want %s", kindOf(v), typeSetString(n.types))
 	case "const":

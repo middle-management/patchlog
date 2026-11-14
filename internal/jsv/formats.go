@@ -7,8 +7,11 @@ import (
 )
 
 // builtinFormats are the formats checked when format is asserted. They
-// read each format the way github.com/santhosh-tekuri/jsonschema/v6 does,
-// which this package is measured against. regex is checked with the
+// accept what github.com/santhosh-tekuri/jsonschema/v6, which this package
+// is measured against, accepts, with one exception: where a format has
+// digits (the fields of a time, the parts of an ipv4), that library reads
+// them with strconv.Atoi and so takes a sign ("+2:00:00Z", "+1.2.3.4");
+// these do not (TestDifferentialFormats). regex is checked with the
 // schema's regexp engine, and a name not here (idn-email and idn-hostname
 // among them) passes unless Options.Formats supplies it.
 var builtinFormats = map[string]func(string) bool{

@@ -141,20 +141,6 @@ func TestBudget(t *testing.T) {
 	}
 }
 
-// TestLoop: a schema that applies itself to the same instance is refused,
-// at compile time if its references say so, when validating otherwise.
-func TestLoop(t *testing.T) {
-	var ce *CompileError
-	for _, s := range []string{`{"$ref": "#"}`, `{"allOf": [{"$ref": "#/$defs/a"}], "$defs": {"a": {"anyOf": [{"$ref": "#"}]}}}`} {
-		if _, err := Compile(mustJSON(s), "", Options{}); !errors.As(err, &ce) {
-			t.Errorf("%s: %v", s, err)
-		}
-	}
-	if _, err := Compile(mustJSON(`{"properties": {"a": {"$ref": "#"}}}`), "", Options{}); err != nil {
-		t.Errorf("recursion through a child: %v", err)
-	}
-}
-
 // TestLibraryUnionTime times the library on the recursive union once: it
 // is too slow to benchmark by default. Run with -run TestLibraryUnionTime -v.
 func TestLibraryUnionTime(t *testing.T) {
@@ -256,6 +242,34 @@ func BenchmarkUnion(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			if err := lib.Validate(tree); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// BenchmarkCompile compiles the structured schema, with and without the
+// check against the meta-schema, which compiles the meta-schema each time.
+func BenchmarkCompile(b *testing.B) {
+	raw := mustJSON(structuredSchema)
+	for _, skip := range []bool{false, true} {
+		name := "meta-checked"
+		if skip {
+			name = "unchecked"
+		}
+		b.Run("jsv-"+name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				if _, err := Compile(raw, "", Options{AssertFormat: true, SkipMetaSchema: skip}); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+	b.Run("library", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := libCompile(raw, nil); err != nil {
 				b.Fatal(err)
 			}
 		}

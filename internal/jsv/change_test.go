@@ -92,6 +92,53 @@ func TestValidateChangeEdges(t *testing.T) {
 	}
 }
 
+// TestValidateChangeTagged: in a tree of tagged unions, a change in a
+// leaf is validated along its path, each anyOf by the one branch that
+// what did not change leaves standing.
+func TestValidateChangeTagged(t *testing.T) {
+	sch, err := Compile(mustJSON(taggedSchema), "", Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var build func(depth int) any
+	build = func(depth int) any {
+		if depth == 0 {
+			return map[string]any{"tag": "a", "payload": map[string]any{"n": 1.0}}
+		}
+		return map[string]any{"tag": "g", "members": []any{build(depth - 1), build(depth - 1), build(depth - 1)}}
+	}
+	doc := build(6) // 729 leaves
+	var full, part Stats
+	if err := sch.Validate(doc, ValidateOptions{Stats: &full}); err != nil {
+		t.Fatal(err)
+	}
+	leaf := strings.Repeat("/members/2", 6)
+	changed := []string{leaf + "/payload/n"}
+	if err := sch.ValidateChange(doc, changed, ValidateOptions{Stats: &part}); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Validate: %d steps; ValidateChange: %d steps", full.Steps, part.Steps)
+	if part.Steps*20 > full.Steps {
+		t.Errorf("ValidateChange took %d steps where Validate took %d", part.Steps, full.Steps)
+	}
+	payload, _ := lookup(doc, leaf+"/payload")
+	payload.(map[string]any)["n"] = 9.0
+	var ve *ValidationError
+	if err := sch.ValidateChange(doc, changed, ValidateOptions{}); !errors.As(err, &ve) {
+		t.Errorf("an invalid leaf: %v", err)
+	}
+	if err := sch.Validate(doc, ValidateOptions{}); !errors.As(err, &ve) {
+		t.Errorf("an invalid leaf, Validate: %v", err)
+	}
+	// "b" fits two branches, so the leaf's anyOf is evaluated whole; the
+	// path to it still is not.
+	node, _ := lookup(doc, leaf)
+	node.(map[string]any)["tag"], payload.(map[string]any)["n"] = "b", 2.0
+	if err := sch.ValidateChange(doc, []string{leaf + "/payload/n"}, ValidateOptions{Stats: &part}); err != nil || part.Steps*20 > full.Steps {
+		t.Errorf("an ambiguous tag: %v after %d steps", err, part.Steps)
+	}
+}
+
 // covered reports whether every location where old and new differ is at
 // or under one of paths, as ValidateChange requires of them: this checks
 // ChangedPaths against the patch's effect, whatever the schema.

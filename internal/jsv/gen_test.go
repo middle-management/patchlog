@@ -137,13 +137,46 @@ const dynamicSchema = `{
   }
 }`
 
+// taggedSchema is a tagged union by anyOf whose tags overlap ("b" fits
+// two branches), with a tag declared through allOf, and a branch in
+// another resource that recurses by $dynamicRef.
+const taggedSchema = `{
+  "$id": "https://example.test/tagged",
+  "$dynamicAnchor": "entry",
+  "type": "object",
+  "required": ["tag"],
+  "anyOf": [
+    {"properties": {"tag": {"enum": ["a", "b"]},
+       "payload": {"type": "object", "required": ["n"], "properties": {"n": {"type": "integer", "minimum": 0, "maximum": 5}}}}},
+    {"properties": {"tag": {"const": "b"},
+       "payload": {"type": "object", "required": ["s"], "properties": {"s": {"type": "string", "examples": ["x", "yy"]}}}}},
+    {"allOf": [{"properties": {"tag": {"const": "c"}}}],
+     "properties": {"payload": {"type": "array", "maxItems": 3, "items": {"type": "integer", "minimum": 0, "maximum": 5}}}},
+    {"$ref": "group"}
+  ],
+  "$defs": {
+    "group": {
+      "$id": "group",
+      "required": ["members"],
+      "properties": {
+        "tag": {"const": "g"},
+        "members": {"type": "array", "maxItems": 3, "items": {"$dynamicRef": "#entry"}}
+      },
+      "$defs": {"entry": {"$dynamicAnchor": "entry"}}
+    }
+  }
+}`
+
 // openTreeSchema is dynamicSchema without unevaluatedProperties.
 var openTreeSchema = strings.Replace(dynamicSchema, `"unevaluatedProperties": false,`, "", 1)
 
 // testSchemas are the schemas of the differential and property tests.
-// local says a change deep in a document can be validated without
-// validating all of it: not so for dynamicSchema, whose root, which is
-// every node, has unevaluatedProperties.
+// local says the property test is to find ValidateChange cheaper than
+// Validate over its small generated documents. Not so for dynamicSchema,
+// whose root, which is every node, has unevaluatedProperties; nor for
+// taggedSchema, where looking for the branch that held costs more than an
+// anyOf that stops at its first match saves on a document of a few values
+// (TestValidateChangeTagged shows it on a large one).
 var testSchemas = []struct {
 	name, schema string
 	local        bool
@@ -153,6 +186,7 @@ var testSchemas = []struct {
 	{"union", unionSchema, true},
 	{"dynamic", dynamicSchema, false},
 	{"open-tree", openTreeSchema, true},
+	{"tagged", taggedSchema, false},
 }
 
 // generator makes a document from a schema, as well as a handful of
@@ -207,9 +241,9 @@ func (g *generator) gen(schema any, depth int) any {
 		switch {
 		case strings.HasPrefix(ref, "#/"):
 			target, _ = lookup(g.root, ref[1:])
-		case ref == "#node":
+		case strings.HasPrefix(ref, "#"): // a $dynamicAnchor of the root
 			target = g.root
-		default: // "tree" in dynamicSchema
+		default: // "tree" in dynamicSchema, "group" in taggedSchema
 			target, _ = lookup(g.root, "/$defs/"+ref)
 		}
 		return g.gen(target, depth)
