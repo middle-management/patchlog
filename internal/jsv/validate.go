@@ -247,17 +247,26 @@ func (s *state) evalNode(n *node, v any, ev *evals) bool {
 // children, then in-place applicators. A branch of a oneOf whose
 // discriminator fails is so rejected before anything is recursed into.
 func (s *state) evalBody(n *node, v any, ev *evals) bool {
-	if !s.assert(n, v) {
-		return false
-	}
 	switch x := v.(type) {
 	case map[string]any:
+		// Going by the declared properties (unless far more are declared
+		// than present) finds a missing required one in passing.
+		bySchema := len(n.props) > 0 && len(n.props) <= 2*len(x)+4
+		if !s.assert(n, v, bySchema) {
+			return false
+		}
 		if n.propNames != nil && !s.propertyNames(n, x) {
 			return false
 		}
-		if n.hasProps && !s.properties(n, x, ev) {
+		if n.hasProps && !s.properties(n, x, ev, bySchema) {
 			return false
 		}
+		return !n.hasInPlace || s.inPlace(n, v, ev)
+	}
+	if !s.assert(n, v, false) {
+		return false
+	}
+	switch x := v.(type) {
 	case []any:
 		if n.hasItems && !s.items(n, x, ev) {
 			return false
@@ -266,25 +275,26 @@ func (s *state) evalBody(n *node, v any, ev *evals) bool {
 			return false
 		}
 	}
-	if n.hasInPlace {
-		if n.ref != nil && !s.eval(n.ref, v, ev) {
-			return s.upKw("$ref")
-		}
-		for i, sub := range n.allOf {
-			if !s.eval(sub, v, ev) {
-				return s.upKwAt("allOf", i)
-			}
-		}
-		if n.hasRest {
-			return s.inPlaceRest(n, v, ev)
+	return !n.hasInPlace || s.inPlace(n, v, ev)
+}
+
+// inPlace applies the applicators that apply subschemas to v itself.
+func (s *state) inPlace(n *node, v any, ev *evals) bool {
+	if n.ref != nil && !s.eval(n.ref, v, ev) {
+		return s.upKw("$ref")
+	}
+	for i, sub := range n.allOf {
+		if !s.eval(sub, v, ev) {
+			return s.upKwAt("allOf", i)
 		}
 	}
-	return true
+	return !n.hasRest || s.inPlaceRest(n, v, ev)
 }
 
 // assert checks the keywords of n that look at v itself and apply no
-// subschema.
-func (s *state) assert(n *node, v any) bool {
+// subschema. With bySchema, the presence of required members that
+// properties declares is left to properties.
+func (s *state) assert(n *node, v any, bySchema bool) bool {
 	switch x := v.(type) {
 	case string:
 		if n.types != 0 && n.types&tString == 0 {
@@ -314,7 +324,7 @@ func (s *state) assert(n *node, v any) bool {
 			return false
 		}
 		if n.hasObj {
-			return s.obj(n, x, v)
+			return s.obj(n, x, v, bySchema)
 		}
 	case []any:
 		if n.types != 0 && n.types&tArray == 0 {
@@ -395,14 +405,18 @@ func (s *state) str(n *node, x string, v any) bool {
 	return true
 }
 
-func (s *state) obj(n *node, x map[string]any, v any) bool {
+func (s *state) obj(n *node, x map[string]any, v any, bySchema bool) bool {
 	if n.minProps >= 0 && len(x) < n.minProps {
 		return s.fail(n, "minProperties", v)
 	}
 	if n.maxProps >= 0 && len(x) > n.maxProps {
 		return s.fail(n, "maxProperties", v)
 	}
-	for _, k := range n.required {
+	required := n.required
+	if bySchema {
+		required = n.requiredOther
+	}
+	for _, k := range required {
 		if _, ok := x[k]; !ok {
 			return s.failArg(n, "required", v, k, 0)
 		}
@@ -444,16 +458,19 @@ func isContainer(v any) bool {
 
 // properties applies properties, patternProperties and
 // additionalProperties.
-func (s *state) properties(n *node, x map[string]any, ev *evals) bool {
+func (s *state) properties(n *node, x map[string]any, ev *evals, bySchema bool) bool {
 	matched := 0
 	if len(n.props) > 0 {
 		// Scalar members first: they are cheap, and a discriminator is one.
 		containers := false
-		if len(n.props) <= 2*len(x)+4 {
+		if bySchema {
 			for i := range n.props {
 				p := &n.props[i]
 				pv, ok := x[p.key]
 				if !ok {
+					if p.required {
+						return s.failArg(n, "required", x, p.key, 0)
+					}
 					continue
 				}
 				matched++
@@ -608,76 +625,94 @@ func (s *state) containsOK(n *node, x []any, v any, ev *evals) bool {
 
 // inPlaceRest applies the in-place applicators other than $ref and allOf.
 func (s *state) inPlaceRest(n *node, v any, ev *evals) bool {
-	if n.dynRef != nil {
-		target := n.dynRef
-		if n.dynName != "" {
-			for _, r := range s.scope {
-				if t := r.dynNodes[n.dynName]; t != nil {
-					target = t
-					break
-				}
+	if n.dynRef != nil && !s.eval(s.dynTarget(n), v, ev) {
+		return s.upKw("$dynamicRef")
+	}
+	if n.anyOf != nil && !s.anyOfOK(n, v, ev) {
+		return false
+	}
+	if n.oneOf != nil && !s.oneOfOK(n, v, ev) {
+		return false
+	}
+	return s.conditionals(n, v, ev)
+}
+
+// dynTarget returns the schema the $dynamicRef of n names here: the
+// outermost $dynamicAnchor of its name in the dynamic scope, if the
+// reference resolves to one at all.
+func (s *state) dynTarget(n *node) *node {
+	if n.dynName != "" {
+		for _, r := range s.scope {
+			if t := r.dynNodes[n.dynName]; t != nil {
+				return t
 			}
-		}
-		if !s.eval(target, v, ev) {
-			return s.upKw("$dynamicRef")
 		}
 	}
-	if n.anyOf != nil {
-		found := false
-		s.quiet++
-		if ev == nil {
-			for _, sub := range n.anyOf {
-				if s.eval(sub, v, nil) {
-					found = true
-					break
-				}
+	return n.dynRef
+}
+
+func (s *state) anyOfOK(n *node, v any, ev *evals) bool {
+	found := false
+	s.quiet++
+	if ev == nil {
+		for _, sub := range n.anyOf {
+			if s.eval(sub, v, nil) {
+				found = true
+				break
 			}
-		} else {
-			// Every branch that holds contributes what it evaluated.
-			tmp := s.getEvals()
-			for _, sub := range n.anyOf {
-				tmp.reset()
-				if s.eval(sub, v, tmp) {
-					found = true
-					ev.merge(tmp)
-				}
-			}
-			s.putEvals(tmp)
 		}
-		s.quiet--
-		if !found {
-			return s.fail(n, "anyOf", v)
-		}
-	}
-	if n.oneOf != nil {
-		count := 0
-		var tmp *evals
-		if ev != nil {
-			tmp = s.getEvals()
-		}
-		s.quiet++
-		for _, sub := range n.oneOf {
-			if tmp != nil {
-				tmp.reset()
-			}
+	} else {
+		// Every branch that holds contributes what it evaluated.
+		tmp := s.getEvals()
+		for _, sub := range n.anyOf {
+			tmp.reset()
 			if s.eval(sub, v, tmp) {
-				count++
-				if count > 1 {
-					break
-				}
-				if tmp != nil {
-					ev.merge(tmp)
-				}
+				found = true
+				ev.merge(tmp)
 			}
 		}
-		s.quiet--
+		s.putEvals(tmp)
+	}
+	s.quiet--
+	if !found {
+		return s.fail(n, "anyOf", v)
+	}
+	return true
+}
+
+func (s *state) oneOfOK(n *node, v any, ev *evals) bool {
+	count := 0
+	var tmp *evals
+	if ev != nil {
+		tmp = s.getEvals()
+	}
+	s.quiet++
+	for _, sub := range n.oneOf {
 		if tmp != nil {
-			s.putEvals(tmp)
+			tmp.reset()
 		}
-		if count != 1 {
-			return s.failArg(n, "oneOf", v, "", count)
+		if s.eval(sub, v, tmp) {
+			count++
+			if count > 1 {
+				break
+			}
+			if tmp != nil {
+				ev.merge(tmp)
+			}
 		}
 	}
+	s.quiet--
+	if tmp != nil {
+		s.putEvals(tmp)
+	}
+	if count != 1 {
+		return s.failArg(n, "oneOf", v, "", count)
+	}
+	return true
+}
+
+// conditionals applies not, if/then/else and dependentSchemas.
+func (s *state) conditionals(n *node, v any, ev *evals) bool {
 	if n.not != nil {
 		s.quiet++
 		ok := s.eval(n.not, v, nil)

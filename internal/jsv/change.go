@@ -37,9 +37,13 @@ import (
 //     or index, so an unchanged child keeps the verdict it had, and only
 //     children on the way to a change are visited, by this same rule;
 //   - $ref, allOf: the same instance, by this same rule;
-//   - anything else (anyOf, oneOf, not, if/then/else, dependentSchemas,
-//     contains, $dynamicRef): that keyword is evaluated in full on the
-//     value, since its verdict is no conjunction over children.
+//   - $dynamicRef: likewise, since the dynamic scope here is what it was;
+//   - anyOf, oneOf: if what did not change refutes every branch but one,
+//     that branch is the one that held, and it goes by this same rule
+//     (soleBranch); otherwise as the next;
+//   - anything else (not, if/then/else, dependentSchemas, contains): that
+//     keyword is evaluated in full on the value, since its verdict is no
+//     conjunction over children.
 //
 // A schema with unevaluatedProperties or unevaluatedItems is evaluated in
 // full where it applies, since those depend on what every other keyword
@@ -157,7 +161,7 @@ func (s *state) changeChild(n *node, v any, c *change) bool {
 }
 
 func (s *state) changeBody(n *node, v any, c *change) bool {
-	if !s.assert(n, v) {
+	if !s.assert(n, v, false) {
 		return false
 	}
 	switch x := v.(type) {
@@ -217,10 +221,100 @@ func (s *state) changeBody(n *node, v any, c *change) bool {
 			}
 		}
 		if n.hasRest {
-			return s.inPlaceRest(n, v, nil)
+			if n.dynRef != nil && !s.change(s.dynTarget(n), v, c) {
+				return s.upKw("$dynamicRef")
+			}
+			if n.anyOf != nil {
+				if i := s.soleBranch(n.anyOf, v, c); i < 0 {
+					if !s.anyOfOK(n, v, nil) {
+						return false
+					}
+				} else if !s.change(n.anyOf[i], v, c) {
+					return s.upKwAt("anyOf", i)
+				}
+			}
+			if n.oneOf != nil {
+				if i := s.soleBranch(n.oneOf, v, c); i < 0 {
+					if !s.oneOfOK(n, v, nil) {
+						return false
+					}
+				} else if !s.change(n.oneOf[i], v, c) {
+					return s.upKwAt("oneOf", i)
+				}
+			}
+			return s.conditionals(n, v, nil)
 		}
 	}
 	return true
+}
+
+// soleBranch finds the branch of an anyOf or oneOf that must be the one
+// that held before the change: the only one not refuted by what did not
+// change. The value was valid, so some branch held; a branch that fails on
+// unchanged members failed then as it does now; so if all but one do, that
+// one held, and the keyword's verdict now is that branch's, which the
+// changes alone decide. This is what keeps a tagged union from being
+// evaluated whole at every level. It returns -1 if more than one branch,
+// or none, is left.
+func (s *state) soleBranch(branches []*node, v any, c *change) int {
+	sole := -1
+	s.quiet++
+	for i, b := range branches {
+		if s.refuted(b, v, c, 0) {
+			continue
+		}
+		if sole >= 0 || s.over || s.loop {
+			sole = -1
+			break
+		}
+		sole = i
+	}
+	s.quiet--
+	return sole
+}
+
+// refuted reports whether n certainly fails on v because of something
+// that is no different from before the change: the type of v (a container
+// that has changed only within), or a scalar member that is not on the way
+// to any change and fails the schema properties gives it. It follows $ref
+// and allOf, whose failure is n's.
+func (s *state) refuted(n *node, v any, c *change, depth int) bool {
+	s.steps++
+	if n.boolean != 0 {
+		return n.boolean < 0
+	}
+	if depth > s.maxHop {
+		return false
+	}
+	pushed := s.sch.dynamic && (len(s.scope) == 0 || s.scope[len(s.scope)-1] != n.res)
+	if pushed {
+		s.scope = append(s.scope, n.res)
+	}
+	dead := false
+	switch x := v.(type) {
+	case map[string]any:
+		dead = n.types != 0 && n.types&tObject == 0
+		for i := 0; i < len(n.props) && !dead; i++ {
+			p := &n.props[i]
+			pv, ok := x[p.key]
+			if !ok || isContainer(pv) || c.kids[p.key] != nil {
+				continue
+			}
+			dead = !s.child(p.n, pv) && !s.over && !s.loop
+		}
+	case []any:
+		dead = n.types != 0 && n.types&tArray == 0
+	}
+	if !dead && n.ref != nil {
+		dead = s.refuted(n.ref, v, c, depth+1)
+	}
+	for i := 0; i < len(n.allOf) && !dead; i++ {
+		dead = s.refuted(n.allOf[i], v, c, depth+1)
+	}
+	if pushed {
+		s.scope = s.scope[:len(s.scope)-1]
+	}
+	return dead
 }
 
 // ChangedPaths maps an RFC 6902 patch, as decoded JSON, to the locations

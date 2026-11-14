@@ -193,6 +193,7 @@ type node struct {
 	// Objects.
 	minProps, maxProps int // -1: none
 	required           []string
+	requiredOther      []string // those of required that properties does not declare
 	depRequired        []depRequired
 	props              []prop
 	propMap            map[string]*node
@@ -228,8 +229,9 @@ type node struct {
 }
 
 type prop struct {
-	key string
-	n   *node
+	key      string
+	n        *node
+	required bool // key is in required: properties checks its presence in passing
 }
 
 type patProp struct {
@@ -486,7 +488,7 @@ var (
 	schemaKeywords = []string{"additionalProperties", "items", "contains", "propertyNames", "not", "if", "then", "else",
 		"unevaluatedItems", "unevaluatedProperties", "contentSchema"}
 	schemaArrayKeywords = []string{"allOf", "anyOf", "oneOf", "prefixItems"}
-	schemaMapKeywords   = []string{"$defs", "definitions", "properties", "patternProperties", "dependentSchemas"}
+	schemaMapKeywords   = []string{"$defs", "definitions", "properties", "patternProperties", "dependentSchemas", "dependencies"}
 )
 
 // index finds the resources ($id) and anchors of a document, visiting only
@@ -575,6 +577,9 @@ func (c *compiler) index(d *document, raw any, ptr string, res *resource) error 
 	for _, kw := range schemaMapKeywords {
 		if obj, ok := m[kw].(map[string]any); ok {
 			for k, sub := range obj {
+				if _, isList := sub.([]any); isList {
+					continue // a list of names in dependencies
+				}
 				if err := c.index(d, sub, ptr+"/"+kw+"/"+escapeToken(k), res); err != nil {
 					return err
 				}
@@ -929,6 +934,11 @@ func (b *builder) build() error {
 			c.dynamic = true
 		}
 	}
+	if _, ok := m["$recursiveRef"]; ok {
+		// Not a draft 2020-12 keyword, so by the letter it is ignored; but
+		// the library this package is measured against still applies it.
+		return &UnsupportedError{Location: n.loc, Keyword: "$recursiveRef", Msg: "use $dynamicRef"}
+	}
 	// Subschemas that are only referenced must still be well-formed where
 	// they are declared.
 	for _, kw := range [...]string{"$defs", "definitions"} {
@@ -975,6 +985,20 @@ func (b *builder) build() error {
 		}
 	}
 
+	n.requiredOther = n.required
+	if len(n.props) > 0 && len(n.required) > 0 {
+		n.requiredOther = nil
+		for _, k := range n.required {
+			if n.propMap[k] == nil {
+				n.requiredOther = append(n.requiredOther, k)
+			}
+		}
+		for i := range n.props {
+			for _, k := range n.required {
+				n.props[i].required = n.props[i].required || k == n.props[i].key
+			}
+		}
+	}
 	n.hasValue = n.hasConst || n.enum != nil
 	n.hasNum = n.hasMin || n.hasMax || n.hasXMin || n.hasXMax || n.multipleOf != nil
 	n.hasStr = n.minLen >= 0 || n.maxLen >= 0 || n.pattern != nil || n.format != nil || n.formatRegex
@@ -1141,6 +1165,35 @@ func (b *builder) applicators() error {
 	}
 	if n.depSchemas, err = b.subMap("dependentSchemas"); err != nil {
 		return err
+	}
+	// dependencies, which draft 2019-09 split into dependentRequired and
+	// dependentSchemas, still has its meaning: the library this package is
+	// measured against keeps it, so schemas stored with it rely on it.
+	if dv, ok := b.m["dependencies"]; ok {
+		obj, ok := dv.(map[string]any)
+		if !ok {
+			return b.errf("dependencies", "must be an object")
+		}
+		keys := make([]string, 0, len(obj))
+		for k := range obj {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if _, isList := obj[k].([]any); isList {
+				need, err := b.strings("dependencies", obj[k])
+				if err != nil {
+					return err
+				}
+				n.depRequired = append(n.depRequired, depRequired{key: k, need: need})
+				continue
+			}
+			sub, err := b.c.compileAt(b.d, b.ptr+"/dependencies/"+escapeToken(k), obj[k])
+			if err != nil {
+				return err
+			}
+			n.depSchemas = append(n.depSchemas, prop{key: k, n: sub})
+		}
 	}
 	if n.prefix, err = b.subList("prefixItems"); err != nil {
 		return err
