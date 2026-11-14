@@ -303,6 +303,21 @@ What the table shows:
 - **Creating the document costs about what two appends do**: about 110 ms at 1 MiB and
   400–470 ms at 3.5 MiB with the schema.
 
+**Note of 2026-11-14, a development machine, not server X.** The table above was measured with
+the validator the server used then. With its own validator (`internal/jsv`), and with a patch
+validated where it changes the document, the same append (`replace /n`) to the 1 MiB
+**schema** document, through the HTTP handler on SQLite (in memory), median of 60:
+
+| Append p50, 1 MiB | Old validator | New, in full (`-full-validation`) | New, by the patch's changes (default) |
+|---|---|---|---|
+| structured, no schema | 20 ms | 21 ms | 21 ms |
+| schema | 56 ms | 24 ms | 19–20 ms |
+
+A typed document now costs what an untyped one of the same shape does. What is left is the
+work every write does on the whole document: parsing the head (about 35–40% of the append) and
+serialising and measuring the result (about 40%). Validation by changes takes 2 steps here
+against 85,503 in full. The table above has not been rerun on server X.
+
 ### A recursive union schema
 
 **A schema whose `oneOf` branches each recurse no longer costs exponential time, and validation
@@ -660,6 +675,7 @@ Each limit is one of three kinds:
 | **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request. The origin shares their reads ([Origin-side collapse](#origin-side-collapse)), at ~0.03–0.04 ms of core CPU per follower per write (0.12–0.14 ms through Varnish). | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
 | **No read replicas, and one `-db` for everything.** The core runs migrations, the tailer and leader jobs, so it can't run on a read-only database. | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
 | **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: 6–7 min on server X (fetches at 2,400–2,800/s); 1.3 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
+| **Rule `test`s with a `schema` and annotation walks are not counted** against `validationSteps`, and listing an invalid document's failures gets the budget anew. | A rule's schema fragment, or a schema's annotations, can still be made expensive to evaluate; an invalid document can cost twice the limit. | Count them against the same budget. |
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
 | **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.0 GB on server X and 1.4 GB on SQLite over a whole run. Scans, reads and small writes alone peaked at 0.2–0.3 GB; the rest came with 3.5 MiB documents and 5,000 followers. | Run with `GOMEMLIMIT` under container limits; profile the large-document path (an opt-in pprof listener would help). |
 
@@ -682,8 +698,7 @@ These were limits and are not any more:
 - **Nothing bounded schema validation time**, and the validator evaluated every `oneOf`/`anyOf`
   branch in full, so a recursive union schema took seconds on a document of a thousand nodes.
   Now validation stops a branch at its first failure and is bounded by steps
-  ([A recursive union schema](#a-recursive-union-schema)). Rule `test`s with a `schema`, and
-  annotation walks, are not bounded.
+  ([A recursive union schema](#a-recursive-union-schema)).
 - **Compiled schemas and their documents** were kept forever. Now the 512 and 2,048 most
   recently used are kept.
 - **Long-polls of a namespace** each read the log on their own when woken. Now the read is

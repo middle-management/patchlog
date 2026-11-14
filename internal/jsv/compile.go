@@ -434,8 +434,10 @@ func Compile(root any, baseURI string, opts Options) (*Schema, error) {
 
 // Compiler compiles several schemas over the same documents: the
 // documents are loaded and checked once, and what the schemas share is
-// compiled once. It is not safe for concurrent use; the schemas it
-// returns are.
+// compiled once. It is not safe for concurrent use, and compiling with it
+// must not overlap validating with a schema it returned earlier, which
+// shares what a later compile adds to; once compiling is over, the schemas
+// are safe for concurrent use.
 type Compiler struct{ c *compiler }
 
 // NewCompiler returns a Compiler with no documents.

@@ -135,6 +135,12 @@ type Options struct {
 	// once (group commit, D.8; groupcommit.go). Zero means 32; 1 or less
 	// turns group commit off, so every write commits on its own.
 	GroupCommit int
+	// FullValidation validates the whole document on every write. By
+	// default a patch to a document this engine has validated against the
+	// same schema revision is validated only where the patch can have
+	// changed the verdict (validateStep); both give the same answer, and
+	// this is there to rule the shortcut out when looking for a fault.
+	FullValidation bool
 	// MaxValidationSteps bounds the work of validating one document
 	// against its schema (§6.2 step 5): a step is one schema applied to
 	// one value, and a document that takes more is refused with the limit
@@ -283,9 +289,14 @@ type Engine struct {
 	mu        sync.Mutex // serialises write transactions
 	blobs     blobStore
 	validator *schema.Validator
-	hub       *hub
-	rate      *rateLimiter
-	docs      *docCache
+	validated validatedDocs // revisions this engine found valid (validateStep)
+	// How many typed documents step 5 validated in full, and by their
+	// changes (ValidationCounts).
+	validatedFull, validatedChange atomic.Int64
+
+	hub  *hub
+	rate *rateLimiter
+	docs *docCache
 	// schemaDocs are parsed schema revisions (schemaRevIn).
 	schemaDocs *parsedCache
 	ids        idCache

@@ -393,6 +393,41 @@ func (v *Validator) ValidateBudget(doc any, load Loader, budget int) (steps int,
 	return v.validate(doc, load, budget)
 }
 
+// ValidateChangeBudget is ValidateBudget for a document typed by a schema
+// revision that was made by changing one known to be valid against that
+// same revision, as this Validator compiles it: changed holds JSON
+// Pointers into Instance(doc) to everything that may differ, as
+// jsv.ValidateChange defines them, and only what those changes can have
+// affected is validated. An invalid document's failures are listed from
+// the whole document, as ValidateBudget lists them. A document that is a
+// schema, or not typed, is validated as by ValidateBudget.
+func (v *Validator) ValidateChangeBudget(doc any, load Loader, changed []string, budget int) (steps int, err error) {
+	obj, _ := doc.(map[string]any)
+	s, _ := obj["$schema"].(string)
+	ref, ok := ParseRef(s)
+	if !ok {
+		return v.validate(doc, load, budget)
+	}
+	sch, err := v.compile(ref, load)
+	if err != nil {
+		return 0, err
+	}
+	inst := Instance(doc)
+	var st jsv.Stats
+	err = sch.ValidateChange(inst, changed, jsv.ValidateOptions{Budget: budget, Stats: &st})
+	if err == nil {
+		return st.Steps, nil
+	}
+	if errors.Is(err, jsv.ErrBudget) {
+		return st.Steps, &BudgetError{Steps: st.Steps, Budget: budget}
+	}
+	var ve *jsv.ValidationError
+	if !errors.As(err, &ve) {
+		return st.Steps, &SchemaError{Msg: compileMsg(err)}
+	}
+	return st.Steps, Failures(sch, inst, budget, ve)
+}
+
 // ValidateRules is Validate: rules, the marker of the revision written,
 // selects nothing, since every schema compiles under this version (§6.1).
 // It is kept for callers that still carry markers.

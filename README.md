@@ -1052,8 +1052,9 @@ What is instrumented:
 - **Schema validation**: `core.schema.validate`, one per typed document a write validates,
   with `patchlog.schema` (its `$schema`), `patchlog.document.size` (canonical bytes),
   `patchlog.document.nodes` (values in the document, containers included),
-  `patchlog.schema.valid` and `patchlog.schema.steps` (schemas applied to values, what the
-  `validationSteps` limit counts). Validation runs in the write's check phase, inside its read
+  `patchlog.schema.valid`, `patchlog.schema.steps` (schemas applied to values, what the
+  `validationSteps` limit counts) and `patchlog.schema.mode` (`full`, or `change` for a patch
+  validated where it changed the document). Validation runs in the write's check phase, inside its read
   transaction and outside the write lock, so without this span its time read as a slow
   `core.db.read`. Loading the schemas is not part of it.
 - **Database transactions**: `core.db.read` and `core.db.update` (with `db.system.name`) inside
@@ -4597,6 +4598,12 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   write that needs more is refused `422` with `code: "limit"`, `limit: "validationSteps"`,
   `measured` and `max`. §6.6 has no such limit; `serve -max-validation-steps` changes it and
   `0` lifts it. Rule `test`s with a `schema` and annotation walks are not counted.
+- **A patch to a typed document is validated where it changes it**, when this instance has
+  validated the document it applies to against the same schema revision: the changed values,
+  and each schema's own keywords on the way to them. The verdict and the `422` are those of
+  validating the whole document, which is still done for a create, a restore, a change of
+  `$schema`, a change at the root and the first patch after a restart;
+  `serve -full-validation` does it always.
 - **`documentSize` is 1 MiB by default**, where §6.6 says 4 MiB, and a namespace may set it up to
   the deployment maximum, 4 MiB unless `serve -max-document-size` says otherwise;
   `serve -document-size` changes the default (at most the maximum). Every write re-serialises,

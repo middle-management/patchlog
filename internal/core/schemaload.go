@@ -4,9 +4,15 @@ import (
 	"bytes"
 	"database/sql"
 	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/jsv"
+	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/schema"
 )
 
@@ -48,10 +54,136 @@ import (
 // a schema document in write mode, any other against the schema revision
 // it names, each revision of its closure compiled under current rules;
 // the markers select nothing (ValidateMarked).
+//
+// A patch to a document this engine has itself validated against the same
+// schema revision is validated only where it can have changed the verdict
+// (changedPaths, jsv.ValidateChange); anything else in full.
 func (t *tx) validateStep(step *stepState, sc *schemaCtx, pending map[string]any) (string, *Error) {
 	rules := t.docRules(step.id, step.doc, sc)
 	step.legacy = rules == schema.Legacy
-	return t.validateDoc(step.doc, len(step.docCanon), rules, sc, pending)
+	changed, partial := t.e.changedPaths(step)
+	typed, err := t.validateDoc(step.doc, len(step.docCanon), changed, partial, sc, pending)
+	if err == nil {
+		if _, ok := schema.ParseRef(typed); ok {
+			t.e.validated.put(step.id, typed)
+		}
+	}
+	return typed, err
+}
+
+// validatedDocs remembers which revisions this engine, since it started,
+// has found valid against which schema revision: the proof that a patch
+// to one may be validated by its changes alone. That a revision is stored
+// is no such proof: a remote branch mirrors revisions another deployment
+// validated (§G.3), and those of an earlier version of this one were
+// validated as that version read schemas and formats. A revision id fixes
+// its document (§3.3) and a schema revision path its schema, so the fact
+// holds wherever and whenever the id is met again; the first patch to a
+// document after a restart is validated in full.
+type validatedDocs struct {
+	mu sync.Mutex
+	c  lru.Cache[ids.ID, string]
+}
+
+// validatedDocsMax is how many revisions validatedDocs remembers, the
+// least recently used forgotten first: an id and a schema path each.
+const validatedDocsMax = 1 << 17
+
+func (v *validatedDocs) put(id ids.ID, schemaRef string) {
+	v.mu.Lock()
+	v.c.MaxEntries = validatedDocsMax
+	v.c.Put(id, schemaRef, 1)
+	v.mu.Unlock()
+}
+
+func (v *validatedDocs) get(id ids.ID) string {
+	v.mu.Lock()
+	s, _ := v.c.Get(id)
+	v.mu.Unlock()
+	return s
+}
+
+// ValidationCounts returns how many documents with a $schema step 5 has
+// validated in full and how many by their changes, since the engine
+// started.
+func (e *Engine) ValidationCounts() (full, change int64) {
+	return e.validatedFull.Load(), e.validatedChange.Load()
+}
+
+// validateBoth makes every step that is validated by its changes also be
+// validated in full, and panics if the two disagree: a switch for test
+// runs (PATCHLOG_TEST_VALIDATE_BOTH=1 go test ./...), read once.
+var validateBoth = os.Getenv("PATCHLOG_TEST_VALIDATE_BOTH") != ""
+
+// changedPaths decides how step 5 validates a step's document: by its
+// changes, which it returns as JSON Pointers into the instance
+// (schema.Instance), or (false) in full. By its changes only if all hold:
+//
+//   - the step appends a patch set to a live document: not a create, a
+//     restore, a delete or a sealed step;
+//   - the document it applied to and the one it results in name the same
+//     schema revision in $schema, and no operation touches $schema;
+//   - this engine has validated the document it applied to against that
+//     revision (validatedDocs): an earlier write, or an earlier step of
+//     this one.
+//
+// The changes are those of the patch's operations (jsv.ChangedPathsIn: an
+// insertion into or removal from an array is the array). The top-level
+// members step 5 leaves out of the instance ($nonce and $successor of
+// their forms, schema.LeftOut) are no change to it when they were left
+// out before and are now; in any other case they stay, and name a member
+// of the instance, or nothing in it, which is validated as the root.
+func (e *Engine) changedPaths(step *stepState) ([]string, bool) {
+	if e.opt.FullValidation || step.action != "append" || step.sealed || step.del || step.parentID == nil {
+		return nil, false
+	}
+	m, ok := step.doc.(map[string]any)
+	if !ok || step.prev.schema == "" {
+		return nil, false
+	}
+	if s, _ := m["$schema"].(string); s != step.prev.schema {
+		return nil, false
+	}
+	if _, ok := schema.ParseRef(step.prev.schema); !ok {
+		return nil, false
+	}
+	if e.validated.get(*step.parentID) != step.prev.schema {
+		return nil, false
+	}
+	ops, ok := step.raw.([]any)
+	if !ok {
+		return nil, false
+	}
+	paths, err := jsv.ChangedPathsIn(step.doc, ops)
+	if err != nil {
+		return nil, false
+	}
+	out := paths[:0]
+	for _, p := range paths {
+		if p == "" {
+			return nil, false
+		}
+		top := p[1:]
+		if i := strings.IndexByte(top, '/'); i >= 0 {
+			top = top[:i]
+		}
+		switch top {
+		case "$schema":
+			return nil, false
+		case "$nonce", "$successor":
+			wasOut := step.prev.nonceOut
+			if top == "$successor" {
+				wasOut = step.prev.successorOut
+			}
+			// Left out before, and left out or gone now: no change to
+			// the instance.
+			if v, has := m[top]; wasOut && (!has || schema.LeftOut(top, v)) {
+				continue
+			}
+		}
+		out = append(out, p)
+	}
+	return out, true
 }
 
 // rulesColumn is the revisions.rules value of the revision a step writes,
@@ -159,10 +291,11 @@ func (t *tx) prefetchRules(seqs []int64) {
 	t.must(rows.Err())
 }
 
-// validateDoc is step 5: resolve $schema and validate (§6.1) under rules,
-// the marker of the revision written, for a schema document. It returns
-// the document's $schema, if typed.
-func (t *tx) validateDoc(doc any, size int, rules schema.Rules, sc *schemaCtx, pending map[string]any) (string, *Error) {
+// validateDoc is step 5: resolve $schema and validate (§6.1). With
+// partial, the document is one changed at changed from one known valid
+// against the same schema revision (changedPaths), and is validated there.
+// It returns the document's $schema, if typed.
+func (t *tx) validateDoc(doc any, size int, changed []string, partial bool, sc *schemaCtx, pending map[string]any) (string, *Error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
 		return "", nil
@@ -206,8 +339,26 @@ func (t *tx) validateDoc(doc any, size int, rules schema.Rules, sc *schemaCtx, p
 	// whatever its marker (§6.1), so neither rules nor the markers of the
 	// closure select anything.
 	span := validateSpan(t.ctx, s, doc, size)
-	steps, err := t.e.validator.ValidateBudget(doc, load, max(t.e.opt.MaxValidationSteps, 0))
-	endValidateSpan(span, err, steps)
+	budget := max(t.e.opt.MaxValidationSteps, 0)
+	var steps int
+	var err error
+	mode := "full"
+	if partial {
+		mode = "change"
+		t.e.validatedChange.Add(1)
+		steps, err = t.e.validator.ValidateChangeBudget(doc, load, changed, budget)
+		if validateBoth {
+			_, ferr := t.e.validator.ValidateBudget(doc, load, 0)
+			var be *schema.BudgetError
+			if !errors.As(err, &be) && (err == nil) != (ferr == nil) {
+				panic(fmt.Sprintf("core: validation by changes %q of a document typed %s says %v, in full %v:\n%s", changed, s, err, ferr, jsonv.Canonical(doc)))
+			}
+		}
+	} else {
+		t.e.validatedFull.Add(1)
+		steps, err = t.e.validator.ValidateBudget(doc, load, budget)
+	}
+	endValidateSpan(span, err, steps, mode)
 	if err != nil {
 		return "", schemaErr(err, s)
 	}

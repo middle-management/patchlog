@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **A patch is validated where it changes the document.** A patch to a typed document used to
+  validate the whole document it resulted in. Now, when this instance has itself validated the
+  document the patch applies to against the same schema revision, it validates only what the
+  patch can have changed the verdict of: the changed values in full, and on the way to them
+  each schema's own keywords (`required`, `maxProperties`, `uniqueItems`, `oneOf`, `contains`
+  and the like), which a change below can break. The answer is the same as validating in
+  full, and an invalid document's `422` still lists every failure of the whole document.
+  - **In full, as before:** a create, a restore, a patch that changes or touches `$schema` or
+    replaces or removes at the root, a schema document, and the first patch to a document
+    after a restart. What has been validated is remembered in memory only, since a stored
+    revision is no proof: a remote branch mirrors revisions another deployment validated.
+  - **`serve -full-validation`** turns it off. The `core.schema.validate` span says which was
+    done in `patchlog.schema.mode` (`full` or `change`).
+  - Measured through the HTTP handler on SQLite, on a development machine: an append of a
+    one-field patch to a 1 MiB document of 9,500 small typed objects takes about 20 ms, as
+    one to the same document without a schema does; it took about 56 ms with the old
+    validator, and takes about 24 ms validated in full with the new one (docs/CAPACITY.md).
+  - `PATCHLOG_TEST_VALIDATE_BOTH=1 go test ./...` validates every such step both ways and
+    panics if they disagree.
+
 - **A validator of our own, and a limit on validation work.** JSON Schema validation is now
   done by `internal/jsv`, written for this server, in place of the
   `santhosh-tekuri/jsonschema` library, which is no longer a dependency. It compiles a schema
