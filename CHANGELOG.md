@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.29.0
 
 - **Capacity: large documents measured again** with the server's own validator, on the
   containers of the earlier runs ([docs/CAPACITY.md](docs/CAPACITY.md), "Large documents, by
