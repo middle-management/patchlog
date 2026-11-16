@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.83** (previously **v0.82**). v0.83 adds TOOLS.md's Addendum J, suggested
+and non-normative: a proxy that keeps an upstream's streamed response as a resource, shared
+sessions of people and agents in one namespace, agents through MCP, and recording model calls.
+It was tested against this server at v0.29.0 and changes nothing in it.
+
+- **`GET /` answers `"spec": "0.83"`**, and the docs mirror v0.83 (SPEC, SERVICES, TOOLS,
+  CONFORMANCE, the spec's change log).
+- **SPEC-FEEDBACK v0.82 Open 93**: what a stream kept as one growing document costs per flush
+  on this server, from the capacity measurements. Notes 89–92 stay open; v0.83 answers none.
+
 ## v0.29.0
 
 - **Capacity: large documents measured again** with the server's own validator, on the

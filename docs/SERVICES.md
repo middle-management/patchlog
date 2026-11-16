@@ -1,6 +1,6 @@
 # Patch Log — Services
 
-Status: draft v0.82 · 2026-11-10. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.83 · 2026-11-16. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Services that follow namespaces through the protocol's public API and answer queries over them:
 
@@ -11,7 +11,7 @@ A server needs nothing from this document, with one exception: an origin MAY ser
 
 - **§E.2.6 (optional):** how a service seals what it derives from sealed and end-to-end namespaces.
 
-**Reading.** "Reading this spec" in [SPEC.md](SPEC.md) applies here, and so do its terms (§2, §2.1). The three documents share one numbering: §1–§10, §12, §13, §C, §E (but §E.2.6), §G.1, §G.3, §G.4.1, §G.5–§G.7 and §I are in SPEC.md; §11, §F, §G.2, §G.4.2–§G.4.4 and §H are in [TOOLS.md](TOOLS.md).
+**Reading.** "Reading this spec" in [SPEC.md](SPEC.md) applies here, and so do its terms (§2, §2.1). The three documents share one numbering: §1–§10, §12, §13, §C, §E (but §E.2.6), §G.1, §G.3, §G.4.1, §G.5–§G.7 and §I are in SPEC.md; §11, §F, §G.2, §G.4.2–§G.4.4, §H and §J are in [TOOLS.md](TOOLS.md).
 
 ---
 

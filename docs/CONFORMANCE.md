@@ -1,6 +1,6 @@
 # Patch Log — Conformance checklist
 
-Status: against spec v0.82, which is three documents sharing one numbering: SPEC.md (§1–§10, §12, §13, Addenda C, E, G and I), SERVICES.md (Addenda A and B, §E.2.6) and TOOLS.md (§11, Addenda F and H, §G.2, §G.4.2–§G.4.4). A server is checked against the sections for SPEC.md; a service or tool against those it claims. Items restate spec requirements as checkable statements; parentheses name the passages restated (bold lead-ins of the section's bullets, or "table"). The spec's text governs: an item that says more or less than its passage, or seems to disagree, is an error here. Ids are never renumbered or reused; a dropped item keeps its id, marked "retired in v0.NN". **[vectors]** items are byte-exact, covered by Addendum I.
+Status: against spec v0.83, which is three documents sharing one numbering: SPEC.md (§1–§10, §12, §13, Addenda C, E, G and I), SERVICES.md (Addenda A and B, §E.2.6) and TOOLS.md (§11, Addenda F, H and J, §G.2, §G.4.2–§G.4.4). A server is checked against the sections for SPEC.md; a service or tool against those it claims. Items restate spec requirements as checkable statements; parentheses name the passages restated (bold lead-ins of the section's bullets, or "table"). The spec's text governs: an item that says more or less than its passage, or seems to disagree, is an error here. Ids are never renumbered or reused; a dropped item keeps its id, marked "retired in v0.NN". **[vectors]** items are byte-exact, covered by Addendum I.
 
 Suggested conformance profiles (not in the spec; proposed):
 

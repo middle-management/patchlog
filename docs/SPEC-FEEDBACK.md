@@ -1,6 +1,6 @@
 # Reference-implementation notes for the spec writer
 
-`docs/SPEC.md` mirrors the canonical specification, now at **v0.82**, with `docs/SERVICES.md` and
+`docs/SPEC.md` mirrors the canonical specification, now at **v0.83**, with `docs/SERVICES.md` and
 `docs/TOOLS.md`, split from it in v0.80. This file collects what the reference does that the text
 doesn't yet describe. Open notes come in one list, from implementing v0.82; cite them as "v0.82
 Open n". v0.82 answered the v0.81 list ("v0.81 Open n"): what it settled is under "Settled in
@@ -8,6 +8,10 @@ v0.82", and what it left open is rewritten in the new list, marked "was v0.81 Op
 list was answered in v0.78 to v0.81 (Settled in v0.81), and earlier lists before it.
 
 ## Open from v0.82
+
+v0.83 adds TOOLS.md's Addendum J (stream proxies, shared agent sessions, MCP agents and
+recording model calls; suggested, non-normative) and asks nothing of the reference. It answers
+none of the notes below, so the list stands as it is, with note 93 added.
 
 From implementing v0.82 (branch `spec-v082`). Numbered afresh; cite these as "v0.82 Open n".
 Each entry gives the section, what the reference does now (the conservative reading where it
@@ -17,7 +21,8 @@ leaves open are carried in place, by subject, marked "was v0.81 Open n" and cut 
 remains. The order is: sealed forms and end-to-end reads (1–31), access and coverage (32–65),
 tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87), index (88),
 rates and contended writes (89–91, from capacity measurements after the v0.82 work),
-validation work (92, from replacing the validator).
+validation work (92, from replacing the validator), streams (93, from reading v0.83's
+Addendum J).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
 92 are open: 62 from this version's work and 30 carried.
@@ -569,6 +574,19 @@ v0.82" (v0.81 Open 24).
     setting; a namespace cannot set it. *Question:* should §6.6 name such a limit, and if so
     in what unit, given that a count of steps is one implementation's and a time is not
     reproducible?
+
+93. **A stream as one growing document** (TOOLS §J.1, §J.2; v0.83). §J.2 appends each flush to
+    `/chunks/-` of one resource. Every write works on the whole document (parse the head,
+    canonicalise and measure the result), so a flush costs the stream's size so far, and a
+    stream costs the square of its length: measured on the reference (docs/CAPACITY.md), an
+    append to a 1 MiB document of long strings takes 5–9 ms and one of many small values
+    20–24 ms, against under a millisecond for a small one. §J.1's close at `documentSize` with
+    `next` bounds it. At §J.2's pace (a flush every 200 ms) the default `ratePerPrincipal` of
+    50 a second carries 10 streams, which §J.2 notes; nothing else in the reference limits
+    it. Two things §J could say: a lower size at which to continue in `next` where latency
+    matters (about 250 KiB keeps a flush near 10 ms), and that a `$schema` on the stream
+    document makes each `/chunks/-` append validate the whole array in the reference, since an
+    added element changes the array. *No change is asked of the core.*
 
 ## Settled in v0.82
 
