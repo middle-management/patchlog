@@ -45,7 +45,7 @@ and serves immutable, CDN-cacheable revisions.
 | Limits (configurable, deployment maximums) and token-bucket rate limits; a refusal names the limit (`limit`) and, for sizes and counts, `measured` and `max` | §6.6, §12 | ✅ (see [Limit refusals](#design-notes)) |
 | `GET /ns/{ns}/principal`: what the grant in `Authorization` is in a namespace (principal, `kid`, the verifying key's thumbprint `key`, `operator`, verbs, roles as `{ name, can, rules }`, and a catalog namespace's `catalog` settings) and what a writer needs from the namespace document (frozen, successor, nonce, signatures, level, limits in force), to a grant limited to some resources or without `read` too | §7.4, §C.5, §C.7, §8.5 | ✅ (client `NSPrincipal`; see [Design notes](#design-notes)) |
 | File trees: `catalog.files` in catalog namespace documents, file metadata (`file: { size, type, modified }`) on placements in tree listings, sealed per entry for items of sealed namespaces, and the rendering of a JSON file shared by tools (`internal/files`) | §7.4, §H.1–§H.3, §E.2.6 | ✅ (tree service; see [File trees](#file-trees-h2-h3)) |
-| Streams and shared agent sessions: a proxy that keeps an upstream's streamed response as a resource, sessions of people and agents in one namespace, agents through MCP, recorded model calls | TOOLS Addendum J (suggested, non-normative; v0.83) | — (patterns built from core requests by tools outside this repository; the spec's two kits were tested against this server at v0.29.0, and nothing here changed for them) |
+| Streams and shared agent sessions: a proxy that keeps an upstream's streamed response as a resource, sessions of people and agents in one namespace, agents through MCP, recorded model calls | TOOLS Addendum J (suggested, non-normative; v0.83) | Partly: J.1–J.4, the stream proxy, are implemented by `patchlog streams` (see [Stream proxy](#stream-proxy-addendum-j1j4)): the stream document, writing, the narrowed read grant, resuming, abort and expiry, in plain and at-rest namespaces; sealed namespaces (J.4 Encryption) are refused at start. J.5–J.7 (shared sessions, agents through MCP, recording model calls) are not implemented: they are patterns built from core requests by tools outside this repository |
 | Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`, bounded by entries and by `logPageBytes`) | §6.2, §7.1–§7.2 | ✅ (`serve -log-page-size`, `-log-page-bytes`; see [Design notes](#design-notes)) |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
 | Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name, `?prefix=`), `/branches` | §7.4 | ✅ |
@@ -143,7 +143,7 @@ request then counts as holding a `*` key, so config guards and forced purges are
 config writes skip namespace rules (resource writes are still checked), and namespace entries
 record `"grant": null` (§1, Conformance). A write without `X-Author` is then `400 bad_input`
 (§7.2; reads are unaffected), so the tools that write (`janitor`, `merge`, `rebase`, `import`,
-`schema`, `dav`) need `-author` against a `-dev` server; compose starts the janitor with
+`schema`, `dav`, `streams`) need `-author` against a `-dev` server; compose starts the janitor with
 `-author=janitor`, and the playground sends `X-Author: anonymous` until its author box is
 filled. `GET /` says which mode a deployment runs in
 (`"auth": "disabled"` or `"grants"`), and the merge tools and the janitor read it from there.
@@ -928,7 +928,7 @@ PATCHLOG_CORS_ORIGINS='*' make up     # compose passes it to every server
 
 ### Health checks and graceful shutdown
 
-`serve`, `index`, `tree` and `dav` answer two paths ahead of their own routes. Both are
+`serve`, `index`, `tree`, `dav` and `streams` answer two paths ahead of their own routes. Both are
 `Cache-Control: no-store` and `CDN-Cache-Control: no-store`, and the compose CDN passes them, so
 a probe always reaches the origin itself:
 
@@ -3727,6 +3727,164 @@ one level. Dead properties (PROPPATCH) are kept per user in memory (§H.8), at m
 read back by PROPFIND, moved with a MOVE, dropped with a DELETE, an hour untouched or a restart.
 Uploads are buffered in memory, not spooled to disk.
 
+### Stream proxy (Addendum J.1–J.4)
+
+`patchlog streams` is the stream proxy of TOOLS Addendum J, sections J.1–J.4: it forwards a
+request to an upstream HTTP API (a model API answering `text/event-stream`, say) and keeps the
+streamed response as a resource, so a client that loses its connection reads on from the
+revision it last saw. It is built from core requests only; the core checks nothing new. Shared
+sessions, agents through MCP and recording model calls (J.5–J.7) are not implemented.
+
+```sh
+# Under grants: the namespace exists (read: "grant", its keys list the key that signed
+# streams.grant, with create, append, read and purge), and callers hold grants naming `app`.
+./patchlog streams -api https://cms.example -ns streams -caller-ns app -grant-file streams.grant \
+  -upstream https://api.example.com/v1/ -state /var/lib/patchlog/streams.json \
+  -addr :8443 -tls-cert proxy.crt -tls-key proxy.key
+
+# Against a -dev core: no grants, callers name themselves in X-Author.
+./patchlog streams -api http://localhost:8080 -author streams -create-ns -upstream http://localhost:9000/
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `-api`, `-addr` | The core's base URL; the proxy's listen address (default `127.0.0.1:8091`). |
+| `-ns` | The namespace the streams are kept in (default `streams`): one of its own, with `read: "grant"`, apart from namespaces consumers follow, as its log records every append (§J.2). |
+| `-grant`, `-grant-file` | The proxy's own grant: `create`, `append`, `read` and `purge` in `-ns`. It writes with it and narrows each caller's read grant from it, so it must carry its proof (not sealed). |
+| `-caller-ns` | The namespace callers' grants are verified in. Required under grants (below). |
+| `-author` | `X-Author` for a `-dev` core. |
+| `-upstream` | An allowed upstream: a URL prefix (repeatable). An `Upstream-URL` must have the same scheme and host and a path under the prefix's, at a segment boundary; anything else is `403`. No `-upstream` refuses every request. Redirects are not followed: a `3xx` is kept as the stream. |
+| `-flush` | Least time between two appends to one stream (default 200 ms, §J.2 Pace). |
+| `-ttl` | How long read grants live from a stream's creation (default 24 h); a closed stream that old is purged (§J.4 Expiry). |
+| `-idle-timeout` | A stream with no append for this long is closed with `"timeout"` (default 2 m). |
+| `-state` | A file with the names of the streams being written; a proxy started again closes those still open with `"error"` (§J.2 Restarts). Without it they are closed by the idle sweep, with `"timeout"`. |
+| `-max-request-body`, `-max-segments`, `-max-streams` | Largest body forwarded upstream (1 MiB); most resources one response may fill (8); most streams carried at once (64, then `503` with `Retry-After`). |
+| `-public-url` | The core's base URL as callers reach it, for the `url` of an answer (default `-api`). |
+| `-create-ns` | Create `-ns` with `read: "grant"` if it is missing. Only over a `-dev` core: under grants a namespace is created with an operator grant and its document lists the key of the proxy's grant, neither of which the proxy holds. |
+| `-tls-cert`, `-tls-key`, `-insecure` | HTTPS. On an address other than loopback the proxy refuses to serve plain HTTP unless `-insecure`: callers' grants and upstream credentials cross it. |
+
+It also takes `-shutdown-timeout` and `-shutdown-delay`, answers `/_health` and `/_ready`, and
+is traced like the other services when `OTEL_*` is set. On shutdown the open streams' upstream
+requests are cancelled and the streams closed with `"error"`.
+
+**The caller's request.** `POST /streams`, answered as soon as the stream's resource exists;
+upstream then runs in the background, whether or not the caller stays connected.
+
+| Header | |
+| --- | --- |
+| `Authorization: Bearer <grant>` | The caller's own Patch Log grant. The proxy asks the core who it is (`GET /ns/{caller-ns}/principal`, §7.4), so the grant must name `-caller-ns` and be valid there; the principal's `sub` is the caller. Over a `-dev` core the caller is its `X-Author` instead. No caller is `401`. |
+| `Upstream-URL` | Required; under an `-upstream` prefix, else `403`. |
+| `Upstream-Method` | Default `POST`. |
+| `Upstream-Authorization` | Sent upstream as `Authorization`. Never stored or logged. |
+| `Upstream-Header-<Name>` | Sent upstream as `<Name>`. |
+| `Content-Type`, the body | Sent upstream as they are. |
+| `Request-Key` | Optional. The stream's id is then derived from the caller (the key that signed its grant, and its `sub`) and this key, so a repeated request finds its stream and upstream is not called again; without it the id is random. |
+
+```sh
+curl -sS https://proxy.example/streams -H "Authorization: Bearer $(cat ann.grant)" \
+  -H 'Upstream-URL: https://api.example.com/v1/messages' -H "Upstream-Authorization: Bearer $API_KEY" \
+  -H 'Content-Type: application/json' -H 'Request-Key: turn-17' -d '{"stream":true,"prompt":"…"}'
+# 201 (a new stream) or 200 (it existed: upstream is not called again)
+# { "id": "…", "url": "https://cms.example/r/streams/{id}", "log": "https://cms.example/r/streams/{id}/log",
+#   "grant": "<read grant>", "exp": "2026-11-17T12:00:00Z" }
+```
+
+`410` is a stream that was purged (its id is spent), `413` a body over `-max-request-body`,
+`503` a proxy at `-max-streams` or shutting down, `502` a core that can't be reached.
+`GET /healthz` answers `{"status":"ok","open":n}`. The proxy serves nothing else: streams are
+read from the core.
+
+**What is stored** is §J.1's document, one resource per upstream response, written as §J.2
+says:
+
+```jsonc
+// /r/streams/{id}
+{ "upstream": { "method": "POST", "status": 200, "contentType": "text/event-stream" },
+  "chunks": [ "data: {\"delta\":\"Hel\"}\n\n", "data: {\"delta\":\"lo\"}\n\n" ],
+  "closed": { "reason": "complete" } }
+```
+
+- The resource is created with `If-None-Match: *`, holding the method and no chunks, before
+  upstream is called; `200` or `412` on that create means the stream exists, and upstream isn't
+  called.
+- Each flush is one patch set of `add`s to `/chunks/-`, with `If-Match` on the proxy's last
+  revision and a fresh `$nonce` where the namespace requires them; the first also records
+  `status` and `contentType`, the last sets `closed`. A write whose outcome is unknown (a
+  timeout) is sent again with the same bytes; a `412` is answered by reading the new entries,
+  never by resending.
+- A chunk is UTF-8 text ending at a line end, at most 16 KiB (less in a namespace with small
+  limits); a longer line is cut between two characters.
+- No request header, no request body and no upstream URL are stored, and `closed.error` is one
+  of a few fixed sentences, since an HTTP library's error names the host.
+- `closed.reason` is `complete` when upstream's response ended, whatever its status: an upstream
+  `4xx` or `5xx` with a body is a stream like any other, with that `status`. `error` is a call
+  that failed or was cut short, a body that isn't text or isn't UTF-8, a proxy that restarted
+  or shut down; `aborted` an abort; `timeout` no append for `-idle-timeout`; `size` a stream
+  that continues in `next`.
+- A stream about to pass the namespace's `documentSize` closes with `"size"` and
+  `"next": "{id}.{n}"`, a resource of the same shape that carries on the same response. After
+  `-max-segments` resources the response is cut: `"size"` with an `error` and no `next`.
+- On `429` the proxy waits `Retry-After` and appends again on the same parent, with what
+  arrived meanwhile.
+
+**Reading and resuming** go to the core, with the `grant` of the answer (§J.3). It is the
+proxy's grant with a narrowing block: `via` the caller, `can: ["read", "append"]`, `exp` the
+stream's creation plus `-ttl` (or the proxy grant's own `exp` if sooner), and two rules: one
+fixing `/resource` to the stream's id and its continuation names, one allowing appends only
+within `/abort`. It reads that stream and nothing else in the namespace.
+
+```sh
+G="Authorization: Bearer $GRANT"
+curl -sSL -H "$G" https://cms.example/r/streams/$ID            # the document so far; its ETag is the revision
+curl -sS -D- -H "$G" "https://cms.example/r/streams/$ID/log?since=$REV&live=long-poll&cursor=$CURSOR"
+# 200 with the entries after $REV (join what each adds to /chunks/-), or 204 after the interval;
+# X-Revision is the next since, X-Cursor the next cursor. An empty since starts at the beginning.
+# The entry that adds /closed is the end; with "next", read on at /r/streams/{next}.
+
+./patchlog streams read -api https://cms.example -grant "$GRANT" streams/$ID            # prints the chunks to the end
+./patchlog streams read -api https://cms.example -grant "$GRANT" -since $REV streams/$ID  # resumes after $REV
+```
+
+In Go, `streams.Follow(ctx, client, ns, id, position, fn)` (internal/streams) does the same with
+a client carrying the grant: it calls `fn` with each revision's chunks and its `Position`
+(resource and revision), follows `next`, and returns how the stream closed; from a `Position`
+it resumes after that revision.
+
+**Abort** (§J.4): append `[{ "op": "add", "path": "/abort", "value": true }]` with `If-Match`
+on the head, and on `412` again on the head its body names; in a namespace that requires
+nonces add a fresh `/$nonce` too (`GET /ns/{ns}/principal` says whether, as the grant can't
+read the namespace document). `streams.Abort` does this, and goes to the continuation if the
+stream moved on. The proxy sees the entry in the resource's log, which it follows between
+chunks, or when its next append is `412`; it cancels the upstream request and closes the stream
+with `"aborted"`, dropping what it had not yet appended. An abort after `closed` changes
+nothing.
+
+**Expiry and orphans.** A sweep (every quarter of the lesser of `-idle-timeout` and `-ttl`,
+at most a minute) lists the namespace: an open stream that no proxy has appended to for
+`-idle-timeout` is closed with `"timeout"`, and a closed stream older than `-ttl`, whose read
+grants have expired, is purged (§8.3). A proxy closes its own stream the same way when
+upstream sends nothing for `-idle-timeout`. Documents in the namespace that aren't streams are
+left alone.
+
+**Limits, and what isn't implemented.**
+
+- **Sealed namespaces** (§J.4 Encryption) are refused at start: the proxy would sign each
+  reader a root grant carrying the reader's `enc`, which needs a namespace signing key in the
+  proxy and the reader's key in the request. End-to-end namespaces are refused too, as §J.4
+  says the design doesn't work there. Plain and at-rest namespaces work, as do namespaces that
+  require nonces; ones that require signatures don't.
+- **Rates.** The proxy writes as one principal: at 200 ms a stream is 5 appends a second, so
+  the default `ratePerPrincipal` (50 a second) carries about 10 streams at full pace, and more
+  only with larger flushes after `429`s. An allowance or a higher namespace limit raises it
+  (§J.2 Pace).
+- **Cost.** A stream is one growing document, so a flush costs its size so far
+  ([docs/CAPACITY.md](docs/CAPACITY.md)); a namespace `documentSize` below the default makes
+  streams continue sooner.
+- **Callers** are one namespace's principals (`-caller-ns`). Text bodies only (§J.1): a
+  response that isn't `text/*`, JSON, NDJSON or XML closes with `"error"`. The request body is
+  buffered, at most `-max-request-body`. The state is one proxy's: two proxies over one
+  namespace each carry their own streams and sweep each other's orphans.
+
 ### Bundles (§G.4)
 
 ```sh
@@ -4865,6 +5023,7 @@ internal/janitor     branch cleanup with claim verification (§F.6)
 internal/tree        tree service: folders, placements, links, manifests (§B.2–§B.9)
 internal/catalog     tree-derived access and grant issuing (§B.11)
 internal/dav         WebDAV for file managers and editors: namespaces and catalogs as files, saves as diffs (a prototype)
+internal/streams     stream proxy: an upstream's streamed response kept as a resource, with a reader (TOOLS §J.1–J.4)
 internal/bundle      bundle format, export and import (§G.4)
 internal/archive     file:// archives for pruning and offline restore (§8.6)
 internal/pgtest      a fresh Postgres database per test (PATCHLOG_TEST_PG)
