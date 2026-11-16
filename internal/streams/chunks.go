@@ -63,6 +63,18 @@ func (s *splitter) next() ([]string, error) {
 			break
 		}
 		if !utf8.Valid(s.carry[:cut]) {
+			// The whole lines before the bad bytes are still the stream's.
+			good := 0
+			for good < cut {
+				r, size := utf8.DecodeRune(s.carry[good:cut])
+				if r == utf8.RuneError && size <= 1 {
+					break
+				}
+				good += size
+			}
+			if i := bytes.LastIndexByte(s.carry[:good], '\n'); i >= 0 {
+				out = append(out, string(s.carry[:i+1]))
+			}
 			return out, errNotUTF8
 		}
 		out = append(out, string(s.carry[:cut]))

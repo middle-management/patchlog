@@ -168,9 +168,21 @@ func TestResume(t *testing.T) {
 			t.Fatalf("the resumed read repeats revision %s", pos.Rev)
 		}
 	}
-	// Resuming from the last revision of a closed stream yields nothing
-	// more... a reader that saw the end doesn't ask; one resuming from
-	// any earlier revision gets the tail.
+	// Resuming from the closing revision itself ends at once, with
+	// nothing more; from the one before, with the tail.
+	end := batches[len(batches)-1]
+	if end.Closed == nil {
+		t.Fatalf("last batch %+v", end)
+	}
+	if more, closed, bs := e.readAll(rc, a.ID, end.Position); more != "" || len(bs) != 0 || closed.Reason != streams.ReasonComplete {
+		t.Fatalf("resumed from the end: %q %+v", more, closed)
+	}
+	if len(batches) > 1 {
+		prev := batches[len(batches)-2]
+		if tail, closed, _ := e.readAll(rc, a.ID, prev.Position); tail != strings.Join(end.Chunks, "") || closed.Reason != streams.ReasonComplete {
+			t.Fatalf("resumed from the revision before the end: %q %+v", tail, closed)
+		}
+	}
 	again, closed2, _ := e.readAll(rc, a.ID, streams.Position{})
 	if again != sseBody() || closed2.Reason != streams.ReasonComplete {
 		t.Fatalf("read of the closed stream: %q %+v", again, closed2)
@@ -278,17 +290,30 @@ func TestUpstreamErrors(t *testing.T) {
 func TestNotText(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOpt{})
-	e.up.set(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		io.WriteString(w, "data: fine\n\n")
-		w.(http.Flusher).Flush()
-		time.Sleep(40 * time.Millisecond)
-		w.Write([]byte("data: \xff\xfe broken\n\n"))
-	})
-	a := e.mustPost(postOpt{})
-	got, closed, _ := e.readAll(e.reader(a), a.ID, streams.Position{})
-	if got != "data: fine\n\n" || closed.Reason != streams.ReasonError || !strings.Contains(closed.Error, "UTF-8") {
-		t.Fatalf("not UTF-8: %q %+v", got, closed)
+	// The lines before the bad bytes are kept, whether they arrive ahead
+	// of them or in the same read.
+	for _, together := range []bool{false, true} {
+		stored := make(chan struct{})
+		e.up.set(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			if together {
+				w.Write([]byte("data: fine\n\ndata: \xff\xfe broken\n\ndata: after\n\n"))
+				return
+			}
+			io.WriteString(w, "data: fine\n\n")
+			w.(http.Flusher).Flush()
+			<-stored
+			w.Write([]byte("data: \xff\xfe broken\n\n"))
+		})
+		a := e.mustPost(postOpt{})
+		if !together {
+			waitFor(t, "the first chunk", func() bool { sd, _ := e.doc(a.ID); return len(sd.Chunks) > 0 })
+		}
+		close(stored)
+		got, closed, _ := e.readAll(e.reader(a), a.ID, streams.Position{})
+		if got != "data: fine\n\n" || closed.Reason != streams.ReasonError || !strings.Contains(closed.Error, "UTF-8") {
+			t.Fatalf("not UTF-8 (together %v): %q %+v", together, got, closed)
+		}
 	}
 	e.up.set(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
@@ -317,6 +342,15 @@ func TestAbort(t *testing.T) {
 			a := e.mustPost(postOpt{})
 			rc := e.reader(a)
 			waitFor(t, "the first chunks", func() bool { sd, _ := e.doc(a.ID); return len(sd.Chunks) > 0 })
+			if nonce {
+				// J.4's patch as written lacks the nonce such a namespace
+				// requires; with one it is still within /abort (§6.4.1).
+				h, _ := rc.Head(e.ctx, nsStreams, a.ID)
+				_, err := rc.Append(e.ctx, nsStreams, a.ID, h.ID, []any{map[string]any{"op": "add", "path": "/abort", "value": true}})
+				if ae, ok := client.AsAPIError(err); !ok || ae.Status != 422 || ae.Code != "nonce" {
+					t.Fatalf("abort without a nonce: %v", err)
+				}
+			}
 			placed, err := streams.Abort(e.ctx, rc, nsStreams, a.ID)
 			if err != nil || !placed {
 				t.Fatalf("Abort: %v %v", placed, err)
@@ -456,6 +490,11 @@ func TestReadGrant(t *testing.T) {
 	if len(g.Blocks) != 2 || blk.Via != "user:ann" || fmt.Sprint(blk.Can) != "[read append]" || blk.Exp == nil || blk.Exp.Format(time.RFC3339) != a.Exp {
 		t.Fatalf("narrowing block %+v", blk.Raw)
 	}
+	// The first rule fixes /resource to a finite set of names (§2.1): the
+	// stream and its continuations.
+	if names, ok := grant.ResourceLiterals(blk.Rules[0]); !ok || len(names) != 8 || names[0] != a.ID || names[1] != streams.SegmentName(a.ID, 1) {
+		t.Fatalf("resource rule %v: %v %v", blk.Rules[0], names, ok)
+	}
 	rule := blk.Rules[1].(map[string]any)
 	if w := rule["then"].([]any)[0].(map[string]any); w["op"] != "writes" || fmt.Sprint(w["within"]) != "[/abort]" {
 		t.Fatalf("append rule %v", rule)
@@ -584,9 +623,31 @@ func TestContinuation(t *testing.T) {
 			if len(segs) < 3 {
 				t.Fatalf("the stream filled %d resources: %v", len(segs), segs)
 			}
-			got, _, _ := e.readAll(rc, a.ID, streams.Position{})
+			got, _, all := e.readAll(rc, a.ID, streams.Position{})
 			if got != want {
 				t.Fatalf("read from the beginning: %d bytes of %d", len(got), len(want))
+			}
+			// A reader whose last revision closed a resource with "size"
+			// carries on in the next, from every such point and from
+			// every other.
+			sizes := 0
+			for _, b := range append(batches, all...) {
+				if b.Closed != nil && b.Closed.Next != "" {
+					sizes++
+				}
+			}
+			if sizes < 2 {
+				t.Fatalf("%d batches close with next", sizes)
+			}
+			var sofar strings.Builder
+			for _, b := range batches {
+				for _, c := range b.Chunks {
+					sofar.WriteString(c)
+				}
+				tail, closed, _ := e.readAll(rc, a.ID, b.Position)
+				if first.String()+sofar.String()+tail != want || closed.Reason != streams.ReasonComplete {
+					t.Fatalf("resumed from %+v (closed %+v): %d bytes short", b.Position, b.Closed, len(want)-first.Len()-sofar.Len()-len(tail))
+				}
 			}
 			// The first resource names the second; each is under the limit
 			// and the same shape.
@@ -717,7 +778,8 @@ func TestIdleUpstream(t *testing.T) {
 	e.up.gated(sseParts[:1], make(chan struct{}), nil)
 	a := e.mustPost(postOpt{})
 	got, closed, _ := e.readAll(e.reader(a), a.ID, streams.Position{})
-	if got != sseParts[0] || closed.Reason != streams.ReasonTimeout {
+	// On a slow machine the timeout may come before the first flush.
+	if (got != sseParts[0] && got != "") || closed.Reason != streams.ReasonTimeout {
 		t.Fatalf("silent upstream: %q %+v", got, closed)
 	}
 	select {

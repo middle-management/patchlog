@@ -526,7 +526,11 @@ func (p *Proxy) start(w http.ResponseWriter, r *http.Request) {
 	if p.nonce {
 		gen["$nonce"] = seal.NewNonce()
 	}
-	res, err := p.create(r.Context(), id, gen)
+	// From here on the caller's connection doesn't matter: a resource
+	// created is a stream started.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
+	defer cancel()
+	res, err := p.create(ctx, id, gen)
 	var created time.Time
 	isNew := false
 	switch {
@@ -551,7 +555,7 @@ func (p *Proxy) start(w http.ResponseWriter, r *http.Request) {
 	if created.IsZero() {
 		// An existing stream whose genesis the answer didn't carry: its
 		// first log entry says when it was created.
-		if created, err = p.createdAt(r.Context(), id, ""); err != nil {
+		if created, err = p.createdAt(ctx, id, ""); err != nil {
 			if client.IsGone(err) {
 				httpError(w, 410, "gone", "the stream was removed")
 				return
@@ -660,14 +664,23 @@ func (p *Proxy) createdAt(ctx context.Context, name, head string) (time.Time, er
 		head = h.ID
 	}
 	es, _, err := p.c.LogPage(ctx, p.opt.NS, name, head, "")
+	if client.IsPruned(err) {
+		// Its history was pruned (§8.6), the genesis with it: the head
+		// is no older than the creation, so nothing is purged early.
+		d, err := p.c.Doc(ctx, p.opt.NS, name, head)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if d.Modified.IsZero() {
+			return time.Time{}, fmt.Errorf("streams: %s: its history is pruned and its head has no time", name)
+		}
+		return d.Modified, nil
+	}
 	if err != nil {
 		return time.Time{}, err
 	}
-	if len(es) == 0 || es[0].Parent != "" {
-		// History pruned (§8.6): the oldest entry left bounds it.
-		if len(es) == 0 {
-			return time.Time{}, fmt.Errorf("streams: %s has no log entries", name)
-		}
+	if len(es) == 0 {
+		return time.Time{}, fmt.Errorf("streams: %s has no log entries", name)
 	}
 	t, err := time.Parse(time.RFC3339, es[0].Created)
 	if err != nil {

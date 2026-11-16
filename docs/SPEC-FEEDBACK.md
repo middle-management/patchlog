@@ -613,7 +613,8 @@ v0.82" (v0.81 Open 24).
     `within ["/abort"]` in the reference, since a fresh `$nonce` is left out of `writes`
     (§6.4.1); the caller learns that it is needed from `/principal`, as its grant can't read
     the namespace document. §J.4 could say "with a fresh `$nonce` where the namespace requires
-    one". *No change is asked of the core.*
+    one". The rule allows any value at or below `/abort`, not only `true`; the reference's
+    proxy takes `true` alone for an abort. *No change is asked of the core.*
 97. **A repeated request** (TOOLS §J.2 step 1, §J.3, §J.4 Expiry). Two things are open when a
     create answers that the stream exists. (a) Which answer: the reference answers an
     identical create `200`, but where nonces are required the repeated request's genesis

@@ -56,34 +56,49 @@ func Follow(ctx context.Context, c *client.Client, ns, id string, from Position,
 	}
 	var up Upstream
 	for {
-		if since == "" {
-			h, d, err := c.Load(ctx, ns, name)
-			if err != nil {
-				return nil, err
-			}
-			if h.State != client.Live {
-				return nil, fmt.Errorf("%w: %s/%s", ErrGone, ns, name)
-			}
-			doc, err := ParseDoc(d.Value)
-			if err != nil {
-				return nil, err
-			}
-			up = doc.Upstream
+		h, d, err := c.Load(ctx, ns, name)
+		if err != nil {
+			return nil, err
+		}
+		if h.State != client.Live {
+			return nil, fmt.Errorf("%w: %s/%s", ErrGone, ns, name)
+		}
+		doc, err := ParseDoc(d.Value)
+		if err != nil {
+			return nil, err
+		}
+		up = doc.Upstream
+		var closed *Closed
+		switch {
+		case since == "":
+			// From the beginning: the document so far.
 			if err := fn(Batch{Position: Position{name, h.ID}, Chunks: doc.Chunks, Upstream: up, Closed: doc.Closed}); err != nil {
 				return nil, err
 			}
-			if doc.Closed != nil {
-				if doc.Closed.Reason == ReasonSize && doc.Closed.Next != "" {
-					name = doc.Closed.Next
-					continue
+			closed = doc.Closed
+		case doc.Closed != nil:
+			// Resuming in a resource that has closed since: what is left
+			// of its log, which no long-poll would end. The closing
+			// revision may be the one the reader saw last.
+			if since != h.ID {
+				es, err := c.Log(ctx, ns, name, h.ID, since)
+				if err != nil {
+					return nil, err
 				}
-				return doc.Closed, nil
+				if _, _, err := emit(name, es, &up, fn); err != nil {
+					return nil, err
+				}
 			}
-			since = h.ID
+			closed = doc.Closed
 		}
-		closed, err := followLog(ctx, c, ns, name, since, &up, fn)
-		if err != nil {
-			return nil, err
+		if closed == nil {
+			at := since
+			if at == "" {
+				at = h.ID
+			}
+			if closed, err = followLog(ctx, c, ns, name, at, &up, fn); err != nil {
+				return nil, err
+			}
 		}
 		if closed.Reason == ReasonSize && closed.Next != "" {
 			name, since = closed.Next, ""
@@ -91,6 +106,37 @@ func Follow(ctx context.Context, c *client.Client, ns, id string, from Position,
 		}
 		return closed, nil
 	}
+}
+
+// emit calls fn for the entries that add to the stream, up to the one
+// that sets closed, which it returns with the last entry's id.
+func emit(name string, entries []client.LogEntry, up *Upstream, fn func(Batch) error) (closed *Closed, last string, err error) {
+	for _, e := range entries {
+		if e.Kind != "rev" {
+			return nil, last, fmt.Errorf("%w: %s was deleted", ErrGone, name)
+		}
+		d := readPatches(e.Patches)
+		if d.upstream != nil {
+			*up = *d.upstream
+		}
+		if d.status != 0 {
+			up.Status = d.status
+		}
+		if d.ctype != "" {
+			up.ContentType = d.ctype
+		}
+		last = e.ID
+		if len(d.chunks) == 0 && d.closed == nil && d.status == 0 {
+			continue // an abort, or nothing a reader shows
+		}
+		if err := fn(Batch{Position: Position{name, e.ID}, Chunks: d.chunks, Upstream: *up, Closed: d.closed}); err != nil {
+			return nil, last, err
+		}
+		if d.closed != nil {
+			return d.closed, last, nil
+		}
+	}
+	return nil, last, nil
 }
 
 // followLog long-polls one resource's log after since until an entry sets
@@ -104,8 +150,6 @@ func followLog(ctx context.Context, c *client.Client, ns, name, since string, up
 		case client.IsBadInput(err) && cursor != "":
 			cursor = ""
 			continue
-		case client.IsNotFound(err) && since == "":
-			return nil, fmt.Errorf("%w: %s/%s", ErrGone, ns, name)
 		case client.Transient(err) && ctx.Err() == nil:
 			select {
 			case <-ctx.Done():
@@ -117,30 +161,12 @@ func followLog(ctx context.Context, c *client.Client, ns, name, since string, up
 			return nil, err
 		}
 		cursor = lp.Cursor
-		for _, e := range lp.Entries {
-			if e.Kind != "rev" {
-				return nil, fmt.Errorf("%w: %s/%s was deleted", ErrGone, ns, name)
-			}
-			d := readPatches(e.Patches)
-			if d.upstream != nil {
-				*up = *d.upstream
-			}
-			if d.status != 0 {
-				up.Status = d.status
-			}
-			if d.ctype != "" {
-				up.ContentType = d.ctype
-			}
-			since = e.ID
-			if len(d.chunks) == 0 && d.closed == nil && d.status == 0 {
-				continue // an abort, or nothing a reader shows
-			}
-			if err := fn(Batch{Position: Position{name, e.ID}, Chunks: d.chunks, Upstream: *up, Closed: d.closed}); err != nil {
-				return nil, err
-			}
-			if d.closed != nil {
-				return d.closed, nil
-			}
+		closed, last, err := emit(name, lp.Entries, up, fn)
+		if err != nil || closed != nil {
+			return closed, err
+		}
+		if last != "" {
+			since = last
 		}
 		if lp.Since != "" {
 			since = lp.Since
