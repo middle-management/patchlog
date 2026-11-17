@@ -161,9 +161,15 @@ const AdminHeader = "Admin-Authorization"
 
 // serveMergeGrants answers POST /merge-grants. Its grants are write grants
 // only, under the merge key, for the merge service to submit a batch to
-// the catalog (§F.8), and rules on /now for writes are unchanged (§C.2
-// item 5, v0.78), so none of its grants is refused for them, as POST
-// /grants and POST /read-grants refuse them (callerRefused).
+// the catalog (§F.8). A merge grant is refused 403, no-store, where its
+// approver's grant, the one in Approver-Authorization or else the
+// caller's own, has a block or key-scope rule that refers to /now, as
+// POST /grants and POST /read-grants refuse a caller's (§B.11.4 The
+// caller's grant, v0.85, scenario 139; errNowRule): after the 401s and a
+// malformed request's 400, before any other answer. Before v0.85 no such
+// grant was refused here. The grant in Admin-Authorization and, where an
+// approver is named, the caller's own aren't judged so: the text names
+// the approver's alone.
 func (s *Service) serveMergeGrants(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	v, err := s.Authenticate(r.Context(), r)
@@ -199,6 +205,10 @@ func (s *Service) serveMergeGrants(w http.ResponseWriter, r *http.Request) {
 	batch, _ := m["batch"].(map[string]any)
 	if batch == nil {
 		writeErr(w, badInput("batch is required"))
+		return
+	}
+	if grantcheck.RefusedByNowRule(av) {
+		tree.WriteAuthError(w, errNowRule, logf(s))
 		return
 	}
 	res, err := s.IssueMerge(r.Context(), v, av, adm, batch)

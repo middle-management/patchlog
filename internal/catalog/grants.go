@@ -317,24 +317,55 @@ func (s *Service) Authenticate(ctx context.Context, r *http.Request) (*grant.Ver
 // key-scope rule that refers to /now (or the whole envelope), which no
 // read passes (§C.2 item 5, grantcheck.RefusedByNowRule); and, where the
 // request reads (POST /read-grants, or a want that lists read), a grant
-// that allows read nowhere it verifies in, which is the catalog namespace
-// (grantcheck.ReadsNothing: no read in its can, or roles none of which
-// counts for read, each having a rule on /now or not listing read). Any
-// other want from such a grant is judged as usual: a role with a rule on
-// /now still counts for a write there, though never for read (counts).
-// It comes after the 401 and the request-shape 400s, which no state
-// decides, and before every other answer: the ?min wait and its 400 or
-// 503, and the decision's 404, 409 and 410. It is decided at no
-// checkpoint and carries none.
-func callerRefused(v *grant.Verified, reads bool) error {
-	switch {
-	case grantcheck.RefusedByNowRule(v):
-		return &grant.AuthError{Status: 403, Msg: "the grant's rules refer to /now, which no read passes (§C.2 item 5)"}
-	case reads && grantcheck.ReadsNothing(v):
+// that allows read in no namespace the service follows that it verifies
+// in (v0.85; tree.Service.ReadsSomewhere): v, as verified for the
+// catalog, has no read in its can, or roles none of which counts for
+// read, each having a rule on /now or not listing read
+// (grantcheck.ReadsNothing), and so has the grant as verified in each
+// content namespace the service follows. Before v0.85 the catalog
+// namespace alone was judged, so a grant whose roles list read only in a
+// content namespace was refused. Any other want from such a grant is
+// judged as usual: a role with a rule on /now still counts for a write
+// there, though never for read (counts). It comes after the 401 and the
+// request-shape 400s, which no state decides, and before every other
+// answer: the ?min wait and its 400 or 503, and the decision's 404, 409
+// and 410. It is decided at no checkpoint and carries none. A requireAt
+// chain of a content namespace that can't be read, where the grant reads
+// in none that could, is returned as it is (503 or 502, §C.4).
+func (s *Service) callerRefused(ctx context.Context, v *grant.Verified, reads bool) error {
+	if grantcheck.RefusedByNowRule(v) {
+		return errNowRule
+	}
+	if !reads {
+		return nil
+	}
+	switch ok, err := s.t.ReadsSomewhere(ctx, v.Grant.Encode(), v); {
+	case err != nil:
+		return err
+	case !ok:
 		return &grant.AuthError{Status: 403, Msg: "the grant allows no read (§C.2 items 2 and 5)"}
 	}
 	return nil
 }
+
+// chainRefusal is err, a requireAt chain a verifier couldn't read (§C.4),
+// as Issue answers it: 503 behind while the cause is transient, 502
+// upstream otherwise, naming no namespace; any other error as it is.
+func chainRefusal(err error) error {
+	var cu grant.ChainUnreadableError
+	switch {
+	case !errors.As(err, &cu):
+		return err
+	case cu.ChainUnreadable():
+		return &Error{Status: 503, Code: "behind", Msg: "the service cannot read the chain a key's requireAt names yet"}
+	}
+	return &Error{Status: 502, Code: "upstream", Msg: "cannot read the chain a key's requireAt names"}
+}
+
+// errNowRule is callerRefused's refusal of a grant with a block or
+// key-scope rule on /now, which POST /merge-grants answers an approver
+// too (serveMergeGrants).
+var errNowRule = &grant.AuthError{Status: 403, Msg: "the grant's rules refer to /now, which no read passes (§C.2 item 5)"}
 
 // verify verifies tok for the catalog namespace, failing as verifyHook
 // says where one is set (tests).
@@ -373,7 +404,7 @@ func (s *Service) serveGrants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if err := callerRefused(v, contains(req.Want, "read")); err != nil {
+	if err := s.callerRefused(r.Context(), v, contains(req.Want, "read")); err != nil {
 		tree.WriteAuthError(w, err, logf(s))
 		return
 	}
@@ -498,7 +529,7 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, badInput("items must list 1 to %d items", maxReadGrants))
 		return
 	}
-	if err := callerRefused(v, true); err != nil {
+	if err := s.callerRefused(ctx, v, true); err != nil {
 		tree.WriteAuthError(w, err, logf(s))
 		return
 	}
@@ -777,8 +808,13 @@ func (s *Service) Issue(ctx context.Context, v *grant.Verified, req Request) (*I
 	if err := s.shape(req); err != nil {
 		return nil, err
 	}
-	if err := callerRefused(v, contains(want, "read")); err != nil {
-		return nil, forbidden("%s", err.(*grant.AuthError).Msg)
+	if err := s.callerRefused(ctx, v, contains(want, "read")); err != nil {
+		var ae *grant.AuthError
+		if !errors.As(err, &ae) {
+			// A requireAt chain it can't read: 503 or 502, never 403.
+			return nil, chainRefusal(err)
+		}
+		return nil, forbidden("%s", ae.Msg)
 	}
 	switch {
 	case len(want) == 0:

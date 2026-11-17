@@ -430,6 +430,51 @@ func (s *Service) listed() map[string]bool {
 	return listed
 }
 
+// ReadsSomewhere reports whether token allows read in a namespace the
+// service follows that it verifies in (§B.11.4 The caller's grant, v0.85:
+// "where the grant allows read (§C.2 item 2, counting only roles item 5
+// lets count) in no namespace the service follows that it verifies in"):
+// vg, the grant as verified for the catalog (nil where it doesn't verify
+// there), or the grant as verified in a content namespace the catalog
+// trusts and the service follows now, one it stopped following or holds
+// as purged aside, isn't grantcheck.ReadsNothing. A grant's roles are
+// each namespace's own, so one whose roles list read only in a content
+// namespace reads there and nowhere in the catalog. Where it reads in
+// none it could judge and a requireAt chain of another couldn't be read,
+// that failure is returned (503 or 502, §C.4), never a refusal.
+func (s *Service) ReadsSomewhere(ctx context.Context, token string, vg *grant.Verified) (bool, error) {
+	if vg != nil && !grantcheck.ReadsNothing(vg) {
+		return true, nil
+	}
+	var nss []string
+	s.View(func(g *Graph, cur map[string]string) {
+		for ns := range g.Trust {
+			if _, purged := s.purged[ns]; cur[ns] != "" && !purged && !g.isStopped(ns) {
+				nss = append(nss, ns)
+			}
+		}
+	})
+	sort.Strings(nss)
+	var unread error
+	for _, ns := range nss {
+		cv, err := s.verify(ctx, s.actual(ns), token)
+		switch _, chain := chainErr(err); {
+		case chain:
+			if unread == nil || transientChain(unread) && !transientChain(err) {
+				unread = err
+			}
+		case err == nil && !grantcheck.ReadsNothing(cv):
+			return true, nil
+		}
+	}
+	return false, unread
+}
+
+// errReadsNothing refuses, at every /g/{gs} URL and at the exchange, a
+// grant POST /read-grants refuses as the caller's grant for allowing
+// read nowhere (§B.11.5 Listing URLs, v0.85; ReadsSomewhere).
+var errReadsNothing = &grant.AuthError{Status: 403, Msg: "the grant allows read in no namespace this service follows (§B.11.4 The caller's grant, §C.2 items 2 and 5)"}
+
 // grantViewer is the viewer of a reader presenting token ("" for none)
 // where the listings aren't all public (publicViewer), at a URL whose
 // subject set is want ("" for none, as for the exchange):
@@ -554,6 +599,15 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 	if v.bucket == "" {
 		// Verified for no namespace at all.
 		return nil, catErr
+	}
+	// One that allows read in no namespace the service follows reads no
+	// listing, whatever its subjects, and gets no edge grant: before
+	// v0.85 a grant without read, say can: ["append"], read its subject
+	// set's listings (§B.11.5 Listing URLs, scenario 140).
+	if reads, err := s.ReadsSomewhere(ctx, token, vg); err != nil {
+		return nil, err
+	} else if !reads {
+		return nil, errReadsNothing
 	}
 	if all && (want == "" || want == AllSubjects || s.opt.RoleView == nil) {
 		// Unfiltered (§B.11.5).
