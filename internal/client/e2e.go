@@ -1467,7 +1467,7 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) ([]string, error) {
 			// reads through as of at (§G.3, §7.6). Every namespace of
 			// the remote chain lies behind this one fork.
 			fork, err := x.remoteFork(ctx, cur, name)
-			if IsAuth(err) || IsNotFound(err) || IsGone(err) {
+			if IsAuth(err) || IsNotFound(err) || IsGone(err) || errors.Is(err, errNoGenesis) {
 				forks = nil
 				break
 			}
@@ -1494,6 +1494,10 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) ([]string, error) {
 	return forks, nil
 }
 
+// errNoGenesis is a remote branch whose log doesn't start with its config
+// genesis, as a deployment's (§G.3) does: its fork can't be placed.
+var errNoGenesis = errors.New("the log does not start with a config genesis")
+
 // remoteFork is the revision of name a remote branch ns forked from in its
 // base: its head of name as of its own first namespace entry, the config
 // genesis its log starts with, before any write of its own (§G.3, §10
@@ -1509,7 +1513,7 @@ func (x *E2E) remoteFork(ctx context.Context, ns, name string) (string, error) {
 		return "", err
 	}
 	if len(entries) == 0 || entries[0].Kind != "config" {
-		return "", fmt.Errorf("client: remote branch %s does not start with its config genesis", ns)
+		return "", fmt.Errorf("client: remote branch %s: %w", ns, errNoGenesis)
 	}
 	return x.headAt(ctx, ns, entries[0].ID, name)
 }

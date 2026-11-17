@@ -21,10 +21,12 @@ Implements spec **v0.85** (previously **v0.84**).
   Per-entry sealing, §E.2.2; v0.82 Open 17). A revision indexed in the clear before its
   namespace was raised to `sealed` has no `kid`. Its hits were sealed under the epoch in force
   when the index first sealed one; the index now reads the head again and seals under the epoch
-  of the `kid` the origin serves it under, which a rotation in between makes another. While
-  that read may yet succeed a query answers `503` (`behind`); a head that can't be read again
-  stays unjudged and nothing derived from it is sealed. End-to-end namespaces are judged as
-  before. No migration: only heads still pending are affected.
+  of the `kid` the origin serves it under, which a rotation in between makes another. The `kid`
+  is read from the served JWE's header, which needs no key (`client.DocKid`, new), so where the
+  index's grant gets no key for that epoch the hit is served by name only, as any hit of such
+  an epoch is. While that read may yet succeed a query answers `503` (`behind`); a head that
+  is gone stays unjudged and nothing derived from it is sealed. End-to-end namespaces are
+  judged as before. No migration: only heads still pending are affected.
 - **A branch catalog served directly lists what it reads through** (SERVICES §B.5 Previews;
   v0.82 Open 21). A tree service whose catalog is itself a branch starts from the branch's
   first entry and its `/heads` there, as a release preview does, so its graph holds the base's
