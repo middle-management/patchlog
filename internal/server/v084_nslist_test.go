@@ -242,7 +242,7 @@ func TestV084NamespacesAuthOrder(t *testing.T) {
 	// 200: every block that carries can lists config and none has a
 	// rule; more verbs, "*" beside a name, narrowing blocks that keep
 	// config or carry no can, and "rules": [], which is none (v0.85;
-	// SPEC-FEEDBACK v0.82 Open 101).
+	// v0.82 Open 101, settled in v0.85).
 	for name, g := range map[string]string{
 		"more verbs":      e.opGrant(map[string]any{"can": []any{"config", "purge", "purge-ns"}}).Encode(),
 		"* beside a name": e.opGrant(map[string]any{"ns": []any{"main", "*"}}).Encode(),

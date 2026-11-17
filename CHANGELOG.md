@@ -2,7 +2,16 @@
 
 ## Unreleased
 
-Implements spec **v0.85** (previously **v0.84**).
+Implements spec **v0.85** (previously **v0.84**). v0.85 is the spec's answer to the reference's
+103 open notes on v0.82 to v0.84 (docs/SPEC-FEEDBACK.md, "Settled in v0.85"): by its own count
+45 already matched the text or are the implementation's business, and the rest got a clause
+each. What the reference changed for them is below, by subject; the 60 notes this work leaves
+are the new list, "v0.85 Open n".
+
+- **`GET /` answers `"spec": "0.85"`**, and the docs mirror v0.85 (SPEC, SERVICES, TOOLS,
+  CONFORMANCE, the spec's change log, the proposed vectors).
+
+Rates and validation:
 
 - **`validationSteps` is §6.6's, and covers a write's rules** (§6.6 Validation work, §6.2
   step 5, §12.2; CONFORMANCE LIM-7, scenario 82; v0.82 Open 92). The limit the reference
@@ -42,6 +51,9 @@ Implements spec **v0.85** (previously **v0.84**).
 - **Deployment maxima of `ratePerResource` and `ratePerPrincipal`** (`serve
   --max-rate-per-resource`, `--max-rate-per-principal`) are what §6.6 intends, and an
   allowance's writes stay held to the namespace's `ratePerResource` (v0.82 Open 89): no change.
+
+`GET /ns`, documents, bundles and tools:
+
 - **`GET /ns`: which operator grants list** (§7.4, v0.85; CONFORMANCE HTTP-69, Access 79 and
   80). Only a block that carries `can` must list `config`, so a grant narrowed by a block with
   `via` or `exp` alone lists; `"rules": []` is no rule; a grant that carries `roles` in any
@@ -102,6 +114,9 @@ Implements spec **v0.85** (previously **v0.84**).
     outside it: a tree entry keeps its names, links, head, order, item file and listing
     structure, and loses every other member in the clear, where it lost `title` and `born`
     alone.
+
+Sealed forms, end-to-end reads and vectors:
+
 - **A base's `ns` is accepted only at E3, and only up to the foreign parent** (Addendum E
   Levels, §E.2.2, §E.3.1, §G.3; v0.82 Open 13; CONFORMANCE E2E scenarios 80, 81). The Go
   client's sealed path (`Doc`, `Log`, resource events and blobs sealed for delivery, the §E.2.2
@@ -139,8 +154,9 @@ Implements spec **v0.85** (previously **v0.84**).
   end-to-end namespaces is `404` (`not_offered`), never the `410` with `last` (scenario 78); a
   client refuses a base's current namespace document naming a lower or unknown level, and
   keeps the level it holds (scenario 79).
-Access and coverage at the origin and the services (the answers to Open 32–71 and 88, and to
-Open 19 and 20):
+
+Access and coverage at the origin and the services (the answers to v0.82 Open 32–71 and 88,
+and to 19 and 20):
 
 - **Index markers name their key: `reads:{ns}:key:{id}`** (§A.4 `gs`, Open 34; as the proposed
   vector C.4 computes it). A reader with namespace-wide `read` gets the marker of the key that
@@ -200,7 +216,6 @@ Open 19 and 20):
   levels up (§B.11.2, scenario 132), no exchange revives an ended cookie (§B.11.9 `gs`), a
   mixed `want` gets the narrower `can`, and only a malformed request's `400` precedes the
   caller's-grant `403`.
-
 
 ## v0.30.0
 
