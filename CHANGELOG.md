@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.85** (previously **v0.84**).
+
+- **A base's `ns` is accepted only at E3, and only up to the foreign parent** (Addendum E
+  Levels, §E.2.2, §E.3.1, §G.3; v0.82 Open 13; CONFORMANCE E2E scenarios 80, 81). The Go
+  client's sealed path (`Doc`, `Log`, resource events and blobs sealed for delivery, the §E.2.2
+  forms) no longer opens a payload whose `kid` or `pl.ns` names a base of the namespace read:
+  `seal.ErrMismatch`, without asking for the base's keys or document. It accepted that for an
+  end-to-end branch, at any position of its chain, a case no deployment has served since v0.78
+  (a sealed branch seals what it reads through under its own keys; an end-to-end branch's base
+  is end-to-end and serves sealed patch sets and snapshots). The `E2E` view, which reads those,
+  already bounded a local base's sealing by the fork; it now bounds a remote chain too, taking
+  the fork from the remote branch's own `/heads` at its first entry, and flags an entry sealed
+  under the chain past it. The playground's fold does the same for local bases (`nsChainOK`
+  reads the base's `/heads` at the branch's `at`), flagging "sealed under a base's key … past
+  the foreign parent"; a fork it can't place isn't checked.
+- **The index takes a pending head's epoch from the origin's sealing** (SERVICES §E.2.6
+  Per-entry sealing, §E.2.2; v0.82 Open 17). A revision indexed in the clear before its
+  namespace was raised to `sealed` has no `kid`. Its hits were sealed under the epoch in force
+  when the index first sealed one; the index now reads the head again and seals under the epoch
+  of the `kid` the origin serves it under, which a rotation in between makes another. While
+  that read may yet succeed a query answers `503` (`behind`); a head that can't be read again
+  stays unjudged and nothing derived from it is sealed. End-to-end namespaces are judged as
+  before. No migration: only heads still pending are affected.
+- **A branch catalog served directly lists what it reads through** (SERVICES §B.5 Previews;
+  v0.82 Open 21). A tree service whose catalog is itself a branch starts from the branch's
+  first entry and its `/heads` there, as a release preview does, so its graph holds the base's
+  nodes as of the branch's `at`. A database that followed such a catalog before is rebuilt
+  (`--rebuild`) to gain them.
+- **Vectors.** §I.17 as v0.85 recomputed it (I.20's accepted bundle sealed in three lines, and
+  padded) reproduces in full through `seal.OpenBundle`, the bundle Reader and `seal.Pad`; the
+  candidates C.1–C.3 are Addendum I's §I.22–§I.24 (`internal/vectors/addendum_i22_test.go`);
+  the new candidates C.4 (a whole response sealed at an index `gs` over `reads:demo:key:…`) and
+  C.5 (grant lines whose `key` doesn't match) reproduce too. docs/TESTVECTORS.md has the detail.
+- **Tests for clauses the reference already met:** a tombstone's `…/raw` in sealed and
+  end-to-end namespaces is `404` (`not_offered`), never the `410` with `last` (scenario 78); a
+  client refuses a base's current namespace document naming a lower or unknown level, and
+  keeps the level it holds (scenario 79).
+
 ## v0.30.0
 
 Implements spec **v0.84** (previously **v0.82**). v0.83 adds TOOLS.md's Addendum J, suggested

@@ -1442,7 +1442,10 @@ is printed on stderr as `--at AT --after TOKEN`, and `--all` follows the pages i
   result's request target as the redirect gave it, for the tree's and catalog's listings too
   (derived migration `002_v081_view_keys` drops the sealed views stored before).
 - Each hit is sealed under the epoch its document's revision is served under (§E.2.6, §E.2.2,
-  v0.73): the `kid` of the sealed document at E2, of the sealed op at E3. A result whose hits come from several
+  v0.73): the `kid` of the sealed document at E2, of the sealed op at E3. A head indexed in the
+  clear before its namespace was raised to `sealed` has no `kid`: the index reads it again and
+  takes the epoch the origin seals it under, never the epoch in force when the hit is first
+  sealed (v0.85; `503 behind` while that read may yet succeed). A result whose hits come from several
   epochs is sealed per entry, and `counts` over several epochs is `400`. After a restart the index
   needs the keys of those older epochs, so its grant needs an `nbf` reaching back before them
   (§E.2.3); a hit whose epoch the grant gets no key for, for good (a `4xx` from `/keys` other
@@ -2459,8 +2462,11 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   read-through content stays the base's ciphertext and keyring. Its writes bind the branch
   (`pl.ns`, `kid`), so a key holder writes the branch's own keyring first. Readers accept a
   base's namespace in `pl` or `kid` only for entries up to the branch's fork point, read from
-  the base's `/heads` at `base.at` (v0.73; remote bases, and readers that can't read those, keep
-  the depth rule). A prune in an e2e branch checks the snapshot as above and needs no archive,
+  the base's `/heads` at `base.at` (v0.73), and for a remote base from the remote branch's own
+  `/heads` at its first entry (v0.85, §G.3; readers that can't read those keep the depth
+  rule). The base's namespace is accepted only there, in sealed patch sets and snapshots: a
+  document, log entry, event or blob served in the §E.2.2 forms under another namespace's `kid`
+  is refused at every level (v0.85, Addendum E Levels; `seal.ErrMismatch`). A prune in an e2e branch checks the snapshot as above and needs no archive,
   since it moves nothing.
 - **Client.** `c.E2E(recipientPriv)` (or `c.E2EKeys(map[kid]key)`): `CreateSealed`,
   `CreateDocSealed`, `AppendSealed`, `RestoreSealed` (nil restores with `[]`) seal under the
@@ -2769,7 +2775,12 @@ included, are sealed under the catalog branch's keys, `kid` and `pl.ns` the bran
 base's, and a head read through is judged as the branch's epoch (v0.82, §B.5 Previews); a
 preview database of an earlier release, which stored the base's epoch numbers, has them judged
 again at start, its nodes listed by name only meanwhile, and a preview without the branch's
-keys answers `404`. After a restart the service needs the keys of older epochs its nodes
+keys answers `404`. A catalog that is itself a branch, served directly under its own name, holds
+the nodes it reads through from its base as of the branch's `at` too (v0.85): its follower starts
+from the branch's first entry and its `/heads` there. Their `parents` still name the base, as
+documents do (TOOLS §F), so under the branch's name they link to another namespace until the
+branch writes parents of its own; a database that followed such a catalog before v0.85 is
+rebuilt (`--rebuild`) to gain them. After a restart the service needs the keys of older epochs its nodes
 are served under, so its grant needs an `nbf` reaching back (§E.2.3): a node whose epoch key it
 can never get is listed by name only, with no `sealed` values, and one it can't fetch for the
 moment makes the listings that show it `503 behind`. A service that reads the catalog afresh
