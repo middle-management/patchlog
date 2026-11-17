@@ -123,9 +123,12 @@ func TestVerifySignatureStatuses(t *testing.T) {
 	bot := signerKey(t, "bot-1", 1)
 	other := signerKey(t, "bot-2", 2) // never listed
 	good := mint(t, nsKey.Priv, nsKey.Kid, "alice", bot)
-	// A grant whose line names a key that didn't sign its root block.
-	forgedKey := clienttest.NewKey("ns-key")
-	forged := mint(t, nsKey.Priv, nsKey.Kid, "mallory", bot)
+	// A grant its line's key signed, which doesn't name the line's
+	// namespace: the line is well-formed, and its signatures fail. (A
+	// line whose key didn't sign its root block rejects the bundle,
+	// §G.4.1, v0.85: TestV085GrantLineKey.)
+	forgedKey := nsKey
+	forged := mintFor(t, nsKey.Priv, nsKey.Kid, "mallory", "elsewhere", bot)
 	gid, fid := good.ID().String(), forged.ID().String()
 	signAs := func(k sig.Key, ns string) func(parent *ids.ID, body []byte) string {
 		return func(parent *ids.ID, body []byte) string {
@@ -269,12 +272,9 @@ func TestGrantLineOrderingAndShape(t *testing.T) {
 	}
 	// Changing a byte of the stored grant changes the digest.
 	tampered := bytes.Replace(ok.Bytes(), []byte(gl.GrantLine.Key.Pub), []byte(keyEntryOf(clienttest.NewKey("x")).Pub), 1)
-	s2, err := bundle.Verify(bytes.NewReader(tampered))
-	if err != nil || s2.Digest == digest {
-		t.Fatalf("digest of a changed grant line: %v %+v", err, s2)
-	}
-	if s2.Signatures.Counts[bundle.SigFailed] != 1 {
-		t.Fatalf("a wrong key on the grant line must fail its signatures: %+v", s2.Signatures)
+	// A wrong key on the grant line rejects the bundle (§G.4.1, v0.85).
+	if s2, err := bundle.Verify(bytes.NewReader(tampered)); err == nil || !strings.Contains(err.Error(), "doesn't verify its stored block") {
+		t.Fatalf("a grant line whose key doesn't verify its stored block: %v %+v", err, s2)
 	}
 
 	// A line that names a grant before its grant line: rejected by the

@@ -114,10 +114,11 @@ func TestV082XrevPlaygroundOpensAncestorsNodes(t *testing.T) {
 // reads a placement's item in the release's branch of its namespace and
 // seals its file metadata under that branch's keys, so kid and pl.ns name
 // the branch (internal/tree/files.go, Graph.Actual), while "item" keeps
-// the link documents use, /r/{base}/{name}; the entry names the branch in
-// "branch" (internal/tree/http.go entry). The playground compares the
-// value with the branch's resource where the entry names a branch, and
-// with the item's own namespace where it names none: never both.
+// the link documents use, /r/{base}/{name}; the entry's content URL names
+// the branch's resource (internal/tree/http.go entry; v0.85, §B.5: "whose
+// resource its entry's content URL then names"). The playground compares
+// the value with the resource that URL names, and with the item's own
+// where the entry has none: never both.
 func TestV082XrevPlaygroundPreviewFileValue(t *testing.T) {
 	t.Parallel()
 	const view = "/cat/at/1abcdefghijklmnopqrstuvwxyz234567/children?of=docs"
@@ -144,7 +145,7 @@ func TestV082XrevPlaygroundPreviewFileValue(t *testing.T) {
 			"sealed": val("cat-r7", "matches.derby", `{"title":"Derby"}`),
 			"file":   map[string]any{"sealed": val(fileNS, fileName, `{"file":{"name":"derby.md"}}`)}}
 		if branch != "" {
-			c["branch"] = branch
+			c["url"] = "https://cms.example/r/" + branch + "/derby/rev/1abcdefghijklmnopqrstuvwxyz234567"
 		}
 		return c
 	}

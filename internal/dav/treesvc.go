@@ -1010,13 +1010,16 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service can't be reached", cat), cause: err}
+		return nil, nil, unreached(fmt.Sprintf("catalog %s's tree service", cat), err)
 	}
 	defer res.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
+		}
+		if de := unreached(fmt.Sprintf("catalog %s's tree service", cat), err); de.status == http.StatusServiceUnavailable {
+			return nil, nil, de
 		}
 		return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service's answer was cut short", cat), cause: err}
 	}
@@ -1055,7 +1058,7 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		// Local mode's grant is the server's own (-bearer): a 502, named
 		// as the tree service's refusal, where record would name a 401
 		// the core's.
-		return nil, nil, fail(http.StatusBadGateway, "catalog %s's tree service refused this server's grant (-bearer): %s", cat, msg)
+		return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service refused this server's grant (-bearer) with 401", cat), cause: errors.New(msg)}
 	case res.StatusCode == http.StatusUnauthorized:
 		// A gateway's 401 is the user's grant refused: the challenge
 		// again, and the token verified again at its next request
@@ -1074,5 +1077,7 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		e.header = http.Header{"Retry-After": {ra}}
 		return nil, nil, e
 	}
-	return nil, nil, fail(http.StatusBadGateway, "catalog %s's tree service answered %d: %s", cat, res.StatusCode, msg)
+	// A 502 names the service and its status, nothing of its answer
+	// (§C.6 Upstream failures), which is logged (record).
+	return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service answered %d", cat, res.StatusCode), cause: errors.New(msg)}
 }

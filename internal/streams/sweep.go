@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -19,6 +21,21 @@ type known struct {
 	closed  bool      // a closed stream, created at created
 	other   bool      // not a stream document: left alone
 	created time.Time // the genesis entry's created
+}
+
+// segmentOf is SegmentName's inverse: the id of the stream a resource
+// name is a segment of, and which one, 0 for a name that is no
+// continuation's ({id}.{n}, n from 1, J.1).
+func segmentOf(name string) (id string, n int) {
+	i := strings.LastIndexByte(name, '.')
+	if i <= 0 || i == len(name)-1 || name[i+1] == '0' {
+		return name, 0
+	}
+	n, err := strconv.Atoi(name[i+1:])
+	if err != nil || n < 1 || SegmentName(name[:i], n) != name {
+		return name, 0
+	}
+	return name[:i], n
 }
 
 // state is the state file: the resources of the streams being written.
@@ -139,8 +156,13 @@ func (p *Proxy) closeOpen(ctx context.Context, name, head string, c *Closed) (bo
 
 // Sweep goes through the namespace once: an open stream no proxy has
 // appended to for IdleTimeout is closed with "timeout" (J.2 Restarts), and
-// a closed stream older than TTL, whose read grants have expired, is
-// purged (J.4 Expiry). Streams this proxy is writing are left alone.
+// a closed stream whose read grants have expired is removed with its
+// continuations (J.4 Expiry, v0.85). Its grants all end TTL after the
+// stream's creation, its first resource's, whenever a continuation was
+// created; and a stream is closed once the last resource it continued in
+// is, not when its first filled up ("size" with next). So no resource of
+// a stream still being carried is removed, and none outlives the others.
+// Streams this proxy is writing are left alone.
 func (p *Proxy) Sweep(ctx context.Context) error {
 	h, err := p.c.NSHead(ctx, p.opt.NS)
 	if err != nil {
@@ -153,6 +175,9 @@ func (p *Proxy) Sweep(ctx context.Context) error {
 	now := p.opt.Now()
 	settle := min(p.opt.IdleTimeout, p.opt.TTL)
 	seen := make(map[string]bool, len(items))
+	// What this sweep knows of each resource: absent for one that is open,
+	// being written, too young to judge or unreadable for now.
+	settled := make(map[string]known, len(items))
 	for _, it := range items {
 		if it.Kind != "head" {
 			continue
@@ -211,11 +236,46 @@ func (p *Proxy) Sweep(ctx context.Context) error {
 			p.known[name] = k
 			p.mu.Unlock()
 		}
-		if k.closed && !now.Before(k.created.Add(p.opt.TTL)) {
-			_, err := p.c.Purge(ctx, p.opt.NS, name, k.target, false)
+		settled[name] = k
+	}
+	// A stream's resources go together (J.4): the first, and the
+	// continuations of it that are there.
+	groups := map[string][]string{}
+	for name := range seen {
+		id, n := segmentOf(name)
+		if n > 0 && !seen[id] {
+			// A continuation whose first resource is gone (a sweep that
+			// was cut short, or a removal by hand): judged alone, by its
+			// own creation.
+			id = name
+		}
+		groups[id] = append(groups[id], name)
+	}
+	for id, names := range groups {
+		// Closed, all of them: a resource that names a next which isn't
+		// there is as closed as the stream gets, its continuation gone.
+		done := true
+		for _, name := range names {
+			if k, ok := settled[name]; !ok || !k.closed {
+				done = false
+				break
+			}
+		}
+		if !done || now.Before(settled[id].created.Add(p.opt.TTL)) {
+			continue
+		}
+		// The continuations first, the last one first, so that a sweep
+		// cut short leaves the first resource to find the rest by.
+		sort.Slice(names, func(i, j int) bool {
+			_, a := segmentOf(names[i])
+			_, b := segmentOf(names[j])
+			return names[j] == id || names[i] != id && a > b
+		})
+		for _, name := range names {
+			_, err := p.c.Purge(ctx, p.opt.NS, name, settled[name].target, false)
 			switch {
 			case err == nil:
-				p.opt.Logf("streams: sweep: purged %s, its read grants expired", name)
+				p.opt.Logf("streams: sweep: purged %s: the read grants of stream %s expired", name, id)
 			case client.IsStale(err), client.IsGone(err):
 			default:
 				p.opt.Logf("streams: sweep: purging %s: %v", name, err)

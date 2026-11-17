@@ -121,6 +121,14 @@ func v82Disagreeing(t *testing.T) map[string]struct {
 		"grant_block respelled": {v82EditLine(t, good, 2, func(m map[string]any) { m["stored"] = respelled }), "(§G.4.1)"},
 		// A stored block that doesn't decode has no grant_block.
 		"stored undecodable": {v82EditLine(t, good, 2, func(m map[string]any) { m["stored"] = "AAAA" }), "no grant_block"},
+		// v0.85 (Import scenario 47; v0.82 Open 75): the line's key has
+		// another kid than its root, or is another key under that kid,
+		// which doesn't verify the stored block. Line and root agree
+		// otherwise, and the signatures are as valid as before.
+		"key of another kid": {v82EditLine(t, good, 2, func(m map[string]any) { m["key"].(map[string]any)["kid"] = "ns-key-2" }), "not its root's"},
+		"key that didn't sign": {v82EditLine(t, good, 2, func(m map[string]any) {
+			m["key"].(map[string]any)["pub"] = clienttest.NewKey("ns-key").Pub
+		}), "doesn't verify its stored block"},
 	}
 }
 

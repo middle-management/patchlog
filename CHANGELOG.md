@@ -42,6 +42,67 @@ Implements spec **v0.85** (previously **v0.84**).
 - **Deployment maxima of `ratePerResource` and `ratePerPrincipal`** (`serve
   --max-rate-per-resource`, `--max-rate-per-principal`) are what §6.6 intends, and an
   allowance's writes stay held to the namespace's `ratePerResource` (v0.82 Open 89): no change.
+- **`GET /ns`: which operator grants list** (§7.4, v0.85; CONFORMANCE HTTP-69, Access 79 and
+  80). Only a block that carries `can` must list `config`, so a grant narrowed by a block with
+  `via` or `exp` alone lists; `"rules": []` is no rule; a grant that carries `roles` in any
+  block, an empty list included, is `403`. A grant its operator key's scope doesn't allow
+  (`can`, `sub`, `maxTtl`, …) is now `403`, as on every other request, where it was `401`; an
+  expired or badly signed one stays `401`.
+- **Bundles: a grant line's `key` must be its root's** (§G.4.1, v0.85; Import scenario 47).
+  A reader rejects the bundle whole, at step 1 of an import and before anything is written,
+  where a grant line's `key` has a `kid` other than `root.kid` or doesn't verify the `stored`
+  block (the block's signature alone). Such a bundle used to be read, with the signatures
+  under that grant reported as failed. The writer refuses such a line; `patchlog export`
+  already wrote only keys that verify. The two candidates of VECTORS-PROPOSED.md C.5
+  reproduce byte for byte and are rejected (`internal/vectors`, `TestV085C5GrantLineKey`).
+- **WebDAV gateway: one rule for a request that failed for now** (TOOLS §H.4 "Answers",
+  v0.85; FILE-18, Access scenario 78). For every method, reads and writes alike: `503` with
+  `Retry-After` after the core's or a tree service's `429` or `503`, or where no answer came
+  in time; `502` after its `408`, another `5xx`, or where there is no connection. Before,
+  only a save answered so, and other requests answered a core `408` with `503` and a `503`
+  with `502`; a tree service that timed out was `502`. A failed read never counts as a
+  refusal: a `408` to `GET /ns/{ns}/principal` or to the namespace document is no longer
+  kept, so a `DELETE`, `MOVE` or `COPY` meanwhile is `502` where it was `403`, and a `MKCOL`
+  fails too where it went ahead with default settings; `GET` and `PROPFIND` that read those
+  fail the same way where they were served from the kept answer. No write of a `DELETE`,
+  `MOVE`, `COPY` or `MKCOL` is sent once such a read has failed in the request, also where
+  it is the written namespace's own and the catalog's answered: a tree `DELETE` deleted
+  the placement and the item on default settings before. The catalog service's answers
+  follow the same rule. A `502` now names the service and its status only; the core's,
+  tree service's or catalog service's message is logged, not answered (§C.6 Upstream
+  failures).
+- **Stream proxy (`patchlog streams`), TOOLS Addendum J as v0.85 has it.** Most of what
+  v0.85 writes down the proxy already did (continuations `{id}.{n}` covered by the read
+  grant, callers identified through `GET /ns/{ns}/principal`, `exp` counted from the stream's
+  creation, upstream error answers and `3xx` kept with their status, sealed and end-to-end
+  namespaces refused). What changes:
+  - **A stream is purged with its continuations** (§J.4 Expiry): all its resources once the
+    last one it continued in is closed and `--ttl` has passed since the stream's creation.
+    Before, each resource was judged by its own creation, so the first could be purged while
+    a continuation was still being written, and a continuation outlived the read grants.
+  - **A stream closed by another proxy stops at once** (§J.2 Restarts): the proxy sees
+    `closed` in the log it follows and cancels upstream then, not at its next append or its
+    own idle timeout. It appends nothing more, as before.
+  - **`--segment-size`** (`Options.SegmentSize`): the size at which a stream continues in its
+    next resource, below the namespace's `documentSize` (§J.1 Size suggests 256 KiB where
+    latency matters). Default: `documentSize`, as before.
+  - The refusal of a sealed namespace no longer speaks of a design v0.85 dropped.
+  A read grant's `exp` is still the earlier of the stream's creation plus `--ttl` and the
+  proxy grant's own `exp`: a narrowed grant can't outlive the grant it was narrowed from.
+- **Playground: reading answers sealed per entry** (SERVICES §E.2.6, §B.5 Previews, v0.85;
+  E3 scenario 84).
+  - A value drawn from an entry's item (a placement's `file`) is compared with the resource
+    the entry's content `url` names, which in a release preview is the release branch's, and
+    with the item's own where the entry has no such URL. The tree service's own `branch`
+    member, which the spec doesn't define, is no longer read. A URL in another namespace than
+    the item's still counts only where that namespace's document names the item's as its
+    base, now also through a branch of it, so a stacked release branch opens where it showed
+    by name only.
+  - Of an entry that carries `sealed`, only what §E.2.6 leaves in the clear is taken from
+    outside it: a tree entry keeps its names, links, head, order, item file and listing
+    structure, and loses every other member in the clear, where it lost `title` and `born`
+    alone.
+
 
 ## v0.30.0
 

@@ -87,7 +87,7 @@ func (st *reqState) derived(ctx context.Context, cat string) (bool, error) {
 	req.Header.Set("Content-Type", "application/json")
 	res, err := st.s.ts.hc.Do(req)
 	if err != nil {
-		return false, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service can't be reached", cat), cause: err}
+		return false, unreached(fmt.Sprintf("catalog %s's tree service", cat), err)
 	}
 	io.Copy(io.Discard, io.LimitReader(res.Body, 1<<16))
 	res.Body.Close()
@@ -167,11 +167,14 @@ func (st *reqState) catalogPost(ctx context.Context, cat, path string, body []by
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's catalog service can't be reached", cat), cause: err}
+			return unreached(fmt.Sprintf("catalog %s's catalog service", cat), err)
 		}
 		b, err := io.ReadAll(io.LimitReader(res.Body, 16<<20))
 		res.Body.Close()
 		if err != nil {
+			if de := unreached(fmt.Sprintf("catalog %s's catalog service", cat), err); de.status == http.StatusServiceUnavailable {
+				return de
+			}
 			return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's catalog service's answer was cut short", cat), cause: err}
 		}
 		if res.StatusCode == http.StatusOK {
@@ -205,13 +208,15 @@ func (st *reqState) catalogPost(ctx context.Context, cat, path string, body []by
 			return de
 		case http.StatusUnauthorized:
 			if !st.s.opt.Gateway {
-				return fail(http.StatusBadGateway, "catalog %s's catalog service refused this server's grant (-bearer): %s", cat, msg)
+				return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's catalog service refused this server's grant (-bearer) with 401", cat), cause: errors.New(msg)}
 			}
 			return fail(http.StatusUnauthorized, "catalog %s's catalog service refused your grant: %s", cat, msg)
 		case http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusGone:
 			return fail(res.StatusCode, "catalog %s's catalog service: %s (§B.11.4)", cat, msg)
 		}
-		return fail(http.StatusBadGateway, "catalog %s's catalog service answered %s %d: %s", cat, path, res.StatusCode, msg)
+		// A 502 names the service and its status, nothing of its answer
+		// (§C.6 Upstream failures), which is logged (record).
+		return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's catalog service answered %s %d", cat, path, res.StatusCode), cause: errors.New(msg)}
 	}
 }
 

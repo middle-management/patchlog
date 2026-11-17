@@ -265,11 +265,38 @@ type Server struct {
 	ts       treeShared    // the tree service's client, and the catalogs' settings
 }
 
+// writeGuard keeps a request that writes (reqState.writes) from writing to
+// the core once a read of what its writes need has failed for now (nsInfo,
+// st.unread): GET /ns/{ns}/principal or the namespace document of a
+// namespace the request asked about. Such a read fails the request, 502
+// or 503 as upstream answers it, and never counts as a refusal or as
+// settings to go by (§H.4 "Answers", v0.85; CONFORMANCE Access 78): the
+// write isn't sent, whichever call would have made it. A save checks
+// before it gets here (saveInfo); a delete, a move, a copy and a new
+// folder went ahead on the defaults a fresh $nonce stands for.
+type writeGuard struct{ next http.RoundTripper }
+
+func (g writeGuard) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		if st := state(r.Context()); st != nil && st.writes() {
+			if e := st.unread.Load(); e != nil {
+				if r.Body != nil {
+					r.Body.Close()
+				}
+				return nil, upstream(*e)
+			}
+		}
+	}
+	return g.next.RoundTrip(r)
+}
+
 // New returns a server for opt.
 func New(opt Options) (*Server, error) {
 	if opt.Client == nil {
 		return nil, errors.New("dav: no client")
 	}
+	// Every client of the server's sends its requests through writeGuard.
+	opt.Client = opt.Client.With(client.WithTransport(func(next http.RoundTripper) http.RoundTripper { return writeGuard{next} }))
 	if !opt.Gateway && opt.Password == "" {
 		return nil, errors.New("dav: local mode needs a password")
 	}
@@ -515,13 +542,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r = r.WithContext(context.WithValue(r.Context(), stateKey{}, st))
 	if de := st.readOnly(r.Context()); de != nil {
-		if st.method == "PUT" {
-			// Which tree owns the namespace is a read the save decides
-			// by (§H.4 "The base").
-			de = de.asSave()
-			for k, v := range de.header {
-				w.Header()[k] = v
-			}
+		// Which tree owns the namespace is a read the answer depends on
+		// (§H.4 "Answers"): one that failed for now carries Retry-After.
+		for k, v := range de.header {
+			w.Header()[k] = v
+		}
+		if de.cause != nil {
+			s.opt.Logf("dav: %s %s: %v", r.Method, r.URL.Path, de)
 		}
 		http.Error(w, de.msg, de.status)
 		return
@@ -586,7 +613,7 @@ func (st *reqState) readOnly(ctx context.Context) *davError {
 			if de, ok := upstream(err).(*davError); ok {
 				return de
 			}
-			return fail(http.StatusBadGateway, "%s: file tree settings couldn't be read: %v", p, err)
+			return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("%s: file tree settings couldn't be read", p), cause: err}
 		case cat != "":
 			return fail(http.StatusForbidden, "%s is read-only here: file tree %s owns the items of namespace %s (its catalog.files.ns, §H.2), so they are written, moved and deleted through /%s/, not in %s's flat view", p, cat, ns, cat, ns)
 		case unread != "":
@@ -2327,7 +2354,7 @@ func (s *Server) authOff(ctx context.Context) (bool, *davError) {
 	if de, ok := upstream(err).(*davError); ok {
 		return false, de
 	}
-	return false, fail(http.StatusBadGateway, "the core's GET / couldn't be read: %v", err)
+	return false, &davError{status: http.StatusBadGateway, msg: "the core's GET / couldn't be read", cause: err}
 }
 
 // authStale has authOff read GET / again at the next login: the core
@@ -2504,14 +2531,15 @@ func (st *reqState) record(err error) error {
 	if de.refresh {
 		st.tk.forgetWriters()
 	}
-	if st.method == "PUT" {
-		// Whichever read failed for now, a save answers it as a save's
-		// failed read (§H.4 "The base").
-		de = de.asSave()
+	if de.cause != nil && de.status >= 500 {
+		// What a 502 or 503 doesn't say: the answer or the failure that
+		// caused it (§C.6 Upstream failures), and the service's address.
+		st.s.opt.Logf("dav: %s %s: %v", st.method, st.path, de)
 	}
 	switch {
 	case de.status == http.StatusUnauthorized && !st.s.opt.Gateway:
-		de = &davError{status: http.StatusBadGateway, msg: "the core refused this server's grant (-bearer): " + de.msg, cause: de.cause}
+		st.s.opt.Logf("dav: %s %s: the core refused this server's grant: %s", st.method, st.path, de.msg)
+		de = &davError{status: http.StatusBadGateway, msg: "the core refused this server's grant (-bearer) with 401", cause: de.cause}
 	case de.status == http.StatusUnauthorized:
 		st.s.mu.Lock()
 		st.tk.verified = time.Time{}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -399,71 +400,115 @@ func v82With(t *testing.T, e *env, rt http.RoundTripper) *env {
 	return &g
 }
 
-// BT-8 changes saves only (TOOLS §H.4 "The base"): to a request that
-// isn't one, the core's 408 to what a namespace's writes need (GET
-// /ns/{ns}/principal, the namespace's head and document) is the answer
-// it was before v0.82, kept as any refusal of them is, and the request
-// is answered as v0.27.0 answered it.
-func TestV082OtherRequestsKeepA408(t *testing.T) {
+// v0.85 (TOOLS §H.4 "Answers", FILE-18; CONFORMANCE Access 78; v0.82
+// Open 79, 80): one rule for every request. A core read the answer
+// depends on that fails for now (GET /ns/{ns}/principal, the namespace's
+// head and document) fails the request, a read or a write alike: 502
+// after the core's 408 or where there is no connection, 503 with
+// Retry-After after its 503 or where no answer comes in time. It never
+// counts as a refusal (a DELETE answered 403 on a kept 408 before), and no
+// write goes ahead on the settings a failed read left unknown (a MKCOL
+// did). Nothing is written, and once the core answers the request is
+// served.
+func TestV085FailedReadIsNoRefusal(t *testing.T) {
 	t.Parallel()
-	for _, c := range []struct {
-		read, method, path string
-		want               int
-	}{
-		{"principal", "GET", "/docs/x.json", 200},
-		{"principal", "PROPFIND", "/docs/", 207},
-		{"principal", "PROPFIND", "/", 207},
-		{"principal", "GET", "/cat/Season/derby.json", 200},
-		{"principal", "PROPFIND", "/cat/Season/", 207},
-		{"principal", "PROPFIND", "/cat/", 207},
-		{"principal", "DELETE", "/docs/x.json", 403},
-		{"principal", "MKCOL", "/cat/Season/New", 201},
-		{"nsdoc", "GET", "/docs/x.json", 200},
-		{"nsdoc", "PROPFIND", "/docs/", 503},
-		{"nsdoc", "PROPFIND", "/", 207},
-		{"nsdoc", "GET", "/cat/Season/derby.json", 503},
-		{"nsdoc", "PROPFIND", "/cat/Season/", 503},
-		{"nsdoc", "PROPFIND", "/cat/", 503},
-		{"nsdoc", "DELETE", "/docs/x.json", 403},
-		{"nsdoc", "MKCOL", "/cat/Season/New", 503},
-	} {
-		t.Run(c.read+" "+c.method+" "+c.path, func(t *testing.T) {
-			t.Parallel()
-			rt := &failRT{status: 408}
-			e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("docs")}})
-			e.create("docs", "x", map[string]any{"a": "1"})
-			e.create("docs", "derby", map[string]any{"title": "Derby"})
-			e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
-			e.create("cat", "season", map[string]any{"title": "Season", "parents": parents("cat", "root")})
-			e.create("cat", "docs.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
-			e = v82With(t, e, rt)
-			rt.match.Store(func(q *http.Request) bool {
-				if q.Method != "GET" {
-					return false
-				}
-				if c.read == "principal" {
-					return strings.HasSuffix(q.URL.Path, "/principal")
-				}
-				for _, ns := range []string{"cat", "docs"} {
-					if q.URL.Path == "/ns/"+ns || strings.HasPrefix(q.URL.Path, "/ns/"+ns+"/rev/") {
-						return true
+	for _, f := range []struct {
+		status, want int // status 0: no answer in time; -1: no connection
+	}{{408, 502}, {-1, 502}, {503, 503}, {0, 503}} {
+		for _, c := range []struct {
+			read, method, path, dst string
+			ok                      int
+		}{
+			{"principal", "GET", "/docs/x.json", "", 200},
+			{"principal", "PROPFIND", "/docs/", "", 207},
+			{"principal", "GET", "/cat/Season/derby.json", "", 200},
+			{"principal", "PROPFIND", "/cat/Season/", "", 207},
+			{"principal", "PROPFIND", "/cat/", "", 207},
+			// A flat namespace no tree owns: which tree does is read
+			// first (the catalog's /principal).
+			{"principal", "DELETE", "/notes/x.json", "", 204},
+			{"principal", "MOVE", "/notes/x.json", "/notes/y.json", 201},
+			{"principal", "COPY", "/notes/x.json", "/notes/y.json", 201},
+			// One the tree owns is read-only in its flat view: that
+			// refusal (403) is given only once the read succeeds.
+			{"principal", "DELETE", "/docs/x.json", "", 403},
+			{"principal", "DELETE", "/cat/Season/derby.json", "", 204},
+			{"principal", "MOVE", "/cat/Season/derby.json", "/cat/Season/city.json", 201},
+			{"principal", "COPY", "/cat/Season/derby.json", "/cat/Season/city.json", 201},
+			{"principal", "MKCOL", "/cat/Season/New", "", 201},
+			{"nsdoc", "PROPFIND", "/docs/", "", 207},
+			{"nsdoc", "GET", "/cat/Season/derby.json", "", 200},
+			{"nsdoc", "PROPFIND", "/cat/Season/", "", 207},
+			{"nsdoc", "PROPFIND", "/cat/", "", 207},
+			{"nsdoc", "DELETE", "/notes/x.json", "", 204},
+			{"nsdoc", "MKCOL", "/cat/Season/New", "", 201},
+		} {
+			t.Run(fmt.Sprintf("%d %s %s %s", f.status, c.read, c.method, c.path), func(t *testing.T) {
+				t.Parallel()
+				rt := &failRT{status: f.status}
+				e := newEnv(t, []string{"docs", "notes"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("docs")}})
+				e.create("docs", "x", map[string]any{"a": "1"})
+				e.create("notes", "x", map[string]any{"a": "1"})
+				e.create("docs", "derby", map[string]any{"title": "Derby"})
+				e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+				e.create("cat", "season", map[string]any{"title": "Season", "parents": parents("cat", "root")})
+				e.create("cat", "docs.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
+				e = v82With(t, e, rt)
+				var hit atomic.Int64
+				rt.match.Store(func(q *http.Request) bool {
+					if q.Method != "GET" {
+						return false
 					}
+					if c.read == "principal" {
+						if strings.HasSuffix(q.URL.Path, "/principal") {
+							hit.Add(1)
+							return true
+						}
+						return false
+					}
+					for _, ns := range []string{"cat", "docs"} {
+						if q.URL.Path == "/ns/"+ns || strings.HasPrefix(q.URL.Path, "/ns/"+ns+"/rev/") {
+							hit.Add(1)
+							return true
+						}
+					}
+					return false
+				})
+				var hdr []string
+				if c.dst != "" {
+					hdr = []string{"Destination", c.dst}
 				}
-				return false
+				docs, cat, notes := e.liveNames("docs"), e.liveNames("cat"), e.liveNames("notes")
+				rt.armed.Store(true)
+				what := fmt.Sprintf("%s %s, the core failing the %s reads (%d)", c.method, c.path, c.read, f.status)
+				r := e.do(c.method, c.path, "", hdr...)
+				if hit.Load() == 0 {
+					// A flat view's own reads need no namespace document.
+					if c.read == "nsdoc" {
+						t.Skipf("%s reads no namespace document", what)
+					}
+					t.Fatalf("%s: the request didn't make the read", what)
+				}
+				v82ExpectFailed(t, e, r, f.want, what)
+				if f.want == 502 && (strings.Contains(r.body, "try later") || strings.Contains(r.body, "unavailable") || strings.Contains(r.body, "127.0.0.1")) {
+					t.Fatalf("%s: the 502 carries the core's answer or address: %q", what, r.body)
+				}
+				if d, c2, n := e.liveNames("docs"), e.liveNames("cat"), e.liveNames("notes"); !reflect.DeepEqual(d, docs) || !reflect.DeepEqual(c2, cat) || !reflect.DeepEqual(n, notes) {
+					t.Fatalf("%s wrote: docs %v (were %v), cat %v (were %v), notes %v (were %v)", what, d, docs, c2, cat, n, notes)
+				}
+				rt.armed.Store(false)
+				e.expect(e.do(c.method, c.path, "", hdr...), c.ok, c.method+" "+c.path+", the core answering")
 			})
-			rt.armed.Store(true)
-			e.expect(e.do(c.method, c.path, ""), c.want, c.method+" "+c.path+", the core answering 408 to the "+c.read+" reads")
-		})
+		}
 	}
 }
 
-// BT-8, the window after another request kept the core's 408 (flat and
-// tree): a GET is served while GET /ns/{ns}/principal answers 408, which
-// the server keeps a while as what the namespace's writes need. A save
-// right after doesn't go by what was kept: it asks again, and while the
-// core still answers 408 it fails (502), nothing written. Once the core
-// answers, the save is made.
-func TestV082SaveAfterAKept408(t *testing.T) {
+// v0.85 (§H.4 "Answers"; before, BT-8's window after a kept 408): no
+// request keeps the core's 408 to GET /ns/{ns}/principal as what a
+// namespace's writes need. A save after a GET made meanwhile asks again
+// and fails (502), nothing written; once the core answers, the save is
+// made.
+func TestV085NoKept408(t *testing.T) {
 	t.Parallel()
 	for _, path := range []string{"/docs/x.json", "/cat/Season/derby.json", "/cat/Season/new.json"} {
 		t.Run(path, func(t *testing.T) {
@@ -475,6 +520,10 @@ func TestV082SaveAfterAKept408(t *testing.T) {
 			e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
 			e.create("cat", "season", map[string]any{"title": "Season", "parents": parents("cat", "root")})
 			e.create("cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
+			// The tag a save names, read through a server whose core
+			// answers; the one under test has asked nothing yet.
+			read := strings.Replace(path, "new.json", "derby.json", 1)
+			g := e.expect(e.do("GET", read, ""), 200, "GET, the core answering")
 			e = v82With(t, e, rt)
 			var asked atomic.Int64
 			// The namespace the save writes: the tree's files.ns, or the
@@ -491,10 +540,11 @@ func TestV082SaveAfterAKept408(t *testing.T) {
 				return false
 			})
 			rt.armed.Store(true)
-			read := strings.Replace(path, "new.json", "derby.json", 1)
-			g := e.expect(e.do("GET", read, ""), 200, "GET, the core answering 408 to the principal reads")
-			if asked.Load() == 0 {
-				t.Fatal("the GET didn't ask who writes the namespace")
+			// A GET meanwhile is served where it needs nothing of the
+			// answer, and fails like the save where it does: never from
+			// a 408 kept as a refusal.
+			if r := e.do("GET", read, ""); r.status != 200 && r.status != 502 {
+				t.Fatalf("GET, the core answering 408 to the principal reads: %d %s", r.status, r.body)
 			}
 			before := len(e.liveNames("matches"))
 			head, _ := e.load("docs", "x")
@@ -504,9 +554,9 @@ func TestV082SaveAfterAKept408(t *testing.T) {
 				hdr = []string{"If-Match", g.header.Get("ETag")}
 			}
 			was := asked.Load()
-			v82ExpectFailed(t, e, e.do("PUT", path, body, hdr...), 502, "PUT after the kept 408")
+			v82ExpectFailed(t, e, e.do("PUT", path, body, hdr...), 502, "PUT after the 408")
 			if asked.Load() == was {
-				t.Fatal("the save went by the kept 408: it didn't ask again")
+				t.Fatal("the save went by a kept 408: it didn't ask again")
 			}
 			x, _ := e.load("docs", "x")
 			d, _ := e.load("matches", "derby")
@@ -671,13 +721,14 @@ func TestV082SaveEveryFailedReadDerived(t *testing.T) {
 	}
 }
 
-// BT-8 changes saves only: a MKCOL reads the head of the folder node it
-// makes as a new file's save reads its placement node's, and a failed
-// read of it is answered as any request's (§H.4 "Answers"): 502 after
-// the core's 503, 503 with Retry-After after its 408. No folder is made.
-func TestV082MkcolFailedReadUnchanged(t *testing.T) {
+// v0.85 (§H.4 "Answers"; before, BT-8 changed saves only): a MKCOL reads
+// the head of the folder node it makes as a new file's save reads its
+// placement node's, and a failed read of it is answered as any request's:
+// 503 with Retry-After after the core's 503, 502 after its 408. No folder
+// is made.
+func TestV085MkcolFailedRead(t *testing.T) {
 	t.Parallel()
-	for _, c := range []struct{ status, want int }{{503, 502}, {408, 503}} {
+	for _, c := range []struct{ status, want int }{{503, 503}, {408, 502}} {
 		t.Run(strconv.Itoa(c.status), func(t *testing.T) {
 			t.Parallel()
 			rt := &failRT{status: c.status}
@@ -712,5 +763,81 @@ func TestV082MkcolFailedReadUnchanged(t *testing.T) {
 			rt.armed.Store(false)
 			e.expect(e.do("MKCOL", "/cat/Season/New", ""), 201, "MKCOL, the core answering")
 		})
+	}
+}
+
+// CONFORMANCE Access 78 (§H.4 "Answers", v0.85), where only the written
+// namespace's own GET /ns/{ns}/principal fails, the catalog's answering:
+// a DELETE, MOVE, COPY or MKCOL fails (502 after a 408, 503 with
+// Retry-After after a 503) before it writes, in a flat namespace with no
+// catalog and in a tree whose items' namespace it is.
+func TestV085WrittenNamespacePrincipalFails(t *testing.T) {
+	t.Parallel()
+	for _, f := range []struct{ status, want int }{{408, 502}, {503, 503}} {
+		for _, c := range []struct {
+			tree              bool
+			method, path, dst string
+		}{
+			{false, "DELETE", "/docs/x.json", ""},
+			{false, "MOVE", "/docs/x.json", "/docs/y.json"},
+			{false, "COPY", "/docs/x.json", "/docs/y.json"},
+			{false, "PUT", "/docs/new.json", ""},
+			{true, "DELETE", "/cat/Season/derby.json", ""},
+			{true, "MOVE", "/cat/Season/derby.json", "/cat/Season/city.json"},
+			{true, "COPY", "/cat/Season/derby.json", "/cat/Season/city.json"},
+			{true, "PUT", "/cat/Season/new.json", ""},
+		} {
+			t.Run(fmt.Sprintf("%d %s %s", f.status, c.method, c.path), func(t *testing.T) {
+				t.Parallel()
+				rt := &failRT{status: f.status}
+				var e *env
+				ns := "docs"
+				if c.tree {
+					e, ns = treeEnv(t), "matches"
+				} else {
+					e = newEnv(t, []string{"docs"}, nil, nil)
+					e.create("docs", "x", map[string]any{"a": "1"})
+				}
+				e = v82With(t, e, rt)
+				var hit atomic.Int64
+				rt.match.Store(func(q *http.Request) bool {
+					if q.Method == "GET" && q.URL.Path == "/ns/"+ns+"/principal" {
+						hit.Add(1)
+						return true
+					}
+					return false
+				})
+				var hdr []string
+				if c.dst != "" {
+					hdr = []string{"Destination", c.dst}
+				}
+				body := ""
+				if c.method == "PUT" {
+					body = `{"a": "2"}`
+				}
+				names := func() [][]string {
+					out := [][]string{e.liveNames(ns)}
+					if c.tree {
+						out = append(out, e.liveNames("cat"))
+					}
+					return out
+				}
+				before := names()
+				rt.armed.Store(true)
+				what := fmt.Sprintf("%s %s, the core answering %d to GET /ns/%s/principal", c.method, c.path, f.status, ns)
+				r := e.do(c.method, c.path, body, hdr...)
+				if hit.Load() == 0 {
+					t.Fatalf("%s: the request didn't ask (%d %s)", what, r.status, r.body)
+				}
+				v82ExpectFailed(t, e, r, f.want, what)
+				if after := names(); !reflect.DeepEqual(after, before) {
+					t.Fatalf("%s wrote: %v, were %v", what, after, before)
+				}
+				rt.armed.Store(false)
+				if r := e.do(c.method, c.path, body, hdr...); r.status != 201 && r.status != 204 {
+					t.Fatalf("%s %s, the core answering: %d %s", c.method, c.path, r.status, r.body)
+				}
+			})
+		}
 	}
 }

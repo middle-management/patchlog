@@ -245,8 +245,9 @@ func (s *stream) run(url string, hdr http.Header, body []byte) {
 			}
 		case <-timer:
 		case <-s.abortSig:
-			// The follower saw an abort between chunks (J.4): read the
-			// entries, as after a 412.
+			// The follower saw an abort between chunks (J.4), or closed
+			// set by another proxy (J.2): read the entries, as after a
+			// 412.
 			switch ab, cl, err := s.catchUp(); {
 			case err != nil && (client.IsGone(err) || client.IsNotFound(err)), cl:
 				cancelUp()
@@ -283,7 +284,7 @@ func (s *stream) flush(pending []piece, closing *Closed, forceFull bool, cancelU
 			map[string]any{"op": "add", "path": "/upstream/contentType", "value": s.ctype})
 		metaSize = 40 + len(jsonv.Canonical(s.ctype))
 	}
-	docLeft := p.docSize - reserve - s.size - metaSize
+	docLeft := p.segSize - reserve - s.size - metaSize
 	setLeft := p.setSize - 1024
 	docFull := forceFull
 	for !docFull && n < len(pending) && len(ops) < p.opsPerSet-4 {
@@ -300,7 +301,7 @@ func (s *stream) flush(pending []piece, closing *Closed, forceFull bool, cancelU
 		setLeft -= enc + 64
 		n++
 	}
-	grew := p.docSize - reserve - s.size - docLeft
+	grew := p.segSize - reserve - s.size - docLeft
 	var closed *Closed
 	switch {
 	case docFull && s.seg+1 >= p.opt.MaxSegments:
@@ -548,7 +549,11 @@ func (s *stream) startFollow() {
 			since, cursor = lp.Since, lp.Cursor
 			for _, e := range lp.Entries {
 				d := readPatches(e.Patches)
-				if d.abort {
+				// An abort, or closed set by another proxy (J.2
+				// Restarts, v0.85): run reads the entries and stops
+				// upstream at once, not at its next append. The
+				// writer's own close wakes it for nothing.
+				if d.abort || d.closed != nil {
 					select {
 					case s.abortSig <- struct{}{}:
 					default:

@@ -2,9 +2,11 @@ package dav_test
 
 import (
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -12,7 +14,8 @@ import (
 )
 
 // failRT answers the core requests match picks with status while armed
-// (status 0: a transport timeout, as an http.Client's Timeout gives), and
+// (status 0: a transport timeout, as an http.Client's Timeout gives; below
+// 0: a refused connection), and
 // passes every other request through.
 type failRT struct {
 	armed  atomic.Bool
@@ -24,6 +27,10 @@ func (f *failRT) RoundTrip(r *http.Request) (*http.Response, error) {
 	if m, _ := f.match.Load().(func(*http.Request) bool); f.armed.Load() && m != nil && m(r) {
 		if f.status == 0 {
 			return nil, timeoutErr{}
+		}
+		if f.status < 0 {
+			// No connection (§H.4 "Answers": 502).
+			return nil, &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
 		}
 		return &http.Response{StatusCode: f.status, Header: http.Header{"Retry-After": {"5"}, "Content-Type": {"application/json"}},
 			Body: io.NopCloser(strings.NewReader(`{"code":"unavailable","message":"try later"}`)), Request: r}, nil

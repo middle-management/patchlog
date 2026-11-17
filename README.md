@@ -45,11 +45,11 @@ and serves immutable, CDN-cacheable revisions.
 | Limits (configurable, deployment maximums) and token-bucket rate limits; a refusal names the limit (`limit`) and, for sizes and counts, `measured` and `max` | §6.6, §12 | ✅ (see [Limit refusals](#design-notes)) |
 | `GET /ns/{ns}/principal`: what the grant in `Authorization` is in a namespace (principal, `kid`, the verifying key's thumbprint `key`, `operator`, verbs, roles as `{ name, can, rules }`, and a catalog namespace's `catalog` settings) and what a writer needs from the namespace document (frozen, successor, nonce, signatures, level, limits in force), to a grant limited to some resources or without `read` too | §7.4, §C.5, §C.7, §8.5 | ✅ (client `NSPrincipal`; see [Design notes](#design-notes)) |
 | File trees: `catalog.files` in catalog namespace documents, file metadata (`file: { size, type, modified }`) on placements in tree listings, sealed per entry for items of sealed namespaces, and the rendering of a JSON file shared by tools (`internal/files`) | §7.4, §H.1–§H.3, §E.2.6 | ✅ (tree service; see [File trees](#file-trees-h2-h3)) |
-| Streams and shared agent sessions: a proxy that keeps an upstream's streamed response as a resource, sessions of people and agents in one namespace, agents through MCP, recorded model calls | TOOLS Addendum J (suggested, non-normative; v0.83) | Partly: J.1–J.4, the stream proxy, are implemented by `patchlog streams` (see [Stream proxy](#stream-proxy-addendum-j1j4)): the stream document, writing, the narrowed read grant, resuming, abort and expiry, in plain and at-rest namespaces; sealed namespaces (J.4 Encryption) are refused at start. J.5–J.7 (shared sessions, agents through MCP, recording model calls) are not implemented: they are patterns built from core requests by tools outside this repository |
+| Streams and shared agent sessions: a proxy that keeps an upstream's streamed response as a resource, sessions of people and agents in one namespace, agents through MCP, recorded model calls | TOOLS Addendum J (suggested, non-normative; v0.83) | Partly: J.1–J.4, the stream proxy, are implemented by `patchlog streams` (see [Stream proxy](#stream-proxy-addendum-j1j4)): the stream document, writing, the narrowed read grant, resuming, abort and expiry, in plain and at-rest namespaces; sealed and end-to-end namespaces are refused at start, as the pattern is for neither (J.4 Encryption, v0.85). J.5–J.7 (shared sessions, agents through MCP, recording model calls) are not implemented: they are patterns built from core requests by tools outside this repository |
 | Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`, bounded by entries and by `logPageBytes`) | §6.2, §7.1–§7.2 | ✅ (`serve --log-page-size`, `--log-page-bytes`; see [Design notes](#design-notes)) |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
 | Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name, `?prefix=`), `/branches` | §7.4 | ✅ |
-| `GET /ns?after={name}`: the deployment's namespaces for operators, branches, remote branches and purged namespaces included, as `{ name, created, base?, frozen, purged }` in byte order of name, paged by `logPageSize`, with `?prefix=`; answered only to an operator grant whose blocks name `"*"`, list `config` and carry no `rules` (`403`, `401`, `403` in that order), or to anyone under `serve --dev` | §7.4, §C.4 (v0.84) | ✅ (`client.Namespaces`, `patchlog ns ls`; see [Grants](#grants)) |
+| `GET /ns?after={name}`: the deployment's namespaces for operators, branches, remote branches and purged namespaces included, as `{ name, created, base?, frozen, purged }` in byte order of name, paged by `logPageSize`, with `?prefix=`; answered only to an operator grant whose blocks name `"*"`, that carries no roles, and whose blocks list `config` where they carry `can` and carry no rule (`403`, `401`, `403` in that order, a key-scope failure being `403`), or to anyone under `serve --dev` | §7.4, §C.4 (v0.84, v0.85) | ✅ (`client.Namespaces`, `patchlog ns ls`; see [Grants](#grants)) |
 | Files and sync clients: `Last-Modified`, `Repr-Digest` and `If-Modified-Since` on `…/rev/{id}`, and `created`, `size` and `digest` on `/heads` entries, outside E2 and E3; raw documents at `…/raw`; moves recorded as `$successor`, named by the head's `410`; whole-document appends up to `documentSize` | §6.2, §6.6, §7.1, §7.4, §7.8, §8.1 | ✅ (see [Files and sync clients](#files-and-sync-clients-71-74-78-81)) |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
@@ -3327,9 +3327,11 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   the core's `429` or `503`, and after a timeout of the gateway's own, else `502` (the core's
   `408`, another `5xx`, an unreachable core; TOOLS §H.4 "The base"). So a save is never written
   over another user's entry taken for the user's own while that history can't be read, as
-  v0.27.0 could. A MOVE or COPY onto an existing file saves into it, and answers so for its
-  reads of the head, the base and the log between; its other reads, and other requests, keep
-  the general answers (a core `408` is `503`, its `503` is `502`).
+  v0.27.0 could. Since v0.85 it is the rule for every request, a read or a write, a DELETE,
+  MOVE, COPY or MKCOL like a save (TOOLS §H.4 "Answers"): a core or tree service request the
+  answer depends on that fails for now fails the request, and never counts as a refusal. So a
+  DELETE made while `GET /ns/{ns}/principal` answers `408` is `502`, where it was `403`, and
+  no write goes ahead on settings a failed read left unknown.
   A raw file over a JSON document's, or the
   other way round, replaces its root. A purged one is `410`, as is any name of a purged
   namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
@@ -3458,8 +3460,11 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   times, for 45 seconds); `410` for a purged file or namespace; `401` and `403` (but in local
   mode a `401` refuses the server's own grant, not the user's password, so it is `502` rather
   than a new login prompt). A `429` is waited out when its Retry-After is at most 2 s, and is
-  otherwise `503` with Retry-After. A core that can't be reached is `502` (the details are
-  logged). `423` and `507` mean only a lock held and this server's memory full.
+  otherwise `503` with Retry-After, as are the core's or a tree service's `503` and a request
+  that got no answer in time. Its `408`, any other `5xx` and a core that can't be reached are
+  `502` (v0.85; a `408` was `503` and a `503` was `502` before, but in a save). A `502` names
+  the service and the status it answered, nothing of its answer, which is logged with the
+  other details (§C.6). `423` and `507` mean only a lock held and this server's memory full.
 - An empty file is a file (§H.1): a raw file of 0 bytes is made (`__init__.py`, `.gitkeep`), a raw
   file truncated, and a JSON file refuses it (`400`), as any content that isn't I-JSON. Only where
   the content decides the kind, a LOCK of a new name and a new `.json` name (Finder's 0-byte PUT
@@ -3786,9 +3791,10 @@ sessions, agents through MCP and recording model calls (J.5–J.7) are not imple
 | `--author` | `X-Author` for a `--dev` core. |
 | `--upstream` | An allowed upstream: a URL prefix (repeatable). An `Upstream-URL` must have the same scheme and host and a path under the prefix's, at a segment boundary; anything else is `403`. No `--upstream` refuses every request. Redirects are not followed: a `3xx` is kept as the stream. |
 | `--flush` | Least time between two appends to one stream (default 200 ms, §J.2 Pace). |
-| `--ttl` | How long read grants live from a stream's creation (default 24 h); a closed stream that old is purged (§J.4 Expiry). |
+| `--ttl` | How long read grants live from a stream's creation (default 24 h); a closed stream that old is purged with its continuations (§J.4 Expiry). |
 | `--idle-timeout` | A stream with no append for this long is closed with `"timeout"` (default 2 m). |
 | `--state` | A file with the names of the streams being written; a proxy started again closes those still open with `"error"` (§J.2 Restarts). Without it they are closed by the idle sweep, with `"timeout"`. |
+| `--segment-size` | The size at which a stream continues in its next resource, where that is below the namespace's `documentSize` (default: `documentSize`). Each append costs the stream's size so far, so where latency matters §J.1 suggests well below it, `--segment-size "256 KiB"` say. |
 | `--max-request-body`, `--max-segments`, `--max-streams` | Largest body forwarded upstream (1 MiB); most resources one response may fill (8); most streams carried at once (64, then `503` with `Retry-After`; requests that arrive together share the count, and a `Request-Key` request for a stream that exists needs no slot). |
 | `--public-url` | The core's base URL as callers reach it, for the `url` of an answer (default `--api`). |
 | `--create-ns` | Create `--ns` with `read: "grant"` if it is missing. Only over a `--dev` core: under grants a namespace is created with an operator grant and its document lists the key of the proxy's grant, neither of which the proxy holds. |
@@ -3803,7 +3809,7 @@ upstream then runs in the background, whether or not the caller stays connected.
 
 | Header | |
 | --- | --- |
-| `Authorization: Bearer <grant>` | The caller's own Patch Log grant. The proxy asks the core who it is (`GET /ns/{caller-ns}/principal`, §7.4), so the grant must name `--caller-ns` and be valid there; the principal's `sub` is the caller. Over a `--dev` core the caller is its `X-Author` instead. No caller is `401`. |
+| `Authorization: Bearer <grant>` | The caller's own Patch Log grant. The proxy asks the core who it is (`GET /ns/{caller-ns}/principal`, §7.4), so the grant must name `--caller-ns` and be valid there, and one narrowed to `"can": []` is enough (§J.1 Names); the principal's `sub` is the caller. Over a `--dev` core the caller is its `X-Author` instead. No caller is `401`. |
 | `Upstream-URL` | Required; under an `--upstream` prefix, else `403`. |
 | `Upstream-Method` | Default `POST`. |
 | `Upstream-Authorization` | Sent upstream as `Authorization`. Never stored or logged. |
@@ -3858,7 +3864,7 @@ says:
   that failed or was cut short, a body that isn't text or isn't UTF-8, a proxy that restarted
   or shut down; `aborted` an abort; `timeout` no append for `--idle-timeout`; `size` a stream
   that continues in `next`.
-- A stream about to pass the namespace's `documentSize` closes with `"size"` and
+- A stream about to pass the namespace's `documentSize`, or `--segment-size`, closes with `"size"` and
   `"next": "{id}.{n}"`, a resource of the same shape that carries on the same response. After
   `--max-segments` resources the response is cut: `"size"` with an `error` and no `next`.
 - On `429` the proxy waits `Retry-After` and appends again on the same parent, with what
@@ -3899,25 +3905,29 @@ nothing.
 
 **Expiry and orphans.** A sweep (every quarter of the lesser of `--idle-timeout` and `--ttl`,
 at most a minute) lists the namespace: an open stream that no proxy has appended to for
-`--idle-timeout` is closed with `"timeout"`, and a closed stream older than `--ttl`, whose read
-grants have expired, is purged (§8.3). A proxy closes its own stream the same way when
-upstream sends nothing for `--idle-timeout`. Documents in the namespace that aren't streams are
-left alone.
+`--idle-timeout` is closed with `"timeout"`, and a closed stream whose read grants have
+expired is purged (§8.3) with its continuations (§J.4, v0.85): all of them once the last
+resource it continued in is closed and `--ttl` has passed since the stream's creation, its
+first resource's. So no resource of a stream still being carried is purged, and a continuation
+doesn't outlive the grants by the time it was created after the first. A proxy closes its own
+stream the same way when upstream sends nothing for `--idle-timeout`, and one that sees its
+stream closed by another proxy, in the log it follows, cancels upstream at once and appends
+nothing more (§J.2 Restarts). Documents in the namespace that aren't streams are left alone.
 
 **Limits, and what isn't implemented.**
 
-- **Sealed namespaces** (§J.4 Encryption) are refused at start: the proxy would sign each
-  reader a root grant carrying the reader's `enc`, which needs a namespace signing key in the
-  proxy and the reader's key in the request. End-to-end namespaces are refused too, as §J.4
-  says the design doesn't work there. Plain and at-rest namespaces work, as do namespaces that
-  require nonces; ones that require signatures don't.
+- **Sealed and end-to-end namespaces** are refused at start: the design is for a `streams`
+  namespace that is neither (§J.4 Encryption, v0.85). A sealed namespace's keys are wrapped to
+  a grant's root block, so the narrowed read grant opens nothing for its reader, and
+  end-to-end the abort rule can't be judged. Plain and at-rest namespaces work, as do
+  namespaces that require nonces; ones that require signatures don't.
 - **Rates.** The proxy writes as one principal: at 200 ms a stream is 5 appends a second, so
   the default `ratePerPrincipal` (50 a second) carries about 10 streams at full pace, and more
   only with larger flushes after `429`s. An allowance or a higher namespace limit raises it
   (§J.2 Pace).
 - **Cost.** A stream is one growing document, so a flush costs its size so far
-  ([docs/CAPACITY.md](docs/CAPACITY.md)); a namespace `documentSize` below the default makes
-  streams continue sooner.
+  ([docs/CAPACITY.md](docs/CAPACITY.md)); `--segment-size`, or a namespace `documentSize`
+  below the default, makes streams continue sooner (§J.1 Size).
 - **Callers** are one namespace's principals (`--caller-ns`). Text bodies only (§J.1): a
   response that isn't `text/*`, JSON, NDJSON or XML closes with `"error"`. The request body is
   buffered, at most `--max-request-body`. The state is one proxy's: two proxies over one
@@ -3942,8 +3952,12 @@ patchlog import -i all.jsonl --atomic --ns demo-schemas=demo2-schemas,demo=demo2
   grant line's `key` with a member §G.4.1 doesn't define rejects the bundle too, and since
   v0.82 so does a grant line whose `grant` isn't the id of its `root` or whose `stored` block
   isn't `canonical(root)`, one that doesn't decode included: whole, at import step 1, before
-  anything is written. The writer refuses such a line, and an export leaves a grant whose
-  record disagrees off the lines that would name it, with a note.
+  anything is written. Since v0.85 so does a grant line whose `key` has a `kid` other than
+  its root's, or whose `key` doesn't verify the `stored` block (its signature alone, whatever
+  the grant's `ns`, times or scope): such a bundle used to import with those signatures
+  reported as failed. The writer refuses such a line, an export leaves a grant whose
+  record disagrees off the lines that would name it, with a note, and writes a `key` only
+  where it verifies the root block.
 - **Authors** (`--authors`, `"authors": true`) adds each history line's author, creation time,
   signature, and its `gesture` and `undoes` (§G.4.1). Imports write the gestures with the
   revisions (batch step objects, §7.5), so undo history survives the move; authors and times
@@ -4607,14 +4621,15 @@ frozen, purged } ], "next"? }`, `no-store`, for operators and admin tools:
 - **Who.** Only an operator grant, checked in the spec's order: the request-shape errors first
   (an unknown or repeated query parameter, a `prefix` that isn't a namespace name, then the
   grant's own of §C.2 item 1); `403` for a grant with a block that carries `ns` without naming
-  `"*"`, before anything is verified; `401` without credentials or for a grant that fails
-  verification, whatever it fails for (a root `kid` that names no operator key in its period, a
-  signature, `nbf`/`exp`, the key's scope); then `403` unless every block lists `config` in its
-  own `can` and no block has `rules`. So `{"kid":"operator","sub":"op:admin","ns":["*"],
-  "can":["config"],"exp":…}` lists, and the grant that created one namespace (`ns: ["docs"]`)
-  doesn't. Taken literally (SPEC-FEEDBACK 101): a narrowing block must repeat `can` with
-  `config`, an empty `rules` list counts as rules, and a grant that carries `roles` is `403`,
-  an operator grant having no effective role. Under `serve --dev` it answers everyone.
+  `"*"`, before anything is verified; `401` without credentials or for a grant that is no
+  usable one (a root `kid` that names no operator key in its period, a signature, `nbf`/`exp`,
+  a revocation); `403` for a grant its operator key's scope doesn't allow, as on any other
+  request (§C.2 item 1); then `403` for a grant that carries `roles` in any block (an operator
+  grant has no effective role), or has a block that carries `can` without `config` or carries
+  non-empty `rules` (v0.85). So `{"kid":"operator","sub":"op:admin","ns":["*"],
+  "can":["config"],"exp":…}` lists, also narrowed by a block with only `via` and `exp` or with
+  `"rules": []`, and the grant that created one namespace (`ns: ["docs"]`) doesn't. Under
+  `serve --dev` it answers everyone.
 - **Rows.** Every namespace: local branches, remote branches, the namespaces a remote branch's
   creation mirrored schemas into, and purged ones, which keep their row. Not the hidden shadows
   that hold a remote base's mirrored content (`~…`, §G.3): they are no namespaces of the API.
