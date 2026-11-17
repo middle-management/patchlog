@@ -323,6 +323,7 @@ type putCmd struct {
 	toolArgs
 	encArgs
 	gestureArgs
+	plainArgs
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
 	Doc      string `arg:"positional,required" placeholder:"JSON|@FILE|-" help:"the document"`
 }
@@ -342,6 +343,9 @@ func (a *putCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if err := v.checkWrite(a.plainArgs); err != nil {
+		return err
+	}
 	_, opt := a.gesture()
 	w, err := v.create(ctx, doc, opt)
 	if err != nil {
@@ -355,6 +359,7 @@ type patchCmd struct {
 	toolArgs
 	encArgs
 	gestureArgs
+	plainArgs
 	If       string `arg:"--if" placeholder:"ID" help:"append to this revision only, failing (412 stale) if the head has moved; by default to the head, trying again when another writer gets there first"`
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
 	Patch    string `arg:"positional,required" placeholder:"JSON|@FILE|-" help:"a JSON Patch (RFC 6902) array"`
@@ -373,6 +378,9 @@ func (a *patchCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	}
 	v, err := a.view(ctx, a.writer(), ns, name)
 	if err != nil {
+		return err
+	}
+	if err := v.checkWrite(a.plainArgs); err != nil {
 		return err
 	}
 	g, opt := a.gesture()

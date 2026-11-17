@@ -31,8 +31,10 @@
   `readers` administer an e2e namespace's keyring; `e2e keys` shows what `/keys` gives a grant.
   `get` (and `--follow`), `put`, `patch`, `log` and `blob put|get` learn the namespace's level:
   sealed namespaces are opened with the keys `/keys` gives, e2e ones sealed and folded by the
-  client with `--identity` (`$PATCHLOG_IDENTITY`), and refused without it. `log --follow` of an
-  e2e namespace isn't supported yet.
+  client with `--identity` (`$PATCHLOG_IDENTITY`), and refused without it. A write whose
+  namespace's level can't be told is refused before sending anything (`--expect-level`, or
+  `--plain` for an unencrypted one); `restore` and `batch` refuse e2e namespaces. `log --follow`
+  of an e2e namespace isn't supported yet.
 - **`client.With` keeps the keyring senders**: a signing or keyed copy of a client lost
   `--keyring-sender`.
 - **Grants.** `grant inspect` decodes a grant offline, `grant check NS TOKEN` verifies it as the

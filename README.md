@@ -4130,7 +4130,11 @@ namespace's level and take the encrypted path. `--identity KEY.jwk` (`$PATCHLOG_
 your X25519 private key (`patchlog bundle keygen -o KEY.jwk` makes one): in a sealed namespace
 the private key of your grant's `enc`, which `/keys` wraps the keys to; in an e2e namespace the
 key its keyring wraps them to, with `--keyring-sender ADMIN.jwk` naming the admin who wrapped
-them. Without it an e2e document is refused, never printed as ciphertext.
+them. Without it an e2e document is refused, never printed as ciphertext. A write whose
+namespace's level the grant can't tell (one that reads neither the namespace document nor a level
+from `/keys`) is refused before anything is sent, rather than risk plaintext reaching an e2e
+namespace's server: give `--expect-level NS=LEVEL`, or `--plain` for one that isn't encrypted.
+`restore` and `batch` can't seal yet, and refuse e2e namespaces.
 
 ```sh
 patchlog e2e init docs ann.pub.jwk --identity admin.jwk          # the keyring, wrapped for you and the readers given

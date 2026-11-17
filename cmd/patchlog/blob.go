@@ -39,6 +39,7 @@ type blobPutCmd struct {
 	toolArgs
 	encArgs
 	gestureArgs
+	plainArgs
 	Type     string  `arg:"--type" placeholder:"MEDIA-TYPE" help:"the blob's media type (default: from the file's extension, else sniffed from its bytes)"`
 	Nonce    bool    `arg:"--nonce" help:"upload with a random nonce (Blob-Nonce), so the blob's id reveals nothing about its bytes (§3.7, §7.8); always in a sealed namespace, never in an e2e one, whose blobs are encrypted under a fresh key"`
 	At       *string `arg:"--at" placeholder:"POINTER" help:"also write the reference into the document at this JSON Pointer (add), so the blob isn't left pending"`
@@ -76,6 +77,9 @@ func (a *blobPutCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	}
 	v, err := a.view(ctx, a.writer(), ns, name)
 	if err != nil {
+		return err
+	}
+	if err := v.checkWrite(a.plainArgs); err != nil {
 		return err
 	}
 	var ref map[string]any

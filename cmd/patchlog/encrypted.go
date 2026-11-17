@@ -62,6 +62,7 @@ type encView struct {
 	x        *client.E2E    // set where ns/name is sealed end to end
 	priv     *ecdh.PrivateKey
 	level    string
+	known    bool // level was told, not assumed (nsLevel)
 	ns, name string
 }
 
@@ -79,7 +80,7 @@ func (e *encArgs) view(ctx context.Context, c *client.Client, ns, name string) (
 	}
 	v.c = c.With(client.WithKeys(client.NewKeys(v.priv)))
 	var err error
-	if v.level, err = nsLevel(ctx, v.c, ns); err != nil {
+	if v.level, v.known, err = nsLevel(ctx, v.c, ns); err != nil {
 		return nil, err
 	}
 	if v.level == "e2e" && name != client.KeyringName {
@@ -99,22 +100,62 @@ func needIdentity(ns string) error {
 
 // nsLevel is ns's encryption level ("" for none): from its namespace
 // document, or for a grant that can't read it (§C.5) from what /keys
-// names; where neither tells, the level c holds (--expect-level), and the
-// plain path's own requests report what is wrong. One lower than held is
+// names; where neither tells, the level c holds (--expect-level). known is
+// false when none of them told: the level is then assumed "", which a read
+// may go on with (its own requests report what is wrong), but a write
+// must not (checkWrite), since it would send plaintext to a server that
+// may be holding an e2e namespace. One lower than held is
 // client.ErrLevelLowered.
-func nsLevel(ctx context.Context, c *client.Client, ns string) (string, error) {
+func nsLevel(ctx context.Context, c *client.Client, ns string) (level string, known bool, err error) {
 	lv, err := c.EncryptionLevel(ctx, ns)
 	if err == nil || errors.Is(err, client.ErrLevelLowered) || !client.IsAuth(err) && !client.IsNotFound(err) {
-		return lv, err
+		return lv, err == nil, err
 	}
 	a, kerr := c.FetchKeysAnswer(ctx, ns, []int{}, nil)
 	switch {
 	case kerr == nil && a.Level != "":
-		return a.Level, nil
+		return a.Level, true, nil
 	case errors.Is(kerr, client.ErrLevelLowered):
-		return "", kerr
+		return "", false, kerr
 	}
-	return c.HeldLevel(ns), nil
+	held := c.HeldLevel(ns)
+	return held, held != "", nil
+}
+
+// errLevelUnknown is a write's refusal when ns's level can't be told.
+func errLevelUnknown(ns string) error {
+	return fmt.Errorf("can't tell whether namespace %s is encrypted (this grant reads neither its document nor a level from /keys), so nothing was sent: content written in the clear to an end-to-end encrypted namespace would be seen by the server. Give --expect-level %s=at-rest|sealed|e2e, or --plain if you know it isn't encrypted", ns, ns)
+}
+
+// plainArgs is --plain, of the commands that write content.
+type plainArgs struct {
+	Plain bool `arg:"--plain" help:"the namespace isn't encrypted: write even when this grant can't tell its level (without it, such a write is refused rather than risk sending plaintext to an end-to-end encrypted namespace)"`
+}
+
+// checkWrite refuses a write whose namespace's level wasn't told, unless
+// --plain: it would go out as plaintext, maybe to an e2e namespace
+// (Addendum E.3).
+func (v *encView) checkWrite(p plainArgs) error {
+	if v.known || p.Plain {
+		return nil
+	}
+	return errLevelUnknown(v.ns)
+}
+
+// plainWriteLevel checks that content may be written to ns by a command
+// with no encrypted path (restore, batch): its level is told, and it isn't
+// e2e, whose content only the client may see in the clear.
+func plainWriteLevel(ctx context.Context, c *client.Client, ns, cmd string, p plainArgs) error {
+	level, known, err := nsLevel(ctx, c, ns)
+	switch {
+	case err != nil:
+		return err
+	case !known && !p.Plain:
+		return errLevelUnknown(ns)
+	case level == "e2e":
+		return fmt.Errorf("namespace %s is end-to-end encrypted (Addendum E.3): %s can't seal what it writes yet, and won't send it in the clear", ns, cmd)
+	}
+	return nil
 }
 
 // e2e reports whether ns/name is read and written through the E2E view.

@@ -6,9 +6,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -126,4 +129,93 @@ func TestBlobAtRoot(t *testing.T) {
 	if err != nil || out != "root blob" {
 		t.Fatalf("blob get --at '': %v %q", err, out)
 	}
+}
+
+// A write whose namespace's level can't be told (a grant that reads
+// neither the namespace document nor a level from /keys) sends nothing,
+// unless --plain or --expect-level tells it; then it goes out.
+func TestWriteRefusedWhenLevelUnknown(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var content []string // requests that carried a document or patch
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"spec":"x","auth":"grants","origin":"http://x"}`))
+		case r.URL.Path == "/ns/n" || strings.HasPrefix(r.URL.Path, "/ns/n/rev"):
+			w.WriteHeader(403)
+			w.Write([]byte(`{"code":"forbidden"}`))
+		case r.URL.Path == "/ns/n/keys":
+			w.WriteHeader(422)
+			w.Write([]byte(`{"code":"invalid","message":"the grant has no enc"}`))
+		case r.Method == "PATCH" || r.Method == "PUT" || r.Method == "POST":
+			mu.Lock()
+			content = append(content, r.Method+" "+r.URL.Path)
+			mu.Unlock()
+			w.WriteHeader(403)
+			w.Write([]byte(`{"code":"forbidden","message":"stub"}`))
+		default:
+			w.WriteHeader(404)
+			w.Write([]byte(`{"code":"not_found"}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+	ctx := context.Background()
+	f := filepath.Join(t.TempDir(), "b")
+	os.WriteFile(f, []byte("x"), 0o600)
+	bf := batchFile(t)
+	for _, args := range [][]string{
+		{"put", "n/d", `{"secret":1}`},
+		{"patch", "n/d", `[{"op":"add","path":"/secret","value":1}]`},
+		{"blob", "put", "n/d", f},
+		{"restore", "n/d"},
+		{"batch", "n", bf},
+	} {
+		_, _, err := clientRun(t, ctx, srv.URL, args...)
+		if err == nil || !strings.Contains(err.Error(), "can't tell whether namespace n is encrypted") {
+			t.Errorf("%q: %v", args, err)
+		}
+	}
+	mu.Lock()
+	if len(content) != 0 {
+		t.Errorf("content sent with the level unknown: %q", content)
+	}
+	mu.Unlock()
+	// Told: --plain sends it (the stub refuses it, 403).
+	if _, _, err := clientRun(t, ctx, srv.URL, "put", "n/d", `{"a":1}`, "--plain"); err == nil || strings.Contains(err.Error(), "can't tell") {
+		t.Errorf("put --plain: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(content) != 1 {
+		t.Errorf("put --plain sent %q", content)
+	}
+}
+
+// restore and batch, which can't seal, refuse an e2e namespace rather
+// than send its content in the clear.
+func TestPlainWritesRefuseE2E(t *testing.T) {
+	t.Parallel()
+	s := clienttest.New(t, clienttest.Options{KeyStore: testKeyStore(t)})
+	ctx := context.Background()
+	if _, err := s.Client(t, client.WithAuthor("a")).CreateNamespace(ctx, "e", map[string]any{"encryption": map[string]any{"level": "e2e"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"restore", "e/d"}, {"batch", "e", batchFile(t)}} {
+		_, _, err := clientRun(t, ctx, s.URL, args...)
+		if err == nil || !strings.Contains(err.Error(), "end-to-end encrypted") {
+			t.Errorf("%q: %v", args, err)
+		}
+	}
+}
+
+// batchFile is a file holding a batch that creates one resource.
+func batchFile(t *testing.T) string {
+	t.Helper()
+	f := filepath.Join(t.TempDir(), "batch.json")
+	if err := os.WriteFile(f, []byte(`{"items":[{"resource":"d","ifNoneMatch":"*","steps":[[{"op":"add","path":"","value":{"secret":1}}]]}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return f
 }

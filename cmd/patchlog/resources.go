@@ -84,6 +84,7 @@ func (a *lsCmd) exec(ctx context.Context, out, errw io.Writer) error {
 // restoreCmd is patchlog restore NS/NAME [PATCH].
 type restoreCmd struct {
 	toolArgs
+	plainArgs
 	gestureArgs
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
 	Patch    string `arg:"positional" default:"[]" placeholder:"JSON|@FILE|-" help:"a JSON Patch (RFC 6902) applied to the last live document as it is restored (default: [], unchanged)"`
@@ -104,6 +105,9 @@ func (a *restoreCmd) exec(ctx context.Context, out, errw io.Writer) error {
 		return errors.New("the patch must be a JSON array (RFC 6902)")
 	}
 	c := a.writer()
+	if err := plainWriteLevel(ctx, c, ns, "restore", a.plainArgs); err != nil {
+		return err
+	}
 	h, err := c.Head(ctx, ns, name)
 	if err != nil {
 		return err
@@ -130,6 +134,7 @@ func (a *restoreCmd) exec(ctx context.Context, out, errw io.Writer) error {
 // batchCmd is patchlog batch NS FILE|-.
 type batchCmd struct {
 	toolArgs
+	plainArgs
 	gestureArgs
 	DryRun bool   `arg:"--dry-run" help:"write nothing: report the ids a submit would produce, and any failure it would meet"`
 	NS     string `arg:"positional,required"`
@@ -187,6 +192,9 @@ func (a *batchCmd) exec(ctx context.Context, out, errw io.Writer) error {
 		req.Gesture = g
 	}
 	c := a.writer()
+	if err := plainWriteLevel(ctx, c, a.NS, "batch", a.plainArgs); err != nil {
+		return err
+	}
 	res, err := c.Batch(ctx, a.NS, req, a.DryRun)
 	if err != nil {
 		return err
