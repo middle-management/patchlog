@@ -625,7 +625,7 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 			}
 			var ce *Error
 			if !errors.As(err, &ce) {
-				ce = &Error{Status: 500, Code: "internal", Msg: err.Error()}
+				ce = s.unexpected(err)
 			}
 			e["status"], e["code"], e["message"] = ce.Status, ce.Code, ce.Msg
 			if ce.Head != "" {
@@ -793,7 +793,30 @@ func writeErr(w http.ResponseWriter, err error) {
 		tree.WriteError(w, ce.Status, ce.Code, ce.Msg)
 		return
 	}
-	tree.WriteError(w, 500, "internal", err.Error())
+	ce = unexpected(err)
+	tree.WriteError(w, ce.Status, ce.Code, ce.Msg)
+}
+
+// unexpected is err, a failure that isn't one of the service's own
+// answers, as it is answered: 500 internal with its text, or, where it is
+// the origin's answer to a read no caller wrapped (upstream), 502
+// upstream with a message of the service's own: a service's 502 "carries
+// nothing of the answer that caused it" (§C.6 Upstream failures, v0.85),
+// and neither does its 500.
+func unexpected(err error) *Error {
+	if _, ok := client.AsAPIError(err); ok {
+		return &Error{Status: 502, Code: "upstream", Msg: "the catalog service can't read what the request needs"}
+	}
+	return &Error{Status: 500, Code: "internal", Msg: err.Error()}
+}
+
+// unexpected is unexpected(err), the origin's answer logged.
+func (s *Service) unexpected(err error) *Error {
+	ce := unexpected(err)
+	if ce.Status == 502 {
+		logf(s)("catalog: %v", err)
+	}
+	return ce
 }
 
 // Issue decides a grant request for the verified caller v and signs the
