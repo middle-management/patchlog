@@ -173,8 +173,9 @@ func movedNote(ctx context.Context, c *client.Client, ns, name string, h *client
 // getCmd is patchlog get NS/NAME.
 type getCmd struct {
 	toolArgs
+	encArgs
 	Rev      string `arg:"--rev" placeholder:"ID" help:"read this revision (default: the head)"`
-	Meta     bool   `arg:"--meta" help:"print the revision id, Last-Modified and Repr-Digest on stderr"`
+	Meta     bool   `arg:"--meta" help:"print the revision id, Last-Modified and Repr-Digest on stderr (an encrypted namespace's revisions have neither: its kid instead)"`
 	Raw      bool   `arg:"--raw" help:"for a raw file (Addendum H), print the file's bytes instead of its document; not to a terminal unless they are text"`
 	Follow   bool   `arg:"--follow,-f" help:"keep going: print each new revision as it is written, one line of JSON each (null when the resource is deleted), until interrupted or it is purged (§7.3)"`
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
@@ -187,34 +188,39 @@ func (a *getCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if a.Follow {
-		if a.Rev != "" {
-			return errors.New("--follow starts at the head: not with --rev")
-		}
-		if a.Raw {
-			return errors.New("--follow prints documents: not with --raw")
-		}
-		return a.follow(ctx, ns, name, out, errw)
+	if a.Follow && a.Rev != "" {
+		return errors.New("--follow starts at the head: not with --rev")
 	}
-	c := a.client()
+	if a.Follow && a.Raw {
+		return errors.New("--follow prints documents: not with --raw")
+	}
+	v, err := a.view(ctx, a.client(), ns, name)
+	if err != nil {
+		return err
+	}
+	if a.Follow {
+		return a.follow(ctx, v, out, errw)
+	}
 	id := a.Rev
 	if id == "" {
-		if id, err = liveHead(ctx, c, ns, name); err != nil {
+		if id, err = liveHead(ctx, v.c, ns, name); err != nil {
 			return err
 		}
 	}
-	d, err := c.Doc(ctx, ns, name, id)
+	d, flags, err := v.doc(ctx, id)
 	if err != nil {
 		return err
 	}
 	a.meta(errw, d)
+	v.warnFlags(errw, flags)
 	if a.Raw {
-		return printRaw(ctx, c, ns, name, d, out)
+		return printRaw(ctx, v.c, ns, name, d, out)
 	}
 	return writeJSON(out, d.Value)
 }
 
-// meta prints d's id, Last-Modified and Repr-Digest on errw with --meta.
+// meta prints d's id, Last-Modified and Repr-Digest (or kid) on errw with
+// --meta.
 func (a *getCmd) meta(errw io.Writer, d *client.Doc) {
 	if !a.Meta {
 		return
@@ -226,6 +232,9 @@ func (a *getCmd) meta(errw io.Writer, d *client.Doc) {
 	if d.Digest != "" {
 		fmt.Fprintf(errw, "  digest %s", d.Digest)
 	}
+	if d.Kid != "" {
+		fmt.Fprintf(errw, "  kid %s", d.Kid)
+	}
 	fmt.Fprintln(errw)
 }
 
@@ -236,11 +245,12 @@ var errPurged = errors.New("purged")
 // one line of JSON each, reading its event stream (§7.3) and reconnecting
 // from the last event when the stream ends, until ctx is done or the
 // resource is purged. A tombstone prints null. A resource that doesn't
-// exist yet is waited for.
-func (a *getCmd) follow(ctx context.Context, ns, name string, out, errw io.Writer) error {
-	c := a.client()
-	line := func(v any) error {
-		b, err := json.Marshal(v)
+// exist yet is waited for. Documents are read through v, so an encrypted
+// namespace's are opened, or folded, as get reads them.
+func (a *getCmd) follow(ctx context.Context, v *encView, out, errw io.Writer) error {
+	c, ns, name := v.c, v.ns, v.name
+	line := func(x any) error {
+		b, err := json.Marshal(x)
 		if err != nil {
 			return err
 		}
@@ -248,11 +258,12 @@ func (a *getCmd) follow(ctx context.Context, ns, name string, out, errw io.Write
 		return err
 	}
 	doc := func(id string) error {
-		d, err := c.Doc(ctx, ns, name, id)
+		d, flags, err := v.doc(ctx, id)
 		if err != nil {
 			return err
 		}
 		a.meta(errw, d)
+		v.warnFlags(errw, flags)
 		return line(d.Value)
 	}
 	h, err := c.Head(ctx, ns, name)
@@ -310,6 +321,7 @@ func (a *getCmd) follow(ctx context.Context, ns, name string, out, errw io.Write
 // putCmd is patchlog put NS/NAME DOC.
 type putCmd struct {
 	toolArgs
+	encArgs
 	gestureArgs
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
 	Doc      string `arg:"positional,required" placeholder:"JSON|@FILE|-" help:"the document"`
@@ -326,8 +338,12 @@ func (a *putCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
+	v, err := a.view(ctx, a.writer(), ns, name)
+	if err != nil {
+		return err
+	}
 	_, opt := a.gesture()
-	w, err := a.writer().CreateDoc(ctx, ns, name, doc, opt)
+	w, err := v.create(ctx, doc, opt)
 	if err != nil {
 		return err
 	}
@@ -337,6 +353,7 @@ func (a *putCmd) exec(ctx context.Context, out, errw io.Writer) error {
 // patchCmd is patchlog patch NS/NAME PATCH.
 type patchCmd struct {
 	toolArgs
+	encArgs
 	gestureArgs
 	If       string `arg:"--if" placeholder:"ID" help:"append to this revision only, failing (412 stale) if the head has moved; by default to the head, trying again when another writer gets there first"`
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
@@ -354,18 +371,12 @@ func (a *patchCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	c := a.writer()
-	g, opt := a.gesture()
-	var w *client.WriteResult
-	if a.If != "" {
-		w, err = c.Append(ctx, ns, name, a.If, p, opt)
-	} else {
-		var head string
-		if head, err = liveHead(ctx, c, ns, name); err != nil {
-			return err
-		}
-		w, err = c.AppendLatest(ctx, ns, name, head, client.Backoff{}, func(string) (any, error) { return p, nil }, opt)
+	v, err := a.view(ctx, a.writer(), ns, name)
+	if err != nil {
+		return err
 	}
+	g, opt := a.gesture()
+	w, err := v.append(ctx, a.If, p, opt)
 	if err != nil {
 		return err
 	}
@@ -378,6 +389,10 @@ func (a *patchCmd) exec(ctx context.Context, out, errw io.Writer) error {
 // rmCmd is patchlog rm NS/NAME.
 type rmCmd struct {
 	toolArgs
+	// --identity is accepted, so command lines and $PATCHLOG_IDENTITY
+	// work alike across the commands, and unused: a delete writes no
+	// content, at any level (§E.3).
+	encArgs
 	gestureArgs
 	If       string `arg:"--if" placeholder:"ID" help:"delete only if this is the head, failing (412 stale) otherwise; by default the head"`
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
@@ -408,6 +423,7 @@ func (a *rmCmd) exec(ctx context.Context, out, errw io.Writer) error {
 // logCmd is patchlog log NS/NAME.
 type logCmd struct {
 	toolArgs
+	encArgs
 	Since    string `arg:"--since" placeholder:"ID" help:"only the entries after this revision"`
 	Follow   bool   `arg:"--follow,-f" help:"keep going: print each entry as it is written, until interrupted or the resource is purged (§7.3)"`
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
@@ -420,23 +436,34 @@ func (a *logCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	c := a.client()
-	es, err := c.Log(ctx, ns, name, "", a.Since)
+	v, err := a.view(ctx, a.client(), ns, name)
+	if err != nil {
+		return err
+	}
+	c := v.c
+	es, flags, err := v.log(ctx, a.Since)
 	if client.IsPruned(err) && a.Since == "" {
 		// A pruned resource: its log starts at the horizon, which is
 		// kept but is not itself a log entry (§8.6).
 		ae, _ := client.AsAPIError(err)
 		if h := ae.Horizon(); h != "" {
 			fmt.Fprintf(errw, "history before %s was pruned\n", h)
-			es, err = c.Log(ctx, ns, name, "", h)
+			es, flags, err = v.log(ctx, h)
 		}
 	}
 	if err != nil {
 		return err
 	}
-	print := func(e client.LogEntry) {
+	if a.Follow && v.e2e() {
+		return fmt.Errorf("log --follow of an end-to-end encrypted namespace isn't supported yet: run log again, or get --follow for the document")
+	}
+	print := func(e client.LogEntry, flag string) {
 		if a.JSON {
-			b, _ := json.Marshal(e.Raw)
+			raw := e.Raw
+			if v.e2e() {
+				raw = openedRaw(e, flag)
+			}
+			b, _ := json.Marshal(raw)
 			fmt.Fprintln(out, string(b))
 			return
 		}
@@ -445,10 +472,13 @@ func (a *logCmd) exec(ctx context.Context, out, errw io.Writer) error {
 			p, _ := json.Marshal(e.Patches)
 			line += "  " + string(p)
 		}
+		if flag != "" {
+			line += "  (flagged: " + flag + ")"
+		}
 		fmt.Fprintln(out, line)
 	}
-	for _, e := range es {
-		print(e)
+	for i, e := range es {
+		print(e, flags[i])
 	}
 	if len(es) > 0 && es[len(es)-1].Kind == "tombstone" {
 		if h, err := c.Head(ctx, ns, name); err == nil && h.State == client.Tombstoned {
@@ -473,7 +503,7 @@ func (a *logCmd) exec(ctx context.Context, out, errw io.Writer) error {
 					return err
 				}
 				since = ev.ID
-				print(e)
+				print(e, "")
 			case "purge":
 				return errPurged
 			}

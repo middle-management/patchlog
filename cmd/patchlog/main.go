@@ -77,7 +77,7 @@ type cli struct {
 	Import  *importCmd  `arg:"subcommand:import" group:"Branches, releases and bundles" help:"import a bundle into a namespace (§G.4.4)"`
 	Bundle  *bundleCmd  `arg:"subcommand:bundle" group:"Branches, releases and bundles" help:"verify a bundle, or make a bundle key"`
 	Schema  *schemaCmd  `arg:"subcommand:schema" group:"Branches, releases and bundles" help:"import external JSON Schemas into a namespace"`
-	E2E     *e2eCmd     `arg:"subcommand:e2e" group:"Branches, releases and bundles" help:"inspect e2e namespaces (Addendum E)"`
+	E2E     *e2eCmd     `arg:"subcommand:e2e" group:"Branches, releases and bundles" help:"administer e2e keyrings, inspect encrypted namespaces' keys (Addendum E)"`
 
 	Keygen     *keygenCmd     `arg:"subcommand:keygen" group:"Keys and operations" help:"print a new Ed25519 key pair for minting grants"`
 	Grant      *grantCmd      `arg:"subcommand:grant" group:"Keys and operations" help:"mint, narrow, seal, inspect, check or show a grant (Biscuit v3, §C.8)"`
