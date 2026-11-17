@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.31.0
 
 Implements spec **v0.85** (previously **v0.84**). v0.85 is the spec's answer to the reference's
 103 open notes on v0.82 to v0.84 (docs/SPEC-FEEDBACK.md, "Settled in v0.85"): by its own count
