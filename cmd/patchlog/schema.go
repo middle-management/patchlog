@@ -24,6 +24,7 @@ type schemaImportCmd struct {
 	API           string        `arg:"--api,env:PATCHLOG_API" placeholder:"URL" help:"base URL of the deployment (optional with --dry-run: then every resource is planned as a create)"`
 	NS            string        `arg:"--ns,required" help:"target namespace (not a branch)"`
 	Bearer        string        `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"grant (Authorization: Bearer)"`
+	BearerFile    string        `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"file holding --bearer (exclusive with it)"`
 	Author        string        `arg:"--author,env:PATCHLOG_AUTHOR" placeholder:"NAME" help:"X-Author (development mode)"`
 	Name          string        `arg:"--name" help:"resource name of the root schema (default: from its URL)"`
 	DryRun        bool          `arg:"--dry-run" help:"fetch, convert, compile and print the plan; write nothing"`

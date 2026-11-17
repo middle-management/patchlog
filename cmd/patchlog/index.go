@@ -65,6 +65,7 @@ type indexCmd struct {
 	Addr             string        `arg:"--addr" default:":8081" help:"listen address of the query API"`
 	NS               string        `arg:"--ns,required" placeholder:"NS,NS" help:"comma-separated namespaces to follow"`
 	Bearer           string        `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"grant for reading the namespaces (Authorization: Bearer)"`
+	BearerFile       string        `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"file holding --bearer (exclusive with it)"`
 	Author           string        `arg:"--author,env:PATCHLOG_AUTHOR" placeholder:"NAME" help:"X-Author for a --dev server"`
 	Branches         bool          `arg:"--branches" help:"also follow branches, building a preview index per branch (§F.8)"`
 	Rebuild          bool          `arg:"--rebuild" help:"drop the index and replay from the beginning (§A.6)"`

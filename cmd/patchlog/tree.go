@@ -82,6 +82,7 @@ type treeCmd struct {
 	DB           string        `arg:"--db" default:"tree.db" placeholder:"PATH" help:"SQLite database path; with several catalogs, may contain {catalog}"`
 	Addr         string        `arg:"--addr" default:":8082" help:"listen address of the tree API"`
 	Bearer       string        `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"grant for reading the catalog and its trusted namespaces (Authorization: Bearer)"`
+	BearerFile   string        `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"file holding --bearer (exclusive with it)"`
 	Author       string        `arg:"--author,env:PATCHLOG_AUTHOR" placeholder:"NAME" help:"X-Author for a --dev server"`
 	SelfPlacing  bool          `arg:"--self-placing" help:"accept $parents in trusted content documents as implicit placements (§B.9)"`
 	Access       bool          `arg:"--access" help:"catalog mode: derive access from $access and issue grants (§B.11); needs --key and --kid"`

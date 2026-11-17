@@ -79,7 +79,8 @@ type cli struct {
 	E2E     *e2eCmd     `arg:"subcommand:e2e" group:"Branches, releases and bundles" help:"inspect e2e namespaces (Addendum E)"`
 
 	Keygen     *keygenCmd  `arg:"subcommand:keygen" group:"Keys and operations" help:"print a new Ed25519 key pair for minting grants"`
-	Grant      *grantCmd   `arg:"subcommand:grant" group:"Keys and operations" help:"mint, narrow or seal a grant (Biscuit v3, §C.8)"`
+	Grant      *grantCmd   `arg:"subcommand:grant" group:"Keys and operations" help:"mint, narrow, seal, inspect, check or show a grant (Biscuit v3, §C.8)"`
+	Profile    *profileCmd `arg:"subcommand:profile" group:"Keys and operations" help:"list or show the connection profiles of the config file (--profile NAME)"`
 	Archive    *archiveCmd `arg:"subcommand:archive" group:"Keys and operations" help:"restore pruned history from its archives (§8.6)"`
 	Whoami     *whoamiCmd  `arg:"subcommand:whoami" group:"Keys and operations" help:"print who the deployment takes you to be, and with a namespace what your grant can do there"`
 	Health     *healthCmd  `arg:"subcommand:health" group:"Keys and operations" help:"check a health endpoint (exit 0 on 200), for container healthchecks"`
@@ -127,6 +128,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, msg)
 		return 1
 	}
+	args, err := applyProfile(args)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 2
+	}
 	var c cli
 	p, err := newParser(&c, stdout)
 	if err != nil {
@@ -155,6 +161,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 			p.WriteHelpForSubcommand(stderr, names...)
 		}
 		return 2
+	}
+	if names[0] != "dav" { // dav reads --bearer-file itself
+		if err := resolveSecretFiles(p.Subcommand(), args, stderr); err != nil {
+			fmt.Fprintln(stderr, "error:", err)
+			return 2
+		}
 	}
 	if slices.Contains(telemetryCommands, names[0]) {
 		// Flushed when the command returns (after a server's graceful
@@ -817,6 +829,10 @@ type grantCmd struct {
 	Mint   *grantMintCmd   `arg:"subcommand:mint" help:"mint a grant signed with a key"`
 	Narrow *grantNarrowCmd `arg:"subcommand:narrow" help:"narrow a grant with another block"`
 	Seal   *grantSealCmd   `arg:"subcommand:seal" help:"seal a grant, so nobody can narrow it further"`
+
+	Inspect *grantInspectCmd `arg:"subcommand:inspect" help:"decode a grant offline and print its blocks"`
+	Check   *grantCheckCmd   `arg:"subcommand:check" help:"verify a grant against a namespace's keys and revocations; exit 1 if refused"`
+	Show    *grantShowCmd    `arg:"subcommand:show" help:"print the grant recorded in a namespace"`
 }
 
 type grantMintCmd struct {
