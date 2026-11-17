@@ -3326,9 +3326,11 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   the core's `429` or `503`, and after a timeout of the gateway's own, else `502` (the core's
   `408`, another `5xx`, an unreachable core; TOOLS §H.4 "The base"). So a save is never written
   over another user's entry taken for the user's own while that history can't be read, as
-  v0.27.0 could. A MOVE or COPY onto an existing file saves into it, and answers so for its
-  reads of the head, the base and the log between; its other reads, and other requests, keep
-  the general answers (a core `408` is `503`, its `503` is `502`).
+  v0.27.0 could. Since v0.85 it is the rule for every request, a read or a write, a DELETE,
+  MOVE, COPY or MKCOL like a save (TOOLS §H.4 "Answers"): a core or tree service request the
+  answer depends on that fails for now fails the request, and never counts as a refusal. So a
+  DELETE made while `GET /ns/{ns}/principal` answers `408` is `502`, where it was `403`, and
+  no write goes ahead on settings a failed read left unknown.
   A raw file over a JSON document's, or the
   other way round, replaces its root. A purged one is `410`, as is any name of a purged
   namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
@@ -3457,8 +3459,11 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   times, for 45 seconds); `410` for a purged file or namespace; `401` and `403` (but in local
   mode a `401` refuses the server's own grant, not the user's password, so it is `502` rather
   than a new login prompt). A `429` is waited out when its Retry-After is at most 2 s, and is
-  otherwise `503` with Retry-After. A core that can't be reached is `502` (the details are
-  logged). `423` and `507` mean only a lock held and this server's memory full.
+  otherwise `503` with Retry-After, as are the core's or a tree service's `503` and a request
+  that got no answer in time. Its `408`, any other `5xx` and a core that can't be reached are
+  `502` (v0.85; a `408` was `503` and a `503` was `502` before, but in a save). A `502` names
+  the service and the status it answered, nothing of its answer, which is logged with the
+  other details (§C.6). `423` and `507` mean only a lock held and this server's memory full.
 - An empty file is a file (§H.1): a raw file of 0 bytes is made (`__init__.py`, `.gitkeep`), a raw
   file truncated, and a JSON file refuses it (`400`), as any content that isn't I-JSON. Only where
   the content decides the kind, a LOCK of a new name and a new `.json` name (Finder's 0-byte PUT

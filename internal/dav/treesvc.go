@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -1010,6 +1011,13 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			// No answer in time: 503 with Retry-After, as for the core
+			// (§H.4 "Answers", v0.85); no connection is 502.
+			return nil, nil, &davError{status: http.StatusServiceUnavailable, msg: fmt.Sprintf("catalog %s's tree service didn't answer in time", cat), cause: err,
+				header: http.Header{"Retry-After": {"5"}}}
+		}
 		return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service can't be reached", cat), cause: err}
 	}
 	defer res.Body.Close()
@@ -1017,6 +1025,11 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
+		}
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return nil, nil, &davError{status: http.StatusServiceUnavailable, msg: fmt.Sprintf("catalog %s's tree service didn't answer in time", cat), cause: err,
+				header: http.Header{"Retry-After": {"5"}}}
 		}
 		return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service's answer was cut short", cat), cause: err}
 	}
@@ -1055,7 +1068,7 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		// Local mode's grant is the server's own (-bearer): a 502, named
 		// as the tree service's refusal, where record would name a 401
 		// the core's.
-		return nil, nil, fail(http.StatusBadGateway, "catalog %s's tree service refused this server's grant (-bearer): %s", cat, msg)
+		return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service refused this server's grant (-bearer) with 401", cat), cause: errors.New(msg)}
 	case res.StatusCode == http.StatusUnauthorized:
 		// A gateway's 401 is the user's grant refused: the challenge
 		// again, and the token verified again at its next request
@@ -1074,5 +1087,7 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		e.header = http.Header{"Retry-After": {ra}}
 		return nil, nil, e
 	}
-	return nil, nil, fail(http.StatusBadGateway, "catalog %s's tree service answered %d: %s", cat, res.StatusCode, msg)
+	// A 502 names the service and its status, nothing of its answer
+	// (§C.6 Upstream failures), which is logged (record).
+	return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service answered %d", cat, res.StatusCode), cause: errors.New(msg)}
 }

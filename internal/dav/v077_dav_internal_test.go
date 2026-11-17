@@ -23,12 +23,12 @@ func TestV077FailedRead(t *testing.T) {
 		failed   bool
 		upstream int
 	}{
-		{api(408), true, http.StatusServiceUnavailable},
+		{api(408), true, http.StatusBadGateway},
 		{api(429), true, http.StatusServiceUnavailable},
 		{api(500), true, http.StatusBadGateway},
-		{api(503), true, http.StatusBadGateway},
-		{fmt.Errorf("%w: docs epoch 1: %w", client.ErrKeyFetch, api(503)), true, http.StatusBadGateway},
-		{fmt.Errorf("%w: docs epoch 1: %w", client.ErrKeyFetch, api(408)), true, http.StatusServiceUnavailable},
+		{api(503), true, http.StatusServiceUnavailable},
+		{fmt.Errorf("%w: docs epoch 1: %w", client.ErrKeyFetch, api(503)), true, http.StatusServiceUnavailable},
+		{fmt.Errorf("%w: docs epoch 1: %w", client.ErrKeyFetch, api(408)), true, http.StatusBadGateway},
 		{&url.Error{Op: "Get", URL: "http://core", Err: errors.New("connection refused")}, true, http.StatusBadGateway},
 		{context.DeadlineExceeded, true, http.StatusServiceUnavailable},
 		{api(403), false, http.StatusForbidden},

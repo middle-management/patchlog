@@ -17,6 +17,18 @@ Implements spec **v0.85** (previously **v0.84**).
   under that grant reported as failed. The writer refuses such a line; `patchlog export`
   already wrote only keys that verify. The two candidates of VECTORS-PROPOSED.md C.5
   reproduce byte for byte and are rejected (`internal/vectors`, `TestV085C5GrantLineKey`).
+- **WebDAV gateway: one rule for a request that failed for now** (TOOLS §H.4 "Answers",
+  v0.85; FILE-18, Access scenario 78). For every method, reads and writes alike: `503` with
+  `Retry-After` after the core's or a tree service's `429` or `503`, or where no answer came
+  in time; `502` after its `408`, another `5xx`, or where there is no connection. Before,
+  only a save answered so, and other requests answered a core `408` with `503` and a `503`
+  with `502`; a tree service that timed out was `502`. A failed read never counts as a
+  refusal: a `408` to `GET /ns/{ns}/principal` or to the namespace document is no longer
+  kept, so a `DELETE`, `MOVE` or `COPY` meanwhile is `502` where it was `403`, and a `MKCOL`
+  fails too where it went ahead with default settings; `GET` and `PROPFIND` that read those
+  fail the same way where they were served from the kept answer. A `502` now names the
+  service and its status only; the core's or tree service's message is logged, not
+  answered (§C.6 Upstream failures).
 
 ## v0.30.0
 

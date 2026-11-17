@@ -219,23 +219,27 @@ func filesOf(cat map[string]any) (*treeFiles, string) {
 // (client.NeedsNonce, §C.7).
 func (s *Server) nsInfo(ctx context.Context, tk *token, ns string) nsInfo {
 	in, err := s.nsInfoErr(ctx, tk, ns)
-	if st := state(ctx); err != nil && st != nil && st.method == "PUT" && failedRead(err) {
-		// What a save's writes need is among what it decides by (§H.4
-		// "The base"): the save fails before it writes (saveInfo).
+	if st := state(ctx); err != nil && st != nil && st.writes() && failedRead(err) {
+		// What a request's writes need is among what its answer depends
+		// on (§H.4 "Answers", v0.85): it fails before it writes
+		// (saveInfo), a save as any other writing request.
 		st.unread.CompareAndSwap(nil, &err)
 	}
 	return in
 }
 
 // saveInfo is nsInfo of ns for st's token where the request writes: for
-// a save (a PUT), a read of it that failed for now (failedRead), here or
+// a request that writes (writes: a save, a delete, a move, a copy, a new
+// folder), a read of it that failed for now (failedRead), here or
 // earlier in the request, of this namespace or of another (nsInfo), is
-// the error, and the save fails before the write, as after any failed
-// read of what it decides by (§H.4 "The base"). Another request goes by
-// the settings a fresh $nonce on every write stands for, as nsInfo does.
+// the error, and the request fails before the write: a failed read of
+// what the answer depends on fails it, and never counts as a refusal or
+// as settings to go by (§H.4 "Answers", v0.85; before, a save's alone).
+// A request that only reads goes by the settings a fresh $nonce on every
+// write stands for, as nsInfo does.
 func (st *reqState) saveInfo(ctx context.Context, ns string) (nsInfo, error) {
 	in, err := st.s.nsInfoErr(ctx, st.tk, ns)
-	if st.method != "PUT" {
+	if !st.writes() {
 		return in, nil
 	}
 	if err != nil && failedRead(err) {
@@ -287,42 +291,26 @@ func (tk *token) forgetWriters() {
 	tk.mu.Unlock()
 }
 
-// transient reports a read that failed for now (a 429, a 5xx, no answer),
-// whose failure isn't kept.
+// transient reports a read that failed for now (a 408, a 429, a 5xx, no
+// answer), whose failure isn't kept: it never counts as a refusal, for
+// any request (§H.4 "Answers", v0.85; before, a 408 was kept like one but
+// by a save).
 func transient(err error) bool {
 	ae, isAPI := client.AsAPIError(err)
-	return err != nil && (!isAPI || ae.Status == 429 || ae.Status >= 500)
-}
-
-// saving reports whether ctx is a save's, a PUT's: what its writes need
-// (nsInfoErr, nsDoc) is among what it decides by (§H.4 "The base").
-func saving(ctx context.Context) bool {
-	st := state(ctx)
-	return st != nil && st.method == "PUT"
-}
-
-// timedOut reports the core's 408, which other requests keep as the
-// answer it is, but a save takes as a read that failed for now
-// (failedRead, §H.4 "The base"): it isn't kept, one kept is asked again,
-// and the save fails.
-func timedOut(err error) bool {
-	ae, ok := client.AsAPIError(err)
-	return ok && ae.Status == 408
+	return err != nil && (!isAPI || ae.Status == 408 || ae.Status == 429 || ae.Status >= 500)
 }
 
 // nsInfoErr is nsInfo, with the error of a read that failed for now
-// (transient; for a save, the core's 408 too, timedOut), which isn't
-// kept.
+// (transient), which isn't kept.
 func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, error) {
 	now := s.opt.Now()
-	save := saving(ctx)
 	tk.mu.Lock()
 	wa, ok := tk.writers[ns]
 	tk.mu.Unlock()
-	if !ok || now.Sub(wa.at) >= s.writerTTL() || save && timedOut(wa.err) {
+	if !ok || now.Sub(wa.at) >= s.writerTTL() {
 		pi, err := tk.c.NSPrincipal(ctx, ns)
 		switch {
-		case transient(err), save && timedOut(err):
+		case transient(err):
 			return nsInfo{nonce: true}, err
 		case err != nil:
 			wa = writerAt{err: err, at: now}
@@ -383,15 +371,13 @@ func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, e
 
 // nsDoc returns what ns's document says, read with tk's grant at most
 // every 30 seconds: a catalog's trust list and file tree, and whether tk
-// reads it (readErr). A failure for now (transient; for a save, the
-// core's 408 too) is the error.
+// reads it (readErr). A failure for now (transient) is the error.
 func (s *Server) nsDoc(ctx context.Context, tk *token, ns string) (nsDocAt, error) {
 	now := s.opt.Now()
 	tk.mu.Lock()
 	d, ok := tk.docs[ns]
 	tk.mu.Unlock()
-	save := saving(ctx)
-	if ok && now.Sub(d.at) < 30*time.Second && !(save && timedOut(d.readErr)) {
+	if ok && now.Sub(d.at) < 30*time.Second {
 		return d, nil
 	}
 	d = nsDocAt{at: now}
@@ -404,7 +390,7 @@ func (s *Server) nsDoc(ctx context.Context, tk *token, ns string) (nsDocAt, erro
 	case errors.Is(err, client.ErrNoKeys):
 		// Sealed (§H.7): its writer block says so.
 		d.readErr = err
-	case transient(err), save && timedOut(err):
+	case transient(err):
 		return nsDocAt{}, err
 	case err != nil:
 		d.readErr = err

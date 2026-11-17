@@ -515,13 +515,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	r = r.WithContext(context.WithValue(r.Context(), stateKey{}, st))
 	if de := st.readOnly(r.Context()); de != nil {
-		if st.method == "PUT" {
-			// Which tree owns the namespace is a read the save decides
-			// by (§H.4 "The base").
-			de = de.asSave()
-			for k, v := range de.header {
-				w.Header()[k] = v
-			}
+		// Which tree owns the namespace is a read the answer depends on
+		// (§H.4 "Answers"): one that failed for now carries Retry-After.
+		for k, v := range de.header {
+			w.Header()[k] = v
+		}
+		if de.cause != nil {
+			s.opt.Logf("dav: %s %s: %v", r.Method, r.URL.Path, de)
 		}
 		http.Error(w, de.msg, de.status)
 		return
@@ -2504,14 +2504,15 @@ func (st *reqState) record(err error) error {
 	if de.refresh {
 		st.tk.forgetWriters()
 	}
-	if st.method == "PUT" {
-		// Whichever read failed for now, a save answers it as a save's
-		// failed read (§H.4 "The base").
-		de = de.asSave()
+	if de.cause != nil && de.status >= 500 {
+		// What a 502 or 503 doesn't say: the answer or the failure that
+		// caused it (§C.6 Upstream failures), and the service's address.
+		st.s.opt.Logf("dav: %s %s: %v", st.method, st.path, de)
 	}
 	switch {
 	case de.status == http.StatusUnauthorized && !st.s.opt.Gateway:
-		de = &davError{status: http.StatusBadGateway, msg: "the core refused this server's grant (-bearer): " + de.msg, cause: de.cause}
+		st.s.opt.Logf("dav: %s %s: the core refused this server's grant: %s", st.method, st.path, de.msg)
+		de = &davError{status: http.StatusBadGateway, msg: "the core refused this server's grant (-bearer) with 401", cause: de.cause}
 	case de.status == http.StatusUnauthorized:
 		st.s.mu.Lock()
 		st.tk.verified = time.Time{}
