@@ -51,9 +51,6 @@ type Keys struct {
 	nsKeys    map[string][]byte // kid -> K_n, derived from K_e
 	res       map[string][]byte // kid "\n" resource -> K_r
 	noFetch   bool
-	// bases caches, per server and e2e namespace, the namespaces of its
-	// base chain (readThrough); nil for a namespace that isn't e2e.
-	bases map[string]map[string]bool
 }
 
 // NewKeys returns an empty key cache. recipient, if not nil, unwraps keys
@@ -325,10 +322,12 @@ func isJOSE(r *response) bool {
 // open decrypts a JWE of namespace ns. want returns the pl it must carry,
 // given its (unauthenticated) header; resource names the resource whose key
 // opens it ("" for namespace content, under K_n). Its kid must name ns,
-// or, for a resource document or log entry an e2e namespace reads through
-// from a base, that base (readThrough), whose ns its pl then carries too,
-// as readers accept a base's ns for content read through (Addendum E
-// Levels, §E.2.2, §E.3.1).
+// and so must its pl: a payload in the §E.2.2 form is never a base's,
+// since a sealed branch seals all it serves under its own keys (§E.2.5)
+// and a base's ns is accepted only at E3 (Addendum E Levels, §E.2.2,
+// v0.85), where what a branch reads through is sealed patch sets and
+// prune snapshots, which the E2E view opens, up to the resource's foreign
+// parent (chainCheck).
 func (c *Client) open(ctx context.Context, ns, resource, jwe string, want func(h *seal.Header) (seal.PL, error)) ([]byte, error) {
 	if c.keys == nil {
 		return nil, ErrNoKeys
@@ -346,137 +345,13 @@ func (c *Client) open(ctx context.Context, ns, resource, jwe string, want func(h
 		return nil, err
 	}
 	if kns != ns {
-		kind, _ := pl["kind"].(string)
-		content := resource != "" && (kind == seal.KindDoc || kind == seal.KindRev || kind == seal.KindTombstone)
-		through := false
-		if content {
-			if through, err = c.readThrough(ctx, ns, kns); err != nil {
-				return nil, fmt.Errorf("client: reading the bases of %s: %w", ns, err)
-			}
-		}
-		if !through {
-			return nil, fmt.Errorf("client: sealed content of %s is sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
-		}
-		pl = withNS(pl, kns)
+		return nil, fmt.Errorf("client: sealed content of %s is sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
 	}
 	key, err := c.keys.key(ctx, c, h.Kid, resource, ns)
 	if err != nil {
 		return nil, err
 	}
 	return seal.OpenExpect(jwe, key, h.Kid, pl)
-}
-
-// withNS is pl with its ns replaced by ns.
-func withNS(pl seal.PL, ns string) seal.PL {
-	out := make(seal.PL, len(pl))
-	for k, v := range pl {
-		out[k] = v
-	}
-	out["ns"] = ns
-	return out
-}
-
-// readThrough reports whether kns is a base of ns that ns, an e2e
-// namespace, reads content through from (Addendum E Levels, Branches of a
-// raised base): its base, that base's own bases as far as their documents
-// are readable, or for a remote branch the namespaces of its base.chain
-// (§G.3). Only e2e namespaces serve a base's sealing so; a sealed branch
-// seals what it reads through under its own keys (§E.2.5). Namespace
-// documents stay plaintext at E3, so a branch's base chain reads from them.
-// Only a chain read without a transient failure is cached.
-func (c *Client) readThrough(ctx context.Context, ns, kns string) (bool, error) {
-	key := c.BaseURL() + " " + ns
-	k := c.keys
-	k.mu.Lock()
-	bases, ok := k.bases[key]
-	k.mu.Unlock()
-	if !ok {
-		var err error
-		if bases, err = c.readThroughBases(ctx, ns); err != nil {
-			return false, err
-		}
-		k.mu.Lock()
-		if k.bases == nil {
-			k.bases = map[string]map[string]bool{}
-		}
-		k.bases[key] = bases
-		k.mu.Unlock()
-	}
-	return bases[kns], nil
-}
-
-// readThroughBases lists the bases ns reads through, nil if ns isn't an e2e
-// branch or its document can't be read (readThrough). A transport error, or
-// an answer that may change on retry (408, 429, 5xx), is an error: the chain is
-// then unknown, not empty.
-func (c *Client) readThroughBases(ctx context.Context, ns string) (map[string]bool, error) {
-	var out map[string]bool
-	// seen ends a chain that names a namespace twice; out marks a base
-	// before its own document is read, so it can't be the guard.
-	seen := map[string]bool{}
-	for cur, e2e := ns, true; cur != "" && !seen[cur]; {
-		seen[cur] = true
-		h, err := c.NSHead(ctx, cur)
-		if err != nil {
-			return out, transient(err)
-		}
-		r, err := c.do(ctx, "GET", "/ns/"+cur+"/rev/"+h.ID, nil, nil)
-		if err != nil {
-			return out, err
-		}
-		if r.status != 200 {
-			return out, transient(r.apiError())
-		}
-		// The current document of cur names its level: learnt, and a
-		// lower one than held is refused (levels.go).
-		lv, err := c.learnDocLevel(cur, r)
-		if err != nil {
-			return out, err
-		}
-		if isJOSE(r) {
-			return out, nil
-		}
-		doc, _ := r.value().(map[string]any)
-		if e2e {
-			// ns itself must be end-to-end.
-			if lv != "e2e" {
-				return nil, nil
-			}
-			e2e = false
-		}
-		b, _ := doc["base"].(map[string]any)
-		next, _ := b["ns"].(string)
-		if next == "" {
-			return out, nil
-		}
-		if out == nil {
-			out = map[string]bool{}
-		}
-		if _, remote := b["origin"]; remote {
-			out[next] = true
-			chain, _ := b["chain"].([]any)
-			for _, x := range chain {
-				if s, ok := x.(string); ok && ValidNSName(s) {
-					out[s] = true
-				}
-			}
-			return out, nil
-		}
-		out[next] = true
-		cur = next
-	}
-	return out, nil
-}
-
-// transient is err if retrying may give another answer (a transport error,
-// 408, 429 or 5xx, §A.4), else nil: a document the reader can't read ends
-// the chain.
-func transient(err error) error {
-	var ae *APIError
-	if errors.As(err, &ae) && ae.Status != 408 && ae.Status != 429 && ae.Status < 500 {
-		return nil
-	}
-	return err
 }
 
 func fixedPL(pl seal.PL) func(*seal.Header) (seal.PL, error) {

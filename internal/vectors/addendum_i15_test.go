@@ -1,7 +1,8 @@
 package vectors_test
 
 // Addendum I, §I.15–§I.21 (v0.82; the candidates P.1–P.7 of v0.81's
-// VECTORS-PROPOSED.md, which the reference confirmed), each computed here
+// VECTORS-PROPOSED.md, which the reference confirmed; §I.17 as v0.85
+// recomputed it, over I.20's accepted bundle), each computed here
 // through the reference's production code and compared with the spec's
 // value. testdata/addendum_i.json holds the values as docs/SPEC.md prints
 // them (extracted, never computed, and never rewritten by -update); a
@@ -11,6 +12,7 @@ package vectors_test
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
@@ -53,13 +55,21 @@ type addendumI struct {
 			Doc, Note, SHA256 string
 			Bytes             int
 		}
-		Numbers [][2]string
+		Numbers       [][2]string
+		LastRendering string // the last rendering's bytes, printed since v0.85
 	} `json:"I.16"`
 	I17 struct {
 		Envelope, SHA256, SealedDigest string // the envelope is I.12's
+		KB, PlainDigest                string // K_b in hex; I.20's accepted bundle's digest
 		Headers, Lines                 []string
 		Bytes                          int
-		Rejected                       []struct{ Change, SHA256, Rule string }
+		Padded                         struct {
+			Buckets []int
+			Tags    []string
+			Bytes   int
+			SHA256  string
+		}
+		Rejected []struct{ Change, SHA256, Rule string }
 	} `json:"I.17"`
 	I18 []struct {
 		Instances     []string
@@ -79,6 +89,23 @@ type addendumI struct {
 		Bytes, PlainBytes                                          int
 	} `json:"I.20"`
 	I21 []struct{ Change, Token string } `json:"I.21"`
+	// §I.22–§I.24 (v0.85): addendum_i22_test.go.
+	I22 struct {
+		Plaintexts      map[string]string
+		Rows            []struct{ Payload, Key, PL, Plaintext, Tag, PaddedTag string }
+		NamespaceEvent  string
+		RejectedRangePL string
+	} `json:"I.22"`
+	I23 struct {
+		Q, Sort, CanonicalQuery, View string
+		ViewKeyKr                     string
+		Item                          struct{ Header, Plaintext, JWE, PaddedTag string }
+		Served, Rejected              string
+	} `json:"I.23"`
+	I24 struct {
+		Grant string // the id of I.21's ops-2027 root block, which §I.21 states
+		Rows  []struct{ Change, SHA256, Rule string }
+	} `json:"I.24"`
 }
 
 // loadAddendumI reads testdata/addendum_i.json. It only reads: the file is
@@ -91,9 +118,6 @@ func loadAddendumI(t *testing.T) addendumI {
 	}
 	return f
 }
-
-// i9Digest is I.9's digest, which §I.17 refers to.
-const i9Digest = "1b3a64kkqf3o6f3rglkgi6ok5hgldbne6"
 
 func sha256Hex(b []byte) string {
 	s := sha256.Sum256(b)
@@ -214,6 +238,9 @@ func TestI16Renderings(t *testing.T) {
 		if !bytes.Contains(last, []byte(": "+n[1])) {
 			t.Errorf("the last rendering has no number %s:\n%s", n[1], last)
 		}
+	} // The last rendering's bytes, which §I.16 prints since v0.85.
+	if string(last) != p.LastRendering {
+		t.Errorf("the last rendering is\n%s\nwant\n%s", last, p.LastRendering)
 	}
 }
 
@@ -261,22 +288,26 @@ func TestI18Hostnames(t *testing.T) {
 	}
 }
 
-// I.17 (§G.5.1.1): a sealed bundle of I.9's two lines under I.12's
-// envelope, to the recipient 20 21 … 3f, opened by seal.OpenBundle; its plaintext's digest and the
-// sealed file's, through ids.Of (I.9's header lacks created, at and docs,
-// and the bundle Reader refuses it; TestI9BundleDigest).
-// Its lines are reproduced under the envelope's K_b with the IV c0 … cb
-// by sealLine (seal.SealWithIV needs a kid, which bundle lines have none
-// of); every rejection row is rebuilt from it, its file hash compared, and
-// refused by OpenBundle read to its end.
+// I.17 (§G.5.1.1), as v0.85 recomputed it: I.12's envelope, which wraps
+// K_b to the recipient 20 21 … 3f, over the three lines of I.20's accepted
+// bundle ("authors": false), opened by seal.OpenBundle; its plaintext read
+// by the bundle Reader, with I.20's digest, and the sealed file's own
+// digest through ids.Of. Its lines are reproduced under the envelope's K_b
+// with the IV c0 … cb by sealLineRaw (seal.SealWithIV needs a kid, which
+// bundle lines have none of), unpadded and padded through seal.Pad; the
+// padded file opens to the same bundle, and seal.BundleWriter with Pad
+// pads each line to the same bucket. Every rejection row is rebuilt, its
+// file hash compared, and refused by OpenBundle read to its end.
 func TestI17SealedBundle(t *testing.T) {
 	t.Parallel()
-	p := loadAddendumI(t).I17
-	if len(p.Lines) != 2 || len(p.Headers) != 2 {
-		t.Fatalf("%d lines and %d headers in addendum_i.json, want 2 and 2", len(p.Lines), len(p.Headers))
+	ai := loadAddendumI(t)
+	p := ai.I17
+	const n = 3
+	if len(p.Lines) != n || len(p.Headers) != n || len(p.Padded.Tags) != n || len(p.Padded.Buckets) != n {
+		t.Fatalf("%d lines, %d headers, %d padded tags and %d buckets in addendum_i.json, want %d of each", len(p.Lines), len(p.Headers), len(p.Padded.Tags), len(p.Padded.Buckets), n)
 	}
-	// The envelope line and the two lines, each followed by 0a.
-	sealed := []byte(p.Envelope + "\n" + p.Lines[0] + "\n" + p.Lines[1] + "\n")
+	// The envelope line and the three lines, each followed by 0a.
+	sealed := []byte(p.Envelope + "\n" + strings.Join(p.Lines, "\n") + "\n")
 	if len(sealed) != p.Bytes || sha256Hex(sealed) != p.SHA256 {
 		t.Fatalf("the sealed bundle of addendum_i.json: %d bytes, sha-256 %s; want %d, %s", len(sealed), sha256Hex(sealed), p.Bytes, p.SHA256)
 	}
@@ -289,24 +320,27 @@ func TestI17SealedBundle(t *testing.T) {
 		pt, err := io.ReadAll(r)
 		return string(pt), err
 	}
+	// Decrypted, it is I.20's accepted bundle, which §G.4.1 accepts.
 	plain, err := open(sealed)
-	if err != nil || plain != i9 {
-		t.Fatalf("opens to %q, %v; want I.9's bundle", plain, err)
+	if err != nil || len(plain) != ai.I20.PlainBytes {
+		t.Fatalf("opens to %q, %v; want I.20's accepted bundle, %d bytes", plain, err, ai.I20.PlainBytes)
 	}
-	if d := ids.Of([]byte(plain)).String(); d != i9Digest {
-		t.Errorf("source.bundle %s, want I.9's %s", d, i9Digest)
+	if p.PlainDigest != ai.I20.PlainDigest {
+		t.Fatalf("§I.17 gives the bundle's digest as %s, §I.20 as %s", p.PlainDigest, ai.I20.PlainDigest)
 	}
-	if d := ids.Of(sealed).String(); d != p.SealedDigest {
+	if d := ids.Of([]byte(plain)).String(); d != p.PlainDigest {
+		t.Errorf("source.bundle %s, want I.20's %s", d, p.PlainDigest)
+	}
+	if d, err := readBundle(plain); err != nil || d != p.PlainDigest {
+		t.Errorf("the bundle Reader: %s %v, want %s", d, err, p.PlainDigest)
+	}
+	if d := ids.Of(sealed).String(); d != p.SealedDigest || d == p.PlainDigest {
 		t.Errorf("the sealed bytes' digest %s, want %s", d, p.SealedDigest)
-	}
-	// I.9's lines are a digest vector: no importer reads them as a bundle.
-	if d, err := readBundle(i9); err == nil {
-		t.Errorf("the bundle Reader read I.9's lines (digest %s); it needs created, at and docs", d)
 	}
 
 	lines := strings.SplitAfter(string(sealed), "\n")
 	lines = lines[:len(lines)-1] // after the last 0x0A
-	if len(lines) != 3 {
+	if len(lines) != n+1 {
 		t.Fatalf("%d lines", len(lines))
 	}
 	env, _, err := seal.ParseBundleEnvelope([]byte(strings.TrimSuffix(lines[0], "\n")))
@@ -314,18 +348,72 @@ func TestI17SealedBundle(t *testing.T) {
 		t.Fatal(err)
 	}
 	kb := contentKey(t, recipient, env)
-	pts := strings.SplitAfter(strings.TrimSuffix(i9, "\n"), "\n")
+	if hex.EncodeToString(kb) != p.KB {
+		t.Errorf("the envelope wraps K_b %x, want %s", kb, p.KB)
+	}
+	if kid := seal.Thumbprint(recipient.PublicKey()); !strings.Contains(p.Envelope, `"kid":"`+kid+`"`) {
+		t.Errorf("the envelope names no recipient %s", kid)
+	}
+	pts := strings.SplitAfter(strings.TrimSuffix(plain, "\n"), "\n")
 	for i := range pts {
 		pts[i] = strings.TrimSuffix(pts[i], "\n")
 	}
+	if len(pts) != n {
+		t.Fatalf("the bundle has %d lines, want %d", len(pts), n)
+	}
+	tag := func(jwe string) string { return jwe[strings.LastIndexByte(jwe, '.')+1:] }
+	padded := p.Envelope + "\n"
 	for i, h := range p.Headers {
 		if got := sealLineRaw(t, kb, h, []byte(pts[i])) + "\n"; got != lines[i+1] {
 			t.Errorf("line %d under %s is\n%s\nwant\n%s", i, h, got, lines[i+1])
 		}
+		// Padded (§E.2.2): the plaintext, then spaces to its bucket.
+		pp := seal.Pad([]byte(pts[i]))
+		if len(pp) != p.Padded.Buckets[i] || !bytes.HasPrefix(pp, []byte(pts[i])) || strings.Trim(string(pp[len(pts[i]):]), " ") != "" {
+			t.Errorf("line %d padded is %d bytes, want %d: the plaintext and spaces", i, len(pp), p.Padded.Buckets[i])
+		}
+		l := sealLineRaw(t, kb, h, pp)
+		if tag(l) != p.Padded.Tags[i] {
+			t.Errorf("line %d padded has tag %s, want %s", i, tag(l), p.Padded.Tags[i])
+		}
+		padded += l + "\n"
+	}
+	if len(padded) != p.Padded.Bytes || sha256Hex([]byte(padded)) != p.Padded.SHA256 {
+		t.Errorf("the padded file: %d bytes, sha-256 %s; want %d, %s", len(padded), sha256Hex([]byte(padded)), p.Padded.Bytes, p.Padded.SHA256)
+	}
+	if got, err := open([]byte(padded)); err != nil || got != plain {
+		t.Errorf("the padded file opens to %q, %v; want the same bundle", got, err)
+	}
+	// The reference's writer pads each line to the same bucket and marks
+	// the same lines (its envelope, K_b and IVs are its own).
+	var own bytes.Buffer
+	w, err := seal.NewBundleWriter(&own, []*ecdh.PublicKey{recipient.PublicKey()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Pad = true
+	if _, err := io.WriteString(w, plain); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ownLines := strings.Split(strings.TrimSuffix(own.String(), "\n"), "\n")
+	wantLines := strings.Split(strings.TrimSuffix(padded, "\n"), "\n")
+	if len(ownLines) != n+1 {
+		t.Fatalf("the writer wrote %d lines, want %d", len(ownLines), n+1)
+	}
+	for i := 1; i <= n; i++ {
+		if len(ownLines[i]) != len(wantLines[i]) {
+			t.Errorf("the writer's padded line %d is %d characters, §I.17's %d", i-1, len(ownLines[i]), len(wantLines[i]))
+		}
+	}
+	if got, err := open(own.Bytes()); err != nil || got != plain {
+		t.Errorf("the writer's padded file opens to %q, %v", got, err)
 	}
 
-	hdr := func(n int, last bool, extra map[string]any) map[string]any {
-		pl := map[string]any{"bundle": env.ID, "line": float64(n)}
+	hdr := func(ln int, last bool, extra map[string]any) map[string]any {
+		pl := map[string]any{"bundle": env.ID, "line": float64(ln)}
 		if last {
 			pl["last"] = true
 		}
@@ -334,25 +422,36 @@ func TestI17SealedBundle(t *testing.T) {
 		}
 		return map[string]any{"alg": "dir", "enc": "A256GCM", "pl": pl}
 	}
-	file := func(l1, l2 string) []byte { return []byte(lines[0] + l1 + l2) }
+	// The changes are to the last line, 2, but one to line 0.
+	const last = n - 1
+	front := lines[0] + lines[1] + lines[2]
+	file := func(l string) []byte { return []byte(front + l) }
 	line := func(h map[string]any, i int) string { return sealLine(t, kb, h, []byte(pts[i])) + "\n" }
-	head := `{"alg":"dir","enc":"A256GCM","pl":{"bundle":"` + env.ID + `","last":true,"line":1}}`
+	head := `{"alg":"dir","enc":"A256GCM","pl":{"bundle":"` + env.ID + `","last":true,"line":2}}`
+	if head != p.Headers[last] {
+		t.Fatalf("the last header is %s", p.Headers[last])
+	}
+	const (
+		notCanonical = "a line's protected header isn't canonical JSON"
+		noLast       = "no line says `last`, or a line follows it"
+		oneLF        = "each line is followed by one `0x0A`"
+	)
 	cases := []struct {
-		rule string // the row's rule, which keeps the rows in step
+		rule string // the row's rule, in §G.5.1.1's words, which keeps the rows in step
 		b    []byte
 	}{
-		{"header not canonical", file(lines[1], sealLineRaw(t, kb, `{"alg":"dir","enc":"A256GCM","pl":{"bundle":"`+env.ID+`","line":1,"last":true}}`, []byte(pts[1]))+"\n")},
-		{"header not canonical", file(lines[1], sealLineRaw(t, kb, strings.Replace(head, `"pl":`, `"pl": `, 1), []byte(pts[1]))+"\n")},
-		{"other members", file(lines[1], line(hdr(1, true, map[string]any{"ns": "matches"}), 1))},
-		{"`pl.bundle` isn't `id`", file(lines[1], line(hdr(1, true, map[string]any{"bundle": "AAAAAAAAAAAAAAAAAAAAAA"}), 1))},
-		{"line numbers", file(lines[1], line(hdr(2, true, nil), 1))},
-		{"no `last`", file(lines[1], line(hdr(1, false, nil), 1))},
-		{"a line after `last`", file(line(hdr(0, true, nil), 0), lines[2])},
-		{"not one `0a`", []byte(strings.TrimSuffix(lines[0], "\n") + "\r\n" + lines[1] + lines[2])},
-		{"not one `0a`", []byte(lines[0] + lines[1] + strings.TrimSuffix(lines[2], "\n") + "\r\n")},
-		{"not one `0a`", []byte(lines[0] + lines[1] + strings.TrimSuffix(lines[2], "\n"))},
-		{"blank line", file(lines[1], lines[2]+"\n")},
-		{"fails to decrypt", file(lines[1], strings.TrimSuffix(lines[2], "Q\n")+"B\n")},
+		{notCanonical, file(sealLineRaw(t, kb, `{"alg":"dir","enc":"A256GCM","pl":{"bundle":"`+env.ID+`","line":2,"last":true}}`, []byte(pts[last])) + "\n")},
+		{notCanonical, file(sealLineRaw(t, kb, strings.Replace(head, `"pl":`, `"pl": `, 1), []byte(pts[last])) + "\n")},
+		{"`pl` included, has other members", file(line(hdr(last, true, map[string]any{"ns": "matches"}), last))},
+		{"`pl.bundle` differs from `id`", file(line(hdr(last, true, map[string]any{"bundle": "AAAAAAAAAAAAAAAAAAAAAA"}), last))},
+		{"line numbers are not 0, 1, 2… in order", file(line(hdr(last+1, true, nil), last))},
+		{noLast, file(line(hdr(last, false, nil), last))},
+		{noLast, []byte(lines[0] + line(hdr(0, true, nil), 0) + lines[2] + lines[3])},
+		{oneLF, []byte(strings.TrimSuffix(lines[0], "\n") + "\r\n" + lines[1] + lines[2] + lines[3])},
+		{oneLF, []byte(front + strings.TrimSuffix(lines[3], "\n") + "\r\n")},
+		{oneLF, []byte(front + strings.TrimSuffix(lines[3], "\n"))},
+		{"a blank one included", file(lines[3] + "\n")},
+		{"any line fails to decrypt", file(strings.TrimSuffix(lines[3], "Q\n") + "B\n")},
 	}
 	if len(cases) != len(p.Rejected) {
 		t.Fatalf("%d rejection rows in addendum_i.json, %d built", len(p.Rejected), len(cases))

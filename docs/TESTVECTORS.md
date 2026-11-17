@@ -17,11 +17,11 @@ the tree service's combined checkpoint (I.8), the bundle Writer and Reader (I.9)
 `seal.GrantPL`, tag `sAMGTdYa8kLrAP_ZfHvxCA`, v0.81; `TestI13GrantUnderKn`). I.1's `400`s and the
 ids a write answers are also checked against an in-process deployment. `internal/ids` and
 `internal/files` pin their own vectors in their package tests. §I.15–§I.21, which joined the
-addendum in v0.82, have their own file and section below.
+addendum in v0.82, and §I.22–§I.24, which joined it in v0.85, have their own files and sections below.
 
 Since v0.81 services seal views under view keys, `HKDF-SHA256(K_n or K_r, "patchlog-view", view)`
 (SERVICES §E.2.6, `seal.ViewKey`); `internal/derived` checks that its views open under them and
-under no other key. A view-key vector is candidate C.2 below, which the reference confirms.
+under no other key. A view-key vector is §I.23, and one for a response sealed whole is candidate C.4 below.
 
 ```
 go test ./internal/vectors/ ./internal/ids/ ./internal/files/
@@ -36,7 +36,7 @@ and `K_r` with code of its own instead of calling the reference's.
 
 ## Proposed additions (the reference's own)
 
-Vectors for what "Still to come" (§I.22, before v0.82 §I.11 and §I.15) has listed, and those the
+Vectors for what "Still to come" (§I.25; §I.22 before v0.85, §I.11 and §I.15 before v0.82) has listed, and those the
 spec writer asked for, are computed through
 production code too and kept in [`internal/vectors/testdata`](../internal/vectors/testdata) as
 JSON, each naming the production function that produced it: RE2 `\u` (`re2.json`), key wraps in
@@ -56,7 +56,7 @@ go test ./internal/vectors/ ./internal/grant/ ./internal/merge/ ./internal/core/
 regenerates them (randomness is fixed with the reference's test hooks, sealed bundles under a fixed
 seed).
 
-## §I.15–§I.21 (v0.82)
+## §I.15–§I.21 (v0.82; §I.17 as of v0.85)
 
 v0.81's candidates P.1–P.7, which the reference confirmed in v0.27.0, are Addendum I's §I.15–§I.21
 since v0.82. Their values are kept as SPEC.md prints them in
@@ -71,8 +71,8 @@ go test ./internal/vectors/ ./internal/grant/ -run 'TestI1[5-9]|TestI2[01]|V081S
 | | Test | What the reference computes it with |
 |---|---|---|
 | §I.15 Plan digests (§F.9) | `TestI15PlanDigests` | the release revision's genesis id through `client.ExpectedRevision`; `plan₁` through `merge.PlanObject` and `merge.PlanDigest`; `plan₂`'s items and its `{ batch, item }` precondition through `PlanObject`, its `config` members added by hand (no release batch of the reference carries config), and both digests through `PlanDigest`, which also gives the digest the spec calls wrong when the fresh-nonce ops are kept. The fresh-nonce stripping itself (merge's `digestSteps`) is unexported and checked by merge's own tests |
-| §I.16 More file renderings (§H.1) | `TestI16Renderings` | `jsonv.ParseInput`, `files.Rendering`, by length and sha-256; the six exponents through `jsonv.FormatNumber` and in the last rendering's bytes |
-| §I.17 Sealed bundles (§G.5.1.1) | `TestI17SealedBundle` | I.12's envelope and the two lines opened by `seal.OpenBundle` with recipient `20 21 … 3f`; `ids.Of` over the plaintext (I.9's digest; I.9's lines, which the bundle Reader refuses for want of `created`, `at` and `docs`) and over the 907 sealed bytes (`1gc7sf6e…`); the lines rebuilt under the envelope's `K_b` with the IV `c0 … cb` (AES-GCM in the test: bundle lines have no `kid`, which `seal.SealWithIV` needs); each of the twelve rejection rows rebuilt, its file hash compared and refused by `OpenBundle` |
+| §I.16 More file renderings (§H.1) | `TestI16Renderings` | `jsonv.ParseInput`, `files.Rendering`, by length and sha-256; the six exponents through `jsonv.FormatNumber`; the last rendering's 96 bytes as §I.16 prints them (v0.85) |
+| §I.17 Sealed bundles (§G.5.1.1), recomputed in v0.85 | `TestI17SealedBundle` | I.12's envelope and the three lines opened by `seal.OpenBundle` with recipient `20 21 … 3f`: the plaintext is I.20's accepted bundle (`"authors": false`), which the bundle Reader reads with I.20's digest `1wmmkh2s…`; `ids.Of` over the 1580 sealed bytes (`1mrkazwa…`); the envelope opened to `K_b` `dbe5882e…`; the lines rebuilt under it with the IV `c0 … cb` (AES-GCM in the test: bundle lines have no `kid`, which `seal.SealWithIV` needs), unpadded and, through `seal.Pad`, padded to 272, 256 and 256 bytes (the three tags, the 1789-byte file, which opens to the same bundle; `seal.BundleWriter` with `Pad` writes lines of the same lengths); each of the twelve rejection rows rebuilt, its file hash compared and refused by `OpenBundle` |
 | §I.18 Hostnames (§6.2 step 5) | `TestI18Hostnames` | the format assertions of the reference's dialect (`schema.V073`), four rows, five instances |
 | §I.19 Sealed log entries, namespace documents and ranges (§E.2.2) | `TestI19SealedPayloads`, `TestI19SealedServed` | every row's plaintext sealed under `seal.ResourceKey` or `seal.NamespaceKey` with the pl of `seal.ResourcePL`, `NamespaceDocPL` or `RangePL`, through `seal.SealWithIV`, padded through `seal.Pad`: all twelve tags, `entry_g`'s JWE and the 1247-byte range; and the forms a sealed deployment serves (below) |
 | §I.20 Full-history lines with `via` (§G.4.1) | `TestI20BundleVia` | `bundle.Writer` with I.4's grant line (I.14's authority block as `stored`) and the bundle Reader, which recomputes the line ids and, since v0.82, holds the grant line to its `root`; the signature under `key.pub` through `grant.ParseStoredBlock` and `SignedBy`, as a verifier checks it: the 1543-byte bundle (`1hywrrzi…`), the 631-byte one (`1wmmkh2s…`) and the three rejections |
@@ -92,26 +92,53 @@ the array of its entries.
 breaks: a symbol an earlier block adds that only a later block uses is refused at the block that
 adds it.
 
-## Candidate vectors (VECTORS-PROPOSED.md, v0.82)
+**§I.17 in v0.85.** The spec recomputed §I.17 from its text alone and asks the reference to
+confirm it. It does: every value reproduces through the production code above (the 1580-byte
+file and its sha-256, both digests, `K_b`, the three lines, the padded tags, length and sha-256,
+and the twelve rejection files, each refused). Until v0.85 it sealed I.9's two lines, which
+§G.4.1 rejects once decrypted (907 bytes, `30bf22f8…`). One row is refused earlier than its rule
+says: "line 2's last character `Q` made `B`" leaves a tag that isn't canonical base64url, which
+the reference refuses as a malformed JWE before it decrypts anything.
 
-[VECTORS-PROPOSED.md](VECTORS-PROPOSED.md) holds candidates for §I.22's list, computed
-independently from the v0.82 text. They are kept as the document gives them in
-[`testdata/candidates.json`](../internal/vectors/testdata/candidates.json) (extracted, never
-computed) and checked through production code in
-[`internal/vectors/v082_vectors_test.go`](../internal/vectors/v082_vectors_test.go):
+## §I.22–§I.24 (v0.85)
+
+v0.82's candidates C.1, the per-entry half of C.2, and C.3, which the reference confirmed in
+v0.28.0, are Addendum I's §I.22–§I.24 since v0.85, their values unchanged. They are kept as
+SPEC.md prints them in `testdata/addendum_i.json` and checked in
+[`internal/vectors/addendum_i22_test.go`](../internal/vectors/addendum_i22_test.go):
 
 ```
-go test ./internal/vectors/ -run 'V082C'
+go test ./internal/vectors/ -run 'TestI2[234]'
+```
+
+| | Test | What the reference computes it with |
+|---|---|---|
+| §I.22 Sealed events (§E.2.2) | `TestI22SealedEvents`, `TestI22SealedEventsServed` | the two resource rows under `seal.ResourceKey` with the pl of `seal.ResourceEventPL`, the namespace event under `seal.NamespaceKey` with the pl of `seal.NamespaceEventPL`, through `seal.SealWithIV` and `seal.Pad`: all six tags and the namespace event's JWE; the client (`NSEvents`, `ResourceEvents`) reading the three as a stream serves them, and refusing the namespace event under the range pl §I.22 names (v0.81's form, tag `yXiFzJA3…`, rebuilt); and the forms a sealed deployment serves |
+| §I.23 View keys and per-entry sealing (§E.2.6) | `TestI23ViewKey` | the view from I.8's `gs` (`grantcheck.SubjectSetID`; an input only), `ns_id₂` and `derived.CanonicalQuery` without `min`; `seal.ViewKey` over `K_r`; the hit's JWE through `seal.SealWithIV` with the pl of `derived.View`, padded through `seal.Pad`; `derived.SealItem` (own IV) for the same header and plaintext; `derived.OpenItem` opening the JWE and rejecting the four altered views |
+| §I.24 Bundles refused (§G.4.1) | `TestI24BundlesRefused` | each bundle built from §I.20's and matched to its sha-256, then read by the bundle Reader: row 1's id is `grant.Decode` of §I.21's `ops-2027` token, `ID()`, the id §I.21 now states; row 2's `stored` is the authority block cut out of §I.21's token whose root block string has `sub` first; each rejected whole, rows 1 and 2 at the grant line (line 2), row 3 at the header. The Writer refuses rows 1 and 2 too |
+
+## Candidate vectors (VECTORS-PROPOSED.md, v0.85)
+
+[VECTORS-PROPOSED.md](VECTORS-PROPOSED.md) holds candidates for §I.25's list, computed
+independently from the v0.85 text. They are kept as the document gives them in
+[`testdata/candidates.json`](../internal/vectors/testdata/candidates.json) (extracted, never
+computed) and checked through production code in
+[`internal/vectors/v085_candidates_test.go`](../internal/vectors/v085_candidates_test.go) (the
+computed values) and
+[`internal/vectors/v085_pending_test.go`](../internal/vectors/v085_pending_test.go) (what a
+deployment answers with them):
+
+```
+go test ./internal/vectors/ -run 'V085C'
 ```
 
 | | What the reference computes it with | Verdict |
 |---|---|---|
-| C.1 Resource `purge` and `prune` events, namespace events (§E.2.2) | the two resource rows under `seal.ResourceKey` with the pl of `seal.ResourceEventPL`, the namespace event under `seal.NamespaceKey` with the pl of `seal.NamespaceEventPL`, through `seal.SealWithIV` and `seal.Pad`; the client (`NSEvents`, `ResourceEvents`) reading the three as a stream serves them, and refusing v0.81's range form of the namespace event (its tag `yXiFzJA3…`, rebuilt); and the forms a sealed deployment serves (`TestV082C1EventsServed`) | confirmed: all six tags and the namespace event's JWE. The closing sentence is not: read as written, it says the resource events' `{"kind":…,"name":…,"ns":…}` is no longer accepted, against its own table and §E.2.2, which keep it. The reference accepts that form for resource events and refuses only the range form of a namespace event |
-| C.2 A view key and JWEs under it (§E.2.6) | the view from I.8's `gs` (`grantcheck.SubjectSetID`), `ns_id₂` and `derived.CanonicalQuery` without `min`; `seal.ViewKey` over `K_n` and `K_r`; both JWEs through `seal.SealWithIV` with the pl of `derived.View`, padded through `seal.Pad`; `derived.SealView` and `SealItem` (own IVs) for the same headers and plaintexts; `derived.OpenView` and `OpenItem` opening the candidate's JWEs and rejecting the four altered views | confirmed: the canonical query, the view, both view keys, both JWEs and both padded tags; the four altered `pl.view` forms are rejected. Its premise is illustrative: I.8's `gs` is a set of two principals, and the reference serves a response sealed whole only at the `gs` of `reads:demo` (§E.2.6 Whole-response sealing) |
-| C.3 Bundle rejections (§G.4.1) | each bundle built from §I.20's and matched to the candidate's sha-256, then read by the bundle Reader: row 1's id is `grant.Decode` of §I.21's `ops-2027` token, `ID()`; row 2's `stored` is the authority block cut out of §I.21's token whose root block string has `sub` first (the grant package refuses to decode it) | confirmed: the three sha-256 values, each bundle rejected whole, rows 1 and 2 at the grant line (line 2) for the rule named, row 3 at the header. The Writer refuses rows 1 and 2 too |
+| C.4 Whole-response sealing at an index `gs` (§E.2.6, §A.4) | the `key:` string of `ops-2026` with I.14's `pub` through `catvis.KeySubject`, the function the origin and the index bind a `gs` to a key with; the `gs` over the one marker `reads:demo:key:…` through `grantcheck.SubjectSetID`; the view with `derived.CanonicalQuery`; `seal.ViewKey` over `K_n`; both JWEs through `seal.SealWithIV` with the pl of `derived.View`, the padded one over `seal.Pad` (204 bytes to 256); `derived.SealView` (own IV) for the same header and plaintext, and `derived.OpenView` opening both candidates at that view and not at §I.23's | confirmed: the `key:` string, the marker, the `gs`, the view, the view key and both JWEs in full. `canonical([kid, pub])` is read with `pub` the key entry's base64url string, as "Underdetermined" supposes: that is the reference's reading too. An index answering a namespace-wide reader at this `gs` is checked in `TestV085C4IndexServesWhole` |
+| C.5 Grant lines whose `key` doesn't match (§G.4.1) | each bundle built from §I.20's by changing the grant line's `key.kid`, or its `key.pub` to the key of seed `20 21 … 3f` (`ed25519.NewKeyFromSeed`), and matched to the candidate's sha-256 (`TestV085C5GrantLineKey`); then read by the bundle Reader (`TestV085C5GrantLineKeyRejected`) | confirmed: both sha-256 values; each bundle is rejected whole at the grant line (line 2) by the check §G.4.1 gained in v0.85 |
 
-C.1's plaintexts, like §I.19's, are illustrative; the served forms are checked against the same
-sealed deployment (`TestV082C1EventsServed`): after a prune at `c` and a purge, the namespace
+§I.22's plaintexts, like §I.19's, are illustrative; the served forms are checked against the same
+sealed deployment (`TestI22SealedEventsServed`): after a prune at `c` and a purge, the namespace
 event for the last entry opens under `K_n` with pl `{ event, ns }` and under no range's pl, its
 plaintext that entry, and the reference's client reads the stream as that entry; the `prune` and
 `purge` events open under `K_r` with pl `{ kind, name, ns }`, their plaintext the namespace entry

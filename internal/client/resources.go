@@ -160,6 +160,41 @@ type Doc struct {
 	Kid string
 }
 
+// DocKid returns the kid a sealed (E2) namespace serves the document at
+// revision id under, read from the JWE's protected header without a key,
+// and "" for a document served in the clear: for a reader that needs the
+// epoch of a revision whose key its grant doesn't get (§E.2.3; SERVICES
+// §E.2.6, where such an entry is served by name only). The header isn't
+// authenticated without the key; it must still name ns and bind this
+// document, pl { ns, name, id, kind: "doc" }, else seal.ErrMismatch.
+func (c *Client) DocKid(ctx context.Context, ns, name, id string) (string, error) {
+	if err := checkRes(ns, name); err != nil {
+		return "", err
+	}
+	if err := checkID("revision", id); err != nil {
+		return "", err
+	}
+	r, err := c.do(ctx, "GET", "/r/"+ns+"/"+name+"/rev/"+id, nil, nil)
+	if err != nil {
+		return "", err
+	}
+	if r.status != 200 {
+		return "", r.apiError()
+	}
+	if !isJOSE(r) {
+		return "", nil
+	}
+	h, err := seal.ParseHeader(string(r.body))
+	if err != nil {
+		return "", fmt.Errorf("client: document %s/%s@%s: %w", ns, name, id, err)
+	}
+	kns, _, err := seal.ParseKid(h.Kid)
+	if err != nil || kns != ns || !jsonv.Equal(jsonv.FromGo(map[string]any(h.PL)), jsonv.FromGo(map[string]any(seal.ResourcePL(ns, name, id, seal.KindDoc)))) {
+		return "", fmt.Errorf("client: document %s/%s@%s is sealed under %s with pl %v: %w", ns, name, id, h.Kid, h.PL, seal.ErrMismatch)
+	}
+	return h.Kid, nil
+}
+
 // Doc fetches the document at revision id (immutable). A tombstone id, a
 // purge or a pruned revision is a 410 *APIError (IsGone / IsPruned).
 func (c *Client) Doc(ctx context.Context, ns, name, id string) (*Doc, error) {

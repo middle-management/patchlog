@@ -1315,8 +1315,9 @@ func (x *E2E) chain(ctx context.Context, ns string) (depth map[string]int, remot
 // writes. A base's namespace is accepted only for entries up to where the
 // chain forked from that base (Addendum E Levels, §E.3.1): its head of the
 // resource as of the branch's at, the fork, which /heads gives. Past the
-// fork, every entry is the branch's own. A fork in a remote base, or one a
-// reader without access to the base's /heads can't place, isn't checked.
+// fork, every entry is the branch's own. A remote base's fork is the head
+// the branch lists at its first entry (remoteFork; §G.3, v0.85). A fork a
+// reader without access to those /heads can't place isn't checked.
 type chainCheck struct {
 	x      *E2E
 	ctx    context.Context
@@ -1436,9 +1437,11 @@ func (c *chainCheck) loadForks() error {
 	return nil
 }
 
-// forksOf returns, for ns and its local bases, the forks of resource name
-// (chainCheck.forks), nil where they can't be had: ns isn't a branch, its
-// base is remote, or this reader can't read a base's /heads.
+// forksOf returns, for ns and its bases, the forks of resource name
+// (chainCheck.forks), nil where they can't be had: ns isn't a branch, or
+// this reader can't read a local base's /heads, or a remote branch's own
+// log and /heads. A remote base ends the list with the one fork every
+// namespace of its chain lies behind (remoteFork).
 func (x *E2E) forksOf(ctx context.Context, ns, name string) ([]string, error) {
 	key := ns + "/" + name
 	x.forks.mu.Lock()
@@ -1454,7 +1457,24 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		if cfg.Base == "" || cfg.Remote || cfg.At == "" {
+		if cfg.Base == "" || cfg.At == "" {
+			break
+		}
+		if cfg.Remote {
+			// The base is in another deployment, whose /heads this
+			// reader may not reach: the foreign parent is the head the
+			// branch itself lists at its first entry, which is what it
+			// reads through as of at (§G.3, §7.6). Every namespace of
+			// the remote chain lies behind this one fork.
+			fork, err := x.remoteFork(ctx, cur, name)
+			if IsAuth(err) || IsNotFound(err) || IsGone(err) || errors.Is(err, errNoGenesis) {
+				forks = nil
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			forks = append(forks, fork)
 			break
 		}
 		fork, err := x.headAt(ctx, cfg.Base, cfg.At, name)
@@ -1472,6 +1492,30 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) ([]string, error) {
 	x.forks.m[key] = forks
 	x.forks.mu.Unlock()
 	return forks, nil
+}
+
+// errNoGenesis is a remote branch whose log doesn't start with its config
+// genesis, as a deployment's (§G.3) does: its fork can't be placed.
+var errNoGenesis = errors.New("the log does not start with a config genesis")
+
+// remoteFork is the revision of name a remote branch ns forked from in its
+// base: its head of name as of its own first namespace entry, the config
+// genesis its log starts with, before any write of its own (§G.3, §10
+// Branches). "" if it read none through.
+func (x *E2E) remoteFork(ctx context.Context, ns, name string) (string, error) {
+	h, err := x.c.NSHead(ctx, ns)
+	if err != nil {
+		return "", err
+	}
+	// The first page holds the first entry (§7.1 Paging).
+	entries, _, err := x.c.NSLogPage(ctx, ns, h.ID, "")
+	if err != nil {
+		return "", err
+	}
+	if len(entries) == 0 || entries[0].Kind != "config" {
+		return "", fmt.Errorf("client: remote branch %s: %w", ns, errNoGenesis)
+	}
+	return x.headAt(ctx, ns, entries[0].ID, name)
 }
 
 // headAt returns the revision of name that ns's /heads lists as of nsID,

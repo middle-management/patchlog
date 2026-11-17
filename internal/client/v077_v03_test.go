@@ -15,11 +15,8 @@ func TestV077Transient408(t *testing.T) {
 	if !Transient(fmt.Errorf("%w: x epoch 1: %w", ErrKeyFetch, ae)) {
 		t.Error("Transient(ErrKeyFetch 408) = false")
 	}
-	if transient(ae) == nil {
-		t.Error("transient(408) ends a read-through chain")
-	}
 	for _, s := range []int{400, 403, 404, 410} {
-		if Transient(&APIError{Status: s}) || transient(&APIError{Status: s}) != nil {
+		if Transient(&APIError{Status: s}) {
 			t.Errorf("%d is transient", s)
 		}
 	}
