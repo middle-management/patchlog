@@ -2517,7 +2517,8 @@ redirected. URLs without
 `/{catalog}/g/{gs}/at/{cur}/{op}` (`403` at another reader's `gs`). The old
 `/{catalog}/at/{at}/g/{gs}/…` is moved to the new form with a `301`. A grant over `grantSize` or
 `rulesPerGrant` is `413 limit`, naming the limit, on listings, `/read-grants` and the exchange
-(it was `401`; §C.8, §C.6). Cycles and depth over 64 show up under `problems`. `--catalog` is
+(it was `401`; §C.8, §C.6). Cycles show up under `problems`; a path cut at depth 64 is reported only by
+`subtree`, `ancestors` and `where`, as `"tooDeep": true` (§B.5, v0.85: `problems` listed such nodes before). `--catalog` is
 repeatable (or comma-separated): each catalog gets its own
 service and database (`--db` with `{catalog}` replaced, or `-{catalog}` added before the
 extension) behind one origin, and `/_status` covers them all (`?catalog=` for one). Listings

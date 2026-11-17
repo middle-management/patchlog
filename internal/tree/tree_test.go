@@ -558,9 +558,10 @@ func TestCyclesDepthAndDanglingParents(t *testing.T) {
 			t.Errorf("dangling parents lack %q: %s", want, dp)
 		}
 	}
-	deep := pr["tooDeep"].([]any)
-	if len(deep) != 3 || deep[0].(map[string]any)["href"] != "/r/cat/d64" || deep[0].(map[string]any)["depth"] != 65.0 {
-		t.Errorf("tooDeep: %v", deep)
+	// Only subtree, ancestors and where report a path cut at depth 64
+	// (§B.5 Cycles, v0.85): /problems lists no such nodes.
+	if _, has := pr["tooDeep"]; has {
+		t.Errorf("/problems reports tooDeep: %v", pr["tooDeep"])
 	}
 	// Cyclic folders are excluded from traversals: root's children lack a,
 	// and m1 (whose only parent is in the cycle) is an orphan.

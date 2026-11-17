@@ -3334,7 +3334,6 @@ function renderCatProblems() {
     parts.push(line('cycles', p.cycles || [], (c) => h('span', { class: 'mono' }, [].concat(c).map((x) => nodeName(x) || x).join(' → '))),
       line('dangling items', p.danglingItems || [], (x) => [nodeLink(nodeName(x.href)), h('span', { class: 'muted small' }, ` (${x.reason || 'dangling'})`)]),
       line('dangling parents', p.danglingParents || [], (x) => [nodeLink(nodeName(x.href)), h('span', { class: 'muted small' }, ` → ${x.parent || ''} ${x.state || ''}`)]),
-      line('too deep', p.tooDeep || [], (x) => nodeLink(nodeName(x.href))),
       line('orphans', C.problems.orphans || [], (x) => nodeLink(x.name)));
   } else {
     $('catProbMeta').textContent = 'computed here from the documents';

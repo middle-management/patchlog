@@ -3358,7 +3358,7 @@ func (q *query) problems() (any, int, string) {
 			cycles = append(cycles, arr)
 		}
 	}
-	items, parents, deep := []any{}, []any{}, []any{}
+	items, parents := []any{}, []any{}
 	for _, name := range g.Names() {
 		n := g.Node(name)
 		if n.State == StateDangling {
@@ -3384,12 +3384,11 @@ func (q *query) problems() (any, int, string) {
 			}
 			parents = append(parents, e)
 		}
-		if n.Deep {
-			q.tags.node(g, name)
-			deep = append(deep, map[string]any{"href": g.Href(name), "depth": n.Depth})
-		}
 	}
-	return map[string]any{"at": q.at, "cycles": cycles, "danglingItems": items, "danglingParents": parents, "tooDeep": deep}, http.StatusOK, ""
+	// Paths deeper than 64 aren't listed here: only subtree, ancestors
+	// and where report such a cut, as "tooDeep": true (§B.5 Cycles,
+	// v0.85). Before v0.85 a tooDeep member listed those nodes.
+	return map[string]any{"at": q.at, "cycles": cycles, "danglingItems": items, "danglingParents": parents}, http.StatusOK, ""
 }
 
 // where answers "is this item in the catalog, and where?" with its
