@@ -54,12 +54,16 @@ func (e *Engine) Namespaces(ctx context.Context, after, prefix string, cred Cred
 //     is 401 here, having no blocks to check;
 //   - 403 for a grant with a block that carries ns without naming "*";
 //   - 401 for a grant that fails verification by the operator keys in
-//     force, whatever it fails for: its root kid names no operator key in
-//     its period (§C.4), a signature, nbf and exp, or the key's scope;
-//   - 403 unless every block lists config in can, a narrowing block that
-//     carries no can included, and no block has rules, even an empty
-//     list. Nor does a grant that carries roles list: an operator grant
-//     has no effective role, so nothing allows config (§C.2 Invariant).
+//     force: its root kid names no operator key in its period (§C.4), a
+//     signature, nbf and exp, a revocation;
+//   - 403 for a grant the operator key's scope doesn't allow, as on any
+//     other request (§C.2 item 1; CONFORMANCE Access 80);
+//   - 403 for a grant that carries roles, one with a block that lists
+//     roles, an empty list too (§2.1): an operator grant has no effective
+//     role, so nothing allows config (§C.2 Invariant). And for a block
+//     that carries can without config, or carries non-empty rules: a
+//     narrowing block without can keeps the verbs it was given, and
+//     "rules": [] is none (v0.85).
 func (t *tx) namespaceLister(cred Credentials) *Error {
 	if t.e.opt.AuthDisabled {
 		return nil
@@ -78,15 +82,19 @@ func (t *tx) namespaceLister(cred Credentials) *Error {
 	}
 	a, err := t.verifyGrant(g, "*", nil, nil, keys)
 	if err != nil {
-		msg, _ := err.Body["message"].(string)
-		return apiErr(401, "unauthenticated", "message", msg)
+		// 401 for no usable grant, 403 for one the key's scope doesn't
+		// allow (authErr).
+		return err
 	}
 	t.e.bearers.put(cred.Bearer, g)
 	for _, b := range g.Blocks {
-		if !b.HasCan || !contains(b.Can, "config") {
-			return forbidden("listing namespaces needs config in the can of every block of the grant (§7.4)")
+		if _, ok := b.Raw["roles"]; ok {
+			return forbidden("a grant that carries roles doesn't list namespaces: an operator grant has no effective role (§7.4)")
 		}
-		if _, ok := b.Raw["rules"]; ok {
+		if b.HasCan && !contains(b.Can, "config") {
+			return forbidden("listing namespaces needs config in the can of every block of the grant that carries can (§7.4)")
+		}
+		if r, ok := b.Raw["rules"].([]any); ok && len(r) > 0 {
 			return forbidden("a grant with rules in a block doesn't list namespaces (§7.4)")
 		}
 	}

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.85** (previously **v0.84**).
+
+- **`GET /ns`: which operator grants list** (§7.4, v0.85; CONFORMANCE HTTP-69, Access 79 and
+  80). Only a block that carries `can` must list `config`, so a grant narrowed by a block with
+  `via` or `exp` alone lists; `"rules": []` is no rule; a grant that carries `roles` in any
+  block, an empty list included, is `403`. A grant its operator key's scope doesn't allow
+  (`can`, `sub`, `maxTtl`, …) is now `403`, as on every other request, where it was `401`; an
+  expired or badly signed one stays `401`.
+
 ## v0.30.0
 
 Implements spec **v0.84** (previously **v0.82**). v0.83 adds TOOLS.md's Addendum J, suggested
