@@ -2755,8 +2755,11 @@ func (q *query) entry(n *Node) map[string]any {
 // is, unless the item's namespace is sealed or end-to-end by its document
 // as the graph holds it (Graph.Content, which a catalog service keeps),
 // since a namespace raised since such a value was read protects it now.
-// The service reads these values only from namespaces that are neither
-// (Apply), so they are there to show only for such items.
+// The service reads these values only from namespaces that are neither,
+// and drops those it holds as it applies a raise (applyLocked: items'
+// titles and self-placed borns go with the config entry), so without
+// that document, as in a service with no RoleView, there is none left to
+// show for an item of a sealed or end-to-end namespace.
 func (q *query) itemClear(n *Node) bool {
 	if !derived.InfoOf(q.g.Config).Protected() {
 		return true

@@ -336,10 +336,10 @@ func (s *Service) callerRefused(ctx context.Context, v *grant.Verified, reads bo
 	if grantcheck.RefusedByNowRule(v) {
 		return errNowRule
 	}
-	if !reads {
+	if !reads || !grantcheck.ReadsNothing(v) {
 		return nil
 	}
-	switch ok, err := s.t.ReadsSomewhere(ctx, v.Grant.Encode(), v); {
+	switch ok, err := s.t.ReadsSomewhere(ctx, v.Grant.Encode(), nil); {
 	case err != nil:
 		return err
 	case !ok:

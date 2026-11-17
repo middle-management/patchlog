@@ -493,9 +493,18 @@ func isCatalog(doc map[string]any) bool {
 // 410 for its documents, its purge head's included (§8.5). False where
 // the index recorded no level of it.
 func (ix *Index) purgedSealed(ctx context.Context, ns string) (bool, error) {
+	return ix.purgedSealedTx(ctx, ix.db, ns)
+}
+
+// purgedSealedTx is purgedSealed read through db, a transaction or the
+// database. A member's row goes once its follower is forgotten
+// (forgetMember), which forgets a sealed one's catalog.trust with it.
+func (ix *Index) purgedSealedTx(ctx context.Context, db interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ns string) (bool, error) {
 	for _, table := range []string{"ns_conf", "member_conf"} {
 		var level string
-		switch err := ix.db.QueryRowContext(ctx, `SELECT level FROM `+table+` WHERE ns = ?`, ns).Scan(&level); {
+		switch err := db.QueryRowContext(ctx, `SELECT level FROM `+table+` WHERE ns = ?`, ns).Scan(&level); {
 		case errors.Is(err, sql.ErrNoRows):
 		case err != nil:
 			return false, err
