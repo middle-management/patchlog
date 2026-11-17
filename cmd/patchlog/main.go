@@ -51,16 +51,22 @@ type cli struct {
 	Tree  *treeCmd  `arg:"subcommand:tree" group:"Server commands" help:"run the tree service, or with --access the catalog service (Addendum B)"`
 	Dav   *davCmd   `arg:"subcommand:dav" group:"Server commands" help:"serve namespaces over WebDAV (a prototype)"`
 
-	Get   *getCmd   `arg:"subcommand:get" group:"Client commands" help:"print a resource's document"`
-	Put   *putCmd   `arg:"subcommand:put" group:"Client commands" help:"create a resource"`
-	Patch *patchCmd `arg:"subcommand:patch" group:"Client commands" help:"append a JSON Patch to a resource"`
-	Rm    *rmCmd    `arg:"subcommand:rm" group:"Client commands" help:"delete (tombstone) a resource"`
-	Log   *logCmd   `arg:"subcommand:log" group:"Client commands" help:"print a resource's history"`
-	Watch *watchCmd `arg:"subcommand:watch" group:"Client commands" help:"follow a namespace's log as it is written"`
-	Blob  *blobCmd  `arg:"subcommand:blob" group:"Client commands" help:"upload or download a resource's blobs (put, get)"`
-	Undo  *undoCmd  `arg:"subcommand:undo" group:"Client commands" help:"undo an action (a gesture), by default your last (§11.2)"`
-	Redo  *redoCmd  `arg:"subcommand:redo" group:"Client commands" help:"redo an undone action, by default your last undone"`
-	NS    *nsCmd    `arg:"subcommand:ns" group:"Client commands" help:"create, read and configure namespaces (create, get, config, log)"`
+	Get      *getCmd      `arg:"subcommand:get" group:"Client commands" help:"print a resource's document"`
+	Put      *putCmd      `arg:"subcommand:put" group:"Client commands" help:"create a resource"`
+	Patch    *patchCmd    `arg:"subcommand:patch" group:"Client commands" help:"append a JSON Patch to a resource"`
+	Rm       *rmCmd       `arg:"subcommand:rm" group:"Client commands" help:"delete (tombstone) a resource"`
+	Log      *logCmd      `arg:"subcommand:log" group:"Client commands" help:"print a resource's history"`
+	Watch    *watchCmd    `arg:"subcommand:watch" group:"Client commands" help:"follow a namespace's log as it is written"`
+	Blob     *blobCmd     `arg:"subcommand:blob" group:"Client commands" help:"upload or download a resource's blobs (put, get)"`
+	Undo     *undoCmd     `arg:"subcommand:undo" group:"Client commands" help:"undo an action (a gesture), by default your last (§11.2)"`
+	Redo     *redoCmd     `arg:"subcommand:redo" group:"Client commands" help:"redo an undone action, by default your last undone"`
+	NS       *nsCmd       `arg:"subcommand:ns" group:"Client commands" help:"create, read and configure namespaces (create, get, config, log, purge)"`
+	Ls       *lsCmd       `arg:"subcommand:ls" group:"Client commands" help:"list a namespace's resources"`
+	Restore  *restoreCmd  `arg:"subcommand:restore" group:"Client commands" help:"restore a deleted (tombstoned) resource"`
+	Batch    *batchCmd    `arg:"subcommand:batch" group:"Client commands" help:"write several resources of a namespace atomically (§7.5)"`
+	Validate *validateCmd `arg:"subcommand:validate" group:"Client commands" help:"check a document against its schema, without writing it"`
+	Purge    *purgeCmd    `arg:"subcommand:purge" group:"Client commands" help:"purge a resource, destroying it for good (§8.3); needs --yes"`
+	Prune    *pruneCmd    `arg:"subcommand:prune" group:"Client commands" help:"prune a resource's history below a revision (§8.6); needs --yes"`
 
 	Branch  *branchCmd  `arg:"subcommand:branch" group:"Branches, releases and bundles" help:"create or list a namespace's branches (§7.6)"`
 	Merge   *mergeCmd   `arg:"subcommand:merge" group:"Branches, releases and bundles" help:"merge a branch, or a release across namespaces (Addendum F)"`
@@ -75,6 +81,7 @@ type cli struct {
 	Keygen     *keygenCmd  `arg:"subcommand:keygen" group:"Keys and operations" help:"print a new Ed25519 key pair for minting grants"`
 	Grant      *grantCmd   `arg:"subcommand:grant" group:"Keys and operations" help:"mint, narrow or seal a grant (Biscuit v3, §C.8)"`
 	Archive    *archiveCmd `arg:"subcommand:archive" group:"Keys and operations" help:"restore pruned history from its archives (§8.6)"`
+	Whoami     *whoamiCmd  `arg:"subcommand:whoami" group:"Keys and operations" help:"print who the deployment takes you to be, and with a namespace what your grant can do there"`
 	Health     *healthCmd  `arg:"subcommand:health" group:"Keys and operations" help:"check a health endpoint (exit 0 on 200), for container healthchecks"`
 	VersionCmd *versionCmd `arg:"subcommand:version" group:"Keys and operations" help:"print the version"`
 }
