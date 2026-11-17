@@ -4057,6 +4057,7 @@ patchlog patch matches/derby --if "$R" '[…]'            # 412 stale: the head 
 
 patchlog get matches/derby --meta                       # the document; its id, Last-Modified and Repr-Digest on stderr
 patchlog get matches/derby --rev "$R"                   # an earlier revision
+patchlog get matches/derby --follow | jq -c .score      # each revision as written, one JSON line (null when deleted)
 patchlog log matches/derby                              # its history, patch sets and authors
 patchlog ns config matches '[{"op":"add","path":"/x-note","value":"football"}]'
 patchlog ns get matches

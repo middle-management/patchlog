@@ -15,6 +15,10 @@
   together. `undo NS` undoes your last action, `redo NS` redoes your last undone one, and a
   `GESTURE` argument names one; `--plan` shows the inverse and its conflicts without writing,
   `--list` your stack.
+- **`patchlog get --follow`** (`-f`) prints the document, then each revision as it is written,
+  one line of JSON each (`null` for a tombstone), from the resource's event stream (§7.3),
+  reconnecting when it ends, until interrupted or the resource is purged. A resource that
+  doesn't exist yet is waited for.
 - **`patchlog blob put` and `blob get`** (§7.8). `put` uploads a file or stdin and prints the
   reference to write, or with `--at /pointer` writes it into the document; `get` downloads a blob
   by id or by the reference at `--at`, checked against its id, to `-o FILE` or stdout.

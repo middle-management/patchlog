@@ -367,3 +367,61 @@ func TestBlobCommands(t *testing.T) {
 		}
 	}
 }
+
+// TestGetFollow: get --follow waits for a resource that doesn't exist
+// yet, prints each revision as one line of JSON and a tombstone as null,
+// and ends with an error when the resource is purged.
+func TestGetFollow(t *testing.T) {
+	t.Parallel()
+	s := clienttest.New(t, clienttest.Options{})
+	ctx := context.Background()
+	c := s.Client(t, client.WithAuthor("alice"))
+	if _, err := c.CreateNamespace(ctx, "m", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	cmd := command(t, "get", "m/d", "--follow", "--api", s.URL).(*getCmd)
+	out := &syncWriter{w: &bytes.Buffer{}}
+	done := make(chan error, 1)
+	fctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	go func() { done <- cmd.exec(fctx, out, io.Discard) }()
+	waitLines := func(n int) {
+		t.Helper()
+		for strings.Count(out.String(), "\n") < n {
+			if fctx.Err() != nil {
+				t.Fatalf("follow printed %q, want %d lines", out.String(), n)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	time.Sleep(100 * time.Millisecond) // following before the create
+	w, err := c.CreateDoc(ctx, "m", "d", map[string]any{"n": 1.0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitLines(1)
+	if w, err = c.Append(ctx, "m", "d", w.ID, []any{map[string]any{"op": "replace", "path": "/n", "value": 2.0}}); err != nil {
+		t.Fatal(err)
+	}
+	waitLines(2)
+	tomb, err := c.Delete(ctx, "m", "d", w.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitLines(3)
+	if got := out.String(); got != "{\"n\":1}\n{\"n\":2}\nnull\n" {
+		t.Fatalf("follow printed %q", got)
+	}
+	if _, err := c.Purge(ctx, "m", "d", tomb.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "purged") {
+			t.Fatalf("follow after the purge: %v", err)
+		}
+	case <-fctx.Done():
+		t.Fatal("follow didn't end with the purge")
+	}
+}

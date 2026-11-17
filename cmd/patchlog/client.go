@@ -15,11 +15,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -158,6 +160,7 @@ type getCmd struct {
 	toolArgs
 	Rev      string `arg:"--rev" placeholder:"ID" help:"read this revision (default: the head)"`
 	Meta     bool   `arg:"--meta" help:"print the revision id, Last-Modified and Repr-Digest on stderr"`
+	Follow   bool   `arg:"--follow,-f" help:"keep going: print each new revision as it is written, one line of JSON each (null when the resource is deleted), until interrupted or it is purged (§7.3)"`
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
 }
 
@@ -167,6 +170,12 @@ func (a *getCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	ns, name, err := resourceArg(a.Resource)
 	if err != nil {
 		return err
+	}
+	if a.Follow {
+		if a.Rev != "" {
+			return errors.New("--follow starts at the head: not with --rev")
+		}
+		return a.follow(ctx, ns, name, out, errw)
 	}
 	c := a.client()
 	id := a.Rev
@@ -179,17 +188,101 @@ func (a *getCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if a.Meta {
-		fmt.Fprintf(errw, "rev %s", d.ID)
-		if !d.Modified.IsZero() {
-			fmt.Fprintf(errw, "  modified %s", d.Modified.UTC().Format("2006-01-02T15:04:05Z"))
-		}
-		if d.Digest != "" {
-			fmt.Fprintf(errw, "  digest %s", d.Digest)
-		}
-		fmt.Fprintln(errw)
-	}
+	a.meta(errw, d)
 	return writeJSON(out, d.Value)
+}
+
+// meta prints d's id, Last-Modified and Repr-Digest on errw with --meta.
+func (a *getCmd) meta(errw io.Writer, d *client.Doc) {
+	if !a.Meta {
+		return
+	}
+	fmt.Fprintf(errw, "rev %s", d.ID)
+	if !d.Modified.IsZero() {
+		fmt.Fprintf(errw, "  modified %s", d.Modified.UTC().Format("2006-01-02T15:04:05Z"))
+	}
+	if d.Digest != "" {
+		fmt.Fprintf(errw, "  digest %s", d.Digest)
+	}
+	fmt.Fprintln(errw)
+}
+
+// errPurged ends a follow: the resource's stream ends with its purge.
+var errPurged = errors.New("purged")
+
+// follow prints ns/name's document, then each revision written after it,
+// one line of JSON each, reading its event stream (§7.3) and reconnecting
+// from the last event when the stream ends, until ctx is done or the
+// resource is purged. A tombstone prints null. A resource that doesn't
+// exist yet is waited for.
+func (a *getCmd) follow(ctx context.Context, ns, name string, out, errw io.Writer) error {
+	c := a.client()
+	line := func(v any) error {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(out, string(b))
+		return err
+	}
+	doc := func(id string) error {
+		d, err := c.Doc(ctx, ns, name, id)
+		if err != nil {
+			return err
+		}
+		a.meta(errw, d)
+		return line(d.Value)
+	}
+	h, err := c.Head(ctx, ns, name)
+	if err != nil {
+		return err
+	}
+	since := h.ID
+	switch h.State {
+	case client.Live:
+		err = doc(h.ID)
+	case client.Tombstoned:
+		fmt.Fprintf(errw, "%s/%s is deleted (tombstone %s); following\n", ns, name, h.ID)
+		err = line(nil)
+	case client.NotFound:
+		fmt.Fprintf(errw, "%s/%s doesn't exist yet; following\n", ns, name)
+	case client.Purged:
+		return fmt.Errorf("%s/%s is purged", ns, name)
+	}
+	if err != nil {
+		return err
+	}
+	for {
+		err := c.ResourceEvents(ctx, ns, name, since, func(ev client.Event) error {
+			switch ev.Type {
+			case "revision":
+				since = ev.ID
+				return doc(ev.ID)
+			case "tombstone":
+				since = ev.ID
+				fmt.Fprintf(errw, "%s/%s deleted (tombstone %s)\n", ns, name, ev.ID)
+				return line(nil)
+			case "purge":
+				return errPurged
+			}
+			return nil // prune: the document is unchanged
+		})
+		switch {
+		case errors.Is(err, errPurged):
+			return fmt.Errorf("%s/%s was purged", ns, name)
+		case ctx.Err() != nil:
+			return nil
+		case err != nil:
+			return err
+		}
+		// The stream ended cleanly (a server restart, a proxy's
+		// timeout): resume after the last event.
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 // putCmd is patchlog put NS/NAME DOC.
