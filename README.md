@@ -12,11 +12,14 @@ mirror follows. The test vectors are SPEC.md Addendum I (normative);
 [internal/vectors/addendum_i_test.go](internal/vectors/addendum_i_test.go) reproduces I.1–I.10
 through production code and
 [internal/vectors/addendum_i15_test.go](internal/vectors/addendum_i15_test.go) §I.15–§I.21 (the
-candidates P.1–P.7 of v0.81, which v0.82 took into the Addendum), and
+candidates P.1–P.7 of v0.81, which v0.82 took into the Addendum; §I.17 as v0.85 recomputed it,
+which the reference confirms),
+[internal/vectors/addendum_i22_test.go](internal/vectors/addendum_i22_test.go) §I.22–§I.24 (the
+candidates C.1–C.3 of v0.82, in the Addendum since v0.85), and
 [docs/TESTVECTORS.md](docs/TESTVECTORS.md) points there and records which candidate vectors of
-[docs/VECTORS-PROPOSED.md](docs/VECTORS-PROPOSED.md) the reference confirms (all of C.1–C.3,
-v0.82). The
-additions the reference proposes to the spec writer (for §I.22's list, "Still to come", and the
+[docs/VECTORS-PROPOSED.md](docs/VECTORS-PROPOSED.md) the reference confirms (C.4 and C.5,
+v0.85). The
+additions the reference proposes to the spec writer (for §I.25's list, "Still to come", and the
 writer's own: RE2 `\u`, key
 wraps, sealed payloads, blobs and bundles, the plan digest, Biscuit tokens, file renderings and
 more) live in [internal/vectors/testdata](internal/vectors/testdata), each naming the production
