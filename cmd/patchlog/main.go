@@ -171,11 +171,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
-	if names[0] != "dav" { // dav reads --bearer-file itself
-		if err := resolveSecretFiles(p.Subcommand(), args, stderr); err != nil {
-			fmt.Fprintln(stderr, "error:", err)
-			return 2
-		}
+	if err := resolveSecretFiles(p.Subcommand(), args, stderr); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		return 2
 	}
 	if slices.Contains(telemetryCommands, names[0]) && !(names[0] == "tree" && len(names) > 1) { // tree ls is a client, not the service
 		// Flushed when the command returns (after a server's graceful

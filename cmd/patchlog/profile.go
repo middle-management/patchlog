@@ -118,6 +118,9 @@ func flagGiven(args []string, name string) bool {
 		if a == "--" {
 			return false
 		}
+		if !strings.HasPrefix(a, "-") {
+			continue // a value or a positional argument, not a flag
+		}
 		a = strings.TrimLeft(a, "-")
 		if a == name || strings.HasPrefix(a, name+"=") {
 			return true

@@ -237,7 +237,7 @@ func (a *grantCheckCmd) check(ctx context.Context, tok string, out io.Writer) er
 	if tf.Bearer == "" {
 		tf.Bearer = tok
 	}
-	ch := grantcheck.New(tf.client(), grantcheck.WithTTL(0))
+	ch := grantcheck.New(tf.client(), grantcheck.WithTTL(time.Hour)) // one snapshot: Verify and Config below read the same head
 	v, err := ch.Verify(ctx, a.NS, tok)
 	var ae *grant.AuthError
 	if errors.As(err, &ae) {

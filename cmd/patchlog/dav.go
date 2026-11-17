@@ -41,7 +41,7 @@ type davCmd struct {
 	TreeURL          []string      `arg:"--tree-url,separate" placeholder:"[CATALOG=]URL" help:"tree service (§B.5) following the --catalog trees, e.g. http://tree:8082, which their folders are listed from with each user's grant (§H.3, §H.7); CATALOG=URL maps one catalog to its own (repeatable). Without one, folders are listed from the catalogs' node documents"`
 	TreeWait         time.Duration `arg:"--tree-wait" default:"3s" placeholder:"DURATION" help:"how long a user's listing waits for the tree service to reach the user's own writes (?min=) before it reads the node documents"`
 	Bearer           string        `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"local mode: the grant every request is sent with (Authorization: Bearer)"`
-	BearerFile       string        `arg:"--bearer-file" placeholder:"FILE" help:"local mode: file holding --bearer"`
+	BearerFile       string        `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"local mode: file holding --bearer (a profile's bearer_file too)"`
 	Author           string        `arg:"--author,env:PATCHLOG_AUTHOR" placeholder:"NAME" help:"X-Author for a --dev server (local mode)"`
 	PasswordFile     string        `arg:"--password-file" placeholder:"FILE" help:"local mode: file holding the Basic password WebDAV clients log in with (any user name); default a random one, logged at start"`
 	Gateway          bool          `arg:"--gateway" help:"gateway mode: each request's Basic password is the grant sent upstream, the user name ignored; over a core with authentication disabled, the Basic user name is the X-Author, and the user (§H.7)"`
@@ -73,7 +73,7 @@ func (a *davCmd) run(string) {
 	copts := []client.Option{client.WithIdleConns(a.FetchConcurrency)}
 	if a.Gateway {
 		if a.Bearer != "" || a.BearerFile != "" || a.PasswordFile != "" || a.Author != "" {
-			log.Fatal("dav: --gateway takes each request's grant; --bearer, --bearer-file, --password-file and --author are for local mode (unset $PATCHLOG_BEARER and $PATCHLOG_AUTHOR too)")
+			log.Fatal("dav: --gateway takes each request's grant; --bearer, --bearer-file, --password-file and --author are for local mode (unset $PATCHLOG_BEARER, $PATCHLOG_BEARER_FILE and $PATCHLOG_AUTHOR too, and give no --profile with them)")
 		}
 		if !tls && !loopback(a.Addr) && !a.Insecure {
 			log.Fatalf("dav: --gateway on %s, not a loopback address, needs --tls-cert and --tls-key (grants must not cross plain HTTP), or --insecure", a.Addr)
@@ -82,15 +82,11 @@ func (a *davCmd) run(string) {
 			log.Printf("patchlog dav: warning: --api %s is plain HTTP to another host: every user's grant crosses the network to it in the clear", a.API)
 		}
 	} else {
-		grant := a.Bearer
-		if a.BearerFile != "" {
-			if grant != "" {
-				log.Fatal("dav: --bearer and --bearer-file are exclusive")
-			}
-			grant = readSecret("--bearer-file", a.BearerFile)
-		}
-		if grant != "" {
-			copts = append(copts, client.WithBearer(grant))
+		// --bearer-file (or $PATCHLOG_BEARER_FILE, a profile's
+		// bearer_file) was read into Bearer when the flags were
+		// (resolveSecretFiles), as for every command.
+		if a.Bearer != "" {
+			copts = append(copts, client.WithBearer(a.Bearer))
 		}
 		if a.Author != "" {
 			copts = append(copts, client.WithAuthor(a.Author))

@@ -39,11 +39,11 @@ type blobPutCmd struct {
 	toolArgs
 	encArgs
 	gestureArgs
-	Type     string `arg:"--type" placeholder:"MEDIA-TYPE" help:"the blob's media type (default: from the file's extension, else sniffed from its bytes)"`
-	Nonce    bool   `arg:"--nonce" help:"upload with a random nonce (Blob-Nonce), so the blob's id reveals nothing about its bytes (§3.7, §7.8); always in a sealed namespace, never in an e2e one, whose blobs are encrypted under a fresh key"`
-	At       string `arg:"--at" placeholder:"POINTER" help:"also write the reference into the document at this JSON Pointer (add), so the blob isn't left pending"`
-	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
-	File     string `arg:"positional,required" placeholder:"FILE|-" help:"the bytes to upload (- for stdin)"`
+	Type     string  `arg:"--type" placeholder:"MEDIA-TYPE" help:"the blob's media type (default: from the file's extension, else sniffed from its bytes)"`
+	Nonce    bool    `arg:"--nonce" help:"upload with a random nonce (Blob-Nonce), so the blob's id reveals nothing about its bytes (§3.7, §7.8); always in a sealed namespace, never in an e2e one, whose blobs are encrypted under a fresh key"`
+	At       *string `arg:"--at" placeholder:"POINTER" help:"also write the reference into the document at this JSON Pointer (add), so the blob isn't left pending"`
+	Resource string  `arg:"positional,required" placeholder:"NS/NAME"`
+	File     string  `arg:"positional,required" placeholder:"FILE|-" help:"the bytes to upload (- for stdin)"`
 }
 
 func (a *blobPutCmd) run(string) { runClient(a) }
@@ -53,8 +53,8 @@ func (a *blobPutCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if a.At != "" {
-		if _, err := pointer.Parse(a.At); err != nil {
+	if a.At != nil {
+		if _, err := pointer.Parse(*a.At); err != nil {
 			return fmt.Errorf("--at: %w", err)
 		}
 	}
@@ -98,12 +98,12 @@ func (a *blobPutCmd) exec(ctx context.Context, out, errw io.Writer) error {
 		}
 		ref = client.BlobRef(bid, typ, len(data), nonce)
 	}
-	if a.At == "" {
+	if a.At == nil {
 		fmt.Fprintf(errw, "uploaded %s to %s, pending until a write references it\n", bid, a.Resource)
 		return writeJSON(out, ref)
 	}
 	g, opt := a.gesture()
-	p := []any{map[string]any{"op": "add", "path": a.At, "value": ref}}
+	p := []any{map[string]any{"op": "add", "path": *a.At, "value": ref}}
 	w, err := v.append(ctx, "", p, opt)
 	if err != nil {
 		return fmt.Errorf("uploaded %s, but writing its reference: %w", bid, err)
@@ -111,18 +111,18 @@ func (a *blobPutCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if w.Gesture == "" {
 		w.Gesture = g
 	}
-	return a.wrote(out, errw, fmt.Sprintf("uploaded %s to %s at %s", bid, a.Resource, a.At), w.ID, w.NSID, w.Gesture)
+	return a.wrote(out, errw, fmt.Sprintf("uploaded %s to %s at %s", bid, a.Resource, atLabel(*a.At)), w.ID, w.NSID, w.Gesture)
 }
 
 type blobGetCmd struct {
 	toolArgs
 	encArgs
-	At       string `arg:"--at" placeholder:"POINTER" help:"the blob the document references at this JSON Pointer (its id and nonce)"`
-	Rev      string `arg:"--rev" placeholder:"ID" help:"with --at, the revision to read the reference from (default: the head)"`
-	Nonce    string `arg:"--nonce" help:"with BLOB, the reference's nonce, to check the bytes against the id"`
-	Out      string `arg:"-o" placeholder:"FILE" help:"write the bytes to FILE (default: stdout, unless it is a terminal)"`
-	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
-	Blob     string `arg:"positional" help:"the blob id (or give --at)"`
+	At       *string `arg:"--at" placeholder:"POINTER" help:"the blob the document references at this JSON Pointer (its id and nonce)"`
+	Rev      string  `arg:"--rev" placeholder:"ID" help:"with --at, the revision to read the reference from (default: the head)"`
+	Nonce    string  `arg:"--nonce" help:"with BLOB, the reference's nonce, to check the bytes against the id"`
+	Out      string  `arg:"-o" placeholder:"FILE" help:"write the bytes to FILE (default: stdout, unless it is a terminal)"`
+	Resource string  `arg:"positional,required" placeholder:"NS/NAME"`
+	Blob     string  `arg:"positional" help:"the blob id (or give --at)"`
 }
 
 func (a *blobGetCmd) run(string) { runClient(a) }
@@ -132,14 +132,14 @@ func (a *blobGetCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if (a.Blob == "") == (a.At == "") {
+	if (a.Blob == "") == (a.At == nil) {
 		return errors.New("give BLOB or --at, not both")
 	}
 	v, err := a.view(ctx, a.client(), ns, name)
 	if err != nil {
 		return err
 	}
-	if (v.e2e() || v.sealed()) && a.At == "" {
+	if (v.e2e() || v.sealed()) && a.At == nil {
 		return fmt.Errorf("namespace %s is %s: its blobs are read through their reference in the document, which an encrypted blob is checked and opened with; give --at POINTER", ns, v.level)
 	}
 	if a.Out == "" && out == io.Writer(os.Stdout) && isTerminal(os.Stdout) {
@@ -147,8 +147,8 @@ func (a *blobGetCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	}
 	bid, nonce := a.Blob, a.Nonce
 	var b *client.Blob
-	if a.At != "" {
-		ref, err := v.refAt(ctx, a.Rev, a.At)
+	if a.At != nil {
+		ref, err := v.refAt(ctx, a.Rev, *a.At)
 		if err != nil {
 			return err
 		}
@@ -180,4 +180,12 @@ func (a *blobGetCmd) exec(ctx context.Context, out, errw io.Writer) error {
 func isTerminal(f *os.File) bool {
 	fi, err := f.Stat()
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// atLabel names a --at pointer in a message: "" is the document root.
+func atLabel(p string) string {
+	if p == "" {
+		return "the document root"
+	}
+	return p
 }

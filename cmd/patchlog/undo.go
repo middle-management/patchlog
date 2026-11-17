@@ -24,10 +24,16 @@ type undoArgs struct {
 	Gesture   string   `arg:"positional" help:"the gesture to act on (default: the last of the author's stack)"`
 }
 
-// options are the client.UndoOption of the flags.
-func (a *undoArgs) options() []client.UndoOption {
+// options are the client.UndoOption of the flags; author, if not "",
+// is whose writes of the gesture to undo: the owner of the stack it was
+// taken from, so another author's writes under the same gesture id are
+// never undone in their place.
+func (a *undoArgs) options(author string) []client.UndoOption {
 	var opts []client.UndoOption
-	if a.Of != "" && a.Gesture != "" {
+	switch {
+	case author != "":
+		opts = append(opts, client.UndoAuthor(author))
+	case a.Of != "" && a.Gesture != "":
 		opts = append(opts, client.UndoAuthor(a.Of))
 	}
 	if a.Since != "" {
@@ -63,10 +69,10 @@ func (a *undoArgs) stack(ctx context.Context, c *client.Client) (*client.UndoSta
 // the user saw written: done reports whether the action stands, target is
 // the gesture to undo (the latest redo of it, or the undo whose undo
 // redoes it). ok is false when the stack can't be read or doesn't hold g.
-func (a *undoArgs) resolve(ctx context.Context, c *client.Client, g string) (target string, done, ok bool) {
+func (a *undoArgs) resolve(ctx context.Context, c *client.Client, g string) (target, author string, done, ok bool) {
 	st, err := a.stack(ctx, c)
 	if err != nil {
-		return "", false, false
+		return "", "", false, false
 	}
 	for _, l := range []struct {
 		items []client.StackItem
@@ -74,11 +80,11 @@ func (a *undoArgs) resolve(ctx context.Context, c *client.Client, g string) (tar
 	}{{st.Done, true}, {st.Undone, false}} {
 		for _, it := range l.items {
 			if it.Gesture == g || it.Target == g || slices.Contains(it.Chain, g) {
-				return it.Target, l.done, true
+				return it.Target, st.Author, l.done, true
 			}
 		}
 	}
-	return "", false, false
+	return "", "", false, false
 }
 
 // undid reports an undo or redo.
@@ -114,12 +120,12 @@ func (a *undoCmd) exec(ctx context.Context, out, errw io.Writer) error {
 		}
 		return printStack(out, st, a.JSON)
 	}
-	g, action := a.Gesture, a.Gesture
+	g, action, author := a.Gesture, a.Gesture, ""
 	if g != "" {
-		if t, done, ok := a.resolve(ctx, c, g); ok && !done {
+		if t, who, done, ok := a.resolve(ctx, c, g); ok && !done {
 			return fmt.Errorf("%s is undone already: patchlog redo %s %s redoes it", g, a.NS, g)
 		} else if ok {
-			g = t
+			g, author = t, who
 		}
 	} else {
 		st, err := a.stack(ctx, c)
@@ -129,16 +135,16 @@ func (a *undoCmd) exec(ctx context.Context, out, errw io.Writer) error {
 		if len(st.Done) == 0 {
 			return fmt.Errorf("%s has nothing to undo in %s", st.Author, a.NS)
 		}
-		g, action = st.Done[len(st.Done)-1].Target, st.Done[len(st.Done)-1].Gesture
+		g, action, author = st.Done[len(st.Done)-1].Target, st.Done[len(st.Done)-1].Gesture, st.Author
 	}
 	if a.Plan {
-		p, err := c.PlanUndo(ctx, a.NS, g, a.options()...)
+		p, err := c.PlanUndo(ctx, a.NS, g, a.options(author)...)
 		if err != nil {
 			return err
 		}
 		return printUndoPlan(out, p, a.JSON)
 	}
-	r, err := c.Undo(ctx, a.NS, g, a.options()...)
+	r, err := c.Undo(ctx, a.NS, g, a.options(author)...)
 	if err != nil {
 		return err
 	}
@@ -158,13 +164,13 @@ func (a *redoCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	var err error
 	action := a.Gesture
 	if a.Gesture != "" {
-		if t, done, ok := a.resolve(ctx, c, a.Gesture); ok && done {
+		if t, who, done, ok := a.resolve(ctx, c, a.Gesture); ok && done {
 			return fmt.Errorf("%s stands: nothing to redo", a.Gesture)
 		} else if ok {
 			// Undoing the undo redoes it (§11.2 Redo).
-			r, err = c.Undo(ctx, a.NS, t, a.options()...)
+			r, err = c.Undo(ctx, a.NS, t, a.options(who)...)
 		} else {
-			r, err = c.Redo(ctx, a.NS, a.Gesture, a.options()...)
+			r, err = c.Redo(ctx, a.NS, a.Gesture, a.options("")...)
 		}
 	} else {
 		st, serr := a.stack(ctx, c)
@@ -177,7 +183,7 @@ func (a *redoCmd) exec(ctx context.Context, out, errw io.Writer) error {
 		// Undoing the author's undo of the action redoes it (§11.2 Redo).
 		it := st.Undone[len(st.Undone)-1]
 		action = it.Gesture
-		r, err = c.Undo(ctx, a.NS, it.Target, a.options()...)
+		r, err = c.Undo(ctx, a.NS, it.Target, a.options(st.Author)...)
 	}
 	if errors.Is(err, client.ErrNotUndone) {
 		return fmt.Errorf("%s: nobody undid it, so there is nothing to redo", a.Gesture)
@@ -230,7 +236,10 @@ func printUndoPlan(out io.Writer, p *client.UndoPlan, asJSON bool) error {
 		for _, c := range p.Conflicts {
 			cs = append(cs, c.String())
 		}
-		return writeJSON(out, map[string]any{"gesture": p.Gesture, "author": p.Author, "resources": res, "conflicts": cs})
+		if err := writeJSON(out, map[string]any{"gesture": p.Gesture, "author": p.Author, "resources": res, "conflicts": cs}); err != nil {
+			return err
+		}
+		return p.Err() // conflicts fail the command, with --json too
 	}
 	fmt.Fprintf(out, "undo of %s by %s in %s:\n", p.Gesture, p.Author, p.NS)
 	for _, r := range p.Resources {
