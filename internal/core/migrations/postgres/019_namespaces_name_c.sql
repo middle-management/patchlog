@@ -1,0 +1,24 @@
+-- Migration: namespaces name c
+-- Created: 2026-11-17T12:43:03Z
+-- Checksum: 535e211e4517257eef3809117cd1cda45d7066e5d300ef7f3812481e3ff1ec08
+-- Chain: 77143cea9be8e04ca8c913e24974e310b09522c44d6269becfcae285fec5a525
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;-- The deployment's namespaces in ascending byte order of name, for the
+-- pages of GET /ns (§7.4, v0.84; nslist.go): namespaces' UNIQUE index on
+-- name is in the database's collation, which may order "-", "_" and digits
+-- otherwise, so neither the page's bound nor its order could use it. As
+-- resources_ns_name_c for the pages of /heads. (SQLite's index on name is
+-- BINARY already, so it has no such migration.)
+CREATE INDEX IF NOT EXISTS namespaces_name_c ON namespaces (name COLLATE "C");

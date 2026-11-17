@@ -1,6 +1,6 @@
 # Patch Log — Tools
 
-Status: draft v0.83 · 2026-11-16. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.84 · 2026-11-17. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Clients and tools that use the protocol's public API. A server needs nothing from this document.
 

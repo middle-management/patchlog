@@ -2,13 +2,31 @@
 
 ## Unreleased
 
-Implements spec **v0.83** (previously **v0.82**). v0.83 adds TOOLS.md's Addendum J, suggested
+Implements spec **v0.84** (previously **v0.82**). v0.83 adds TOOLS.md's Addendum J, suggested
 and non-normative: a proxy that keeps an upstream's streamed response as a resource, shared
 sessions of people and agents in one namespace, agents through MCP, and recording model calls.
-It was tested against this server at v0.29.0 and changes nothing in it.
+It was tested against this server at v0.29.0 and changes nothing in it. v0.84 adds one request,
+`GET /ns?after={name}` (§7.4), which lists the deployment's namespaces to operators.
 
-- **`GET /` answers `"spec": "0.83"`**, and the docs mirror v0.83 (SPEC, SERVICES, TOOLS,
+- **`GET /` answers `"spec": "0.84"`**, and the docs mirror v0.84 (SPEC, SERVICES, TOOLS,
   CONFORMANCE, the spec's change log).
+- **`GET /ns?after={name}`: the deployment's namespaces, for operators** (§7.4, §C.4, v0.84;
+  CONFORMANCE HTTP-69, scenario 75). `200` with `{ "namespaces": [ { name, created, base?,
+  frozen, purged } ], "next"? }`, `no-store`: every namespace, branches, remote branches and
+  purged ones included, in ascending byte order of name, strictly after `after` (a plain
+  bound), in pages of `logPageSize`, and with `prefix`, a namespace name (`400` otherwise),
+  only the names that start with it. It answers only an operator grant, checked in the spec's
+  order: request-shape errors; `403` for a block that carries `ns` without `"*"`; `401` for no
+  credentials or a grant that fails verification by an operator key in its period; `403` unless
+  every block lists `config` in `can` and none has `rules`. With authentication disabled it
+  answers everyone. The hidden shadows of remote branches aren't listed. Operator grants now
+  authorise four things, this one among them; under one, every other request is `401` as
+  before. `client.Namespaces(ctx, after, prefix)` reads a page and `AllNamespaces` every page,
+  and **`patchlog ns ls [--prefix P] [--json]`** prints name, `live`/`frozen`/`purged`,
+  created and base. Postgres gets an index of the names under the `"C"` collation (core
+  migration `019_namespaces_name_c`, applied at start; SQLite needs none), so pages are in byte
+  order whatever the database's collation. SPEC-FEEDBACK notes 101–103 are what §7.4 left
+  open.
 - **`patchlog streams`: the stream proxy of TOOLS Addendum J.1–J.4** (internal/streams). A
   caller sends `POST /streams` with its own grant, the upstream's URL, method, headers and
   body; the proxy creates a resource in a namespace of its own, calls upstream and appends what

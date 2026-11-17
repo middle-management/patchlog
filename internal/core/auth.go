@@ -224,7 +224,8 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 // is not revealed: 401 without a usable grant, 403 for a grant that
 // doesn't name the namespace, and 401 for any other grant naming it, since
 // no key of the namespace can verify it. Operator grants authorise only
-// creating namespaces and forcing purges (§C.4): any other request under
+// creating namespaces, forcing purges and listing the deployment's
+// namespaces (§C.4, nslist.go): any other request under
 // one is 401, as for an existing namespace whose keys don't list it.
 func (t *tx) absentNS(nsName string, cred Credentials) *Error {
 	return t.absentNSOp(nsName, cred, false)

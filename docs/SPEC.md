@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.83 · 2026-11-16. See Changes at the end, and CHANGELOG.md for the full history.
+Status: draft v0.84 · 2026-11-17. See Changes at the end, and CHANGELOG.md for the full history.
 
 **Scope.** This document is the protocol: what a server stores, checks and answers. The core (§1–§10, §12, §13) specifies, implementation-neutrally, identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. Its addenda cover:
 
@@ -1012,7 +1012,7 @@ The `regex` format asserts the same syntax. A pattern RE2 doesn't accept makes a
 
   - In `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Log-Next` and `Last-Event-ID`, an id is unquoted.
 
-- **`GET /`** answers `{ "origin": "https://cms.example", "spec": "0.83", "auth": "grants" }`: the deployment's canonical origin (§C.3), the spec version it implements, as dotted decimal numbers compared component by component, and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4). A client, peer or tool MUST NOT refuse a deployment on the version alone; endpoints show what is offered (`404 not_offered` for an optional one, a plain `404` from an older server).
+- **`GET /`** answers `{ "origin": "https://cms.example", "spec": "0.84", "auth": "grants" }`: the deployment's canonical origin (§C.3), the spec version it implements, as dotted decimal numbers compared component by component, and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4). A client, peer or tool MUST NOT refuse a deployment on the version alone; endpoints show what is offered (`404 not_offered` for an optional one, a plain `404` from an older server).
 
 - **Answers,** a service's too, may carry members this spec doesn't define, which clients ignore.
 
@@ -1209,6 +1209,7 @@ It also ends, at the latest, when the grant or cookie it was admitted under expi
 
 | Request | Response | Cache-Control |
 |---|---|---|
+| `GET /ns?after={name}` | `200` with `{ "namespaces": [ … ], "next"? }`, a page of the deployment's namespaces, for operators only, as below | `no-store` |
 | `GET /ns/{ns}` | `302` with `Location: /ns/{ns}/rev/{ns_id}`, `ETag: "{ns_id}"`, `X-Config-Revision: {config_id}` | head pointer |
 | `GET /ns/{ns}/rev/{ns_id}` | `200` with the namespace document in force at that point in the chain, `ETag: "{ns_id}"`, `X-Config-Revision: {config_id}`. An `ns_id` not in the chain is `404` here, and at its `/log` and `/heads` | immutable (a `404` as short) |
 | `GET /ns/{ns}/rev/{ns_id}/log?since={a}` | `200` with an array of entries, shaped as below, following §3.5. `404` if `a` is neither `ns_id` nor earlier in its chain. Paged as in §7.1 | immutable |
@@ -1218,6 +1219,39 @@ It also ends, at the latest, when the grant or cookie it was admitted under expi
 | `GET /ns/{ns}/gestures/{gesture}` | `400` or `404` as below; otherwise `200` with `[{ resource, id, kind, gesture?, undoes?, author, ns_id }]` | `no-store` |
 | `GET /ns/{ns}/grants/{gid}` | `200` with `{ id, root, stored }`, served as §C.3.1 says | immutable (`private` at E3) |
 | `GET /ns/{ns}/branches` | `200` with `[{ name, at, frozen, purged, successor?, drafts? }]` for the namespace's direct branches, and `{ remote, at, ns_id, expires }` for remote branches whose registration hasn't expired (§G.3). Requires unrestricted `read` (§2.1) | head pointer |
+
+**`GET /ns?after={name}`.** For operators and admin tools.
+
+-
+It answers operator grants only (§C.4), checked in this order:
+
+  - the request-shape checks of §C.2 item 1;
+
+  - a grant whose blocks that carry `ns` don't all name `"*"` is `403`;
+
+  - a grant that fails verification is `401`, as is one whose root `kid` names no operator key in its period, and a request without credentials;
+
+  - a grant whose blocks don't all list `config` in `can`, or that has `rules` in any block, is `403`.
+
+While authentication is disabled (§1), it answers everyone.
+
+-
+Each row is `{ name, created, base?, frozen, purged }`.
+
+  - `created` is that of the entry that created the namespace: the base's `branch` entry for a local branch, otherwise its chain's first.
+
+  - `base` is the namespace document's (§7.6), without `chain`.
+
+  - `frozen` is as in §8.4, and `purged` whether it is purged (§8.5).
+
+-
+Rows are in ascending byte order of name, strictly after `after`, a plain bound, and paged by `logPageSize`. `next` is for the following page, absent on the last.
+
+-
+With `prefix`, a namespace name, only names that start with it are listed. Any other `prefix` is `400` (`bad_input`), a request-shape error (§6.2).
+
+-
+It is `Cache-Control: no-store`.
 
 **`GET /ns/{ns}/rev/{ns_id}/log?since={a}`.**
 
@@ -2172,7 +2206,7 @@ The limits of §6.6, with their keys in a namespace document's `limits` and thei
 | items per batch | `itemsPerBatch` | 1,000 |
 | batch size (all items' patch sets) | `batchSize` | 16 MiB |
 | bytes of patch sets per log page, sealed ones as served (§7.1, §7.3, §7.7), at least one entry per page, deployment only | `logPageBytes` | 16 MiB |
-| log page size, in resource entries, a batch entry counting as its items, for log ranges (§7.1), `/heads` pages and gesture listings (§7.4), event-stream catch-up (§7.3) and long-poll answers (§7.7), deployment only | `logPageSize` | 1,000 entries |
+| log page size, in resource entries, a batch entry counting as its items, for log ranges (§7.1), `/heads` and `GET /ns` pages and gesture listings (§7.4), event-stream catch-up (§7.3) and long-poll answers (§7.7), deployment only | `logPageSize` | 1,000 entries |
 | branch depth (bases of bases), deployment only | `branchDepth` | 8 |
 | live local branches per namespace: neither frozen nor purged (§F.6, §G.3) | `branchesPerNamespace` | 100 |
 | writes and blob uploads per resource, per principal | `ratePerResource` | 10/s, burst 20 |
@@ -2230,10 +2264,10 @@ On the core server, its filtered URLs included (§B.11.9). Services of the adden
 | `since` | resource and namespace log ranges, event streams and long-poll URLs | an id or `ns_id`, or empty for genesis | §7.1, §7.3, §7.4, §7.7 |
 | `live` | long-poll URLs | `long-poll` | §7.7 |
 | `cursor` | long-poll URLs | an `X-Cursor` value | §7.7 |
-| `after` | `/heads` pages; gesture listings | a resource name; an `X-Log-Next` value | §7.4 |
+| `after` | `/heads` and `GET /ns` pages; gesture listings | a name; an `X-Log-Next` value | §7.4 |
 | `dry-run` | `POST /ns/{ns}/batch` | flag, `1` | §7.5 |
 | `force` | `POST /r/{ns}/{name}/purge`, `POST /ns/{ns}/purge` | flag, `1` | §6.1, §8.5 |
-| `prefix` | `/heads` pages; `DELETE /edge-grants` (repeatable) | a resource name; an edge prefix | §7.4, §C.5.4 |
+| `prefix` | `/heads` and `GET /ns` pages; `DELETE /edge-grants` (repeatable) | a name; an edge prefix | §7.4, §C.5.4 |
 
 ### 12.5 Headers
 
@@ -2524,7 +2558,7 @@ The write's **candidate verbs** are those for which this item and item 4's step-
     - A role that counts for `read` must pass all its rules against a `read` envelope, as in item 5.
 
   -
-**Operator grants** (§C.4) check `config` for a namespace's creation, a remote branch's with the schema histories it mirrors included, and `purge` or `purge-ns` for a forced purge (§6.1).
+**Operator grants** (§C.4) check `config` for a namespace's creation, a remote branch's with the schema histories it mirrors included, `purge` or `purge-ns` for a forced purge (§6.1), and `config` for `GET /ns` (§7.4).
 
 -
 **Build the principal:** `{ id: root sub, groups: root groups, roles: effective roles, attrs: root attrs, via: [...], grant: grant id }`.
@@ -2695,7 +2729,9 @@ An entry stored without `can` allows no verb. Changing keys and scopes needs a `
 
   - creating a remote branch, including the schema histories it mirrors and their `nonce` settings (§G.3, §C.7);
 
-  - forcing a purge or namespace purge (§6.1).
+  - forcing a purge or namespace purge (§6.1);
+
+  - listing the deployment's namespaces (`GET /ns`, §7.4).
 
 Any other request under one is `401`, as for a key the namespace doesn't list, with two exceptions:
 
@@ -3401,7 +3437,7 @@ The server checks `pl` and `kid` (`422`, `invalid`).
 
   - padding (`pad`, §E.2.2)
 
-  - edge grants, hiding existence from non-readers; nothing hides from the operator who writes when
+  - edge grants, hiding existence from non-readers; only operators list namespaces (§7.4); nothing hides from the operator who writes when
 
 ## E.5 Open questions
 
@@ -4343,18 +4379,10 @@ Candidates for these, computed independently from this text and not yet confirme
 
 ## Changes
 
-The full history is in CHANGELOG.md, and the conformance checklist in CONFORMANCE.md. Since v0.82:
+The full history is in CHANGELOG.md, and the conformance checklist in CONFORMANCE.md. Since v0.83:
 
-- **v0.83:** patterns for stream proxies and shared agent sessions.
+- **v0.84:** a namespace listing for operators.
 
-  - **Addendum J (TOOLS.md, suggested, non-normative)** builds a proxy that keeps an upstream's streamed response, as the Durable Streams proxy protocol does, from core requests. Each response is one resource: it is created with `If-None-Match: *` before upstream is called, so a repeated request finds it (`200` or `412`), and each flush is appended with `If-Match` and a fresh `$nonce`, so none lands twice. A grant fixed to the resource, allowing appends only to `/abort`, lets the caller read, resume by revision id through the resource long-poll, and abort. The core deletes nothing by age, so the proxy purges expired streams; rate limits count by the proxy's principal; in a sealed namespace each reader gets a root grant of its own; the design doesn't work end-to-end.
+  - **`GET /ns?after={name}`** (§7.4) lists the deployment's namespaces, branches and purged ones included, as `{ name, created, base?, frozen, purged }`, in name order, paged like `/heads` and filtered by `prefix`. It answers only an operator grant whose blocks name `"*"`, allow `config` and carry no `rules` (§C.4), and is `no-store`. Everyone else learns namespaces from their grants, catalogs and `branch` entries, as before (§E.4).
 
-  - **Shared sessions (§J.5):** one namespace per session in which people and agents edit the same documents, with messages as resources of their own. People act as themselves, an agent through its person's grant narrowed with `via`, so the log attributes every change. Roles, not grant rules, limit writes while keeping unrestricted `read`: messages are created once, in one's own name; agents acting for people only create and edit. A shared agent answers messages addressed to it, in log order; forks are branches.
-
-  - **Agents through MCP (§J.6):** a tool surface any MCP-speaking agent can use, each tool mapped to its core request. Edits are patches against the revision read; on a conflict the agent redoes its change against the current document, never resending or overwriting.
-
-  - **Recording model calls (§J.7):** the stream proxy in front of each participant's model API, at a secret per-participant URL, records each call as a document under that participant's grant, with its stream beside the session. The agent never waits on the recording, and keys are never stored.
-
-  - **Tested** against the reference server (v0.29.0) with two kits: the stream proxy and session (30 checks), and MCP agents with recording (37 checks); the roles in §J.5 are the ones the tests run.
-
-  - **The reference changes:** nothing.
+  - **The reference changes:** add the endpoint.

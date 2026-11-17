@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -563,11 +564,66 @@ func (a *watchCmd) exec(ctx context.Context, out, errw io.Writer) error {
 
 // nsCmd is patchlog ns.
 type nsCmd struct {
+	Ls     *nsLsCmd     `arg:"subcommand:ls" help:"list the deployment's namespaces, with an operator grant (§7.4)"`
 	Create *nsCreateCmd `arg:"subcommand:create" help:"create a namespace"`
 	Get    *nsGetCmd    `arg:"subcommand:get" help:"print the namespace document in force"`
 	Config *nsConfigCmd `arg:"subcommand:config" help:"patch the namespace document (its config)"`
 	Log    *nsLogCmd    `arg:"subcommand:log" help:"print the namespace log"`
 	Purge  *nsPurgeCmd  `arg:"subcommand:purge" help:"purge a frozen namespace, destroying it for good (§8.5); needs --yes"`
+}
+
+// nsLsCmd is patchlog ns ls: GET /ns (§7.4, v0.84), every page. The
+// server answers only an operator grant whose blocks name "*" in ns and
+// list config in can, without rules (§C.4), or anyone while
+// authentication is disabled.
+type nsLsCmd struct {
+	toolArgs
+	Prefix string `arg:"--prefix" placeholder:"P" help:"only the namespaces whose names start with this, a namespace name"`
+}
+
+func (a *nsLsCmd) run(string) { runClient(a) }
+
+func (a *nsLsCmd) exec(ctx context.Context, out, errw io.Writer) error {
+	items, err := a.client().AllNamespaces(ctx, a.Prefix)
+	if err != nil {
+		return err
+	}
+	if a.JSON {
+		rows := make([]map[string]any, 0, len(items))
+		for _, it := range items {
+			m := map[string]any{"name": it.Name, "created": it.Created, "frozen": it.Frozen, "purged": it.Purged}
+			if it.Base != nil {
+				m["base"] = it.Base
+			}
+			rows = append(rows, m)
+		}
+		return writeJSON(out, rows)
+	}
+	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	for _, it := range items {
+		// A purged namespace was frozen first (§8.5): purged says both.
+		state := "live"
+		switch {
+		case it.Purged:
+			state = "purged"
+		case it.Frozen:
+			state = "frozen"
+		}
+		created := it.Created
+		if created == "" {
+			created = "-"
+		}
+		base := "-"
+		if it.Base != nil {
+			// ns@at, after its deployment's origin for a remote branch.
+			base = fmt.Sprintf("%v@%v", it.Base["ns"], it.Base["at"])
+			if o, ok := it.Base["origin"].(string); ok {
+				base = o + "/ns/" + base
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", it.Name, state, created, base)
+	}
+	return tw.Flush()
 }
 
 type nsCreateCmd struct {
