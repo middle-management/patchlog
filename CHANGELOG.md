@@ -47,6 +47,19 @@ Implements spec **v0.85** (previously **v0.84**).
   - The refusal of a sealed namespace no longer speaks of a design v0.85 dropped.
   A read grant's `exp` is still the earlier of the stream's creation plus `--ttl` and the
   proxy grant's own `exp`: a narrowed grant can't outlive the grant it was narrowed from.
+- **Playground: reading answers sealed per entry** (SERVICES §E.2.6, §B.5 Previews, v0.85;
+  E3 scenario 84).
+  - A value drawn from an entry's item (a placement's `file`) is compared with the resource
+    the entry's content `url` names, which in a release preview is the release branch's, and
+    with the item's own where the entry has no such URL. The tree service's own `branch`
+    member, which the spec doesn't define, is no longer read. A URL in another namespace than
+    the item's still counts only where that namespace's document names the item's as its
+    base, now also through a branch of it, so a stacked release branch opens where it showed
+    by name only.
+  - Of an entry that carries `sealed`, only what §E.2.6 leaves in the clear is taken from
+    outside it: a tree entry keeps its names, links, head, order, item file and listing
+    structure, and loses every other member in the clear, where it lost `title` and `born`
+    alone.
 
 ## v0.30.0
 
