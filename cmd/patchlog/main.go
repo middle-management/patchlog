@@ -46,10 +46,11 @@ type runner interface{ run(name string) }
 
 // cli is the patchlog command line: one subcommand.
 type cli struct {
-	Serve *serveCmd `arg:"subcommand:serve" group:"Server commands" help:"run the patch-log server"`
-	Index *indexCmd `arg:"subcommand:index" group:"Server commands" help:"run the search index service (Addendum A)"`
-	Tree  *treeCmd  `arg:"subcommand:tree" group:"Server commands" help:"run the tree service, or with --access the catalog service (Addendum B); tree ls lists a catalog"`
-	Dav   *davCmd   `arg:"subcommand:dav" group:"Server commands" help:"serve namespaces over WebDAV (a prototype)"`
+	Serve   *serveCmd   `arg:"subcommand:serve" group:"Server commands" help:"run the patch-log server"`
+	Index   *indexCmd   `arg:"subcommand:index" group:"Server commands" help:"run the search index service (Addendum A)"`
+	Tree    *treeCmd    `arg:"subcommand:tree" group:"Server commands" help:"run the tree service, or with --access the catalog service (Addendum B); tree ls lists a catalog"`
+	Dav     *davCmd     `arg:"subcommand:dav" group:"Server commands" help:"serve namespaces over WebDAV (a prototype)"`
+	Streams *streamsCmd `arg:"subcommand:streams" group:"Server commands" help:"run the stream proxy (TOOLS Addendum J.1-J.4); streams read prints a stream"`
 
 	Get      *getCmd      `arg:"subcommand:get" group:"Client commands" help:"print a resource's document"`
 	Ls       *lsCmd       `arg:"subcommand:ls" group:"Client commands" help:"list a namespace's resources"`
@@ -115,7 +116,7 @@ $PATCHLOG_AUTHOR; resources are named NS/NAME, and JSON is given inline, as
 
 // telemetryCommands are the commands that set up OpenTelemetry, if
 // configured by OTEL_* (off by default).
-var telemetryCommands = []string{"serve", "index", "tree", "dav", "merge", "rebase", "janitor", "export", "import", "bundle", "archive", "schema"}
+var telemetryCommands = []string{"serve", "index", "tree", "dav", "streams", "merge", "rebase", "janitor", "export", "import", "bundle", "archive", "schema"}
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -175,7 +176,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error:", err)
 		return 2
 	}
-	if slices.Contains(telemetryCommands, names[0]) && !(names[0] == "tree" && len(names) > 1) { // tree ls is a client, not the service
+	if slices.Contains(telemetryCommands, names[0]) && !((names[0] == "tree" || names[0] == "streams") && len(names) > 1) { // tree ls and streams read are clients, not the services
 		// Flushed when the command returns (after a server's graceful
 		// shutdown), not on log.Fatal.
 		defer startTelemetry(names[0])()

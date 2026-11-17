@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.82 · 2026-11-10. See Changes at the end, and CHANGELOG.md for the full history.
+Status: draft v0.83 · 2026-11-16. See Changes at the end, and CHANGELOG.md for the full history.
 
 **Scope.** This document is the protocol: what a server stores, checks and answers. The core (§1–§10, §12, §13) specifies, implementation-neutrally, identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. Its addenda cover:
 
@@ -18,7 +18,7 @@ Status: draft v0.82 · 2026-11-10. See Changes at the end, and CHANGELOG.md for 
 |---|---|
 | this document | §1–§10, §12, §13, Addenda C, E (but §E.2.6) and I, and of Addendum G: §G.1, §G.3, §G.4.1 and §G.5–§G.7 |
 | SERVICES.md | **Addendum A (suggested):** indexing. **Addendum B (suggested):** organising documents in separate catalog namespaces, tree-derived access and filtered namespace reads. **§E.2.6:** how services seal derived views |
-| TOOLS.md | **§11 (non-normative):** client behaviour. **Addendum F (suggested):** working with branches: merge, rebase, cleanup and releases. **§G.2 and §G.4.2–§G.4.4 (suggested):** external consumers, export and import. **Addendum H (suggested, non-normative):** files: how file tools, such as WebDAV gateways and mounts, store files, folders and names to share a namespace |
+| TOOLS.md | **§11 (non-normative):** client behaviour. **Addendum F (suggested):** working with branches: merge, rebase, cleanup and releases. **§G.2 and §G.4.2–§G.4.4 (suggested):** external consumers, export and import. **Addendum H (suggested, non-normative):** files: how file tools, such as WebDAV gateways and mounts, store files, folders and names to share a namespace. **Addendum J (suggested, non-normative):** streams: a proxy that keeps an upstream's streamed response, and shared agent sessions |
 
 **Labels.** A *recommended* addendum is needed by every deployment outside development. An *optional* one may be left out, and §1 says how a server without it answers. A *suggested* one is a design for a service or tool: it binds whatever claims to implement it, and a deployment may use another design. A *non-normative* one binds nothing.
 
@@ -1012,7 +1012,7 @@ The `regex` format asserts the same syntax. A pattern RE2 doesn't accept makes a
 
   - In `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Log-Next` and `Last-Event-ID`, an id is unquoted.
 
-- **`GET /`** answers `{ "origin": "https://cms.example", "spec": "0.82", "auth": "grants" }`: the deployment's canonical origin (§C.3), the spec version it implements, as dotted decimal numbers compared component by component, and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4). A client, peer or tool MUST NOT refuse a deployment on the version alone; endpoints show what is offered (`404 not_offered` for an optional one, a plain `404` from an older server).
+- **`GET /`** answers `{ "origin": "https://cms.example", "spec": "0.83", "auth": "grants" }`: the deployment's canonical origin (§C.3), the spec version it implements, as dotted decimal numbers compared component by component, and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4). A client, peer or tool MUST NOT refuse a deployment on the version alone; endpoints show what is offered (`404 not_offered` for an optional one, a plain `404` from an older server).
 
 - **Answers,** a service's too, may carry members this spec doesn't define, which clients ignore.
 
@@ -4343,24 +4343,18 @@ Candidates for these, computed independently from this text and not yet confirme
 
 ## Changes
 
-The full history is in CHANGELOG.md, and the conformance checklist in CONFORMANCE.md. Since v0.81:
+The full history is in CHANGELOG.md, and the conformance checklist in CONFORMANCE.md. Since v0.82:
 
-- **v0.82:** the reference's 77 notes on v0.81 answered: 23 already matched the text or are the implementation's business, the rest are a clause each, and its confirmed vectors join Addendum I.
+- **v0.83:** patterns for stream proxies and shared agent sessions.
 
-  - **Earlier drafts' data.** A deployment may refuse or discard it, and MUST NOT serve it under less protection than this draft gives that namespace's content ("Reading this spec"). Nothing else is said about it: the reference's start gate and purge conform, and so does keeping read-only paths that accept nothing this draft refuses.
+  - **Addendum J (TOOLS.md, suggested, non-normative)** builds a proxy that keeps an upstream's streamed response, as the Durable Streams proxy protocol does, from core requests. Each response is one resource: it is created with `If-None-Match: *` before upstream is called, so a repeated request finds it (`200` or `412`), and each flush is appended with `If-Match` and a fresh `$nonce`, so none lands twice. A grant fixed to the resource, allowing appends only to `/abort`, lets the caller read, resume by revision id through the resource long-poll, and abort. The core deletes nothing by age, so the proxy purges expired streams; rate limits count by the proxy's principal; in a sealed namespace each reader gets a root grant of its own; the design doesn't work end-to-end.
 
-  - **Sealed forms.** A namespace event has its own `pl`, `{ ns, event: id }`, so it can't be replayed as a range and a filtered stream needs no previous id. Events need not be stored. A view's `view` string is the request target in origin form, byte for byte; a whole-response JWE's plaintext is the response body and its `kid` names the epoch, a per-entry JWE's the members it replaces, all in canonical JSON (§E.2.6). A keyring's `$nonce` is new on every write. A service seals nothing from a revision until it has judged its epoch.
+  - **Shared sessions (§J.5):** one namespace per session in which people and agents edit the same documents, with messages as resources of their own. People act as themselves, an agent through its person's grant narrowed with `via`, so the log attributes every change. Roles, not grant rules, limit writes while keeping unrestricted `read`: messages are created once, in one's own name; agents acting for people only create and edit. A shared agent answers messages addressed to it, in log order; forks are branches.
 
-  - **End-to-end reads.** A tombstone's `/rev/{T}` is `410` with `{ tombstone, last }`, so a pruner and a mirroring remote branch learn its parent there. A stored snapshot is served until a purge or a later prune moves the horizon. A remote branch mirrors its source's stored snapshot (§G.5.2). A client learns the level from its configuration, the namespace document or `/keys`, and keeps the highest it has learnt.
+  - **Agents through MCP (§J.6):** a tool surface any MCP-speaking agent can use, each tool mapped to its core request. Edits are patches against the revision read; on a conflict the agent redoes its change against the current document, never resending or overwriting.
 
-  - **Message bound.** It covers every key sealed under with random IVs, a bundle's `K_b` included (line numbers stop before 2³² − 1). Counts may run over, never under. At E2 the origin MAY rotate by itself, in an entry it writes; at E3 each writer counts what it knows.
+  - **Recording model calls (§J.7):** the stream proxy in front of each participant's model API, at a secret per-participant URL, records each call as a document under that participant's grant, with its stream beside the session. The agent never waits on the recording, and keys are never stored.
 
-  - **Rules on `/now`.** A rule on the whole envelope, or on a pointer above `/now`, refers to it. The refusal is the read check's ordinary answer, in its usual place, `/keys` included. Where reads are public the grant is ignored, at services too. The catalog refuses such a grant every request; a grant that allows no `read` only read grants and read wants; a read `want` leaves out roles that don't count for `read` (§B.11.4).
+  - **Tested** against the reference server (v0.29.0) with two kits: the stream proxy and session (30 checks), and MCP agents with recording (37 checks); the roles in §J.5 are the ones the tests run.
 
-  - **Coverage and services.** A trusted catalog that is a branch, local or remote, makes nothing visible. A purged namespace trusts no catalog, and its `/heads` is `410` directly. A service keeps the last `catalog.trust` it read of a purged catalog. Any change to the verifying key's entry ends a cookie. An origin answers `403`, naming nothing, for a `requireAt` whose namespace doesn't exist; a service, which can't tell, `502` or `503` (§C.4). No fallback to an earlier authentication mode. `ancestors` answers `paths`, `tooDeep` and `truncated` (§B.5). A namespace a service stopped following leaves its combined checkpoint. A long-poll MAY end `204` after a bounded scan.
-
-  - **Bundles and tools.** A bundle reader rejects a member §G.4.1 doesn't define, and a grant line whose id or stored block disagrees with its `root`. An exporter writes no read-through lines for an `e2e` branch. Prune archives carry `access`. Release collaborators get unrestricted branch `read` only if they read the base unrestricted (§F.8). A gateway may copy out of an `$access` folder, or refuse as its own policy, and refuses a copy into itself (§H.5).
-
-  - **Vectors.** §I.15–§I.21 are the candidates the reference reproduced: plan digests, file renderings, sealed bundles, hostnames, sealed entries, documents and ranges, `via` lines and failing Biscuit tokens. "Still to come" is §I.22. New candidates, for the namespace event's `pl`, a view key and three bundle rejections, are in VECTORS-PROPOSED.md.
-
-  - **The reference changes:** seal namespace events under the new `pl`; answer a tombstone's `/rev` with `last`, and stop serving a tombstone snapshot at its parent once a later prune moves the horizon; never seal a view value under an epoch not yet judged, and seal previews under the branch's keys; refuse 2³² bundle lines; treat a grant at an all-public listing as anonymous; make a remote-branch catalog dark; have `POST /grants` leave `/now` roles out of read wants and refuse a grant without `read` its read wants; end index cookies on any change to the key's entry; drop "unknown namespace" from the `requireAt` `403`; answer a purged covered namespace's `/heads` with `410` directly; reject disagreeing grant lines and write `access` in archives; write no read-through lines for an `e2e` branch; never serve a tree listing computed before a purge. One question back: what is a "shadow" (Q19)? The text says only "a branch, local or remote".
+  - **The reference changes:** nothing.

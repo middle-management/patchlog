@@ -1,6 +1,6 @@
 # Patch Log — Tools
 
-Status: draft v0.82 · 2026-11-10. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.83 · 2026-11-16. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Clients and tools that use the protocol's public API. A server needs nothing from this document.
 
@@ -8,6 +8,7 @@ Status: draft v0.82 · 2026-11-10. A companion to the [Patch Log specification](
 - **Addendum F (suggested):** working with branches: merge, rebase, cleanup and releases across namespaces.
 - **§G.2 and §G.4.2–§G.4.4 (suggested):** external consumers, and exporting and importing bundles.
 - **Addendum H (suggested, non-normative):** files: how file tools, such as WebDAV gateways and mounts, store files, folders and names to share a namespace.
+- **Addendum J (suggested, non-normative):** streams: a proxy that keeps an upstream's streamed response for clients to resume, and shared agent sessions built on it.
 
 **Reading.** "Reading this spec" in [SPEC.md](SPEC.md) applies here, and so do its terms (§2, §2.1). The three documents share one numbering: §1–§10, §12, §13, §C, §E (but §E.2.6), §G.1, §G.3, §G.4.1, §G.5–§G.7 and §I are in SPEC.md; §A, §B and §E.2.6 are in [SERVICES.md](SERVICES.md).
 
@@ -767,3 +768,124 @@ One mapping, as an example:
 - Should the tree service, rather than each tool, flag sibling title collisions and unplaced items, e.g. in `/problems` (§B.12)?
 - A tentative delete, or an atomic "replace content", for clients that delete before they write, so other readers don't see the deleted window.
 - Branches of file trees, and manifests that keep titles.
+
+---
+
+# Addendum J — Streams (suggested, non-normative)
+
+A **stream proxy** forwards a request to an upstream HTTP API and keeps the streamed response, so a client that loses its connection resumes where it stopped. The Durable Streams proxy protocol is one such design. This addendum builds one from core requests; the server checks nothing new.
+
+## J.1 The stream document
+
+The proxy keeps each upstream response as one resource, in a namespace of its own such as `streams`, with `read: "grant"`. It writes with a grant that allows `create`, `append`, `read` and `purge` there:
+
+``` jsonc
+// /r/streams/{id}
+{ "upstream": { "method": "POST", "status": 200, "contentType": "text/event-stream" },
+  "chunks": [ "data: {\"delta\":\"Hel\"}\n\n", "data: {\"delta\":\"lo\"}\n\n" ],
+  "closed": { "reason": "complete" } }   // or "aborted", "error", "timeout", "size"; with "error"? and "next"?
+```
+
+- **Names.** The proxy draws `{id}` at random, or derives it from the caller's principal and a request key the caller sends, so a repeated request finds its stream. It is a name of §3.6. Names aren't secret: reads need the grant (J.3).
+- **Chunks** are UTF-8 text, split at line ends, as `text/event-stream` and NDJSON allow. A body that isn't text is out of scope; it would go in blobs (§7.8).
+- **Nothing secret.** The document holds no request headers, `Authorization` above all, and no upstream URL.
+- **Size.** A chunk stays far below `valueSize`. A stream about to pass `documentSize` (§6.6) closes with `"size"`, naming its continuation in `next`.
+
+## J.2 Writing
+
+1.  **Create** the resource with `If-None-Match: *` (§7.2), holding `upstream.method` and `"chunks": []`, before calling upstream. A `200` (the same create, retried) or a `412` means the stream exists: return it, and don't call upstream again. A `410` means it was removed.
+2.  **Call upstream.** Record `status` and `contentType` in the first append. A failed upstream is recorded too, closing with `"error"`; the proxy still answers its own caller as its protocol says.
+3.  **Append** each flush as one patch set adding to `/chunks/-`, with a fresh `$nonce` (§C.7) and `If-Match` on the proxy's last revision, so no append lands twice (§7.2).
+4.  **Close** with a last append that sets `closed`.
+
+- **Restarts.** Upstream can't be resumed. A proxy that restarts closes its open streams with `"error"`, and a stream with no append for a set time is closed by any proxy with `"timeout"`.
+- **Pace.** Rate limits count by the proxy's principal (§6.6). Flush each stream at most every 200 ms, leaving room for aborts. `ratePerPrincipal` bounds how many streams the proxy carries at once; an allowance raises it.
+- **The namespace log** records every append (§3.5), so keep `streams` apart from namespaces that consumers follow.
+
+## J.3 Reading and resuming
+
+- **The read grant.** The proxy hands its caller the resource's URL and its own grant, narrowed (§C.1). The narrowing block names the caller in `via`, fixes the resource, and allows appends only to `/abort`:
+
+  ``` jsonc
+  { "via": "{caller}", "can": ["read", "append"], "exp": "…",
+    "rules": [ { "op": "test", "path": "/resource", "value": "{id}" },
+               { "if":   [{ "op": "test", "path": "/action", "value": "append" }],
+                 "then": [{ "op": "writes", "within": ["/abort"] }] } ] }
+  ```
+
+- **Following.** A reader loads the document (§11), then long-polls `GET /r/streams/{id}/log?since={rev}&live=long-poll&cursor={c}` (§7.7) and joins the chunks each entry adds. The last revision it saw is where it resumes; an empty `since` starts from the beginning. Readers who exchange the grant for an edge-grant cookie (§C.5.2) share one CDN answer.
+- **The end** is the revision that sets `closed`.
+
+## J.4 Abort, expiry and encryption
+
+- **Abort.** The caller appends `{ "op": "add", "path": "/abort", "value": true }` with `If-Match` on the head it last saw, and on `412` retries on the head the body gives. The proxy's next append then gets `412`, or the proxy sees the entry while following the log between chunks. It reads the new entries, never resending blindly, cancels upstream and closes with `"aborted"`. An abort after `closed` is ignored.
+- **Expiry.** The core deletes nothing by age, and retention prunes only history (§8.6). The proxy purges a stream (§8.3) once its read grants have expired.
+- **Encryption.** A sealed namespace keeps chunks from caches (Addendum E). Every patch set then carries a fresh `$nonce` (§E.2.5).
+  - Keys are wrapped to the root block's `enc` (§E.2.3), so a narrowed grant of the proxy's opens nothing for the reader. The proxy signs each reader a root grant instead, with the same `can` and rules and the reader's `enc`, under a key the namespace lists.
+  - This design doesn't work end-to-end, where the abort rule can't be judged (§6.2).
+
+## J.5 Shared sessions
+
+A **shared session** is a namespace in which several people and agents work on the same documents at once. It needs nothing beyond the core.
+
+- **One namespace per session,** with `read: "grant"`.
+  - The documents people work on, such as a plan or a draft, are ordinary resources.
+  - Each message is a resource of its own, `m-…`, so people posting at once never conflict. The namespace log orders them the same way for everyone.
+  - Streams live in a companion namespace, `{session}-streams`, so the session's log stays readable (J.2). A recorded call (J.7) adds only its own document to the session.
+  - A session's name is at most 56 bytes, so that its companion's is a name (§3.6).
+
+  ``` jsonc
+  // /r/session-42/m-1794833504178064434
+  { "author": "user:bo", "text": "@shared add a packing list to the plan", "to"?: "agent:shared" }
+  ```
+
+- **Who acts.** People edit as themselves. An agent acts through the person's grant narrowed with `via` naming it (§C.1), or, shared by all, through a grant of its own. Each log entry records `author` and `via` (§7.1, §7.4). The server verifies `user:anna`; `via agent:claude-code` is what her narrowing named.
+- **Roles, not grant rules,** limit what participants write, since a grant whose rules refer to `/resource` loses unrestricted `read` and with it the session's log (§2.1). Every grant names `reader`, since `member` never counts for reading the log: its rules refer to `/resource`. Members add `member`:
+
+  ``` jsonc
+  "roles": {
+    "reader": { "can": ["read"] },
+    "member": { "can": ["read", "create", "append", "restore", "delete"], "rules": [
+      { "if":   [{ "op": "test", "path": "/resource", "schema": { "type": "string", "pattern": "^m-" } }],
+        "then": [{ "op": "test", "path": "/action", "value": "create" },
+                 { "op": "compare", "path": "/doc/author", "eq": { "path": "/principal/id" } }] },
+      { "if":   [{ "op": "test", "path": "/principal/via", "schema": { "minItems": 1 } }],
+        "then": [{ "op": "test", "path": "/action", "schema": { "enum": ["create", "append"] } }] } ] },
+    "forker": { "can": ["read", "branch"] } }
+  ```
+
+  - The first rule lets a member only create a message, in their own name, and never change, delete or restore it.
+  - The second limits a grant with `via` to creating and appending: deleting and restoring stay with the people. `forker` has no such rule, so add it there if agents mustn't branch. A shared agent's own grant isn't limited.
+  - A rule on `/principal/via` can narrow agents in any other way.
+- **A shared agent** is a service on the public API. It follows the session's log by long-poll (§7.7) and answers the messages addressed to it, in log order, so messages sent at once queue rather than conflict. It runs an agent with the tools of J.6 under its own grant, and posts the reply as its message. A reply can stream (J.2): the message then names its stream as `/r/{session}-streams/{id}`, which a schema may mark `x-ref` (§6.5), and a stream's read grant (J.3) goes to a caller whose own grant reads that message.
+- **Joining and resuming.** A participant who joins late loads the documents (§11), then follows the session's log.
+- **Forking.** Trying another direction is a branch of the session namespace (§7.6). The branch reads the earlier documents and messages through its base and leaves the session unchanged. Keeping its outcome is a merge (Addendum F).
+- **Left to the application:** presence and typing (§11), and any turn order stricter than the log's.
+
+## J.6 Agents through MCP
+
+An agent takes part through tools, served over the Model Context Protocol so that any agent that speaks it can use them. Each agent's tools run under the grant it acts with (J.5).
+
+| Tool | Request | Answer |
+|---|---|---|
+| `session_info` | `GET /ns/{ns}/principal` | Who the agent is, and the session's conventions |
+| `list_documents` | `GET /ns/{ns}`, then that revision's `/heads` (§7.4) | Names and revisions, without `m-…` and `c-…` unless asked |
+| `read_document` | `GET /r/{ns}/{name}`, following the `302` | The document and its revision, without `$nonce` |
+| `create_document` | `PATCH` with `If-None-Match: *` (§7.2) | The revision, on `201` or `200` (a retry); on `412`, the current document; on `410`, the deleted one |
+| `edit_document` | `PATCH` with `If-Match` on the revision read, and a fresh `$nonce` (§C.7), kept when resending | The new revision; on `412`, the current document and who changed it; on `422`, the refusal, with nothing applied |
+| `document_history` | The resource's log (§7.1) | Each change's `author`, `via`, time and patch |
+| `recent_changes` | `GET /ns/{ns}/log?since=`, optionally long-polled (§7.7) | Changes with who made them, and the next `since` |
+| `post_message`, `read_messages` | Creating `m-…`; the log | As J.5 |
+
+- **Edits are patches against what the agent read.** On a conflict, the agent reads the current document and redoes its change against it. It never resends a refused patch unchanged, and never replaces a whole document to get past a conflict.
+- **`test` operations** (RFC 6902) state what an edit assumes, so the server refuses it when the assumption no longer holds.
+
+## J.7 Recording model calls
+
+The proxy of J.1–J.4 can stand between each participant's agent and its model API, so that what agents say is kept beside what they do.
+
+- **One base URL per participant,** `…/p/{id}`. `{id}` is random and secret: it stands for that participant's grant, which never goes in a URL.
+- **Each call** is a document `c-…` in the session, written under that grant: `author`, `agent` (the `via`), `api`, `model`, the number of turns, the call's last turn only, and the tool names. Its stream goes in `{session}-streams`, under a grant that can also purge it (J.1, J.4). Once the stream closes, the document gets the assembled `response` (text, tool calls, stop reason, usage) and `closed`.
+- **The agent never waits on the recording.** It gets the upstream's bytes unchanged, and the recording runs beside it: a failure loses the record, not the call. Keys pass through to the upstream and are never stored.
+- **Within limits.** Agents resend the whole conversation on every call, so only the newest turn is kept, strings are clipped below `valueSize` as canonical JSON, the closing append stays below `patchSetSize`, and each document below `documentSize` (§6.6).
+- **Only where the agent takes a base URL.** An agent signed in to its vendor's own backend can't be recorded this way; its tools (J.6) work regardless.

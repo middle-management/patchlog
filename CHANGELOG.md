@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+Implements spec **v0.83** (previously **v0.82**). v0.83 adds TOOLS.md's Addendum J, suggested
+and non-normative: a proxy that keeps an upstream's streamed response as a resource, shared
+sessions of people and agents in one namespace, agents through MCP, and recording model calls.
+It was tested against this server at v0.29.0 and changes nothing in it.
+
+- **`GET /` answers `"spec": "0.83"`**, and the docs mirror v0.83 (SPEC, SERVICES, TOOLS,
+  CONFORMANCE, the spec's change log).
+- **`patchlog streams`: the stream proxy of TOOLS Addendum J.1–J.4** (internal/streams). A
+  caller sends `POST /streams` with its own grant, the upstream's URL, method, headers and
+  body; the proxy creates a resource in a namespace of its own, calls upstream and appends what
+  it streams, one patch set a flush, and answers with the resource's URL and its own grant
+  narrowed to that stream (`via` the caller, read, and appends within `/abort` only). Callers
+  read, resume and abort against the core; `streams.Follow` and `streams.Abort` do so in Go,
+  and `patchlog streams read NS/ID [--since REV]` prints a stream. Covered: the J.1 document
+  with nothing of the request in it, creation before upstream with `If-None-Match: *`,
+  `Request-Key` ids that find a repeated request's stream, `If-Match` and nonces on every
+  append, `429` waits, continuation in `{id}.{n}` at `documentSize`, abort seen in the log or
+  by `412`, `"error"` for streams open at a restart (`--state`) or shutdown, the idle sweep
+  (`"timeout"`) and the purge once read grants have expired. Upstreams are an allowlist of URL
+  prefixes (`--upstream`). Not implemented: sealed namespaces (refused at start, as end-to-end
+  ones are) and J.5–J.7. From its review: a `read: "public"` namespace is refused at start;
+  the read grant names the stream namespace alone, and keyed ids include it; chunks are cut by
+  their length as JSON, which is what `valueSize` measures; what upstream sent and isn't yet
+  appended is bounded, holding upstream back; `--max-streams` holds for concurrent requests; a
+  response cut short keeps its last partial line; and a repeated request for a stream whose
+  creation time was pruned away is `409` rather than a grant with a later `exp`. See the
+  README's "Stream proxy". SPEC-FEEDBACK notes 94–100 are what
+  J.1–J.4 left open.
+- **SPEC-FEEDBACK v0.82 Open 93**: what a stream kept as one growing document costs per flush
+  on this server, from the capacity measurements. Notes 89–92 stay open; v0.83 answers none.
+
 - **The CLI parses its flags with go-arg.** Help is generated: `patchlog <command> --help`.
   The docs and examples now write flags as `--flag` (`patchlog serve --addr :8080 --db x.db`).
   The single-dash spellings (`-addr :8080`) still parse, so existing scripts and compose files

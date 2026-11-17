@@ -1,6 +1,6 @@
 # Reference-implementation notes for the spec writer
 
-`docs/SPEC.md` mirrors the canonical specification, now at **v0.82**, with `docs/SERVICES.md` and
+`docs/SPEC.md` mirrors the canonical specification, now at **v0.83**, with `docs/SERVICES.md` and
 `docs/TOOLS.md`, split from it in v0.80. This file collects what the reference does that the text
 doesn't yet describe. Open notes come in one list, from implementing v0.82; cite them as "v0.82
 Open n". v0.82 answered the v0.81 list ("v0.81 Open n"): what it settled is under "Settled in
@@ -8,6 +8,11 @@ v0.82", and what it left open is rewritten in the new list, marked "was v0.81 Op
 list was answered in v0.78 to v0.81 (Settled in v0.81), and earlier lists before it.
 
 ## Open from v0.82
+
+v0.83 adds TOOLS.md's Addendum J (stream proxies, shared agent sessions, MCP agents and
+recording model calls; suggested, non-normative) and asks nothing of the reference. It answers
+none of the notes below, so the list stands as it is, with note 93 added.
+Notes 94–100 come from implementing §J.1–J.4 as `patchlog streams` (branch `stream-proxy`).
 
 From implementing v0.82 (branch `spec-v082`). Numbered afresh; cite these as "v0.82 Open n".
 Each entry gives the section, what the reference does now (the conservative reading where it
@@ -17,7 +22,8 @@ leaves open are carried in place, by subject, marked "was v0.81 Open n" and cut 
 remains. The order is: sealed forms and end-to-end reads (1–31), access and coverage (32–65),
 tree answers (66–71), documents, bundles and tools (72–83), vectors (84–85), playground (86–87), index (88),
 rates and contended writes (89–91, from capacity measurements after the v0.82 work),
-validation work (92, from replacing the validator).
+validation work (92, from replacing the validator), streams (93, from reading v0.83's
+Addendum J).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
 92 are open: 62 from this version's work and 30 carried.
@@ -570,6 +576,82 @@ v0.82" (v0.81 Open 24).
     in what unit, given that a count of steps is one implementation's and a time is not
     reproducible?
 
+93. **A stream as one growing document** (TOOLS §J.1, §J.2; v0.83). §J.2 appends each flush to
+    `/chunks/-` of one resource. Every write works on the whole document (parse the head,
+    canonicalise and measure the result), so a flush costs the stream's size so far, and a
+    stream costs the square of its length: measured on the reference (docs/CAPACITY.md), an
+    append to a 1 MiB document of long strings takes 5–9 ms and one of many small values
+    20–24 ms, against under a millisecond for a small one. §J.1's close at `documentSize` with
+    `next` bounds it. At §J.2's pace (a flush every 200 ms) the default `ratePerPrincipal` of
+    50 a second carries 10 streams, which §J.2 notes; nothing else in the reference limits
+    it. Two things §J could say: a lower size at which to continue in `next` where latency
+    matters (about 250 KiB keeps a flush near 10 ms), and that a `$schema` on the stream
+    document makes each `/chunks/-` append validate the whole array in the reference, since an
+    added element changes the array. *No change is asked of the core.*
+
+94. **A continuation and the read grant** (TOOLS §J.1 Size, §J.3; v0.83). §J.3's narrowing
+    block fixes `/resource` to `{id}`, and §J.1 has a stream at `documentSize` continue in the
+    resource `next` names. A grant fixed to `{id}` reads the continuation as `404`, so the
+    reader the grant was made for can't follow its own stream. The reference (`patchlog
+    streams`) names continuations `{id}.{n}` and fixes `/resource` to the id and its first
+    `--max-segments` − 1 continuations (`{ "op": "compare", "path": "/resource", "in":
+    { "value": […] } }`, still a finite set for §2.1 and §C.5.2), and cuts a response that
+    fills them all: `"size"` with an `error` and no `next`. *Question:* should §J say how a
+    continuation is named and that the read grant covers it; and is a `"size"` close without
+    `next` the right end for a stream out of resources?
+95. **Who the caller is** (TOOLS §J.1 Names, §J.3). The proxy derives ids from "the caller's
+    principal" and names the caller in `via`, but §J doesn't say how it learns who its caller
+    is. The core's only verdict on a bearer is `GET /ns/{ns}/principal` (§7.4), which needs a
+    namespace the grant names, and a caller's grant has no reason to name `streams`. The
+    reference takes a namespace to verify callers in (`--caller-ns`) and derives the id from the
+    verifying key's thumbprint, the `sub` and the request key, as a `sub` is unique only under
+    its key. *Question:* is that the intended way, or should a deployment-wide "who is this
+    bearer" exist?
+96. **Abort where nonces are required** (TOOLS §J.4, §C.7). §J.4's abort is one `add` of
+    `/abort`. In a namespace that requires nonces (and in the sealed one §J.4 goes on to
+    describe) it is `422 nonce` without a fresh `/$nonce`. With one it passes §J.3's `writes`
+    `within ["/abort"]` in the reference, since a fresh `$nonce` is left out of `writes`
+    (§6.4.1); the caller learns that it is needed from `/principal`, as its grant can't read
+    the namespace document. §J.4 could say "with a fresh `$nonce` where the namespace requires
+    one". The rule allows any value at or below `/abort`, not only `true`; the reference's
+    proxy takes `true` alone for an abort. *No change is asked of the core.*
+97. **A repeated request** (TOOLS §J.2 step 1, §J.3, §J.4 Expiry). Two things are open when a
+    create answers that the stream exists. (a) Which answer: the reference answers an
+    identical create `200`, but where nonces are required the repeated request's genesis
+    carries another `$nonce` and is `412`; §J.2 covers both, and neither tells a stream being
+    carried from one whose proxy died between the create and the call, which stays open and
+    empty until the timeout. (b) The read grant handed out again: with `exp` counted from
+    the repeat, a stream's grants never all expire while requests repeat, and §J.4 purges
+    "once its read grants have expired". The reference counts `exp` from the stream's
+    creation (the genesis entry's `created`, which a `412` doesn't give, so it reads the log's
+    first entry), answers `410` once that has passed, and purges then. Where that entry has
+    been pruned (§8.6) and the create was `412`, the creation time is gone, and the reference
+    hands out no further grant (`409`). *Question:* is `exp` from creation what §J means?
+98. **Closed by another proxy** (TOOLS §J.2 Restarts). "A stream with no append for a set time
+    is closed by any proxy", but a proxy can't tell an orphan from a stream another proxy is
+    carrying whose upstream is silent (a model thinking), and §J doesn't say what the carrying
+    proxy does when it finds `closed` set by someone else. In the reference a proxy closes its
+    own stream with `"timeout"` after the same time without an append, so no live stream is
+    older than that; and one that finds `closed` after a `412` cancels upstream and appends
+    nothing more. Two proxies with different timeouts still cut each other's streams.
+    *Question:* should §J say both, or give the carrying proxy a heartbeat?
+99. **A failed upstream, and what `error` holds** (TOOLS §J.2 step 2, §J.1 Nothing secret). §J
+    doesn't say whether an upstream `4xx` or `5xx` is "a failed upstream". The reference keeps
+    it as a stream like any other, with its `status` and body, closed `"complete"`: the caller
+    wants the error body, and `status` says what it is. `"error"` is a call that got no
+    response or was cut short, and a body that isn't text. A `3xx` is kept too, not followed,
+    since the target may lie outside what the proxy may call. `closed.error` is one of a few
+    fixed sentences: an HTTP library's error text names the URL or host, which §J.1 keeps out
+    of the document. *Question:* is that the reading meant?
+100. **A sealed `streams` namespace** (TOOLS §J.4 Encryption). Not implemented: the reference
+    refuses to start on a sealed namespace. Signing "each reader a root grant … with the
+    reader's `enc`, under a key the namespace lists" changes what the proxy is: it holds a
+    namespace signing key rather than a grant, so nothing bounds its `exp` or scope but the
+    key's `can`; the caller must send its `enc` public key, which §J's request doesn't
+    mention; and the reader's entries (the abort) are then written by the root block's `sub`,
+    where a narrowed grant records the proxy as author and the caller in `via`. *Question:*
+    whose `sub` does that root grant carry, and should §J say the request carries `enc`?
+
 ## Settled in v0.82
 
 v0.82 answers the 77 notes open from v0.81. By the reference's reading of the changed text it
@@ -1065,7 +1147,7 @@ All fifteen v0.50 notes. As the reference did them:
   `"public": true`, or with its key; `4xx` refused, `5xx` undecided; a cap is allowed
   (§B.11.5).
 - **Renamed imports** (14), as the reference does them, with one addition: a renamed
-  namespace's `{dst}-upstream` must fit the name limit, `422` at step 1 otherwise (§G.4.4).
+  namespace's `{dst}--upstream` must fit the name limit, `422` at step 1 otherwise (§G.4.4).
 
 Adopted with more than the reference did, which now follows the text:
 - **Key rotation** (2): origins and edges SHOULD accept several keys and mint with the newest;
