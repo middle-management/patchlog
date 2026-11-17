@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -300,4 +302,68 @@ func tombstone(t *testing.T, api, res string) string {
 		t.Fatal(err)
 	}
 	return h.ID
+}
+
+// TestBlobCommands: blob put uploads and prints the reference, or with
+// --at writes it; blob get reads it back by --at or by id (and nonce),
+// checked against the id.
+func TestBlobCommands(t *testing.T) {
+	t.Parallel()
+	s := clienttest.New(t, clienttest.Options{})
+	ctx := context.Background()
+	dir := t.TempDir()
+	must := func(args ...string) (string, string) {
+		t.Helper()
+		out, errw, err := clientRun(t, ctx, s.URL, args...)
+		if err != nil {
+			t.Fatalf("%q: %v\n%s", args, err, errw)
+		}
+		return out, errw
+	}
+	photo := filepath.Join(dir, "photo.png")
+	data := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{7}, 5000)...)
+	if err := os.WriteFile(photo, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	must("ns", "create", "d")
+	must("put", "d/r", `{"title":"x"}`)
+
+	must("blob", "put", "d/r", photo, "--at", "/photo")
+	out, _ := must("get", "d/r")
+	var doc map[string]any
+	json.Unmarshal([]byte(out), &doc)
+	ref, _ := doc["photo"].(map[string]any)
+	if ref["type"] != "image/png" || ref["size"] != float64(len(data)) || ref["$blob"] == nil {
+		t.Fatalf("reference at /photo: %v", doc)
+	}
+	got := filepath.Join(dir, "got.png")
+	must("blob", "get", "d/r", "--at", "/photo", "-o", got)
+	if b, _ := os.ReadFile(got); !bytes.Equal(b, data) {
+		t.Fatal("blob get --at returned other bytes")
+	}
+
+	// Without --at: the reference is printed, the blob pending until a
+	// write references it.
+	out, _ = must("blob", "put", "d/r", photo, "--nonce", "--type", "application/octet-stream")
+	var ref2 map[string]any
+	if err := json.Unmarshal([]byte(out), &ref2); err != nil || ref2["nonce"] == nil || ref2["type"] != "application/octet-stream" {
+		t.Fatalf("blob put printed %s", out)
+	}
+	bid, nonce := ref2["$blob"].(string), ref2["nonce"].(string)
+	if _, _, err := clientRun(t, ctx, s.URL, "blob", "get", "d/r", bid, "--nonce", nonce); err == nil {
+		t.Fatal("a pending blob was served")
+	}
+	must("patch", "d/r", `[{"op":"add","path":"/raw","value":`+strings.TrimSpace(out)+`}]`)
+	out, _ = must("blob", "get", "d/r", bid, "--nonce", nonce)
+	if out != string(data) {
+		t.Fatal("blob get by id returned other bytes")
+	}
+	if _, _, err := clientRun(t, ctx, s.URL, "blob", "get", "d/r", bid); err == nil || !strings.Contains(err.Error(), "--nonce") {
+		t.Fatalf("blob get without its nonce: %v", err)
+	}
+	for _, args := range [][]string{{"blob", "get", "d/r", "--at", "/title"}, {"blob", "get", "d/r"}, {"blob", "get", "d/r", bid, "--at", "/photo"}} {
+		if _, _, err := clientRun(t, ctx, s.URL, args...); err == nil {
+			t.Errorf("%q: no error", args)
+		}
+	}
 }

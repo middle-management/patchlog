@@ -4063,7 +4063,17 @@ patchlog ns get matches
 patchlog ns log matches                                 # the namespace log
 patchlog watch matches                                  # follow it (server-sent events, §7.4)
 patchlog rm matches/derby                               # a tombstone
+
+patchlog put matches/final '{"score":"0-0"}'
+patchlog blob put matches/final photo.jpg --at /photo   # upload, and write {"$blob","type","size"} at /photo
+patchlog blob get matches/final --at /photo -o got.jpg  # download, checked against the blob id
+patchlog blob put matches/final notes.txt --nonce       # upload only: prints the reference for a later write
 ```
+
+A blob stays pending, visible to nobody, until a write references it (§7.8): `--at` writes the
+reference in the same command. Its type comes from the file's extension, else its bytes
+(`--type` names it). `--nonce` keeps the id from revealing the bytes; `blob get` then needs the
+nonce to check them, which `--at` reads from the reference (or give `BLOB --nonce N`).
 
 JSON arguments are inline, `@file`, or `-` for stdin; `--json` prints entries and write
 results as JSON. The same over HTTP:

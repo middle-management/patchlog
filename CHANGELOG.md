@@ -15,6 +15,9 @@
   together. `undo NS` undoes your last action, `redo NS` redoes your last undone one, and a
   `GESTURE` argument names one; `--plan` shows the inverse and its conflicts without writing,
   `--list` your stack.
+- **`patchlog blob put` and `blob get`** (§7.8). `put` uploads a file or stdin and prints the
+  reference to write, or with `--at /pointer` writes it into the document; `get` downloads a blob
+  by id or by the reference at `--at`, checked against its id, to `-o FILE` or stdout.
 - **`patchlog branch create BASE NAME`** (`--at ID`, `--patch JSON`) and `branch list BASE`.
 - **`$PATCHLOG_API`, `$PATCHLOG_BEARER` and `$PATCHLOG_AUTHOR`** are the defaults of `--api`,
   `--bearer` and `--author` in every command that takes them.
