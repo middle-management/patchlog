@@ -765,3 +765,79 @@ func TestV085MkcolFailedRead(t *testing.T) {
 		})
 	}
 }
+
+// CONFORMANCE Access 78 (§H.4 "Answers", v0.85), where only the written
+// namespace's own GET /ns/{ns}/principal fails, the catalog's answering:
+// a DELETE, MOVE, COPY or MKCOL fails (502 after a 408, 503 with
+// Retry-After after a 503) before it writes, in a flat namespace with no
+// catalog and in a tree whose items' namespace it is.
+func TestV085WrittenNamespacePrincipalFails(t *testing.T) {
+	t.Parallel()
+	for _, f := range []struct{ status, want int }{{408, 502}, {503, 503}} {
+		for _, c := range []struct {
+			tree              bool
+			method, path, dst string
+		}{
+			{false, "DELETE", "/docs/x.json", ""},
+			{false, "MOVE", "/docs/x.json", "/docs/y.json"},
+			{false, "COPY", "/docs/x.json", "/docs/y.json"},
+			{false, "PUT", "/docs/new.json", ""},
+			{true, "DELETE", "/cat/Season/derby.json", ""},
+			{true, "MOVE", "/cat/Season/derby.json", "/cat/Season/city.json"},
+			{true, "COPY", "/cat/Season/derby.json", "/cat/Season/city.json"},
+			{true, "PUT", "/cat/Season/new.json", ""},
+		} {
+			t.Run(fmt.Sprintf("%d %s %s", f.status, c.method, c.path), func(t *testing.T) {
+				t.Parallel()
+				rt := &failRT{status: f.status}
+				var e *env
+				ns := "docs"
+				if c.tree {
+					e, ns = treeEnv(t), "matches"
+				} else {
+					e = newEnv(t, []string{"docs"}, nil, nil)
+					e.create("docs", "x", map[string]any{"a": "1"})
+				}
+				e = v82With(t, e, rt)
+				var hit atomic.Int64
+				rt.match.Store(func(q *http.Request) bool {
+					if q.Method == "GET" && q.URL.Path == "/ns/"+ns+"/principal" {
+						hit.Add(1)
+						return true
+					}
+					return false
+				})
+				var hdr []string
+				if c.dst != "" {
+					hdr = []string{"Destination", c.dst}
+				}
+				body := ""
+				if c.method == "PUT" {
+					body = `{"a": "2"}`
+				}
+				names := func() [][]string {
+					out := [][]string{e.liveNames(ns)}
+					if c.tree {
+						out = append(out, e.liveNames("cat"))
+					}
+					return out
+				}
+				before := names()
+				rt.armed.Store(true)
+				what := fmt.Sprintf("%s %s, the core answering %d to GET /ns/%s/principal", c.method, c.path, f.status, ns)
+				r := e.do(c.method, c.path, body, hdr...)
+				if hit.Load() == 0 {
+					t.Fatalf("%s: the request didn't ask (%d %s)", what, r.status, r.body)
+				}
+				v82ExpectFailed(t, e, r, f.want, what)
+				if after := names(); !reflect.DeepEqual(after, before) {
+					t.Fatalf("%s wrote: %v, were %v", what, after, before)
+				}
+				rt.armed.Store(false)
+				if r := e.do(c.method, c.path, body, hdr...); r.status != 201 && r.status != 204 {
+					t.Fatalf("%s %s, the core answering: %d %s", c.method, c.path, r.status, r.body)
+				}
+			})
+		}
+	}
+}

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"mime"
-	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -1011,14 +1010,7 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
-			// No answer in time: 503 with Retry-After, as for the core
-			// (§H.4 "Answers", v0.85); no connection is 502.
-			return nil, nil, &davError{status: http.StatusServiceUnavailable, msg: fmt.Sprintf("catalog %s's tree service didn't answer in time", cat), cause: err,
-				header: http.Header{"Retry-After": {"5"}}}
-		}
-		return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service can't be reached", cat), cause: err}
+		return nil, nil, unreached(fmt.Sprintf("catalog %s's tree service", cat), err)
 	}
 	defer res.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
@@ -1026,10 +1018,8 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
-			return nil, nil, &davError{status: http.StatusServiceUnavailable, msg: fmt.Sprintf("catalog %s's tree service didn't answer in time", cat), cause: err,
-				header: http.Header{"Retry-After": {"5"}}}
+		if de := unreached(fmt.Sprintf("catalog %s's tree service", cat), err); de.status == http.StatusServiceUnavailable {
+			return nil, nil, de
 		}
 		return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service's answer was cut short", cat), cause: err}
 	}

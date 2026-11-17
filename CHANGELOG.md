@@ -26,9 +26,13 @@ Implements spec **v0.85** (previously **v0.84**).
   refusal: a `408` to `GET /ns/{ns}/principal` or to the namespace document is no longer
   kept, so a `DELETE`, `MOVE` or `COPY` meanwhile is `502` where it was `403`, and a `MKCOL`
   fails too where it went ahead with default settings; `GET` and `PROPFIND` that read those
-  fail the same way where they were served from the kept answer. A `502` now names the
-  service and its status only; the core's or tree service's message is logged, not
-  answered (§C.6 Upstream failures).
+  fail the same way where they were served from the kept answer. No write of a `DELETE`,
+  `MOVE`, `COPY` or `MKCOL` is sent once such a read has failed in the request, also where
+  it is the written namespace's own and the catalog's answered: a tree `DELETE` deleted
+  the placement and the item on default settings before. The catalog service's answers
+  follow the same rule. A `502` now names the service and its status only; the core's,
+  tree service's or catalog service's message is logged, not answered (§C.6 Upstream
+  failures).
 - **Stream proxy (`patchlog streams`), TOOLS Addendum J as v0.85 has it.** Most of what
   v0.85 writes down the proxy already did (continuations `{id}.{n}` covered by the read
   grant, callers identified through `GET /ns/{ns}/principal`, `exp` counted from the stream's

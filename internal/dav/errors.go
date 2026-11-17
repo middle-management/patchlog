@@ -176,6 +176,19 @@ func upstream(err error) error {
 	return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("the core answered %d", ae.Status), cause: err}
 }
 
+// unreached is the answer for a request to a service (what names it) that
+// got no response, by §H.4's rule (v0.85): 503 with Retry-After where no
+// answer came in time, else, with no connection, 502. The failure, which
+// names the service's address, is logged, not answered.
+func unreached(what string, err error) *davError {
+	var ne net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &ne) && ne.Timeout() {
+		return &davError{status: http.StatusServiceUnavailable, msg: what + " didn't answer in time", cause: err,
+			header: http.Header{"Retry-After": {"5"}}}
+	}
+	return &davError{status: http.StatusBadGateway, msg: what + " can't be reached", cause: err}
+}
+
 // busy is the 503 the core's 429 or 503 turns into once waiting is no
 // longer brief (§6.6, §H.4 "Answers").
 func busy(ae *client.APIError) *davError {
