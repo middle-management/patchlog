@@ -57,8 +57,11 @@ type cli struct {
 	Rm    *rmCmd    `arg:"subcommand:rm" group:"Client commands" help:"delete (tombstone) a resource"`
 	Log   *logCmd   `arg:"subcommand:log" group:"Client commands" help:"print a resource's history"`
 	Watch *watchCmd `arg:"subcommand:watch" group:"Client commands" help:"follow a namespace's log as it is written"`
+	Undo  *undoCmd  `arg:"subcommand:undo" group:"Client commands" help:"undo an action (a gesture), by default your last (§11.2)"`
+	Redo  *redoCmd  `arg:"subcommand:redo" group:"Client commands" help:"redo an undone action, by default your last undone"`
 	NS    *nsCmd    `arg:"subcommand:ns" group:"Client commands" help:"create, read and configure namespaces (create, get, config, log)"`
 
+	Branch  *branchCmd  `arg:"subcommand:branch" group:"Branches, releases and bundles" help:"create or list a namespace's branches (§7.6)"`
 	Merge   *mergeCmd   `arg:"subcommand:merge" group:"Branches, releases and bundles" help:"merge a branch, or a release across namespaces (Addendum F)"`
 	Rebase  *rebaseCmd  `arg:"subcommand:rebase" group:"Branches, releases and bundles" help:"rebase a branch into a successor branch (§F.5)"`
 	Janitor *janitorCmd `arg:"subcommand:janitor" group:"Branches, releases and bundles" help:"purge merged and abandoned branches (§F.6)"`

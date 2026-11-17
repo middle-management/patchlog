@@ -33,12 +33,22 @@ type clientCommand interface {
 
 // runClient runs cmd, interruptible by SIGINT, exiting 1 if it fails.
 func runClient(cmd clientCommand) {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	err := cmd.exec(ctx, os.Stdout, os.Stderr)
-	stop()
-	if err != nil && ctx.Err() == nil {
+	if err := execClient(cmd, os.Stdout, os.Stderr); err != nil {
 		toolFatal(err)
 	}
+}
+
+// execClient runs cmd until it returns or SIGINT, returning its error
+// unless it was interrupted.
+func execClient(cmd clientCommand, out, errw io.Writer) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	err := cmd.exec(ctx, out, errw)
+	interrupted := ctx.Err() != nil // before stop, which cancels ctx
+	stop()
+	if interrupted {
+		return nil
+	}
+	return err
 }
 
 // writer returns the client of tf, signing writes with --sign-key if set.
@@ -82,14 +92,38 @@ func jsonArg(s string) (any, error) {
 }
 
 // wrote reports a write: as JSON with --json, else the id on out and what
-// was done on errw.
-func (tf *toolArgs) wrote(out, errw io.Writer, what, id, nsID string) error {
+// was done, under which gesture, on errw.
+func (tf *toolArgs) wrote(out, errw io.Writer, what, id, nsID, gesture string) error {
 	if tf.JSON {
-		return writeJSON(out, map[string]any{"id": id, "nsId": nsID})
+		m := map[string]any{"id": id, "nsId": nsID}
+		if gesture != "" {
+			m["gesture"] = gesture
+		}
+		return writeJSON(out, m)
 	}
-	fmt.Fprintf(errw, "%s (namespace entry %s)\n", what, nsID)
+	if gesture != "" {
+		fmt.Fprintf(errw, "%s (gesture %s, namespace entry %s)\n", what, gesture, nsID)
+	} else {
+		fmt.Fprintf(errw, "%s (namespace entry %s)\n", what, nsID)
+	}
 	fmt.Fprintln(out, id)
 	return nil
+}
+
+// gestureArgs is --gesture, of the resource writes: each write is a
+// user action of its own (a new gesture) that patchlog undo undoes, unless
+// --gesture names one several writes share (§7.2, §11.2).
+type gestureArgs struct {
+	Gesture string `arg:"--gesture" placeholder:"ID" help:"the gesture (user action) the write belongs to, so several writes undo together; default a new one per write, printed with the result"`
+}
+
+// gesture returns the gesture of a write and its option.
+func (g *gestureArgs) gesture() (string, client.WriteOption) {
+	id := g.Gesture
+	if id == "" {
+		id = client.NewGesture()
+	}
+	return id, client.WithGesture(id)
 }
 
 func writeJSON(w io.Writer, v any) error {
@@ -108,8 +142,13 @@ func liveHead(ctx context.Context, c *client.Client, ns, name string) (string, e
 	if err != nil {
 		return "", err
 	}
-	if h.State != client.Live {
-		return "", fmt.Errorf("%s/%s: %v", ns, name, h.State)
+	switch h.State {
+	case client.NotFound:
+		return "", fmt.Errorf("%s/%s doesn't exist", ns, name)
+	case client.Tombstoned:
+		return "", fmt.Errorf("%s/%s is deleted (tombstone %s)", ns, name, h.ID)
+	case client.Purged:
+		return "", fmt.Errorf("%s/%s is purged", ns, name)
 	}
 	return h.ID, nil
 }
@@ -156,6 +195,7 @@ func (a *getCmd) exec(ctx context.Context, out, errw io.Writer) error {
 // putCmd is patchlog put NS/NAME DOC.
 type putCmd struct {
 	toolArgs
+	gestureArgs
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
 	Doc      string `arg:"positional,required" placeholder:"JSON|@FILE|-" help:"the document"`
 }
@@ -171,16 +211,18 @@ func (a *putCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	w, err := a.writer().CreateDoc(ctx, ns, name, doc)
+	_, opt := a.gesture()
+	w, err := a.writer().CreateDoc(ctx, ns, name, doc, opt)
 	if err != nil {
 		return err
 	}
-	return a.wrote(out, errw, "created "+a.Resource, w.ID, w.NSID)
+	return a.wrote(out, errw, "created "+a.Resource, w.ID, w.NSID, w.Gesture)
 }
 
 // patchCmd is patchlog patch NS/NAME PATCH.
 type patchCmd struct {
 	toolArgs
+	gestureArgs
 	If       string `arg:"--if" placeholder:"ID" help:"append to this revision only, failing (412 stale) if the head has moved; by default to the head, trying again when another writer gets there first"`
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
 	Patch    string `arg:"positional,required" placeholder:"JSON|@FILE|-" help:"a JSON Patch (RFC 6902) array"`
@@ -198,21 +240,30 @@ func (a *patchCmd) exec(ctx context.Context, out, errw io.Writer) error {
 		return err
 	}
 	c := a.writer()
+	g, opt := a.gesture()
 	var w *client.WriteResult
 	if a.If != "" {
-		w, err = c.Append(ctx, ns, name, a.If, p)
+		w, err = c.Append(ctx, ns, name, a.If, p, opt)
 	} else {
-		w, err = c.AppendLatest(ctx, ns, name, "", client.Backoff{}, func(string) (any, error) { return p, nil })
+		var head string
+		if head, err = liveHead(ctx, c, ns, name); err != nil {
+			return err
+		}
+		w, err = c.AppendLatest(ctx, ns, name, head, client.Backoff{}, func(string) (any, error) { return p, nil }, opt)
 	}
 	if err != nil {
 		return err
 	}
-	return a.wrote(out, errw, "appended to "+a.Resource, w.ID, w.NSID)
+	if w.Gesture == "" {
+		w.Gesture = g
+	}
+	return a.wrote(out, errw, "appended to "+a.Resource, w.ID, w.NSID, w.Gesture)
 }
 
 // rmCmd is patchlog rm NS/NAME.
 type rmCmd struct {
 	toolArgs
+	gestureArgs
 	If       string `arg:"--if" placeholder:"ID" help:"delete only if this is the head, failing (412 stale) otherwise; by default the head"`
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
 }
@@ -231,11 +282,12 @@ func (a *rmCmd) exec(ctx context.Context, out, errw io.Writer) error {
 			return err
 		}
 	}
-	w, err := c.Delete(ctx, ns, name, head)
+	_, opt := a.gesture()
+	w, err := c.Delete(ctx, ns, name, head, opt)
 	if err != nil {
 		return err
 	}
-	return a.wrote(out, errw, "deleted "+a.Resource, w.ID, w.NSID)
+	return a.wrote(out, errw, "deleted "+a.Resource, w.ID, w.NSID, w.Gesture)
 }
 
 // logCmd is patchlog log NS/NAME.
@@ -323,7 +375,7 @@ func (a *nsCreateCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return a.wrote(out, errw, "created namespace "+a.NS, r.Config, r.NSID)
+	return a.wrote(out, errw, "created namespace "+a.NS, r.Config, r.NSID, "")
 }
 
 type nsGetCmd struct {
@@ -378,7 +430,7 @@ func (a *nsConfigCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return a.wrote(out, errw, "patched the config of "+a.NS, r.Config, r.NSID)
+	return a.wrote(out, errw, "patched the config of "+a.NS, r.Config, r.NSID, "")
 }
 
 type nsLogCmd struct {

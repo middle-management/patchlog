@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"reflect"
 	"strings"
 	"sync"
@@ -92,7 +93,7 @@ func TestClientCommands(t *testing.T) {
 	if id := jsonOut(out).(map[string]any)["id"]; id == "" || id == nil {
 		t.Fatalf("rm --json: %s", out)
 	}
-	if _, _, err := clientRun(t, ctx, s.URL, "get", "matches/final"); err == nil || !strings.Contains(err.Error(), "tombstoned") {
+	if _, _, err := clientRun(t, ctx, s.URL, "get", "matches/final"); err == nil || !strings.Contains(err.Error(), "is deleted") {
 		t.Fatalf("get of a deleted resource: %v", err)
 	}
 	if _, _, err := clientRun(t, ctx, s.URL, "get", "matches"); err == nil || !strings.Contains(err.Error(), "NS/NAME") {
@@ -168,4 +169,135 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.w.Write(p)
+}
+
+// TestClientErrors: a client command that fails returns its error, which
+// runClient exits 1 with, and a missing resource is named plainly.
+func TestClientErrors(t *testing.T) {
+	t.Parallel()
+	s := clienttest.New(t, clienttest.Options{})
+	if _, _, err := clientRun(t, context.Background(), s.URL, "ns", "create", "m"); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"get", "m/nope"}, {"patch", "m/nope", "[]"}, {"rm", "m/nope"}} {
+		cmd := command(t, append(args, "--api", s.URL, "--author", "a")...).(clientCommand)
+		err := execClient(cmd, io.Discard, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "m/nope doesn't exist") {
+			t.Errorf("%q: %v", args, err)
+		}
+	}
+}
+
+// TestUndoRedoBranch: CLI writes carry a gesture each, or one --gesture
+// names; undo and redo act on the author's stack, or on a gesture given
+// as the action that was written; branch create copies the base.
+func TestUndoRedoBranch(t *testing.T) {
+	t.Parallel()
+	s := clienttest.New(t, clienttest.Options{})
+	ctx := context.Background()
+	must := func(args ...string) (string, string) {
+		t.Helper()
+		out, errw, err := clientRun(t, ctx, s.URL, args...)
+		if err != nil {
+			t.Fatalf("%q: %v\n%s", args, err, errw)
+		}
+		return out, errw
+	}
+	doc := func(res string) any {
+		t.Helper()
+		out, _, err := clientRun(t, ctx, s.URL, "get", res)
+		if err != nil {
+			return err.Error()
+		}
+		var v map[string]any
+		json.Unmarshal([]byte(out), &v)
+		return v["n"]
+	}
+	gesture := func(out, _ string) string {
+		t.Helper()
+		var v map[string]any
+		if err := json.Unmarshal([]byte(out), &v); err != nil || v["gesture"] == "" {
+			t.Fatalf("%v: %s", err, out)
+		}
+		return v["gesture"].(string)
+	}
+
+	must("ns", "create", "m")
+	g1 := gesture(must("put", "m/a", `{"n":1}`, "--json"))
+	g2 := gesture(must("patch", "m/a", `[{"op":"replace","path":"/n","value":2}]`, "--json"))
+	if g1 == g2 {
+		t.Fatal("two writes, one gesture")
+	}
+	must("patch", "m/a", `[{"op":"replace","path":"/n","value":3}]`, "--gesture", g2)
+	must("put", "m/b", `{"n":1}`, "--gesture", g2)
+
+	out, _ := must("undo", "m", "--list")
+	if !strings.Contains(out, "done (2)") || !strings.Contains(out, g2+"  ") || !strings.Contains(out, "a, b") {
+		t.Fatalf("undo --list:\n%s", out)
+	}
+	out, _ = must("undo", "m", "--plan")
+	if !strings.Contains(out, "undo of "+g2) || !strings.Contains(out, "b: deleted again") || doc("m/a") != 3.0 {
+		t.Fatalf("undo --plan wrote, or said:\n%s", out)
+	}
+	_, msg := must("undo", "m")
+	if !strings.Contains(msg, "undid "+g2) || doc("m/a") != 1.0 || doc("m/b") != "m/b is deleted (tombstone "+tombstone(t, s.URL, "m/b")+")" {
+		t.Fatalf("undo: %q, a %v, b %v", msg, doc("m/a"), doc("m/b"))
+	}
+	_, msg = must("redo", "m")
+	if !strings.Contains(msg, "redid "+g2) || doc("m/a") != 3.0 || doc("m/b") != 1.0 {
+		t.Fatalf("redo: %q, a %v, b %v", msg, doc("m/a"), doc("m/b"))
+	}
+	if _, _, err := clientRun(t, ctx, s.URL, "redo", "m"); err == nil || !strings.Contains(err.Error(), "nothing to redo") {
+		t.Fatalf("redo with nothing undone: %v", err)
+	}
+	// g2 was undone and redone: undo and redo find it by the gesture the
+	// writes carried.
+	must("undo", "m", g2)
+	if doc("m/a") != 1.0 {
+		t.Fatalf("undo %s: a %v", g2, doc("m/a"))
+	}
+	if _, _, err := clientRun(t, ctx, s.URL, "undo", "m", g2); err == nil || !strings.Contains(err.Error(), "undone already") {
+		t.Fatalf("undo of an undone action: %v", err)
+	}
+	must("redo", "m", g2)
+	if doc("m/a") != 3.0 {
+		t.Fatalf("redo %s: a %v", g2, doc("m/a"))
+	}
+	// Undoing the create conflicts with the writes after it: the plan
+	// shows them and fails, writing nothing.
+	if out, _, err := clientRun(t, ctx, s.URL, "undo", "m", g1, "--plan"); !client.IsUndoConflict(err) || !strings.Contains(out, "CONFLICT a: overlap") || doc("m/a") != 3.0 {
+		t.Fatalf("undo --plan of a conflicting action: %v\n%s", err, out)
+	}
+
+	name, _ := must("branch", "create", "m", "r1", "--patch", `[{"op":"add","path":"/x-note","value":"draft"}]`)
+	if strings.TrimSpace(name) != "r1" {
+		t.Fatalf("branch create printed %q", name)
+	}
+	must("patch", "r1/a", `[{"op":"replace","path":"/n","value":9}]`)
+	if doc("r1/a") != 9.0 || doc("m/a") != 3.0 {
+		t.Fatalf("branch r1/a %v, base m/a %v", doc("r1/a"), doc("m/a"))
+	}
+	out, _ = must("branch", "list", "m")
+	if !strings.HasPrefix(out, "r1 ") {
+		t.Fatalf("branch list: %q", out)
+	}
+	out, _ = must("ns", "get", "r1")
+	if !strings.Contains(out, `"x-note": "draft"`) {
+		t.Fatalf("branch document: %s", out)
+	}
+}
+
+// tombstone is the head id of a deleted resource.
+func tombstone(t *testing.T, api, res string) string {
+	t.Helper()
+	c, err := client.New(api)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns, name, _ := strings.Cut(res, "/")
+	h, err := c.Head(context.Background(), ns, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h.ID
 }

@@ -1264,6 +1264,21 @@ res, err  = c.Redo(ctx, "docs", g)              // undoes the latest undo of g
 st, err  := c.UndoStack(ctx, "docs", "alice")   // st.Done / st.Undone, each item's Target to pass to Undo
 ```
 
+From the shell, each `patchlog put`, `patch` and `rm` is a gesture of its own (printed with the
+result), or joins the one `--gesture ID` names:
+
+```sh
+patchlog undo docs --list            # your stack: done (the last is what undo undoes) and undone
+patchlog undo docs --plan            # the inverse of your last action and its conflicts; writes nothing
+patchlog undo docs                   # undo it
+patchlog redo docs                   # redo your last undone action
+patchlog undo docs GESTURE           # a given action, as written (found on the stack after undos and redos)
+patchlog undo docs GESTURE --of bob  # bob's writes of it
+```
+
+The stack is the caller's: the root sub of `--bearer`, else `--author` (`--of` names another).
+An undo that conflicts with later writes prints them and writes nothing (exit 1).
+
 - **Finding it.** `GET /ns/{ns}/gestures/{gesture}` where offered, also to grants limited to
   some resources; otherwise (sealed and e2e namespaces, older deployments, or `UndoScanLog()`)
   the namespace log. The log is read all of it page by page or after
@@ -1553,6 +1568,9 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
 ### Merge, rebase and cleanup (Addendum F)
 
 ```sh
+patchlog branch create matches release-7          # a branch of matches at its head (§7.6; --at ID, --patch JSON)
+patchlog patch release-7/derby '[…]'              # work in it: reads fall through to the base
+patchlog branch list matches
 patchlog merge status --branch release-7          # per resource: ahead, behind, clean, conflicting
 patchlog merge plan   --branch release-7          # the batch, plus a dry run
 patchlog merge apply  --branch release-7 --freeze  # one batch into the base, then freeze with "merged"

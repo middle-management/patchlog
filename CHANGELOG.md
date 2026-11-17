@@ -10,6 +10,12 @@
   resources (`NS/NAME`), and `patchlog ns create|get|config|log` namespaces, through the public
   API. Each write supplies its precondition (§7.2): `patch` appends to the head, trying again
   after a lost race, unless `--if ID` pins one. See the README's short tour.
+- **`patchlog undo` and `redo`** (§11.2). Every `put`, `patch` and `rm` now sends a gesture of
+  its own, printed with the result, or the one `--gesture ID` names, so several writes undo
+  together. `undo NS` undoes your last action, `redo NS` redoes your last undone one, and a
+  `GESTURE` argument names one; `--plan` shows the inverse and its conflicts without writing,
+  `--list` your stack.
+- **`patchlog branch create BASE NAME`** (`--at ID`, `--patch JSON`) and `branch list BASE`.
 - **`$PATCHLOG_API`, `$PATCHLOG_BEARER` and `$PATCHLOG_AUTHOR`** are the defaults of `--api`,
   `--bearer` and `--author` in every command that takes them.
 - **`patchlog --help` groups the commands**: server commands, client commands, branches,
