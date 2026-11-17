@@ -2027,12 +2027,37 @@ async function readDoc(ns, name, id, r, retried) {
   return { doc: r.json };
 }
 
-/* nsChainOK: a branch reads its bases' ciphertext, sealed under their keys (§F.8). */
-async function nsChainOK(ns, kns) {
+/* nsChainOK: a branch reads its bases' ciphertext, sealed under their keys (§F.8), up to the resource's foreign parent
+ * (§E.2.2, §E.3.1, v0.85). With at = { name, seen }, the resource whose log is folded and the ids the fold has moved
+ * past (the snapshot it starts from included), a base's namespace is refused once the fold is past the fork from that
+ * base: the base's head of the resource as of the branch's at, which its /heads gives, or none where the base had no
+ * such resource. A fork this reader can't place (a remote base, a /heads it may not read) isn't checked. */
+async function nsChainOK(ns, kns, at) {
+  const forks = nsChainOK.forks || (nsChainOK.forks = new Map());
   for (let cur = ns, i = 0; cur && i < 16; i++) {
     if (cur === kns) return true;
     const info = await nsInfo(cur);
-    cur = info.doc && info.doc.base && info.doc.base.ns;
+    const b = info.doc && info.doc.base;
+    cur = b && b.ns;
+    if (!at || !cur || !b || typeof b !== 'object' || b.origin !== undefined || typeof b.at !== 'string') continue;
+    const k = cur + ' ' + b.at + ' ' + at.name;
+    if (!forks.has(k)) {
+      // The base's entry for the resource at at: pages start just before its name, a plain bound (§7.4).
+      let fork = null, after = Array.from(at.name).slice(0, -1).join('');
+      for (let page = 0; page < 20 && fork === null; page++) {
+        const r = await api('GET', `/ns/${cur}/rev/${b.at}/heads` + (after ? `?after=${encodeURIComponent(after)}` : ''), { auto: true, label: 'fork' });
+        if (r.status !== 200 || !r.json) break;
+        const rows = r.json.heads || r.json.items || [];
+        const row = rows.find((x) => x && x.resource >= at.name);
+        if (row) fork = row.resource === at.name && row.kind !== 'purge' && typeof row.target === 'string' ? row.target : '';
+        else if (!r.json.next) fork = '';
+        else after = r.json.next;
+      }
+      if (fork !== null) forks.set(k, fork);
+      else continue;
+    }
+    const fork = forks.get(k);
+    if (fork === '' || at.seen.has(fork)) return false;
   }
   return false;
 }
@@ -2086,6 +2111,7 @@ async function foldLog(ns, name, id, since, arr) {
   const out = { id, since, entries: [], flagged: [], validID: '', value: undefined, notes: [] };
   const bad = (msg) => { throw new Error(`e2e log of ${ns}/${name}: ${msg}`); };
   let doc, exists = false, prev = '';
+  const passed = new Set(); // the ids the fold has moved past: a base's key seals nothing after the fork (nsChainOK)
   const cfg = ((await nsInfo(ns)).doc || {}).encryption || {};
   if (since) {
     // A namespace is end-to-end from its creation or never (Addendum E Levels): the start is always a snapshot.
@@ -2099,6 +2125,7 @@ async function foldLog(ns, name, id, since, arr) {
     const e = Object.assign({}, arr[i]);
     out.entries.push(e);
     if ((e.parent || '') !== prev) bad(`entry ${e.id} does not chain`);
+    if (prev) passed.add(prev);
     if (e.kind === 'tombstone') {
       if ((await Z.tombstoneID(e.parent)) !== e.id) bad(`tombstone ${e.id} has the wrong id`);
       prev = e.id; continue;
@@ -2116,6 +2143,7 @@ async function foldLog(ns, name, id, since, arr) {
     let hdr, kns;
     try { hdr = Z.parseJWE(jwe).header; kns = Z.parseKid(hdr.kid).ns; } catch (err) { flag('sealed patch set: ' + err.message); continue; }
     if (!(await nsChainOK(ns, kns))) { flag('sealed under another namespace\'s key ' + hdr.kid); continue; }
+    if (kns !== ns && !(await nsChainOK(ns, kns, { name, seen: passed }))) { flag('sealed under a base\'s key ' + hdr.kid + ' past the foreign parent (\u00a7E.2.2)'); continue; }
     e._sealed = hdr.kid;
     // Under the resource's K_r only (§E.3.1): one sealed otherwise, as under K_e before v0.65, is flagged (v0.78).
     let o;
