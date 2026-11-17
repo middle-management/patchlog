@@ -334,12 +334,13 @@ func TestV076OriginUncoveredFiltered401(t *testing.T) {
 	}
 }
 
-// §B.11.9 Purged namespaces, §8.5: a purged namespace this section doesn't
-// cover answers its filtered URLs as §8.5 answers their unfiltered forms
-// once the read check passes: /heads, at an at or without, is 410, as are
-// long-poll and events from the purge-ns entry; the forms §8.5 serves as
-// before keep the uncovered answer, 401 without credentials. A private
-// purged namespace is still 401 before any 410.
+// §B.11.9 Purged covered namespaces (v0.85, scenario 141): only a purged
+// namespace this section covers answers its filtered URLs as §8.5 answers
+// their unfiltered forms. One it doesn't cover answers every one of them
+// as any other uncovered namespace does, 401 without a grant that
+// verifies there or a cookie, else 403, never 410: its /heads, at an at
+// or without, and long-poll and events from the purge-ns entry included,
+// which were 410 before v0.85, as its unfiltered /heads still is.
 func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -364,7 +365,7 @@ func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
 	for _, c := range []struct {
 		name, ns   string
 		cred       Credentials
-		heads, log int // /heads forms; log ranges and live from elsewhere
+		heads, log int // the unfiltered /heads; every filtered form
 	}{
 		{"public, no credentials", "pub", Credentials{}, 410, 401},
 		{"public, a grant that verifies there", "pub", reader("pub"), 410, 403},
@@ -381,13 +382,8 @@ func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
 		_, _, herr := w.e.FilteredHeads(ctx, c.ns, gs, at, "", "", c.cred)
 		hcur := w.e.FilteredCurrent(ctx, c.ns, gs, "/heads", c.cred)
 		_, _, pollPurge := w.e.FilteredLiveLog(ctx, c.ns, gs, purge, 10, c.cred)
-		if v75Status(herr) != c.heads || v75Status(hcur) != c.heads || v75Status(pollPurge) != c.heads {
-			t.Errorf("%s: FilteredHeads %v, FilteredCurrent /heads %v, live from the purge-ns entry %v, want %d", c.name, herr, hcur, pollPurge, c.heads)
-		}
-		if c.heads == 410 {
-			if e, _ := herr.(*Error); e == nil || e.Body["code"] != "purged" || e.Body["head"] != purge {
-				t.Errorf("%s: %v, want purged with head %s", c.name, herr, purge)
-			}
+		if v75Status(herr) != c.log || v75Status(hcur) != c.log || v75Status(pollPurge) != c.log {
+			t.Errorf("%s: FilteredHeads %v, FilteredCurrent /heads %v, live from the purge-ns entry %v, want %d", c.name, herr, hcur, pollPurge, c.log)
 		}
 		_, _, lerr := w.e.FilteredLog(ctx, c.ns, gs, at, "", 10, c.cred)
 		lcur := w.e.FilteredCurrent(ctx, c.ns, gs, "/log", c.cred)

@@ -280,10 +280,26 @@ type itemState struct {
 	// computed (canon): the retry lookup, the batch size and step 3 each
 	// need them, and a create's is its whole document.
 	canons [][]byte
+	// meters are the steps' validation meters (writeMeter), one for each
+	// step: the step-1 rules of step j, its validation at step 5 and its
+	// rules at step 6 draw on meters[j] (§6.6 Validation work).
+	meters []*writeMeter
 	// revs are the steps' revision ids, each with the parent it was
 	// computed on (revID): the retry lookup, signatures and step 3 each
 	// need them, and on the same parents once the precondition holds.
 	revs []revMemo
+}
+
+// meter is the validation meter of the item's step j, the one its step-1
+// rules drew on (checkItems).
+func (s *itemState) meter(t *tx, j int) *writeMeter {
+	for len(s.meters) <= j {
+		s.meters = append(s.meters, nil)
+	}
+	if s.meters[j] == nil {
+		s.meters[j] = t.newMeter(nil)
+	}
+	return s.meters[j]
 }
 
 // revMemo is a step's revision id on one parent (revID).
@@ -547,11 +563,22 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		return batchError(fs)
 	}
 	// Step 1 for the items: authorisation.
+	// Each step of each item has its own validation meter, which the
+	// step's rules draw on from here on (itemState.meters): a run of step
+	// 1 starts them afresh, and every candidate verb tried counts. A step
+	// whose steps run out is 422 here already, before the rate limits.
+	cfg := cur
 	authorizeItems := func(a *actor) []itemErr {
 		var fs []itemErr
+		prev := t.meter
+		defer func() { t.meter = prev }()
 		for _, s := range st {
 			s.cands = nil
+			s.meters = make([]*writeMeter, len(s.Steps))
+			readable := func() bool { return t.canRead(n, cfg, a, s.Resource) }
 			for j := range s.Steps {
+				s.meters[j] = t.newMeter(readable)
+				t.meter = s.meters[j]
 				if verbs := candidateVerbs(s.Item); j == 0 && verbs != nil {
 					// Verbs only the resource's state decides: each is
 					// tried, and the item passes if any does (§C.2 item 2).
@@ -561,8 +588,14 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 					var passed []string
 					for _, verb := range verbs {
 						if err := t.authorize(a, verb, s.Resource); err != nil {
-							if first == nil {
+							if first == nil || t.meter.Over {
 								first = err
+							}
+							if t.meter.Over {
+								// Out of steps, whatever another verb
+								// would say.
+								passed = nil
+								break
 							}
 							continue
 						}
@@ -586,7 +619,6 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		return fs
 	}
 
-	cfg := cur
 	var cplan *configPlan
 	// A dry run reports its config change as config (§7.5): the id a
 	// submit would produce, or a failure after the change's step 1, which
@@ -597,10 +629,13 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	if cc != nil {
 		// A failure of the change's step 1 answers the batch, a dry run
 		// included, as that config write would (§7.5), drawing nothing.
+		// The change is a write of its own, with its own meter.
+		unmeter := t.metered(func() bool { return t.readsNS(n, cur, a, false) })
 		if err := t.authorize(a, "config", ""); err != nil {
 			return nil, nil, err
 		}
 		p, err := t.planConfig(n, cur, a, cc, true)
+		unmeter()
 		if err != nil {
 			var ae *Error
 			if !errors.As(err, &ae) {
@@ -886,11 +921,11 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	pns := t.pendingNS(n)
 	t.prefetchSchemas(pinnedSchemas(st, pns))
 	for _, s := range st {
-		for _, step := range s.steps {
+		for j, step := range s.steps {
 			if step.del || step.sealed {
 				continue // e2e: validation moves to clients (§E.3.2)
 			}
-			typed, err := t.validateStep(step, sc, pending)
+			typed, err := t.validateStep(step, sc, pending, s.meter(t, j))
 			if err != nil {
 				fs = append(fs, itemErr{s.index, err})
 				break
@@ -934,12 +969,17 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			return t.checkGrantRules(a, envOf(s, step), stepUnknown(cfg, s, step))
 		},
 		func(s *itemState, step *stepState) *Error {
-			return checkNSRules(cfg, a, envOf(s, step), false, stepUnknown(cfg, s, step))
+			return checkNSRules(cfg, a, envOf(s, step), false, stepUnknown(cfg, s, step), t.meter)
 		},
 	} {
 		for _, s := range st {
-			for _, step := range s.steps {
-				if err := check(s, step); err != nil {
+			for j, step := range s.steps {
+				// The step's rules draw on what its step 1 and its
+				// validation left of its meter.
+				t.meter = s.meter(t, j)
+				err := check(s, step)
+				t.meter = nil
+				if err != nil {
 					fs = append(fs, itemErr{s.index, err})
 					break
 				}

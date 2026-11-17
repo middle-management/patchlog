@@ -14,6 +14,8 @@ import (
 // 412: an operator grant may create namespaces with config (§C.2 item 2,
 // §C.4), and otherwise the caller needs config on the namespace itself.
 func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
+	// The write's rules draw on one validation meter (§6.6, writeMeter).
+	defer t.metered(nil)()
 	if keys := t.operatorKeys(); len(keys) > 0 {
 		if a, err := t.authenticate(n.name, nil, nil, req.Cred, keys); err == nil {
 			return t.authorize(a, "config", "")
@@ -42,6 +44,8 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	if aerr != nil {
 		return nil, aerr
 	}
+	// The write's rules draw on one validation meter (§6.6, writeMeter).
+	defer t.metered(func() bool { return true })()
 	if err := t.authorize(a, "config", ""); err != nil {
 		return nil, err
 	}
@@ -130,6 +134,8 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if !ValidNSName(br.Name) {
 		return nil, badInput("invalid branch name")
 	}
+	// The write's rules draw on one validation meter (§6.6, writeMeter).
+	defer t.metered(func() bool { return t.readsNS(base, bcfg, a, true) })()
 	if err := t.authorize(a, "branch", br.Name); err != nil {
 		return nil, err
 	}

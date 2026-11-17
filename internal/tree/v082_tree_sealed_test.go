@@ -340,10 +340,19 @@ func TestV082UnjudgedEpochByNameOnly(t *testing.T) {
 	if a := x.fetch("/cat/ancestors?of=old", q.full); a.header.Get("Content-Type") != "application/json" || bytes.Contains(a.body, []byte("sealed")) || bytes.Contains(a.body, []byte("Old")) {
 		t.Errorf("during the fill: ancestors carry a value of old: %s %s", a.header.Get("Content-Type"), a.body)
 	}
-	var jwes int
+	// "In a response that is no-store and isn't stored" (v0.85): for
+	// browsers and edges, at the at URL, and no view is stored at all.
+	for what, f := range map[string]fetched{"children": during, "ancestors": x.fetch("/cat/ancestors?of=old", q.full)} {
+		for _, h := range []string{"Cache-Control", "CDN-Cache-Control", "Surrogate-Control"} {
+			if got := f.header.Get(h); got != "no-store" {
+				t.Errorf("during the fill: %s of a listing by name only (%s): %q, want no-store", h, what, got)
+			}
+		}
+	}
+	var views int
 	sq := must(sql.Open("sqlite", q.db))
-	if err := sq.QueryRow(`SELECT count(*) FROM sealed_views WHERE json = 0 OR instr(CAST(body AS TEXT), 'eyJ') > 0`).Scan(&jwes); err != nil || jwes != 0 {
-		t.Errorf("during the fill: %d stored views hold a JWE (%v)", jwes, err)
+	if err := sq.QueryRow(`SELECT count(*) FROM sealed_views`).Scan(&views); err != nil || views != 0 {
+		t.Errorf("during the fill: %d views stored (%v), want none", views, err)
 	}
 	sq.Close()
 
@@ -352,6 +361,9 @@ func TestV082UnjudgedEpochByNameOnly(t *testing.T) {
 	after := x.fetch(during.path, q.full)
 	if bytes.Equal(after.body, during.body) {
 		t.Fatalf("after the fill: the listing by name only is still served at its at")
+	}
+	if cc := after.header.Get("Cache-Control"); cc == "no-store" || cc == "" {
+		t.Errorf("after the fill: Cache-Control %q on a listing with every value judged", cc)
 	}
 	var body map[string]any
 	if after.header.Get("Content-Type") == seal.ContentType {

@@ -1,5 +1,5 @@
 {
- "source": "docs/SPEC.md Addendum I, §I.15–§I.21 (v0.82); the expected values are copied from it, never computed",
+ "source": "docs/SPEC.md Addendum I, §I.15–§I.24 (v0.85; §I.17 as v0.85 recomputed it, §I.22–§I.24 the candidates C.1–C.3 of v0.82); the expected values are copied from it, never computed",
  "I.15": {
   "releaseDoc": "{\"branches\":{\"matches\":{\"at\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\",\"ns\":\"matches-r7\"}},\"name\":\"release-7\"}",
   "releaseGenesis": "1bx3m7usot3btfia44al7op7h4tbzwprh",
@@ -82,81 +82,100 @@
     "5e-324",
     "5e-324"
    ]
-  ]
+  ],
+  "lastRendering": "{\n  \"a\": 1e+21,\n  \"b\": 1e-7,\n  \"c\": -0.0000015,\n  \"d\": 1.23e-18,\n  \"e\": 1e+300,\n  \"f\": 5e-324\n}\n"
  },
  "I.17": {
   "envelope": "{\"id\":\"auZ4P0-96RtuuItzpI7SRw\",\"recipients\":[{\"kid\":\"5_RYhfysTyU1BDBnv9LSpAGNHJ_A1_UesBCKoRG370E\",\"suite\":\"hpke-base-0x0020-0x0001-0x0002\",\"wrapped\":\"qOEsrFfQ5Y0IhiuiliORWAQzhGlJcMKuQw90ZdV851fEb8UlPgrdP1U8de6PBjNaodTtMiXXXGFcMBEQ3tDUBPy8Q4SkD88eVuu5cHhiB_U\"}],\"sealedBundle\":1}",
+  "kb": "dbe5882e2579683432c1bfc525454add0cd87274d67084caaf0e0d36c8496db7",
   "headers": [
    "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"pl\":{\"bundle\":\"auZ4P0-96RtuuItzpI7SRw\",\"line\":0}}",
-   "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"pl\":{\"bundle\":\"auZ4P0-96RtuuItzpI7SRw\",\"last\":true,\"line\":1}}"
+   "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"pl\":{\"bundle\":\"auZ4P0-96RtuuItzpI7SRw\",\"line\":1}}",
+   "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"pl\":{\"bundle\":\"auZ4P0-96RtuuItzpI7SRw\",\"last\":true,\"line\":2}}"
   ],
   "lines": [
-   "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxpbmUiOjB9fQ..wMHCw8TFxsfIycrL.1je8Ze50PqpSOnyuJwmJlIP8Qgp7AuYU2GSMaaqzoFIh-4aQi9zKQGzhopNkHzYN91K1O4uc3tJh32F1FTwu.g-aBsut25PYodIaP85FSPw",
-   "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxhc3QiOnRydWUsImxpbmUiOjF9fQ..wMHCw8TFxsfIycrL.1je0dLgmc-lNKiGhdA2SnJyoVEgnCvlDlSvbNPi3o0s1-t7Hx5POWDq988IiXiFbrBeuMJqQl4huwTMjUnMy2CYHLfAELI95X8VtxLxfpJMMpES9jJl0DIbYOCd6ih8heQ10_mx9EOtrimNVaUv9I9Yavipi5HZsrDC5MsmPzGC7fDw4O8hjjG-2I2QNSCEixHnaCo2EsE1pE6dmBuN1Dt9CnMc9R4gx_WX-7g.kFkKVIEefyfbKVXBCsNtCQ"
+   "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxpbmUiOjB9fQ..wMHCw8TFxsfIycrL.1je8c_l5IqsDIj3qKwSOkse7U10vRPoDkyjcMe3-rxdk85yQi4WAWXnlssEuQ2dDtASsNN7c05xpxSNgFCw3xjQJMbFRct5zWoJjzaQb7slY5USwwc92EZfDdW9S0wcoaEM9uSE7FrwpzH9RPxnuNdZb4G118X996yihe9vJkznmKTMyLdQ31DnpMXIfDhJlnyicX96K7yo-E7hiAe9oGc8I2phtQZRhpWf--3WF0fWsfp1ueq8VUgphdgZ5OEuXANkL6BneOHm8e5n7GUohAWgFRT0fXsvAmYRhh6WPguXuG47aTxUdYdKNtlo9oOyY8SaBlPdo6N_VF7XIgD4e1y_NSwSsx8cnIJm3.RybvCcTQ8coZcrNsotjdug",
+   "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxpbmUiOjF9fQ..wMHCw8TFxsfIycrL.1je0dLgmc-lNKiGhdA2SnJyoVEgnCvlDlSvbNPi3o0s1-t7Hx5POWDq988IiXiFbrBeuMJqQl4huwTMjUnMy2CYHLfAELI95X8VtxLxfpJMMpES9jJl0DIbYOCd6ih8heQ10_mx9EOtrimNVaUv9I9Yavipi5HZsrDC5MsmPzGC7fDw4O8hjjG-2I2QNSCEixHnaCo2EsE1pE6dmBuN1Dt9CnMc9R4gx_WX-7g.zJJLhqznyED1wpuSl5sA3Q",
+   "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwicGwiOnsiYnVuZGxlIjoiYXVaNFAwLTk2UnR1dUl0enBJN1NSdyIsImxhc3QiOnRydWUsImxpbmUiOjJ9fQ..wMHCw8TFxsfIycrL.1je0dLgmc-lSYTGgc1GRgcDtQ0twHORDgDDWMf6w4Vow9Y2Gy5KXUDq988IiXiFbrBeuMJqQl4huwTMjUnMy2CYHLfAELI95X8VtxLxfpJMf5FSqhN9_DI6YbGkWw1E9O0A7unxpH7g323sCaFWydZgavipk5G56oXfwa9Gg3ja4aTw4O_JjkG-4Yi0NEmo30n6QEofb4mYsVKJwV6AiCt1Ly5g9Gdw-wjD-4XWX2qLkP8k_OfoZAkxof0s3.9nAggSbYpBD7B_F6uSf_wQ"
   ],
-  "bytes": 907,
-  "sha256": "30bf22f88eb79ccd830d8b5da982a493c9e67b694b3e51a9344934df2dab03a6",
-  "sealedDigest": "1gc7sf6eow6om3aynrno2tavespe6m63j",
+  "bytes": 1580,
+  "sha256": "64540cd81c52da8d150e9db78e5255f8aee5b9e4c3ef1e568fbf15204976655b",
+  "plainDigest": "1wmmkh2s4kkveocf5yh4uzoookxmrzptr",
+  "sealedDigest": "1mrkazwa4klni2fiotw3y4usv7cxolope",
+  "padded": {
+   "buckets": [
+    272,
+    256,
+    256
+   ],
+   "tags": [
+    "1iIYtbZyZy2yof46mGghnQ",
+    "seB2BjFUe7yaCu_nktvOVA",
+    "xrIfbpvxGdlXILIiZ8Mbtw"
+   ],
+   "bytes": 1789,
+   "sha256": "33985a4988eeb73818522d110b966dd66cedaec008775344e0876d7e4d86bd30"
+  },
   "rejected": [
    {
-    "change": "line 1's `pl` members out of order",
-    "sha256": "ea43aecec4ac64b816582fa621489ed53fa706d21c45669f366f49657ab5f80a",
-    "rule": "header not canonical"
+    "change": "line 2's `pl` members out of order",
+    "sha256": "8bedffe110d76287ba43de22a7d71c2bf2ce7ca4fbf64284820d2e8f1aeb2f41",
+    "rule": "a line's protected header isn't canonical JSON"
    },
    {
-    "change": "line 1's header with a space after `\"pl\":`",
-    "sha256": "2ee9369a6be54795328003bf8e65adcab0ede3515f3499582194c9e52b3f3d59",
-    "rule": "header not canonical"
+    "change": "line 2's header with a space after `\"pl\":`",
+    "sha256": "1d45a5a65c6deb2352a0f22239b9924cbcef0c585cb5f26846943b903534d3dc",
+    "rule": "a line's protected header isn't canonical JSON"
    },
    {
-    "change": "line 1's `pl` with `\"ns\":\"matches\"` added",
-    "sha256": "c792cad748b02c609caca285c03f0814643fe9525bda726a8b25297eedf33736",
-    "rule": "other members"
+    "change": "line 2's `pl` with `\"ns\":\"matches\"` added",
+    "sha256": "810c72ca2a3fdf048ae4d887f6d3b48f1880f36eab45237c46b1e5096a3492d0",
+    "rule": "`pl` included, has other members"
    },
    {
-    "change": "line 1's `pl.bundle` `AAAAAAAAAAAAAAAAAAAAAA`",
-    "sha256": "d5d714e391d92b6c8086d23fc9aaaf1520674bd91a3eb9d0bb80132c9b471a31",
-    "rule": "`pl.bundle` isn't `id`"
+    "change": "line 2's `pl.bundle` `AAAAAAAAAAAAAAAAAAAAAA`",
+    "sha256": "28c709a56f132218637250ac5e8da68e092d984b596957da5fb743a6b4f2a437",
+    "rule": "`pl.bundle` differs from `id`"
    },
    {
-    "change": "line 1 numbered 2",
-    "sha256": "c99ee90c9ca07c6621149b670cd8a0392433d39fb898dc904d7b2c55f8291464",
-    "rule": "line numbers"
+    "change": "line 2 numbered 3",
+    "sha256": "315705d09ae62e77b5acb14c34f1a6b4412e1a1573331874f532d8db67f5db70",
+    "rule": "line numbers are not 0, 1, 2… in order"
    },
    {
-    "change": "line 1 without `last`",
-    "sha256": "568f5b379c76ca5b14d1462260223d8790377e85edd7831b877b47f9828f0d52",
-    "rule": "no `last`"
+    "change": "line 2 without `last`",
+    "sha256": "6bfaaaaff95646852e1fa4be7055cb19584800d3547b75096fab3981b7b32bc8",
+    "rule": "no line says `last`, or a line follows it"
    },
    {
     "change": "line 0 with `last`",
-    "sha256": "c389d152c50071d34d49c8a731c7f0dbbd65ba0fb47995c435cf6acba7f2d822",
-    "rule": "a line after `last`"
+    "sha256": "3d2a7f635416701defee2ed48a9e9e4646b798cbd9d6fea7b9b92d237ee7bba8",
+    "rule": "no line says `last`, or a line follows it"
    },
    {
     "change": "`0d 0a` after the envelope line",
-    "sha256": "1e790de0fce6a5b140cbc2cec3a1c11c35ed1d71b37c1a38df8e5f0484945b40",
-    "rule": "not one `0a`"
+    "sha256": "1f345cb4553e1b91b228fb1d45a02033a1ca2c60ae688b5d46072274c08c833b",
+    "rule": "each line is followed by one `0x0A`"
    },
    {
     "change": "`0d 0a` after the last line",
-    "sha256": "4d80d21eaf4a5a972d4489a3c8a0cc7877a387269fc6b46f05dd2e7e3fd6f561",
-    "rule": "not one `0a`"
+    "sha256": "8cfe78bf7d9b381dbc7dbdad4f1aa4e0d8fcd4b9660eee1da74610c06eb50641",
+    "rule": "each line is followed by one `0x0A`"
    },
    {
     "change": "the last `0a` removed",
-    "sha256": "bb48a88d8a72e71a812c1f709da4646578b7842794c0747706d811fc2bb2201d",
-    "rule": "not one `0a`"
+    "sha256": "b34b1b3728b128d1299aef08321db03326ce163179353675e8a43a89b1fa05a7",
+    "rule": "each line is followed by one `0x0A`"
    },
    {
     "change": "a blank line added at the end",
-    "sha256": "ce77fe793cc9f5e8005805ffe434659dc3939f61e15d65daf6de48f491bacf96",
-    "rule": "blank line"
+    "sha256": "7602a14e188a68c2e17e7e48efaf6bfdf852d199d4f15e095284c1fc8e07e30a",
+    "rule": "a blank one included"
    },
    {
-    "change": "line 1's last character `Q` made `B`",
-    "sha256": "55482215c25c2d182283c29511966dff78c1125249b63a91f3cefab96aec6124",
-    "rule": "fails to decrypt"
+    "change": "line 2's last character `Q` made `B`",
+    "sha256": "b0f519c88e36960476e5fcc3c13133a0965bc1e3c452ff1dd28ea54e6678f63f",
+    "rule": "any line fails to decrypt"
    }
   ]
  },
@@ -331,5 +350,74 @@
    "change": "The root block names `kid` `ops-2027`, where the namespace lists `ops-2026` with I.14's `pub` and `ops-2027` with `Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc` (seed `20 21 … 3f`).",
    "token": "EpcCCqoBCgtncmFudF9ibG9jawqMAXsiY2FuIjpbInJlYWQiLCJhcHBlbmQiXSwiZXhwIjoiMjAyNi0xMC0wNVQwMDowMDowMFoiLCJncm91cHMiOlsibWF0Y2gtZGVzayJdLCJraWQiOiJvcHMtMjAyNyIsIm5zIjpbIm1hdGNoZXMiXSwicnVsZXMiOltdLCJzdWIiOiJ1c2VyOmJvYiJ9GAMiCgoICIAIEgMYgQgSJAgAEiAlQ7kv8QlVEUdq3INp223ckzZloRl43aFATuEGbKlVnRpAu-gwaE_qNuMT-3TIHQFkGRx28PgT3Qs7xmmqoUovqFTdPPtiiFR-X8ktpRvWwc0xN_KLRHaI5fMfNGNtnF3vDSgBGp8BCjMKI3siY2FuIjpbInJlYWQiXSwidmlhIjoic3ZjOnJlYWRlciJ9GAMiCgoICIAIEgMYgggSJAgAEiAXRVO0Vt3fxpCOyrHBAf5qsh4rqgYXeVt9Q6Y0gpk_1RpAtiLICY5OX_83a517DhTHhIr8RhXN-poWBLlsDeMRPJ9006SE3zvfK3OOuEskZ1vQyqu9d1opOlc2yImulUkuDCgBIiIKIGBhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5_"
   }
- ]
+ ],
+ "I.22": {
+  "plaintexts": {
+   "purge": "{\"author\":\"user:bob\",\"created\":\"2026-10-04T13:00:00.000Z\",\"grant\":{\"id\":\"15swdvi5nbnlkv76v7y6k77h52atov6ru\",\"kid\":\"ops-2026\",\"sub\":\"user:bob\"},\"kind\":\"purge\",\"resource\":\"derby\",\"target\":\"1idx6u2b3z42obqmwsgmlzvrfuutks2bq\"}",
+   "prune": "{\"author\":\"user:bob\",\"created\":\"2026-10-04T13:00:00.000Z\",\"grant\":{\"id\":\"15swdvi5nbnlkv76v7y6k77h52atov6ru\",\"kid\":\"ops-2026\",\"sub\":\"user:bob\"},\"kind\":\"prune\",\"resource\":\"derby\",\"target\":\"1sywh54kpo3c4ezn2znktvl3avge4zl5d\"}"
+  },
+  "rows": [
+   {
+    "payload": "resource `purge` event",
+    "key": "K_r",
+    "pl": "{\"kind\":\"purge\",\"name\":\"derby\",\"ns\":\"demo\"}",
+    "plaintext": "purge",
+    "tag": "2Lr0YlsnReKv3Vu1vzww6w",
+    "paddedTag": "o6qg_FLKKyVd-bUUDCd0WA"
+   },
+   {
+    "payload": "resource `prune` event (horizon `c`)",
+    "key": "K_r",
+    "pl": "{\"kind\":\"prune\",\"name\":\"derby\",\"ns\":\"demo\"}",
+    "plaintext": "prune",
+    "tag": "DQW969cxsNvKvMFoLcdwHw",
+    "paddedTag": "UqL8Ockwt491woTRn4ov6w"
+   },
+   {
+    "payload": "namespace event for `ns_id₂`",
+    "key": "K_n",
+    "pl": "{\"event\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\",\"ns\":\"demo\"}",
+    "plaintext": "nsentry₂",
+    "tag": "IegL6XMQn_6bp6mbVNkAhQ",
+    "paddedTag": "zxVQ6oolCdXa4Bl6cJIlXA"
+   }
+  ],
+  "namespaceEvent": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiZXZlbnQiOiIxcGEybmg2aXcyeWQyZGpxZnkyd3JzemQ1a2dsZnB4dm0iLCJucyI6ImRlbW8ifX0..wMHCw8TFxsfIycrL.u8c251n3WG3uDvexX6uwqBTPKeBvMQlL6b6hdn6BXzGasJsQYlzR2iRxzmt6VvZnsT23l0wx0KocOYbmfx5u4j-_DQ2xvuhBRCpvZdadGJoEhHO6FLSfwwSaX5egIQARrBBTZhH59ABtgAByLNLCl2cC0zdgCD3pmcnL3myyHmW8yaZ9F4RPBKS2IfqEh_aB-24mj6LA_qpnyYuKX00RfNsEhfpHqjcOjWbhoDTEtkSho4uTVjf1EIE6uhwDUOG9gsFVNNxGxBQ7zy-sK8GKTQhfGPj8HQjolLe_9BL_VXgVkluBiUrdBKvgVi7KwsftAmzaDQA6QAU480SWSSXikQ_OZWFgwxOlaTanElMLFFvBhO-Gj-jZqqEFhVvVl4U7mOFcLW3Br1jngs0h7PKg5HU.IegL6XMQn_6bp6mbVNkAhQ",
+  "rejectedRangePL": "{\"ns\":\"demo\",\"range\":[\"1vmctae4vewju6nvxi374rkrkmyzpdrif\",\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\"]}"
+ },
+ "I.23": {
+  "q": "a b",
+  "sort": "/title",
+  "canonicalQuery": "q=a%20b&sort=%2Ftitle",
+  "view": "/demo/g/17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm/at/1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm?q=a%20b&sort=%2Ftitle",
+  "viewKeyKr": "4a9740243099b77c664dee6d8e810508baf276d8b726ca0b338c98caa9ac6219",
+  "item": {
+   "header": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"name\":\"derby\",\"ns\":\"demo\",\"view\":\"/demo/g/17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm/at/1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm?q=a%20b&sort=%2Ftitle\"}}",
+   "plaintext": "{\"/title\":[\"Hello\"],\"score\":1.5}",
+   "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIiwidmlldyI6Ii9kZW1vL2cvMTdpMnJxenN2M28yaTV2bGZoc2tsbzZmdTIyam5xd3RtL2F0LzFwYTJuaDZpdzJ5ZDJkanFmeTJ3cnN6ZDVrZ2xmcHh2bT9xPWElMjBiJnNvcnQ9JTJGdGl0bGUifX0..wMHCw8TFxsfIycrL.TZJpva2ZV7PahdlmA_E0rJj0WDX9xRfnqBGhzj3GRJY.QtG0R9eNAARRKqqGNvJIhg",
+   "paddedTag": "aI4EZpDID0edvKf5GA7Sxw"
+  },
+  "served": "{\"id\":\"1sywh54kpo3c4ezn2znktvl3avge4zl5d\",\"resource\":\"derby\",\"sealed\":\"%s\",\"url\":\"/r/demo/derby/rev/1sywh54kpo3c4ezn2znktvl3avge4zl5d\"}",
+  "rejected": "A JWE whose `pl.view` is the same target with `+` for the space, lowercase hex (`%2ftitle`) or the parameters in another order, or with a scheme and host, doesn't match the URL fetched, and the reader rejects it. No `view` has a `min`: a `200` is never served at a URL with one (§A.5)."
+ },
+ "I.24": {
+  "grant": "1d7hzis4zva7kl5aa3hi7cr3lxslua25j",
+  "rows": [
+   {
+    "change": "the grant line's `grant`, and both history lines', is `1d7hzis4zva7kl5aa3hi7cr3lxslua25j`, the id of I.21's `ops-2027` root block",
+    "sha256": "0ec81821b866aa5c02558212e4bb1b84640841cfba2457d594eab0730fb0bfcf",
+    "rule": "a grant line whose `grant` isn't the id of its `root`"
+   },
+   {
+    "change": "the grant line's `stored` is the authority block of I.21's token whose root block string isn't canonical (`sub` first), validly signed",
+    "sha256": "027a5892e6e75752703a253d24a4b8e6bb4db92a91bb46fad0c95cb6035a2278",
+    "rule": "a grant line whose `stored` block's `grant_block` isn't `canonical(root)`"
+   },
+   {
+    "change": "the header with `\"x-note\":\"hi\"`",
+    "sha256": "eff926c75ff1a289375536562a090a02c1fabb11c921abfe43a5b95735548954",
+    "rule": "a member §G.4.1 doesn't define"
+   }
+  ]
+ }
 }

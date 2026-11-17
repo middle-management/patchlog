@@ -1,12 +1,12 @@
 package vectors_test
 
-// The candidate vectors of docs/VECTORS-PROPOSED.md for §I.22's list
-// (C.1–C.3, computed independently from the v0.82 text), each computed
-// here through the reference's production code and compared with the
-// candidate. testdata/candidates.json holds the candidates as the document
-// gives them (extracted, never computed, and never rewritten by -update);
-// a value the reference computes otherwise is a failure here, reported to
-// the writer as contested, never a candidate overwritten with ours.
+// Addendum I, §I.22–§I.24 (v0.85; the candidates C.1, the per-entry half
+// of C.2, and C.3 of v0.82's VECTORS-PROPOSED.md, which the reference
+// confirmed in v0.28.0), each computed here through the reference's
+// production code and compared with the spec's value. They are in
+// testdata/addendum_i.json as docs/SPEC.md prints them (addendum_i15_test.go).
+// The whole-response half of C.2 left the spec with its premise; C.4
+// replaces it (v085_candidates_test.go).
 
 import (
 	"bytes"
@@ -30,39 +30,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
-	"github.com/middle-management/patchlog/internal/vectors/golden"
 )
-
-// candidatesFile is testdata/candidates.json.
-type candidatesFile struct {
-	C1 struct {
-		Plaintexts     map[string]string
-		Rows           []struct{ Payload, Key, PL, Plaintext, Tag, PaddedTag string }
-		NamespaceEvent string
-		Closing        string
-	} `json:"C.1"`
-	C2 struct {
-		Q, Sort, CanonicalQuery, View string
-		ViewKeyKn, ViewKeyKr          string
-		Whole, Item                   struct{ Header, Plaintext, JWE, PaddedTag string }
-		Served, Rejected              string
-	} `json:"C.2"`
-	C3 struct {
-		Grant string
-		Rows  []struct{ Change, SHA256, Rule string }
-	} `json:"C.3"`
-}
-
-// loadCandidates reads testdata/candidates.json. It only reads: the file
-// is the candidates' text, and no run of the reference writes it.
-func loadCandidates(t *testing.T) candidatesFile {
-	t.Helper()
-	var f candidatesFile
-	if !golden.Load(t, "candidates", &f) {
-		t.Fatal("testdata/candidates.json is missing")
-	}
-	return f
-}
 
 // v081NamespaceEventTag is the tag v0.81's candidate P.5 gave the
 // namespace event for ns_id₂ under the range form, pl
@@ -105,9 +73,9 @@ func v82vecSSE(t *testing.T, path string, events ...[3]string) string {
 // a stream serves them: it opens all three, and refuses v0.81's range form
 // of the namespace event, with the entry and with the range's own
 // plaintext.
-func TestV082C1Events(t *testing.T) {
+func TestI22SealedEvents(t *testing.T) {
 	t.Parallel()
-	p := loadCandidates(t).C1
+	p := loadAddendumI(t).I22
 	i19 := loadAddendumI(t).I19
 	kr, err := seal.ResourceKey(seq(0x00), "demo", "derby")
 	if err != nil {
@@ -127,8 +95,8 @@ func TestV082C1Events(t *testing.T) {
 		{kr, seal.ResourceEventPL("demo", "derby", seal.KindPrune), p.Plaintexts["prune"]},
 		{kn, seal.NamespaceEventPL("demo", nsID2), nsentry2},
 	}
-	if len(p.Rows) != len(cases) || p.Rows[2].Plaintext != "§I.19's `nsentry₂`" {
-		t.Fatalf("%d rows in candidates.json, want %d, the last of §I.19's nsentry₂", len(p.Rows), len(cases))
+	if len(p.Rows) != len(cases) || p.Rows[2].Plaintext != "nsentry₂" {
+		t.Fatalf("%d rows in addendum_i.json, want %d, the last of §I.19's nsentry₂", len(p.Rows), len(cases))
 	}
 	jwes := make([]string, len(cases))
 	for i, r := range p.Rows {
@@ -187,9 +155,9 @@ func TestV082C1Events(t *testing.T) {
 			t.Errorf("%s: %+v %v, want a mismatch", what, got, err)
 		}
 	}
-	// Resource events keep {kind, name, ns} (§E.2.2's table and C.1's own
-	// rows; C.1's closing sentence reads as if that form were refused):
-	// the client opens the candidate's rows, and no namespace event's.
+	// Resource events keep {kind, name, ns} (§E.2.2's table; §I.22: "A
+	// resource event's pl is { ns, name, kind }, as above"): the client
+	// opens the rows, and no namespace event's.
 	resEvents := func(typ, jwe string) (client.Event, error) {
 		c, err := client.New(v82vecSSE(t, "/r/demo/derby/events", [3]string{typ, "", jwe}), client.WithKeys(keys))
 		if err != nil {
@@ -211,21 +179,22 @@ func TestV082C1Events(t *testing.T) {
 	if ev, err := resEvents("purge", p.NamespaceEvent); err == nil {
 		t.Errorf("the namespace event served as a purge event: %+v, want refused", ev)
 	}
-	if !strings.Contains(p.Closing, `{"kind":…,"name":…,"ns":…}`) {
-		t.Errorf("C.1's closing sentence changed: %s", p.Closing)
+	// The pl §I.22 names as rejected is that range's, of the one entry.
+	if got := string(jsonv.Canonical(jsonv.FromGo(map[string]any(seal.RangePL("demo", nsID1, nsID2))))); got != p.RejectedRangePL {
+		t.Errorf("the range pl refused is %s, §I.22's %s", got, p.RejectedRangePL)
 	}
 }
 
-// TestV082C1EventsServed (C.1, §E.2.2, §7.3), forms: in sealedDemo, bob
+// TestI22SealedEventsServed (§I.22, §E.2.2, §7.3), forms: in sealedDemo, bob
 // prunes at c and purges. The namespace event for the last entry is served
 // under K_n with pl {ns, event: id}, its plaintext that entry as the range
 // gives it, and under no range's pl; the reference's client reads the same
 // stream as that entry. The purge and prune events are served under K_r
 // with pl {kind, name, ns}, their plaintext the namespace entry without id
 // and prev, with the members of C.1's purge and prune.
-func TestV082C1EventsServed(t *testing.T) {
+func TestI22SealedEventsServed(t *testing.T) {
 	t.Parallel()
-	p := loadCandidates(t).C1
+	p := loadAddendumI(t).I22
 	d := newSealedDemo(t, loadAddendumI(t).I19.Plaintexts["nsdoc"], p.Plaintexts)
 
 	// The resource's events after the tombstone, streamed live: the
@@ -305,29 +274,26 @@ func TestV082C1EventsServed(t *testing.T) {
 	}
 }
 
-// C.2 (SERVICES §E.2.6, §A.5): the view string an index on its own origin
-// serves demo at, for I.8's gs and ns_id₂ and the query q = "a b", sort =
-// "/title", built as the index builds it (the path, then
-// derived.CanonicalQuery without min); the view keys of K_n and K_r
-// (seal.ViewKey); the whole response and the hit's values sealed under
-// them with the pl of derived.View, kid demo#3 and the IV c0 … cb, in full
-// and by their padded tags; derived.SealView and SealItem, which draw
-// their own IVs, give the same headers and plaintexts; derived.OpenView
-// and OpenItem open the candidate's JWEs, and reject each under the four
-// altered views, as they reject a JWE sealed for any of those. No view
-// carries min.
-func TestV082C2ViewKey(t *testing.T) {
+// I.23 (SERVICES §E.2.6, §A.5): the view string an index on its own origin
+// serves demo at, for I.8's gs (an input only: no index serves a whole
+// reader there) and ns_id₂ and the query q = "a b", sort = "/title", built
+// as the index builds it (the path, then derived.CanonicalQuery without
+// min); the view key of K_r (seal.ViewKey); the hit's values sealed under
+// it with the pl of derived.View, kid demo#3 and the IV c0 … cb, in full
+// and by its padded tag; derived.SealItem, which draws its own IV, gives
+// the same header and plaintext; derived.OpenItem opens the vector's JWE,
+// and rejects it under the four altered views, as it rejects a JWE sealed
+// for any of those. No view carries min.
+func TestI23ViewKey(t *testing.T) {
 	t.Parallel()
-	p := loadCandidates(t).C2
+	p := loadAddendumI(t).I23
 	gs := grantcheck.SubjectSetID([]string{"group:match-desk", "user:anna"}) // I.8's
 	// The premise is illustrative, like §I.19's plaintexts: I.8's gs is a
 	// set of two principals, and the reference serves a response sealed
 	// whole only at a gs every reader of which reads the namespace whole,
-	// that of reads:demo (SERVICES §E.2.6 Whole-response sealing, §A.4).
-	// The bytes don't depend on it.
-	if whole := grantcheck.SubjectSetID([]string{"reads:demo"}); whole == gs {
-		t.Fatalf("I.8's gs is that of reads:demo")
-	}
+	// that of a reads:demo:{k} marker (SERVICES §E.2.6 Whole-response
+	// sealing, §A.4; v0.85), which is no set of principals. The bytes
+	// don't depend on it.
 	vals := url.Values{"q": {p.Q}, "sort": {p.Sort}, "min": {nsID2}}
 	cq := derived.CanonicalQuery(vals, "min")
 	if cq != "?"+p.CanonicalQuery {
@@ -340,12 +306,7 @@ func TestV082C2ViewKey(t *testing.T) {
 	if strings.Contains(view, "min") {
 		t.Errorf("the view carries min: %s", view)
 	}
-	kn, _ := seal.NamespaceKey(seq(0x00), "demo")
 	kr, _ := seal.ResourceKey(seq(0x00), "demo", "derby")
-	vkn, err := seal.ViewKey(kn, view)
-	if err != nil || hex.EncodeToString(vkn) != p.ViewKeyKn {
-		t.Errorf("the view key of K_n is %x %v, want %s", vkn, err, p.ViewKeyKn)
-	}
 	vkr, err := seal.ViewKey(kr, view)
 	if err != nil || hex.EncodeToString(vkr) != p.ViewKeyKr {
 		t.Errorf("the view key of K_r is %x %v, want %s", vkr, err, p.ViewKeyKr)
@@ -376,9 +337,6 @@ func TestV082C2ViewKey(t *testing.T) {
 		seal func(derived.Key, any) (string, error)
 		open func(string, derived.View) ([]byte, error)
 	}{
-		{"the whole response", p.Whole, vkn, v.PL(),
-			func(k derived.Key, body any) (string, error) { return derived.SealView(k, v, body) },
-			func(jwe string, v derived.View) ([]byte, error) { return derived.OpenView(jwe, keyOf, v) }},
 		{"the hit", p.Item, vkr, v.ItemPL("demo", "derby"),
 			func(k derived.Key, body any) (string, error) { return derived.SealItem(k, v, "derby", body) },
 			func(jwe string, v derived.View) ([]byte, error) {
@@ -436,13 +394,13 @@ func TestV082C2ViewKey(t *testing.T) {
 			"a scheme and host":               "https://index.example" + view,
 		}
 		if len(altered) != 4 || !strings.Contains(p.Rejected, "`+` for the space, lowercase hex (`%2ftitle`) or the parameters in another order, or with a scheme and host") {
-			t.Fatalf("C.2's rejected views changed: %s", p.Rejected)
+			t.Fatalf("§I.23's rejected views changed: %s", p.Rejected)
 		}
 		for what, target := range altered {
 			av := derived.View{NS: "demo", Target: target}
 			// A JWE whose pl.view is the altered form, however it was
 			// keyed, doesn't match the URL fetched.
-			avk, _ := seal.ViewKey(map[bool][]byte{true: kn, false: kr}[c.what == "the whole response"], target)
+			avk, _ := seal.ViewKey(kr, target)
 			apl := seal.PL{}
 			for k, x := range c.pl {
 				apl[k] = x
@@ -477,20 +435,13 @@ func TestV082C2ViewKey(t *testing.T) {
 	if !ok || !bytes.Equal(jsonv.Canonical(m), []byte(served)) || m["sealed"] != p.Item.JWE || m["resource"] != "derby" || m["id"] != idC {
 		t.Errorf("the served hit: %s", served)
 	}
-	whole := jsonv.MustParse([]byte(p.Whole.Plaintext)).(map[string]any)
-	hit := whole["hits"].([]any)[0].(map[string]any)
-	vals2 := jsonv.MustParse([]byte(p.Item.Plaintext)).(map[string]any)
-	for k, x := range hit {
+	// Its sealed members are the plaintext's, and no clear one is among
+	// them (the whole response they are split from is C.4's,
+	// TestV085C4WholeResponse).
+	for k := range jsonv.MustParse([]byte(p.Item.Plaintext)).(map[string]any) {
 		if _, clear := m[k]; clear {
-			if !jsonv.Equal(m[k], x) {
-				t.Errorf("the served hit's %s is %v, the whole response's %v", k, m[k], x)
-			}
-		} else if !jsonv.Equal(vals2[k], x) {
-			t.Errorf("the hit's sealed %s is %v, the whole response's %v", k, vals2[k], x)
+			t.Errorf("the hit's %s is both sealed and in the clear", k)
 		}
-	}
-	if len(hit) != len(m)-1+len(vals2) {
-		t.Errorf("the hit's members split into %d clear and %d sealed, of %d", len(m)-1, len(vals2), len(hit))
 	}
 }
 
@@ -534,17 +485,17 @@ func v82vecAuthority(t *testing.T, token string) string {
 	return ""
 }
 
-// C.3 (§G.4.1): three changes to §I.20's bundle, each matched to the
-// candidate's sha-256 and then rejected whole by the bundle Reader, at the
-// line and for the rule the candidate names: a grant line whose grant
-// isn't the id of its root (the id of §I.21's ops-2027 root block, in the
-// grant line and both history lines); one whose stored block's grant_block
+// I.24 (§G.4.1): three changes to §I.20's bundle, each matched to the
+// spec's sha-256 and then rejected whole by the bundle Reader, at the
+// line and for the rule named: a grant line whose grant isn't the id of
+// its root (the id §I.21 states for its ops-2027 root block, in the grant
+// line and both history lines); one whose stored block's grant_block
 // isn't canonical(root) (the authority block of §I.21's token with sub
 // first, validly signed); and a header member §G.4.1 doesn't define. The
 // Writer refuses to write the first two.
-func TestV082C3BundleRejections(t *testing.T) {
+func TestI24BundlesRefused(t *testing.T) {
 	t.Parallel()
-	p := loadCandidates(t).C3
+	p := loadAddendumI(t).I24
 	ai := loadAddendumI(t)
 	b := ai.I20.Bundle
 	if d, err := readBundle(b); err != nil || d != ai.I20.Digest {
@@ -560,7 +511,7 @@ func TestV082C3BundleRejections(t *testing.T) {
 		return ""
 	}
 	if len(p.Rows) != 3 {
-		t.Fatalf("%d rows in candidates.json, want 3", len(p.Rows))
+		t.Fatalf("%d rows in addendum_i.json, want 3", len(p.Rows))
 	}
 	ls := strings.SplitAfter(b, "\n")
 
@@ -570,7 +521,7 @@ func TestV082C3BundleRejections(t *testing.T) {
 		t.Fatal(err)
 	}
 	if g27.ID().String() != p.Grant {
-		t.Errorf("the id of §I.21's ops-2027 root block is %s, the candidate's %s", g27.ID(), p.Grant)
+		t.Errorf("the id of §I.21's ops-2027 root block is %s, §I.21's %s", g27.ID(), p.Grant)
 	}
 	if n := strings.Count(b, i4GrantID); n != 3 {
 		t.Fatalf("§I.20's bundle names its grant %d times, want 3", n)

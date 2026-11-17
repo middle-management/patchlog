@@ -573,8 +573,9 @@ type nsCmd struct {
 }
 
 // nsLsCmd is patchlog ns ls: GET /ns (§7.4, v0.84), every page. The
-// server answers only an operator grant whose blocks name "*" in ns and
-// list config in can, without rules (§C.4), or anyone while
+// server answers only an operator grant whose blocks name "*" in ns, that
+// carries no roles, and whose blocks list config where they carry can and
+// carry no rule (§7.4, §C.4, v0.85), or anyone while
 // authentication is disabled.
 type nsLsCmd struct {
 	toolArgs

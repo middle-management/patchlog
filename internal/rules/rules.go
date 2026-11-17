@@ -56,22 +56,56 @@ func not3(t Tri) Tri {
 	return Unknown
 }
 
-// blind is the set of top-level envelope members whose values are
-// unknown (EvalTri); nil for none.
-type blind map[string]bool
+// Meter bounds the work of the schema tests of the rules evaluated with
+// it (§6.6 Validation work): together they may take Max steps, a step
+// being one schema or subschema applied to one value, as
+// jsv.ValidateOptions.Budget counts them. Steps already holds what else
+// drew on the same budget, a write's own validation.
+//
+// Once the steps run out Over is set, and every schema test from then on
+// is False without being run. Tri has no value for that, so the outcome of
+// an evaluation that left Over set means nothing: a test cut short under a
+// not would pass. Callers check Over before they read the outcome.
+type Meter struct {
+	Max   int // 0: no limit
+	Steps int // taken so far; where they ran out, a lower bound of what was needed
+	Over  bool
+}
+
+// Left is the steps m still allows, and whether there are any; with none
+// it sets Over. 0 with ok is no limit, as jsv reads a budget of 0, so a
+// caller never hands jsv the 0 of a meter that has run out.
+func (m *Meter) Left() (n int, ok bool) {
+	if m.Max <= 0 {
+		return 0, true
+	}
+	if m.Over || m.Steps >= m.Max {
+		m.Over = true
+		return 0, false
+	}
+	return m.Max - m.Steps, true
+}
+
+// blind is what an evaluation doesn't see or may not spend: hidden, the
+// set of top-level envelope members whose values are unknown (EvalTri),
+// nil for none; and meter, the bound on its schema tests, nil for none.
+type blind struct {
+	hidden map[string]bool
+	meter  *Meter
+}
 
 // hides reports whether p reads what b makes unknown: a value at or below
 // an unknown member, or the whole envelope, which holds them. Presence
 // (an exists test) is known at the member and above it, since the
 // envelope holds the member whatever its value, and unknown below it.
 func (b blind) hides(p pointer.Pointer, presence bool) bool {
-	if len(b) == 0 {
+	if len(b.hidden) == 0 {
 		return false
 	}
 	if len(p) == 0 {
 		return !presence
 	}
-	return b[p[0]] && !(presence && len(p) == 1)
+	return b.hidden[p[0]] && !(presence && len(p) == 1)
 }
 
 type node interface {
@@ -149,7 +183,7 @@ func compileList(v any, strict func(any) bool) ([]*Rule, error) {
 }
 
 // Eval evaluates the rule against a change envelope.
-func (r *Rule) Eval(env map[string]any) bool { return r.n.eval(env, nil) == True }
+func (r *Rule) Eval(env map[string]any) bool { return r.n.eval(env, blind{}) == True }
 
 // EvalTri evaluates the rule against a change envelope in which the
 // top-level members unknown name are hidden from the server, as writes
@@ -160,16 +194,24 @@ func (r *Rule) Eval(env map[string]any) bool { return r.n.eval(env, nil) == True
 // presence of the member itself); all, any, not and if combine in Kleene
 // logic. With no unknown members it is Eval.
 func (r *Rule) EvalTri(env map[string]any, unknown ...string) Tri {
-	return r.n.eval(env, blindOf(unknown))
+	return r.n.eval(env, blindOf(unknown, nil))
 }
 
-func blindOf(unknown []string) blind {
+// EvalMetered is EvalTri with the rule's schema tests drawing on m (nil:
+// no bound). If it leaves m.Over set, the steps ran out and the value
+// returned means nothing (Meter).
+func (r *Rule) EvalMetered(env map[string]any, m *Meter, unknown ...string) Tri {
+	return r.n.eval(env, blindOf(unknown, m))
+}
+
+func blindOf(unknown []string, m *Meter) blind {
+	b := blind{meter: m}
 	if len(unknown) == 0 {
-		return nil
+		return b
 	}
-	b := blind{}
-	for _, m := range unknown {
-		b[m] = true
+	b.hidden = map[string]bool{}
+	for _, u := range unknown {
+		b.hidden[u] = true
 	}
 	return b
 }
@@ -182,7 +224,7 @@ func blindOf(unknown []string) blind {
 // of an all (/all/{k}) or a then (/then/{k}); any, not, test, writes and
 // compare stop at themselves.
 func EvalList(rs []*Rule, env map[string]any) (int, string, bool) {
-	i, path, t := evalList(rs, env, nil)
+	i, path, t := evalList(rs, env, blind{})
 	return i, path, t == True
 }
 
@@ -192,12 +234,45 @@ func EvalList(rs []*Rule, env map[string]any) (int, string, bool) {
 // False, as EvalList's, and the rule's own, /rules/{i}, for Unknown,
 // whose rule fails as a whole (§6.2); (-1, "", True) if all pass.
 func EvalTri(rs []*Rule, env map[string]any, unknown ...string) (int, string, Tri) {
-	return evalList(rs, env, blindOf(unknown))
+	return evalList(rs, env, blindOf(unknown, nil))
+}
+
+// EvalMetered is EvalTri with the rules' schema tests drawing on m (nil:
+// no bound). If it leaves m.Over set, the steps ran out at the rule whose
+// index it returns, and the value and path returned mean nothing (Meter).
+func EvalMetered(rs []*Rule, env map[string]any, m *Meter, unknown ...string) (int, string, Tri) {
+	return evalList(rs, env, blindOf(unknown, m))
+}
+
+// failPathWithin is n.failPath, which evaluates the failing members once
+// more, within what unk's meter has left: the steps it takes count, and if
+// they run out the rule has still failed, and the path stops at the rule
+// itself.
+func failPathWithin(n node, env map[string]any, unk blind) string {
+	m := unk.meter
+	if m == nil || m.Max <= 0 {
+		return n.failPath(env, unk)
+	}
+	left, ok := m.Left()
+	if !ok {
+		m.Over = false // the rule was decided within the budget
+		return ""
+	}
+	again := &Meter{Max: left}
+	path := n.failPath(env, blind{hidden: unk.hidden, meter: again})
+	m.Steps += min(again.Steps, left)
+	if again.Over {
+		return ""
+	}
+	return path
 }
 
 func evalList(rs []*Rule, env map[string]any, unk blind) (int, string, Tri) {
 	for i, r := range rs {
 		t := r.n.eval(env, unk)
+		if unk.meter != nil && unk.meter.Over {
+			return i, "", False
+		}
 		if t == True {
 			continue
 		}
@@ -207,7 +282,7 @@ func evalList(rs []*Rule, env map[string]any, unk blind) (int, string, Tri) {
 		}
 		path := "/rules/" + strconv.Itoa(at)
 		if t == False {
-			path += r.n.failPath(env, unk)
+			path += failPathWithin(r.n, env, unk)
 		}
 		return i, path, t
 	}
@@ -479,7 +554,24 @@ func (n *testNode) eval(env map[string]any, unk blind) Tri {
 		if !ok {
 			return False
 		}
-		return tri(n.schema.Validate(v, jsv.ValidateOptions{}) == nil)
+		m := unk.meter
+		if m == nil {
+			return tri(n.schema.Validate(v, jsv.ValidateOptions{}) == nil)
+		}
+		// A budget of 0 is no limit to jsv: a meter with nothing left
+		// refuses the test here.
+		left, ok := m.Left()
+		if !ok {
+			return False
+		}
+		var st jsv.Stats
+		err := n.schema.Validate(v, jsv.ValidateOptions{Budget: left, Stats: &st})
+		m.Steps += st.Steps
+		if errors.Is(err, jsv.ErrBudget) {
+			m.Over = true
+			return False
+		}
+		return tri(err == nil)
 	}
 }
 func (n *testNode) failPath(map[string]any, blind) string { return "" }
@@ -561,7 +653,7 @@ func writesOf(env map[string]any) (ps []pointer.Pointer, bad int) {
 }
 
 func (n *writesNode) eval(env map[string]any, unk blind) Tri {
-	if unk["writes"] {
+	if unk.hidden["writes"] {
 		return Unknown
 	}
 	ws, bad := writesOf(env)

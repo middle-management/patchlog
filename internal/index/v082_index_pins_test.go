@@ -413,7 +413,7 @@ func TestV082CatalogPurgedWhileDown(t *testing.T) {
 	w := newV75XOn(t, clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}))
 	db := filepath.Join(t.TempDir(), "i.db")
 	x1 := v0261Start(w, db, false, false, "matches")
-	li := w.reader("user:li", []any{"fans"})
+	li := w.readerVia("user:li", []any{"fans"})
 	r := x1.raw("/matches", li)
 	at := r.header.Get("Location")
 	if got := strings.Join(resources(x1.search("/matches", li)), ","); r.status != 302 || got != "derby,shared" {

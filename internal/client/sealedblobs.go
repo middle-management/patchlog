@@ -287,14 +287,12 @@ func (c *Client) openBlob(ctx context.Context, ns, name, bid string, sealed []by
 	if err != nil {
 		return nil, fmt.Errorf("client: sealed blob: %w", err)
 	}
-	// A base's blob an e2e branch reads through keeps the base's sealing
-	// (Addendum E Levels, readThrough).
+	// Sealed for delivery, so by a sealed (E2) namespace, which seals all
+	// it serves under its own keys, a branch's read-through blobs
+	// included (§E.2.5; Addendum E Levels, v0.85: a base's ns only at
+	// E3, whose blobs are sealed by their writers, not for delivery).
 	if kns != ns {
-		if through, err := c.readThrough(ctx, ns, kns); err != nil {
-			return nil, fmt.Errorf("client: reading the bases of %s: %w", ns, err)
-		} else if !through {
-			return nil, fmt.Errorf("client: blob of %s is sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
-		}
+		return nil, fmt.Errorf("client: blob of %s is sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
 	}
 	key, err := c.keys.key(ctx, c, h.Kid, name, ns)
 	if err != nil {

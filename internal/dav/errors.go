@@ -38,9 +38,6 @@ type davError struct {
 	// (403), as one without tree-derived access refuses every grant that
 	// doesn't read its namespaces whole (§B.11.5)
 	svcRefused bool
-	// read: the core's 408 or 503 to a read (a GET) this answers, which
-	// a save answers the other way round (asSave, §H.4 "The base")
-	read *client.APIError
 }
 
 func (e *davError) Error() string {
@@ -107,12 +104,17 @@ func limitRefusal(ae *client.APIError, more string) *davError {
 // lock that may go), 410 purged stays (§8.5) and another 410 (deleted
 // meanwhile, pruned) is a 409 asking for a reload, a limit refused (413,
 // or 422 code limit) is 413 with the limit and sizes the core gave
-// (limitRefusal, §6.6), the other 422s keep their errors, 429 and 408 are
-// 503 with Retry-After, as is a timeout, and anything else the core
-// failed with (a 5xx among them) is 502. A failure to reach the core is
-// 502 too, its details (the core's address) only logged. Writes map 412 and patch failures themselves. The text is the
-// core's code and message: the status is the answer's own, and the core's
-// is named only where it differs.
+// (limitRefusal, §6.6), and the other 422s keep their errors.
+//
+// A request that failed for now has one rule, for every method, reads and
+// writes alike (§H.4 "Answers", v0.85; FILE-18): 503 with Retry-After
+// after the core's 429 or 503, or where no answer came in time; else 502,
+// after its 408, any other 5xx, and where there is no connection. A 502
+// names the service and its status only: nothing of the answer that caused
+// it (§C.6 Upstream failures), which is logged with the core's address
+// (davError.cause, record). Writes map 412 and patch failures themselves.
+// Elsewhere the text is the core's code and message: the status is the
+// answer's own, and the core's is named only where it differs.
 func upstream(err error) error {
 	if err == nil {
 		return nil
@@ -168,42 +170,27 @@ func upstream(err error) error {
 		e := fail(http.StatusUnprocessableEntity, "%s", msg)
 		e.refresh = ae.Code == "nonce"
 		return e
-	case ae.Status == 429, ae.Status == 408:
-		e := busy(ae)
-		if ae.Status == 408 && ae.Method == http.MethodGet {
-			e.read = ae
-		}
-		return e
+	case ae.Status == 429, ae.Status == http.StatusServiceUnavailable:
+		return busy(ae)
 	}
-	e := fail(http.StatusBadGateway, "the core answered %d: %s", ae.Status, msg)
-	if ae.Status == http.StatusServiceUnavailable && ae.Method == http.MethodGet {
-		e.read = ae
-	}
-	return e
+	return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("the core answered %d", ae.Status), cause: err}
 }
 
-// asSave is e as a save answers it (§H.4 "The base": a failed read of
-// anything the save decides by is 503 with Retry-After after the core's
-// 429 or 503, else 502): where e answers the core's 503 or 408 to a
-// read as upstream does for any request (502, and 503), the other way
-// round, as saveRead maps them; otherwise e. Whichever read of a PUT
-// fails, it is answered so (record).
-func (e *davError) asSave() *davError {
-	if e == nil || e.read == nil {
-		return e
+// unreached is the answer for a request to a service (what names it) that
+// got no response, by §H.4's rule (v0.85): 503 with Retry-After where no
+// answer came in time, else, with no connection, 502. The failure, which
+// names the service's address, is logged, not answered.
+func unreached(what string, err error) *davError {
+	var ne net.Error
+	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &ne) && ne.Timeout() {
+		return &davError{status: http.StatusServiceUnavailable, msg: what + " didn't answer in time", cause: err,
+			header: http.Header{"Retry-After": {"5"}}}
 	}
-	out := *e
-	out.read = nil
-	if e.read.Status == http.StatusServiceUnavailable {
-		out.status, out.header = http.StatusServiceUnavailable, busy(e.read).header
-	} else {
-		out.status, out.header = http.StatusBadGateway, nil
-	}
-	return &out
+	return &davError{status: http.StatusBadGateway, msg: what + " can't be reached", cause: err}
 }
 
-// busy is the 503 a 429 or a 408 turns into once waiting is no longer
-// brief (§6.6, §H.4 "Answers").
+// busy is the 503 the core's 429 or 503 turns into once waiting is no
+// longer brief (§6.6, §H.4 "Answers").
 func busy(ae *client.APIError) *davError {
 	e := fail(http.StatusServiceUnavailable, "the core answered %d: %s", ae.Status, apiText(ae))
 	secs := int(math.Ceil(ae.RetryAfter.Seconds()))
@@ -334,28 +321,21 @@ func (w *errWriter) Write(b []byte) (int, error) {
 
 // saveRead is the error of a read a save decides by (§H.4 "The base":
 // the head, the base and the revisions between, their log, whose entries
-// they are): one that failed for now (failedRead) fails the save, 503
-// with Retry-After after the core's 429 or 503, else 502. upstream gives
-// the 429 its 503 (after retrying waited it out, where brief), any other
-// 5xx its 502, a core that can't be reached its 502 and a timeout of the
-// gateway's own, with no answer to go by, 503 with Retry-After; the two
-// it answers otherwise for other requests are mapped here, the core's
-// 503 (503 with its Retry-After, not 502) and its 408 (502, not 503).
-// Any other error is returned as it is.
+// they are): one that failed for now (failedRead) fails the save, as
+// upstream answers a request that failed for now for every method since
+// v0.85 (§H.4 "Answers"): 503 with Retry-After after the core's 429 or
+// 503 or no answer in time, else 502. Any other error is returned as it
+// is.
 func saveRead(err error) error {
 	var de *davError
 	if err == nil || errors.As(err, &de) || !failedRead(err) {
 		return err
 	}
-	ae, ok := client.AsAPIError(err)
-	if !ok {
-		return err
-	}
-	switch ae.Status {
-	case http.StatusServiceUnavailable:
-		return busy(ae)
-	case http.StatusRequestTimeout:
-		return fail(http.StatusBadGateway, "the core answered %d: %s", ae.Status, apiText(ae))
+	// The core's 503 and 408 are answered here, as before v0.85, when
+	// they were a save's alone; the rest is left to upstream as it is,
+	// for the callers that look at it first (failedRead).
+	if ae, ok := client.AsAPIError(err); ok && (ae.Status == http.StatusServiceUnavailable || ae.Status == http.StatusRequestTimeout) {
+		return upstream(err)
 	}
 	return err
 }

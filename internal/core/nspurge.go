@@ -19,6 +19,8 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		if aerr != nil {
 			return aerr
 		}
+		// The write's rules draw on one validation meter (§6.6, writeMeter).
+		defer t.metered(func() bool { return t.canRead(n, cfg, a, name) })()
 		if err := t.authorize(a, "purge", name); err != nil {
 			return err
 		}
@@ -232,6 +234,8 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		if aerr != nil {
 			return aerr
 		}
+		// The write's rules draw on one validation meter (§6.6, writeMeter).
+		defer t.metered(nil)()
 		if err := t.authorize(a, "purge-ns", ""); err != nil {
 			return err
 		}

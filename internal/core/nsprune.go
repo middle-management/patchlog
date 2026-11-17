@@ -60,6 +60,8 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		if aerr != nil {
 			return aerr
 		}
+		// The write's rules draw on one validation meter (§6.6, writeMeter).
+		defer t.metered(func() bool { return t.canRead(n, cfg, a, name) })()
 		if err := t.authorize(a, "prune", name); err != nil {
 			return err
 		}

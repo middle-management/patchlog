@@ -334,7 +334,7 @@ func TestFailPath(t *testing.T) {
 		if r.Eval(e) {
 			t.Fatalf("rule %d should fail", i)
 		}
-		if got := r.n.failPath(e, nil); got != want[i] {
+		if got := r.n.failPath(e, blind{}); got != want[i] {
 			t.Errorf("rule %d failPath %q want %q", i, got, want[i])
 		}
 	}

@@ -435,8 +435,9 @@ type Namespace struct {
 // of name, strictly after after, a plain bound ("" = the first page), and,
 // if prefix isn't "", only those whose names start with it, a namespace
 // name (§3.6). next is "" on the last page. The server answers only an
-// operator grant whose blocks name "*", list config and carry no rules
-// (§C.4), or anyone while authentication is disabled; a server before
+// operator grant whose blocks name "*", that carries no roles, and whose
+// blocks list config where they carry can and carry no rule (§7.4, §C.4,
+// v0.85), or anyone while authentication is disabled; a server before
 // v0.84 has no such route (404 or 405).
 func (c *Client) Namespaces(ctx context.Context, after, prefix string) (items []Namespace, next string, err error) {
 	if prefix != "" && !ValidNSName(prefix) {

@@ -1332,6 +1332,8 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 	// The operator grant is checked for config, which covers the schema
 	// histories the creation mirrors and the namespaces it creates for
 	// them (§C.2, §C.4).
+	// The write's rules draw on one validation meter (§6.6, writeMeter).
+	defer t.metered(func() bool { return true })()
 	if aerr := t.authorize(a, "config", ""); aerr != nil {
 		return nil, nil, nil, aerr
 	}

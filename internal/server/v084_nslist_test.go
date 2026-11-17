@@ -11,6 +11,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // v0.84 §7.4 GET /ns?after={name}: the deployment's namespaces, for
@@ -211,23 +212,23 @@ func TestV084NamespacesAuthOrder(t *testing.T) {
 		}
 	}
 
-	// 403: a verified operator grant naming "*" that
-	// lacks config in a block's can, or has rules in a block, even ones
-	// that pass or an empty list.
+	// 403: a verified operator grant naming "*" with a block that carries
+	// can without config, or non-empty rules, even ones that pass; and
+	// one that carries roles, in any block, even an empty list (v0.85;
+	// CONFORMANCE Access 79).
 	for name, g := range map[string]string{
 		"no config":                      e.opGrant(map[string]any{"can": []any{"purge", "purge-ns"}}).Encode(),
 		"roles, no can":                  e.opGrant(map[string]any{"can": nil, "roles": []any{"admin"}}).Encode(),
 		"rules that pass":                e.opGrant(map[string]any{"rules": passing}).Encode(),
-		"empty rules":                    e.opGrant(map[string]any{"rules": []any{}}).Encode(),
 		"a narrowing block drops config": narrowed(t, e.opGrant(map[string]any{"can": []any{"config", "purge"}}), map[string]any{"can": []any{"purge"}}),
+		"a narrowing block reads":        narrowed(t, e.opGrant(nil), map[string]any{"can": []any{"read"}}),
 		"a narrowing block has rules":    narrowed(t, e.opGrant(nil), map[string]any{"can": []any{"config"}, "rules": passing}),
-		// Every block lists config: one that narrows without a can
-		// doesn't (SPEC-FEEDBACK 101).
-		"a narrowing block without can": narrowed(t, e.opGrant(nil), map[string]any{"via": "svc:admin"}),
-		"an exp-only narrowing block":   narrowed(t, e.opGrant(nil), map[string]any{"exp": e.clock.Now().Add(time.Minute).Format(time.RFC3339)}),
+		"a can-less block has rules":     narrowed(t, e.opGrant(nil), map[string]any{"rules": passing}),
 		// A grant that carries roles has no effective role under an
 		// operator key, so nothing allows config (§C.2 Invariant).
-		"roles": e.opGrant(map[string]any{"roles": []any{"admin"}}).Encode(),
+		"roles":                  e.opGrant(map[string]any{"roles": []any{"admin"}}).Encode(),
+		"empty roles":            e.opGrant(map[string]any{"roles": []any{}}).Encode(),
+		"roles in a later block": narrowed(t, e.opGrant(nil), map[string]any{"roles": []any{}}),
 	} {
 		r := e.get("/ns", g)
 		if r.Code != 403 || r.Obj()["code"] != "forbidden" {
@@ -238,13 +239,19 @@ func TestV084NamespacesAuthOrder(t *testing.T) {
 		}
 	}
 
-	// 200: every block lists config and none has rules; more verbs,
-	// "*" beside a name, and narrowing blocks that keep config.
+	// 200: every block that carries can lists config and none has a
+	// rule; more verbs, "*" beside a name, narrowing blocks that keep
+	// config or carry no can, and "rules": [], which is none (v0.85;
+	// v0.82 Open 101, settled in v0.85).
 	for name, g := range map[string]string{
 		"more verbs":      e.opGrant(map[string]any{"can": []any{"config", "purge", "purge-ns"}}).Encode(),
 		"* beside a name": e.opGrant(map[string]any{"ns": []any{"main", "*"}}).Encode(),
 		"narrowed, config kept": narrowed(t, e.opGrant(map[string]any{"can": []any{"config", "purge"}}),
 			map[string]any{"via": "svc:admin", "can": []any{"config"}, "ns": []any{"*"}, "exp": e.clock.Now().Add(time.Minute).Format(time.RFC3339)}),
+		"empty rules":                     e.opGrant(map[string]any{"rules": []any{}}).Encode(),
+		"a narrowing block without can":   narrowed(t, e.opGrant(nil), map[string]any{"via": "svc:admin"}),
+		"a via and exp narrowing block":   narrowed(t, e.opGrant(nil), map[string]any{"via": "svc:admin", "exp": e.clock.Now().Add(time.Minute).Format(time.RFC3339)}),
+		"a narrowing block's empty rules": narrowed(t, e.opGrant(nil), map[string]any{"rules": []any{}}),
 	} {
 		if r := e.get("/ns", g); r.Code != 200 {
 			t.Errorf("%s: %d %s, want 200", name, r.Code, r.Body)
@@ -577,5 +584,50 @@ func TestV084NamespacesDefaultPage(t *testing.T) {
 	rows, next = e.nsPage("after=" + next)
 	if got := rowNames(rows); !reflect.DeepEqual(got, []string{"n1000", "n1001", "n1002"}) || next != "" {
 		t.Fatalf("last page %v, next %q", got, next)
+	}
+}
+
+// CONFORMANCE Access 80 (§7.4, §C.2 item 1; v0.85): an operator grant
+// naming "*" that its operator key's scope doesn't allow is 403 at GET
+// /ns, as on any other request, between the 401s and the config check; the
+// same grant expired is 401.
+func TestV085NamespacesKeyScope(t *testing.T) {
+	t.Parallel()
+	pub, priv := grant.GenerateKey()
+	e := newEnv(t, func(o *core.Options) {
+		ks, err := grant.ParseKeys(jsonv.FromGo([]any{map[string]any{"kid": "operator", "alg": "ed25519", "pub": pub,
+			"can": []any{"config"}, "sub": "op:.*", "maxTtl": "PT2H"}}))
+		if err != nil {
+			panic(err)
+		}
+		o.OperatorKeys = ks
+		o.AuthDisabled = false
+	})
+	e.opPriv = priv
+	expect(t, e.get("/ns", e.lister()), 200)
+	in := func(d time.Duration) string { return e.clock.Now().Add(d).Format(time.RFC3339) }
+	for name, g := range map[string]string{
+		"sub":                      e.opGrant(map[string]any{"sub": "user:eve"}).Encode(),
+		"maxTtl":                   e.opGrant(map[string]any{"exp": in(3 * time.Hour)}).Encode(),
+		"can":                      e.opGrant(map[string]any{"can": []any{"config", "purge"}}).Encode(),
+		"sub, and no config":       e.opGrant(map[string]any{"sub": "user:eve", "can": []any{"purge"}}).Encode(),
+		"sub, narrowed to nothing": narrowed(t, e.opGrant(map[string]any{"sub": "user:eve"}), map[string]any{"can": []any{}}),
+	} {
+		r := e.get("/ns", g)
+		if r.Code != 403 || r.Obj()["code"] != "forbidden" || r.H.Get("Cache-Control") != "no-store" {
+			t.Errorf("%s: %d %s %v, want 403", name, r.Code, r.Body, r.H)
+		}
+	}
+	for name, g := range map[string]string{
+		"sub, expired":       e.opGrant(map[string]any{"sub": "user:eve", "exp": in(-time.Minute)}).Encode(),
+		"sub, not yet valid": e.opGrant(map[string]any{"sub": "user:eve", "nbf": in(time.Minute)}).Encode(),
+	} {
+		if r := e.get("/ns", g); r.Code != 401 || r.Obj()["code"] != "unauthenticated" {
+			t.Errorf("%s: %d %s, want 401", name, r.Code, r.Body)
+		}
+	}
+	// Before verification, the ns check still answers 403 for both.
+	if r := e.get("/ns", e.opGrant(map[string]any{"sub": "user:eve", "ns": []any{"main"}}).Encode()); r.Code != 403 {
+		t.Fatalf("ns names a namespace: %d %s", r.Code, r.Body)
 	}
 }

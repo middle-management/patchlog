@@ -430,6 +430,51 @@ func (s *Service) listed() map[string]bool {
 	return listed
 }
 
+// ReadsSomewhere reports whether token allows read in a namespace the
+// service follows that it verifies in (§B.11.4 The caller's grant, v0.85:
+// "where the grant allows read (§C.2 item 2, counting only roles item 5
+// lets count) in no namespace the service follows that it verifies in"):
+// vg, the grant as verified for the catalog (nil where it doesn't verify
+// there), or the grant as verified in a content namespace the catalog
+// trusts and the service follows now, one it stopped following or holds
+// as purged aside, isn't grantcheck.ReadsNothing. A grant's roles are
+// each namespace's own, so one whose roles list read only in a content
+// namespace reads there and nowhere in the catalog. Where it reads in
+// none it could judge and a requireAt chain of another couldn't be read,
+// that failure is returned (503 or 502, §C.4), never a refusal.
+func (s *Service) ReadsSomewhere(ctx context.Context, token string, vg *grant.Verified) (bool, error) {
+	if vg != nil && !grantcheck.ReadsNothing(vg) {
+		return true, nil
+	}
+	var nss []string
+	s.View(func(g *Graph, cur map[string]string) {
+		for ns := range g.Trust {
+			if _, purged := s.purged[ns]; cur[ns] != "" && !purged && !g.isStopped(ns) {
+				nss = append(nss, ns)
+			}
+		}
+	})
+	sort.Strings(nss)
+	var unread error
+	for _, ns := range nss {
+		cv, err := s.verify(ctx, s.actual(ns), token)
+		switch _, chain := chainErr(err); {
+		case chain:
+			if unread == nil || transientChain(unread) && !transientChain(err) {
+				unread = err
+			}
+		case err == nil && !grantcheck.ReadsNothing(cv):
+			return true, nil
+		}
+	}
+	return false, unread
+}
+
+// errReadsNothing refuses, at every /g/{gs} URL and at the exchange, a
+// grant POST /read-grants refuses as the caller's grant for allowing
+// read nowhere (§B.11.5 Listing URLs, v0.85; ReadsSomewhere).
+var errReadsNothing = &grant.AuthError{Status: 403, Msg: "the grant allows read in no namespace this service follows (§B.11.4 The caller's grant, §C.2 items 2 and 5)"}
+
 // grantViewer is the viewer of a reader presenting token ("" for none)
 // where the listings aren't all public (publicViewer), at a URL whose
 // subject set is want ("" for none, as for the exchange):
@@ -554,6 +599,15 @@ func (s *Service) grantViewer(ctx context.Context, token, want string) (*viewer,
 	if v.bucket == "" {
 		// Verified for no namespace at all.
 		return nil, catErr
+	}
+	// One that allows read in no namespace the service follows reads no
+	// listing, whatever its subjects, and gets no edge grant: before
+	// v0.85 a grant without read, say can: ["append"], read its subject
+	// set's listings (§B.11.5 Listing URLs, scenario 140).
+	if reads, err := s.ReadsSomewhere(ctx, token, vg); err != nil {
+		return nil, err
+	} else if !reads {
+		return nil, errReadsNothing
 	}
 	if all && (want == "" || want == AllSubjects || s.opt.RoleView == nil) {
 		// Unfiltered (§B.11.5).
@@ -1227,6 +1281,8 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		s.rekeyAs(v, l.prof)
 		setPtr()
 		redirect(w, moved(l.at))
+	case l.nameOnly:
+		s.writeListingNoStore(w, l.st)
 	default:
 		s.writeListing(w, r, v, at, l.st)
 	}
@@ -1267,6 +1323,11 @@ type computed struct {
 	msg    string
 	// noStore: the refusal holds only until the reader exchanges again.
 	noStore bool
+	// nameOnly: the listing left values out because the epoch of the
+	// revision they derive from isn't judged yet (§E.2.6 Per-entry
+	// sealing, v0.85): it is served no-store, and neither stored nor
+	// kept.
+	nameOnly bool
 	// prof is the RoleView's profile at at (Profiler), the one recorded
 	// with it (recordAt), nil without one.
 	prof Profile
@@ -1424,6 +1485,9 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		prof     Profile
 		more     []keptPage
 		judged   map[string]*judgement
+		// unjudged is whether the listing, as last computed, left
+		// values out for an epoch that isn't judged.
+		unjudged bool
 	)
 	for {
 		// Sealed whole only where every reader the URL admits reads the
@@ -1466,9 +1530,10 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			// are read in; until then (epochsPending) it may be one not
 			// read in yet, and a head a fill couldn't read for good
 			// (unreadEpoch) is never judged: it may be one of an older
-			// epoch. An implicit placement and a node without a
-			// head have no revision of the catalog to judge: their values
-			// are the current epoch's (see epochOf).
+			// epoch. An implicit placement has no revision of the
+			// catalog to judge, and nothing of it is sealed as the
+			// catalog's (entry); a node without a head has none either,
+			// and its values are the current epoch's (see epochOf).
 			unjudged := func(n *Node) bool {
 				if n == nil || n.Epoch > 0 || n.Head == "" || n.Self {
 					return false
@@ -1612,9 +1677,11 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				run()
 			}
 		})
-		if nameOnly || fs.pending {
+		unjudged = nameOnly || fs.pending
+		if unjudged {
 			// The fill that judges them drops the listings that left
-			// them out (backfillEpochs).
+			// them out (backfillEpochs): none is stored or kept since
+			// v0.85, but a sealed store from before may hold some.
 			s.nameOnly.Store(true)
 		}
 		if reread || fs.reread {
@@ -1677,9 +1744,17 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	if l.st, serr = stored(view, body, tags); serr != nil {
 		return nil, serr
 	}
-	if !keep {
+	if !keep || unjudged {
 		// Neither stored nor kept: whether it may be served depends on
-		// the reader. The kept generation guards it all the same, as it
+		// the reader, or it serves entries by name only, or leaves
+		// file metadata out, until the epoch of a revision is judged,
+		// "in a response that is no-store and isn't stored" (§E.2.6
+		// Per-entry sealing, Stored once, v0.85; scenario 73): once it
+		// is judged, a listing at the same at carries the values.
+		// Before v0.85 such a listing was stored and served as any
+		// other, until the fill that judged dropped it.
+		l.nameOnly = unjudged
+		// The kept generation guards it all the same, as it
 		// does a listing that is kept: one computed from what was read
 		// before a purge of what it shows is not served (§A.1, §B.5),
 		// and is computed again (currentListing).
@@ -1960,6 +2035,23 @@ func (s *Service) cdnAll() time.Duration {
 // stored with.
 func (s *Service) writeListing(w http.ResponseWriter, r *http.Request, v *viewer, at string, st derived.Stored) {
 	s.setListingHeaders(w, r, v, at, st.Tags)
+	if st.JSON {
+		w.Header().Set("Content-Type", "application/json")
+	} else {
+		w.Header().Set("Content-Type", seal.ContentType)
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write(st.Body)
+}
+
+// writeListingNoStore writes a listing that isn't stored, one that left
+// values out until an epoch is judged (computed.nameOnly; §E.2.6
+// Per-entry sealing, v0.85): no-store, for browsers and edges alike, and
+// without tags, since nothing keeps it.
+func (s *Service) writeListingNoStore(w http.ResponseWriter, st derived.Stored) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Surrogate-Control", "no-store")
 	if st.JSON {
 		w.Header().Set("Content-Type", "application/json")
 	} else {
@@ -2581,10 +2673,27 @@ const noSuchNode = "no such node"
 // only for items of namespaces that are neither sealed nor e2e, which the
 // service doesn't hold it for (Apply), since §E.2.2 keeps the exact
 // created of their revisions in their logs.
+//
+// An implicit placement has no revision of its own, so in a sealed or e2e
+// catalog nothing it carries is sealed as the catalog's (§E.2.6 Per-entry
+// sealing, v0.85: a value "that an entry with no revision of its own
+// carries, such as an implicit placement (§B.9), is sealed in place as a
+// value of another resource is"): its file metadata is sealed under its
+// item's K_r and its head's epoch (query.file), and its title and born,
+// which the service holds only for an item whose namespace is neither
+// sealed nor e2e and so has no K_r, are protected as that item is: in the
+// clear, on an entry that carries no "sealed", to readers of the item
+// (itemClear; scenario 82: for an item of a sealed namespace, "born and
+// title left out"). Before v0.85 they were sealed under the catalog
+// node's K_r at the catalog's current epoch.
 func (q *query) entry(n *Node) map[string]any {
 	q.tags.node(q.g, n.Name)
 	m := map[string]any{"href": q.g.Href(n.Name), "name": n.Name, "kind": "folder"}
-	vals := map[string]any{}
+	// vals are the values the entry takes from the node's own revision,
+	// sealed per entry where the listing is; own those an implicit
+	// placement, which has no revision in the catalog, takes from its
+	// item.
+	vals, own := map[string]any{}, map[string]any{}
 	if n.Title != "" {
 		vals["title"] = n.Title
 	}
@@ -2605,12 +2714,16 @@ func (q *query) entry(n *Node) map[string]any {
 			m["self"] = true
 		}
 		if q.v.item(q.g, n) && n.ItemHead != "" {
-			if n.Title == "" && n.ItemTitle != "" {
+			switch {
+			case n.Title != "" || n.ItemTitle == "":
+			case n.Self:
+				own["title"] = n.ItemTitle
+			default:
 				// The head's title (§B.5), unless the placement has its own.
 				vals["title"] = n.ItemTitle
 			}
 			if n.Self && n.Born != "" {
-				vals["born"] = n.Born
+				own["born"] = n.Born
 			}
 			m["head"] = n.ItemHead
 			// In a release preview the head is the branch's: url reads it
@@ -2628,7 +2741,31 @@ func (q *query) entry(n *Node) map[string]any {
 		}
 	}
 	q.values(m, n.Name, vals)
+	if len(own) > 0 && q.itemClear(n) {
+		for k, v := range own {
+			m[k] = v
+		}
+	}
 	return m
+}
+
+// itemClear reports whether the values an implicit placement n takes
+// from its item (entry: own) go on its entry in the clear: in a catalog
+// that is neither sealed nor end-to-end, always, as before; in one that
+// is, unless the item's namespace is sealed or end-to-end by its document
+// as the graph holds it (Graph.Content, which a catalog service keeps),
+// since a namespace raised since such a value was read protects it now.
+// The service reads these values only from namespaces that are neither,
+// and drops those it holds as it applies a raise (applyLocked: items'
+// titles and self-placed borns go with the config entry), so without
+// that document, as in a service with no RoleView, there is none left to
+// show for an item of a sealed or end-to-end namespace.
+func (q *query) itemClear(n *Node) bool {
+	if !derived.InfoOf(q.g.Config).Protected() {
+		return true
+	}
+	c := q.g.Content[n.ItemNS]
+	return c == nil || !derived.InfoOf(c.Doc).Protected()
 }
 
 // bornLeftOut is bornApart's answer for a born whose epoch isn't known.
@@ -3358,7 +3495,7 @@ func (q *query) problems() (any, int, string) {
 			cycles = append(cycles, arr)
 		}
 	}
-	items, parents, deep := []any{}, []any{}, []any{}
+	items, parents := []any{}, []any{}
 	for _, name := range g.Names() {
 		n := g.Node(name)
 		if n.State == StateDangling {
@@ -3384,12 +3521,11 @@ func (q *query) problems() (any, int, string) {
 			}
 			parents = append(parents, e)
 		}
-		if n.Deep {
-			q.tags.node(g, name)
-			deep = append(deep, map[string]any{"href": g.Href(name), "depth": n.Depth})
-		}
 	}
-	return map[string]any{"at": q.at, "cycles": cycles, "danglingItems": items, "danglingParents": parents, "tooDeep": deep}, http.StatusOK, ""
+	// Paths deeper than 64 aren't listed here: only subtree, ancestors
+	// and where report such a cut, as "tooDeep": true (§B.5 Cycles,
+	// v0.85). Before v0.85 a tooDeep member listed those nodes.
+	return map[string]any{"at": q.at, "cycles": cycles, "danglingItems": items, "danglingParents": parents}, http.StatusOK, ""
 }
 
 // where answers "is this item in the catalog, and where?" with its

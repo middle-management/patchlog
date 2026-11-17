@@ -425,7 +425,7 @@ func (v *Validator) ValidateChangeBudget(doc any, load Loader, changed []string,
 	if !errors.As(err, &ve) {
 		return st.Steps, &SchemaError{Msg: compileMsg(err)}
 	}
-	return st.Steps, Failures(sch, inst, budget, ve)
+	return st.Steps, Failures(sch, inst, budgetLeft(budget, st.Steps), ve)
 }
 
 // ValidateRules is Validate: rules, the marker of the revision written,
@@ -614,7 +614,8 @@ func checkStoredSchema(doc any, path string) error {
 // check validates inst against sch within budget steps (0: no limit) and
 // returns the steps taken. A document that does not validate is validated
 // once more to list every failure (*ValidationError): first fast, to the
-// first failure, as most documents are valid; then collecting.
+// first failure, as most documents are valid; then collecting, within the
+// steps the first pass left of the budget.
 func check(sch *jsv.Schema, inst any, budget int) (int, error) {
 	var st jsv.Stats
 	err := sch.Validate(inst, jsv.ValidateOptions{Budget: budget, Stats: &st})
@@ -628,15 +629,34 @@ func check(sch *jsv.Schema, inst any, budget int) (int, error) {
 	if !errors.As(err, &ve) {
 		return st.Steps, &SchemaError{Msg: compileMsg(err)}
 	}
-	return st.Steps, Failures(sch, inst, budget, ve)
+	return st.Steps, Failures(sch, inst, budgetLeft(budget, st.Steps), ve)
+}
+
+// budgetLeft is what steps taken leave of budget (0: no limit), negative
+// where nothing is left: jsv reads a budget of 0 as no limit.
+func budgetLeft(budget, steps int) int {
+	if budget <= 0 {
+		return 0
+	}
+	if left := budget - steps; left > 0 {
+		return left
+	}
+	return -1
 }
 
 // Failures lists every failure of inst against sch, which ve says it
 // fails, as a *ValidationError: its details sorted by pointer, then
-// message, without repeats. Listing them has the budget anew; if that runs
-// out, the document is still invalid, and ve alone says why.
+// message, without repeats. Listing them may take budget steps (0: no
+// limit; negative: none, so nothing is listed), which callers that bound
+// validation give as what finding ve left of their budget (§6.6
+// Validation work); if that runs out, the document is still invalid, and
+// ve alone says why.
 func Failures(sch *jsv.Schema, inst any, budget int, ve *jsv.ValidationError) *ValidationError {
-	fs, err := sch.Collect(inst, jsv.ValidateOptions{Budget: budget})
+	var fs []jsv.Failure
+	var err error
+	if budget >= 0 {
+		fs, err = sch.Collect(inst, jsv.ValidateOptions{Budget: budget})
+	}
 	if err != nil || len(fs) == 0 {
 		return &ValidationError{Errors: []Detail{{Pointer: ve.InstancePath, Message: ve.Message}}}
 	}

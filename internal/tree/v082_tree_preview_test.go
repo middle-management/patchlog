@@ -211,9 +211,14 @@ func TestV082PreviewUnreadHeadNeverJudged(t *testing.T) {
 	x = startSvc(t, p.sc(lost), svcOpts{now: p.s.Now, db: p.db}, p.opts)
 	p.reach(t, x)
 	nameOnly(x, "after a restart")
-	// Readable again: the next listing computed (the catalog moved) has
-	// it read, and it gets its own epoch.
+	// Readable again: a head a fill couldn't read isn't asked for again
+	// while the service runs (unknownEpoch), and since v0.85 a listing by
+	// name only is computed on every request, none being stored, so the
+	// one above already asked. Started again, the next listing computed
+	// has it read, and it gets its own epoch.
 	gone.Store(false)
+	x.stop()
+	x = startSvc(t, p.sc(lost), svcOpts{now: p.s.Now, db: p.db}, p.opts)
 	must(p.x2.CreateDocSealed(ctx, "catb", "z", map[string]any{"title": "Z", "parents": parents("root@a2")}))
 	p.reach(t, x)
 	waitFor(t, "own to be read", func() bool {

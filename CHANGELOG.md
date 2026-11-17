@@ -1,5 +1,222 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.85** (previously **v0.84**). v0.85 is the spec's answer to the reference's
+103 open notes on v0.82 to v0.84 (docs/SPEC-FEEDBACK.md, "Settled in v0.85"): by its own count
+45 already matched the text or are the implementation's business, and the rest got a clause
+each. What the reference changed for them is below, by subject; the 60 notes this work leaves
+are the new list, "v0.85 Open n".
+
+- **`GET /` answers `"spec": "0.85"`**, and the docs mirror v0.85 (SPEC, SERVICES, TOOLS,
+  CONFORMANCE, the spec's change log, the proposed vectors).
+
+Rates and validation:
+
+- **`validationSteps` is §6.6's, and covers a write's rules** (§6.6 Validation work, §6.2
+  step 5, §12.2; CONFORMANCE LIM-7, scenario 82; v0.82 Open 92). The limit the reference
+  added in v0.30.0 for validating one document is now the spec's, with the same unit and
+  default (5,000,000 steps, one schema or subschema applied to one value), and wider:
+  - **One budget for a write's validation and its rules' `schema` tests together.** The rule
+    tests were not counted before. Grant, key-scope and role rules (step 1 and step 6) and
+    namespace rules draw on the same meter as step 5. Each step of each batch item has the
+    limit to itself (§7.5 checks every step with its own envelope); a config, branch or prune
+    write, a purge, a registration and a blob upload have one meter each for their rules, a
+    batch's `config` change its own, and a remote branch's creation one for its step 1 and one
+    for its step 6, which run in separate transactions. Every candidate verb tried at step 1
+    counts.
+  - **Running out is `422` `limit` at any stage**, also inside a grant rule whose own failure
+    is `403`, and at step 1, where it comes before the rate limits and draws no token. A write
+    that passed, or was `403` or `422 rule`, with rule `schema` tests that take more than the
+    limit is now refused this way.
+  - **`measured` is left out for a writer who can't read the resource**, as for the other
+    limits on the resulting document; `max` stays.
+  - **Listing an invalid document's failures takes what is left of the limit**, where it had
+    the limit anew: an invalid document near the limit may get a `422 invalid` that names its
+    first failure alone.
+  - **`validationSteps` is a deployment-only limit by name**: a namespace document that sets
+    `limits.validationSteps` is `422 invalid` as for the other deployment-only limits (it was
+    `422 invalid` as an unknown limit), and `GET /ns/{ns}/principal` lists it in
+    `writer.limits`. `serve --max-validation-steps 0` still lifts the limit, as an operator's
+    explicit choice the spec doesn't provide for; `/principal` then leaves it out.
+  - Reads are not bounded: the spec bounds writes, and rule `schema` tests evaluated for a
+    read, an exchange or a key request are not counted.
+  - `internal/rules`: `Meter`, `Rule.EvalMetered` and `EvalMetered`; `schema.Failures` takes
+    the steps it may spend.
+- **Refused writes keep their rate tokens: tests only** (§6.2 step 1, §6.6 Cost; CONFORMANCE
+  GATE-2, LIM-3, scenario 81; v0.82 Open 90). v0.85 says what the server did already: rate
+  limits come last in step 1, so a `412`, a tombstoned resource's `410`, a `428`, a frozen
+  namespace's `409`, a settled verb's `403` and an idempotent retry's `200` each spend a
+  token, and a step-1 `403` spends none. New tests pin each.
+- **Deployment maxima of `ratePerResource` and `ratePerPrincipal`** (`serve
+  --max-rate-per-resource`, `--max-rate-per-principal`) are what §6.6 intends, and an
+  allowance's writes stay held to the namespace's `ratePerResource` (v0.82 Open 89): no change.
+
+`GET /ns`, documents, bundles and tools:
+
+- **`GET /ns`: which operator grants list** (§7.4, v0.85; CONFORMANCE HTTP-69, Access 79 and
+  80). Only a block that carries `can` must list `config`, so a grant narrowed by a block with
+  `via` or `exp` alone lists; `"rules": []` is no rule; a grant that carries `roles` in any
+  block, an empty list included, is `403`. A grant its operator key's scope doesn't allow
+  (`can`, `sub`, `maxTtl`, …) is now `403`, as on every other request, where it was `401`; an
+  expired or badly signed one stays `401`.
+- **Bundles: a grant line's `key` must be its root's** (§G.4.1, v0.85; Import scenario 47).
+  A reader rejects the bundle whole, at step 1 of an import and before anything is written,
+  where a grant line's `key` has a `kid` other than `root.kid` or doesn't verify the `stored`
+  block (the block's signature alone). Such a bundle used to be read, with the signatures
+  under that grant reported as failed. The writer refuses such a line; `patchlog export`
+  already wrote only keys that verify. The two candidates of VECTORS-PROPOSED.md C.5
+  reproduce byte for byte and are rejected (`internal/vectors`, `TestV085C5GrantLineKey`).
+- **WebDAV gateway: one rule for a request that failed for now** (TOOLS §H.4 "Answers",
+  v0.85; FILE-18, Access scenario 78). For every method, reads and writes alike: `503` with
+  `Retry-After` after the core's or a tree service's `429` or `503`, or where no answer came
+  in time; `502` after its `408`, another `5xx`, or where there is no connection. Before,
+  only a save answered so, and other requests answered a core `408` with `503` and a `503`
+  with `502`; a tree service that timed out was `502`. A failed read never counts as a
+  refusal: a `408` to `GET /ns/{ns}/principal` or to the namespace document is no longer
+  kept, so a `DELETE`, `MOVE` or `COPY` meanwhile is `502` where it was `403`, and a `MKCOL`
+  fails too where it went ahead with default settings; `GET` and `PROPFIND` that read those
+  fail the same way where they were served from the kept answer. No write of a `DELETE`,
+  `MOVE`, `COPY` or `MKCOL` is sent once such a read has failed in the request, also where
+  it is the written namespace's own and the catalog's answered: a tree `DELETE` deleted
+  the placement and the item on default settings before. The catalog service's answers
+  follow the same rule. A `502` now names the service and its status only; the core's,
+  tree service's or catalog service's message is logged, not answered (§C.6 Upstream
+  failures).
+- **Stream proxy (`patchlog streams`), TOOLS Addendum J as v0.85 has it.** Most of what
+  v0.85 writes down the proxy already did (continuations `{id}.{n}` covered by the read
+  grant, callers identified through `GET /ns/{ns}/principal`, `exp` counted from the stream's
+  creation, upstream error answers and `3xx` kept with their status, sealed and end-to-end
+  namespaces refused). What changes:
+  - **A stream is purged with its continuations** (§J.4 Expiry): all its resources once the
+    last one it continued in is closed and `--ttl` has passed since the stream's creation.
+    Before, each resource was judged by its own creation, so the first could be purged while
+    a continuation was still being written, and a continuation outlived the read grants.
+  - **A stream closed by another proxy stops at once** (§J.2 Restarts): the proxy sees
+    `closed` in the log it follows and cancels upstream then, not at its next append or its
+    own idle timeout. It appends nothing more, as before.
+  - **`--segment-size`** (`Options.SegmentSize`): the size at which a stream continues in its
+    next resource, below the namespace's `documentSize` (§J.1 Size suggests 256 KiB where
+    latency matters). Default: `documentSize`, as before.
+  - The refusal of a sealed namespace no longer speaks of a design v0.85 dropped.
+  A read grant's `exp` is still the earlier of the stream's creation plus `--ttl` and the
+  proxy grant's own `exp`: a narrowed grant can't outlive the grant it was narrowed from.
+- **Playground: reading answers sealed per entry** (SERVICES §E.2.6, §B.5 Previews, v0.85;
+  E3 scenario 84).
+  - A value drawn from an entry's item (a placement's `file`) is compared with the resource
+    the entry's content `url` names, which in a release preview is the release branch's, and
+    with the item's own where the entry has no such URL. The tree service's own `branch`
+    member, which the spec doesn't define, is no longer read. A URL in another namespace than
+    the item's still counts only where that namespace's document names the item's as its
+    base, now also through a branch of it, so a stacked release branch opens where it showed
+    by name only.
+  - Of an entry that carries `sealed`, only what §E.2.6 leaves in the clear is taken from
+    outside it: a tree entry keeps its names, links, head, order, item file and listing
+    structure, and loses every other member in the clear, where it lost `title` and `born`
+    alone.
+
+Sealed forms, end-to-end reads and vectors:
+
+- **A base's `ns` is accepted only at E3, and only up to the foreign parent** (Addendum E
+  Levels, §E.2.2, §E.3.1, §G.3; v0.82 Open 13; CONFORMANCE E2E scenarios 80, 81). The Go
+  client's sealed path (`Doc`, `Log`, resource events and blobs sealed for delivery, the §E.2.2
+  forms) no longer opens a payload whose `kid` or `pl.ns` names a base of the namespace read:
+  `seal.ErrMismatch`, without asking for the base's keys or document. It accepted that for an
+  end-to-end branch, at any position of its chain, a case no deployment has served since v0.78
+  (a sealed branch seals what it reads through under its own keys; an end-to-end branch's base
+  is end-to-end and serves sealed patch sets and snapshots). The `E2E` view, which reads those,
+  already bounded a local base's sealing by the fork; it now bounds a remote chain too, taking
+  the fork from the remote branch's own `/heads` at its first entry, and flags an entry sealed
+  under the chain past it. The playground's fold does the same for local bases (`nsChainOK`
+  reads the base's `/heads` at the branch's `at`), flagging "sealed under a base's key … past
+  the foreign parent"; a fork it can't place isn't checked.
+- **The index takes a pending head's epoch from the origin's sealing** (SERVICES §E.2.6
+  Per-entry sealing, §E.2.2; v0.82 Open 17). A revision indexed in the clear before its
+  namespace was raised to `sealed` has no `kid`. Its hits were sealed under the epoch in force
+  when the index first sealed one; the index now reads the head again and seals under the epoch
+  of the `kid` the origin serves it under, which a rotation in between makes another. The `kid`
+  is read from the served JWE's header, which needs no key (`client.DocKid`, new), so where the
+  index's grant gets no key for that epoch the hit is served by name only, as any hit of such
+  an epoch is. While that read may yet succeed a query answers `503` (`behind`); a head that
+  is gone stays unjudged and nothing derived from it is sealed. End-to-end namespaces are
+  judged as before. No migration: only heads still pending are affected.
+- **A branch catalog served directly lists what it reads through** (SERVICES §B.5 Previews;
+  v0.82 Open 21). A tree service whose catalog is itself a branch starts from the branch's
+  first entry and its `/heads` there, as a release preview does, so its graph holds the base's
+  nodes as of the branch's `at`. A database that followed such a catalog before is rebuilt
+  (`--rebuild`) to gain them.
+- **Vectors.** §I.17 as v0.85 recomputed it (I.20's accepted bundle sealed in three lines, and
+  padded) reproduces in full through `seal.OpenBundle`, the bundle Reader and `seal.Pad`; the
+  candidates C.1–C.3 are Addendum I's §I.22–§I.24 (`internal/vectors/addendum_i22_test.go`);
+  the new candidates C.4 (a whole response sealed at an index `gs` over `reads:demo:key:…`) and
+  C.5 (grant lines whose `key` doesn't match) reproduce too. docs/TESTVECTORS.md has the detail.
+- **Tests for clauses the reference already met:** a tombstone's `…/raw` in sealed and
+  end-to-end namespaces is `404` (`not_offered`), never the `410` with `last` (scenario 78); a
+  client refuses a base's current namespace document naming a lower or unknown level, and
+  keeps the level it holds (scenario 79).
+
+Access and coverage at the origin and the services (the answers to v0.82 Open 32–71 and 88,
+and to 19 and 20):
+
+- **Index markers name their key: `reads:{ns}:key:{id}`** (§A.4 `gs`, Open 34; as the proposed
+  vector C.4 computes it). A reader with namespace-wide `read` gets the marker of the key that
+  verified its grant, by `kid` and `pub`, so readers through two keys have two `gs`, two sets
+  of prefixes and results, and a change to one key ends only its readers' cookies. It was
+  `reads:{ns}` for every key. **Private result URLs of such readers change**, and a cookie
+  minted before the upgrade is `403` until its reader exchanges again. Cookies of one marker
+  are still told apart by `exp`, and an exchange with no second left is still `503 behind`.
+- **An index exchange behind a key or role change is `503 behind`** (§A.4 `gs`, §12.1, Open 35,
+  scenario 134), with `Retry-After` and no cookie, ranked with an unreadable `requireAt` chain:
+  the index's checkpoint of a covered namespace is behind a change to the key that verified
+  the grant or to a role it reads through, or the namespace's document moved during the
+  exchange. Before, it minted a cookie that was `403` at its first use.
+- **A cookie on a purged sealed namespace is judged by the last document the index read**
+  (§A.4 Unavailable namespaces, Open 36, scenario 135): one a document the index applied ended
+  is `403`, not the purge's `410`. The index ends such cookies as it applies each namespace
+  document, so one stays ended should the document change back.
+- **A `requireAt` naming a purged namespace fails the scope: `403`** (§C.4, Open 42, scenario
+  77), with the one text of a rejected `at`, at the origin, which went on verifying an `at` in
+  the purged namespace's kept log, and at the services, where a sealed one was `502` and an
+  unsealed one's grant still verified. A catalog's key in a content namespace therefore signs
+  nothing that verifies once the catalog is purged.
+- **An uncovered purged namespace's filtered URLs are `403`, or `401`** (§B.11.9 Purged covered
+  namespaces, Open 43, scenario 141), never `410`: only a purged namespace filtered reads cover
+  answers them as its unfiltered forms.
+- **The caller's grant is judged in every namespace the catalog service follows** (§B.11.4,
+  Open 37, scenario 136): `POST /read-grants` and a `want` listing `read` refuse, `403`, a grant
+  that allows `read` in none it verifies in; one whose roles list `read` only in a content
+  namespace was refused before. **Listings and the service's exchange refuse such a grant too**
+  (§B.11.5 Listing URLs, Open 41, scenario 140): a grant without `read` no longer reads its
+  subject set's listings. **`POST /merge-grants` refuses an approver whose grant has a block or
+  key-scope rule on `/now`** (Open 40, scenario 139).
+- **A stopped namespace at the catalog service** (§B.5 Behind, Open 50, scenario 142): its
+  items are `502 upstream` whatever the service can still read of it, and no `checkpoint` names
+  it.
+- **`/problems` no longer lists `tooDeep`** (§B.5 Cycles, Open 68): only `subtree`, `ancestors`
+  and `where` report a path cut at depth 64, as `"tooDeep": true`. The playground follows.
+- **A listing that leaves values out until an epoch is judged is `no-store` and isn't stored**
+  (§E.2.6 Per-entry sealing, Open 20, scenario 73): the tree service computes it on each
+  request, and the same `at` URL carries the values once the epoch is judged.
+- **An implicit placement's values are its item's** (§E.2.6, Open 19, scenario 82): in a
+  sealed or end-to-end catalog nothing of it is sealed under the catalog's keys. Its item's
+  title and `born`, held only for items of namespaces that are neither, are on its entry in
+  the clear, with no `sealed`; they were sealed under the catalog node's `K_r` at the
+  catalog's current epoch. The playground shows them.
+- **A purged sealed catalog counts as no catalog at the index** (§B.11.9 Where, Open 88): its
+  document is `410` at its purge head, whatever the index read of it while it lived. A partial
+  reader of a namespace that trusts only such a catalog gets `403` with no marker, where the
+  trust recorded before kept the namespace covered and dark. An unsealed one is read at its
+  purge head, as before.
+- **The index reuses a successful `GET /` for a minute at most** (§B.11.9 Where, Open 46), and
+  nothing after a read that failed.
+- **A service's `502` carries nothing of the origin's answer** (§C.6 Upstream failures, Open
+  55): already so at the index, the tree and the catalog service, now tested; an origin answer
+  the catalog service met unwrapped, which was a `500` quoting it, is a `502` of its own.
+- Confirmed against the text, with tests where there were none: inherited access stops 64
+  levels up (§B.11.2, scenario 132), no exchange revives an ended cookie (§B.11.9 `gs`), a
+  mixed `want` gets the narrower `can`, and only a malformed request's `400` precedes the
+  caller's-grant `403`.
+
 ## v0.30.0
 
 Implements spec **v0.84** (previously **v0.82**). v0.83 adds TOOLS.md's Addendum J, suggested

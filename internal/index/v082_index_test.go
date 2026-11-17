@@ -6,13 +6,16 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/index"
 	"github.com/middle-management/patchlog/internal/svcedge"
@@ -24,8 +27,8 @@ import (
 // scenario 120).
 
 // newV82Whole is newV77Docs's setup with keys k1 and k2 that have no
-// scope rules, so their grants read docs whole: their marker is
-// reads:docs, which every such reader shares whatever its key.
+// scope rules, so their grants read docs whole: their markers are
+// reads:docs:{k}, one per key, which every such reader through it shares.
 func newV82Whole(t *testing.T) *v77docs {
 	t.Helper()
 	ctx := context.Background()
@@ -48,6 +51,13 @@ func newV82Whole(t *testing.T) *v77docs {
 		})
 	d.x.caughtUp("docs")
 	return d
+}
+
+// readsGS is the gs of a reader of private ns whole through key k: the
+// subject set of its one marker, reads:{ns}:{k}, k's key: string by kid
+// and pub (§A.4 gs, v0.85).
+func readsGS(ns string, k clienttest.Key) string {
+	return grantcheck.SubjectSetID([]string{"reads:" + ns + ":" + catvis.KeySubject(k.Kid, k.Pub)})
 }
 
 // v82Grant is k's grant for sub with the role reader, expiring exp from
@@ -191,25 +201,29 @@ func TestV082CookieWithoutEntry(t *testing.T) {
 	}
 }
 
-// TestV082CookieWindowOtherReaders (SVC-10; §A.4 gs: "403 until the
-// reader exchanges again"; the v0.76 rule that one reader's exchange
-// never rescues another's cookie, TestV076PubSharedMarker): readers of
-// docs whole share the marker reads:docs and its prefixes whatever their
-// key. A cookie carries its prefix and exp alone, so the index keeps the
-// keys per marker and exp, and gives a cookie through other keys, or
-// through a key whose entry has changed, another exp:
+// TestV082CookieWindowOtherReaders (SVC-10; §A.4 gs, v0.85, scenario 76:
+// "Two readers of private docs with namespace-wide read, through keys k1
+// and k2 → GET /_refs → different gs, as their markers are
+// reads:docs:{k}. k1's groups scope changes → only the k1 reader's cookie
+// is 403, until she exchanges again; another reader's exchange through
+// k1 doesn't revive it"). Readers of docs whole through one key share the
+// marker reads:docs:{k} and its prefixes; those through another key have
+// their own. A cookie carries its prefix and exp alone, so the index
+// keeps the keys per marker and exp, and gives a cookie through a key
+// whose entry has changed another exp:
 //
-//   - al and bo read through k1, cy through k2, each with a cookie of its
-//     own exp; di reads through k2 with a grant that expires when al's
-//     does, and her cookie is another, expiring a second earlier;
+//   - al and bo read through k1, cy and di through k2: two gs, each
+//     pair's prefixes the same, whatever its grants' exps;
 //   - once k1's sub scope changes, al's and bo's cookies are 403; cy's
-//     and di's, which no exchange through k1 minted, still read;
+//     and di's, through k2, still read;
 //   - bo exchanges again, then cy: each reads under its new cookie, and
 //     al's stays 403 at the prefix, at an at URL already answered and at
-//     /_refs, through the same key and through another: no exchange but
-//     one for her own cookie vouches for it;
+//     /_refs: no exchange but one for her own cookie vouches for it;
 //   - al exchanges again and reads under her new cookie, which is
 //     another: the one she held stays 403.
+//
+// Before v0.85 the marker was reads:docs for every key, and all four
+// shared one gs.
 func TestV082CookieWindowOtherReaders(t *testing.T) {
 	t.Parallel()
 	d := newV82Whole(t)
@@ -219,60 +233,74 @@ func TestV082CookieWindowOtherReaders(t *testing.T) {
 	bo := v82Grant(d, d.k1, "user:bo", now.Add(5*time.Minute))
 	cy := v82Grant(d, d.k2, "user:cy", now.Add(7*time.Minute))
 	di := v82Grant(d, d.k2, "user:di", alExp)
-	prefixes, alC := d.exchange(al)
-	_, boC := d.exchange(bo)
-	_, cyC := d.exchange(cy)
-	_, diC := d.exchange(di)
-	if alC[0].Name != diC[0].Name || alC[0].Value == diC[0].Value {
-		t.Fatalf("al's and di's cookies, through k1 and k2 for one prefix: %v, %v", alC[0], diC[0])
+	p1, alC := d.exchange(al)
+	pBo, boC := d.exchange(bo)
+	p2, cyC := d.exchange(cy)
+	pDi, diC := d.exchange(di)
+	for ns, k := range map[string]clienttest.Key{"docs": d.k1, "_refs": d.k1} {
+		gs := readsGS("docs", k)
+		if want := map[string]string{"docs": "/docs/g/" + gs, "_refs": "/_refs/g/" + gs}[ns]; p1[ns] != want || pBo[ns] != want {
+			t.Fatalf("al's and bo's %s prefixes, through k1: %s, %s, want %s", ns, p1[ns], pBo[ns], want)
+		}
 	}
-	paths := v82Paths(prefixes)
-	_, at := p37Follow(t, d.x, paths[0], alC, "")
-	paths = append(paths, at)
+	if p2["docs"] == p1["docs"] || p2["_refs"] == p1["_refs"] || !reflect.DeepEqual(p2, pDi) {
+		t.Fatalf("prefixes through k2: cy %v, di %v; through k1: %v", p2, pDi, p1)
+	}
+	paths1, paths2 := v82Paths(p1), v82Paths(p2)
+	_, at := p37Follow(t, d.x, paths1[0], alC, "")
+	paths1 = append(paths1, at)
+	_, at = p37Follow(t, d.x, paths2[0], cyC, "")
+	paths2 = append(paths2, at)
 	const reads, refused = v82Reads + ",OK", v82Refuse + ",Forbidden"
-	for name, c := range map[string][]*http.Cookie{"al": alC, "bo": boC, "cy": cyC, "di": diC} {
-		if got := v82Status(t, d.x, paths, c); got != reads {
+	for name, c := range map[string][]*http.Cookie{"al": alC, "bo": boC} {
+		if got := v82Status(t, d.x, paths1, c); got != reads {
+			t.Fatalf("%s under its cookie: %s", name, got)
+		}
+	}
+	for name, c := range map[string][]*http.Cookie{"cy": cyC, "di": diC} {
+		if got := v82Status(t, d.x, paths2, c); got != reads {
 			t.Fatalf("%s under its cookie: %s", name, got)
 		}
 	}
 	d.patch(map[string]any{"op": "add", "path": "/keys/1/sub", "value": "user:.*"})
 	for name, c := range map[string][]*http.Cookie{"al": alC, "bo": boC} {
-		if got := v82Status(t, d.x, paths, c); got != refused {
+		if got := v82Status(t, d.x, paths1, c); got != refused {
 			t.Errorf("%s under its cookie once k1 changed: %s, want 403", name, got)
 		}
 	}
 	for name, c := range map[string][]*http.Cookie{"cy": cyC, "di": diC} {
-		if got := v82Status(t, d.x, paths, c); got != reads {
-			t.Errorf("%s, through k2, under a cookie no exchange through k1 minted: %s", name, got)
+		if got := v82Status(t, d.x, paths2, c); got != reads {
+			t.Errorf("%s, through k2, once k1 changed: %s", name, got)
 		}
 	}
 	_, boC = d.exchange(bo)
-	if got := v82Status(t, d.x, paths, boC); got != reads {
+	if got := v82Status(t, d.x, paths1, boC); got != reads {
 		t.Errorf("bo, exchanged again: %s", got)
 	}
-	if got := v82Status(t, d.x, paths, alC); got != refused {
+	if got := v82Status(t, d.x, paths1, alC); got != refused {
 		t.Errorf("al's cookie after bo exchanged again through k1: %s, want 403", got)
 	}
 	_, cyC = d.exchange(cy)
-	if got := v82Status(t, d.x, paths, cyC); got != reads {
+	if got := v82Status(t, d.x, paths2, cyC); got != reads {
 		t.Errorf("cy, exchanged again: %s", got)
 	}
-	if got := v82Status(t, d.x, paths, alC); got != refused {
+	if got := v82Status(t, d.x, paths1, alC); got != refused {
 		t.Errorf("al's cookie after cy exchanged again through k2: %s, want 403", got)
 	}
 	_, alC2 := d.exchange(al)
-	if got := v82Status(t, d.x, paths, alC2); got != reads {
+	if got := v82Status(t, d.x, paths1, alC2); got != reads {
 		t.Errorf("al once she exchanged again: %s", got)
 	}
-	if got := v82Status(t, d.x, paths, alC); got != refused {
+	if got := v82Status(t, d.x, paths1, alC); got != refused {
 		t.Errorf("the cookie al held before, once she exchanged again: %s, want 403", got)
 	}
 }
 
-// TestV082ExchangeTwoKeysOneMarker (SVC-10; §A.4 gs): one exchange with
-// two grants, through k1 and k2, gives one cookie for reads:docs, which
-// both keys vouch for: it is 403 once either changes. Before v0.82
-// nothing was recorded for it.
+// TestV082ExchangeTwoKeysOneMarker (SVC-10; §A.4 gs, v0.85): one exchange
+// with two grants, through k1 and k2, gives each key's marker its own
+// prefixes and cookies: a change to one key ends its cookies alone.
+// Before v0.85 both shared reads:docs and one cookie, which either
+// change ended.
 func TestV082ExchangeTwoKeysOneMarker(t *testing.T) {
 	t.Parallel()
 	for i, path := range []string{"/keys/1/sub", "/keys/2/sub"} {
@@ -282,20 +310,23 @@ func TestV082ExchangeTwoKeysOneMarker(t *testing.T) {
 			exp := d.s.Now().Add(10 * time.Minute)
 			body := must(json.Marshal(map[string]any{"grants": []any{v82Grant(d, d.k1, "user:al", exp), v82Grant(d, d.k2, "user:cy", exp)}}))
 			r := p37Do(t, d.x, "POST", "/edge-grants", "", string(body), nil, "")
-			if r.status != 200 || len(r.cookies) != 2 {
+			if r.status != 200 || len(r.cookies) != 4 {
 				t.Fatalf("exchange: %d %v, %d cookies", r.status, r.body, len(r.cookies))
 			}
-			prefixes := map[string]string{}
-			for _, p := range r.body["prefixes"].([]any) {
-				prefixes[strings.Split(p.(string), "/")[1]] = p.(string)
-			}
-			paths := v82Paths(prefixes)
-			if got := v82Status(t, d.x, paths, r.cookies); got != v82Reads {
-				t.Fatalf("under the cookie: %s", got)
+			var paths [2][]string
+			for j, k := range []clienttest.Key{d.k1, d.k2} {
+				gs := readsGS("docs", k)
+				paths[j] = v82Paths(map[string]string{"docs": "/docs/g/" + gs, "_refs": "/_refs/g/" + gs})
+				if got := v82Status(t, d.x, paths[j], r.cookies); got != v82Reads {
+					t.Fatalf("under k%d's cookies: %s", j+1, got)
+				}
 			}
 			d.patch(map[string]any{"op": "add", "path": path, "value": "user:.*"})
-			if got := v82Status(t, d.x, paths, r.cookies); got != v82Refuse {
-				t.Errorf("under the cookie once key %d changed: %s, want 403", i+1, got)
+			if got := v82Status(t, d.x, paths[i], r.cookies); got != v82Refuse {
+				t.Errorf("under k%d's cookies once it changed: %s, want 403", i+1, got)
+			}
+			if got := v82Status(t, d.x, paths[1-i], r.cookies); got != v82Reads {
+				t.Errorf("under k%d's cookies once the other key changed: %s", 2-i, got)
 			}
 		})
 	}

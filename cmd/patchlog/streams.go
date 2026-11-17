@@ -38,7 +38,8 @@ type streamsCmd struct {
 	IdleTimeout    time.Duration `arg:"--idle-timeout" default:"2m" placeholder:"DURATION" help:"a stream with no append for this long is closed with \"timeout\" (§J.2)"`
 	State          string        `arg:"--state" placeholder:"FILE" help:"file keeping the names of the open streams, so a proxy started again closes them with \"error\" (§J.2)"`
 	MaxRequestBody byteSize      `arg:"--max-request-body" default:"1 MiB" placeholder:"SIZE" help:"largest request body forwarded upstream"`
-	MaxSegments    int           `arg:"--max-segments" default:"8" placeholder:"N" help:"most resources one upstream response may fill, each up to the namespace's documentSize (§J.1)"`
+	MaxSegments    int           `arg:"--max-segments" default:"8" placeholder:"N" help:"most resources one upstream response may fill, each up to the namespace's documentSize, or --segment-size (§J.1)"`
+	SegmentSize    byteSize      `arg:"--segment-size" placeholder:"SIZE" help:"size at which a stream continues in its next resource, where below the namespace's documentSize: each append costs the stream's size so far, so 256 KiB keeps appends fast (§J.1); 0 is documentSize"`
 	MaxStreams     int           `arg:"--max-streams" default:"64" placeholder:"N" help:"most streams carried at once (§J.2 Pace)"`
 	CreateNS       bool          `arg:"--create-ns" help:"create --ns with read: \"grant\" if it doesn't exist; only over a --dev server (under grants a namespace is created with an operator grant and lists the key of the proxy's grant)"`
 	Insecure       bool          `arg:"--insecure" help:"allow plain HTTP on an address other than loopback, so callers' grants and upstream credentials cross the network in the clear"`
@@ -93,7 +94,7 @@ func (a *streamsCmd) run(string) {
 		}
 	}
 	p, err := streams.New(sctx, streams.Options{Client: c, Grant: a.Bearer, NS: a.NS, CallerNS: a.CallerNS, PublicURL: a.PublicURL, Upstreams: a.Upstream,
-		Flush: a.Flush, TTL: a.TTL, IdleTimeout: a.IdleTimeout, StateFile: a.State, MaxRequestBody: int64(a.MaxRequestBody), MaxSegments: a.MaxSegments,
+		Flush: a.Flush, TTL: a.TTL, IdleTimeout: a.IdleTimeout, StateFile: a.State, MaxRequestBody: int64(a.MaxRequestBody), MaxSegments: a.MaxSegments, SegmentSize: int(a.SegmentSize),
 		MaxStreams: a.MaxStreams, Logf: log.Printf})
 	cancel()
 	if err != nil {

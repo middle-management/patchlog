@@ -30,6 +30,8 @@ type configPlan struct {
 // planConfig runs steps 1–6 of a config write on an existing namespace.
 func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBatch bool) (*configPlan, error) {
 	// Step 1.
+	// The write's rules draw on one validation meter (§6.6, writeMeter).
+	defer t.metered(func() bool { return t.readsNS(n, cur, a, false) })()
 	if err := t.authorize(a, "config", ""); err != nil {
 		return nil, err
 	}

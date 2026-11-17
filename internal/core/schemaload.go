@@ -58,11 +58,13 @@ import (
 // A patch to a document this engine has itself validated against the same
 // schema revision is validated only where it can have changed the verdict
 // (changedPaths, jsv.ValidateChange); anything else in full.
-func (t *tx) validateStep(step *stepState, sc *schemaCtx, pending map[string]any) (string, *Error) {
+//
+// The validation draws on m, the step's meter (writeMeter).
+func (t *tx) validateStep(step *stepState, sc *schemaCtx, pending map[string]any, m *writeMeter) (string, *Error) {
 	rules := t.docRules(step.id, step.doc, sc)
 	step.legacy = rules == schema.Legacy
 	changed, partial := t.e.changedPaths(step)
-	typed, err := t.validateDoc(step.doc, len(step.docCanon), changed, partial, sc, pending)
+	typed, err := t.validateDoc(step.doc, len(step.docCanon), changed, partial, sc, pending, m)
 	if err == nil {
 		if _, ok := schema.ParseRef(typed); ok {
 			t.e.validated.put(step.id, typed)
@@ -294,8 +296,9 @@ func (t *tx) prefetchRules(seqs []int64) {
 // validateDoc is step 5: resolve $schema and validate (§6.1). With
 // partial, the document is one changed at changed from one known valid
 // against the same schema revision (changedPaths), and is validated there.
-// It returns the document's $schema, if typed.
-func (t *tx) validateDoc(doc any, size int, changed []string, partial bool, sc *schemaCtx, pending map[string]any) (string, *Error) {
+// It returns the document's $schema, if typed. The validation draws on vm,
+// the write's meter, and is refused with its limit once that runs out.
+func (t *tx) validateDoc(doc any, size int, changed []string, partial bool, sc *schemaCtx, pending map[string]any, vm *writeMeter) (string, *Error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
 		return "", nil
@@ -338,8 +341,18 @@ func (t *tx) validateDoc(doc any, size int, changed []string, partial bool, sc *
 	// Each revision of the closure compiles under this version's rules,
 	// whatever its marker (§6.1), so neither rules nor the markers of the
 	// closure select anything.
+	// The validation may take what the write's meter has left: the rules
+	// of its step 1 drew on it already, and those of step 6 draw on the
+	// rest (§6.6 Validation work). A budget of 0 is no limit to the
+	// validator, so a meter with nothing left refuses here.
+	if vm == nil {
+		vm = t.newMeter(nil)
+	}
+	budget, ok := vm.Left()
+	if !ok {
+		return "", vm.over()
+	}
 	span := validateSpan(t.ctx, s, doc, size)
-	budget := max(t.e.opt.MaxValidationSteps, 0)
 	var steps int
 	var err error
 	mode := "full"
@@ -359,6 +372,11 @@ func (t *tx) validateDoc(doc any, size int, changed []string, partial bool, sc *
 		steps, err = t.e.validator.ValidateBudget(doc, load, budget)
 	}
 	endValidateSpan(span, err, steps, mode)
+	vm.Steps += steps
+	if be := (*schema.BudgetError)(nil); errors.As(err, &be) {
+		vm.Over = true
+		return "", vm.over()
+	}
 	if err != nil {
 		return "", schemaErr(err, s)
 	}

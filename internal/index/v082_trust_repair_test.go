@@ -319,19 +319,36 @@ func TestV082LostTrustGoneStays(t *testing.T) {
 		x, stop := r.start(false, nil)
 		x.caughtUp("matches")
 		x.caughtUp("cat-sec")
+		if n := r.rows(x, "cat-sec"); n != 1 {
+			t.Fatalf("%d rows of cat-sec's trust while the index follows it", n)
+		}
 		must(admin.PatchConfig(ctx, "cat-sec", must(admin.NSHead(ctx, "cat-sec")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
 		purged := must(admin.PurgeNamespace(ctx, "cat-sec", must(admin.NSHead(ctx, "cat-sec")).ID))
 		r.purgeApplied(x, "cat-sec")
 		if _, err := r.core.NSDoc(ctx, "cat-sec", purged); !client.IsPurged(err) {
 			t.Fatalf("the sealed catalog's document at its purge: %v, want 410", err)
 		}
-		if n := r.rows(x, "cat-sec"); n != 1 {
-			t.Fatalf("%d rows of cat-sec's trust once its purge is applied", n)
+		// A purged catalog whose document the origin doesn't serve at
+		// its purge head counts as no catalog, whatever the index read
+		// of it while it lived (§B.11.9 Where, v0.85: "one it can't read
+		// there counts as no catalog"): with the trust it recorded while
+		// it followed cat-sec, matches is uncovered here all the same,
+		// and li, a partial reader, has no marker (403). Before v0.85
+		// that row kept matches covered and dark (302).
+		waitFor(t, "matches without a catalog", func() bool { return r.status(x, li) == 403 })
+		time.Sleep(300 * time.Millisecond)
+		if st := r.status(x, li); st != 403 {
+			t.Fatalf("li once the sealed catalog is purged: %d, want 403 with no marker", st)
 		}
-		// With the trust it recorded while it followed cat-sec, matches
-		// is covered and dark: what the lost row takes away.
-		waitFor(t, "matches covered and dark", func() bool { return r.status(x, li) == 302 })
-		if n := must(x.ix.ExecForTest(ctx, `DELETE FROM catalog_trust WHERE ns = 'cat-sec'`)); n != 1 {
+		// The row it recorded may be gone by now, or not: no coverage
+		// reads cat-sec any more, so the reconciler stops following it
+		// for visibility, and forgetting that follower forgets a purged
+		// sealed catalog's trust with it (forgetMember, v0.85), whenever
+		// it gets to it. Either way it is gone before the index starts
+		// again, on a database that holds cat-sec's purge and no trust
+		// of it, which is what lostTrustStays is about: the read at the
+		// purge head is made once, is 410, and records nothing.
+		if n := must(x.ix.ExecForTest(ctx, `DELETE FROM catalog_trust WHERE ns = 'cat-sec'`)); n > 1 {
 			t.Fatalf("deleted %d rows", n)
 		}
 		stop()

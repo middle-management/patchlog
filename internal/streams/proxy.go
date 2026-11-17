@@ -63,9 +63,15 @@ type Options struct {
 	// 1 MiB).
 	MaxRequestBody int64
 	// MaxSegments bounds the resources one upstream response may fill: a
-	// stream about to pass documentSize continues in the next (J.1), and
-	// the read grant names all of them (default 8).
+	// stream about to pass documentSize, or SegmentSize, continues in the
+	// next (J.1), and the read grant names all of them (default 8).
 	MaxSegments int
+	// SegmentSize is the size, in bytes of the stream document, at which a
+	// stream continues in its next resource (J.1 Size, v0.85): each append
+	// costs the stream's size so far, so where latency matters a stream
+	// continues well below documentSize, at 256 KiB say. 0, or more than
+	// the namespace's documentSize, is documentSize.
+	SegmentSize int
 	// MaxStreams bounds the streams carried at once (J.2 Pace; default
 	// 64).
 	MaxStreams int
@@ -90,6 +96,7 @@ type Proxy struct {
 	authDisabled bool
 	nonce        bool
 	docSize      int // documentSize of the namespace
+	segSize      int // the size a stream continues at: docSize, or SegmentSize below it
 	setSize      int // patchSetSize
 	opsPerSet    int
 	maxChunk     int // most bytes of a chunk
@@ -195,9 +202,9 @@ func New(ctx context.Context, opt Options) (*Proxy, error) {
 	}
 	switch pi.Writer.Level {
 	case "sealed":
-		return nil, fmt.Errorf("streams: namespace %s is sealed: signing each reader a root grant with its enc (J.4 Encryption) is not implemented", opt.NS)
+		return nil, fmt.Errorf("streams: namespace %s is sealed: the stream proxy is for a namespace that is neither sealed nor end-to-end, as a sealed one's keys are wrapped to a grant's root block, so the narrowed read grant opens nothing for its reader (J.4 Encryption)", opt.NS)
 	case "e2e":
-		return nil, fmt.Errorf("streams: namespace %s is end-to-end encrypted, where the abort rule can't be judged (J.4): a stream proxy doesn't work there", opt.NS)
+		return nil, fmt.Errorf("streams: namespace %s is end-to-end encrypted: the stream proxy is for a namespace that is neither sealed nor end-to-end, as the abort rule can't be judged there (J.4 Encryption)", opt.NS)
 	}
 	if pi.Writer.Frozen {
 		return nil, fmt.Errorf("streams: namespace %s is frozen", opt.NS)
@@ -218,12 +225,16 @@ func New(ctx context.Context, opt Options) (*Proxy, error) {
 	// included (§6.6), where a control character is six bytes. A chunk
 	// stays far below it (J.1): half at most by that measure, 16 KiB of
 	// text, and small enough for a patch set and for four to a segment.
-	p.maxEnc = min(valueSize/2, (p.setSize-1024)/2, (p.docSize-reserve-256)/4) - 2
+	p.segSize = p.docSize
+	if opt.SegmentSize > 0 && opt.SegmentSize < p.docSize {
+		p.segSize = opt.SegmentSize
+	}
+	p.maxEnc = min(valueSize/2, (p.setSize-1024)/2, (p.segSize-reserve-256)/4) - 2
 	p.maxChunk = min(16<<10, p.maxEnc)
 	p.maxPending = 2 * p.setSize
 	if p.maxEnc < 6*64 || p.opsPerSet < 8 {
-		return nil, fmt.Errorf("streams: namespace %s's limits are too small for streams (documentSize %d, patchSetSize %d, valueSize %d, opsPerSet %d)",
-			opt.NS, p.docSize, p.setSize, valueSize, p.opsPerSet)
+		return nil, fmt.Errorf("streams: namespace %s's limits, or the segment size, are too small for streams (documentSize %d, segment size %d, patchSetSize %d, valueSize %d, opsPerSet %d)",
+			opt.NS, p.docSize, p.segSize, p.setSize, valueSize, p.opsPerSet)
 	}
 
 	if !p.authDisabled {

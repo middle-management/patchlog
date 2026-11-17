@@ -115,6 +115,10 @@ func (s *Service) upstream(what string, err error) error {
 	return &Error{Status: 502, Code: "upstream", Msg: "the catalog service can't read " + what}
 }
 
+// errStopped is why a stopped namespace's document isn't read
+// (contentConfig), for the log.
+var errStopped = errors.New("the service stopped following the namespace (§B.5 Behind)")
+
 // configErr answers a namespace document the checker couldn't read: 410
 // purged, with the core's head, the purge-ns entry, for a purged sealed
 // namespace, whose documents are 410 purged once the purge destroys their
@@ -197,14 +201,20 @@ func (s *Service) untrustedIn(g *tree.Graph, cur map[string]string, ns string) e
 // §B.11.5); then 410 purged for every name of a namespace the service
 // holds as purged (purgedIn). One whose document the core answers 410
 // purged (a sealed one, §8.5) is 410 purged too, from the core's head
-// (configErr).
+// (configErr). Then, whatever the checker could still read of it, 502
+// upstream for an item of a namespace the service stopped following
+// (§B.5 Behind, v0.85: "A catalog service answers a request naming one of
+// its items 502 (upstream) ... after any 403 its own catalog.trust
+// decides, or 410 once the namespace is purged").
 func (s *Service) contentConfig(ctx context.Context, ns string) (*grantcheck.Config, error) {
 	var err error
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		if err = s.untrustedIn(g, cur, ns); err != nil {
 			return
 		}
-		err = s.purgedIn(g, cur, ns)
+		if err = s.purgedIn(g, cur, ns); err == nil && g.Stopped(ns) {
+			err = s.upstream("the document of namespace "+ns, errStopped)
+		}
 	})
 	if err != nil {
 		return nil, err
@@ -244,11 +254,13 @@ func decidedAt(err error, checkpoint map[string]string) error {
 // which are all a decision on them depends on. So a write elsewhere, in
 // a content namespace the decision didn't read, doesn't move it, as the
 // combined checkpoint of listings (§B.5) would. A namespace the service
-// doesn't follow has no entry. Call it under View.
+// doesn't follow has no entry, nor has one it stopped following (§B.5
+// Behind, v0.85: "No checkpoint names the namespace"), whose last
+// checkpoint it still holds. Call it under View.
 func checkpointAt(g *tree.Graph, cur map[string]string, nss ...string) map[string]string {
 	cp := map[string]string{}
 	for _, ns := range append([]string{g.Catalog}, nss...) {
-		if id := cur[ns]; id != "" {
+		if id := cur[ns]; id != "" && !g.Stopped(ns) {
 			cp[g.Actual(ns)] = id
 		}
 	}
@@ -305,24 +317,55 @@ func (s *Service) Authenticate(ctx context.Context, r *http.Request) (*grant.Ver
 // key-scope rule that refers to /now (or the whole envelope), which no
 // read passes (§C.2 item 5, grantcheck.RefusedByNowRule); and, where the
 // request reads (POST /read-grants, or a want that lists read), a grant
-// that allows read nowhere it verifies in, which is the catalog namespace
-// (grantcheck.ReadsNothing: no read in its can, or roles none of which
-// counts for read, each having a rule on /now or not listing read). Any
-// other want from such a grant is judged as usual: a role with a rule on
-// /now still counts for a write there, though never for read (counts).
-// It comes after the 401 and the request-shape 400s, which no state
-// decides, and before every other answer: the ?min wait and its 400 or
-// 503, and the decision's 404, 409 and 410. It is decided at no
-// checkpoint and carries none.
-func callerRefused(v *grant.Verified, reads bool) error {
-	switch {
-	case grantcheck.RefusedByNowRule(v):
-		return &grant.AuthError{Status: 403, Msg: "the grant's rules refer to /now, which no read passes (§C.2 item 5)"}
-	case reads && grantcheck.ReadsNothing(v):
+// that allows read in no namespace the service follows that it verifies
+// in (v0.85; tree.Service.ReadsSomewhere): v, as verified for the
+// catalog, has no read in its can, or roles none of which counts for
+// read, each having a rule on /now or not listing read
+// (grantcheck.ReadsNothing), and so has the grant as verified in each
+// content namespace the service follows. Before v0.85 the catalog
+// namespace alone was judged, so a grant whose roles list read only in a
+// content namespace was refused. Any other want from such a grant is
+// judged as usual: a role with a rule on /now still counts for a write
+// there, though never for read (counts). It comes after the 401 and the
+// request-shape 400s, which no state decides, and before every other
+// answer: the ?min wait and its 400 or 503, and the decision's 404, 409
+// and 410. It is decided at no checkpoint and carries none. A requireAt
+// chain of a content namespace that can't be read, where the grant reads
+// in none that could, is returned as it is (503 or 502, §C.4).
+func (s *Service) callerRefused(ctx context.Context, v *grant.Verified, reads bool) error {
+	if grantcheck.RefusedByNowRule(v) {
+		return errNowRule
+	}
+	if !reads || !grantcheck.ReadsNothing(v) {
+		return nil
+	}
+	switch ok, err := s.t.ReadsSomewhere(ctx, v.Grant.Encode(), nil); {
+	case err != nil:
+		return err
+	case !ok:
 		return &grant.AuthError{Status: 403, Msg: "the grant allows no read (§C.2 items 2 and 5)"}
 	}
 	return nil
 }
+
+// chainRefusal is err, a requireAt chain a verifier couldn't read (§C.4),
+// as Issue answers it: 503 behind while the cause is transient, 502
+// upstream otherwise, naming no namespace; any other error as it is.
+func chainRefusal(err error) error {
+	var cu grant.ChainUnreadableError
+	switch {
+	case !errors.As(err, &cu):
+		return err
+	case cu.ChainUnreadable():
+		return &Error{Status: 503, Code: "behind", Msg: "the service cannot read the chain a key's requireAt names yet"}
+	}
+	return &Error{Status: 502, Code: "upstream", Msg: "cannot read the chain a key's requireAt names"}
+}
+
+// errNowRule is callerRefused's refusal of a grant with a block or
+// key-scope rule on /now, which POST /merge-grants answers an approver
+// too (serveMergeGrants).
+var errNowRule = &grant.AuthError{Status: 403, Msg: "the grant's rules refer to /now, which no read passes (§C.2 item 5)"}
 
 // verify verifies tok for the catalog namespace, failing as verifyHook
 // says where one is set (tests).
@@ -361,7 +404,7 @@ func (s *Service) serveGrants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if err := callerRefused(v, contains(req.Want, "read")); err != nil {
+	if err := s.callerRefused(r.Context(), v, contains(req.Want, "read")); err != nil {
 		tree.WriteAuthError(w, err, logf(s))
 		return
 	}
@@ -486,7 +529,7 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, badInput("items must list 1 to %d items", maxReadGrants))
 		return
 	}
-	if err := callerRefused(v, true); err != nil {
+	if err := s.callerRefused(ctx, v, true); err != nil {
 		tree.WriteAuthError(w, err, logf(s))
 		return
 	}
@@ -582,7 +625,7 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 			}
 			var ce *Error
 			if !errors.As(err, &ce) {
-				ce = &Error{Status: 500, Code: "internal", Msg: err.Error()}
+				ce = s.unexpected(err)
 			}
 			e["status"], e["code"], e["message"] = ce.Status, ce.Code, ce.Msg
 			if ce.Head != "" {
@@ -750,7 +793,30 @@ func writeErr(w http.ResponseWriter, err error) {
 		tree.WriteError(w, ce.Status, ce.Code, ce.Msg)
 		return
 	}
-	tree.WriteError(w, 500, "internal", err.Error())
+	ce = unexpected(err)
+	tree.WriteError(w, ce.Status, ce.Code, ce.Msg)
+}
+
+// unexpected is err, a failure that isn't one of the service's own
+// answers, as it is answered: 500 internal with its text, or, where it is
+// the origin's answer to a read no caller wrapped (upstream), 502
+// upstream with a message of the service's own: a service's 502 "carries
+// nothing of the answer that caused it" (§C.6 Upstream failures, v0.85),
+// and neither does its 500.
+func unexpected(err error) *Error {
+	if _, ok := client.AsAPIError(err); ok {
+		return &Error{Status: 502, Code: "upstream", Msg: "the catalog service can't read what the request needs"}
+	}
+	return &Error{Status: 500, Code: "internal", Msg: err.Error()}
+}
+
+// unexpected is unexpected(err), the origin's answer logged.
+func (s *Service) unexpected(err error) *Error {
+	ce := unexpected(err)
+	if ce.Status == 502 {
+		logf(s)("catalog: %v", err)
+	}
+	return ce
 }
 
 // Issue decides a grant request for the verified caller v and signs the
@@ -765,8 +831,13 @@ func (s *Service) Issue(ctx context.Context, v *grant.Verified, req Request) (*I
 	if err := s.shape(req); err != nil {
 		return nil, err
 	}
-	if err := callerRefused(v, contains(want, "read")); err != nil {
-		return nil, forbidden("%s", err.(*grant.AuthError).Msg)
+	if err := s.callerRefused(ctx, v, contains(want, "read")); err != nil {
+		var ae *grant.AuthError
+		if !errors.As(err, &ae) {
+			// A requireAt chain it can't read: 503 or 502, never 403.
+			return nil, chainRefusal(err)
+		}
+		return nil, forbidden("%s", ae.Msg)
 	}
 	switch {
 	case len(want) == 0:

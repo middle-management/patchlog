@@ -40,7 +40,7 @@ var sixSixKeys = []string{"patchSetSize", "opsPerSet", "documentSize", "valueSiz
 	"rulesPerNamespace", "rulesPerGrant", "grantSize", "itemsPerBatch", "batchSize", "logPageBytes", "logPageSize",
 	"branchDepth", "branchesPerNamespace", "ratePerResource", "ratePerPrincipal", "ratePerNamespace", "retryWindow",
 	"keepPerResource", "remoteRegistration", "blobSize", "blobsPerDocument", "blobPending", "blobGrace", "blobRate",
-	"exchangeRate"}
+	"exchangeRate", "validationSteps"}
 
 // v0.55 §7.4: what a grant is in a namespace, to a grant limited to some
 // resources or without read too, and what a writer needs from the
@@ -92,7 +92,7 @@ func TestV055Principal(t *testing.T) {
 		!reflect.DeepEqual(l["ratePerNamespace"], map[string]any{"rate": 200.0, "burst": 400.0}) ||
 		!reflect.DeepEqual(l["exchangeRate"], map[string]any{"rate": def.ExchangeRate.Rate, "burst": def.ExchangeRate.Burst}) ||
 		l["retryWindow"] != "PT5M" || l["remoteRegistration"] != "P30D" || l["blobGrace"] != "P1D" ||
-		l["documentSize"] != float64(def.DocumentSize) {
+		l["documentSize"] != float64(def.DocumentSize) || l["validationSteps"] != float64(core.DefaultMaxValidationSteps) {
 		t.Fatalf("limits %v", l)
 	}
 

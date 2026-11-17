@@ -359,13 +359,17 @@ var errAtRejected = errors.New("at rejected by requireAt")
 // is the target namespace's (default 60 seconds), or the key's when that
 // is stricter. At the origin, at is in no chain of a namespace that
 // doesn't exist: the grant fails the scope as for any other at, with
-// errAtRejected.
+// errAtRejected, and so it does where requireAt names a purged namespace
+// (v0.85).
 func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 	return func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 		target := n
 		if s, ok := requireAt.(string); ok {
 			target = t.nsByName(s)
-			if target == nil {
+			// A purged namespace as one that doesn't exist (§C.4,
+			// v0.85): its log is kept, and its purge-ns entry stays
+			// its head for good, but the grant fails the scope.
+			if target == nil || target.purged {
 				return errAtRejected
 			}
 		}
@@ -432,7 +436,9 @@ func (t *tx) authorize(a *actor, verb, resource string) *Error {
 		return forbidden(fmt.Sprintf("the grant does not allow %s", verb))
 	}
 	env := t.basicEnvelope(verb, resource, a)
-	return t.grantRules(a, verb, roles, env, true)
+	// Only writes are authorised here, and a write's rules draw on its
+	// meter from step 1 on (§6.6 Validation work).
+	return t.grantRulesMode(a, verb, roles, env, true, nil, t.meter)
 }
 
 var ruleCache sync.Map // canonical rule -> *rules.Rule
@@ -705,7 +711,7 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 		return false
 	}
 	env := t.basicEnvelope("read", "", a)
-	return t.scopeRules(a, env, stepOne, nil) == nil && t.roleRules(a, "read", roles, env, false, nil) == nil
+	return t.scopeRules(a, env, stepOne, nil, t.readMeter) == nil && t.roleRules(a, "read", roles, env, false, nil, t.readMeter) == nil
 }
 
 // unrestrictedRoles reports whether a grant's rules leave every resource

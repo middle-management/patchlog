@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
-	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
@@ -42,7 +41,7 @@ func TestV076AccessExchangePerNamespace(t *testing.T) {
 		t.Fatalf("prefixes %v, want /pa/g/%s and /_refs/g/… alone", prefixes, w.x.gsOf("pa", amy))
 	}
 	_, gs, _ := w.x.refsPointer("?to="+url.QueryEscape("/r/target/x"), amy)
-	if prefixes["_refs"] != "/_refs/g/"+gs || gs != grantcheck.SubjectSetID([]string{"reads:pa"}) {
+	if prefixes["_refs"] != "/_refs/g/"+gs || gs != readsGS("pa", w.issuer) {
 		t.Errorf("/_refs prefix %s, want /_refs/g/%s, over pa's marker alone", prefixes["_refs"], gs)
 	}
 	if got, _ := p37Follow(t, w.x, prefixes["pa"], cookies, ""); got.status != 200 || strings.Join(p37Hits(got.body), ",") != "a,b" {
@@ -153,7 +152,7 @@ func TestV076AccessExchangePurged(t *testing.T) {
 	if _, ok := prefixes["pb"]; ok || prefixes["pa"] != "/pa/g/"+w.x.gsOf("pa", amy) || len(prefixes) != 2 {
 		t.Fatalf("prefixes %v, want /pa/g/%s and /_refs/g/… alone", prefixes, w.x.gsOf("pa", amy))
 	}
-	if prefixes["_refs"] != "/_refs/g/"+grantcheck.SubjectSetID([]string{"reads:pa"}) {
+	if prefixes["_refs"] != "/_refs/g/"+readsGS("pa", w.issuer) {
 		t.Errorf("/_refs prefix %s, want the gs over pa's marker alone", prefixes["_refs"])
 	}
 	if got, _ := p37Follow(t, w.x, prefixes["pa"], cookies, ""); got.status != 200 || strings.Join(p37Hits(got.body), ",") != "a,b" {

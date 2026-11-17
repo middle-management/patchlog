@@ -348,10 +348,17 @@ with `children`.
 | Tree of depth 10 (1,023 nodes) | 4.2 s (7.3 s when first measured, on another machine) | 0.39 ms, 14,833 steps |
 | The 1 MiB **schema** document of [the section above](#large-documents-by-shape-and-schema) (9,500 typed objects) | 43 ms | 4.2 ms, 85,503 steps |
 
-- **Validation is bounded by steps**, a step being one schema applied to one value: 5,000,000
-  for a document unless `serve --max-validation-steps` says otherwise. A write that needs more is
-  refused `422`, `limit: "validationSteps"`. The `core.schema.validate` span carries the count
-  (README, "Telemetry").
+- **Validation is bounded by steps** (`validationSteps`, §6.6 since v0.85), a step being one
+  schema or subschema applied to one value: 5,000,000 for a write unless
+  `serve --max-validation-steps` says otherwise. The limit covers validating the resulting
+  document and the `schema` tests of the rules evaluated for the write, together, and each
+  step of each batch item has it to itself, so a batch of 1,000 documents like the 1 MiB one
+  above is far within it. A write that needs more is refused `422`, `limit: "validationSteps"`.
+  The `core.schema.validate` span carries the validation's own count (README, "Telemetry").
+- **A rule's schema fragment can be as costly as a document's schema**, and on any value: a
+  fragment whose n levels each apply the next twice takes 2^n steps on a one-word string, and
+  twelve levels fit in a kilobyte of a grant. Counted against the same limit, it is refused
+  as a document over it is. That holds for writes only; see the gaps below.
 - Keeping the recursion out of the union (declaring `children` once on the node schema, with
   only the discriminator and each kind's own members in the branches) is still the cheaper
   schema, but no longer needed to stay out of trouble.
@@ -580,8 +587,9 @@ read of an old revision costs; the "cold reads of old revisions" row of
 
 **An experimental alternative was built, measured and set aside. It is not in this code.**
 
-The prototype is on branch `capacity-schema-single`. docs/SPEC-FEEDBACK.md, v0.82 Open 91, has
-the rules and what it left open. It let the server:
+The prototype is on branch `capacity-schema-single`. docs/SPEC-FEEDBACK.md's v0.82 Open 91 had
+the rules and what it left open (in git history: v0.85 answered the note, and a write applied
+on the current head is now one of the spec's own open questions, §13). It let the server:
 
 - apply a stale append to the current head when nothing written since overlapped it;
 - write the waiting appends of a document in one transaction;
@@ -685,7 +693,7 @@ Each limit is one of three kinds:
 | **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request. The origin shares their reads ([Origin-side collapse](#origin-side-collapse)), at ~0.03–0.04 ms of core CPU per follower per write (0.12–0.14 ms through Varnish). | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
 | **No read replicas, and one `--db` for everything.** The core runs migrations, the tailer and leader jobs, so it can't run on a read-only database. | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
 | **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: 6–7 min on server X (fetches at 2,400–2,800/s); 1.3 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
-| **Rule `test`s with a `schema` and annotation walks are not counted** against `validationSteps`, and listing an invalid document's failures gets the budget anew. | A rule's schema fragment, or a schema's annotations, can still be made expensive to evaluate; an invalid document can cost twice the limit. | Count them against the same budget. |
+| **Rule `test`s with a `schema` are not counted on reads, and annotation walks never.** A write's rule tests draw on its `validationSteps` with its validation (v0.85), and listing an invalid document's failures takes what is left of it. | A grant narrowed with a rule whose schema fragment is expensive to evaluate still costs that on every read, exchange and key request it is presented for; the spec bounds writes only (docs/SPEC-FEEDBACK.md, v0.85 Open 52). A schema's annotations can still be made expensive to walk. | Bound rule tests on reads too, once the spec says what a read that runs out answers; count annotation walks. |
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
 | **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.0 GB on server X and 1.4 GB on SQLite over a whole run. Scans, reads and small writes alone peaked at 0.2–0.3 GB; the rest came with 3.5 MiB documents and 5,000 followers. | Run with `GOMEMLIMIT` under container limits; profile the large-document path (an opt-in pprof listener would help). |
 

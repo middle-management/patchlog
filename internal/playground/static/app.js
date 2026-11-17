@@ -2027,12 +2027,37 @@ async function readDoc(ns, name, id, r, retried) {
   return { doc: r.json };
 }
 
-/* nsChainOK: a branch reads its bases' ciphertext, sealed under their keys (§F.8). */
-async function nsChainOK(ns, kns) {
+/* nsChainOK: a branch reads its bases' ciphertext, sealed under their keys (§F.8), up to the resource's foreign parent
+ * (§E.2.2, §E.3.1, v0.85). With at = { name, seen }, the resource whose log is folded and the ids the fold has moved
+ * past (the snapshot it starts from included), a base's namespace is refused once the fold is past the fork from that
+ * base: the base's head of the resource as of the branch's at, which its /heads gives, or none where the base had no
+ * such resource. A fork this reader can't place (a remote base, a /heads it may not read) isn't checked. */
+async function nsChainOK(ns, kns, at) {
+  const forks = nsChainOK.forks || (nsChainOK.forks = new Map());
   for (let cur = ns, i = 0; cur && i < 16; i++) {
     if (cur === kns) return true;
     const info = await nsInfo(cur);
-    cur = info.doc && info.doc.base && info.doc.base.ns;
+    const b = info.doc && info.doc.base;
+    cur = b && b.ns;
+    if (!at || !cur || !b || typeof b !== 'object' || b.origin !== undefined || typeof b.at !== 'string') continue;
+    const k = cur + ' ' + b.at + ' ' + at.name;
+    if (!forks.has(k)) {
+      // The base's entry for the resource at at: pages start just before its name, a plain bound (§7.4).
+      let fork = null, after = Array.from(at.name).slice(0, -1).join('');
+      for (let page = 0; page < 20 && fork === null; page++) {
+        const r = await api('GET', `/ns/${cur}/rev/${b.at}/heads` + (after ? `?after=${encodeURIComponent(after)}` : ''), { auto: true, label: 'fork' });
+        if (r.status !== 200 || !r.json) break;
+        const rows = r.json.heads || r.json.items || [];
+        const row = rows.find((x) => x && x.resource >= at.name);
+        if (row) fork = row.resource === at.name && row.kind !== 'purge' && typeof row.target === 'string' ? row.target : '';
+        else if (!r.json.next) fork = '';
+        else after = r.json.next;
+      }
+      if (fork !== null) forks.set(k, fork);
+      else continue;
+    }
+    const fork = forks.get(k);
+    if (fork === '' || at.seen.has(fork)) return false;
   }
   return false;
 }
@@ -2086,6 +2111,7 @@ async function foldLog(ns, name, id, since, arr) {
   const out = { id, since, entries: [], flagged: [], validID: '', value: undefined, notes: [] };
   const bad = (msg) => { throw new Error(`e2e log of ${ns}/${name}: ${msg}`); };
   let doc, exists = false, prev = '';
+  const passed = new Set(); // the ids the fold has moved past: a base's key seals nothing after the fork (nsChainOK)
   const cfg = ((await nsInfo(ns)).doc || {}).encryption || {};
   if (since) {
     // A namespace is end-to-end from its creation or never (Addendum E Levels): the start is always a snapshot.
@@ -2099,6 +2125,7 @@ async function foldLog(ns, name, id, since, arr) {
     const e = Object.assign({}, arr[i]);
     out.entries.push(e);
     if ((e.parent || '') !== prev) bad(`entry ${e.id} does not chain`);
+    if (prev) passed.add(prev);
     if (e.kind === 'tombstone') {
       if ((await Z.tombstoneID(e.parent)) !== e.id) bad(`tombstone ${e.id} has the wrong id`);
       prev = e.id; continue;
@@ -2116,6 +2143,7 @@ async function foldLog(ns, name, id, since, arr) {
     let hdr, kns;
     try { hdr = Z.parseJWE(jwe).header; kns = Z.parseKid(hdr.kid).ns; } catch (err) { flag('sealed patch set: ' + err.message); continue; }
     if (!(await nsChainOK(ns, kns))) { flag('sealed under another namespace\'s key ' + hdr.kid); continue; }
+    if (kns !== ns && !(await nsChainOK(ns, kns, { name, seen: passed }))) { flag('sealed under a base\'s key ' + hdr.kid + ' past the foreign parent (\u00a7E.2.2)'); continue; }
     e._sealed = hdr.kid;
     // Under the resource's K_r only (§E.3.1): one sealed otherwise, as under K_e before v0.65, is flagged (v0.78).
     let o;
@@ -2909,16 +2937,18 @@ async function sealedLevel(ns) {
 }
 
 /* openSealedEntries decrypts per-entry sealed values ("sealed": JWE, pl {ns, name, view}) in place. from is the
- * entry a value of another resource hangs on and the member it is, { key, ns, of, name, item, branch }, where v is such
+ * entry a value of another resource hangs on and the member it is, { key, ns, of, name, item, url }, where v is such
  * a value. filed is the node name v is filed under, where v is an entry of the "nodes" map of an ancestors or where
  * answer, { href, sealed } with no name of its own (SERVICES.md §B.5). ctx is what the caller knows of the answer,
  * { ns, sealed }: the namespace its entries are of (the catalog, the namespace searched), and whether that one is
  * known sealed or e2e and the answer came as JSON, so sealed per entry.
  *
  * Three things hold of what is left in an entry afterwards (§E.2.6 Per-entry sealing):
- * - In an answer sealed per entry, what a sealed value carries is taken from an opened one only: a node's title and
- *   born, and everything of a hit but resource, id, url and ns, are dropped where they stand in the clear, so an
- *   entry whose value is absent, doesn't open or lacks the member shows by name only. A tree answer is sealed per
+ * - In an answer sealed per entry, what a sealed value carries is taken from an opened one only: of an entry that
+ *   carries "sealed" a reader takes from outside it only what §E.2.6 leaves in the clear (v0.85), names, ids, URLs,
+ *   heads and the view's own structure. So everything of a node but the members of NODE_CLEAR and values sealed in
+ *   place, its title and born above all, and everything of a hit but resource, id, url and ns, are dropped where
+ *   they stand in the clear, and an entry whose value is absent, doesn't open or lacks the member shows by name only. A tree answer is sealed per
  *   entry where ctx says so or any of its entries carries "sealed" (a catalog is one namespace); a hit, which may
  *   stand beside clear hits of other namespaces, where it carries "sealed" itself or ctx says so.
  * - An entry's own value is of ctx.ns, or without one of its href's namespace, or of a branch of it (a release
@@ -2927,10 +2957,19 @@ async function sealedLevel(ns) {
  *   the entry's own value is there and opened. A { "sealed" } alone that hangs on no entry is of ctx.ns or a
  *   branch of it, and isn't opened where there is no ctx.ns; one that is a member, other than born, of an entry
  *   naming no item is compared with no resource, but is of the entry's namespace or a branch of it where known.
- * - A "branch" an entry names beside its item counts only where it is a branch of the item's namespace.
+ * - A value drawn from an entry's item is compared with the resource the entry's content URL names ("url",
+ *   /r/{ns}/{name}/rev/{id}), which in a release preview is the release branch's (§B.5 Previews, §E.2.6 Values of
+ *   another resource, v0.85), and with the item's own where the entry has no such URL. The service's own "branch"
+ *   member, which the spec doesn't define, is not read. A URL that names another namespace than the item's counts
+ *   only where that namespace is a branch of the item's, directly or through branches of it (a stacked release
+ *   branch): otherwise any namespace's value the reader holds keys for would pass as the item's.
  * A namespace is a branch of another where its own namespace document names that one as its base (branchBase).
  * No kid's namespace and no pl's name is asked about, or for a key, unless it is a name (§3.6). */
 async function openSealedEntries(v, view, from, filed, ctx) {
+  // What a tree answer's entry holds in the clear (§E.2.6 What gets sealed): its names, ids, URLs and head, and the
+  // listing's own structure.
+  const NODE_CLEAR = ['name', 'href', 'kind', 'item', 'self', 'head', 'url', 'branch', 'file', 'dangling', 'sealed',
+    'order', 'children', 'more', 'repeat', 'parents', 'parent', 'reason', 'read', 'tooDeep', 'truncated', 'incomplete'];
   const lone = (x) => !!x && typeof x === 'object' && !Array.isArray(x) && typeof x.sealed === 'string' && Object.keys(x).length === 1;
   if (!ctx || ctx.perEntry === undefined) {
     // A node's own sealed value: on an entry with a name, or one filed in the nodes of an answer's paths.
@@ -2949,16 +2988,37 @@ async function openSealedEntries(v, view, from, filed, ctx) {
   if (!v || typeof v !== 'object') return;
   const isFiled = typeof filed === 'string' && filed !== '';
   const isBranch = async (b, base) => !!base && (await branchBase(b, ctx.notBranch)) === base;
+  // b is a branch of base, or a branch of such a branch, up to 8 levels (§7.6): each by its own document.
+  const branchesFrom = async (b, base) => {
+    for (let i = 0, cur = b; base && i < 8; i++) {
+      cur = await branchBase(cur, ctx.notBranch);
+      if (!cur) return false;
+      if (cur === base) return true;
+    }
+    return false;
+  };
   // The namespace the entry v is of: the answer's, or the one its href names where the caller gave none.
   const entryNS = (e) => ctx.ns || (/^\/r\/([^/]+)\//.exec(e && typeof e.href === 'string' ? e.href : '') || [])[1] || '';
   // An entry names its resource "name" (the tree service) or "resource" (the index's hits); one of a "nodes" map
   // is named by its key, which a name of its own must agree with.
   const named = typeof v.name === 'string' ? v.name : typeof v.resource === 'string' ? v.resource : '';
   const node = isFiled || typeof v.name === 'string';
-  if (node && (ctx.perEntry || typeof v.sealed === 'string')) {
-    delete v.title;
-    // A born of another epoch stands sealed in place, and opens or fails as itself.
-    if (!lone(v.born)) delete v.born;
+  // An implicit placement ("self": true) has no revision in the catalog: what it carries in the clear, with no
+  // "sealed", are values of its item, of a namespace that is neither sealed nor end-to-end (§E.2.6 Per-entry
+  // sealing, v0.85), and stays.
+  const itemsOwn = v.self === true && typeof v.sealed !== 'string';
+  if (node && !itemsOwn && (ctx.perEntry || typeof v.sealed === 'string')) {
+    // What §E.2.6 leaves in the clear, and what stands sealed in place (a born of another epoch, a file's
+    // metadata), which opens or fails as itself. An item's file in the clear is of a namespace that isn't sealed.
+    // An entry is filed, or has a name and an href. Anything else with a name is a value the answer carries
+    // whole, in the clear or just opened, such as an item's file metadata ({ name, size, type }): of it only
+    // what could pass for an entry's title and born goes, as before v0.85.
+    if (isFiled || typeof v.href === 'string') {
+      for (const k of Object.keys(v)) if (!NODE_CLEAR.includes(k) && !lone(v[k])) delete v[k];
+    } else {
+      delete v.title;
+      if (!lone(v.born)) delete v.born;
+    }
   } else if (!node && named && (ctx.sealed || typeof v.sealed === 'string')) {
     for (const k of Object.keys(v)) if (!['resource', 'id', 'url', 'ns', 'sealed'].includes(k)) delete v[k];
   }
@@ -2998,9 +3058,11 @@ async function openSealedEntries(v, view, from, filed, ctx) {
         // The entry's own namespace: the one its own sealed value opened under, else, that value being absent or
         // unopened, the one the entry is of (from.of), or a branch of that one. With neither it is nobody's own.
         const fromOwn = !!from.name && rname === from.name && (from.ns ? ens === from.ns : !!from.of && (ens === from.of || await isBranch(ens, from.of)));
-        // In a release preview the item is read in the release's branch of its namespace, which the entry names
-        // in "branch" (§B.5 Previews): the value is that branch's resource, and never the base's.
-        const itemNS = item ? from.branch || item[1] : '';
+        // The resource the entry's content URL names, where it names the item's (§B.5): in a release preview
+        // the item is read in the release's branch of its namespace, and the value is that branch's resource,
+        // never the base's. Without such a URL it is the item's own.
+        const cu = /^(?:https?:\/\/[^/?#]+)?\/r\/([^/?#]+)\/([^/?#]+)\/rev\/[^/?#]+$/.exec(typeof from.url === 'string' ? from.url : '');
+        const itemNS = item ? (cu && cu[2] === item[2] && Z.isNamespaceName(cu[1]) ? cu[1] : item[1]) : '';
         const fromItem = !!item && ens === itemNS && rname === item[2];
         // born is the entry's own; any other value is its own or its item's, where the entry names an item.
         if (from.key === 'born' && from.name ? !fromOwn : item && !fromOwn && !fromItem) {
@@ -3011,10 +3073,11 @@ async function openSealedEntries(v, view, from, filed, ctx) {
         if (!item && from.key !== 'born' && from.of && ens !== from.of && !(await isBranch(ens, from.of))) {
           throw new Error(`a sealed value of ${ens}/${rname} in an entry of ${from.of}, which names no item and which ${ens} isn't known to be a branch of (§E.2.6)`);
         }
-        // "branch" is the service's word, in the clear: it stands for the item's namespace only where that
-        // namespace's own document says it is a branch of it. Otherwise any namespace's value would pass as the item's.
-        if (item && fromItem && !fromOwn && from.key !== 'born' && itemNS !== item[1] && !(await isBranch(itemNS, item[1]))) {
-          throw new Error(`a sealed value of ${ens}/${rname}, in the branch its entry names, ${itemNS}, which isn't known to be a branch of its item's namespace ${item[1]} (§B.5 Previews, §E.2.6)`);
+        // The URL is the service's word, in the clear: its namespace stands for the item's only where that
+        // namespace's own document says it is a branch of it, or of a branch of it. Otherwise any namespace's value
+        // would pass as the item's.
+        if (item && fromItem && !fromOwn && from.key !== 'born' && itemNS !== item[1] && !(await branchesFrom(itemNS, item[1]))) {
+          throw new Error(`a sealed value of ${ens}/${rname}, in the namespace its entry's url names, ${itemNS}, which isn't known to be a branch of its item's namespace ${item[1]} (§B.5 Previews, §E.2.6)`);
         }
       }
       const d = await openSealed(ens, v.sealed, rname, { ns: ens, name: rname, view });
@@ -3027,7 +3090,6 @@ async function openSealedEntries(v, view, from, filed, ctx) {
   // What a value of another resource is compared with: the entry's own name (and namespace, where its own sealed
   // part named it) and its item.
   const name = isFiled ? filed : named;
-  const branch = typeof v.branch === 'string' ? v.branch : '';
   for (const k of Object.keys(v)) {
     if (k === 'sealed' || !v[k] || typeof v[k] !== 'object') continue;
     if (k === 'nodes' && !isFiled && Array.isArray(v.paths) && !Array.isArray(v[k])) {
@@ -3036,7 +3098,7 @@ async function openSealedEntries(v, view, from, filed, ctx) {
       continue;
     }
     const nested = lone(v[k]);
-    await openSealedEntries(v[k], view, nested && (name || typeof v.item === 'string') ? { key: k, ns: own, of: entryNS(v), name, item: v.item, branch } : undefined, undefined, ctx);
+    await openSealedEntries(v[k], view, nested && (name || typeof v.item === 'string') ? { key: k, ns: own, of: entryNS(v), name, item: v.item, url: v.url } : undefined, undefined, ctx);
   }
 }
 
@@ -3334,7 +3396,6 @@ function renderCatProblems() {
     parts.push(line('cycles', p.cycles || [], (c) => h('span', { class: 'mono' }, [].concat(c).map((x) => nodeName(x) || x).join(' → '))),
       line('dangling items', p.danglingItems || [], (x) => [nodeLink(nodeName(x.href)), h('span', { class: 'muted small' }, ` (${x.reason || 'dangling'})`)]),
       line('dangling parents', p.danglingParents || [], (x) => [nodeLink(nodeName(x.href)), h('span', { class: 'muted small' }, ` → ${x.parent || ''} ${x.state || ''}`)]),
-      line('too deep', p.tooDeep || [], (x) => nodeLink(nodeName(x.href))),
       line('orphans', C.problems.orphans || [], (x) => nodeLink(x.name)));
   } else {
     $('catProbMeta').textContent = 'computed here from the documents';

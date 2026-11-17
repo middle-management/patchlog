@@ -77,6 +77,11 @@ type Checker struct {
 	minForced  time.Duration
 	forcing    map[string]*forcedRead
 	lastForced map[string]time.Time
+
+	// purgedHeads is whether a frozen namespace a requireAt key names is
+	// purged at a head, by namespace and head (purgedAt): a head is
+	// purged or not for good.
+	purgedHeads map[string]bool
 }
 
 // minForcedInterval is the default Checker.minForced.
@@ -109,7 +114,8 @@ func WithMaxGrantRules(n int) Option { return func(ch *Checker) { ch.maxRules = 
 func New(c *client.Client, opts ...Option) *Checker {
 	ch := &Checker{c: c, ttl: 30 * time.Second, now: time.Now, maxGrant: 8 << 10, maxRules: 32,
 		states: map[string]*nsState{}, copied: map[string]map[string]grant.Key{}, observed: map[string]uint64{},
-		minForced: minForcedInterval, forcing: map[string]*forcedRead{}, lastForced: map[string]time.Time{}}
+		minForced: minForcedInterval, forcing: map[string]*forcedRead{}, lastForced: map[string]time.Time{},
+		purgedHeads: map[string]bool{}}
 	for _, o := range opts {
 		o(ch)
 	}
@@ -658,24 +664,45 @@ func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at an
 			return fmt.Errorf("malformed at")
 		}
 		begun := time.Now()
+		_, named := requireAt.(string)
+		// A purged namespace requireAt names fails the scope, as one
+		// that doesn't exist does at the origin (§C.4, v0.85): never a
+		// chain the checker can't read.
+		gone := func(err error) bool { return named && purgedNS(err, target) }
 		tst, checked, err := ch.stateWithin(ctx, target, ch.ttl)
 		if err != nil {
+			if gone(err) {
+				return errRequireAt
+			}
 			return chainError(err)
 		}
 		entries, err := ch.chainAfter(ctx, target, tst, idText)
 		if notInChain(err) && checked.Before(begun) {
 			// The cached head may be older than at: read it again.
 			if tst, err = ch.forcedState(ctx, target, begun); err != nil {
+				if gone(err) {
+					return errRequireAt
+				}
 				return chainError(err)
 			}
 			entries, err = ch.chainAfter(ctx, target, tst, idText)
 		}
 		switch {
-		case notInChain(err):
+		case notInChain(err), gone(err):
 			return errRequireAt
 		case err != nil:
 			return chainError(err)
-		case len(entries) == 0:
+		}
+		if named {
+			purged, err := ch.purgedAt(ctx, target, tst.cfg, entries)
+			switch {
+			case err != nil:
+				return chainError(err)
+			case purged:
+				return errRequireAt
+			}
+		}
+		if len(entries) == 0 {
 			return nil
 		}
 		next, err := time.Parse(time.RFC3339Nano, entries[0].Created)
@@ -689,6 +716,64 @@ func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at an
 		return nil
 	}
 }
+
+// purgedNS reports whether err is the 410 purged of namespace ns itself
+// (§8.5), which a sealed one's head, documents and log answer once it is
+// purged, not that of a base in its chain.
+func purgedNS(err error, ns string) bool {
+	if !client.IsPurged(err) {
+		return false
+	}
+	ae, ok := client.AsAPIError(err)
+	if !ok {
+		return false
+	}
+	name, has := ae.Body["ns"].(string)
+	return !has || name == ns
+}
+
+// purgedAt reports whether target, whose document at its head is cfg and
+// whose log up to that head ends with entries (none where the at checked
+// is the head), is purged there (§C.4 requireAt, v0.85: "which a service
+// learns from its log or 410", §8.5). A purge-ns entry is the log's last,
+// so entries tell where there are any. Where at is the head, an unsealed
+// purged namespace still serves its document and log, and only its
+// /heads, 410 at any revision, tells: asked once per head (purgedHeads),
+// and only of a frozen namespace, as a purge needs one (§8.5); a purge
+// applied to a namespace that isn't frozen, such as one a remote branch
+// takes from its base, is learnt from the log alone.
+func (ch *Checker) purgedAt(ctx context.Context, target string, cfg *Config, entries []client.NSEntry) (bool, error) {
+	if n := len(entries); n > 0 {
+		return entries[n-1].Kind == "purge-ns", nil
+	}
+	if frozen, _ := cfg.Doc["frozen"].(bool); !frozen {
+		return false, nil
+	}
+	key := target + "\x00" + cfg.Head
+	ch.mu.Lock()
+	purged, known := ch.purgedHeads[key]
+	ch.mu.Unlock()
+	if known {
+		return purged, nil
+	}
+	_, _, err := ch.c.HeadsPage(ctx, target, cfg.Head, "")
+	switch {
+	case purgedNS(err, target):
+		purged = true
+	case err != nil:
+		return false, err
+	}
+	ch.mu.Lock()
+	if len(ch.purgedHeads) >= maxPurgedHeads {
+		clear(ch.purgedHeads)
+	}
+	ch.purgedHeads[key] = purged
+	ch.mu.Unlock()
+	return purged, nil
+}
+
+// maxPurgedHeads bounds Checker.purgedHeads.
+const maxPurgedHeads = 1024
 
 // errRequireAt is the refusal of an at a readable chain rejects, not in
 // it or not its head within maxLag: one text for both, naming no

@@ -54,9 +54,16 @@ func TestV077OriginPurgedCatalogStaysCovered(t *testing.T) {
 	w := newV75World(t, v75Opts{})
 	w.seed()
 	ctx := context.Background()
-	// li's grant names cat-season's head before the purge, within maxLag.
-	li := w.li()
+	// li reads matches in part through k, by a block rule on /resource:
+	// a grant of the catalog's key, whose requireAt names cat-season,
+	// fails the scope once cat-season is purged (§C.4, v0.85).
+	viaCat := w.li()
+	li := w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:li", "groups": []any{"editors", "interns"}, "ns": []any{"matches"}, "can": []any{"read"},
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}})
 	v077Purge(t, w, "cat-season")
+	if err := w.e.FilteredCurrent(ctx, "matches", v075GS(t, w, li), "/heads", viaCat); v75Status(err) != 403 {
+		t.Fatalf("a grant of the key whose requireAt names the purged catalog: %v, want 403", err)
+	}
 
 	w.inTx(func(t2 *tx) {
 		fs := t2.filteredScope(t2.nsByName("matches"))

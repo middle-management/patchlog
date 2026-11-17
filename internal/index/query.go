@@ -1021,7 +1021,9 @@ func (ix *Index) judgeEpochs(ctx context.Context, docs []docHead, current int) (
 	return out, tx.Commit()
 }
 
-// judgeEpochsAt is judgeEpochs of docs, of ns, under current, the epoch
+// judgeEpochsAt is, for an e2e namespace, judgeEpochs of docs, of ns, under
+// current, and for a sealed one judgeServed, which takes each head's epoch
+// from the origin's sealing instead (v0.85). current is the epoch
 // the caller read last, which a rotation (keys.Observe, Apply) may have
 // moved since: it is read again, under epochMu, which Apply holds for
 // writing around keys.Observe, so no rotation is applied between that
@@ -1036,12 +1038,18 @@ func (ix *Index) judgeEpochsAt(ctx context.Context, ns string, docs []docHead, c
 	}
 	ix.epochMu.RLock()
 	defer ix.epochMu.RUnlock()
-	switch now, err := ix.keys.Info(ctx, ns); {
+	now, err := ix.keys.Info(ctx, ns)
+	switch {
 	case err != nil:
 		ix.opt.Logf("index: encryption of %s: %v", ns, err)
 		return nil, fmt.Errorf("%w (%s)", errEpochKey, ns)
 	case now.Epoch != current:
 		return nil, errInfoChanged
+	}
+	if epochIsServed(now) {
+		// A sealed (E2) namespace: the epoch is the one the origin
+		// serves the head under, read again (judgeServed; v0.85).
+		return ix.judgeServed(ctx, ns, docs)
 	}
 	return ix.judgeEpochs(ctx, docs, current)
 }

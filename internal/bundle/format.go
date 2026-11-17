@@ -99,6 +99,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -894,6 +895,12 @@ func StoredAuthority(v any) (string, error) {
 // that doesn't decode carries no such string, so it is rejected too; the
 // array form from before v0.73 was read as its first element
 // (StoredAuthority). Neither rule needs the line's key or a signature.
+//
+// A line that carries a key is also rejected where the key's kid isn't
+// the root block's, or the key doesn't verify the stored block (§G.4.1,
+// v0.85): the block's signature alone, under key.pub, whatever its ns,
+// times or scope say, which the server judged when it let the write in
+// (§C.3.1). So no bundle imports with such a key reported as attested.
 func grantLineAgrees(g *GrantLine) error {
 	canon := jsonv.Canonical(jsonv.FromGo(g.Root))
 	if id := ids.Of(canon).String(); id != g.ID {
@@ -907,6 +914,16 @@ func grantLineAgrees(g *GrantLine) error {
 	// so canonical(Raw) is that string byte for byte.
 	if !bytes.Equal(jsonv.Canonical(gr.Blocks[0].Raw), canon) {
 		return fmt.Errorf("its stored block's grant_block is not canonical(root) (§G.4.1)")
+	}
+	if !g.HasKey() {
+		return nil
+	}
+	if kid := gr.Blocks[0].Kid; g.Key.Kid != kid {
+		return fmt.Errorf("its key has kid %q, not its root's, %q (§G.4.1)", g.Key.Kid, kid)
+	}
+	pub, err := base64.RawURLEncoding.Strict().DecodeString(g.Key.Pub)
+	if err != nil || len(pub) != ed25519.PublicKeySize || !gr.SignedBy(ed25519.PublicKey(pub)) {
+		return fmt.Errorf("its key doesn't verify its stored block (§G.4.1)")
 	}
 	return nil
 }

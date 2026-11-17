@@ -1,6 +1,6 @@
 # Patch Log — Tools
 
-Status: draft v0.84 · 2026-11-17. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.85 · 2026-11-17. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Clients and tools that use the protocol's public API. A server needs nothing from this document.
 
@@ -45,6 +45,8 @@ Status: draft v0.84 · 2026-11-17. A companion to the [Patch Log specification](
 - **Split documents along the lines of access, editing and size:** a document is the unit of read access (§C.5), concurrency and rate limits (§6.6), merge conflicts (§F.3) and revision cost.
 
   Split one that grows without bound, has parts with different readers, or is edited by unrelated people at once; link the parts with `x-ref` (§6.5) and group them with a catalog (Addendum B).
+
+  Where several parties add to one list, make each entry a resource: creates of different resources never collide, and the namespace log orders them. This gives up constraints across entries, such as a schema's `maxItems`. Writers of one shared document queue behind its head, each lost race costing a request and its rate tokens (§6.6), and a `test` guards whatever a write depends on (§11).
 
 ### 11.2 Undo and redo
 
@@ -440,7 +442,7 @@ A selection is a list of resources, or anything a resolver turns into one, e.g. 
 2.  **Declared references:** fields marked `x-ref` in the documents' schemas (§6.5). A **pinned** reference needs that exact revision, a **live** one the head as of the export's `at`.
 3.  **Application resolvers:** tool plug-ins for relationships no schema expresses, e.g. "a match brings its team pages".
 
-Untyped documents have no level 2, but an opt-in rule may treat any string in them matching `^/r/` as a reference. Dependencies left out with `external` are checked by the importer to exist in the target: by id for pinned references, by name for live ones.
+Untyped documents have no level 2, but an opt-in rule may treat any string in them matching `^/r/` as a reference. Dependencies left out with `external` are checked by the importer to exist in the target: by id for pinned references, in the resource's chain and not purged, and by name for live ones.
 
 ### G.4.3 History or snapshot
 
@@ -615,10 +617,10 @@ A save follows §11.3, with these specifics:
 
   - For `PUT` only, and unlike RFC 9110 on purpose, an older tag is not a failed precondition but the starting point of a rebase.
   - `If-Match: *` asks only that the file exist, and the head is the base.
-  - A tag naming a revision where the path holds no file is `412`, not a create.
+  - A tag naming a revision where the path holds no file is `412`, not a create. A tag naming a tombstone counts as one naming the revision it deletes.
   - A tag naming a revision of a flat resource another user has since deleted is `409`.
 
-  - An unknown revision is `412`. A pruned one is `409`, asking for a reload, as are a recorded base below a horizon and a pruned range between base and head. A failed read (`408`, `429`, `5xx`) of anything the save decides by, `theirs` and the user's own entries included, fails the save: `503` with `Retry-After` after a `429` or `503`, else `502`. The head is never taken as the base instead.
+  - An unknown revision is `412`. A pruned one is `409`, asking for a reload, as are a recorded base below a horizon and a pruned range between base and head. A failed read of anything the save decides by, `theirs` and the user's own entries included, fails the save (Answers, below). The head is never taken as the base instead.
   - **Records.** Without a tag, a gateway MAY keep, per user (§H.7) and path, the revisions it served that user in full and those it wrote for them, with the item each path named when last read whole or written.
     - A `304`, `HEAD` or `PROPFIND` records nothing, and a save that changed nothing isn't a write.
     - Records outlive sessions, for a day, and a path whose records expired counts as evicted.
@@ -666,7 +668,7 @@ A save follows §11.3, with these specifics:
   | Frozen namespace                                                                                                                                                                                                                                                           | `403`, naming the successor; never `423` (§H.6)                                                                                                                            |
   | Purged                                                                                                                                                                                                                                                                     | `410`                                                                                                                                                                      |
   | Rate limited, or a service behind, for longer than a client waits (§6.6, §B.5)                                                                                                                                                                                             | `503` with `Retry-After`                                                                                                                                                   |
-  | A tree service that can't be reached                                                                                                                                                                                                                                       | `502`                                                                                                                                                                      |
+  | A core or service request the answer depends on fails (`408`, `429`, `5xx`, no connection, or no answer in time), a read of another namespace's documents or a write included; a failed read never counts as a refusal | `503` with `Retry-After` after a `429`, a `503` or no answer in time, else `502` |
   | A limit exceeded (the core's `413` or `422` with `code: "limit"`)                                                                                                                                                                                                          | `413`, in one shape: `too large: {limit} {measured} > {max} (§6.6): {message}`, a limit without sizes named alone, and a `413` that names no limit keeping the core's text |
   | A bound of the gateway's own (an upload buffer, a file-size setting, `blobSize` checked before an upload)                                                                                                                                                                  | `413` in the same shape, naming its setting, `measured` a lower bound where reading stopped                                                                                |
   | The gateway's own memory for scratch files or locks full (§H.6)                                                                                                                                                                                                            | `507`; bounds are generous                                                                                                                                                 |
@@ -786,43 +788,43 @@ The proxy keeps each upstream response as one resource, in a namespace of its ow
   "closed": { "reason": "complete" } }   // or "aborted", "error", "timeout", "size"; with "error"? and "next"?
 ```
 
-- **Names.** The proxy draws `{id}` at random, or derives it from the caller's principal and a request key the caller sends, so a repeated request finds its stream. It is a name of §3.6. Names aren't secret: reads need the grant (J.3).
+- **Names.** The proxy learns its caller from `GET /ns/{ns}/principal` (§7.4) with the caller's grant, in a namespace of its choosing that callers' grants name; a grant narrowed to `"can": []` suffices. It draws `{id}` at random, or derives it from that answer's `key` and `principal.id` (a `sub` is unique only under its key) and a request key the caller sends, so a repeated request finds its stream. It is a name of §3.6, short enough that its continuations' are too. Names aren't secret: reads need the grant (J.3).
 - **Chunks** are UTF-8 text, split at line ends, as `text/event-stream` and NDJSON allow. A body that isn't text is out of scope; it would go in blobs (§7.8).
-- **Nothing secret.** The document holds no request headers, `Authorization` above all, and no upstream URL.
-- **Size.** A chunk stays far below `valueSize`. A stream about to pass `documentSize` (§6.6) closes with `"size"`, naming its continuation in `next`.
+- **Nothing secret.** The document holds no request headers, `Authorization` above all, and no upstream URL. `closed.error` is one of a few fixed sentences, as a library's error text may name the URL or host.
+- **Size.** A chunk stays far below `valueSize`. Each append costs the stream's size so far, so where latency matters a stream continues well below `documentSize` (§6.6), at 256 KiB say. A `$schema` on the stream document revalidates the whole array on every append.
+  - A stream about to pass that size closes with `"size"`, naming its continuation `{id}.{n}` in `next`, `n` counting from 1.
+  - The proxy bounds the continuations. One that fills the last closes with `"size"` and an `error`, without `next`.
 
 ## J.2 Writing
 
 1.  **Create** the resource with `If-None-Match: *` (§7.2), holding `upstream.method` and `"chunks": []`, before calling upstream. A `200` (the same create, retried) or a `412` means the stream exists: return it, and don't call upstream again. A `410` means it was removed.
-2.  **Call upstream.** Record `status` and `contentType` in the first append. A failed upstream is recorded too, closing with `"error"`; the proxy still answers its own caller as its protocol says.
+2.  **Call upstream.** Record `status` and `contentType` in the first append. An answer of any status, a `3xx` included and not followed, is kept with its body and closed `"complete"`. A call that gets no answer, is cut short or gets a body that isn't text closes with `"error"`; the proxy still answers its own caller as its protocol says.
 3.  **Append** each flush as one patch set adding to `/chunks/-`, with a fresh `$nonce` (§C.7) and `If-Match` on the proxy's last revision, so no append lands twice (§7.2).
 4.  **Close** with a last append that sets `closed`.
 
-- **Restarts.** Upstream can't be resumed. A proxy that restarts closes its open streams with `"error"`, and a stream with no append for a set time is closed by any proxy with `"timeout"`.
-- **Pace.** Rate limits count by the proxy's principal (§6.6). Flush each stream at most every 200 ms, leaving room for aborts. `ratePerPrincipal` bounds how many streams the proxy carries at once; an allowance raises it.
+- **Restarts.** Upstream can't be resumed. A proxy that restarts closes its open streams with `"error"`, and a stream with no append for a set time is closed by any proxy with `"timeout"`, the one carrying it included. A proxy that finds its stream closed by another cancels upstream and appends nothing more.
+- **Pace.** Rate limits count by the proxy's principal (§6.6). Flush each stream at most every 200 ms, leaving room for aborts. `ratePerPrincipal` bounds how many streams the proxy carries at once; an allowance raises it. Callers' aborts, refused ones included, draw on the same buckets, so a caller can slow every stream; a proxy that can't accept this takes aborts itself and hands out `can: ["read"]`.
 - **The namespace log** records every append (§3.5), so keep `streams` apart from namespaces that consumers follow.
 
 ## J.3 Reading and resuming
 
-- **The read grant.** The proxy hands its caller the resource's URL and its own grant, narrowed (§C.1). The narrowing block names the caller in `via`, fixes the resource, and allows appends only to `/abort`:
+- **The read grant.** The proxy hands its caller the resource's URL and its own grant, narrowed (§C.1). The narrowing block names the caller in `via`, fixes the resource and its continuations, and allows appends only to `/abort`:
 
   ``` jsonc
   { "via": "{caller}", "can": ["read", "append"], "exp": "…",
-    "rules": [ { "op": "test", "path": "/resource", "value": "{id}" },
+    "rules": [ { "op": "compare", "path": "/resource", "in": { "value": ["{id}", "{id}.1", "{id}.2"] } },
                { "if":   [{ "op": "test", "path": "/action", "value": "append" }],
                  "then": [{ "op": "writes", "within": ["/abort"] }] } ] }
   ```
 
 - **Following.** A reader loads the document (§11), then long-polls `GET /r/streams/{id}/log?since={rev}&live=long-poll&cursor={c}` (§7.7) and joins the chunks each entry adds. The last revision it saw is where it resumes; an empty `since` starts from the beginning. Readers who exchange the grant for an edge-grant cookie (§C.5.2) share one CDN answer.
-- **The end** is the revision that sets `closed`.
+- **The end** is the revision that sets `closed`. A `"size"` close with `next` continues in that resource, from its beginning.
 
 ## J.4 Abort, expiry and encryption
 
-- **Abort.** The caller appends `{ "op": "add", "path": "/abort", "value": true }` with `If-Match` on the head it last saw, and on `412` retries on the head the body gives. The proxy's next append then gets `412`, or the proxy sees the entry while following the log between chunks. It reads the new entries, never resending blindly, cancels upstream and closes with `"aborted"`. An abort after `closed` is ignored.
-- **Expiry.** The core deletes nothing by age, and retention prunes only history (§8.6). The proxy purges a stream (§8.3) once its read grants have expired.
-- **Encryption.** A sealed namespace keeps chunks from caches (Addendum E). Every patch set then carries a fresh `$nonce` (§E.2.5).
-  - Keys are wrapped to the root block's `enc` (§E.2.3), so a narrowed grant of the proxy's opens nothing for the reader. The proxy signs each reader a root grant instead, with the same `can` and rules and the reader's `enc`, under a key the namespace lists.
-  - This design doesn't work end-to-end, where the abort rule can't be judged (§6.2).
+- **Abort.** The caller appends `{ "op": "add", "path": "/abort", "value": true }`, with a fresh `$nonce` where the namespace requires one (§C.7, as `GET /ns/{ns}/principal` says) and `If-Match` on the head it last saw, and on `412` retries on the head the body gives. The proxy's next append then gets `412`, or the proxy sees the entry while following the log between chunks. It reads the new entries, never resending blindly, cancels upstream and closes with `"aborted"`. An abort after `closed`, or of any value but `true`, is ignored.
+- **Expiry.** The core deletes nothing by age, and retention prunes only history (§8.6). Every read grant of a stream has the same `exp`, counted from the stream's creation (its first log entry's `created`), also when a repeated request hands it out again. After it the proxy answers that request `410` and, once the stream is closed, purges it and its continuations (§8.3).
+- **Encryption.** This design is for a `streams` namespace that is neither sealed nor end-to-end: keys are wrapped to the root block's `enc` (§E.2.3), so a narrowed grant opens nothing for the reader, and at E3 the abort rule can't be judged (§6.2).
 
 ## J.5 Shared sessions
 
@@ -831,7 +833,7 @@ A **shared session** is a namespace in which several people and agents work on t
 - **One namespace per session,** with `read: "grant"`.
   - The documents people work on, such as a plan or a draft, are ordinary resources.
   - Each message is a resource of its own, `m-…`, so people posting at once never conflict. The namespace log orders them the same way for everyone.
-  - Streams live in a companion namespace, `{session}-streams`, so the session's log stays readable (J.2). A recorded call (J.7) adds only its own document to the session.
+  - Streams live in a companion namespace, `{session}-streams`, so the session's log stays readable (J.2). A recorded call (J.7) adds only its own document to the session. A sealed or end-to-end session has no companion, so it doesn't stream replies or record calls (J.4 Encryption).
   - A session's name is at most 56 bytes, so that its companion's is a name (§3.6).
 
   ``` jsonc
