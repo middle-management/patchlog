@@ -133,6 +133,7 @@ type ExportCmd struct {
 	Mode           string   `arg:"--mode" default:"history" help:"history (full) or snapshot"`
 	Out            string   `arg:"-o" help:"output file (default stdout)"`
 	Bearer         string   `arg:"--bearer,env:PATCHLOG_BEARER" help:"grant sent as Authorization: Bearer (needs read, §G.2)"`
+	BearerFile     string   `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"file holding --bearer (exclusive with it)"`
 	Author         string   `arg:"--author,env:PATCHLOG_AUTHOR" help:"X-Author (development servers only)"`
 	External       string   `arg:"--external" help:"dependencies to leave out: ns or ns/name (comma-separated)"`
 	Authors        bool     `arg:"--authors" help:"include authors, creation times, signatures and gestures (§G.4.1)"`
@@ -377,6 +378,7 @@ type ImportCmd struct {
 	Atomic             bool     `arg:"--atomic" help:"one batch per namespace; over the namespace's limits it needs an allowance there, up to the deployment maximums (patchlog serve --max-items-per-batch, --max-batch-size; by default 1000 items, 16 MiB) (§6.6)"`
 	Pace               string   `arg:"--pace" help:"backfill: split batches to fit the limits and pace them, dry runs included, at this fraction of the lower of the namespace's and the importer's rate, e.g. 0.5; an allowance of the importer's own in a namespace sets its batches and full rate there instead (§6.6)"`
 	Bearer             string   `arg:"--bearer,env:PATCHLOG_BEARER" help:"grant sent as Authorization: Bearer"`
+	BearerFile         string   `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"file holding --bearer (exclusive with it)"`
 	Author             string   `arg:"--author,env:PATCHLOG_AUTHOR" help:"X-Author (development servers only)"`
 	Create             bool     `arg:"--create" default:"true" help:"create missing target and upstream namespaces (--create=false to refuse)"`
 	UpstreamSuffix     string   `arg:"--upstream-suffix" default:"-upstream" help:"suffix of upstream namespaces for snapshot documents, after the new name of a renamed namespace (--ns src=dst: dst-upstream); an upstream name over the 64 characters of a namespace name is refused before anything is written (§3.6, §G.4.4)"`
@@ -548,6 +550,7 @@ type VerifyCmd struct {
 	Identity   string `arg:"--identity" help:"private key (JWK) that opens a sealed bundle"`
 	Source     string `arg:"--source" help:"the source deployment's base URL: checks the key of each grant line against its namespace log and operator key history (§C.3.1), so complete chains are verified, not only attested"`
 	Bearer     string `arg:"--bearer,env:PATCHLOG_BEARER" help:"--source: grant sent as Authorization: Bearer (needs read)"`
+	BearerFile string `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"file holding --bearer (exclusive with it)"`
 	Author     string `arg:"--author,env:PATCHLOG_AUTHOR" help:"--source: X-Author (development servers only)"`
 	Signatures bool   `arg:"--signatures" help:"list the signature status of every revision"`
 }
