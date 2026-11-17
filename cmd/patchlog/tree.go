@@ -107,6 +107,9 @@ type treeCmd struct {
 	ExchangeRate       string   `arg:"--exchange-rate" placeholder:"RATE,BURST" help:"exchangeRate (§6.6, §C.5): edge-grant exchanges each principal may make at the service's POST /edge-grants, for --access, e.g. 10,100 (the default); the buckets are shared by the instances on one --db (§B.11.5)"`
 	corsArgs
 	shutdownArgs
+	// Ls is the one client command here (query.go): with it the service's
+	// own flags, --catalog included, aren't required.
+	Ls *treeLsCmd `arg:"subcommand:ls" help:"list a catalog's roots, or a folder's children, as a running tree service answers (patchlog tree ls CATALOG [PATH])"`
 }
 
 func (a *treeCmd) run(string) {
