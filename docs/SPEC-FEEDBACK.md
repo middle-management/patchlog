@@ -13,6 +13,9 @@ v0.83 adds TOOLS.md's Addendum J (stream proxies, shared agent sessions, MCP age
 recording model calls; suggested, non-normative) and asks nothing of the reference. It answers
 none of the notes below, so the list stands as it is, with note 93 added.
 Notes 94–100 come from implementing §J.1–J.4 as `patchlog streams` (branch `stream-proxy`).
+v0.84 adds `GET /ns?after={name}` (§7.4), the deployment's namespaces for operators, which the
+reference implements (branch `spec-v084`); it answers none of the notes below either, and notes
+101–103 are what its text left open.
 
 From implementing v0.82 (branch `spec-v082`). Numbered afresh; cite these as "v0.82 Open n".
 Each entry gives the section, what the reference does now (the conservative reading where it
@@ -651,6 +654,31 @@ v0.82" (v0.81 Open 24).
     mention; and the reader's entries (the abort) are then written by the root block's `sub`,
     where a narrowed grant records the proxy as author and the caller in `via`. *Question:*
     whose `sub` does that root grant carry, and should §J say the request carries `enc`?
+101. **Which operator grants list** (§7.4 `GET /ns`, §C.1, §C.2). "A grant whose blocks don't
+    all list `config` in `can`, or that has `rules` in any block, is `403`." The reference
+    takes it by the letter, which is stricter than what `config` means for a creation
+    (§C.2 item 2, the verbs every block that carries `can` keeps): (a) a narrowing block
+    without `can`, such as `{ "via" }` or `{ "exp" }` alone, doesn't list `config`, so the
+    grant is `403`, and a delegatee must repeat `"can": ["config"]`; (b) `"rules": []` is
+    `rules` in a block, `403`; (c) a grant that carries `roles` is `403` although its blocks
+    list `config`, since under an operator key no role is effective and nothing allows the
+    verb (§C.2 Invariant). The `ns` check, by contrast, is of "blocks that carry `ns`".
+    *Question:* is (a) meant, or is it "every block that carries `can` lists `config`"?
+102. **A grant that fails verification** (§7.4 `GET /ns`, §C.2 item 1). The listing answers
+    `401` for "a grant that fails verification". Item 1's verification includes the key's
+    scope (`can`, `sub`, `maxTtl`, …), whose failure is `403` everywhere else. The reference
+    answers `401` for all of it here, an operator key's scope included, as the sentence
+    says, so the same grant is `403` at a creation and `401` at the listing. *Question:* is
+    the key's scope meant to be `403` here too, between the `401`s and the `config` check?
+103. **Which namespaces, and their `created`** (§7.4 `GET /ns`, §G.3, §E.2.2). (a) The
+    reference lists every namespace the API can address: remote branches, with `created`
+    of their own chain's first entry and `base` as `{ origin, ns, at }`, and the namespaces
+    a remote branch's creation mirrored schema histories into, which are ordinary ones here.
+    It doesn't list the copies of a remote base it keeps to read through, which have no
+    name in the API. (b) `created` is given for sealed and end-to-end namespaces too, where
+    `/heads` leaves `created` out and logs are sealed (§7.4, §E.2.2), and for purged ones:
+    the operator's deployment knows when its namespaces were created, but an admin tool
+    holding the grant then learns it without any key. *Question:* is (b) meant?
 
 ## Settled in v0.82
 

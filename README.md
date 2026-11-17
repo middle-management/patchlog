@@ -49,6 +49,7 @@ and serves immutable, CDN-cacheable revisions.
 | Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`, bounded by entries and by `logPageBytes`) | §6.2, §7.1–§7.2 | ✅ (`serve --log-page-size`, `--log-page-bytes`; see [Design notes](#design-notes)) |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
 | Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name, `?prefix=`), `/branches` | §7.4 | ✅ |
+| `GET /ns?after={name}`: the deployment's namespaces for operators, branches, remote branches and purged namespaces included, as `{ name, created, base?, frozen, purged }` in byte order of name, paged by `logPageSize`, with `?prefix=`; answered only to an operator grant whose blocks name `"*"`, list `config` and carry no `rules` (`403`, `401`, `403` in that order), or to anyone under `serve --dev` | §7.4, §C.4 (v0.84) | ✅ (`client.Namespaces`, `patchlog ns ls`; see [Grants](#grants)) |
 | Files and sync clients: `Last-Modified`, `Repr-Digest` and `If-Modified-Since` on `…/rev/{id}`, and `created`, `size` and `digest` on `/heads` entries, outside E2 and E3; raw documents at `…/raw`; moves recorded as `$successor`, named by the head's `410`; whole-document appends up to `documentSize` | §6.2, §6.6, §7.1, §7.4, §7.8, §8.1 | ✅ (see [Files and sync clients](#files-and-sync-clients-71-74-78-81)) |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
@@ -4286,6 +4287,8 @@ patchlog verify matches [--from NS_ID] [--resource NAME]…   # recompute the ch
 patchlog purge matches/derby --yes [--force]    # destroy a resource for good (§8.3)
 patchlog prune matches/derby --below REV --yes  # destroy history older than REV (§8.6)
 patchlog ns purge matches --yes                 # destroy a frozen namespace (§8.5)
+patchlog ns ls [--prefix P] [--json]            # every namespace of the deployment: name, live/frozen/purged, created, base
+                                                # (ns@at); under grants, an operator grant naming "*" with config (§7.4)
 ```
 
 The destructive commands, without `--yes`, print what they would destroy and exit 1. A deleted
@@ -4585,15 +4588,45 @@ Namespace keys look like `{ "kid", "alg": "ed25519", "pub": <base64url>, "can": 
 with the key-scope fields of §C.4. Operator keys (`--operator-key`) get kid `operator`
 (then `operator-2`, …) and may create namespaces; a creating grant lists the new
 namespace's name, which need not exist yet, or `"*"`, in `ns`. Only operator grants may use
-`"*"`: any other grant that names `"*"` is `401` on every request (§C.4). An operator grant authorises exactly three things (§C.4): creating a
+`"*"`: any other grant that names `"*"` is `401` on every request (§C.4). An operator grant authorises exactly four things (§C.4): creating a
 namespace with its genesis document, creating a remote branch with the schema histories it
-mirrors, and forcing a purge or namespace purge (`?force=1`). A creating grant must list
+mirrors, forcing a purge or namespace purge (`?force=1`), and listing the deployment's
+namespaces (`GET /ns`, below). A creating grant must list
 `config` (§C.2 item 2, v0.73: one minted with `can: ["create"]` alone is `403`, as is one asking
 about a taken name), and passes the `*`-key guard whatever its key's `can`. Anything else under
 one is `401`, as for a key the namespace doesn't list, also for a namespace that doesn't exist
 (a forced purge
 of one is `404`); reads of a public namespace ignore it. An operator who needs more adds a key
 to the namespace document.
+
+**Listing namespaces** (`GET /ns?after={name}&prefix={name}`, §7.4, v0.84; `patchlog ns ls`,
+`client.Namespaces` and `AllNamespaces`) answers `{ "namespaces": [ { name, created, base?,
+frozen, purged } ], "next"? }`, `no-store`, for operators and admin tools:
+
+- **Who.** Only an operator grant, checked in the spec's order: the request-shape errors first
+  (an unknown or repeated query parameter, a `prefix` that isn't a namespace name, then the
+  grant's own of §C.2 item 1); `403` for a grant with a block that carries `ns` without naming
+  `"*"`, before anything is verified; `401` without credentials or for a grant that fails
+  verification, whatever it fails for (a root `kid` that names no operator key in its period, a
+  signature, `nbf`/`exp`, the key's scope); then `403` unless every block lists `config` in its
+  own `can` and no block has `rules`. So `{"kid":"operator","sub":"op:admin","ns":["*"],
+  "can":["config"],"exp":…}` lists, and the grant that created one namespace (`ns: ["docs"]`)
+  doesn't. Taken literally (SPEC-FEEDBACK 101): a narrowing block must repeat `can` with
+  `config`, an empty `rules` list counts as rules, and a grant that carries `roles` is `403`,
+  an operator grant having no effective role. Under `serve --dev` it answers everyone.
+- **Rows.** Every namespace: local branches, remote branches, the namespaces a remote branch's
+  creation mirrored schemas into, and purged ones, which keep their row. Not the hidden shadows
+  that hold a remote base's mirrored content (`~…`, §G.3): they are no namespaces of the API.
+  `created` is the created time of the namespace's first entry, which for a local branch is
+  written with, and at the time of, the base's `branch` entry; `frozen` and `base` are the
+  namespace document's, `base` without a remote branch's `chain`; a purged namespace is
+  `purged: true` and still `frozen: true`, since a purge needs it frozen.
+- **Order and pages.** Ascending byte order of name (`a-b`, `a0`, `a_b`, `aa`), strictly after
+  `after`, which is a bound and needn't be a name, in pages of `logPageSize` (`serve
+  --log-page-size`, 1,000 by default) with `next`, the page's last name, absent on the last
+  page. On Postgres the page orders and bounds under the `"C"` collation, from the index of
+  core migration `019_namespaces_name_c`, whatever the database's own collation; SQLite's index
+  on the name is bytewise already. A page costs two queries at most, whatever its size.
 
 **Keys follow the base** (§C.4). A branch accepts its base's *current* keys as well as its own,
 recursively through every local base: a key added to the base after branching works in the
