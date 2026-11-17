@@ -157,7 +157,9 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 // With returns a copy of the client with further options applied, e.g. a
 // different bearer grant. The copy shares the HTTP client.
 func (c *Client) With(opts ...Option) *Client {
-	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth, signer: c.signer, levels: c.levels}
+	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth, signer: c.signer, levels: c.levels,
+		// Copied, so options appending to them don't write into c's.
+		senders: append([]*ecdh.PublicKey(nil), c.senders...), trusted: append([]*ecdh.PublicKey(nil), c.trusted...)}
 	c.rootMu.Lock()
 	n.root = c.root
 	c.rootMu.Unlock()

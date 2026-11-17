@@ -4,6 +4,14 @@ package main
 // client.UploadBlob and client.GetBlob. A blob uploaded stays pending,
 // visible to nobody, until a write references it: put prints the
 // reference to write, or with --at writes it into the document itself.
+//
+// In encrypted namespaces (encrypted.go) a blob is read through its
+// reference in the document (--at, client.GetBlobRef): a sealed
+// namespace's are sealed for delivery, opened with the namespace's keys,
+// and uploaded with a nonce (§E.2.2); an e2e namespace's are encrypted by
+// the client under a key of their own that the reference carries
+// (E2E.UploadBlob, §E.3.1), so a reference written elsewhere than with
+// --at must go into the document with patch --identity.
 
 import (
 	"context"
@@ -29,9 +37,10 @@ type blobCmd struct {
 
 type blobPutCmd struct {
 	toolArgs
+	encArgs
 	gestureArgs
 	Type     string `arg:"--type" placeholder:"MEDIA-TYPE" help:"the blob's media type (default: from the file's extension, else sniffed from its bytes)"`
-	Nonce    bool   `arg:"--nonce" help:"upload with a random nonce (Blob-Nonce), so the blob's id reveals nothing about its bytes (§3.7, §7.8)"`
+	Nonce    bool   `arg:"--nonce" help:"upload with a random nonce (Blob-Nonce), so the blob's id reveals nothing about its bytes (§3.7, §7.8); always in a sealed namespace, never in an e2e one, whose blobs are encrypted under a fresh key"`
 	At       string `arg:"--at" placeholder:"POINTER" help:"also write the reference into the document at this JSON Pointer (add), so the blob isn't left pending"`
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
 	File     string `arg:"positional,required" placeholder:"FILE|-" help:"the bytes to upload (- for stdin)"`
@@ -65,27 +74,37 @@ func (a *blobPutCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if typ == "" {
 		typ = http.DetectContentType(data)
 	}
-	nonce := ""
-	if a.Nonce {
-		nonce = seal.NewNonce()
-	}
-	c := a.writer()
-	bid, err := c.UploadBlob(ctx, ns, name, typ, nonce, data)
+	v, err := a.view(ctx, a.writer(), ns, name)
 	if err != nil {
 		return err
 	}
-	ref := client.BlobRef(bid, typ, len(data), nonce)
+	var ref map[string]any
+	var bid string
+	if v.e2e() {
+		if a.Nonce {
+			return errors.New("--nonce: an e2e namespace's blobs are encrypted under a fresh key, so their id reveals nothing, and are uploaded without one (§E.3.1)")
+		}
+		if ref, err = v.x.UploadBlob(ctx, ns, name, typ, data); err != nil {
+			return v.explain(err)
+		}
+		bid, _ = ref["$blob"].(string)
+	} else {
+		nonce := ""
+		if a.Nonce || v.sealed() {
+			nonce = seal.NewNonce()
+		}
+		if bid, err = v.c.UploadBlob(ctx, ns, name, typ, nonce, data); err != nil {
+			return err
+		}
+		ref = client.BlobRef(bid, typ, len(data), nonce)
+	}
 	if a.At == "" {
 		fmt.Fprintf(errw, "uploaded %s to %s, pending until a write references it\n", bid, a.Resource)
 		return writeJSON(out, ref)
 	}
-	head, err := liveHead(ctx, c, ns, name)
-	if err != nil {
-		return err
-	}
 	g, opt := a.gesture()
 	p := []any{map[string]any{"op": "add", "path": a.At, "value": ref}}
-	w, err := c.AppendLatest(ctx, ns, name, head, client.Backoff{}, func(string) (any, error) { return p, nil }, opt)
+	w, err := v.append(ctx, "", p, opt)
 	if err != nil {
 		return fmt.Errorf("uploaded %s, but writing its reference: %w", bid, err)
 	}
@@ -97,6 +116,7 @@ func (a *blobPutCmd) exec(ctx context.Context, out, errw io.Writer) error {
 
 type blobGetCmd struct {
 	toolArgs
+	encArgs
 	At       string `arg:"--at" placeholder:"POINTER" help:"the blob the document references at this JSON Pointer (its id and nonce)"`
 	Rev      string `arg:"--rev" placeholder:"ID" help:"with --at, the revision to read the reference from (default: the head)"`
 	Nonce    string `arg:"--nonce" help:"with BLOB, the reference's nonce, to check the bytes against the id"`
@@ -115,22 +135,35 @@ func (a *blobGetCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if (a.Blob == "") == (a.At == "") {
 		return errors.New("give BLOB or --at, not both")
 	}
-	c := a.client()
-	bid, nonce := a.Blob, a.Nonce
-	if a.At != "" {
-		if bid, nonce, err = blobAt(ctx, c, ns, name, a.Rev, a.At); err != nil {
-			return err
-		}
+	v, err := a.view(ctx, a.client(), ns, name)
+	if err != nil {
+		return err
+	}
+	if (v.e2e() || v.sealed()) && a.At == "" {
+		return fmt.Errorf("namespace %s is %s: its blobs are read through their reference in the document, which an encrypted blob is checked and opened with; give --at POINTER", ns, v.level)
 	}
 	if a.Out == "" && out == io.Writer(os.Stdout) && isTerminal(os.Stdout) {
 		return errors.New("stdout is a terminal: give -o FILE, or redirect it")
 	}
-	b, err := c.GetBlob(ctx, ns, name, bid, nonce)
-	if err != nil && nonce == "" && strings.Contains(err.Error(), "doesn't match its id") {
-		return fmt.Errorf("%w: a blob uploaded with a nonce is checked with it (--nonce, or --at reads it from the reference)", err)
-	}
-	if err != nil {
-		return err
+	bid, nonce := a.Blob, a.Nonce
+	var b *client.Blob
+	if a.At != "" {
+		ref, err := v.refAt(ctx, a.Rev, a.At)
+		if err != nil {
+			return err
+		}
+		bid, _ = ref["$blob"].(string)
+		if b, err = v.c.GetBlobRef(ctx, ns, name, ref); err != nil {
+			return v.explain(err)
+		}
+	} else {
+		b, err = v.c.GetBlob(ctx, ns, name, bid, nonce)
+		if err != nil && nonce == "" && strings.Contains(err.Error(), "doesn't match its id") {
+			return fmt.Errorf("%w: a blob uploaded with a nonce is checked with it (--nonce, or --at reads it from the reference)", err)
+		}
+		if err != nil {
+			return err
+		}
 	}
 	if a.Out != "" {
 		if err := os.WriteFile(a.Out, b.Data, 0o644); err != nil {
@@ -141,32 +174,6 @@ func (a *blobGetCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	}
 	_, err = out.Write(b.Data)
 	return err
-}
-
-// blobAt reads the blob reference at ptr of ns/name's document (at rev,
-// else the head) and returns its id and nonce.
-func blobAt(ctx context.Context, c *client.Client, ns, name, rev, ptr string) (bid, nonce string, err error) {
-	p, err := pointer.Parse(ptr)
-	if err != nil {
-		return "", "", fmt.Errorf("--at: %w", err)
-	}
-	if rev == "" {
-		if rev, err = liveHead(ctx, c, ns, name); err != nil {
-			return "", "", err
-		}
-	}
-	d, err := c.Doc(ctx, ns, name, rev)
-	if err != nil {
-		return "", "", err
-	}
-	v, ok := pointer.Get(d.Value, p)
-	ref, _ := v.(map[string]any)
-	bid, _ = ref["$blob"].(string)
-	if !ok || bid == "" {
-		return "", "", fmt.Errorf("%s/%s has no blob reference at %s", ns, name, ptr)
-	}
-	nonce, _ = ref["nonce"].(string)
-	return bid, nonce, nil
 }
 
 // isTerminal reports whether f is a terminal (a character device).
