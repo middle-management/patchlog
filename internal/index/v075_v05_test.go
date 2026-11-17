@@ -149,6 +149,18 @@ func (w *v75x) reader(sub string, groups []any, ns ...string) string {
 		"at": map[string]any{"ns": "cat-season", "id": w.head("cat-season")}, "exp": w.s.Now().Add(10 * time.Minute).Format(time.RFC3339)})
 }
 
+// readerVia is reader through key k, with a block rule on /resource that
+// makes it a partial reader of matches as the catalog's key's scope rule
+// does: a grant that still verifies once cat-season is purged, as one of
+// the catalog's key, whose requireAt names it, no longer does (§C.4,
+// v0.85).
+func (w *v75x) readerVia(sub string, groups []any) string {
+	w.t.Helper()
+	return w.k.Grant(w.t, w.s.Now(), sub, []string{"matches"}, []string{"read"}, map[string]any{"groups": groups, "roles": []any{"reader"},
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}},
+		"exp":   w.s.Now().Add(10 * time.Minute).Format(time.RFC3339)})
+}
+
 // pointer asks path with token and returns the at URL it redirects to,
 // its gs and its at.
 func (w *v75x) pointer(path, token string) (loc, gs, at string) {

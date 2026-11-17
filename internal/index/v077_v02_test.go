@@ -247,7 +247,7 @@ func TestV077PurgedCatalogDark(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	w := newV75X(t, false)
-	li := w.reader("user:li", []any{"fans"})
+	li := w.readerVia("user:li", []any{"fans"})
 	if got := strings.Join(resources(w.x.search("/matches", li)), ","); got != "derby,shared" {
 		t.Fatalf("li sees %s before the purge", got)
 	}

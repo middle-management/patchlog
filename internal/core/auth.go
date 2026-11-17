@@ -359,13 +359,17 @@ var errAtRejected = errors.New("at rejected by requireAt")
 // is the target namespace's (default 60 seconds), or the key's when that
 // is stricter. At the origin, at is in no chain of a namespace that
 // doesn't exist: the grant fails the scope as for any other at, with
-// errAtRejected.
+// errAtRejected, and so it does where requireAt names a purged namespace
+// (v0.85).
 func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 	return func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 		target := n
 		if s, ok := requireAt.(string); ok {
 			target = t.nsByName(s)
-			if target == nil {
+			// A purged namespace as one that doesn't exist (§C.4,
+			// v0.85): its log is kept, and its purge-ns entry stays
+			// its head for good, but the grant fails the scope.
+			if target == nil || target.purged {
 				return errAtRejected
 			}
 		}
