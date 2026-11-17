@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -38,11 +37,8 @@ func TestV082ExpectLevelFlag(t *testing.T) {
 	t.Cleanup(srv.Close)
 	tool := func(args ...string) *client.Client {
 		t.Helper()
-		fs := flag.NewFlagSet("t", flag.ContinueOnError)
-		tf := addToolFlags(fs)
-		if err := fs.Parse(append([]string{"-api", srv.URL}, args...)); err != nil {
-			t.Fatal(err)
-		}
+		tf := &toolArgs{}
+		parseArgs(t, tf, append([]string{"--api", srv.URL}, args...)...)
 		return tf.client()
 	}
 	ctx := context.Background()

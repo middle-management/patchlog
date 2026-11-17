@@ -257,7 +257,7 @@ if [ -n "$drivecfg" ]; then
      "then":[{"op":"test","path":"/doc/title","schema":{"type":"string","minLength":1,"pattern":"^[^/\\\\\\p{Cc}\\p{Zl}\\p{Zp}\\u202A-\\u202E\\u2066-\\u2069]+$","not":{"enum":[".",".."]}}}]}]}]'
 fi
 
-# Encryption demos (Addendum E; the server needs -master-key). "private" is
+# Encryption demos (Addendum E; the server needs --master-key). "private" is
 # sealed for delivery (E2): documents leave the origin as JWEs, and every
 # patch set carries a fresh $nonce. "vault" is end-to-end (E3): the server
 # never sees plaintext; create its keyring from the playground's Keys tab.

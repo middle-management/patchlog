@@ -296,7 +296,7 @@ var ErrNotOffered = errors.New("merge: the catalog service issues no merge grant
 func (h *HTTPGranter) MergeGrant(ctx context.Context, cat string, batch map[string]any, adminGrant string) (*MergeGrantResult, error) {
 	u := h.URLs[cat]
 	if u == "" {
-		return nil, fmt.Errorf("merge: no catalog service for %s (give one with -catalog-service %s=URL)", cat, cat)
+		return nil, fmt.Errorf("merge: no catalog service for %s (give one with --catalog-service %s=URL)", cat, cat)
 	}
 	body, err := json.Marshal(map[string]any{"batch": batch})
 	if err != nil {
@@ -1113,7 +1113,7 @@ func (x *relCtx) placedItems(ctx context.Context) error {
 				case changedInRelease[pl]:
 					x.conflict(RCPlacedItem, b.Key, b.NS, r.Name, fmt.Sprintf("step 3 creates or restores %s/%s, which the placement %s/%s already names, and the release changes that placement other than by removing it in step 2: step 3 would publish the item under the base's placement before step 4 changes it", b.Key, r.Name, cb.Target, pl))
 				case !accepted[pl]:
-					x.conflict(RCPlacedItem, b.Key, b.NS, r.Name, fmt.Sprintf("step 3 creates or restores %s/%s, which the placement %s/%s already names: step 3 publishes it under that placement; accept with -accept-placement %s, or unplace it in the release", b.Key, r.Name, cb.Target, pl, pl))
+					x.conflict(RCPlacedItem, b.Key, b.NS, r.Name, fmt.Sprintf("step 3 creates or restores %s/%s, which the placement %s/%s already names: step 3 publishes it under that placement; accept with --accept-placement %s, or unplace it in the release", b.Key, r.Name, cb.Target, pl, pl))
 				}
 			}
 		}

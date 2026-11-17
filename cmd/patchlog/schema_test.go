@@ -23,7 +23,10 @@ func TestSchemaImportCLI(t *testing.T) {
 	}))
 	defer srv.Close()
 	var out, errb bytes.Buffer
-	if code := schemaImport(context.Background(), []string{"-ns", "schemas", "-dry-run", "-json", "-name", "thing", srv.URL + "/root.json"}, &out, &errb); code != 0 {
+	schemaImport := func(args ...string) int {
+		return command(t, append([]string{"schema", "import"}, args...)...).(*schemaImportCmd).importSchemas(context.Background(), &out, &errb)
+	}
+	if code := schemaImport("--ns", "schemas", "--dry-run", "--json", "--name", "thing", srv.URL+"/root.json"); code != 0 {
 		t.Fatalf("exit %d: %s", code, errb.String())
 	}
 	var res struct {
@@ -37,10 +40,10 @@ func TestSchemaImportCLI(t *testing.T) {
 		t.Errorf("%s", out.String())
 	}
 	out.Reset()
-	if code := schemaImport(context.Background(), []string{"-ns", "schemas", "-dry-run", srv.URL + "/root.json"}, &out, &errb); code != 0 || !strings.Contains(out.String(), "/r/schemas/root/rev/") {
+	if code := schemaImport("--ns", "schemas", "--dry-run", srv.URL+"/root.json"); code != 0 || !strings.Contains(out.String(), "/r/schemas/root/rev/") {
 		t.Errorf("table: %d %s", code, out.String())
 	}
-	if code := schemaImport(context.Background(), []string{"-ns", "schemas", srv.URL + "/root.json"}, &out, &errb); code != 2 {
-		t.Errorf("missing -api: exit %d", code)
+	if code := schemaImport("--ns", "schemas", srv.URL+"/root.json"); code != 2 {
+		t.Errorf("missing --api: exit %d", code)
 	}
 }

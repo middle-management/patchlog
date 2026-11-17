@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"os"
 	"path/filepath"
 	"testing"
@@ -60,11 +59,8 @@ func TestV073P29KeyringSenderFlags(t *testing.T) {
 	af, ef := write("admin.jwk", adminJWK), write("evil.jwk", evilJWK)
 	tool := func(args ...string) *client.E2E {
 		t.Helper()
-		fs := flag.NewFlagSet("t", flag.ContinueOnError)
-		tf := addToolFlags(fs)
-		if err := fs.Parse(append([]string{"-api", s.URL, "-author", "w"}, args...)); err != nil {
-			t.Fatal(err)
-		}
+		tf := &toolArgs{}
+		parseArgs(t, tf, append([]string{"--api", s.URL, "--author", "w"}, args...)...)
 		return tf.client().E2E(w)
 	}
 	strict := tool("-keyring-sender", ef, "-trusted-sender", af)
@@ -80,7 +76,7 @@ func TestV073P29KeyringSenderFlags(t *testing.T) {
 	if _, err := tool("-trusted-sender", ef).CreateDocSealed(ctx, "e", "c", map[string]any{"n": 1.0}); err != nil {
 		t.Fatalf("with the sender trusted: %v", err)
 	}
-	kf := &keyringFlags{senders: multi{filepath.Join(dir, "missing")}}
+	kf := &keyringArgs{KeyringSender: []string{filepath.Join(dir, "missing")}}
 	if _, err := kf.options(); err == nil {
 		t.Fatal("a missing -keyring-sender file")
 	}

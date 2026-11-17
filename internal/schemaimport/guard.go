@@ -12,7 +12,7 @@ import (
 )
 
 // ErrFetchDisabled is what a client from DisabledClient answers.
-var ErrFetchDisabled = errors.New("fetching URLs is disabled on this server (serve -schema-fetch)")
+var ErrFetchDisabled = errors.New("fetching URLs is disabled on this server (serve --schema-fetch)")
 
 // DisabledClient is an HTTP client that fetches nothing.
 func DisabledClient() *http.Client {

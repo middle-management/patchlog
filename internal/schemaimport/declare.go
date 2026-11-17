@@ -247,7 +247,7 @@ func (p *planner) noteDeclaration(patch map[string][]pointer.Pointer, refused ma
 		if n == 1 {
 			s = ""
 		}
-		p.notes = append(p.notes, fmt.Sprintf("declared $schema in %d closed schema%s for servers before spec v0.36 (-declare-schema)", n, s))
+		p.notes = append(p.notes, fmt.Sprintf("declared $schema in %d closed schema%s for servers before spec v0.36 (--declare-schema)", n, s))
 	}
 	if len(shared) > 0 {
 		var at []string

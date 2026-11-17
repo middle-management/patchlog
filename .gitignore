@@ -3,3 +3,5 @@
 *.db-shm
 /patchlog
 /dev.key
+/cmd/patchlog/patchlog
+/cmd/capacity/capacity

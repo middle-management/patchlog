@@ -145,7 +145,7 @@ func (s *Service) serveEdgeGrants(w http.ResponseWriter, r *http.Request) {
 // disabled (§1), it is 404 not_offered, before the body is read; it
 // takes no query parameter (400, as the core's, §7). Cookies are Secure,
 // HttpOnly and SameSite as EdgeGrants says (None with credentialed
-// origins, -cors-credentials-origin, else Lax).
+// origins, --cors-credentials-origin, else Lax).
 func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	root, err := s.c.Root(ctx)

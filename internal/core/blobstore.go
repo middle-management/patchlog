@@ -186,7 +186,7 @@ func openBlobStore(dir, path string, pg bool) (blobStore, error) {
 	if dir == "" {
 		switch {
 		case pg:
-			log.Print("blob bytes are stored in the database: give -blob-dir (a directory every instance shares) to store them in files")
+			log.Print("blob bytes are stored in the database: give --blob-dir (a directory every instance shares) to store them in files")
 			return tableStore{}, nil
 		case path == ":memory:":
 			return tableStore{}, nil

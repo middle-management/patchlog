@@ -30,11 +30,11 @@ func v077Child() bool {
 		return false
 	}
 	args := strings.Split(os.Getenv("V077_ARGS"), "\x1f")
-	switch args[0] {
-	case "rebase":
-		rebaseCmd(args[1:])
-	case "release":
-		releaseCmd(args[1:])
+	if args[0] == "release" {
+		args = append([]string{"merge"}, args...)
+	}
+	if code := run(args, os.Stdout, os.Stderr); code != 0 {
+		os.Exit(code)
 	}
 	return true
 }
@@ -151,7 +151,7 @@ func TestV077ReleaseRebaseLeaveOutFlag(t *testing.T) {
 	if _, err := release.Write(ctx, c, release.Ref{NS: "releases", Name: "rel"}, "", &release.Doc{Name: "rel", Branches: map[string]release.Branch{"matches": {NS: "r7", At: at}}}); err != nil {
 		t.Fatal(err)
 	}
-	base := []string{"release", "rebase", "-api", s.URL, "-author", "alice", "-suffix", "-b"}
+	base := []string{"release", "rebase", "-api", s.URL, "-author", "alice", "--suffix=-b"}
 	out, ok := v077Tool(t, "TestV077ReleaseRebaseLeaveOutFlag", append(base, "/r/releases/rel")...)
 	if ok || !strings.Contains(out, "derby") || !strings.Contains(out, "-leave-out") {
 		t.Fatalf("release rebase: ok %v\n%s", ok, out)

@@ -125,7 +125,7 @@ func (t *tx) isSealedNS(n *nsRow) bool { return t.config(n.configSeq).level == l
 
 // sealedConfigWritten runs after a namespace document of n was written: a
 // sealed document beginning a new epoch gets its epoch key, and with
-// -rotate-on-revoke a change that revokes access (a new revocation, a key
+// --rotate-on-revoke a change that revokes access (a new revocation, a key
 // removed or changed) queues a rotation.
 //
 // The rotation is recorded as due (rotations_due) in the same transaction

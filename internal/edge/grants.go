@@ -181,7 +181,7 @@ func KeyFromSecret(secret []byte) []byte {
 // nil without a Verifier. Every holder of the edge secret can derive it,
 // the catalog service and the search index included, and mint core
 // cookies with it, so the origin never signs with it by default: only
-// when the deployment names it (patchlog serve -edge-grant-key
+// when the deployment names it (patchlog serve --edge-grant-key
 // KID=edge-secret), to migrate to key files of the origin's own. A
 // service's key must never be it (§C.5.3: each key vouches only for its own
 // prefixes).

@@ -280,7 +280,7 @@ func (s *importer) mergePlan(w http.ResponseWriter, r *http.Request) {
 	}
 	if tdoc.Value["signatures"] == "required" {
 		fail(w, http.StatusUnprocessableEntity, "merge_unsupported",
-			target+" requires author signatures (§C.3.1), which the playground can't make: use `patchlog merge -sign-key`")
+			target+" requires author signatures (§C.3.1), which the playground can't make: use `patchlog merge --sign-key`")
 		return
 	}
 

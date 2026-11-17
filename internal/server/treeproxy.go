@@ -82,7 +82,7 @@ func NewTreeProxy(targets ...string) (http.Handler, error) {
 		}
 		if rp == nil {
 			treeSvc.headers(w.Header())
-			writeJSON(w, http.StatusNotFound, map[string]any{"code": "not_found", "message": "no tree service for catalog " + strconv.Quote(cat) + " (-tree-url CATALOG=URL)"})
+			writeJSON(w, http.StatusNotFound, map[string]any{"code": "not_found", "message": "no tree service for catalog " + strconv.Quote(cat) + " (--tree-url CATALOG=URL)"})
 			return
 		}
 		rp.ServeHTTP(w, r)

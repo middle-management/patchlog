@@ -128,7 +128,7 @@ func (e *Engine) openStoreCodec() error {
 			return fmt.Errorf("recording store compression: %w", err)
 		}
 		if n, _ := r.RowsAffected(); n == 1 && e.opt.Path != ":memory:" {
-			log.Printf("store compression on: patch sets of namespaces without encryption are stored compressed; versions of patchlog without -store-compression can no longer read this database")
+			log.Printf("store compression on: patch sets of namespaces without encryption are stored compressed; versions of patchlog without --store-compression can no longer read this database")
 		}
 		c.mayHold = true
 		return nil

@@ -51,7 +51,7 @@ import (
 //	                                 namespace with "purged:{ns}" is purged (itemInfo); meta
 //	                                 "filed" marks file metadata computed for a file tree
 //	self_parents(ns, name, parents, born)
-//	                                 $parents of content documents (§B.9, -self-placing), with
+//	                                 $parents of content documents (§B.9, --self-placing), with
 //	                                 the content document's born
 //	explicit_gone(name)              placements whose explicit placement was deleted or
 //	                                 purged, which still win over $parents (§B.9); meta

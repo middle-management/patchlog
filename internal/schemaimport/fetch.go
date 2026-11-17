@@ -115,7 +115,7 @@ func sourceURL(arg string) (*url.URL, error) {
 // final URL after redirects, which may differ from u.
 func (f *fetcher) fetch(ctx context.Context, u *url.URL) (any, *url.URL, error) {
 	if f.docs >= f.maxDocs {
-		return nil, nil, limitError(fmt.Sprintf("more than %d documents (raise -max-docs)", f.maxDocs))
+		return nil, nil, limitError(fmt.Sprintf("more than %d documents (raise --max-docs)", f.maxDocs))
 	}
 	f.docs++
 	remaining := f.maxBytes - f.bytes
@@ -165,7 +165,7 @@ func (f *fetcher) fetch(ctx context.Context, u *url.URL) (any, *url.URL, error) 
 		return nil, nil, fmt.Errorf("%s: only http(s) and local files are fetched", u)
 	}
 	if int64(len(body)) > remaining {
-		return nil, nil, limitError(fmt.Sprintf("documents exceed %d bytes in total (raise -max-bytes)", f.maxBytes))
+		return nil, nil, limitError(fmt.Sprintf("documents exceed %d bytes in total (raise --max-bytes)", f.maxBytes))
 	}
 	f.bytes += int64(len(body))
 	// A UTF-8 byte order mark is not JSON, but some servers send one.

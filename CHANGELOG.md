@@ -15,17 +15,65 @@ It was tested against this server at v0.29.0 and changes nothing in it.
   it streams, one patch set a flush, and answers with the resource's URL and its own grant
   narrowed to that stream (`via` the caller, read, and appends within `/abort` only). Callers
   read, resume and abort against the core; `streams.Follow` and `streams.Abort` do so in Go,
-  and `patchlog streams read NS/ID [-since REV]` prints a stream. Covered: the J.1 document
+  and `patchlog streams read NS/ID [--since REV]` prints a stream. Covered: the J.1 document
   with nothing of the request in it, creation before upstream with `If-None-Match: *`,
   `Request-Key` ids that find a repeated request's stream, `If-Match` and nonces on every
   append, `429` waits, continuation in `{id}.{n}` at `documentSize`, abort seen in the log or
-  by `412`, `"error"` for streams open at a restart (`-state`) or shutdown, the idle sweep
+  by `412`, `"error"` for streams open at a restart (`--state`) or shutdown, the idle sweep
   (`"timeout"`) and the purge once read grants have expired. Upstreams are an allowlist of URL
-  prefixes (`-upstream`). Not implemented: sealed namespaces (refused at start, as end-to-end
+  prefixes (`--upstream`). Not implemented: sealed namespaces (refused at start, as end-to-end
   ones are) and J.5–J.7. See the README's "Stream proxy". SPEC-FEEDBACK notes 94–100 are what
   J.1–J.4 left open.
 - **SPEC-FEEDBACK v0.82 Open 93**: what a stream kept as one growing document costs per flush
   on this server, from the capacity measurements. Notes 89–92 stay open; v0.83 answers none.
+
+- **The CLI parses its flags with go-arg.** Help is generated: `patchlog <command> --help`.
+  The docs and examples now write flags as `--flag` (`patchlog serve --addr :8080 --db x.db`).
+  The single-dash spellings (`-addr :8080`) still parse, so existing scripts and compose files
+  keep working. A value that starts with a dash is given with `=`: `--suffix=-b`.
+- **Client commands.** `patchlog get`, `put`, `patch`, `rm`, `log` and `watch` read and write
+  resources (`NS/NAME`), and `patchlog ns create|get|config|log` namespaces, through the public
+  API. Each write supplies its precondition (§7.2): `patch` appends to the head, trying again
+  after a lost race, unless `--if ID` pins one. See the README's short tour.
+- **`patchlog undo` and `redo`** (§11.2). Every `put`, `patch` and `rm` now sends a gesture of
+  its own, printed with the result, or the one `--gesture ID` names, so several writes undo
+  together. `undo NS` undoes your last action, `redo NS` redoes your last undone one, and a
+  `GESTURE` argument names one; `--plan` shows the inverse and its conflicts without writing,
+  `--list` your stack.
+- **`patchlog get --follow`** (`-f`) prints the document, then each revision as it is written,
+  one line of JSON each (`null` for a tombstone), from the resource's event stream (§7.3),
+  reconnecting when it ends, until interrupted or the resource is purged. A resource that
+  doesn't exist yet is waited for.
+- **`patchlog blob put` and `blob get`** (§7.8). `put` uploads a file or stdin and prints the
+  reference to write, or with `--at /pointer` writes it into the document; `get` downloads a blob
+  by id or by the reference at `--at`, checked against its id, to `-o FILE` or stdout.
+- **More client commands.** `ls`, `restore`, `batch` (with `--dry-run`), `validate`, `whoami`,
+  `log --follow`, `get --raw` for raw files, and `verify` (§G.2). `search` queries the index and
+  `tree ls` lists a catalog. The destructive `purge`, `prune` and `ns purge` need `--yes`, and
+  without it print what they would destroy. A deleted resource that moved is named in errors, and
+  `log` of a pruned resource starts at the horizon.
+- **Encrypted namespaces from the CLI** (Addendum E). `e2e init`, `add-reader`, `rotate` and
+  `readers` administer an e2e namespace's keyring; `e2e keys` shows what `/keys` gives a grant.
+  `get` (and `--follow`), `put`, `patch`, `log` and `blob put|get` learn the namespace's level:
+  sealed namespaces are opened with the keys `/keys` gives, e2e ones sealed and folded by the
+  client with `--identity` (`$PATCHLOG_IDENTITY`), and refused without it. A write whose
+  namespace's level can't be told is refused before sending anything (`--expect-level`, or
+  `--plain` for an unencrypted one); `restore` and `batch` refuse e2e namespaces. `log --follow`
+  of an e2e namespace isn't supported yet.
+- **`client.With` keeps the keyring senders**: a signing or keyed copy of a client lost
+  `--keyring-sender`.
+- **Grants.** `grant inspect` decodes a grant offline, `grant check NS TOKEN` verifies it as the
+  namespace would (exit 1 if refused), `grant show NS GID` prints a recorded grant.
+- **`--bearer-file` and `--sign-key-file`** (`$PATCHLOG_BEARER_FILE`, `$PATCHLOG_SIGN_KEY_FILE`)
+  on every command that takes the flag, and **profiles**: `--profile NAME` (`$PATCHLOG_PROFILE`)
+  reads defaults from `~/.config/patchlog/config.json`; `profile list|show`.
+- **Shell completion**: `patchlog completion bash|zsh|fish`.
+- **`cmd/capacity`** parses its flags with go-arg too.
+- **`patchlog branch create BASE NAME`** (`--at ID`, `--patch JSON`) and `branch list BASE`.
+- **`$PATCHLOG_API`, `$PATCHLOG_BEARER` and `$PATCHLOG_AUTHOR`** are the defaults of `--api`,
+  `--bearer` and `--author` in every command that takes them.
+- **`patchlog --help` groups the commands**: server commands, client commands, branches,
+  releases and bundles, and keys and operations.
 
 ## v0.29.0
 

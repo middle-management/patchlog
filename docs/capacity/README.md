@@ -8,7 +8,7 @@ runs, which started from a new, empty one.
 
 - **Server X** (`pg-*`): the core at 2 vCPU / 4 GB, Postgres 16 at 2 vCPU / 4 GB
   (`max_connections=300`), each in a container.
-- **SQLite** (`sqlite-*`): the core with `-dev`, in a container with no limit.
+- **SQLite** (`sqlite-*`): the core with `--dev`, in a container with no limit.
 
 | File | Run |
 |---|---|
@@ -18,9 +18,9 @@ runs, which started from a new, empty one.
 | `pg-grants-serverX-direct-longpoll.json` | `-only live`, long-polls straight to the core |
 | `pg-grants-core1vcpu.json` | grants, the core at 1 vCPU / 2 GB: scans, reads, writes, bootstrap |
 | `pg-grants-core2x1vcpu.json` | grants, two core instances at 1 vCPU / 2 GB, writes routed by namespace |
-| `pg-noauth-serverX.json` | the same data, the core with `-dev` (no grant checks). Its `long_poll_fanout` is of the private namespace the grants run made, so it is not a public namespace through the CDN; the `pg-public-*` files are |
-| `pg-noauth-serverX-single-unlimited.json`, `pg-noauth-serverX-direct-longpoll.json` | the same with `-dev` |
-| `pg-public-serverX-cdn-longpoll-{1,2}.json` | `-dev`, a new public namespace, `-only live` through Varnish: the CDN collapse |
+| `pg-noauth-serverX.json` | the same data, the core with `--dev` (no grant checks). Its `long_poll_fanout` is of the private namespace the grants run made, so it is not a public namespace through the CDN; the `pg-public-*` files are |
+| `pg-noauth-serverX-single-unlimited.json`, `pg-noauth-serverX-direct-longpoll.json` | the same with `--dev` |
+| `pg-public-serverX-cdn-longpoll-{1,2}.json` | `--dev`, a new public namespace, `-only live` through Varnish: the CDN collapse |
 | `pg-public-serverX-direct-longpoll.json` | the same straight to the core |
 | `pg-grants-serverX-cold-start.json` | a pass taken minutes after Postgres was restarted on the seeded data, before its cache had filled: the first read and write measurements are slow. Kept as a record of a cold start |
 | `{pg-grants-serverX,sqlite-public-4vcpu}-large-{change,full}.json` | 2026-11-14, the same host and containers, an empty database, `-only large` with the server's own validator: `change` is the default (a patch validated where it changes the document), `full` the core with `-full-validation`. These supersede the `append_large_*` figures of the two full runs |

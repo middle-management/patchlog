@@ -504,7 +504,7 @@ func Open(opt Options) (*Engine, error) {
 	if err := e.purgeRaisedE2E(context.Background(), legacy); err != nil {
 		e.comp.close()
 		db.Close()
-		return nil, fmt.Errorf("purging namespaces raised to e2e (-purge-raised-e2e): %w", err)
+		return nil, fmt.Errorf("purging namespaces raised to e2e (--purge-raised-e2e): %w", err)
 	}
 	// After the gate, the migrations and the gate's purges: E3 snapshots
 	// an earlier version left behind a moved horizon are never served

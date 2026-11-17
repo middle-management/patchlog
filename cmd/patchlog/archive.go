@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -13,32 +12,34 @@ import (
 	"github.com/middle-management/patchlog/internal/keystore"
 )
 
-// archiveCmd is `patchlog archive restore`: the offline restore of pruned
-// history from its archives (§8.6, §D.4).
-func archiveCmd(args []string) {
-	if len(args) < 1 || args[0] != "restore" {
-		fmt.Fprintln(os.Stderr, "usage: patchlog archive restore -db patchlog.db [-blob-dir DIR] [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]")
-		os.Exit(2)
+// archiveCmd is patchlog archive restore.
+type archiveCmd struct {
+	Restore *archiveRestoreCmd `arg:"subcommand:restore" help:"restore pruned history from its archives, offline (§8.6, §D.4)"`
+}
+
+// archiveRestoreCmd is the offline restore of pruned history from its
+// archives (§8.6, §D.4).
+type archiveRestoreCmd struct {
+	DB        string `arg:"--db" default:"patchlog.db" placeholder:"PATH|URL" help:"SQLite database path (no server may have it open), or a Postgres URL"`
+	BlobDir   string `arg:"--blob-dir,env:PATCHLOG_BLOB_DIR" placeholder:"DIR" help:"the server's blob directory (default <db>.blobs next to a SQLite file)"`
+	From      string `arg:"--from" placeholder:"file:///DIR" help:"file:// directory the archives are in now (default: the URLs recorded when they were written)"`
+	NS        string `arg:"--ns" help:"restore only this namespace"`
+	Resource  string `arg:"--resource" placeholder:"NAME" help:"restore only this resource (with --ns)"`
+	MasterKey string `arg:"--master-key" placeholder:"FILE" help:"master key file, needed to restore archives of encrypted namespaces (Addendum E.1)"`
+}
+
+func (a *archiveRestoreCmd) run(string) {
+	if a.Resource != "" && a.NS == "" {
+		log.Fatal("--resource needs --ns")
 	}
-	fs := flag.NewFlagSet("archive restore", flag.ExitOnError)
-	db := fs.String("db", "patchlog.db", "SQLite database path (no server may have it open), or a Postgres URL")
-	blobDir := fs.String("blob-dir", envOr("PATCHLOG_BLOB_DIR", ""), "the server's blob directory (default $PATCHLOG_BLOB_DIR, else <db>.blobs next to a SQLite file)")
-	from := fs.String("from", "", "file:// directory the archives are in now (default: the URLs recorded when they were written)")
-	ns := fs.String("ns", "", "restore only this namespace")
-	res := fs.String("resource", "", "restore only this resource (with -ns)")
-	masterKey := fs.String("master-key", "", "master key file, needed to restore archives of encrypted namespaces (Addendum E.1)")
-	fs.Parse(args[1:])
-	if *res != "" && *ns == "" {
-		log.Fatal("-resource needs -ns")
+	if _, err := os.Stat(a.DB); err != nil && !strings.HasPrefix(a.DB, "postgres") {
+		log.Fatalf("--db: %v", err)
 	}
-	if _, err := os.Stat(*db); err != nil && !strings.HasPrefix(*db, "postgres") {
-		log.Fatalf("-db: %v", err)
-	}
-	opt := core.Options{Path: *db, BlobDir: *blobDir, RetentionInterval: -1}
-	if *masterKey != "" {
-		ks, err := keystore.LoadFile(*masterKey, false)
+	opt := core.Options{Path: a.DB, BlobDir: a.BlobDir, RetentionInterval: -1}
+	if a.MasterKey != "" {
+		ks, err := keystore.LoadFile(a.MasterKey, false)
 		if err != nil {
-			log.Fatalf("-master-key: %v", err)
+			log.Fatalf("--master-key: %v", err)
 		}
 		opt.KeyStore = ks
 	}
@@ -48,7 +49,7 @@ func archiveCmd(args []string) {
 	}
 	defer e.Close()
 	reps, err := archive.Restore(context.Background(), e, archive.RestoreOptions{
-		From: *from, NS: *ns, Name: *res,
+		From: a.From, NS: a.NS, Name: a.Resource,
 		Log: func(format string, args ...any) { log.Printf(format, args...) },
 	})
 	if err != nil {
@@ -68,7 +69,7 @@ func archiveCmd(args []string) {
 	}
 }
 
-// archiver builds the serve archiver from -archive and -archive-root.
+// archiver builds the serve archiver from --archive and --archive-root.
 func archiver(def string, roots []string) (core.Archiver, error) {
 	if def == "" && len(roots) == 0 {
 		return nil, nil

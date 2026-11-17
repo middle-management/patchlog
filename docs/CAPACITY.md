@@ -73,8 +73,8 @@ so they include the HTTP stack. The raw results are in [`capacity/`](capacity/).
   - Postgres 16 in a container limited to **2 vCPU / 4 GB** (`max_connections=300`, otherwise
     default settings);
   - **grants on**: the namespaces are private (`read: grant`), and every request carries a
-    signed grant. Rows that say "authentication off" ran the same core with `-dev`.
-- **SQLite** (the "SQLite" figures): the core with `-dev` and a SQLite file, in a container
+    signed grant. Rows that say "authentication off" ran the same core with `--dev`.
+- **SQLite** (the "SQLite" figures): the core with `--dev` and a SQLite file, in a container
   with **no limit**, so it had the host's 4 vCPU. Its namespaces are public.
 
 So the two columns differ in more than the database: SQLite also had twice the CPU and no grant
@@ -197,7 +197,7 @@ of followers.
 ### Private namespaces: no collapse at the CDN
 
 The CDN collapse holds for **public** namespaces only. A private namespace's long-poll answers
-are `CDN-Cache-Control: no-store` unless the CDN verifies edge grants (§C.5, `-edge-secret`).
+are `CDN-Cache-Control: no-store` unless the CDN verifies edge grants (§C.5, `--edge-secret`).
 No edge that verifies them is included. Only the checks are, in Go: `edge.Cookies.Check`.
 
 Without such an edge, every follower is an origin request, and every write wakes all of them.
@@ -289,7 +289,7 @@ And three patches to the schema document:
   The server validates a patch where it changes the document, so this checks `/n` alone.
 - **the array**: an item added at the end of `items` and one removed at its start. The array
   itself changed, so all of it is validated again.
-- **in full**: the one-member patch with the core run with `-full-validation`, which validates
+- **in full**: the one-member patch with the core run with `--full-validation`, which validates
   the whole document on every write.
 
 | Append p50 | 16 KiB | 256 KiB | 1 MiB | 3.5 MiB |
@@ -314,7 +314,7 @@ What the table shows:
   the patch changed is validated, and the constraints of the objects and arrays above it.
 - **Validating in full adds about a quarter**: 5–6 ms a MiB of small typed objects on top of
   about 20 ms a MiB without a schema. That is what a patch that changes the large array pays,
-  and what every append pays under `-full-validation`.
+  and what every append pays under `--full-validation`.
 - **The database adds a constant** (3–4 ms on server X). The rest is the core's CPU, which is
   why the two agree at the large sizes even though one core has half the CPU: an append uses one
   thread.
@@ -349,7 +349,7 @@ with `children`.
 | The 1 MiB **schema** document of [the section above](#large-documents-by-shape-and-schema) (9,500 typed objects) | 43 ms | 4.2 ms, 85,503 steps |
 
 - **Validation is bounded by steps**, a step being one schema applied to one value: 5,000,000
-  for a document unless `serve -max-validation-steps` says otherwise. A write that needs more is
+  for a document unless `serve --max-validation-steps` says otherwise. A write that needs more is
   refused `422`, `limit: "validationSteps"`. The `core.schema.validate` span carries the count
   (README, "Telemetry").
 - Keeping the recursion out of the union (declaring `children` once on the node schema, with
@@ -371,7 +371,7 @@ What to do instead:
 - Or keep one writer per document, or put a queue in front of it.
 - Or collect one writer's changes into batch steps ([Batches](#batches)).
 - **Where one writer does need more than 10 writes a second on a small document**, raise the
-  deployment maximum (`serve -max-rate-per-resource`) and set `ratePerResource` in that
+  deployment maximum (`serve --max-rate-per-resource`) and set `ratePerResource` in that
   namespace's `limits`. Leave it at the default where documents are large: a 1 MiB
   document of small values already costs ~24 ms of CPU an append
   ([above](#large-documents-by-shape-and-schema)).
@@ -431,7 +431,7 @@ principal, and an allowance doesn't lift it.
 
 Here nothing is rate limited, and the core and the database set the pace. The settings:
 
-- the core run with `serve -max-rate-per-resource 1e6,1e6 -max-rate-per-principal 1e6,1e6`;
+- the core run with `serve --max-rate-per-resource 1e6,1e6 --max-rate-per-principal 1e6,1e6`;
 - a namespace whose `limits` set both that high;
 - `capacity -single-rate 1000000`.
 
@@ -634,7 +634,7 @@ Each limit is one of three kinds:
   - batches: 1,000 items and 16 MiB;
   - log pages: 1,000 entries.
   - The other deployment maximums equal the defaults.
-- *Lever:* `serve -max-document-size` raises the document maximum. Large documents are slow to
+- *Lever:* `serve --max-document-size` raises the document maximum. Large documents are slow to
   write (next limit). Batches are imports, not interactive writes.
 
 **Whole-document work on every write.**
@@ -657,7 +657,7 @@ Each limit is one of three kinds:
   - 500 items/s a namespace (burst 1,000);
   - 10/s a resource (burst 20).
   - Since v0.73 the instances of a Postgres deployment share the buckets (`rate_buckets`, about
-    +1.2 ms a write). They are per instance only with `serve -local-rate-buckets`.
+    +1.2 ms a write). They are per instance only with `serve --local-rate-buckets`.
 - *Measured:* 500/s a namespace is about half of server X's single-namespace ceiling.
 - *Lever:* allowances (§6.6) replace a principal's and its namespace's buckets, for loaders and
   importers. The per-resource rate always applies.
@@ -683,7 +683,7 @@ Each limit is one of three kinds:
 | Gap | Effect | Fix |
 |---|---|---|
 | **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request. The origin shares their reads ([Origin-side collapse](#origin-side-collapse)), at ~0.03–0.04 ms of core CPU per follower per write (0.12–0.14 ms through Varnish). | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
-| **No read replicas, and one `-db` for everything.** The core runs migrations, the tailer and leader jobs, so it can't run on a read-only database. | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
+| **No read replicas, and one `--db` for everything.** The core runs migrations, the tailer and leader jobs, so it can't run on a read-only database. | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
 | **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: 6–7 min on server X (fetches at 2,400–2,800/s); 1.3 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
 | **Rule `test`s with a `schema` and annotation walks are not counted** against `validationSteps`, and listing an invalid document's failures gets the budget anew. | A rule's schema fragment, or a schema's annotations, can still be made expensive to evaluate; an invalid document can cost twice the limit. | Count them against the same budget. |
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
@@ -727,7 +727,7 @@ These were limits and are not any more:
 | **Postgres round trips** | A single write is ~13 statements; on server X one writer did 200–240 writes/s (about 4 ms each). | Keep the core near Postgres (sub-millisecond); concurrency, not speed, is what instances add. |
 | **Postgres CPU and memory** | 3.3 of 4 GB at the end of the runs; CPU not recorded in them. In the earlier measurements it was the limit (~1.3 of 2 vCPU under reads), and here a smaller core was no slower. | Size Postgres first; a read replica takes bulk reads and private followers' log reads (a gap, above). |
 | **Storage** | 6.8 GB on Postgres, 3.7 GB on SQLite for 5M revisions of ~500-byte documents. | Linear in revisions; pruning (§8.6) bounds it. |
-| **Memory** | Core: 0.2–0.3 GB through scans, reads and small writes, 0.4–0.6 GB after a whole run, 1.0 GB peak (1.4 GB on SQLite) with 3.5 MiB documents and 5,000 followers. The caches are bounded: up to 256 MiB of documents, 64 MiB of read-cache revisions and 65,536 grants (a few hundred MB at most) by default. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves large documents or many followers; size the caches with `serve -doc-cache-size`, `-read-cache-size` and `-grant-cache`. |
+| **Memory** | Core: 0.2–0.3 GB through scans, reads and small writes, 0.4–0.6 GB after a whole run, 1.0 GB peak (1.4 GB on SQLite) with 3.5 MiB documents and 5,000 followers. The caches are bounded: up to 256 MiB of documents, 64 MiB of read-cache revisions and 65,536 grants (a few hundred MB at most) by default. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves large documents or many followers; size the caches with `serve --doc-cache-size`, `--read-cache-size` and `--grant-cache`. |
 | **Upgrades** | Schema migrations run in a transaction at start (README "Schema migrations"); one that builds an index on a large table blocks writes to it while the index builds. | Create the index `CONCURRENTLY` beforehand under the same name: migrations are written with `IF NOT EXISTS`, so they then find it. |
 
 ## Recommended settings
@@ -736,10 +736,10 @@ Changes to limits that these measurements recommend. Most are done.
 
 | Setting | Status | Detail |
 |---|---|---|
-| **Bearer cache** | Done | 65,536 grants, at most 32 MiB of tokens, least recently used out first (`serve -grant-cache`). |
-| **Document and read caches** | Done | 256 MiB and 64 MiB, evicting gradually (`serve -doc-cache-size`, `-read-cache-size`). |
-| **`documentSize`** | Done | 1 MiB by default, 4 MiB a namespace may set (`serve -document-size`, `-max-document-size`). Appends at 3.5 MiB are 4× slower than at 16 KiB for documents of long strings on server X, and 14× for documents of many small values ([above](#large-documents-by-shape-and-schema)); every revision of a large document weighs on the caches. |
-| **Per-resource and per-principal maximums** | Done | `serve -max-rate-per-resource` and `-max-rate-per-principal` let a namespace set its own above the defaults (10/s and 50/s), for small documents one writer writes often. The defaults stay. |
+| **Bearer cache** | Done | 65,536 grants, at most 32 MiB of tokens, least recently used out first (`serve --grant-cache`). |
+| **Document and read caches** | Done | 256 MiB and 64 MiB, evicting gradually (`serve --doc-cache-size`, `--read-cache-size`). |
+| **`documentSize`** | Done | 1 MiB by default, 4 MiB a namespace may set (`serve --document-size`, `--max-document-size`). Appends at 3.5 MiB are 4× slower than at 16 KiB for documents of long strings on server X, and 14× for documents of many small values ([above](#large-documents-by-shape-and-schema)); every revision of a large document weighs on the caches. |
+| **Per-resource and per-principal maximums** | Done | `serve --max-rate-per-resource` and `--max-rate-per-principal` let a namespace set its own above the defaults (10/s and 50/s), for small documents one writer writes often. The defaults stay. |
 | **Log pages** | Recommended | Bound items or bytes as well as entries. |
 | **The rates** | Keep | 500/s a namespace is about half of one namespace's ceiling on server X, which leaves room for reads. |
 | **`itemsPerBatch`** | Keep | 1,000. Batches are for imports; give importers allowances. |
@@ -770,20 +770,20 @@ on that one day:
 
 ```sh
 go build -o patchlog ./cmd/patchlog && go build -o capacity ./cmd/capacity
-./patchlog serve -dev -addr :9080 -db cap.db -origin http://localhost:8080 -max-rate-per-namespace 1e9,1e9 &
+./patchlog serve --dev --addr :9080 --db cap.db --origin http://localhost:8080 --max-rate-per-namespace 1e9,1e9 &
 ./capacity -url http://127.0.0.1:9080 -pid $! -json result.json   # 1M docs, 5M revisions: about 40 min to seed
 ```
 
-Why `-max-rate-per-namespace 1e9,1e9` is needed:
+Why `--max-rate-per-namespace 1e9,1e9` is needed:
 
 - The harness's namespaces give its loader an allowance of 1e9 writes a second and burst.
 - An allowance's bucket never exceeds the deployment maximum of `ratePerNamespace` (§6.6), so
-  the core needs `-max-rate-per-namespace` raised to it.
+  the core needs `--max-rate-per-namespace` raised to it.
 - Without it, creating the namespaces is `422` (`limit: "ratePerNamespace"`).
 
 Options:
 
-- **Grants**: run the core with `-operator-key <public>` (from `patchlog keygen`) and pass the
+- **Grants**: run the core with `--operator-key <public>` (from `patchlog keygen`) and pass the
   private seed as `-operator-seed`. The namespaces are then private and every
   request carries a grant. Readers carry 5,000 distinct ones (`-readers`).
 - **A CDN**: put Varnish with `deploy/varnish/default.vcl` (backends pointed at the core) in
@@ -797,15 +797,15 @@ Options:
   namespaces of its own) and takes about two minutes.
   - `-single-seconds` sets how long each single-document measurement runs.
   - `-single-rate N` runs them in a namespace that allows N writes a second per resource and
-    principal. The core then needs `-max-rate-per-resource N,N -max-rate-per-principal N,N`.
+    principal. The core then needs `--max-rate-per-resource N,N --max-rate-per-principal N,N`.
   - `-only single` also measures the writers each creating resources of their own
     (`single_ns_items_writers_N`).
 - **Server X**: run the core and Postgres in containers with `--cpus 2 --memory 4g` each
-  (Postgres with `-c max_connections=300`), the core with `-operator-key`, and point `-url` at
+  (Postgres with `-c max_connections=300`), the core with `--operator-key`, and point `-url` at
   the core container's address. `-pid` takes the core's process id on the host
   (`docker inspect -f '{{.State.Pid}}'`), which is where the CPU and memory figures come from.
 - **A public namespace's followers** need a namespace made without grants: run the core with
-  `-dev` and give `-ns` a name not used before, since `-only live` reuses `<ns>-live` if it
+  `--dev` and give `--ns` a name not used before, since `-only live` reuses `<ns>-live` if it
   exists.
 - **Sizes**: `-docs`, `-revs`, `-namespaces`, `-doc-size`, `-append-batch`. `-help` lists the
   rest.

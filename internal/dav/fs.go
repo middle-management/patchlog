@@ -1562,7 +1562,7 @@ func (st *reqState) textBlob(ctx context.Context, ns, name string, r *rawRef) (b
 func (st *reqState) fileBytes(ctx context.Context, hd *headDoc) ([]byte, error) {
 	if r := hd.m.raw; r != nil {
 		if r.size > int64(st.s.opt.MaxRawSize) {
-			return nil, overLimit("-max-raw-size", r.size, int64(st.s.opt.MaxRawSize), "(this gateway's bound on a raw file, which it copies here whole): %s/%s", hd.ns, hd.name)
+			return nil, overLimit("--max-raw-size", r.size, int64(st.s.opt.MaxRawSize), "(this gateway's bound on a raw file, which it copies here whole): %s/%s", hd.ns, hd.name)
 		}
 		b, err := st.tk.c.GetBlob(ctx, hd.ns, hd.name, r.bid, r.nonce)
 		if err != nil {
@@ -1771,9 +1771,9 @@ func (w *writeFile) Write(p []byte) (int, error) {
 	if n := w.buf.Len() + len(p); n > w.max {
 		// The body read so far: a lower bound, as in the core's refusals
 		// of a body it stopped reading (§6.6).
-		key, what := "-max-file-size", "a JSON file or a temporary file"
+		key, what := "--max-file-size", "a JSON file or a temporary file"
 		if w.max == w.st.s.opt.MaxRawSize && !w.scratch {
-			key, what = "-max-raw-size", "a raw file"
+			key, what = "--max-raw-size", "a raw file"
 		}
 		w.err = w.st.record(overLimit(key, int64(n), int64(w.max), "(this gateway's bound on %s, which it buffers whole; it stopped reading there)", what))
 		return 0, w.err

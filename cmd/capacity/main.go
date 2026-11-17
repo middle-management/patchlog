@@ -22,7 +22,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"hash/fnv"
 	"math/rand/v2"
@@ -33,6 +32,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	arg "github.com/alexflint/go-arg"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/grant"
@@ -67,33 +68,65 @@ type config struct {
 	backoffMax  time.Duration
 }
 
+// args are the harness's flags (go-arg), copied into config.
+type args struct {
+	URL         string        `arg:"--url" default:"http://localhost:8080" help:"the core; several instances of one deployment comma-separated: a namespace's writes go to one of them by a hash of its name (README: one writer per namespace), reads and followers to each in turn"`
+	Big         string        `arg:"--ns" default:"cap-big" help:"the large namespace"`
+	Docs        int           `arg:"--docs" default:"1000000" help:"documents in the large namespace"`
+	Revs        int           `arg:"--revs" default:"5000000" help:"revisions in the large namespace (at least --docs)"`
+	DocSize     int           `arg:"--doc-size" default:"512" help:"approximate bytes per seeded document"`
+	Small       int           `arg:"--namespaces" default:"1000" help:"small namespaces (cap-0001, …) besides the large one"`
+	SmallDocs   int           `arg:"--namespace-docs" default:"10" help:"documents per small namespace"`
+	Workers     int           `arg:"--seed-workers" default:"16" help:"concurrent seeding requests"`
+	AppendBatch int           `arg:"--append-batch" default:"1" help:"appends per seeding request: 1 writes each on its own, as most clients do, so the namespace log holds an entry per append; more makes batch entries (§7.5) of that many"`
+	Samples     int           `arg:"--samples" default:"2000" help:"requests per latency measurement"`
+	Fetch       int           `arg:"--fetch" default:"20000" help:"documents fetched in the bootstrap measurement"`
+	Large       string        `arg:"--large-sizes" default:"16384,262144,1048576,3670016" help:"document sizes for the large-document appends ('' to skip)"`
+	Out         string        `arg:"--json" help:"also write the results to this file"`
+	LiveURL     string        `arg:"--live-url" help:"where long-poll followers connect: a CDN in front of --url (default --url itself)"`
+	Waiters     string        `arg:"--waiters" default:"100,1000,5000" help:"long-poll followers of one namespace to measure ('' to skip)"`
+	Pid         string        `arg:"--pid" help:"the core's process ids, comma-separated, to report the CPU time they spend per measurement and their memory (Linux)"`
+	Operator    string        `arg:"--operator-seed" help:"grants profile: the private seed of the core's --operator-key (patchlog keygen); namespaces are then read: grant, and every request carries a signed grant (§C)"`
+	Readers     int           `arg:"--readers" default:"5000" help:"grants profile: distinct reader grants the reads draw from (past the core's 1,024 cached bearers, most reads verify their grant)"`
+	SingleSecs  int           `arg:"--single-seconds" default:"15" help:"seconds each single-document write measurement runs"`
+	SingleRate  float64       `arg:"--single-rate" help:"single-document measurements: writes a second (and burst) the namespace allows per resource, per principal and in all, in place of the defaults (10, 50 and 500 a second); the core needs --max-rate-per-resource, --max-rate-per-principal and --max-rate-per-namespace raised to it"`
+	BackoffMax  time.Duration `arg:"--single-backoff-max" help:"single-document measurements: the longest wait of the client's backoff after lost races (default: the client's, 16ms)"`
+	Only        string        `arg:"--only" help:"run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live"`
+}
+
+func (args) Description() string {
+	return "capacity seeds a patchlog deployment and measures it (docs/CAPACITY.md)."
+}
+
 func main() {
-	var c config
-	flag.StringVar(&c.url, "url", "http://localhost:8080", "the core; several instances of one deployment comma-separated: a namespace's writes go to one of them by a hash of its name (README: one writer per namespace), reads and followers to each in turn")
-	flag.StringVar(&c.big, "ns", "cap-big", "the large namespace")
-	flag.IntVar(&c.docs, "docs", 1_000_000, "documents in the large namespace")
-	flag.IntVar(&c.revs, "revs", 5_000_000, "revisions in the large namespace (at least -docs)")
-	flag.IntVar(&c.docSize, "doc-size", 512, "approximate bytes per seeded document")
-	flag.IntVar(&c.small, "namespaces", 1000, "small namespaces (cap-0001, …) besides the large one")
-	flag.IntVar(&c.smallDocs, "namespace-docs", 10, "documents per small namespace")
-	flag.IntVar(&c.workers, "seed-workers", 16, "concurrent seeding requests")
-	flag.IntVar(&c.appendBatch, "append-batch", 1, "appends per seeding request: 1 writes each on its own, as most clients do, so the namespace log holds an entry per append; more makes batch entries (§7.5) of that many")
-	flag.IntVar(&c.samples, "samples", 2000, "requests per latency measurement")
-	flag.IntVar(&c.fetch, "fetch", 20000, "documents fetched in the bootstrap measurement")
-	flag.StringVar(&c.large, "large-sizes", "16384,262144,1048576,3670016", "document sizes for the large-document appends ('' to skip)")
-	flag.StringVar(&c.out, "json", "", "also write the results to this file")
-	flag.StringVar(&c.liveURL, "live-url", "", "where long-poll followers connect: a CDN in front of -url (default -url itself)")
-	flag.StringVar(&c.waiters, "waiters", "100,1000,5000", "long-poll followers of one namespace to measure ('' to skip)")
-	flag.StringVar(&c.pid, "pid", "", "the core's process ids, comma-separated, to report the CPU time they spend per measurement and their memory (Linux)")
-	flag.StringVar(&c.operator, "operator-seed", "", "grants profile: the private seed of the core's -operator-key (patchlog keygen); namespaces are then read: grant, and every request carries a signed grant (§C)")
-	flag.IntVar(&c.readers, "readers", 5000, "grants profile: distinct reader grants the reads draw from (past the core's 1,024 cached bearers, most reads verify their grant)")
-	flag.IntVar(&c.singleSecs, "single-seconds", 15, "seconds each single-document write measurement runs")
-	flag.Float64Var(&c.singleRate, "single-rate", 0, "single-document measurements: writes a second (and burst) the namespace allows per resource, per principal and in all, in place of the defaults (10, 50 and 500 a second); the core needs -max-rate-per-resource, -max-rate-per-principal and -max-rate-per-namespace raised to it")
-	flag.DurationVar(&c.backoffMax, "single-backoff-max", 0, "single-document measurements: the longest wait of the client's backoff after lost races (default: the client's, 16ms)")
-	flag.StringVar(&c.only, "only", "", "run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live")
-	flag.Parse()
+	var a args
+	arg.MustParse(&a)
+	c := config{
+		url:         a.URL,
+		big:         a.Big,
+		docs:        a.Docs,
+		revs:        a.Revs,
+		docSize:     a.DocSize,
+		small:       a.Small,
+		smallDocs:   a.SmallDocs,
+		workers:     a.Workers,
+		appendBatch: a.AppendBatch,
+		samples:     a.Samples,
+		fetch:       a.Fetch,
+		large:       a.Large,
+		out:         a.Out,
+		liveURL:     a.LiveURL,
+		waiters:     a.Waiters,
+		pid:         a.Pid,
+		operator:    a.Operator,
+		readers:     a.Readers,
+		singleSecs:  a.SingleSecs,
+		singleRate:  a.SingleRate,
+		backoffMax:  a.BackoffMax,
+		only:        a.Only,
+	}
 	if c.revs < c.docs {
-		fail(errors.New("-revs must be at least -docs"))
+		fail(errors.New("--revs must be at least --docs"))
 	}
 	r := &runner{c: c, ctx: context.Background(), res: map[string]any{}, hc: sharedHTTP(512)}
 	r.urls = strings.Split(c.url, ",")
@@ -105,7 +138,7 @@ func main() {
 	if c.operator != "" {
 		op, err := grant.ParsePrivateKey(c.operator)
 		if err != nil {
-			fail(fmt.Errorf("-operator-seed: %w", err))
+			fail(fmt.Errorf("--operator-seed: %w", err))
 		}
 		r.op = op
 		// The namespaces' key follows from the operator's, so a later run
