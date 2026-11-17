@@ -115,6 +115,10 @@ func (s *Service) upstream(what string, err error) error {
 	return &Error{Status: 502, Code: "upstream", Msg: "the catalog service can't read " + what}
 }
 
+// errStopped is why a stopped namespace's document isn't read
+// (contentConfig), for the log.
+var errStopped = errors.New("the service stopped following the namespace (§B.5 Behind)")
+
 // configErr answers a namespace document the checker couldn't read: 410
 // purged, with the core's head, the purge-ns entry, for a purged sealed
 // namespace, whose documents are 410 purged once the purge destroys their
@@ -197,14 +201,20 @@ func (s *Service) untrustedIn(g *tree.Graph, cur map[string]string, ns string) e
 // §B.11.5); then 410 purged for every name of a namespace the service
 // holds as purged (purgedIn). One whose document the core answers 410
 // purged (a sealed one, §8.5) is 410 purged too, from the core's head
-// (configErr).
+// (configErr). Then, whatever the checker could still read of it, 502
+// upstream for an item of a namespace the service stopped following
+// (§B.5 Behind, v0.85: "A catalog service answers a request naming one of
+// its items 502 (upstream) ... after any 403 its own catalog.trust
+// decides, or 410 once the namespace is purged").
 func (s *Service) contentConfig(ctx context.Context, ns string) (*grantcheck.Config, error) {
 	var err error
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		if err = s.untrustedIn(g, cur, ns); err != nil {
 			return
 		}
-		err = s.purgedIn(g, cur, ns)
+		if err = s.purgedIn(g, cur, ns); err == nil && g.Stopped(ns) {
+			err = s.upstream("the document of namespace "+ns, errStopped)
+		}
 	})
 	if err != nil {
 		return nil, err
@@ -244,11 +254,13 @@ func decidedAt(err error, checkpoint map[string]string) error {
 // which are all a decision on them depends on. So a write elsewhere, in
 // a content namespace the decision didn't read, doesn't move it, as the
 // combined checkpoint of listings (§B.5) would. A namespace the service
-// doesn't follow has no entry. Call it under View.
+// doesn't follow has no entry, nor has one it stopped following (§B.5
+// Behind, v0.85: "No checkpoint names the namespace"), whose last
+// checkpoint it still holds. Call it under View.
 func checkpointAt(g *tree.Graph, cur map[string]string, nss ...string) map[string]string {
 	cp := map[string]string{}
 	for _, ns := range append([]string{g.Catalog}, nss...) {
-		if id := cur[ns]; id != "" {
+		if id := cur[ns]; id != "" && !g.Stopped(ns) {
 			cp[g.Actual(ns)] = id
 		}
 	}
