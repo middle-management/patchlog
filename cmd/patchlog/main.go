@@ -66,7 +66,7 @@ type cli struct {
 	Blob     *blobCmd     `arg:"subcommand:blob" group:"Client commands" help:"upload or download a resource's blobs (put, get)"`
 	Undo     *undoCmd     `arg:"subcommand:undo" group:"Client commands" help:"undo an action (a gesture), by default your last (§11.2)"`
 	Redo     *redoCmd     `arg:"subcommand:redo" group:"Client commands" help:"redo an undone action, by default your last undone"`
-	NS       *nsCmd       `arg:"subcommand:ns" group:"Client commands" help:"create, read and configure namespaces (create, get, config, log, purge)"`
+	NS       *nsCmd       `arg:"subcommand:ns" group:"Client commands" help:"list, create, read and configure namespaces (ls, create, get, config, log, purge)"`
 	Purge    *purgeCmd    `arg:"subcommand:purge" group:"Client commands" help:"purge a resource, destroying it for good (§8.3); needs --yes"`
 	Prune    *pruneCmd    `arg:"subcommand:prune" group:"Client commands" help:"prune a resource's history below a revision (§8.6); needs --yes"`
 

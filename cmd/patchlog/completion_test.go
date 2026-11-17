@@ -27,6 +27,8 @@ func TestComplete(t *testing.T) {
 		{words: []string{"get", "--api", ""}, none: true},
 		{words: []string{"get", "--json", ""}, none: true}, // a bool: then NS/NAME, a positional
 		{words: []string{"tree", ""}, want: []string{"ls"}},
+		{words: []string{"ns", ""}, want: []string{"ls", "create", "get", "config", "log", "purge"}},
+		{words: []string{"ns", "ls", "--"}, want: []string{"--prefix", "--json", "--bearer-file"}},
 	} {
 		got := complete(c.words)
 		if c.none {

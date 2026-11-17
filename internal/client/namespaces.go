@@ -415,6 +415,78 @@ func parseHeads(r *response, prefix string) (items []HeadItem, next string, err 
 	return items, str(m, "next"), nil
 }
 
+// Namespace is one row of GET /ns (§7.4, v0.84).
+type Namespace struct {
+	Name string
+	// Created is the created time of the entry that created the
+	// namespace: the base's branch entry for a local branch, otherwise
+	// its chain's first.
+	Created string
+	// Base is the namespace document's base (§7.6) without chain: { ns,
+	// at }, with origin for a remote branch. nil unless a branch.
+	Base   map[string]any
+	Frozen bool
+	Purged bool
+	Raw    map[string]any
+}
+
+// Namespaces fetches one page of GET /ns (§7.4, v0.84): the deployment's
+// namespaces, branches and purged ones included, in ascending byte order
+// of name, strictly after after, a plain bound ("" = the first page), and,
+// if prefix isn't "", only those whose names start with it, a namespace
+// name (§3.6). next is "" on the last page. The server answers only an
+// operator grant whose blocks name "*", list config and carry no rules
+// (§C.4), or anyone while authentication is disabled; a server before
+// v0.84 has no such route (404 or 405).
+func (c *Client) Namespaces(ctx context.Context, after, prefix string) (items []Namespace, next string, err error) {
+	if prefix != "" && !ValidNSName(prefix) {
+		return nil, "", fmt.Errorf("client: invalid namespace prefix %q: not a namespace name (§3.6)", prefix)
+	}
+	r, err := c.do(ctx, "GET", "/ns", headsQuery(prefix, after), nil)
+	if err != nil {
+		return nil, "", err
+	}
+	if r.status != 200 {
+		return nil, "", r.apiError()
+	}
+	m := r.obj()
+	arr, ok := m["namespaces"].([]any)
+	if !ok {
+		return nil, "", fmt.Errorf("client: %s: no namespaces in the answer (§7.4)", r.path)
+	}
+	for _, x := range arr {
+		o, _ := x.(map[string]any)
+		it := Namespace{Name: str(o, "name"), Created: str(o, "created"), Frozen: o["frozen"] == true, Purged: o["purged"] == true, Raw: o}
+		it.Base, _ = o["base"].(map[string]any)
+		if !ValidNSName(it.Name) || !strings.HasPrefix(it.Name, prefix) || it.Name <= after {
+			return nil, "", fmt.Errorf("client: %s: row %q outside the page asked for (§7.4)", r.path, it.Name)
+		}
+		items = append(items, it)
+	}
+	return items, str(m, "next"), nil
+}
+
+// AllNamespaces lists the deployment's namespaces whose names start with
+// prefix ("" for all), iterating all pages of Namespaces.
+func (c *Client) AllNamespaces(ctx context.Context, prefix string) ([]Namespace, error) {
+	var all []Namespace
+	after := ""
+	for {
+		items, next, err := c.Namespaces(ctx, after, prefix)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, items...)
+		if next == "" {
+			return all, nil
+		}
+		if next <= after {
+			return nil, fmt.Errorf("client: /ns: next %q doesn't follow %q (§7.4)", next, after)
+		}
+		after = next
+	}
+}
+
 // Branch is one entry of GET /ns/{ns}/branches.
 type Branch struct {
 	Name      string
