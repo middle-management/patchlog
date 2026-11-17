@@ -370,3 +370,6 @@ Changes to `SPEC.md` by version, oldest first. Section references (§) point int
   - **Recording model calls (§J.7):** the stream proxy in front of each participant's model API, at a secret per-participant URL, records each call as a document under that participant's grant, with its stream beside the session. The agent never waits on the recording, and keys are never stored.
   - **Tested** against the reference server (v0.29.0) with two kits: the stream proxy and session (30 checks), and MCP agents with recording (37 checks); the roles in §J.5 are the ones the tests run.
   - **The reference changes:** nothing.
+- **v0.84:** a namespace listing for operators.
+  - **`GET /ns?after={name}`** (§7.4) lists the deployment's namespaces, branches and purged ones included, as `{ name, created, base?, frozen, purged }`, in name order, paged like `/heads` and filtered by `prefix`. It answers only an operator grant whose blocks name `"*"`, allow `config` and carry no `rules` (§C.4), and is `no-store`. Everyone else learns namespaces from their grants, catalogs and `branch` entries, as before (§E.4).
+  - **The reference changes:** add the endpoint.

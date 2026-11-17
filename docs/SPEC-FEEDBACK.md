@@ -1,6 +1,6 @@
 # Reference-implementation notes for the spec writer
 
-`docs/SPEC.md` mirrors the canonical specification, now at **v0.83**, with `docs/SERVICES.md` and
+`docs/SPEC.md` mirrors the canonical specification, now at **v0.84**, with `docs/SERVICES.md` and
 `docs/TOOLS.md`, split from it in v0.80. This file collects what the reference does that the text
 doesn't yet describe. Open notes come in one list, from implementing v0.82; cite them as "v0.82
 Open n". v0.82 answered the v0.81 list ("v0.81 Open n"): what it settled is under "Settled in
