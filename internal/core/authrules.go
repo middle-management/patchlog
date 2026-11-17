@@ -16,8 +16,10 @@ var stepOneRefs = []string{"action", "resource", "principal", "now"}
 //
 // It bounds nothing: reads come here, and §6.6 bounds the schema tests of
 // a write's rules only (grantRulesMode with the write's meter).
+// The one read that is bounded is the check a write's refusal makes to
+// decide whether it may carry measured (writeMeter.over, t.readMeter).
 func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool) *Error {
-	return t.grantRulesMode(a, verb, roles, env, stepOne, nil, nil)
+	return t.grantRulesMode(a, verb, roles, env, stepOne, nil, t.readMeter)
 }
 
 // writeMeter counts the validation steps of one write against the
@@ -34,11 +36,12 @@ func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]an
 type writeMeter struct {
 	rules.Meter
 	readable func() bool
+	t        *tx
 }
 
 // newMeter is a meter for one write, at the deployment's limit.
 func (t *tx) newMeter(readable func() bool) *writeMeter {
-	return &writeMeter{Meter: rules.Meter{Max: max(t.e.opt.MaxValidationSteps, 0)}, readable: readable}
+	return &writeMeter{Meter: rules.Meter{Max: max(t.e.opt.MaxValidationSteps, 0)}, readable: readable, t: t}
 }
 
 // metered gives the write this transaction checks its meter, which the
@@ -69,10 +72,23 @@ func (m *writeMeter) over() *Error {
 		return nil
 	}
 	err := limitErr(422, "validationSteps", int64(m.Steps), int64(m.Max), "validating the document against its schema and its rules' schema tests take too many steps together")
-	if m.readable == nil || !m.readable() {
+	if m.readable == nil || !m.readsWithin() {
 		delete(err.Body, "measured")
 	}
 	return err
+}
+
+// readsWithin is m.readable, with the read check's own rules held to the
+// limit too: the grant whose rule just took too many steps on the write
+// may take as many on the read envelope, and the refusal must not cost
+// what it refuses. A check that runs out counts as can't read.
+func (m *writeMeter) readsWithin() bool {
+	t := m.t
+	prev := t.readMeter
+	rm := t.newMeter(nil)
+	t.readMeter = rm
+	defer func() { t.readMeter = prev }()
+	return m.readable() && !rm.Over
 }
 
 // grantRulesMode is grantRules with the envelope members unknown names

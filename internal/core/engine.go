@@ -739,6 +739,10 @@ type tx struct {
 	// checked, which its rules' schema tests draw on (writeMeter); nil
 	// for reads, which nothing bounds.
 	meter *writeMeter
+	// readMeter, set only while a write's refusal for validationSteps
+	// checks whether the writer may read the resource, bounds that
+	// check's rules (writeMeter.readsWithin).
+	readMeter *writeMeter
 	// rateDrawn, when set, records that a write drew its rate-limit tokens,
 	// so a transaction run again doesn't draw them twice.
 	rateDrawn *bool

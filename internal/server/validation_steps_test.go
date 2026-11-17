@@ -229,15 +229,17 @@ func TestV085ValidationStepsGrantRules(t *testing.T) {
 		t.Fatalf("writer without read: %s", r.Body)
 	}
 
-	// A rule of step 1, on /resource: 4,096 steps and more on a name. Its
+	// A rule of step 1, on /resource: a billion steps and more on a name,
+	// for the write and again for the read check that decides whether the
+	// refusal may carry measured, which is held to the limit too. Its
 	// 422 comes before the rate limits, so it draws no token: the one the
 	// bucket of that resource holds is still there for a grant without
 	// the rule.
-	onName := narrowed(t, root, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": doubling(12)}}})
+	onName := narrowed(t, root, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": doubling(30)}}})
 	for i := 0; i < 2; i++ {
 		r = e.write("PATCH", "sec", "named", "", addRoot(map[string]any{}), onName)
 		expectCode(t, r, 422, "limit")
-		if r.Obj()["limit"] != "validationSteps" {
+		if _, has := r.Obj()["measured"]; has || r.Obj()["limit"] != "validationSteps" {
 			t.Fatalf("step 1: %s", r.Body)
 		}
 	}

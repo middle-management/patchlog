@@ -14,6 +14,8 @@ import (
 // 412: an operator grant may create namespaces with config (§C.2 item 2,
 // §C.4), and otherwise the caller needs config on the namespace itself.
 func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
+	// The write's rules draw on one validation meter (§6.6, writeMeter).
+	defer t.metered(nil)()
 	if keys := t.operatorKeys(); len(keys) > 0 {
 		if a, err := t.authenticate(n.name, nil, nil, req.Cred, keys); err == nil {
 			return t.authorize(a, "config", "")
