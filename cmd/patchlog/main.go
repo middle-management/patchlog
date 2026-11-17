@@ -79,14 +79,15 @@ type cli struct {
 	Schema  *schemaCmd  `arg:"subcommand:schema" group:"Branches, releases and bundles" help:"import external JSON Schemas into a namespace"`
 	E2E     *e2eCmd     `arg:"subcommand:e2e" group:"Branches, releases and bundles" help:"inspect e2e namespaces (Addendum E)"`
 
-	Keygen     *keygenCmd  `arg:"subcommand:keygen" group:"Keys and operations" help:"print a new Ed25519 key pair for minting grants"`
-	Grant      *grantCmd   `arg:"subcommand:grant" group:"Keys and operations" help:"mint, narrow, seal, inspect, check or show a grant (Biscuit v3, §C.8)"`
-	Profile    *profileCmd `arg:"subcommand:profile" group:"Keys and operations" help:"list or show the connection profiles of the config file (--profile NAME)"`
-	Archive    *archiveCmd `arg:"subcommand:archive" group:"Keys and operations" help:"restore pruned history from its archives (§8.6)"`
-	Whoami     *whoamiCmd  `arg:"subcommand:whoami" group:"Keys and operations" help:"print who the deployment takes you to be, and with a namespace what your grant can do there"`
-	Health     *healthCmd  `arg:"subcommand:health" group:"Keys and operations" help:"check a health endpoint (exit 0 on 200), for container healthchecks"`
-	Verify     *verifyCmd  `arg:"subcommand:verify" group:"Keys and operations" help:"check a namespace's hash chain and its resources' logs (§G.2)"`
-	VersionCmd *versionCmd `arg:"subcommand:version" group:"Keys and operations" help:"print the version"`
+	Keygen     *keygenCmd     `arg:"subcommand:keygen" group:"Keys and operations" help:"print a new Ed25519 key pair for minting grants"`
+	Grant      *grantCmd      `arg:"subcommand:grant" group:"Keys and operations" help:"mint, narrow, seal, inspect, check or show a grant (Biscuit v3, §C.8)"`
+	Profile    *profileCmd    `arg:"subcommand:profile" group:"Keys and operations" help:"list or show the connection profiles of the config file (--profile NAME)"`
+	Archive    *archiveCmd    `arg:"subcommand:archive" group:"Keys and operations" help:"restore pruned history from its archives (§8.6)"`
+	Whoami     *whoamiCmd     `arg:"subcommand:whoami" group:"Keys and operations" help:"print who the deployment takes you to be, and with a namespace what your grant can do there"`
+	Health     *healthCmd     `arg:"subcommand:health" group:"Keys and operations" help:"check a health endpoint (exit 0 on 200), for container healthchecks"`
+	Verify     *verifyCmd     `arg:"subcommand:verify" group:"Keys and operations" help:"check a namespace's hash chain and its resources' logs (§G.2)"`
+	Completion *completionCmd `arg:"subcommand:completion" group:"Keys and operations" help:"print a shell completion script (bash, zsh, fish)"`
+	VersionCmd *versionCmd    `arg:"subcommand:version" group:"Keys and operations" help:"print the version"`
 }
 
 // writeRootHelp writes patchlog's own help: the commands by their group
@@ -125,6 +126,12 @@ func main() {
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && (args[0] == "-version" || args[0] == "--version") {
 		args = []string{"version"}
+	}
+	if len(args) > 0 && args[0] == "__complete" { // the shell completion scripts' callback
+		for _, c := range complete(args[1:]) {
+			fmt.Fprintln(stdout, c)
+		}
+		return 0
 	}
 	if msg := removedCommand(args); msg != "" {
 		fmt.Fprintln(stderr, msg)
