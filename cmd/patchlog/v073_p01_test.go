@@ -30,10 +30,11 @@ func TestV073ComposeWritersNameAuthor(t *testing.T) {
 			seen[cmd[0]] = true
 			named := false
 			for _, a := range cmd[1:] {
+				a = "-" + strings.TrimLeft(a, "-")
 				named = named || strings.HasPrefix(a, "-author=") || strings.HasPrefix(a, "-bearer=")
 			}
 			if !named {
-				t.Errorf("%s: %v writes without -author or -bearer (§7.2)", filepath.Base(f), cmd)
+				t.Errorf("%s: %v writes without --author or --bearer (§7.2)", filepath.Base(f), cmd)
 			}
 		}
 	}

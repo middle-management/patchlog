@@ -71,7 +71,7 @@ v0.82" (v0.81 Open 24).
    absent, or `null`?
 10. **First contact with a lower level** (§7.1 End-to-end namespaces, Levels). A client with no
     configured level that first meets a server claiming a lower level can't detect it. The Go
-    client offers `WithExpectedLevel` (`-expect-level`), the playground an "expect" control,
+    client offers `WithExpectedLevel` (`--expect-level`), the playground an "expect" control,
     and both document it. *Question:* should the text say configuration is the only protection
     there?
 11. **What teaches a level** (§7.1 "keeps the highest it has learnt"). In the reference only the
@@ -494,7 +494,7 @@ v0.82" (v0.81 Open 24).
     allowance, so an importer or a service with an allowance is still held to 10 writes a second
     on each document unless it collects them into the steps of one batch item, which cost one
     token (1,000 steps were one token in the reference's measurement). The reference lets a deployment raise the maximum of `ratePerResource` and
-    `ratePerPrincipal` (`serve -max-rate-per-resource`, `-max-rate-per-principal`), so a
+    `ratePerPrincipal` (`serve --max-rate-per-resource`, `--max-rate-per-principal`), so a
     namespace can set its own higher; the defaults stay §12.2's. *Question:* is a deployment
     maximum above the default intended for these two, as for `ratePerNamespace`; and should an
     allowance be able to carry a per-resource rate?
@@ -564,7 +564,7 @@ v0.82" (v0.81 Open 24).
     the document's size: a `oneOf` whose branches each recurse, or nested `anyOf`s that a
     validator must try in turn. The reference adds a limit, `validationSteps`: validating one
     document may take 5,000,000 steps, a step being one schema applied to one value
-    (`serve -max-validation-steps`), and a write that needs more is refused `422` with
+    (`serve --max-validation-steps`), and a write that needs more is refused `422` with
     `code: "limit"`, `limit: "validationSteps"`, `measured` and `max`. It is a deployment
     setting; a namespace cannot set it. *Question:* should §6.6 name such a limit, and if so
     in what unit, given that a count of steps is one implementation's and a time is not
@@ -614,7 +614,7 @@ searched. Where the text went against the reference, the reference changed, in t
   said). A client learns the level from its configuration, the namespace document or `/keys`
   and keeps the highest it has learnt (39). Changed: the core's tombstone `410` and snapshot
   lifetime; `PruneE2E`; a remote branch's creation at a tombstone head; the client's and the
-  playground's level tables, with `WithExpectedLevel` and `-expect-level`.
+  playground's level tables, with `WithExpectedLevel` and `--expect-level`.
 - **Message bound** (10, 11, 12; part of 9): counts may run over, never under, and reserving is
   the origin's choice (10). At E3 the origin need not count; each writer counts what it knows
   (11). The bound covers every key sealed under with random IVs, a bundle's `K_b` included,
@@ -693,7 +693,7 @@ the reference changed, in the area named:
   check-fixed epochs for pre-raise content (24), no longer arise. Changed: a config write raising
   to `e2e` is `422`; the pre-raise read paths and remote pending sealings are deleted (core
   migration `016_v081_encryption` drops `remote_pending_sealings` and `e2e_raises`); a database
-  holding a raised namespace is refused at start unless `-purge-raised-e2e` purges it (v0.81
+  holding a raised namespace is refused at start unless `--purge-raised-e2e` purges it (v0.81
   Open 2); and a remote branch of a raised source is `502 upstream` at creation.
 - **Encryption** (26, 27; part of 18): §E.3.1 now says a snapshot's `kid` names this namespace,
   its epoch that of the newest own op, else of an earlier own snapshot, else the epoch in force.
@@ -772,7 +772,7 @@ area named:
   keyrings (26).
 - **Merges, undo and gateways** (29, 30, 31, 36): Switch waits until every changed resource is
   recorded, apart from §F.6's exceptions, or a person gives up the rest, and the catch-up reports
-  what is left (changed: `Plan.Unrecorded`, `-leave-out`; 29
+  what is left (changed: `Plan.Unrecorded`, `--leave-out`; 29
   above); only a write whose last segment indexes an array widens, which merge already did
   (30), and undo's writes and guard widen to the outermost array (changed:
   `pointer.WidenArray`; 31 above); a failed read fails a save over
@@ -899,7 +899,7 @@ went against it, the reference changed, in the area named:
   Levels allow, to `sealed` where `e2e` is refused, also on seeing sealed content, and answers
   `502` only where its server lacks the level (changed: `internal/core/remote_branch.go`,
   `upstream.go`); start times come only through `base.origin` (changed: `originStarts`,
-  `-remote-origin-url`); `502` rows in `/heads` lack `created`, `size` and `digest` (changed:
+  `--remote-origin-url`); `502` rows in `/heads` lack `created`, `size` and `digest` (changed:
   `internal/core/reads.go`); creation's `422`/`502` split, the registration retry and the mirror
   genesis stand as the reference had them. 6–9 above ask what remains.
 - **Derived views** (15): values of another epoch are sealed in place, and an entry whose epoch
@@ -970,7 +970,7 @@ had done otherwise, as follows:
 - **Undo** (1, 2): the prefix cap draws no token; a log read from genesis doesn't make an undo
   impossible, and partial undos are said (§C.5, §11.2).
 - **Limits** (11, 12, 21, 28, 32–35, 37, 38): `documentSize` defaults to 1 MiB, with a deployment
-  default and maximum per limit (`serve -document-size`, `-max-document-size`); log pages count
+  default and maximum per limit (`serve --document-size`, `--max-document-size`); log pages count
   batch items; whole-document writes may go on after the root op; bodies without a limit of their
   own are `400` above 1 MiB; `measured` is defined per limit and left out of document limits for a
   grant that can't read the resource, which the reference had given; `/principal` draws no token
@@ -1069,12 +1069,12 @@ All fifteen v0.50 notes. As the reference did them:
 
 Adopted with more than the reference did, which now follows the text:
 - **Key rotation** (2): origins and edges SHOULD accept several keys and mint with the newest;
-  `-edge-grant-key` is now repeatable (§C.5).
+  `--edge-grant-key` is now repeatable (§C.5).
 - **Services and §9** (5): services apply §9 to their own origin. Private listings are cached
   at the edge under cookies the service mints with a key of its own for
   `/{catalog}/g/{gs}`, at an exchange endpoint of its own, so listing URLs now put the subject
   set first: `/{catalog}/g/{gs}/at/{at}/…`, `/{ns}/g/{gs}/at/{ns_id}`, `/_refs/g/{gs}/at/{at}`
-  (§A.4, §B.11.5). The catalog service (`tree -access`) now mints and verifies them.
+  (§A.4, §B.11.5). The catalog service (`tree --access`) now mints and verifies them.
 - **Undo by writers limited to some resources** (15): `/keys` names `epoch`, `level` and
   `pad`, and is `404 not_offered` where nothing is sealed, so such a writer can seal and undo at
   E3 (§E.2.3, §11.2). It credits carried gestures to the merger, and reports an undo as
@@ -1205,7 +1205,7 @@ The reference changed to follow the text:
   encryption level.
 - **Dry runs in imports** (13): each existing namespace's first batch and a new one's first
   item, but batches that change existing dependencies are dry-run first (§G.4.4). The
-  reference now dry-runs later batches that move heads the target had, `-dry-run` too.
+  reference now dry-runs later batches that move heads the target had, `--dry-run` too.
 - **`/_refs` answers** (17): the body, byte order, `limit`, and `after` as `{ns}/{name}` with
   `next` the following page's `after`; on an `at` URL, a `min` already included answers `200`
   (§A.4). The reference paged by offset with a `next` URL, and always redirected an `at` URL

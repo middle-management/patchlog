@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+- **The CLI parses its flags with go-arg.** Help is generated: `patchlog <command> --help`.
+  The docs and examples now write flags as `--flag` (`patchlog serve --addr :8080 --db x.db`).
+  The single-dash spellings (`-addr :8080`) still parse, so existing scripts and compose files
+  keep working. A value that starts with a dash is given with `=`: `--suffix=-b`.
+- **Client commands.** `patchlog get`, `put`, `patch`, `rm`, `log` and `watch` read and write
+  resources (`NS/NAME`), and `patchlog ns create|get|config|log` namespaces, through the public
+  API. Each write supplies its precondition (§7.2): `patch` appends to the head, trying again
+  after a lost race, unless `--if ID` pins one. See the README's short tour.
+- **`patchlog undo` and `redo`** (§11.2). Every `put`, `patch` and `rm` now sends a gesture of
+  its own, printed with the result, or the one `--gesture ID` names, so several writes undo
+  together. `undo NS` undoes your last action, `redo NS` redoes your last undone one, and a
+  `GESTURE` argument names one; `--plan` shows the inverse and its conflicts without writing,
+  `--list` your stack.
+- **`patchlog get --follow`** (`-f`) prints the document, then each revision as it is written,
+  one line of JSON each (`null` for a tombstone), from the resource's event stream (§7.3),
+  reconnecting when it ends, until interrupted or the resource is purged. A resource that
+  doesn't exist yet is waited for.
+- **`patchlog blob put` and `blob get`** (§7.8). `put` uploads a file or stdin and prints the
+  reference to write, or with `--at /pointer` writes it into the document; `get` downloads a blob
+  by id or by the reference at `--at`, checked against its id, to `-o FILE` or stdout.
+- **More client commands.** `ls`, `restore`, `batch` (with `--dry-run`), `validate`, `whoami`,
+  `log --follow`, `get --raw` for raw files, and `verify` (§G.2). `search` queries the index and
+  `tree ls` lists a catalog. The destructive `purge`, `prune` and `ns purge` need `--yes`, and
+  without it print what they would destroy. A deleted resource that moved is named in errors, and
+  `log` of a pruned resource starts at the horizon.
+- **Encrypted namespaces from the CLI** (Addendum E). `e2e init`, `add-reader`, `rotate` and
+  `readers` administer an e2e namespace's keyring; `e2e keys` shows what `/keys` gives a grant.
+  `get` (and `--follow`), `put`, `patch`, `log` and `blob put|get` learn the namespace's level:
+  sealed namespaces are opened with the keys `/keys` gives, e2e ones sealed and folded by the
+  client with `--identity` (`$PATCHLOG_IDENTITY`), and refused without it. A write whose
+  namespace's level can't be told is refused before sending anything (`--expect-level`, or
+  `--plain` for an unencrypted one); `restore` and `batch` refuse e2e namespaces. `log --follow`
+  of an e2e namespace isn't supported yet.
+- **`client.With` keeps the keyring senders**: a signing or keyed copy of a client lost
+  `--keyring-sender`.
+- **Grants.** `grant inspect` decodes a grant offline, `grant check NS TOKEN` verifies it as the
+  namespace would (exit 1 if refused), `grant show NS GID` prints a recorded grant.
+- **`--bearer-file` and `--sign-key-file`** (`$PATCHLOG_BEARER_FILE`, `$PATCHLOG_SIGN_KEY_FILE`)
+  on every command that takes the flag, and **profiles**: `--profile NAME` (`$PATCHLOG_PROFILE`)
+  reads defaults from `~/.config/patchlog/config.json`; `profile list|show`.
+- **Shell completion**: `patchlog completion bash|zsh|fish`.
+- **`cmd/capacity`** parses its flags with go-arg too.
+- **`patchlog branch create BASE NAME`** (`--at ID`, `--patch JSON`) and `branch list BASE`.
+- **`$PATCHLOG_API`, `$PATCHLOG_BEARER` and `$PATCHLOG_AUTHOR`** are the defaults of `--api`,
+  `--bearer` and `--author` in every command that takes them.
+- **`patchlog --help` groups the commands**: server commands, client commands, branches,
+  releases and bundles, and keys and operations.
+
 ## v0.29.0
 
 - **Capacity: large documents measured again** with the server's own validator, on the

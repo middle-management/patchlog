@@ -23,12 +23,12 @@
 //  1. Drain: /_health and /_ready answer 503 and keep-alives are turned
 //     off, so load balancers take the instance out of rotation and clients
 //     reconnect elsewhere. Requests are still served normally.
-//  2. Delay: that goes on for Options.Delay (-shutdown-delay), the time a
+//  2. Delay: that goes on for Options.Delay (--shutdown-delay), the time a
 //     load balancer needs to notice.
 //  3. Stop: the listeners close (http.Server.Shutdown) and Stopping(ctx) is
 //     closed, so long-lived requests (long-polls, event streams, ?min=
 //     waits) end promptly with their normal answers. In-flight requests
-//     are waited for, up to Options.Timeout (-shutdown-timeout).
+//     are waited for, up to Options.Timeout (--shutdown-timeout).
 //  4. Cancel: only if the timeout expires are the remaining requests'
 //     contexts cancelled, so their transactions roll back; the handlers
 //     are then given Options.CancelGrace to return.
@@ -292,12 +292,12 @@ func (s *Server) Shutdown() (clean bool) {
 	s.drainOne.Do(func() { close(s.draining) })
 	s.HTTP.SetKeepAlivesEnabled(false)
 	if s.opt.Delay > 0 {
-		s.logf("draining: %s answers 503; serving for %s more (-shutdown-delay), %d requests in flight", HealthPath, s.opt.Delay, s.InFlight())
+		s.logf("draining: %s answers 503; serving for %s more (--shutdown-delay), %d requests in flight", HealthPath, s.opt.Delay, s.InFlight())
 		time.Sleep(s.opt.Delay)
 	}
 	n := s.InFlight()
 	if n > 0 {
-		s.logf("stopping: waiting up to %s (-shutdown-timeout) for %d requests: %s; long-polls and event streams end now", s.opt.Timeout, n, s.describe(10))
+		s.logf("stopping: waiting up to %s (--shutdown-timeout) for %d requests: %s; long-polls and event streams end now", s.opt.Timeout, n, s.describe(10))
 	} else {
 		s.logf("stopping: no requests in flight")
 	}

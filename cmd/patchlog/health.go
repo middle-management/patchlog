@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,20 +14,19 @@ import (
 // healthCmd checks a health endpoint, for container healthchecks (the image
 // has no curl):
 //
-//	patchlog health [-timeout 2s] [URL]
+//	patchlog health [--timeout 2s] [URL]
 //
 // URL defaults to http://localhost:8080/_health; a bare port (":8081") or
 // host:port gets http:// and /_health. Exit status 0 on 200, 1 otherwise
 // (503 while draining, connection refused, …), with the reason on stderr.
-func healthCmd(args []string) {
-	fs := flag.NewFlagSet("health", flag.ExitOnError)
-	timeout := fs.Duration("timeout", 2*time.Second, "request timeout")
-	fs.Parse(args)
-	url := "http://localhost:8080/_health"
-	if fs.NArg() > 0 {
-		url = healthURL(fs.Arg(0))
-	}
-	c := &http.Client{Timeout: *timeout, Transport: telemetry.Transport(nil)}
+type healthCmd struct {
+	Timeout time.Duration `arg:"--timeout" default:"2s" placeholder:"DURATION" help:"request timeout"`
+	URL     string        `arg:"positional" default:"http://localhost:8080/_health" help:"health endpoint; a bare port (:8081) or host:port gets http:// and /_health"`
+}
+
+func (a *healthCmd) run(string) {
+	url := healthURL(a.URL)
+	c := &http.Client{Timeout: a.Timeout, Transport: telemetry.Transport(nil)}
 	r, err := c.Get(url)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "health:", err)

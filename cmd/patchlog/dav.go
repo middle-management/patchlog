@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/base32"
 	"errors"
-	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -22,106 +21,87 @@ import (
 
 // davCmd serves namespaces over WebDAV (a prototype, internal/dav):
 //
-//	patchlog dav -api URL [-addr 127.0.0.1:8090] -ns NS[,NS…] [-catalog NS[,NS…] [-case-sensitive] [-tree-url [CATALOG=]URL]... [-tree-wait 3s]] [-inline-pdf]
-//	             [-bearer GRANT | -bearer-file FILE] [-author NAME] [-password-file FILE]
-//	             [-gateway [-insecure]] [-tls-cert FILE -tls-key FILE]
+//	patchlog dav --api URL --ns NS[,NS…] [--catalog NS[,NS…]] [--gateway [--insecure]] [--tls-cert FILE --tls-key FILE] …
 //
-// Local mode (the default) sends -bearer's grant with every request to the
+// Local mode (the default) sends --bearer's grant with every request to the
 // core; WebDAV clients log in with HTTP Basic, any user name and the
-// password of -password-file, or a random one logged at start. Gateway
+// password of --password-file, or a random one logged at start. Gateway
 // mode sends each request's Basic password upstream as its grant
 // (Authorization: Bearer); grants must not cross plain HTTP, so it needs
-// TLS on any address but loopback unless -insecure. With -tree-url, the
+// TLS on any address but loopback unless --insecure. With --tree-url, the
 // trees' folders are listed from the tree service (§H.3, §H.7), as
-// serve's -tree-url names it; without, from the catalogs' node documents.
-func davCmd(args []string) {
-	fs := flag.NewFlagSet("dav", flag.ExitOnError)
-	api := fs.String("api", "http://localhost:8080", "base URL of the patch-log API")
-	addr := fs.String("addr", "127.0.0.1:8090", "listen address of the WebDAV server")
-	var nss, cats multi
-	fs.Var(&nss, "ns", "flat namespace to serve, a directory of its files: raw ones by name, JSON documents as {name}.json (repeatable or comma-separated)")
-	fs.Var(&cats, "catalog", "catalog namespace to serve as a file tree, one whose namespace document has catalog.files (§H.2; repeatable or comma-separated)")
-	caseSensitive := fs.Bool("case-sensitive", false, "compare the names in a file tree's folder after NFC only, not after case folding too")
-	inlinePDF := fs.Bool("inline-pdf", false, "serve PDFs for display in the browser rather than as attachments (Content-Disposition: attachment); either way without the sandbox (§7.8, §H.6)")
-	var treeURLs multi
-	fs.Var(&treeURLs, "tree-url", "tree service (§B.5) following the -catalog trees, e.g. http://tree:8082, which their folders are listed from with each user's grant (§H.3, §H.7); CATALOG=URL maps one catalog to its own (repeatable). Without one, folders are listed from the catalogs' node documents")
-	treeWait := fs.Duration("tree-wait", 3*time.Second, "how long a user's listing waits for the tree service to reach the user's own writes (?min=) before it reads the node documents")
-	bearer := fs.String("bearer", "", "local mode: the grant every request is sent with (Authorization: Bearer)")
-	bearerFile := fs.String("bearer-file", "", "local mode: file holding -bearer")
-	author := fs.String("author", "", "X-Author for a -dev server (local mode)")
-	passwordFile := fs.String("password-file", "", "local mode: file holding the Basic password WebDAV clients log in with (any user name); default a random one, logged at start")
-	gateway := fs.Bool("gateway", false, "gateway mode: each request's Basic password is the grant sent upstream, the user name ignored; over a core with authentication disabled, the Basic user name is the X-Author, and the user (§H.7)")
-	insecure := fs.Bool("insecure", false, "gateway mode: allow plain HTTP on an address other than loopback, so grants cross the network in the clear")
-	tlsCert := fs.String("tls-cert", "", "serve HTTPS with this certificate (PEM), with -tls-key")
-	tlsKey := fs.String("tls-key", "", "the private key of -tls-cert (PEM)")
-	fetchConc := fs.Int("fetch-concurrency", 8, "how many documents are read from the core at once")
-	cacheSize := fs.String("cache-size", "64 MiB", "rendered documents kept in memory by revision id")
-	maxFile := fs.String("max-file-size", "16 MiB", "largest JSON file written (buffered whole) or file kept as a temporary file")
-	maxRaw := fs.String("max-raw-size", "64 MiB", "largest raw file written (buffered whole): the deployment's blobSize, 64 MiB by default")
-	sdFlags := addShutdownFlags(fs)
-	fs.Parse(args)
+// serve's --tree-url names it; without, from the catalogs' node documents.
+type davCmd struct {
+	API              string        `arg:"--api,env:PATCHLOG_API" default:"http://localhost:8080" placeholder:"URL" help:"base URL of the patch-log API"`
+	Addr             string        `arg:"--addr" default:"127.0.0.1:8090" help:"listen address of the WebDAV server"`
+	NS               []string      `arg:"--ns,separate" placeholder:"NS[,NS]" help:"flat namespace to serve, a directory of its files: raw ones by name, JSON documents as {name}.json (repeatable or comma-separated)"`
+	Catalog          []string      `arg:"--catalog,separate" placeholder:"NS[,NS]" help:"catalog namespace to serve as a file tree, one whose namespace document has catalog.files (§H.2; repeatable or comma-separated)"`
+	CaseSensitive    bool          `arg:"--case-sensitive" help:"compare the names in a file tree's folder after NFC only, not after case folding too"`
+	InlinePDF        bool          `arg:"--inline-pdf" help:"serve PDFs for display in the browser rather than as attachments (Content-Disposition: attachment); either way without the sandbox (§7.8, §H.6)"`
+	TreeURL          []string      `arg:"--tree-url,separate" placeholder:"[CATALOG=]URL" help:"tree service (§B.5) following the --catalog trees, e.g. http://tree:8082, which their folders are listed from with each user's grant (§H.3, §H.7); CATALOG=URL maps one catalog to its own (repeatable). Without one, folders are listed from the catalogs' node documents"`
+	TreeWait         time.Duration `arg:"--tree-wait" default:"3s" placeholder:"DURATION" help:"how long a user's listing waits for the tree service to reach the user's own writes (?min=) before it reads the node documents"`
+	Bearer           string        `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"local mode: the grant every request is sent with (Authorization: Bearer)"`
+	BearerFile       string        `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"local mode: file holding --bearer (a profile's bearer_file too)"`
+	Author           string        `arg:"--author,env:PATCHLOG_AUTHOR" placeholder:"NAME" help:"X-Author for a --dev server (local mode)"`
+	PasswordFile     string        `arg:"--password-file" placeholder:"FILE" help:"local mode: file holding the Basic password WebDAV clients log in with (any user name); default a random one, logged at start"`
+	Gateway          bool          `arg:"--gateway" help:"gateway mode: each request's Basic password is the grant sent upstream, the user name ignored; over a core with authentication disabled, the Basic user name is the X-Author, and the user (§H.7)"`
+	Insecure         bool          `arg:"--insecure" help:"gateway mode: allow plain HTTP on an address other than loopback, so grants cross the network in the clear"`
+	TLSCert          string        `arg:"--tls-cert" placeholder:"FILE" help:"serve HTTPS with this certificate (PEM), with --tls-key"`
+	TLSKey           string        `arg:"--tls-key" placeholder:"FILE" help:"the private key of --tls-cert (PEM)"`
+	FetchConcurrency int           `arg:"--fetch-concurrency" default:"8" placeholder:"N" help:"how many documents are read from the core at once"`
+	CacheSize        byteSize      `arg:"--cache-size" default:"64 MiB" placeholder:"SIZE" help:"rendered documents kept in memory by revision id"`
+	MaxFileSize      byteSize      `arg:"--max-file-size" default:"16 MiB" placeholder:"SIZE" help:"largest JSON file written (buffered whole) or file kept as a temporary file"`
+	MaxRawSize       byteSize      `arg:"--max-raw-size" default:"64 MiB" placeholder:"SIZE" help:"largest raw file written (buffered whole): the deployment's blobSize, 64 MiB by default"`
+	shutdownArgs
+}
 
-	flat, catalogs := splitCatalogs(nss), splitCatalogs(cats)
+func (a *davCmd) run(string) {
+	flat, catalogs := splitCatalogs(a.NS), splitCatalogs(a.Catalog)
 	if len(flat)+len(catalogs) == 0 {
-		log.Fatal("dav: -ns or -catalog is required")
+		log.Fatal("dav: --ns or --catalog is required")
 	}
-	if (*tlsCert == "") != (*tlsKey == "") {
-		log.Fatal("dav: -tls-cert and -tls-key go together")
+	if (a.TLSCert == "") != (a.TLSKey == "") {
+		log.Fatal("dav: --tls-cert and --tls-key go together")
 	}
-	tls := *tlsCert != ""
-	cache, err := core.ParseSize(*cacheSize)
-	if err != nil {
-		log.Fatalf("dav: -cache-size: %v", err)
+	tls := a.TLSCert != ""
+	var err error
+	opt := dav.Options{Namespaces: flat, Catalogs: catalogs, CaseSensitive: a.CaseSensitive, InlinePDF: a.InlinePDF, Gateway: a.Gateway, FetchConcurrency: a.FetchConcurrency,
+		CacheBytes: int(a.CacheSize), MaxFileSize: int(a.MaxFileSize), MaxRawSize: int(a.MaxRawSize), TreeWait: a.TreeWait, Logf: log.Printf}
+	if opt.TreeService, opt.TreeServices, err = treeServices(a.TreeURL); err != nil {
+		log.Fatalf("dav: --tree-url: %v", err)
 	}
-	maxSize, err := core.ParseSize(*maxFile)
-	if err != nil {
-		log.Fatalf("dav: -max-file-size: %v", err)
-	}
-	maxRawSize, err := core.ParseSize(*maxRaw)
-	if err != nil {
-		log.Fatalf("dav: -max-raw-size: %v", err)
-	}
-	opt := dav.Options{Namespaces: flat, Catalogs: catalogs, CaseSensitive: *caseSensitive, InlinePDF: *inlinePDF, Gateway: *gateway, FetchConcurrency: *fetchConc,
-		CacheBytes: cache, MaxFileSize: maxSize, MaxRawSize: maxRawSize, TreeWait: *treeWait, Logf: log.Printf}
-	if opt.TreeService, opt.TreeServices, err = treeServices(treeURLs); err != nil {
-		log.Fatalf("dav: -tree-url: %v", err)
-	}
-	copts := []client.Option{client.WithIdleConns(*fetchConc)}
-	if *gateway {
-		if *bearer != "" || *bearerFile != "" || *passwordFile != "" || *author != "" {
-			log.Fatal("dav: -gateway takes each request's grant; -bearer, -bearer-file, -password-file and -author are for local mode")
+	copts := []client.Option{client.WithIdleConns(a.FetchConcurrency)}
+	if a.Gateway {
+		if a.Bearer != "" || a.BearerFile != "" || a.PasswordFile != "" || a.Author != "" {
+			log.Fatal("dav: --gateway takes each request's grant; --bearer, --bearer-file, --password-file and --author are for local mode (unset $PATCHLOG_BEARER, $PATCHLOG_BEARER_FILE and $PATCHLOG_AUTHOR too, and give no --profile with them)")
 		}
-		if !tls && !loopback(*addr) && !*insecure {
-			log.Fatalf("dav: -gateway on %s, not a loopback address, needs -tls-cert and -tls-key (grants must not cross plain HTTP), or -insecure", *addr)
+		if !tls && !loopback(a.Addr) && !a.Insecure {
+			log.Fatalf("dav: --gateway on %s, not a loopback address, needs --tls-cert and --tls-key (grants must not cross plain HTTP), or --insecure", a.Addr)
 		}
-		if plainRemote(*api) {
-			log.Printf("patchlog dav: warning: -api %s is plain HTTP to another host: every user's grant crosses the network to it in the clear", *api)
+		if plainRemote(a.API) {
+			log.Printf("patchlog dav: warning: --api %s is plain HTTP to another host: every user's grant crosses the network to it in the clear", a.API)
 		}
 	} else {
-		grant := *bearer
-		if *bearerFile != "" {
-			if grant != "" {
-				log.Fatal("dav: -bearer and -bearer-file are exclusive")
-			}
-			grant = readSecret("-bearer-file", *bearerFile)
+		// --bearer-file (or $PATCHLOG_BEARER_FILE, a profile's
+		// bearer_file) was read into Bearer when the flags were
+		// (resolveSecretFiles), as for every command.
+		if a.Bearer != "" {
+			copts = append(copts, client.WithBearer(a.Bearer))
 		}
-		if grant != "" {
-			copts = append(copts, client.WithBearer(grant))
+		if a.Author != "" {
+			copts = append(copts, client.WithAuthor(a.Author))
 		}
-		if *author != "" {
-			copts = append(copts, client.WithAuthor(*author))
-		}
-		if *passwordFile != "" {
-			opt.Password = readSecret("-password-file", *passwordFile)
+		if a.PasswordFile != "" {
+			opt.Password = readSecret("--password-file", a.PasswordFile)
 		} else {
 			opt.Password = randomPassword()
 			log.Printf("patchlog dav: WebDAV password (any user name): %s", opt.Password)
 		}
-		if !tls && !loopback(*addr) {
-			log.Printf("patchlog dav: warning: serving plain HTTP on %s: the WebDAV password crosses the network in the clear", *addr)
+		if !tls && !loopback(a.Addr) {
+			log.Printf("patchlog dav: warning: serving plain HTTP on %s: the WebDAV password crosses the network in the clear", a.Addr)
 		}
 	}
-	if opt.Client, err = client.New(*api, copts...); err != nil {
+	if opt.Client, err = client.New(a.API, copts...); err != nil {
 		log.Fatal(err)
 	}
 	srv, err := dav.New(opt)
@@ -137,26 +117,26 @@ func davCmd(args []string) {
 	}
 
 	ctx, sigs := shutdownSignals("patchlog dav")
-	// A request (a written file, at most -max-raw-size) has ten minutes
+	// A request (a written file, at most --max-raw-size) has ten minutes
 	// to arrive, and an idle connection two before it is closed.
-	hs := &http.Server{Addr: *addr, Handler: srv, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Minute, IdleTimeout: 2 * time.Minute}
-	ls := sdFlags.server("patchlog dav", hs, nil)
-	ln, err := net.Listen("tcp", *addr)
+	hs := &http.Server{Addr: a.Addr, Handler: srv, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Minute, IdleTimeout: 2 * time.Minute}
+	ls := a.shutdownArgs.server("patchlog dav", hs, nil)
+	ln, err := net.Listen("tcp", a.Addr)
 	if err != nil {
 		log.Fatal(err)
 	}
 	mode, scheme := "local", "http"
-	if *gateway {
+	if a.Gateway {
 		mode = "gateway"
 	}
 	if tls {
 		scheme = "https"
 	}
-	log.Printf("patchlog dav: %s mode, serving %s of %s at %s://%s/", mode, strings.Join(append(flat, catalogs...), ","), *api, scheme, ln.Addr())
+	log.Printf("patchlog dav: %s mode, serving %s of %s at %s://%s/", mode, strings.Join(append(flat, catalogs...), ","), a.API, scheme, ln.Addr())
 	go func() {
 		var err error
 		if tls {
-			err = ls.HTTP.ServeTLS(ln, *tlsCert, *tlsKey)
+			err = ls.HTTP.ServeTLS(ln, a.TLSCert, a.TLSKey)
 		} else {
 			err = ls.HTTP.Serve(ln)
 		}
@@ -169,9 +149,9 @@ func davCmd(args []string) {
 	ls.Shutdown()
 }
 
-// treeServices splits -tree-url values into the default tree service, a
+// treeServices splits --tree-url values into the default tree service, a
 // plain URL, and those of catalogs given as CATALOG=URL, as serve's
-// -tree-url takes them: what precedes a plain URL's first "=", if any,
+// --tree-url takes them: what precedes a plain URL's first "=", if any,
 // holds its scheme's colon, so it is never a namespace name.
 func treeServices(vals []string) (string, map[string]string, error) {
 	def, per := "", map[string]string{}

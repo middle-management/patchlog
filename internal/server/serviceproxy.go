@@ -23,7 +23,7 @@ import (
 //   - The service's redirects (head pointers, checkpoints) come back
 //     rewritten under the prefix, so browsers follow them through the proxy.
 //   - Upstream Access-Control-* headers are dropped (the core's own
-//     -cors-origin applies), and every response carries a CSP that forbids
+//     --cors-origin applies), and every response carries a CSP that forbids
 //     everything, and nosniff: the bytes are data on the playground's
 //     origin and must never run as a page.
 //   - An unreachable service is 502 (e.g. while it is still starting).
@@ -103,7 +103,7 @@ func (s serviceProxy) gate(w http.ResponseWriter, r *http.Request, extra func() 
 }
 
 func (s serviceProxy) headers(h http.Header) {
-	// The core's own CORS (-cors-origin) applies to proxied responses,
+	// The core's own CORS (--cors-origin) applies to proxied responses,
 	// not whatever the service answers with.
 	for k := range h {
 		if strings.HasPrefix(k, "Access-Control-") {

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -48,7 +47,7 @@ func TestEdgeGrantKeyFlags(t *testing.T) {
 	k2 := file("k2", "the second key, sixteen bytes or more")
 	short := file("short", "too short")
 	eq := file("edge=v3.key", "the third key, sixteen bytes or more")
-	cors := addCORSFlags(flag.NewFlagSet("t", flag.ContinueOnError))
+	cors := &corsArgs{}
 	now := time.Unix(1790000000, 0)
 	cl := edge.Claims{Prefix: "/r/demo", Exp: now.Add(time.Minute).Unix()}
 

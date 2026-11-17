@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -19,7 +18,8 @@ func TestServerTelemetry(t *testing.T) {
 	t.Cleanup(telemetry.Use(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec)), nil))
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /x/{id}", func(http.ResponseWriter, *http.Request) {})
-	sd := addShutdownFlags(flag.NewFlagSet("t", flag.ContinueOnError))
+	sd := &shutdownArgs{}
+	parseArgs(t, sd)
 	ls := sd.server("test", &http.Server{Handler: mux}, nil)
 	ts := httptest.NewServer(ls.HTTP.Handler)
 	defer ts.Close()

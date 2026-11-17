@@ -35,7 +35,7 @@ migration: ## commit each migrations directory's current.sql that holds SQL as i
 	done
 
 dev: ## run the core server natively in dev mode on :8080 (dev.db; dev.key enables sealed/e2e namespaces)
-	go run ./cmd/patchlog serve -dev -db dev.db -master-key dev.key -master-key-create
+	go run ./cmd/patchlog serve --dev --db dev.db --master-key dev.key --master-key-create
 
 up: ## build and start the whole stack (core, seed, index, tree, janitor, dav, cdn)
 	docker compose up --build -d

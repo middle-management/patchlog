@@ -53,7 +53,7 @@ const Methods = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"
 // revisions, §7.1), gestures (§7.2), author signatures
 // (§C.3), blob uploads and copies (§7.8), ranges and event-stream resumes
 // (§9), and X-Author, which names the author when authentication is off
-// (serve -dev). The edge's verification header (-edge-header) is left out
+// (serve -dev). The edge's verification header (--edge-header) is left out
 // on purpose: a browser has no business sending it.
 const Headers = "Authorization, Content-Type, If-Match, If-None-Match, If-Modified-Since, If-Range, Range, Signature, Source-Authorization, Gesture, Undoes, Blob-From, Blob-Nonce, Last-Event-ID, X-Author"
 

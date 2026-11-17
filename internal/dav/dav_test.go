@@ -1009,16 +1009,16 @@ func TestFileSizes(t *testing.T) {
 	// "Answers"): the bytes read when the bound was passed, at least, and
 	// the bound.
 	r := e.expect(e.do("PUT", "/docs/x.json", `{"v": "`+big+`"}`), 413, "PUT a JSON file over -max-file-size")
-	if !regexp.MustCompile(`^too large: -max-file-size [0-9]+ > 1024 .*JSON file`).MatchString(r.body) {
+	if !regexp.MustCompile(`^too large: --max-file-size [0-9]+ > 1024 .*JSON file`).MatchString(r.body) {
 		t.Fatalf("413 %q", r.body)
 	}
 	r = e.expect(e.do("PUT", "/docs/.x.swp", big), 413, "PUT a temporary file over -max-file-size")
-	if !regexp.MustCompile(`^too large: -max-file-size [0-9]+ > 1024 `).MatchString(r.body) {
+	if !regexp.MustCompile(`^too large: --max-file-size [0-9]+ > 1024 `).MatchString(r.body) {
 		t.Fatalf("413 %q", r.body)
 	}
 	s := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.MaxFileSize, o.MaxRawSize = 1024, 2048 })
 	r = s.expect(s.do("PUT", "/docs/big.pdf", big), 413, "PUT a raw file over -max-raw-size")
-	if !regexp.MustCompile(`^too large: -max-raw-size [0-9]+ > 2048 .*raw file`).MatchString(r.body) {
+	if !regexp.MustCompile(`^too large: --max-raw-size [0-9]+ > 2048 .*raw file`).MatchString(r.body) {
 		t.Fatalf("413 %q", r.body)
 	}
 }

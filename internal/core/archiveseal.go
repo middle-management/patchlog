@@ -26,7 +26,7 @@ import (
 // padded (§E.2.2) when the namespace pads its sealed payloads. Their lines
 // are written and read back without seal's line bound (MaxBundleLine), as
 // a plain bundle's are: a pruned attachment is one blob line, and one that
-// -max-blob-size allows can be longer sealed than that bound, which would
+// --max-blob-size allows can be longer sealed than that bound, which would
 // leave the archive, the only copy of the pruned bytes, unreadable.
 // Archives written before v0.73 are in a chunked AES-256-GCM format of
 // their own ("PLAR", crypt.go), which Engine.ReadArchive still reads.

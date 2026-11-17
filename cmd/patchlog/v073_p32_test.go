@@ -13,7 +13,7 @@ import (
 // following altogether.
 func TestV073RemoteIgnorePurgesFlagGone(t *testing.T) {
 	if os.Getenv("P32_SERVE") == "1" {
-		serve(strings.Fields(os.Getenv("P32_ARGS")))
+		os.Exit(run(append([]string{"serve"}, strings.Fields(os.Getenv("P32_ARGS"))...), os.Stdout, os.Stderr))
 		return
 	}
 	// A database path that can't be opened: serve exits right after its
@@ -22,7 +22,7 @@ func TestV073RemoteIgnorePurgesFlagGone(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=^TestV073RemoteIgnorePurgesFlagGone$")
 	cmd.Env = append(os.Environ(), "P32_SERVE=1", "P32_ARGS=-remote-ignore-purges -addr 127.0.0.1:0 -db "+db)
 	out, err := cmd.CombinedOutput()
-	if err == nil || !strings.Contains(string(out), "flag provided but not defined: -remote-ignore-purges") {
+	if err == nil || !strings.Contains(string(out), "unknown argument -remote-ignore-purges") {
 		t.Fatalf("serve -remote-ignore-purges: %v\n%s", err, out)
 	}
 }

@@ -12,7 +12,7 @@ const IndexProxyPrefix = "/playground/index/"
 
 // indexResponseTimeout bounds how long the index may take to answer: a
 // request with ?min= waits for the index to catch up (§A.5, the index's
-// -min-wait, 2s unless set higher) and then asks the core once more.
+// --min-wait, 2s unless set higher) and then asks the core once more.
 const indexResponseTimeout = 2 * time.Minute
 
 // NewIndexProxy returns a read-only reverse proxy to one search index, to be

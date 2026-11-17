@@ -13,7 +13,7 @@
 <header class="top">
   <div class="brand">Patch Log <span>playground</span></div>
   <div class="conn">
-    <label>Author <input id="author" class="mono" placeholder="alice  (X-Author, serve -dev)" autocomplete="off" spellcheck="false"></label>
+    <label>Author <input id="author" class="mono" placeholder="alice  (X-Author, serve --dev)" autocomplete="off" spellcheck="false"></label>
     <label>Bearer grant <input id="bearer" class="mono" type="password" placeholder="optional token" autocomplete="off" spellcheck="false"></label>
     <span id="origin" title="GET / response"></span>
   </div>
@@ -292,7 +292,7 @@
       <div class="stream"><code id="liveNsUrl" class="muted small"></code></div>
       <div class="stream"><label class="check"><input type="checkbox" id="liveRes"> Resource events</label><span id="liveResSt" class="badge">off</span></div>
       <div class="stream"><code id="liveResUrl" class="muted small"></code></div>
-      <div id="liveWarn" class="warn-box" hidden>EventSource cannot send custom headers, so <code>Authorization</code> and <code>X-Author</code> are <b>not</b> sent on these streams. That is fine for <code>serve -dev</code> and public namespaces; a namespace that needs a grant will answer 401/403/404 here.</div>
+      <div id="liveWarn" class="warn-box" hidden>EventSource cannot send custom headers, so <code>Authorization</code> and <code>X-Author</code> are <b>not</b> sent on these streams. That is fine for <code>serve --dev</code> and public namespaces; a namespace that needs a grant will answer 401/403/404 here.</div>
       <p class="note help">Streams start at <code>?since=</code> the current head, so only new entries arrive. Views refresh automatically on each event.</p>
     </div>
     <div class="card" data-card="live.feed" data-open>

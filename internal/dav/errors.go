@@ -58,7 +58,7 @@ func fail(status int, format string, args ...any) *davError {
 // key, what was measured and the limit in force, then why, as in "too
 // large: documentSize 1048577 > 1048576 (§6.6): document too large". The
 // gateway's own bounds take this shape too, named by their flags
-// (-max-file-size, -max-raw-size). Where reading stopped at the bound,
+// (--max-file-size, --max-raw-size). Where reading stopped at the bound,
 // measured is a lower bound, as in the core's refusals (§6.6).
 func overLimit(key string, measured, max int64, format string, args ...any) *davError {
 	e := fail(http.StatusRequestEntityTooLarge, "too large: %s %d > %d", key, measured, max)
