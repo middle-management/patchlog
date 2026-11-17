@@ -904,7 +904,11 @@ func (s *Service) follow(ctx context.Context, ns string) {
 			err = fmt.Errorf("skipped: %s", reason)
 		} else {
 			if ns == s.opt.Catalog || s.opt.RoleView == nil {
-				err = s.runFollower(ctx, real, opts)
+				// A branch catalog served directly reads through (catalogOpts).
+				var ropts []follow.Option
+				if ropts, err = s.catalogOpts(ctx, ns, real, opts); err == nil {
+					err = s.runFollower(ctx, real, ropts)
+				}
 			} else if err = s.ensureContent(ctx, ns); err == nil {
 				err = s.runFollower(ctx, real, opts)
 			}
