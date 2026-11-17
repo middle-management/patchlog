@@ -113,7 +113,7 @@ func (s *stream) pump(ctx context.Context, url string, hdr http.Header, body []b
 		*end = Closed{Reason: ReasonError, Error: "the upstream body is not text, which a stream can't keep"}
 		return
 	}
-	sp := newSplitter(resp.Body, s.p.maxChunk)
+	sp := newSplitter(resp.Body, s.p.maxChunk, s.p.maxEnc)
 	for {
 		chunks, err := sp.next()
 		if len(chunks) > 0 {
@@ -146,7 +146,7 @@ func (s *stream) run(url string, hdr http.Header, body []byte) {
 	p := s.p
 	upCtx, cancelUp := context.WithCancel(context.Background())
 	defer cancelUp()
-	ch := make(chan event, 256)
+	ch := make(chan event, 8)
 	var end Closed
 	go s.pump(upCtx, url, hdr, body, ch, &end)
 	s.startFollow()
@@ -155,7 +155,12 @@ func (s *stream) run(url string, hdr http.Header, body []byte) {
 		p.finish(s)
 	}()
 
+	// pending is what upstream sent and no append has carried yet, queued
+	// bytes long as JSON. At maxPending the pump is no longer read from, so
+	// upstream is held back (its channel and the connection fill) until a
+	// flush makes room; aborts, the timers and shutdown are still served.
 	var pending []piece
+	queued := 0
 	ended, forceFull := false, false
 	var lastFlush, notBefore time.Time
 	idle := time.NewTimer(p.opt.IdleTimeout)
@@ -178,7 +183,13 @@ func (s *stream) run(url string, hdr http.Header, body []byte) {
 				n, done, out, wait := s.flush(pending, closing, forceFull, cancelUp)
 				switch out {
 				case ok:
+					for _, pc := range pending[:n] {
+						queued -= pc.enc
+					}
 					pending, forceFull = pending[n:], false
+					if len(pending) == 0 {
+						pending = nil // let go of the flushed chunks' array
+					}
 					lastFlush = time.Now()
 					if !idle.Stop() {
 						select {
@@ -214,8 +225,12 @@ func (s *stream) run(url string, hdr http.Header, body []byte) {
 				continue
 			}
 		}
+		recv := events
+		if queued >= p.maxPending {
+			recv = nil
+		}
 		select {
-		case ev, more := <-events:
+		case ev, more := <-recv:
 			if !more {
 				ended, events = true, nil
 				continue
@@ -224,7 +239,9 @@ func (s *stream) run(url string, hdr http.Header, body []byte) {
 				s.status, s.ctype, s.metaKnown = ev.status, ev.ctype, true
 			}
 			for _, c := range ev.chunks {
-				pending = append(pending, piece{c, len(jsonv.Canonical(c))})
+				pc := piece{c, len(jsonv.Canonical(c))}
+				pending = append(pending, pc)
+				queued += pc.enc
 			}
 		case <-timer:
 		case <-s.abortSig:

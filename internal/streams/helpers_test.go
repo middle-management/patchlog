@@ -105,18 +105,19 @@ func (u *upstream) gated(first []string, release <-chan struct{}, rest []string)
 
 // env is a core, an upstream and a stream proxy in front of them.
 type env struct {
-	t      *testing.T
-	ctx    context.Context
-	s      *clienttest.Server
-	key    clienttest.Key // signs the proxy's grant in nsStreams
-	appKey clienttest.Key // signs callers' grants in nsApp
-	pc     *client.Client // the proxy's client
-	grant  string         // the proxy's grant
-	up     *upstream
-	opt    streams.Options
-	p      *streams.Proxy
-	srv    *httptest.Server
-	offset atomic.Int64 // added to the proxy's clock
+	t        *testing.T
+	ctx      context.Context
+	s        *clienttest.Server
+	key      clienttest.Key // signs the proxy's grant in nsStreams
+	appKey   clienttest.Key // signs callers' grants in nsApp
+	adminKey clienttest.Key
+	pc       *client.Client // the proxy's client
+	grant    string         // the proxy's grant
+	up       *upstream
+	opt      streams.Options
+	p        *streams.Proxy
+	srv      *httptest.Server
+	offset   atomic.Int64 // added to the proxy's clock
 }
 
 type envOpt struct {
@@ -149,7 +150,9 @@ func newEnv(t *testing.T, eo envOpt) *env {
 		}
 	} else {
 		e.key, e.appKey = clienttest.NewKey("proxy-key"), clienttest.NewKey("app-key")
-		doc["keys"] = []any{e.key.Entry("create", "append", "read", "purge")}
+		// The second key is an administrator's (retention prunes with one).
+		e.adminKey = clienttest.NewKey("admin-key")
+		doc["keys"] = []any{e.key.Entry("create", "append", "read", "purge"), e.adminKey.Entry("*")}
 		if _, err := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, nsStreams))).CreateNamespace(e.ctx, nsStreams, doc); err != nil {
 			t.Fatal(err)
 		}

@@ -92,16 +92,21 @@ type Proxy struct {
 	docSize      int // documentSize of the namespace
 	setSize      int // patchSetSize
 	opsPerSet    int
-	maxChunk     int
+	maxChunk     int // most bytes of a chunk
+	maxEnc       int // and most as a canonical JSON string, without its quotes
+	maxPending   int // most bytes read from upstream and not yet appended, as JSON
 
 	ctx    context.Context // cancelled by Close: streams wind down
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	mu     sync.Mutex
-	open   map[string]*stream // by current resource name
-	known  map[string]known   // what the sweeper learnt of a resource
-	closed bool
+	mu    sync.Mutex
+	open  map[string]*stream // by current resource name
+	known map[string]known   // what the sweeper learnt of a resource
+	// reserved counts the requests that hold a slot of MaxStreams for a
+	// stream whose resource is being created.
+	reserved int
+	closed   bool
 }
 
 // reserve is the room kept in a stream document for what ends it: closed
@@ -209,10 +214,14 @@ func New(ctx context.Context, opt Options) (*Proxy, error) {
 	}
 	p.docSize, p.setSize, p.opsPerSet = size("documentSize", 1<<20), size("patchSetSize", 256<<10), size("opsPerSet", 1000)
 	valueSize := size("valueSize", 64<<10)
-	// A chunk stays far below valueSize (J.1), fits a patch set and, in
-	// its JSON form (at most six bytes a byte), an empty segment.
-	p.maxChunk = min(16<<10, valueSize/4, (p.setSize-1024)/12, (p.docSize-reserve-256)/6)
-	if p.maxChunk < 64 || p.opsPerSet < 8 {
+	// valueSize measures a string as canonical JSON, quotes and escapes
+	// included (§6.6), where a control character is six bytes. A chunk
+	// stays far below it (J.1): half at most by that measure, 16 KiB of
+	// text, and small enough for a patch set and for four to a segment.
+	p.maxEnc = min(valueSize/2, (p.setSize-1024)/2, (p.docSize-reserve-256)/4) - 2
+	p.maxChunk = min(16<<10, p.maxEnc)
+	p.maxPending = 2 * p.setSize
+	if p.maxEnc < 6*64 || p.opsPerSet < 8 {
 		return nil, fmt.Errorf("streams: namespace %s's limits are too small for streams (documentSize %d, patchSetSize %d, valueSize %d, opsPerSet %d)",
 			opt.NS, p.docSize, p.setSize, valueSize, p.opsPerSet)
 	}
@@ -233,6 +242,17 @@ func New(ctx context.Context, opt Options) (*Proxy, error) {
 		if !client.ValidNSName(opt.CallerNS) {
 			return nil, fmt.Errorf("streams: invalid caller namespace name %q", opt.CallerNS)
 		}
+		// A namespace anyone may read serves its documents without a
+		// grant, whatever a read grant's rules say (§2.1): every stream
+		// would be public. The configuration must say otherwise, and a
+		// proxy that can't read it doesn't start.
+		read, err := p.readMode(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("streams: the configuration of namespace %s can't be read to check that its reads need a grant (J.1): %w", opt.NS, err)
+		}
+		if read != "grant" {
+			return nil, fmt.Errorf("streams: namespace %s has read: %q, so anyone could read every stream; streams need a namespace with read: \"grant\" (J.1)", opt.NS, read)
+		}
 		if exp := grantExp(p.grant); !exp.IsZero() && exp.Before(opt.Now().Add(opt.TTL)) {
 			opt.Logf("streams: the proxy's grant expires %s, sooner than a read grant's ttl of %s: read grants end with it", exp.Format(time.RFC3339), opt.TTL)
 		}
@@ -243,6 +263,26 @@ func New(ctx context.Context, opt Options) (*Proxy, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+// readMode is the namespace document's read member in force: "grant"
+// when it has none (§6.5).
+func (p *Proxy) readMode(ctx context.Context) (string, error) {
+	h, err := p.c.NSHead(ctx, p.opt.NS)
+	if err != nil {
+		return "", err
+	}
+	d, err := p.c.NSDoc(ctx, p.opt.NS, h.ID)
+	if err != nil {
+		return "", err
+	}
+	switch v := d.Value["read"].(type) {
+	case nil:
+		return "grant", nil
+	case string:
+		return v, nil
+	}
+	return "", errors.New("its read member is not a string")
 }
 
 // grantExp is the earliest exp of a grant's blocks.
@@ -410,12 +450,12 @@ func (p *Proxy) allowed(u *url.URL) bool {
 
 var idEnc = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
 
-// keyedID derives a stream id from the caller and its Request-Key, so a
+// keyedID derives a stream id from the namespace, the caller and its Request-Key, so a
 // repeated request finds its stream (J.1 Names): 160 bits of a sha-256 in
 // base32, a name of §3.6.
-func keyedID(c caller, requestKey string) string {
+func keyedID(ns string, c caller, requestKey string) string {
 	h := sha256.New()
-	for _, s := range []string{"patchlog-streams/1", c.key, c.sub, requestKey} {
+	for _, s := range []string{"patchlog-streams/2", ns, c.key, c.sub, requestKey} {
 		fmt.Fprintf(h, "%d:%s,", len(s), s)
 	}
 	return idEnc.EncodeToString(h.Sum(nil)[:20])
@@ -499,10 +539,21 @@ func (p *Proxy) start(w http.ResponseWriter, r *http.Request) {
 			httpError(w, 400, "bad_input", "Request-Key is longer than 1024 bytes")
 			return
 		}
-		id = keyedID(who, key)
+		id = keyedID(p.opt.NS, who, key)
 	}
 
-	// Count the stream before its resource exists, so MaxStreams holds.
+	// A new stream needs a slot of MaxStreams, taken here, before its
+	// resource exists, and held until the stream is carried or the
+	// request turns out not to start one.
+	keyed := r.Header.Get("Request-Key") != ""
+	reserved := false
+	defer func() {
+		if reserved {
+			p.mu.Lock()
+			p.reserved--
+			p.mu.Unlock()
+		}
+	}()
 	p.mu.Lock()
 	switch {
 	case p.closed:
@@ -511,13 +562,28 @@ func (p *Proxy) start(w http.ResponseWriter, r *http.Request) {
 		return
 	case p.open[id] != nil:
 		// Ours and running: the create below answers that it exists.
-	case len(p.open) >= p.opt.MaxStreams:
-		p.mu.Unlock()
-		w.Header().Set("Retry-After", "1")
-		httpError(w, 503, "busy", fmt.Sprintf("the proxy carries %d streams, its most", p.opt.MaxStreams))
-		return
+	case len(p.open)+p.reserved < p.opt.MaxStreams:
+		p.reserved++
+		reserved = true
 	}
 	p.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
+	defer cancel()
+	exists := false
+	if !reserved {
+		// No slot. A keyed request may still be for a stream that
+		// exists, which needs none.
+		if keyed {
+			if h, err := p.c.Head(ctx, p.opt.NS, id); err == nil && h.State == client.Live {
+				exists = true
+			}
+		}
+		if !exists {
+			w.Header().Set("Retry-After", "1")
+			httpError(w, 503, "busy", fmt.Sprintf("the proxy carries %d streams, its most", p.opt.MaxStreams))
+			return
+		}
+	}
 
 	// J.2 step 1: create before calling upstream. 201 is a new stream;
 	// 200 (the same create, retried) or 412 means it exists; 410 that it
@@ -526,14 +592,18 @@ func (p *Proxy) start(w http.ResponseWriter, r *http.Request) {
 	if p.nonce {
 		gen["$nonce"] = seal.NewNonce()
 	}
-	// From here on the caller's connection doesn't matter: a resource
-	// created is a stream started.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
-	defer cancel()
-	res, err := p.create(ctx, id, gen)
+	// The caller's connection doesn't matter to any of this (ctx): a
+	// resource created is a stream started.
+	var res *client.WriteResult
+	var err2 error
+	if !exists {
+		res, err2 = p.create(ctx, id, gen)
+	}
+	err = err2
 	var created time.Time
 	isNew := false
 	switch {
+	case exists:
 	case err == nil && res.Status == 201:
 		isNew = true
 		created = entryTime(res.Entry, p.opt.Now())
@@ -555,13 +625,21 @@ func (p *Proxy) start(w http.ResponseWriter, r *http.Request) {
 	if created.IsZero() {
 		// An existing stream whose genesis the answer didn't carry: its
 		// first log entry says when it was created.
-		if created, err = p.createdAt(ctx, id, ""); err != nil {
+		var exact bool
+		if created, exact, err = p.createdAt(ctx, id, ""); err != nil {
 			if client.IsGone(err) {
 				httpError(w, 410, "gone", "the stream was removed")
 				return
 			}
 			p.opt.Logf("streams: reading %s: %v", id, err)
 			httpError(w, 502, "unavailable", "the stream could not be read from the core")
+			return
+		}
+		if !exact {
+			// Its history was pruned, the genesis with it (§8.6): a
+			// grant counted from anything later would outlive the ones
+			// handed out before, and the stream's purge.
+			httpError(w, 409, "pruned", "the stream's history was pruned, so when it was created is not known: no further read grant is made for it")
 			return
 		}
 	}
@@ -602,6 +680,8 @@ func (p *Proxy) start(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.open[id] = s
+	p.reserved--
+	reserved = false
 	p.saveStateLocked()
 	p.wg.Add(1)
 	p.mu.Unlock()
@@ -651,42 +731,43 @@ func entryTime(e *client.LogEntry, def time.Time) time.Time {
 }
 
 // createdAt is when resource name was created: its genesis entry's
-// created. head "" reads the current head first.
-func (p *Proxy) createdAt(ctx context.Context, name, head string) (time.Time, error) {
+// created, which is exact. Where the history was pruned, the genesis with
+// it (§8.6), it is the head's time instead, not exact but no earlier:
+// good for purging no sooner than due, not for a grant's exp. head ""
+// reads the current head first.
+func (p *Proxy) createdAt(ctx context.Context, name, head string) (t time.Time, exact bool, err error) {
 	if head == "" {
 		h, err := p.c.Head(ctx, p.opt.NS, name)
 		if err != nil {
-			return time.Time{}, err
+			return time.Time{}, false, err
 		}
 		if h.State != client.Live {
-			return time.Time{}, &client.APIError{Status: 410, Code: "gone", Method: "GET", Path: "/r/" + p.opt.NS + "/" + name}
+			return time.Time{}, false, &client.APIError{Status: 410, Code: "gone", Method: "GET", Path: "/r/" + p.opt.NS + "/" + name}
 		}
 		head = h.ID
 	}
 	es, _, err := p.c.LogPage(ctx, p.opt.NS, name, head, "")
-	if client.IsPruned(err) {
-		// Its history was pruned (§8.6), the genesis with it: the head
-		// is no older than the creation, so nothing is purged early.
+	if client.IsPruned(err) || (err == nil && len(es) > 0 && es[0].Parent != "") {
 		d, err := p.c.Doc(ctx, p.opt.NS, name, head)
 		if err != nil {
-			return time.Time{}, err
+			return time.Time{}, false, err
 		}
 		if d.Modified.IsZero() {
-			return time.Time{}, fmt.Errorf("streams: %s: its history is pruned and its head has no time", name)
+			return time.Time{}, false, fmt.Errorf("streams: %s: its history is pruned and its head has no time", name)
 		}
-		return d.Modified, nil
+		// Last-Modified is to the second, rounded down.
+		return d.Modified.Add(time.Second), false, nil
 	}
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, false, err
 	}
 	if len(es) == 0 {
-		return time.Time{}, fmt.Errorf("streams: %s has no log entries", name)
+		return time.Time{}, false, fmt.Errorf("streams: %s has no log entries", name)
 	}
-	t, err := time.Parse(time.RFC3339, es[0].Created)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("streams: %s: created %q: %w", name, es[0].Created, err)
+	if t, err = time.Parse(time.RFC3339, es[0].Created); err != nil {
+		return time.Time{}, false, fmt.Errorf("streams: %s: created %q: %w", name, es[0].Created, err)
 	}
-	return t, nil
+	return t, true, nil
 }
 
 // readGrant narrows the proxy's grant for a caller (J.3): via names the
@@ -704,6 +785,10 @@ func (p *Proxy) readGrant(id, callerSub string, exp time.Time) (string, error) {
 		resource = map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": names}}
 	}
 	g, err := p.grant.Narrow(map[string]any{
+		// The proxy's grant may name other namespaces too: the reader's
+		// names this one alone (§C.1), or the names fixed below would
+		// be readable in each.
+		"ns":  []any{p.opt.NS},
 		"via": callerSub,
 		"can": []any{"read", "append"},
 		"exp": exp.UTC().Format(time.RFC3339),

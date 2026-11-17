@@ -202,7 +202,7 @@ func (p *Proxy) Sweep(ctx context.Context) error {
 				continue
 			default:
 				k.closed = true
-				if k.created, err = p.createdAt(ctx, name, it.Target); err != nil {
+				if k.created, _, err = p.createdAt(ctx, name, it.Target); err != nil {
 					p.opt.Logf("streams: sweep: reading the log of %s: %v", name, err)
 					continue
 				}

@@ -22,7 +22,13 @@ It was tested against this server at v0.29.0 and changes nothing in it.
   by `412`, `"error"` for streams open at a restart (`--state`) or shutdown, the idle sweep
   (`"timeout"`) and the purge once read grants have expired. Upstreams are an allowlist of URL
   prefixes (`--upstream`). Not implemented: sealed namespaces (refused at start, as end-to-end
-  ones are) and J.5–J.7. See the README's "Stream proxy". SPEC-FEEDBACK notes 94–100 are what
+  ones are) and J.5–J.7. From its review: a `read: "public"` namespace is refused at start;
+  the read grant names the stream namespace alone, and keyed ids include it; chunks are cut by
+  their length as JSON, which is what `valueSize` measures; what upstream sent and isn't yet
+  appended is bounded, holding upstream back; `--max-streams` holds for concurrent requests; a
+  response cut short keeps its last partial line; and a repeated request for a stream whose
+  creation time was pruned away is `409` rather than a grant with a later `exp`. See the
+  README's "Stream proxy". SPEC-FEEDBACK notes 94–100 are what
   J.1–J.4 left open.
 - **SPEC-FEEDBACK v0.82 Open 93**: what a stream kept as one growing document costs per flush
   on this server, from the capacity measurements. Notes 89–92 stay open; v0.83 answers none.

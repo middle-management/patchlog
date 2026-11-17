@@ -662,7 +662,7 @@ func TestContinuation(t *testing.T) {
 			for name := range segs {
 				s, _ := e.doc(name)
 				for _, c := range s.Chunks {
-					if len(c) > 600 {
+					if len(c) > 800 {
 						t.Fatalf("a chunk of %d bytes in a 4 KiB document", len(c))
 					}
 				}
@@ -1183,7 +1183,9 @@ func TestStartChecks(t *testing.T) {
 	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true, KeyStore: ks})
 	k := clienttest.NewKey("k")
 	mk := func(ns string, doc map[string]any, can ...string) (*client.Client, string) {
-		doc["read"] = "grant"
+		if doc["read"] == nil {
+			doc["read"] = "grant"
+		}
 		doc["keys"] = []any{k.Entry("*")}
 		if _, err := s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc); err != nil {
 			t.Fatal(err)
@@ -1201,6 +1203,7 @@ func TestStartChecks(t *testing.T) {
 		{"sealed", map[string]any{"encryption": map[string]any{"level": "sealed"}}, all, "sealed"},
 		{"e2e", map[string]any{"encryption": map[string]any{"level": "e2e"}}, all, "end-to-end"},
 		{"nopurge", map[string]any{}, []string{"create", "append", "read"}, "purge"},
+		{"open", map[string]any{"read": "public"}, all, "public"},
 		{"tiny", map[string]any{"limits": map[string]any{"documentSize": 900}}, all, "too small"},
 	} {
 		c, g := mk(tc.ns, tc.doc, tc.can...)

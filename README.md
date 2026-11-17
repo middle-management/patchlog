@@ -3778,7 +3778,7 @@ sessions, agents through MCP and recording model calls (J.5–J.7) are not imple
 | Flag | Meaning |
 | --- | --- |
 | `--api`, `--addr` | The core's base URL; the proxy's listen address (default `127.0.0.1:8091`). |
-| `--ns` | The namespace the streams are kept in (default `streams`): one of its own, with `read: "grant"`, apart from namespaces consumers follow, as its log records every append (§J.2). |
+| `--ns` | The namespace the streams are kept in (default `streams`): one of its own, with `read: "grant"`, apart from namespaces consumers follow, as its log records every append (§J.2). Under grants the proxy reads the namespace document at start and refuses a `read: "public"` namespace, where the core serves every stream to anyone whatever the read grant says; it refuses to start too if it can't read the document. |
 | `--bearer`, `--bearer-file` | The proxy's own grant: `create`, `append`, `read` and `purge` in `--ns`. It writes with it and narrows each caller's read grant from it, so it must carry its proof (not sealed). |
 | `--caller-ns` | The namespace callers' grants are verified in. Required under grants (below). |
 | `--author` | `X-Author` for a `--dev` core. |
@@ -3787,7 +3787,7 @@ sessions, agents through MCP and recording model calls (J.5–J.7) are not imple
 | `--ttl` | How long read grants live from a stream's creation (default 24 h); a closed stream that old is purged (§J.4 Expiry). |
 | `--idle-timeout` | A stream with no append for this long is closed with `"timeout"` (default 2 m). |
 | `--state` | A file with the names of the streams being written; a proxy started again closes those still open with `"error"` (§J.2 Restarts). Without it they are closed by the idle sweep, with `"timeout"`. |
-| `--max-request-body`, `--max-segments`, `--max-streams` | Largest body forwarded upstream (1 MiB); most resources one response may fill (8); most streams carried at once (64, then `503` with `Retry-After`). |
+| `--max-request-body`, `--max-segments`, `--max-streams` | Largest body forwarded upstream (1 MiB); most resources one response may fill (8); most streams carried at once (64, then `503` with `Retry-After`; requests that arrive together share the count, and a `Request-Key` request for a stream that exists needs no slot). |
 | `--public-url` | The core's base URL as callers reach it, for the `url` of an answer (default `--api`). |
 | `--create-ns` | Create `--ns` with `read: "grant"` if it is missing. Only over a `--dev` core: under grants a namespace is created with an operator grant and its document lists the key of the proxy's grant, neither of which the proxy holds. |
 | `--tls-cert`, `--tls-key`, `--insecure` | HTTPS. On an address other than loopback the proxy refuses to serve plain HTTP unless `--insecure`: callers' grants and upstream credentials cross it. |
@@ -3807,7 +3807,7 @@ upstream then runs in the background, whether or not the caller stays connected.
 | `Upstream-Authorization` | Sent upstream as `Authorization`. Never stored or logged. |
 | `Upstream-Header-<Name>` | Sent upstream as `<Name>`. |
 | `Content-Type`, the body | Sent upstream as they are. |
-| `Request-Key` | Optional. The stream's id is then derived from the caller (the key that signed its grant, and its `sub`) and this key, so a repeated request finds its stream and upstream is not called again; without it the id is random. |
+| `Request-Key` | Optional. The stream's id is then derived from the namespace, the caller (the key that signed its grant, and its `sub`) and this key, so a repeated request finds its stream and upstream is not called again; without it the id is random. |
 
 ```sh
 curl -sS https://proxy.example/streams -H "Authorization: Bearer $(cat ann.grant)" \
@@ -3818,7 +3818,9 @@ curl -sS https://proxy.example/streams -H "Authorization: Bearer $(cat ann.grant
 #   "grant": "<read grant>", "exp": "2026-11-17T12:00:00Z" }
 ```
 
-`410` is a stream that was purged (its id is spent), `413` a body over `--max-request-body`,
+`410` is a stream that was purged (its id is spent), `409` a repeated request for a stream
+whose history was pruned (§8.6) where the core no longer says when it was created (the first
+grant stays good; no later-expiring one is made), `413` a body over `--max-request-body`,
 `503` a proxy at `--max-streams` or shutting down, `502` a core that can't be reached.
 `GET /healthz` answers `{"status":"ok","open":n}`. The proxy serves nothing else: streams are
 read from the core.
@@ -3841,8 +3843,12 @@ says:
   `status` and `contentType`, the last sets `closed`. A write whose outcome is unknown (a
   timeout) is sent again with the same bytes; a `412` is answered by reading the new entries,
   never by resending.
-- A chunk is UTF-8 text ending at a line end, at most 16 KiB (less in a namespace with small
-  limits); a longer line is cut between two characters.
+- A chunk is UTF-8 text ending at a line end, at most 16 KiB, and at most half the namespace's
+  `valueSize` as the core measures it: as a JSON string, where a control character is six
+  bytes (less in a namespace with small limits). A longer line is cut between two characters.
+  What arrived of the last line of a response cut short is kept.
+- What upstream has sent and no append has carried yet is bounded (twice `patchSetSize`):
+  beyond it the proxy stops reading, so a fast upstream waits for the core's pace.
 - No request header, no request body and no upstream URL are stored, and `closed.error` is one
   of a few fixed sentences, since an HTTP library's error names the host.
 - `closed.reason` is `complete` when upstream's response ended, whatever its status: an upstream
@@ -3860,7 +3866,8 @@ says:
 proxy's grant with a narrowing block: `via` the caller, `can: ["read", "append"]`, `exp` the
 stream's creation plus `--ttl` (or the proxy grant's own `exp` if sooner), and two rules: one
 fixing `/resource` to the stream's id and its continuation names, one allowing appends only
-within `/abort`. It reads that stream and nothing else in the namespace.
+within `/abort`; and it names `--ns` alone, though the proxy's grant may name more
+namespaces. It reads that stream and nothing else.
 
 ```sh
 G="Authorization: Bearer $GRANT"

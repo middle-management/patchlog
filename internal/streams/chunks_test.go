@@ -6,11 +6,13 @@ import (
 	"testing"
 	"testing/iotest"
 	"unicode/utf8"
+
+	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 func split(t *testing.T, r io.Reader, max int) ([]string, error) {
 	t.Helper()
-	sp := newSplitter(r, max)
+	sp := newSplitter(r, max, 6*max)
 	var out []string
 	for {
 		cs, err := sp.next()
@@ -80,19 +82,99 @@ func TestTextType(t *testing.T) {
 }
 
 func TestKeyedID(t *testing.T) {
-	a := keyedID(caller{sub: "user:ann", key: "k1"}, "turn-1")
-	if len(a) != 32 || a != keyedID(caller{sub: "user:ann", key: "k1"}, "turn-1") {
+	a := keyedID("streams", caller{sub: "user:ann", key: "k1"}, "turn-1")
+	if len(a) != 32 || a != keyedID("streams", caller{sub: "user:ann", key: "k1"}, "turn-1") {
 		t.Fatalf("id %q", a)
 	}
 	for _, other := range []string{
-		keyedID(caller{sub: "user:ann", key: "k2"}, "turn-1"),
-		keyedID(caller{sub: "user:bo", key: "k1"}, "turn-1"),
-		keyedID(caller{sub: "user:ann", key: "k1"}, "turn-2"),
-		keyedID(caller{sub: "user:an", key: "k1"}, "nturn-1"),
-		keyedID(caller{sub: "user:ann,6:turn-1", key: "k1"}, ""),
+		keyedID("streams", caller{sub: "user:ann", key: "k2"}, "turn-1"),
+		keyedID("streams", caller{sub: "user:bo", key: "k1"}, "turn-1"),
+		keyedID("streams", caller{sub: "user:ann", key: "k1"}, "turn-2"),
+		keyedID("streams", caller{sub: "user:an", key: "k1"}, "nturn-1"),
+		keyedID("streams", caller{sub: "user:ann,6:turn-1", key: "k1"}, ""),
+		keyedID("other", caller{sub: "user:ann", key: "k1"}, "turn-1"),
 	} {
 		if other == a {
 			t.Fatal("two callers or keys share an id")
+		}
+	}
+}
+
+// cutReader gives data and then fails, as a response cut short does.
+type cutReader struct {
+	r   io.Reader
+	err error
+}
+
+func (c *cutReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if err == io.EOF {
+		err = c.err
+	}
+	return n, err
+}
+
+func TestSplitterCutShort(t *testing.T) {
+	for body, want := range map[string]string{
+		"a\nb\npartial":       "a\nb\npartial",
+		"a\npartial \xe2\x98": "a\npartial ", // half a character at the cut is dropped
+		"no line end":         "no line end",
+		"":                    "",
+	} {
+		for _, r := range []io.Reader{strings.NewReader(body), iotest.OneByteReader(strings.NewReader(body))} {
+			sp := newSplitter(&cutReader{r, io.ErrUnexpectedEOF}, 64, 384)
+			var got []string
+			var err error
+			for err == nil {
+				var cs []string
+				cs, err = sp.next()
+				got = append(got, cs...)
+			}
+			if err != io.ErrUnexpectedEOF || strings.Join(got, "") != want {
+				t.Fatalf("%q: %q %v", body, got, err)
+			}
+		}
+	}
+	// Bad bytes before the cut are still not text.
+	sp := newSplitter(&cutReader{strings.NewReader("ok\n\xff\xfe more"), io.ErrUnexpectedEOF}, 64, 384)
+	var got []string
+	var err error
+	for err == nil {
+		var cs []string
+		cs, err = sp.next()
+		got = append(got, cs...)
+	}
+	if err != errNotUTF8 || strings.Join(got, "") != "ok\n" {
+		t.Fatalf("bad bytes before the cut: %q %v", got, err)
+	}
+}
+
+// A chunk is cut by its length as a JSON string too.
+func TestSplitterEncoded(t *testing.T) {
+	body := strings.Repeat("\x1b", 100) + "\n" + strings.Repeat("é\"", 40) + "\nplain text\n" + strings.Repeat("\x00☃", 30)
+	for _, enc := range []int{6, 7, 16, 60, 1000} {
+		sp := newSplitter(iotest.HalfReader(strings.NewReader(body)), 64, enc)
+		var got []string
+		for {
+			cs, err := sp.next()
+			got = append(got, cs...)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("enc %d: %v", enc, err)
+			}
+		}
+		if strings.Join(got, "") != body {
+			t.Fatalf("enc %d: chunks don't join to the body", enc)
+		}
+		for _, c := range got {
+			if n := len(jsonv.Canonical(c)) - 2; n > enc || len(c) > 64 || len(c) == 0 || !utf8.ValidString(c) {
+				t.Fatalf("enc %d: chunk %q is %d bytes as JSON", enc, c, n)
+			}
+			if encFit([]byte(c), 1<<30) != len(c) {
+				t.Fatal("encFit")
+			}
 		}
 	}
 }
