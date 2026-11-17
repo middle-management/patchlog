@@ -5,7 +5,6 @@ import (
 	"crypto/ecdh"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"maps"
@@ -15,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/alexflint/go-arg"
+
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schema"
@@ -22,41 +23,20 @@ import (
 	"github.com/middle-management/patchlog/internal/sig"
 )
 
-// CLIUsage documents the bundle commands.
-const CLIUsage = `  patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode history|snapshot] [-o file.jsonl] [-bearer T] [-author A]
-          [-external ns|ns/name,…] [-authors] [-untyped-refs] [-foreign-parents] [-json]
-          [-recipient key.jwk]... [-plaintext] [-identity id.jwk]
-  patchlog import -api URL -ns TARGET[,src=dst] -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T] [-author A]
-          [-resolve ns/name=skip|take|replay]... [-create=false] [-json] [-identity id.jwk] [-allow-less-protected]
-          [-sign-key kid:seed]    (src=dst renames: references to src are rewritten, and documents that change get new ids, §G.4.4)
-  patchlog bundle verify -i file.jsonl [-identity id.jwk] [-json] [-signatures]
-          [-source URL [-bearer T] [-author A]]    (-source checks signer keys against the source's namespace log, §C.3.1)
-  patchlog bundle keygen -o id.jwk      (prints the public key, for -recipient and a grant's enc)`
-
-// SignKeyEnv names the environment variable that sets -sign-key.
+// SignKeyEnv names the environment variable that sets --sign-key.
 const SignKeyEnv = "PATCHLOG_SIGN_KEY"
 
-// signKeyFlag registers -sign-key, defaulting to $PATCHLOG_SIGN_KEY.
-func signKeyFlag(fs *flag.FlagSet) *string {
-	return fs.String("sign-key", os.Getenv(SignKeyEnv), "kid:seed (the seed 32 bytes in base64url; default $"+SignKeyEnv+"): sign every step this import writes with this key (§C.3.1). The kid must be listed in the signers of the grant (-bearer). The bundle's own signatures are never re-sent")
-}
-
-// parseSignKey parses a -sign-key value; "" is no key.
+// parseSignKey parses a --sign-key value; "" is no key.
 func parseSignKey(v string) (*sig.Key, error) {
 	if v == "" {
 		return nil, nil
 	}
 	k, err := sig.ParseKey(v)
 	if err != nil {
-		return nil, fmt.Errorf("-sign-key: %w", err)
+		return nil, fmt.Errorf("--sign-key: %w", err)
 	}
 	return &k, nil
 }
-
-type multiFlag []string
-
-func (m *multiFlag) String() string     { return strings.Join(*m, ",") }
-func (m *multiFlag) Set(s string) error { *m = append(*m, s); return nil }
 
 func splitList(s string) []string {
 	var out []string
@@ -87,120 +67,145 @@ func writeJSON(w io.Writer, v any) {
 }
 
 // CLI runs "export", "import" or "bundle" with its arguments and returns
-// the exit status.
+// the exit status. It is a thin wrapper over the command types, which the
+// patchlog binary embeds as go-arg subcommands.
 func CLI(ctx context.Context, cmd string, args []string, stdout, stderr io.Writer) int {
-	var err error
+	var dest any
+	var run func() error
 	switch cmd {
 	case "export":
-		err = cliExport(ctx, args, stdout, stderr)
+		c := &ExportCmd{}
+		dest, run = c, func() error { return c.Run(ctx, stdout, stderr) }
 	case "import":
-		err = cliImport(ctx, args, stdout, stderr)
+		c := &ImportCmd{}
+		dest, run = c, func() error { return c.Run(ctx, stdout, stderr) }
 	case "bundle":
-		switch {
-		case len(args) >= 1 && args[0] == "verify":
-			err = cliVerify(args[1:], stdout)
-		case len(args) >= 1 && args[0] == "keygen":
-			err = cliKeygen(args[1:], stdout)
-		default:
-			fmt.Fprintln(stderr, "usage:\n"+CLIUsage)
-			return 2
+		c := &BundleCmd{}
+		dest = c
+		run = func() error {
+			switch {
+			case c.Verify != nil:
+				return c.Verify.Run(ctx, stdout, stderr)
+			case c.Keygen != nil:
+				return c.Keygen.Run(ctx, stdout, stderr)
+			}
+			return nil
 		}
 	default:
-		fmt.Fprintln(stderr, "usage:\n"+CLIUsage)
+		fmt.Fprintf(stderr, "usage: patchlog export|import|bundle ... (unknown command %q)\n", cmd)
 		return 2
 	}
-	if err == nil {
-		return 0
-	}
-	if errors.Is(err, flag.ErrHelp) {
+	p, err := arg.NewParser(arg.Config{Program: "patchlog " + cmd, Out: stderr, Exit: func(int) {}}, dest)
+	if err != nil {
+		fmt.Fprintln(stderr, "error:", err)
 		return 2
 	}
-	fmt.Fprintln(stderr, "error:", err)
-	if ae, ok := client.AsAPIError(err); ok {
-		for _, it := range ae.Items() {
-			fmt.Fprintf(stderr, "  item %v: %v %v %v\n", it["index"], it["status"], it["code"], it["message"])
+	if err := p.Parse(args); err != nil {
+		if errors.Is(err, arg.ErrHelp) {
+			p.WriteHelp(stdout)
+			return 0
 		}
+		fmt.Fprintln(stderr, "error:", err)
+		p.WriteUsage(stderr)
+		return 2
 	}
-	return 1
+	if b, ok := dest.(*BundleCmd); ok && b.Verify == nil && b.Keygen == nil {
+		p.WriteUsage(stderr)
+		return 2
+	}
+	if err := run(); err != nil {
+		fmt.Fprintln(stderr, "error:", err)
+		if ae, ok := client.AsAPIError(err); ok {
+			for _, it := range ae.Items() {
+				fmt.Fprintf(stderr, "  item %v: %v %v %v\n", it["index"], it["status"], it["code"], it["message"])
+			}
+		}
+		return 1
+	}
+	return 0
 }
 
-func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("export", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	api := fs.String("api", "http://localhost:8080", "source deployment base URL")
-	nsList := fs.String("ns", "", "namespaces to export (comma-separated)")
-	resList := fs.String("resource", "", "resources to export (comma-separated names, or ns/name); default: every resource of -ns")
-	mode := fs.String("mode", "history", "history (full) or snapshot")
-	out := fs.String("o", "", "output file (default stdout)")
-	bearer := fs.String("bearer", "", "grant sent as Authorization: Bearer (needs read, §G.2)")
-	author := fs.String("author", "", "X-Author (development servers only)")
-	external := fs.String("external", "", "dependencies to leave out: ns or ns/name (comma-separated)")
-	authors := fs.Bool("authors", false, "include authors, creation times, signatures and gestures (§G.4.1)")
-	untyped := fs.Bool("untyped-refs", false, "treat /r/… strings in untyped documents as references")
-	foreign := fs.Bool("foreign-parents", false, "branch namespaces: start chains after their foreign parent (in requires) and list read-through resources as external, instead of including the base's history (always so for an e2e branch, §G.5.1)")
-	asJSON := fs.Bool("json", false, "print the export plan as JSON on stderr")
-	var recipients multiFlag
-	fs.Var(&recipients, "recipient", "seal the bundle to this X25519 public key: a JWK file, or inline JSON (repeatable, §G.5.1.1)")
-	plaintext := fs.Bool("plaintext", false, "write private or sealed content unsealed (§G.5.1: it should be sealed to its recipient)")
-	pad := fs.Bool("pad", false, "with -recipient: pad each sealed line to its size bucket (§E.2.2, §G.5.1.1)")
-	idFile := fs.String("identity", "", "private key (JWK) that unwraps the keys of sealed source namespaces, when the grant's enc names it (§E.2.3)")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	nss := splitList(*nsList)
+// ExportCmd is "patchlog export".
+type ExportCmd struct {
+	API            string   `arg:"--api" default:"http://localhost:8080" help:"source deployment base URL"`
+	NS             string   `arg:"--ns" help:"namespaces to export (comma-separated)"`
+	Resource       string   `arg:"--resource" help:"resources to export (comma-separated names, or ns/name); default: every resource of --ns"`
+	Mode           string   `arg:"--mode" default:"history" help:"history (full) or snapshot"`
+	Out            string   `arg:"-o" help:"output file (default stdout)"`
+	Bearer         string   `arg:"--bearer" help:"grant sent as Authorization: Bearer (needs read, §G.2)"`
+	Author         string   `arg:"--author" help:"X-Author (development servers only)"`
+	External       string   `arg:"--external" help:"dependencies to leave out: ns or ns/name (comma-separated)"`
+	Authors        bool     `arg:"--authors" help:"include authors, creation times, signatures and gestures (§G.4.1)"`
+	UntypedRefs    bool     `arg:"--untyped-refs" help:"treat /r/… strings in untyped documents as references"`
+	ForeignParents bool     `arg:"--foreign-parents" help:"branch namespaces: start chains after their foreign parent (in requires) and list read-through resources as external, instead of including the base's history (always so for an e2e branch, §G.5.1)"`
+	JSON           bool     `arg:"--json" help:"print the export plan as JSON on stderr"`
+	Recipient      []string `arg:"--recipient,separate" help:"seal the bundle to this X25519 public key: a JWK file, or inline JSON (repeatable, §G.5.1.1)"`
+	Plaintext      bool     `arg:"--plaintext" help:"write private or sealed content unsealed (§G.5.1: it should be sealed to its recipient)"`
+	Pad            bool     `arg:"--pad" help:"with --recipient: pad each sealed line to its size bucket (§E.2.2, §G.5.1.1)"`
+	Identity       string   `arg:"--identity" help:"private key (JWK) that unwraps the keys of sealed source namespaces, when the grant's enc names it (§E.2.3)"`
+}
+
+// Description is the command's help text.
+func (*ExportCmd) Description() string {
+	return "Export namespaces (or chosen resources) of a deployment as a bundle: a JSON Lines file of documents and their history that another deployment can import. A bundle can be sealed to one or more recipients, and the plan of what went in is printed on stderr."
+}
+
+// Run exports a bundle.
+func (c *ExportCmd) Run(ctx context.Context, stdout, stderr io.Writer) error {
+	nss := splitList(c.NS)
 	if len(nss) == 0 {
-		return fmt.Errorf("export: -ns is required")
+		return fmt.Errorf("export: --ns is required")
 	}
-	opt := ExportOptions{Bearer: *bearer, External: splitList(*external), Authors: *authors, UntypedRefs: *untyped, ForeignParents: *foreign, Plaintext: *plaintext, Pad: *pad}
-	for _, r := range recipients {
+	opt := ExportOptions{Bearer: c.Bearer, External: splitList(c.External), Authors: c.Authors, UntypedRefs: c.UntypedRefs, ForeignParents: c.ForeignParents, Plaintext: c.Plaintext, Pad: c.Pad}
+	for _, r := range c.Recipient {
 		pub, err := LoadRecipient(r)
 		if err != nil {
-			return fmt.Errorf("export: -recipient %s: %w", r, err)
+			return fmt.Errorf("export: --recipient %s: %w", r, err)
 		}
 		opt.Recipients = append(opt.Recipients, pub)
 	}
-	if *pad && len(opt.Recipients) == 0 {
-		return fmt.Errorf("export: -pad pads sealed lines, so it needs -recipient")
+	if c.Pad && len(opt.Recipients) == 0 {
+		return fmt.Errorf("export: --pad pads sealed lines, so it needs --recipient")
 	}
-	identity, err := loadIdentity(*idFile)
+	identity, err := loadIdentity(c.Identity)
 	if err != nil {
 		return err
 	}
 	opt.Identity = identity
-	switch *mode {
+	switch c.Mode {
 	case "history", "full":
 		opt.Mode = Full
 	case "snapshot":
 		opt.Mode = Snapshot
 	default:
-		return fmt.Errorf("export: -mode must be history or snapshot")
+		return fmt.Errorf("export: --mode must be history or snapshot")
 	}
-	if res := splitList(*resList); len(res) > 0 {
+	if res := splitList(c.Resource); len(res) > 0 {
 		for _, r := range res {
 			if strings.Contains(r, "/") {
 				opt.Select = append(opt.Select, r)
 				continue
 			}
 			if len(nss) != 1 {
-				return fmt.Errorf("export: with several -ns, name resources as ns/name (%q)", r)
+				return fmt.Errorf("export: with several --ns, name resources as ns/name (%q)", r)
 			}
 			opt.Select = append(opt.Select, Key(nss[0], r))
 		}
 	} else {
 		opt.Select = nss
 	}
-	c, err := connect(*api, *bearer, *author, identity)
+	cl, err := connect(c.API, c.Bearer, c.Author, identity)
 	if err != nil {
 		return err
 	}
-	plan, err := PlanExport(ctx, c, opt)
+	plan, err := PlanExport(ctx, cl, opt)
 	if err != nil {
 		return err
 	}
 	var w io.Writer = stdout
 	var f *os.File
-	if *out != "" {
-		if f, err = os.Create(*out); err != nil {
+	if c.Out != "" {
+		if f, err = os.Create(c.Out); err != nil {
 			return err
 		}
 		w = f
@@ -211,13 +216,13 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 			err = cerr
 		}
 		if err != nil {
-			os.Remove(*out)
+			os.Remove(c.Out)
 		}
 	}
 	if err != nil {
 		return err
 	}
-	if *asJSON {
+	if c.JSON {
 		writeJSON(stderr, map[string]any{"plan": plan, "digest": sum.Digest, "lines": sum.Lines, "sealed": len(opt.Recipients) > 0})
 		return nil
 	}
@@ -246,7 +251,7 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	return nil
 }
 
-// namespaceMap interprets -ns for an import: "name" imports the bundle's
+// namespaceMap interprets --ns for an import: "name" imports the bundle's
 // namespace of that name as is; "src=dst" maps a source namespace, which
 // renames it unless dst is a branch of it (ImportOptions.NSMap, §G.4.4); a
 // single plain name that isn't in the bundle maps the bundle's one
@@ -276,10 +281,10 @@ func namespaceMap(h *Header, schemaNamespaces func() (map[string]bool, error), s
 	for _, s := range splitList(spec) {
 		if src, dst, ok := strings.Cut(s, "="); ok {
 			if !mappable[src] {
-				return nil, fmt.Errorf("import: -ns %s: the bundle has no namespace %s", s, src)
+				return nil, fmt.Errorf("import: --ns %s: the bundle has no namespace %s", s, src)
 			}
 			if !client.ValidNSName(dst) {
-				return nil, fmt.Errorf("import: -ns %s: invalid target namespace %q", s, dst)
+				return nil, fmt.Errorf("import: --ns %s: invalid target namespace %q", s, dst)
 			}
 			m[src] = dst
 			continue
@@ -297,7 +302,7 @@ func namespaceMap(h *Header, schemaNamespaces func() (map[string]bool, error), s
 			}
 		}
 		if len(docNS) != 1 {
-			return nil, fmt.Errorf("import: -ns %s: the bundle has no namespace %s, and not exactly one document namespace to map to it (%v); use src=dst", s, s, docNS)
+			return nil, fmt.Errorf("import: --ns %s: the bundle has no namespace %s, and not exactly one document namespace to map to it (%v); use src=dst", s, s, docNS)
 		}
 		m[docNS[0]] = s
 	}
@@ -319,7 +324,7 @@ func bundleHeader(open Opener) (*Header, error) {
 }
 
 // schemaNamespaces lists the namespaces named by $schema or $ref paths in a
-// bundle, which reads all of it: only a -ns of one plain name that isn't
+// bundle, which reads all of it: only a --ns of one plain name that isn't
 // in the bundle needs them.
 func schemaNamespaces(open Opener) (map[string]bool, error) {
 	r, err := open()
@@ -362,98 +367,93 @@ func schemaNamespaces(open Opener) (map[string]bool, error) {
 	}
 }
 
-func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("import", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	api := fs.String("api", "http://localhost:8080", "target deployment base URL")
-	nsSpec := fs.String("ns", "", "target namespaces: name, or src=dst to map a source namespace (comma-separated). src=dst renames, to clone a set of "+
-		"namespaces together: references to src ($schema, $ref, x-ref) are rewritten where they are declared in every document, and documents that change "+
-		"get new ids; undeclared ones are listed, not rewritten. Onto a branch of src it keeps references and ids. A single plain name that isn't in "+
-		"the bundle maps its one document namespace to it, so it renames too, unless it is a branch of that namespace. Catalog placement names aren't "+
-		"renamed, and namespace configuration isn't in the bundle: create renamed targets with theirs first (§G.4.4, §G.7)")
-	only := fs.String("only", "", "import only these source namespaces of the bundle (comma-separated): what their documents reference in the others "+
-		"must be in the target already, as the bundle has it, which is checked first (§G.4.1 external)")
-	in := fs.String("i", "", "bundle file")
-	dry := fs.Bool("dry-run", false, "classify, check and dry-run every batch; write nothing")
-	atomic := fs.Bool("atomic", false, "one batch per namespace; over the namespace's limits it needs an allowance there, up to the deployment "+
-		"maximums (patchlog serve -max-items-per-batch, -max-batch-size; by default 1000 items, 16 MiB) (§6.6)")
-	pace := fs.String("pace", "", "backfill: split batches to fit the limits and pace them, dry runs included, at this fraction of the lower of "+
-		"the namespace's and the importer's rate, e.g. 0.5; an allowance of the importer's own in a namespace sets its batches and full rate there instead (§6.6)")
-	bearer := fs.String("bearer", "", "grant sent as Authorization: Bearer")
-	author := fs.String("author", "", "X-Author (development servers only)")
-	create := fs.Bool("create", true, "create missing target and upstream namespaces")
-	suffix := fs.String("upstream-suffix", "-upstream", "suffix of upstream namespaces for snapshot documents, after the new name of a renamed namespace (-ns src=dst: dst-upstream); "+
-		"an upstream name over the 64 characters of a namespace name is refused before anything is written (§3.6, §G.4.4)")
-	asJSON := fs.Bool("json", false, "print the report as JSON")
-	var resolves multiFlag
-	fs.Var(&resolves, "resolve", "resolve a conflict: ns/name=skip|take|replay (repeatable)")
-	idFile := fs.String("identity", "", "private key (JWK): opens a sealed bundle, and unwraps the keys of sealed targets (§G.5.1.1, §E.2.3)")
-	allowLess := fs.Bool("allow-less-protected", false, "operator override: import private or sealed namespaces into public targets (§G.5.1)")
-	concurrency := fs.Int("concurrency", defaultConcurrency, "backfill under an allowance: batches submitted at once, in dependency order all the same, "+
-		"or fewer: as many as the allowance's burst holds the draws of; 1 submits one at a time")
-	signKey := signKeyFlag(fs)
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *in == "" {
+// ImportCmd is "patchlog import".
+type ImportCmd struct {
+	API                string   `arg:"--api" default:"http://localhost:8080" help:"target deployment base URL"`
+	NS                 string   `arg:"--ns" help:"target namespaces: name, or src=dst to map a source namespace (comma-separated). src=dst renames, to clone a set of namespaces together: references to src ($schema, $ref, x-ref) are rewritten where they are declared in every document, and documents that change get new ids; undeclared ones are listed, not rewritten. Onto a branch of src it keeps references and ids. A single plain name that isn't in the bundle maps its one document namespace to it, so it renames too, unless it is a branch of that namespace. Catalog placement names aren't renamed, and namespace configuration isn't in the bundle: create renamed targets with theirs first (§G.4.4, §G.7)"`
+	Only               string   `arg:"--only" help:"import only these source namespaces of the bundle (comma-separated): what their documents reference in the others must be in the target already, as the bundle has it, which is checked first (§G.4.1 external)"`
+	In                 string   `arg:"-i" help:"bundle file"`
+	DryRun             bool     `arg:"--dry-run" help:"classify, check and dry-run every batch; write nothing"`
+	Atomic             bool     `arg:"--atomic" help:"one batch per namespace; over the namespace's limits it needs an allowance there, up to the deployment maximums (patchlog serve --max-items-per-batch, --max-batch-size; by default 1000 items, 16 MiB) (§6.6)"`
+	Pace               string   `arg:"--pace" help:"backfill: split batches to fit the limits and pace them, dry runs included, at this fraction of the lower of the namespace's and the importer's rate, e.g. 0.5; an allowance of the importer's own in a namespace sets its batches and full rate there instead (§6.6)"`
+	Bearer             string   `arg:"--bearer" help:"grant sent as Authorization: Bearer"`
+	Author             string   `arg:"--author" help:"X-Author (development servers only)"`
+	Create             bool     `arg:"--create" default:"true" help:"create missing target and upstream namespaces (--create=false to refuse)"`
+	UpstreamSuffix     string   `arg:"--upstream-suffix" default:"-upstream" help:"suffix of upstream namespaces for snapshot documents, after the new name of a renamed namespace (--ns src=dst: dst-upstream); an upstream name over the 64 characters of a namespace name is refused before anything is written (§3.6, §G.4.4)"`
+	JSON               bool     `arg:"--json" help:"print the report as JSON"`
+	Resolve            []string `arg:"--resolve,separate" help:"resolve a conflict: ns/name=skip|take|replay (repeatable)"`
+	Identity           string   `arg:"--identity" help:"private key (JWK): opens a sealed bundle, and unwraps the keys of sealed targets (§G.5.1.1, §E.2.3)"`
+	AllowLessProtected bool     `arg:"--allow-less-protected" help:"operator override: import private or sealed namespaces into public targets (§G.5.1)"`
+	Concurrency        int      `arg:"--concurrency" default:"4" help:"backfill under an allowance: batches submitted at once, in dependency order all the same, or fewer: as many as the allowance's burst holds the draws of; 1 submits one at a time"`
+	SignKey            string   `arg:"--sign-key,env:PATCHLOG_SIGN_KEY" help:"kid:seed (the seed 32 bytes in base64url; default $PATCHLOG_SIGN_KEY): sign every step this import writes with this key (§C.3.1). The kid must be listed in the signers of the grant (--bearer). The bundle's own signatures are never re-sent"`
+}
+
+// Description is the command's help text.
+func (*ImportCmd) Description() string {
+	return "Import a bundle into a deployment. Choose --atomic (one batch per namespace, for a release that must land at once) or --pace F (a backfill, split to fit the limits and paced at a fraction of the namespace rate). src=dst in --ns renames a namespace: references to src are rewritten, and documents that change get new ids (§G.4.4). Conflicts are reported and resolved with --resolve."
+}
+
+// Run imports a bundle.
+func (c *ImportCmd) Run(ctx context.Context, stdout, stderr io.Writer) error {
+	if c.In == "" {
 		return fmt.Errorf("import: -i is required")
 	}
-	if *concurrency < 1 {
-		return fmt.Errorf("import: -concurrency must be at least 1")
+	if c.Concurrency < 1 {
+		return fmt.Errorf("import: --concurrency must be at least 1")
 	}
-	signer, err := parseSignKey(*signKey)
+	signer, err := parseSignKey(c.SignKey)
 	if err != nil {
 		return err
 	}
-	identity, err := loadIdentity(*idFile)
+	identity, err := loadIdentity(c.Identity)
 	if err != nil {
 		return err
 	}
-	opt := ImportOptions{DryRun: *dry, CreateNamespaces: *create, UpstreamSuffix: *suffix, Resolutions: map[string]Resolution{}, AllowLessProtected: *allowLess, Signer: signer,
-		Concurrency: *concurrency, Only: splitList(*only)}
+	opt := ImportOptions{DryRun: c.DryRun, CreateNamespaces: c.Create, UpstreamSuffix: c.UpstreamSuffix, Resolutions: map[string]Resolution{}, AllowLessProtected: c.AllowLessProtected, Signer: signer,
+		Concurrency: c.Concurrency, Only: splitList(c.Only)}
 	switch {
-	case *atomic && *pace != "":
-		return fmt.Errorf("import: choose one of -atomic and -pace")
-	case *atomic:
+	case c.Atomic && c.Pace != "":
+		return fmt.Errorf("import: choose one of --atomic and --pace")
+	case c.Atomic:
 		opt.Mode = Atomic
-	case *pace != "":
-		p, err := strconv.ParseFloat(*pace, 64)
+	case c.Pace != "":
+		p, err := strconv.ParseFloat(c.Pace, 64)
 		if err != nil || p <= 0 || p > 1 {
-			return fmt.Errorf("import: -pace must be a fraction in (0, 1]")
+			return fmt.Errorf("import: --pace must be a fraction in (0, 1]")
 		}
 		opt.Mode, opt.Pace = Backfill, p
 	default:
-		return fmt.Errorf("import: choose -atomic (one batch per namespace; a release that must land at once, under an allowance if large) " +
-			"or -pace F (a backfill: split to fit the limits, not atomic, paced at F of the namespace rate)")
+		return fmt.Errorf("import: choose --atomic (one batch per namespace; a release that must land at once, under an allowance if large) " +
+			"or --pace F (a backfill: split to fit the limits, not atomic, paced at F of the namespace rate)")
 	}
-	for _, r := range resolves {
+	for _, r := range c.Resolve {
 		k, v, ok := strings.Cut(r, "=")
 		res := Resolution(v)
 		if !ok || (res != ResolveSkip && res != ResolveTake && res != ResolveReplay) {
-			return fmt.Errorf("import: -resolve %q: want ns/name=skip|take|replay", r)
+			return fmt.Errorf("import: --resolve %q: want ns/name=skip|take|replay", r)
 		}
 		opt.Resolutions[k] = res
 	}
-	open := UnsealOpener(FileOpener(*in), identity)
+	open := UnsealOpener(FileOpener(c.In), identity)
 	h, err := bundleHeader(open)
 	if err != nil {
 		return err
 	}
-	if opt.NSMap, err = namespaceMap(h, func() (map[string]bool, error) { return schemaNamespaces(open) }, *nsSpec); err != nil {
+	if opt.NSMap, err = namespaceMap(h, func() (map[string]bool, error) { return schemaNamespaces(open) }, c.NS); err != nil {
 		return err
 	}
-	c, err := connect(*api, *bearer, *author, identity, client.WithIdleConns(opt.Concurrency))
+	cl, err := connect(c.API, c.Bearer, c.Author, identity, client.WithIdleConns(opt.Concurrency))
 	if err != nil {
 		return err
 	}
-	if !*asJSON {
+	if !c.JSON {
 		opt.Progress = func(b *BatchReport) {
 			fmt.Fprintf(stderr, "batch %d/%d into %s: %d items, %d steps -> %s%s\n", b.Part, b.Parts, b.NS, len(b.Resources), b.Steps, b.NSID, paced(b))
 		}
 	}
-	rep, err := Import(ctx, c, open, opt)
+	rep, err := Import(ctx, cl, open, opt)
 	if rep != nil {
-		if *asJSON {
+		if c.JSON {
 			writeJSON(stdout, rep)
 		} else {
 			printReport(stdout, rep)
@@ -537,30 +537,36 @@ func printReport(w io.Writer, r *Report) {
 	fmt.Fprintf(w, "  time %.1fs: planning %.1fs, blobs %.1fs, batch requests %.1fs (%d of them, %d dry runs; mostly the server's time), paced %.1fs, after 429s %.1fs\n",
 		t.Total, t.Planning, t.Blobs, t.Batches, t.Requests, t.DryRuns, t.Paced, t.RateLimited)
 	if u := r.Unresolved(); len(u) > 0 {
-		fmt.Fprintf(w, "%d unresolved conflicts: resolve each with -resolve ns/name=skip|take|replay\n", len(u))
+		fmt.Fprintf(w, "%d unresolved conflicts: resolve each with --resolve ns/name=skip|take|replay\n", len(u))
 	}
 }
 
-func cliVerify(args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet("bundle verify", flag.ContinueOnError)
-	in := fs.String("i", "", "bundle file")
-	asJSON := fs.Bool("json", false, "print JSON")
-	idFile := fs.String("identity", "", "private key (JWK) that opens a sealed bundle")
-	source := fs.String("source", "", "the source deployment's base URL: checks the key of each grant line against its namespace log and operator key history (§C.3.1), so complete chains are verified, not only attested")
-	bearer := fs.String("bearer", "", "-source: grant sent as Authorization: Bearer (needs read)")
-	author := fs.String("author", "", "-source: X-Author (development servers only)")
-	perRev := fs.Bool("signatures", false, "list the signature status of every revision")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *in == "" {
+// VerifyCmd is "patchlog bundle verify".
+type VerifyCmd struct {
+	In         string `arg:"-i" help:"bundle file"`
+	JSON       bool   `arg:"--json" help:"print JSON"`
+	Identity   string `arg:"--identity" help:"private key (JWK) that opens a sealed bundle"`
+	Source     string `arg:"--source" help:"the source deployment's base URL: checks the key of each grant line against its namespace log and operator key history (§C.3.1), so complete chains are verified, not only attested"`
+	Bearer     string `arg:"--bearer" help:"--source: grant sent as Authorization: Bearer (needs read)"`
+	Author     string `arg:"--author" help:"--source: X-Author (development servers only)"`
+	Signatures bool   `arg:"--signatures" help:"list the signature status of every revision"`
+}
+
+// Description is the command's help text.
+func (*VerifyCmd) Description() string {
+	return "Verify a bundle: every line is read and every document id recomputed. With --source, the signer keys of grant lines are checked against the source's namespace log (§C.3.1)."
+}
+
+// Run verifies a bundle.
+func (c *VerifyCmd) Run(ctx context.Context, stdout, stderr io.Writer) error {
+	if c.In == "" {
 		return fmt.Errorf("bundle verify: -i is required")
 	}
-	identity, err := loadIdentity(*idFile)
+	identity, err := loadIdentity(c.Identity)
 	if err != nil {
 		return err
 	}
-	f, err := os.Open(*in)
+	f, err := os.Open(c.In)
 	if err != nil {
 		return err
 	}
@@ -570,18 +576,18 @@ func cliVerify(args []string, stdout io.Writer) error {
 		return err
 	}
 	var vo VerifyOptions
-	if *source != "" {
-		sc, err := connect(*source, *bearer, *author, identity)
+	if c.Source != "" {
+		sc, err := connect(c.Source, c.Bearer, c.Author, identity)
 		if err != nil {
 			return err
 		}
 		vo.Keys, vo.Finder = SourceKeys(sc)
 	}
 	var results []SigResult
-	if *perRev {
+	if c.Signatures {
 		vo.OnSignature = func(r SigResult) { results = append(results, r) }
 	}
-	s, err := VerifyWith(context.Background(), plain, vo)
+	s, err := VerifyWith(ctx, plain, vo)
 	if err != nil {
 		return err
 	}
@@ -593,13 +599,13 @@ func cliVerify(args []string, stdout io.Writer) error {
 			snap++
 		}
 	}
-	if *asJSON {
+	if c.JSON {
 		out := map[string]any{"ok": true, "digest": s.Digest, "origin": s.Header.Origin, "created": s.Header.Created,
 			"at": s.Header.At, "full": full, "snapshot": snap, "lines": s.Lines, "external": s.Header.External, "requires": s.Header.Requires,
 			"access": s.Header.Access, "sealed": sealed}
 		if s.Signatures != nil {
 			out["signatures"] = s.Signatures
-			if *perRev {
+			if c.Signatures {
 				out["revisions"] = results
 			}
 		}
@@ -620,7 +626,7 @@ func cliVerify(args []string, stdout io.Writer) error {
 	if len(s.Header.External) > 0 {
 		fmt.Fprintf(stdout, "  external: %s\n", strings.Join(s.Header.External, ", "))
 	}
-	printSignatures(stdout, s, results, *source != "")
+	printSignatures(stdout, s, results, c.Source != "")
 	fmt.Fprintln(stdout, "  snapshot lines and the header are only as trustworthy as the channel that delivered the bundle (§G.4.1)")
 	return nil
 }
@@ -634,7 +640,7 @@ func printSignatures(w io.Writer, s *Summary, results []SigResult, online bool) 
 	fmt.Fprintf(w, "  signatures (%d grant lines): %d verified, %d attested, %d failed, %d unverifiable, %d unsigned\n", r.Grants,
 		r.Counts[SigVerified], r.Counts[SigAttested], r.Counts[SigFailed], r.Counts[SigUnverifiable], r.Counts[SigUnsigned])
 	if r.Counts[SigAttested] > 0 && !online {
-		fmt.Fprintln(w, "    attested: the chain is complete up to the key the exporter names; check it against the source with -source (§C.3.1)")
+		fmt.Fprintln(w, "    attested: the chain is complete up to the key the exporter names; check it against the source with --source (§C.3.1)")
 	}
 	for _, g := range r.BadGrants {
 		fmt.Fprintf(w, "    bad grant line %s\n", g)
@@ -673,27 +679,38 @@ func loadIdentity(path string) (*ecdh.PrivateKey, error) {
 	}
 	id, err := LoadIdentity(path)
 	if err != nil {
-		return nil, fmt.Errorf("-identity %s: %w", path, err)
+		return nil, fmt.Errorf("--identity %s: %w", path, err)
 	}
 	return id, nil
 }
 
-// cliKeygen writes a new X25519 identity (private JWK, mode 0600) and
-// prints its public JWK.
-func cliKeygen(args []string, stdout io.Writer) error {
-	fs := flag.NewFlagSet("bundle keygen", flag.ContinueOnError)
-	out := fs.String("o", "", "file for the private key (JWK); must not exist")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if *out == "" {
+// BundleCmd groups the bundle utilities: "patchlog bundle verify|keygen".
+type BundleCmd struct {
+	Verify *VerifyCmd `arg:"subcommand:verify" help:"check a bundle: every line, every id, and the signatures"`
+	Keygen *KeygenCmd `arg:"subcommand:keygen" help:"write a new X25519 identity and print its public key, for --recipient and a grant's enc"`
+}
+
+// KeygenCmd is "patchlog bundle keygen".
+type KeygenCmd struct {
+	Out string `arg:"-o" help:"file for the private key (JWK); must not exist"`
+}
+
+// Description is the command's help text.
+func (*KeygenCmd) Description() string {
+	return "Write a new X25519 identity (private JWK, mode 0600) to the file given with -o, which must not exist, and print its public JWK: use it as --recipient on export and as a grant's enc."
+}
+
+// Run writes a new X25519 identity (private JWK, mode 0600) and prints its
+// public JWK.
+func (c *KeygenCmd) Run(ctx context.Context, stdout, stderr io.Writer) error {
+	if c.Out == "" {
 		return fmt.Errorf("bundle keygen: -o is required")
 	}
 	_, priv, err := seal.GenerateRecipient()
 	if err != nil {
 		return err
 	}
-	f, err := os.OpenFile(*out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := os.OpenFile(c.Out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
