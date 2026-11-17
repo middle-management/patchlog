@@ -447,7 +447,10 @@ or nothing across every grant: if any namespace a grant names doesn't exist, is 
 refuses it, no cookie is set, and the request is `401` if any namespace's answer is, else `403`.
 A purged namespace is decided last, once the grant verifies and may read there, so the answer is
 `410 purged` only if every refusal is a purge, with `ns` and `head` naming the first one refused
-in the order of the grants and their root blocks (v0.50). Only then, once nothing is refused, is
+in the order of the grants and their root blocks (v0.50). A purged namespace §B.11.9 doesn't
+cover answers its filtered URLs, `/ns/{ns}/g/{gs}/…`, as any other uncovered one: `401` without
+a grant that verifies there or a cookie, else `403`, its `/heads` and its live reads from the
+`purge-ns` entry included (v0.85; those were `410` before). Only then, once nothing is refused, is
 an exchange that would issue more than 100 distinct prefixes `400 bad_input` (v0.51; up to
 v0.50, more than 100 names were `403`): prefixes several grants give count once, and a
 namespace-wide grant counts two per namespace, `/r/{ns}` and `/ns/{ns}`. That `400` is a
@@ -1486,9 +1489,10 @@ is printed on stderr as `--at AT --after TOKEN`, and `--all` follows the pages i
   `/_refs/at/{at}/g/{gs}` is moved there with a `301`), where `at` is a combined checkpoint over
   only the namespaces the answer covers, which the body's `namespaces` lists, so writes
   elsewhere don't move it.
-  - `gs` keys what the answer depends on, over markers alone (v0.49): `reads:{ns}` for each
+  - `gs` keys what the answer depends on, over markers alone (v0.49): `reads:{ns}:{k}` for each
     private namespace the grant reads unrestricted (one read role without `/resource` rules is
-    enough), and `reads:{ns}:scope:{digest}` for one it reads in part, the digest covering the
+    enough), `k` the `key:` string of the key that verified it there (v0.85; `reads:{ns}`
+    before), and `reads:{ns}:scope:{digest}` for one it reads in part, the digest covering the
     rules that limit it there and the `/principal` values they refer to; rules on `/now` there
     make the namespace unreadable. Readers with no marker, anonymous ones included, share the
     empty set's `gs`.
@@ -1530,9 +1534,13 @@ is printed on stderr as `--at AT --after TOKEN`, and `--all` follows the pages i
 - In private namespaces the reader's grant is checked locally. Results are routed to
   `/{ns}/g/{gs}/at/{ns_id}?…`, the subject set before the checkpoint (v0.51, §A.4), and
   filtered to the resources the grant can read. Since v0.73 `gs` is `SubjectSetID([marker])`, as
-  `/_refs` computes it: `reads:{ns}` for a grant that would get a namespace-wide edge grant,
-  else `reads:{ns}:scope:{digest}`, so readers of a whole namespace share one `gs` whatever
-  their groups (**private result URLs change once**). A grant whose block or key-scope rules
+  `/_refs` computes it: `reads:{ns}:key:{id}` for a grant that would get a namespace-wide edge
+  grant, `key:{id}` naming the key that verified it by `kid` and `pub` (§A.4 `gs`, v0.85, as
+  the proposed vector C.4 computes it; `reads:{ns}` before, for every key), else
+  `reads:{ns}:scope:{digest}`, so readers of a whole namespace through one key share one `gs`
+  whatever their groups, and readers through two keys never do: a change to one key ends only
+  its readers' cookies (**private result URLs changed in v0.73 and change again in v0.85**; a
+  cookie minted before the upgrade is `403` until its reader exchanges again). A grant whose block or key-scope rules
   refer to `/now` (or to the whole envelope), or whose read roles all do, finds the namespace
   unreadable (`403`; `/_refs` leaves it out); a role with such a rule doesn't count, and scope
   markers come only from the roles that count (v0.78, §C.2 item 5). A grant
@@ -1557,7 +1565,7 @@ is printed on stderr as `--at AT --after TOKEN`, and `--all` follows the pages i
   cookie from a key whose `pub` was replaced is `403`; since v0.77 so does a
   `reads:{ns}:scope:{digest}` marker's digest, and such a cookie is `403` once its key is gone,
   no longer lists `read` or has another `pub`, or a role it digested is gone. Since v0.82 a
-  cookie of any marker, `reads:{ns}` included, is `403` once the entry of the key that verified
+  cookie of any marker, `reads:{ns}:{k}` included, is `403` once the entry of the key that verified
   its grant in `{ns}`, or the definition of a role it read through, is gone or changes in any
   member (a `maxTtl`, a role's `can`), until the reader exchanges again (§A.4 `gs`, §B.11.9
   `gs`; index migration `011_edge_gs_keys_entry`, which ends every cookie from before the
@@ -1568,8 +1576,17 @@ is printed on stderr as `--at AT --after TOKEN`, and `--all` follows the pages i
   §B.11.9 doesn't cover that is a catalog, or whose `catalogs` (or a local base's) names one,
   gives a partial reader no marker (`403`, no hits at `/_refs`), nothing is covered while the
   core's root says authentication is disabled (a root the index can't read is `503 behind`, or
-  `502`, only for namespaces that could be covered), and a purged catalog keeps its namespaces
-  covered but makes nothing visible. A result computed from rows read before a purge is never
+  `502`, only for namespaces that could be covered; a successful read of the root is reused for
+  the grant checks' TTL, a minute at most, and never after a read that failed, v0.85), and a
+  purged catalog keeps its namespaces covered but makes nothing visible, unless it was sealed or
+  end-to-end: its document is `410` at its purge head, so it counts as no catalog here, whatever
+  the index read of it while it lived (v0.85, §B.11.9 Where; the origin, which keeps its last
+  document, still covers through it). An exchange whose cookie would be `403` at once, the index
+  being behind a change to the key or a role the grant reads a covered namespace through, is
+  `503 behind` with `Retry-After` and mints nothing (v0.85; before, the cookie was minted and
+  refused at its first use). A cookie on a purged sealed namespace gets the purge's `410` only
+  if its key and roles held in the last document the index applied (v0.85), and a cookie such
+  a document ended stays ended should the document change back. A result computed from rows read before a purge is never
   served or kept: it is computed again, or `503 behind`. Unrestricted readers keep the answers
   above.
 
@@ -2531,7 +2548,11 @@ configured, also when it is raised to such a level while followed, refused or ab
 core) isn't waited for until the core serves it again, and a `?min=` naming it is `400`. Since
 v0.81 such a stopped namespace is out of the combined checkpoint (§B.5 Behind, §B.7): its
 self-placed nodes leave the graph and explicit placements of its items dangle as
-`"unfollowed"` until it is followed again, and `at` moves when it stops and when it resumes; one
+`"unfollowed"` until it is followed again, and `at` moves when it stops and when it resumes. A
+catalog service answers `POST /grants` and each `POST /read-grants` entry naming one of its
+items `502 upstream`, after the `403` of a namespace the catalog doesn't trust and the `410`
+of a purged one, whatever it can still read of the namespace, and no `checkpoint` names it
+(v0.85; before, `/read-grants` reported the checkpoint it stopped at). One
 whose epoch key can't be fetched for the moment (the core
 unreachable, a `5xx`, a `429`), sealed or end-to-end (its relay's keys and its keyring both),
 is skipped but still waited for. A namespace the catalog stops
@@ -2602,8 +2623,15 @@ nowhere in the catalog namespace (`can: []`, or read roles that all have a rule 
 request-shape `400`s and before the `?min` wait and any `404`, `409`, `410` or `503` (v0.82,
 §B.11.4 The caller's grant; v0.81 put it before body errors too). So an identity provider's
 grants must allow `read` in the catalog namespace; a rule fixing `/resource` to a name no node
-has keeps such a grant from reading any node document. `POST /merge-grants`, which issues write
-grants only, doesn't check it:
+has keeps such a grant from reading any node document. Since v0.85 "nowhere" is judged over
+every namespace the service follows that the grant verifies in, not the catalog namespace
+alone: a grant whose roles list `read` only in a content namespace is judged as usual, and one
+that reads in none is `403` too at every `/g/{gs}` listing URL and at the service's
+`POST /edge-grants` (before, a grant without `read` read its subject set's listings; §B.11.4,
+§B.11.5 Listing URLs). The grant must still verify in the catalog namespace, which is where
+the service takes a caller's subjects from. `POST /merge-grants` refuses, `403`, an approver
+whose grant has a block or key-scope rule on `/now` (v0.85; it checked nothing of the kind
+before), and judges neither the admin's grant nor, beside a named approver, the caller's:
 - `POST /grants` with `{ "node", "want": ["create"], "to": [folders] }` creates a folder
   (§B.11.4): `move` on every folder in `to`; the grant fixes the name and parents and, unless
   the caller is an admin, refuses `$access`. A name a node has or had, or that a `parents` entry
@@ -2767,7 +2795,16 @@ included, are sealed under the catalog branch's keys, `kid` and `pl.ns` the bran
 base's, and a head read through is judged as the branch's epoch (v0.82, §B.5 Previews); a
 preview database of an earlier release, which stored the base's epoch numbers, has them judged
 again at start, its nodes listed by name only meanwhile, and a preview without the branch's
-keys answers `404`. After a restart the service needs the keys of older epochs its nodes
+keys answers `404`. A listing that leaves values out because the epoch of a revision isn't
+judged yet (nodes by name only, file metadata `{ "absent": "pending" }`) is `no-store`, for
+browsers and edges, and is neither stored nor kept, so the same `at` URL carries the values
+once the epoch is judged (v0.85, §E.2.6; before, it was stored and served as any listing until
+the fill that judged dropped it). An implicit placement (§B.9), which has no revision in the
+catalog, carries nothing sealed under the catalog's keys: its file metadata is sealed under
+its item's `K_r`, and its item's title and `born`, which the service holds only for an item of
+a namespace that is neither sealed nor end-to-end, are on its entry in the clear, with no
+`sealed` (v0.85; before, they were sealed under the catalog node's `K_r` at the catalog's
+current epoch). After a restart the service needs the keys of older epochs its nodes
 are served under, so its grant needs an `nbf` reaching back (§E.2.3): a node whose epoch key it
 can never get is listed by name only, with no `sealed` values, and one it can't fetch for the
 moment makes the listings that show it `503 behind`. A service that reads the catalog afresh
@@ -4572,9 +4609,15 @@ can't be told (§C.4). `maxTtl` is judged on the root block alone, `exp − max(
 namespace document's (default 60 seconds), or the key's when stricter. A grant issued in time
 stays valid after the head moves on, until it expires. Since v0.77 a service that can't read the
 chain (`/keys` or the namespace failing, the namespace unknown or refusing the service, an
-unreadable log, a purge in it) answers `503 behind` while that is transient and `502 upstream`
+unreadable log) answers `503 behind` while that is transient and `502 upstream`
 otherwise, naming no namespace, never `403`; a grant whose `at` is newer than the service's
-cached head makes it read the head again first.
+cached head makes it read the head again first. Since v0.85 a `requireAt` naming a purged
+namespace fails the scope, `403` with the text of every other `requireAt` refusal, at the
+origin (which before went on verifying an `at` in the purged namespace's kept log) and at a
+service, which learns of the purge from the namespace's `410` or its log (before: `502` for a
+sealed one, and a grant that still verified for an unsealed one). So every grant of a
+catalog's key in a content namespace ends with the catalog's purge. A service asks a frozen
+namespace's `/heads` once per head to tell a purge its log's last entries don't show.
 
 ```sh
 # A root grant signed by a key listed in the namespace document (kid "ops-2026")…
