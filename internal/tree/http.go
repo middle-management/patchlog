@@ -1530,9 +1530,10 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			// are read in; until then (epochsPending) it may be one not
 			// read in yet, and a head a fill couldn't read for good
 			// (unreadEpoch) is never judged: it may be one of an older
-			// epoch. An implicit placement and a node without a
-			// head have no revision of the catalog to judge: their values
-			// are the current epoch's (see epochOf).
+			// epoch. An implicit placement has no revision of the
+			// catalog to judge, and nothing of it is sealed as the
+			// catalog's (entry); a node without a head has none either,
+			// and its values are the current epoch's (see epochOf).
 			unjudged := func(n *Node) bool {
 				if n == nil || n.Epoch > 0 || n.Head == "" || n.Self {
 					return false
@@ -2672,10 +2673,27 @@ const noSuchNode = "no such node"
 // only for items of namespaces that are neither sealed nor e2e, which the
 // service doesn't hold it for (Apply), since §E.2.2 keeps the exact
 // created of their revisions in their logs.
+//
+// An implicit placement has no revision of its own, so in a sealed or e2e
+// catalog nothing it carries is sealed as the catalog's (§E.2.6 Per-entry
+// sealing, v0.85: a value "that an entry with no revision of its own
+// carries, such as an implicit placement (§B.9), is sealed in place as a
+// value of another resource is"): its file metadata is sealed under its
+// item's K_r and its head's epoch (query.file), and its title and born,
+// which the service holds only for an item whose namespace is neither
+// sealed nor e2e and so has no K_r, are protected as that item is: in the
+// clear, on an entry that carries no "sealed", to readers of the item
+// (itemClear; scenario 82: for an item of a sealed namespace, "born and
+// title left out"). Before v0.85 they were sealed under the catalog
+// node's K_r at the catalog's current epoch.
 func (q *query) entry(n *Node) map[string]any {
 	q.tags.node(q.g, n.Name)
 	m := map[string]any{"href": q.g.Href(n.Name), "name": n.Name, "kind": "folder"}
-	vals := map[string]any{}
+	// vals are the values the entry takes from the node's own revision,
+	// sealed per entry where the listing is; own those an implicit
+	// placement, which has no revision in the catalog, takes from its
+	// item.
+	vals, own := map[string]any{}, map[string]any{}
 	if n.Title != "" {
 		vals["title"] = n.Title
 	}
@@ -2696,12 +2714,16 @@ func (q *query) entry(n *Node) map[string]any {
 			m["self"] = true
 		}
 		if q.v.item(q.g, n) && n.ItemHead != "" {
-			if n.Title == "" && n.ItemTitle != "" {
+			switch {
+			case n.Title != "" || n.ItemTitle == "":
+			case n.Self:
+				own["title"] = n.ItemTitle
+			default:
 				// The head's title (§B.5), unless the placement has its own.
 				vals["title"] = n.ItemTitle
 			}
 			if n.Self && n.Born != "" {
-				vals["born"] = n.Born
+				own["born"] = n.Born
 			}
 			m["head"] = n.ItemHead
 			// In a release preview the head is the branch's: url reads it
@@ -2719,7 +2741,28 @@ func (q *query) entry(n *Node) map[string]any {
 		}
 	}
 	q.values(m, n.Name, vals)
+	if len(own) > 0 && q.itemClear(n) {
+		for k, v := range own {
+			m[k] = v
+		}
+	}
 	return m
+}
+
+// itemClear reports whether the values an implicit placement n takes
+// from its item (entry: own) go on its entry in the clear: in a catalog
+// that is neither sealed nor end-to-end, always, as before; in one that
+// is, unless the item's namespace is sealed or end-to-end by its document
+// as the graph holds it (Graph.Content, which a catalog service keeps),
+// since a namespace raised since such a value was read protects it now.
+// The service reads these values only from namespaces that are neither
+// (Apply), so they are there to show only for such items.
+func (q *query) itemClear(n *Node) bool {
+	if !derived.InfoOf(q.g.Config).Protected() {
+		return true
+	}
+	c := q.g.Content[n.ItemNS]
+	return c == nil || !derived.InfoOf(c.Doc).Protected()
 }
 
 // bornLeftOut is bornApart's answer for a born whose epoch isn't known.

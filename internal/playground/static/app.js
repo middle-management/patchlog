@@ -2955,7 +2955,11 @@ async function openSealedEntries(v, view, from, filed, ctx) {
   // is named by its key, which a name of its own must agree with.
   const named = typeof v.name === 'string' ? v.name : typeof v.resource === 'string' ? v.resource : '';
   const node = isFiled || typeof v.name === 'string';
-  if (node && (ctx.perEntry || typeof v.sealed === 'string')) {
+  // An implicit placement ("self": true) has no revision in the catalog: what it carries in the clear, with no
+  // "sealed", are values of its item, of a namespace that is neither sealed nor end-to-end (§E.2.6 Per-entry
+  // sealing, v0.85), and stays.
+  const itemsOwn = v.self === true && typeof v.sealed !== 'string';
+  if (node && !itemsOwn && (ctx.perEntry || typeof v.sealed === 'string')) {
     delete v.title;
     // A born of another epoch stands sealed in place, and opens or fails as itself.
     if (!lone(v.born)) delete v.born;
