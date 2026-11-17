@@ -52,13 +52,13 @@ import (
 // the reads and the /principal values they refer to (edge_filters,
 // markerRec), from which it filters hits per resource as for any grant
 // with that marker, for a marker reads:{ns}:g:{gs} (§B.11.9) also its
-// subjects (edge_gs), and for every marker, reads:{ns} included, every
+// subjects (edge_gs), and for every marker, reads:{ns}:{k} included, every
 // key a cookie of it was minted under, its kid, the role names its grant
 // read through, its kid's pub and the digest of its whole entry and of
 // those roles' whole definitions (edge_gs_keys, gsKey, entryDigest),
 // each until that cookie expires: a cookie is 403 once one of the keys
 // or roles it came from is gone or changes in any member (§A.4 gs: "its
-// key being the one that verified the grant in {ns}, reads:{ns} markers
+// key being the one that verified the grant in {ns}, reads:{ns}:{k} markers
 // included", §B.11.9 gs; readsKeysHold, scopeKeysHold, storedFview), and
 // no later exchange vouches for it again: one whose keys or entries
 // differ mints a cookie with another exp (recordCookies). They
@@ -67,7 +67,7 @@ import (
 // instance with its own database, is 401, and the reader exchanges again.
 // Instances on one database share them, and share the exchangeRate
 // buckets too (§B.11.5). A reader of a whole namespace at issue
-// (reads:{ns}) reads it whole under the cookie until it expires or its
+// (reads:{ns}:{k}) reads it whole under the cookie until it expires or its
 // key or a role it read through changes; a revocation since doesn't end
 // it: for that the cookie's lifetime is the latency (§C.5).
 
@@ -83,7 +83,7 @@ import (
 // referring to /now gives no marker, so the filter judges a read as the
 // grant's read check does, without a clock.
 type markerRec struct {
-	f        *grantcheck.ReadFilter // nil for reads:{ns}, which reads whole
+	f        *grantcheck.ReadFilter // nil for reads:{ns}:{k}, which reads whole
 	subjects []string               // g: markers only
 	key      gsKey                  // from an exchange only
 	// also are the keys the other grants of one exchange got the same
@@ -292,7 +292,7 @@ func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, 
 // a cookie is 403 "where a marker's key, rules or roles would end a gs
 // cookie"), and a g: marker's subjects.
 func markerRecOf(a *access, v *grant.Verified) *markerRec {
-	rec := &markerRec{f: a.filter} // nil for reads:{ns}
+	rec := &markerRec{f: a.filter} // nil for reads:{ns}:{k}
 	rec.key.kid, rec.key.pub = v.Key.Kid, keyPub(*v.Key)
 	for r := range grantcheck.ScopeInputOf(v).Roles {
 		rec.key.roles = append(rec.key.roles, r)
@@ -303,6 +303,23 @@ func markerRecOf(a *access, v *grant.Verified) *markerRec {
 	}
 	return rec
 }
+
+// readsMarker is the marker reads:{ns}:{k} of a reader whose grant would
+// be issued a namespace-wide edge grant in ns (§A.4 gs, v0.85): k is the
+// key: string (catvis.KeySubject, §B.11.9 gs) of the key that verified
+// the grant there, by kid and pub, so reads:{ns}:key:{id}. Readers
+// through two keys never share the marker, so neither its gs, its
+// results nor its cookie prefix, and a change to one key ends only the
+// cookies minted through it. Before v0.85 it was reads:{ns}, shared by
+// every key's readers; a cookie for that form reads nothing now
+// (markerAccess).
+func readsMarker(ns, kid, pub string) string {
+	return "reads:" + ns + ":" + catvis.KeySubject(kid, pub)
+}
+
+// readsPrefix is what every reads:{ns}:{k} marker of ns starts with
+// (readsMarker): no scope or g: marker of any namespace does.
+func readsPrefix(ns string) string { return "reads:" + ns + ":" + catvis.KeyPrefix }
 
 // scopeMarker is the marker reads:{ns}:scope:{digest} of a reader of
 // uncovered ns whose reads there have grantcheck.ReadsScope digest d,
@@ -698,17 +715,17 @@ func (ix *Index) cookieAccess(ctx context.Context, ns string, r *http.Request) (
 }
 
 // markerAccess is access to private namespace ns of a reader with marker m
-// under an edge grant that expires at exp: reads:{ns} reads it whole,
+// under an edge grant that expires at exp: reads:{ns}:{k} reads it whole,
 // reads:{ns}:scope:… as its filter allows while ns is still uncovered
 // (stillUncovered), reads:{ns}:g:… as its subjects and filter see ns at
 // its current checkpoint, which must still be covered (§B.11.9,
 // storedFview), each only while every key that cookie came from, and the
 // roles its grant read through, are as the exchange recorded them (§A.4
-// gs, v0.82: "reads:{ns} markers included"; readsKeysHold, scopeKeysHold,
+// gs, "reads:{ns}:{k} markers included"; readsKeysHold, scopeKeysHold,
 // storedFview); any other marker reads none of it.
 func (ix *Index) markerAccess(ctx context.Context, ns, m string, exp int64) (*access, error) {
 	switch {
-	case m == "reads:"+ns:
+	case strings.HasPrefix(m, readsPrefix(ns)):
 		if err := ix.readsKeysHold(ctx, ns, m, exp); err != nil {
 			return nil, err
 		}
@@ -817,11 +834,12 @@ func (ix *Index) scopeKeysHold(ctx context.Context, ns, m string, rec *markerRec
 	})
 }
 
-// readsKeysHold checks a cookie for marker reads:{ns}, m, that expires at
-// exp, as scopeKeysHold checks a scope marker's (§A.4 gs, v0.82: a cookie
-// is 403 "where a marker's key, rules or roles would end a gs cookie
+// readsKeysHold checks a cookie for marker reads:{ns}:{k}, m, that expires
+// at exp, as scopeKeysHold checks a scope marker's (§A.4 gs: a cookie is
+// 403 "where a marker's key, rules or roles would end a gs cookie
 // (§B.11.9 gs), its key being the one that verified the grant in {ns},
-// reads:{ns} markers included"): keysHold. Readers through several keys
+// reads:{ns}:{k} markers included"): keysHold. Readers through one key
+// with other read roles, or with its entry as it was before a change,
 // share the marker, never a cookie (recordCookies).
 func (ix *Index) readsKeysHold(ctx context.Context, ns, m string, exp int64) error {
 	return ix.keysHold(ctx, ns, m, exp, nil)
@@ -908,7 +926,7 @@ func (ix *Index) refsCookieReader(ctx context.Context, r *http.Request, reached 
 			continue
 		}
 		i := slices.IndexFunc(subs, func(m string) bool {
-			return m == "reads:"+ns || strings.HasPrefix(m, "reads:"+ns+":scope:") || strings.HasPrefix(m, "reads:"+ns+":g:")
+			return strings.HasPrefix(m, readsPrefix(ns)) || strings.HasPrefix(m, "reads:"+ns+":scope:") || strings.HasPrefix(m, "reads:"+ns+":g:")
 		})
 		cfg, err := ix.checker.Config(ctx, ns)
 		switch {
@@ -1333,7 +1351,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			// (§C.5.2, §6.6).
 			ex.bucket = v.Principal.ID + "\x00" + v.Key.Kid
 		}
-		// Every marker, reads:{ns} included, records the key that
+		// Every marker, reads:{ns}:{k} included, records the key that
 		// verified the grant here and its entry (§A.4 gs).
 		rec := markerRecOf(a, v)
 		rec.key.entry = ix.exchangeEntry(ctx, ns, cfg.Head, a, v, rec.key)

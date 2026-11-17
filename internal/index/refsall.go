@@ -57,7 +57,7 @@ import (
 // gs is computed as for subject sets (§B.11.5), over markers of what the
 // answer depends on (Index.access): for every private namespace where the
 // reader's grant would be issued a namespace-wide edge grant (§C.5.2),
-// reads:{ns}, or where it reads otherwise (its hits filtered per resource)
+// reads:{ns}:{k}, or where it reads otherwise (its hits filtered per resource)
 // reads:{ns}:scope:{digest}, digest covering the rules its reads there are
 // judged by and the /principal values they refer to (readsScope); a
 // namespace where those rules refer to /now counts as unreadable. A

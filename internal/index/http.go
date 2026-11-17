@@ -99,7 +99,7 @@ const minOther = "min names a namespace other than the one queried"
 // value is sealed under the epoch the revision it derives from is served
 // under (docs.epoch; the current one where that isn't known). A result
 // has one source, so in a private namespace a reader of it whole (marker
-// reads:{ns}) gets it sealed as one JWE under that epoch's key, when
+// reads:{ns}:{k}) gets it sealed as one JWE under that epoch's key, when
 // every hit (and, with counts, every hit counted) comes from one epoch,
 // Content-Type application/jose, pl { ns, view } where view is the
 // result's request target (/{ns}/g/{gs}/at/{ns_id}?{query}, the
@@ -395,9 +395,11 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
 	}
 	// Results are keyed by a subject set over the reader's marker (§A.4,
-	// as /_refs computes it, §B.11.5): reads:{ns} for a grant that would
-	// be issued a namespace-wide edge grant (§C.5.2), which reads every
-	// resource, so all such readers share results whatever their subjects;
+	// as /_refs computes it, §B.11.5): reads:{ns}:{k}, k the key: string
+	// of the key that verified the grant (readsMarker, v0.85), for a
+	// grant that would be issued a namespace-wide edge grant (§C.5.2),
+	// which reads every resource, so all such readers through one key
+	// share results whatever their subjects;
 	// reads:{ns}:scope:{digest} for one that reads only what its rules
 	// allow, digest covering those rules, the /principal values they
 	// refer to (grantcheck.ReadsScope) and its key's key: string
@@ -408,7 +410,7 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 	// namespace counts as unreadable: a result at an at can't change with
 	// the clock.
 	if ix.checker.NamespaceWide(v) {
-		return marked(&access{v: v, all: true, marker: "reads:" + ns}), nil
+		return marked(&access{v: v, all: true, marker: readsMarker(ns, v.Key.Kid, keyPub(*v.Key))}), nil
 	}
 	digest, ok := grantcheck.ReadsScope(v)
 	if !ok {
@@ -1113,7 +1115,7 @@ func lacksKey(ctx context.Context, err error) bool {
 // epoch's K_r of its resource, and nothing where it couldn't be judged
 // (errUnjudged). A result is sealed whole only when its
 // source isn't public, every reader its URL admits reads it whole, under
-// reads:{ns}, and every value derives from revisions served under one
+// reads:{ns}:{k}, and every value derives from revisions served under one
 // epoch, under that epoch's K_e (§E.2.6 Whole-response sealing); otherwise
 // it is sealed per entry, and counts, which have no entry, are 400.
 func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Values, q *Query, info derived.Info) (derived.Stored, string, error) {

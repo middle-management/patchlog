@@ -244,7 +244,7 @@ func TestV073PrivateGsMarkers(t *testing.T) {
 	t.Parallel()
 	w := v073P22Setup(t)
 	x, s, is := w.x, w.s, w.issuer
-	whole := grantcheck.SubjectSetID([]string{"reads:pa"})
+	whole := readsGS("pa", is)
 	for _, tok := range []string{
 		w.amy,
 		is.Grant(t, s.Now(), "user:cy", []string{"pa"}, []string{"read"}, map[string]any{"groups": []any{"editors"}}),

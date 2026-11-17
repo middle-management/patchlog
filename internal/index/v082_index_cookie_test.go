@@ -2,7 +2,6 @@ package index_test
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -227,10 +226,12 @@ func TestV082GCookieNotRevivedByAnotherReader(t *testing.T) {
 // TestV082ExchangeSameCookieAgain: an exchange through the same key with
 // the same entry, for a grant with the same exp, vouches for exactly
 // what the cookie minted before stands for, and gives that cookie; it
-// uses up no second. A grant with two seconds left gives two cookies of
-// reads:docs, one per key; a third set of keys, both in one exchange,
-// has no second left after now to be told from them by, and is 503 with
-// Retry-After, recording nothing: the two still read.
+// uses up no second. Through another key the marker, so the prefix, is
+// another (v0.85), and takes no second of this one's. A grant with two
+// seconds left gives two cookies of k1's marker, one per entry k1 has
+// had; once k1 changes again a third has no second left after now to be
+// told from them by, and is 503 with Retry-After, recording nothing: the
+// cookie of the entry before it stays 403, and cy's, through k2, reads.
 func TestV082ExchangeSameCookieAgain(t *testing.T) {
 	t.Parallel()
 	d := newV82Whole(t)
@@ -256,19 +257,28 @@ func TestV082ExchangeSameCookieAgain(t *testing.T) {
 			t.Fatalf("bo's cookie through the same key: %v, al's is %v", other, alC)
 		}
 	}
-	_, cyC := d.exchange(cy)
-	if value(cyC) == value(alC) {
-		t.Fatalf("cy's cookie, through k2, is al's")
+	p2, cyC := d.exchange(cy)
+	if p2["docs"] == prefixes["docs"] {
+		t.Fatalf("cy's prefix, through k2, is al's: %v", p2)
 	}
-	body := must(json.Marshal(map[string]any{"grants": []any{al, cy}}))
-	r := p37Do(t, d.x, "POST", "/edge-grants", "", string(body), nil, "")
+	paths := v82Paths(prefixes)
+	d.patch(map[string]any{"op": "add", "path": "/keys/1/sub", "value": "user:.*"})
+	_, alC2 := d.exchange(al)
+	if value(alC2) == value(alC) {
+		t.Fatalf("al's cookie once k1 changed is the one from before")
+	}
+	if got := v82Status(t, d.x, paths, alC2); got != v82Reads {
+		t.Fatalf("al under the cookie of k1's second entry: %s", got)
+	}
+	d.patch(map[string]any{"op": "add", "path": "/keys/1/maxTtl", "value": "PT2H"})
+	r := p37Do(t, d.x, "POST", "/edge-grants", al, "", nil, "")
 	if r.status != 503 || r.body["code"] != "behind" || r.header.Get("Retry-After") == "" || len(r.cookies) != 0 {
 		t.Errorf("an exchange with no second left for its cookie: %d %v %v, %d cookies", r.status, r.body, r.header, len(r.cookies))
 	}
-	paths := v82Paths(prefixes)
-	for name, c := range map[string][]*http.Cookie{"al": alC, "cy": cyC} {
-		if got := v82Status(t, d.x, paths, c); got != v82Reads {
-			t.Errorf("%s under its cookie: %s", name, got)
-		}
+	if got := v82Status(t, d.x, paths, alC2); got != v82Refuse {
+		t.Errorf("al under the cookie of k1's second entry, once k1 changed again: %s, want 403", got)
+	}
+	if got := v82Status(t, d.x, v82Paths(p2), cyC); got != v82Reads {
+		t.Errorf("cy under its cookie, through k2: %s", got)
 	}
 }
