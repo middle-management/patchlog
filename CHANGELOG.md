@@ -22,6 +22,18 @@
 - **`patchlog blob put` and `blob get`** (§7.8). `put` uploads a file or stdin and prints the
   reference to write, or with `--at /pointer` writes it into the document; `get` downloads a blob
   by id or by the reference at `--at`, checked against its id, to `-o FILE` or stdout.
+- **More client commands.** `ls`, `restore`, `batch` (with `--dry-run`), `validate`, `whoami`,
+  `log --follow`, `get --raw` for raw files, and `verify` (§G.2). `search` queries the index and
+  `tree ls` lists a catalog. The destructive `purge`, `prune` and `ns purge` need `--yes`, and
+  without it print what they would destroy. A deleted resource that moved is named in errors, and
+  `log` of a pruned resource starts at the horizon.
+- **Grants.** `grant inspect` decodes a grant offline, `grant check NS TOKEN` verifies it as the
+  namespace would (exit 1 if refused), `grant show NS GID` prints a recorded grant.
+- **`--bearer-file` and `--sign-key-file`** (`$PATCHLOG_BEARER_FILE`, `$PATCHLOG_SIGN_KEY_FILE`)
+  on every command that takes the flag, and **profiles**: `--profile NAME` (`$PATCHLOG_PROFILE`)
+  reads defaults from `~/.config/patchlog/config.json`; `profile list|show`.
+- **Shell completion**: `patchlog completion bash|zsh|fish`.
+- **`cmd/capacity`** parses its flags with go-arg too.
 - **`patchlog branch create BASE NAME`** (`--at ID`, `--patch JSON`) and `branch list BASE`.
 - **`$PATCHLOG_API`, `$PATCHLOG_BEARER` and `$PATCHLOG_AUTHOR`** are the defaults of `--api`,
   `--bearer` and `--author` in every command that takes them.

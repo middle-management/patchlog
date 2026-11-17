@@ -1362,7 +1362,13 @@ or an array of them such as `["facet", "sort"]`:
 
 ```sh
 curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kickoff'
+patchlog search matches 'derby*' --facet /league=allsvenskan --sort -/kickoff --counts /status
+patchlog search matches --min matches:$NS_ID     # wait for your own write first
 ```
+
+`patchlog search` asks the index at `--index` (`$PATCHLOG_INDEX`, default `http://localhost:8081`)
+and prints one hit a line, facet counts after; `--json` prints the answer as served. A next page
+is printed on stderr as `--at AT --after TOKEN`, and `--all` follows the pages itself.
 
 - `GET /{ns}?…` runs the query at the current checkpoint and redirects to `/{ns}/at/{checkpoint}`,
   which stays correct forever. Every result computed or served is kept, in memory for about a
@@ -2488,6 +2494,11 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   namespace log's shape.
 
 ### Tree and catalog (Addendum B)
+
+```sh
+patchlog tree ls cat                    # a catalog's roots, from the service at --tree ($PATCHLOG_TREE, :8082)
+patchlog tree ls cat league --all       # a folder's children: a node name, a /r/… reference, or a path of titles
+```
 
 `patchlog tree --catalog cat` follows a catalog namespace and the content namespaces it trusts, and
 serves folder listings (`children`, `ancestors`, `subtree`, `roots`, `orphans`, `problems`,
@@ -4092,6 +4103,48 @@ curl -L $B/r/matches/derby                  # the document
 curl -sIL $B/r/matches/derby                # its ETag, Last-Modified and Repr-Digest
 curl -L "$B/ns/matches/log"                 # the namespace log
 ```
+
+### More client commands
+
+```sh
+patchlog ls matches [PREFIX]                    # name, live/tombstone/purged, target, created, size
+patchlog log matches/derby --follow             # the log, then each entry as it is written
+patchlog restore matches/derby ['[…]']          # undelete a tombstoned resource (§8.2)
+patchlog batch matches batch.json [--dry-run]   # several resources at once (§7.5), one gesture:
+                                                # {"items":[{"resource":"a","ifNoneMatch":"*","steps":[[…]]}]}
+patchlog validate matches/derby '{"$schema":"/r/schemas/match/rev/ID", …}'  # exit 1 with the errors; writes nothing
+patchlog get files/report.pdf --raw > report.pdf   # a raw file's bytes (Addendum H)
+patchlog whoami [matches]                       # who your grant is; with a namespace, what it can do there
+patchlog verify matches [--from NS_ID] [--resource NAME]…   # recompute the chain and the logs (§G.2); exit 1 on a mismatch
+
+patchlog purge matches/derby --yes [--force]    # destroy a resource for good (§8.3)
+patchlog prune matches/derby --below REV --yes  # destroy history older than REV (§8.6)
+patchlog ns purge matches --yes                 # destroy a frozen namespace (§8.5)
+```
+
+The destructive commands, without `--yes`, print what they would destroy and exit 1. A deleted
+resource that moved (§8.1) is named in the error: `m/a is deleted (tombstone …); it moved to m/b`.
+
+**Grants.** `patchlog grant inspect TOKEN` decodes a grant offline (its blocks, scopes, expiry;
+signatures aren't checked); `grant check NS TOKEN` verifies it as the namespace would, as of its
+head, and exits 1 with the reason if refused; `grant show NS GID` prints a recorded grant.
+
+**Secrets and profiles.** `--bearer-file FILE` (`$PATCHLOG_BEARER_FILE`) and `--sign-key-file`
+keep a grant or signing key out of the process arguments and shell history; a file others can
+read gets a warning. `--profile NAME` (`$PATCHLOG_PROFILE`) selects defaults from
+`~/.config/patchlog/config.json` (`$XDG_CONFIG_HOME`, or `$PATCHLOG_CONFIG`):
+
+```json
+{"profiles": {"work": {"api": "https://pl.example", "author": "ann",
+                       "bearer_file": "work.grant", "sign_key_file": "work.key"}}}
+```
+
+A profile names files, never secrets; a relative path is relative to the config file. Precedence:
+flag, then environment, then profile, then the built-in default. `patchlog profile list` and
+`profile show [NAME]` print them.
+
+**Shell completion.** `source <(patchlog completion bash)` (or `zsh`; `patchlog completion fish |
+source`) completes commands, subcommands and flags, asking `patchlog` itself.
 
 ### Files and sync clients (§7.1, §7.4, §7.8, §8.1)
 
