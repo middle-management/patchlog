@@ -148,11 +148,26 @@ func liveHead(ctx context.Context, c *client.Client, ns, name string) (string, e
 	case client.NotFound:
 		return "", fmt.Errorf("%s/%s doesn't exist", ns, name)
 	case client.Tombstoned:
-		return "", fmt.Errorf("%s/%s is deleted (tombstone %s)", ns, name, h.ID)
+		return "", fmt.Errorf("%s/%s is deleted (tombstone %s)%s", ns, name, h.ID, movedNote(ctx, c, ns, name, h))
 	case client.Purged:
 		return "", fmt.Errorf("%s/%s is purged", ns, name)
 	}
 	return h.ID, nil
+}
+
+// movedNote is "; it moved to NS/NAME" for a tombstoned head whose
+// resource moved (§8.1), else "". Where the move can't be read, it is
+// left out: the error it decorates is the one that matters.
+func movedNote(ctx context.Context, c *client.Client, ns, name string, h *client.Head) string {
+	succ, err := c.Moved(ctx, ns, name, h)
+	if err != nil || succ == "" {
+		return ""
+	}
+	ns2, name2, ok := client.ResolveSuccessor(ns, succ)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("; it moved to %s/%s", ns2, name2)
 }
 
 // getCmd is patchlog get NS/NAME.
@@ -160,6 +175,7 @@ type getCmd struct {
 	toolArgs
 	Rev      string `arg:"--rev" placeholder:"ID" help:"read this revision (default: the head)"`
 	Meta     bool   `arg:"--meta" help:"print the revision id, Last-Modified and Repr-Digest on stderr"`
+	Raw      bool   `arg:"--raw" help:"for a raw file (Addendum H), print the file's bytes instead of its document; not to a terminal unless they are text"`
 	Follow   bool   `arg:"--follow,-f" help:"keep going: print each new revision as it is written, one line of JSON each (null when the resource is deleted), until interrupted or it is purged (§7.3)"`
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
 }
@@ -175,6 +191,9 @@ func (a *getCmd) exec(ctx context.Context, out, errw io.Writer) error {
 		if a.Rev != "" {
 			return errors.New("--follow starts at the head: not with --rev")
 		}
+		if a.Raw {
+			return errors.New("--follow prints documents: not with --raw")
+		}
 		return a.follow(ctx, ns, name, out, errw)
 	}
 	c := a.client()
@@ -189,6 +208,9 @@ func (a *getCmd) exec(ctx context.Context, out, errw io.Writer) error {
 		return err
 	}
 	a.meta(errw, d)
+	if a.Raw {
+		return printRaw(ctx, c, ns, name, d, out)
+	}
 	return writeJSON(out, d.Value)
 }
 
@@ -242,7 +264,7 @@ func (a *getCmd) follow(ctx context.Context, ns, name string, out, errw io.Write
 	case client.Live:
 		err = doc(h.ID)
 	case client.Tombstoned:
-		fmt.Fprintf(errw, "%s/%s is deleted (tombstone %s); following\n", ns, name, h.ID)
+		fmt.Fprintf(errw, "%s/%s is deleted (tombstone %s)%s; following\n", ns, name, h.ID, movedNote(ctx, c, ns, name, h))
 		err = line(nil)
 	case client.NotFound:
 		fmt.Fprintf(errw, "%s/%s doesn't exist yet; following\n", ns, name)
@@ -387,6 +409,7 @@ func (a *rmCmd) exec(ctx context.Context, out, errw io.Writer) error {
 type logCmd struct {
 	toolArgs
 	Since    string `arg:"--since" placeholder:"ID" help:"only the entries after this revision"`
+	Follow   bool   `arg:"--follow,-f" help:"keep going: print each entry as it is written, until interrupted or the resource is purged (§7.3)"`
 	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
 }
 
@@ -397,15 +420,25 @@ func (a *logCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	es, err := a.client().Log(ctx, ns, name, "", a.Since)
+	c := a.client()
+	es, err := c.Log(ctx, ns, name, "", a.Since)
+	if client.IsPruned(err) && a.Since == "" {
+		// A pruned resource: its log starts at the horizon, which is
+		// kept but is not itself a log entry (§8.6).
+		ae, _ := client.AsAPIError(err)
+		if h := ae.Horizon(); h != "" {
+			fmt.Fprintf(errw, "history before %s was pruned\n", h)
+			es, err = c.Log(ctx, ns, name, "", h)
+		}
+	}
 	if err != nil {
 		return err
 	}
-	for _, e := range es {
+	print := func(e client.LogEntry) {
 		if a.JSON {
 			b, _ := json.Marshal(e.Raw)
 			fmt.Fprintln(out, string(b))
-			continue
+			return
 		}
 		line := fmt.Sprintf("%s  %-9s  %-10s  %s", e.ID, e.Kind, e.Author, e.Created)
 		if e.HasPatches {
@@ -414,7 +447,54 @@ func (a *logCmd) exec(ctx context.Context, out, errw io.Writer) error {
 		}
 		fmt.Fprintln(out, line)
 	}
-	return nil
+	for _, e := range es {
+		print(e)
+	}
+	if len(es) > 0 && es[len(es)-1].Kind == "tombstone" {
+		if h, err := c.Head(ctx, ns, name); err == nil && h.State == client.Tombstoned {
+			if note := movedNote(ctx, c, ns, name, h); note != "" {
+				fmt.Fprintf(errw, "%s/%s is deleted%s\n", ns, name, note)
+			}
+		}
+	}
+	if !a.Follow {
+		return nil
+	}
+	since := a.Since
+	if len(es) > 0 {
+		since = es[len(es)-1].ID
+	}
+	for {
+		err := c.ResourceEvents(ctx, ns, name, since, func(ev client.Event) error {
+			switch ev.Type {
+			case "revision", "tombstone":
+				e, err := client.ParseLogEntry(ev.Data)
+				if err != nil {
+					return err
+				}
+				since = ev.ID
+				print(e)
+			case "purge":
+				return errPurged
+			}
+			return nil // prune: nothing new in the log
+		})
+		switch {
+		case errors.Is(err, errPurged):
+			return fmt.Errorf("%s/%s was purged", ns, name)
+		case ctx.Err() != nil:
+			return nil
+		case err != nil:
+			return err
+		}
+		// The stream ended cleanly (a server restart, a proxy's
+		// timeout): resume after the last entry.
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 // nsEntryLine is the line patchlog ns log and watch print for e.
@@ -449,6 +529,7 @@ type nsCmd struct {
 	Get    *nsGetCmd    `arg:"subcommand:get" help:"print the namespace document in force"`
 	Config *nsConfigCmd `arg:"subcommand:config" help:"patch the namespace document (its config)"`
 	Log    *nsLogCmd    `arg:"subcommand:log" help:"print the namespace log"`
+	Purge  *nsPurgeCmd  `arg:"subcommand:purge" help:"purge a frozen namespace, destroying it for good (§8.5); needs --yes"`
 }
 
 type nsCreateCmd struct {
