@@ -257,35 +257,52 @@ func (ix *Index) entryHolds(ctx context.Context, cfg *grantcheck.Config, k gsKey
 // a read under the cookie is judged by, ns's at its head, and for a g:
 // marker the one at its checkpoint (storedFview). It is "", which never
 // holds, so that the reader exchanges again, where it can't vouch that
-// the grant was verified by that very entry: the checker's document moved
-// during the exchange (head is the one read before v was verified), the
-// key that verified v isn't the entry that document gives, or the
-// checkpoint's document gives the key or a role otherwise than the head's,
-// the index not having applied a change yet.
-func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, v *grant.Verified, k gsKey) string {
+// the grant was verified by that very entry: the key that verified v
+// isn't the entry the head's document gives, or a document can't be
+// read. behind reports a cookie that would be 403 at once for a cause
+// that passes (§A.4 gs, v0.85: "An exchange whose cookie would be 403 at
+// once, as a key or role its marker draws on has changed since the
+// checkpoint the marker is judged at, answers 503 (behind)"): the
+// checkpoint's document gives the key or a role otherwise than the
+// head's, the index not having applied a change yet, or the checker's
+// document moved during the exchange (head is the one read before v was
+// verified), so that what verified v can't be told from what a read is
+// judged by. Before v0.85 either minted a cookie that never held.
+func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, v *grant.Verified, k gsKey) (entry string, behind bool) {
 	cfg, err := ix.checker.Config(ctx, ns)
-	if err != nil || cfg.Head != head {
-		return ""
+	if err != nil {
+		return "", false
+	}
+	if cfg.Head != head {
+		return "", true
 	}
 	entry, key, ok, err := ix.entryOf(ctx, cfg, k.kid, k.roles)
 	if err != nil || !ok || !bytes.Equal(jsonv.Canonical(key.Raw), jsonv.Canonical(v.Key.Raw)) {
-		return ""
+		return "", false
 	}
 	if a.cov != nil {
 		doc, err := ix.docAt(ctx, ns, a.cov.cp.reads[ns])
 		if err != nil {
-			return ""
+			return "", false
 		}
 		at, err := grantcheck.ParseConfig(ns, "", doc)
 		if err != nil {
-			return ""
+			return "", false
 		}
-		if e, _, ok, err := ix.entryOf(ctx, at, k.kid, k.roles); err != nil || !ok || e != entry {
-			return ""
+		switch e, _, ok, err := ix.entryOf(ctx, at, k.kid, k.roles); {
+		case err != nil:
+			return "", false
+		case !ok || e != entry:
+			return "", true
 		}
 	}
-	return entry
+	return entry, false
 }
+
+// errExchangeBehind is an exchange whose cookie would be 403 at once
+// (exchangeEntry): 503 behind, ranked as a requireAt chain that can't be
+// read for now (upstreamBehind, worseUpstream; §A.4 gs, §C.5.2).
+var errExchangeBehind = errors.New("the index hasn't applied a change to a key or role the grant reads through")
 
 // markerRecOf is what a's marker stands for, a's grant being v: its
 // filter, the key it came from, for a scope marker as for a g: one (§A.4:
@@ -780,10 +797,13 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string, exp int64) (*ac
 // are for a request that passes the read check (§8.5), and a cookie that
 // had ended before the purge doesn't. Where the core answers 410 for the
 // document too (a sealed namespace, §8.5), nothing is left to judge the
-// keys by: a cookie passes with every key recorded with its entry and
-// pub, as a cookie that never held isn't (purgedKeysHold), and so does
-// one whose key or role changed after its exchange and before the purge,
-// which gets the 410 and its head until it expires.
+// keys by but the last document the index read (§A.4 Unavailable
+// namespaces, v0.85): a cookie passes with every key recorded with its
+// entry and pub, as a cookie that never held, or that a document the
+// index applied ended (endCookies), isn't (purgedKeysHold). One whose
+// key or role changed after its exchange in a document the index never
+// read before the purge still gets the 410 and its head until it
+// expires.
 func (ix *Index) keysHold(ctx context.Context, ns, m string, exp int64, also func(cfg *grantcheck.Config, key grant.Key, k gsKey) bool) error {
 	recorded, err := ix.gsKeysAt(ctx, m, exp)
 	if err != nil {
@@ -813,10 +833,80 @@ func (ix *Index) keysHold(ctx context.Context, ns, m string, exp int64, also fun
 
 // purgedKeysHold is keysHold where the namespace's document is 410 too
 // (§8.5): errRulesChanged for a cookie with no key recorded, or with one
-// recorded without its entry or its pub, which never held.
+// recorded without its entry or its pub, which never held or which the
+// last document the index read of the namespace ended (endCookies).
 func purgedKeysHold(recorded []gsKey) error {
 	if len(recorded) == 0 || slices.ContainsFunc(recorded, func(k gsKey) bool { return k.entry == "" || k.pub == "" }) {
 		return errRulesChanged
+	}
+	return nil
+}
+
+// endCookies ends, in tx, the cookies of ns's markers whose key or roles
+// doc, a document of ns the index has just read, no longer gives as their
+// exchange recorded them: the key gone, with another pub or without read,
+// a role gone, or the entry digest another (entryHolds). Their rows lose
+// their entry, which then never holds again (purgedKeysHold, entryHolds).
+//
+// A live namespace's cookie is judged by the document at its head on
+// every read (keysHold), which this only anticipates. It is for a sealed
+// namespace that is then purged, whose document is 410 and judges nothing
+// any more: its 410 is for a request that passes the read check "against
+// the last namespace document the service read" (§A.4 Unavailable
+// namespaces, v0.85; scenario 135), so a cookie the index saw end gets
+// 403, not the purge's 410 and head. Before v0.85 every cookie recorded
+// with an entry passed.
+//
+// A row ended stays ended should the document change back, as a cookie
+// of the origin's does (§B.11.9 gs: "No exchange revives a cookie minted
+// before the change"). A cookie minted against a newer document than doc,
+// the index being behind several changes of its key, is ended too, and
+// its reader exchanges again. A local branch's keys are its base's
+// (effectiveKey), which doc alone doesn't give: its rows are left to
+// keysHold.
+func endCookies(ctx context.Context, tx *sql.Tx, ns string, doc map[string]any) error {
+	cfg, err := grantcheck.ParseConfig(ns, "", doc)
+	if err != nil || cfg.Base != "" {
+		return nil
+	}
+	prefix := "reads:" + ns + ":"
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT kid, roles, pub, entry FROM edge_gs_keys WHERE substr(marker, 1, ?) = ? AND entry <> ''`, len(prefix), prefix)
+	if err != nil {
+		return err
+	}
+	var ended []gsKeyRow
+	defs, _ := doc["roles"].(map[string]any)
+	for rows.Next() {
+		var k gsKeyRow
+		if err := rows.Scan(&k.kid, &k.roles, &k.pub, &k.entry); err != nil {
+			rows.Close()
+			return err
+		}
+		holds := false
+		if i := slices.IndexFunc(cfg.Keys, func(o grant.Key) bool { return o.Kid == k.kid }); i >= 0 && cfg.Keys[i].Raw != nil {
+			key := cfg.Keys[i]
+			roles, ok := decodeStrings(k.roles)
+			rs := make(map[string]any, len(roles))
+			for _, r := range roles {
+				def, has := defs[r]
+				ok = ok && has
+				rs[r] = def
+			}
+			holds = ok && k.pub != "" && keyPub(key) == k.pub && key.Lists("read") && entryDigest(key.Raw, rs) == k.entry
+		}
+		if !holds {
+			ended = append(ended, k)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, k := range ended {
+		if _, err := tx.ExecContext(ctx, `UPDATE edge_gs_keys SET entry = '' WHERE substr(marker, 1, ?) = ? AND kid = ? AND roles = ? AND pub = ? AND entry = ?`,
+			len(prefix), prefix, k.kid, k.roles, k.pub, k.entry); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1354,7 +1444,11 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		// Every marker, reads:{ns}:{k} included, records the key that
 		// verified the grant here and its entry (§A.4 gs).
 		rec := markerRecOf(a, v)
-		rec.key.entry = ix.exchangeEntry(ctx, ns, cfg.Head, a, v, rec.key)
+		var behind bool
+		if rec.key.entry, behind = ix.exchangeEntry(ctx, ns, cfg.Head, a, v, rec.key); behind {
+			fail(errExchangeBehind)
+			continue
+		}
 		ex.filters[a.marker] = rec
 		if _, _, ok := edgeGS(nsPrefix(ns, a.gs)); ok {
 			ex.issues = append(ex.issues, svcedge.Issue{Prefix: nsPrefix(ns, a.gs), Exp: exp})

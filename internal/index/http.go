@@ -1023,6 +1023,9 @@ func upstreamBehind(err error) (msg string, behind bool) {
 		// A namespace visibility reads not followed yet (members.go).
 		return msgMemberBehind, true
 	}
+	if errors.Is(err, errExchangeBehind) {
+		return "the index has not reached a change to a key or role the grant reads through: exchange it again (§A.4)", true
+	}
 	if re := (*rootErr)(nil); errors.As(err, &re) && re.transient() {
 		// The core's root, read for coverage (authOff), for now.
 		return msgRootBehind, true
