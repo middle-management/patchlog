@@ -139,21 +139,39 @@ func TestV081NowReadRoles(t *testing.T) {
 	}
 }
 
-// TestV081NowMergeGrantsWrite (§F.8, §C.2 item 5): POST /merge-grants
-// issues a write grant only, under the merge key, for the merge service to
-// submit a batch to the catalog, and rules on /now for writes are
-// unchanged (v0.78), so an approver whose grant has a block rule on /now
-// is checked as before.
+// TestV081NowMergeGrantsWrite (§B.11.4 The caller's grant, v0.85,
+// scenario 139: "A merge grant (§F.8) is refused so where its approver's
+// grant has such a /now rule"): an approver whose grant has a block rule
+// on /now gets 403, no-store, and no grant, in Approver-Authorization or
+// as the caller itself; the same approver without the rule gets the
+// grant, and so does a caller with the rule asking for another approver.
+// v0.81 left merge grants out of the refusal, rules on /now being
+// unchanged for writes.
 func TestV081NowMergeGrantsWrite(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()
 	w.caughtUp()
-	clock := w.idp.Grant(t, w.s.Now(), "user:anna", []string{"cat"}, []string{},
-		map[string]any{"groups": toAny("match-desk"), "rules": []any{nowRule}})
+	anna := func(extra map[string]any) string {
+		m := map[string]any{"groups": toAny("match-desk")}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return w.idp.Grant(t, w.s.Now(), "user:anna", []string{"cat"}, idCan, m)
+	}
+	clock, plain := anna(map[string]any{"rules": []any{nowRule}}), anna(nil)
 	del := map[string]any{"resource": "matches.derby", "ifMatch": w.catHead("matches.derby"), "steps": []any{"delete"}}
-	if r := w.mergeAsk(clock, "", del); r.status != 200 || r.body["grant"] == nil {
-		t.Fatalf("merge grant approved under a block rule on /now: %d %v", r.status, r.body)
+	if r := w.mergeAsk(clock, "", del); r.status != 403 || r.body["grant"] != nil || r.header.Get("Cache-Control") != "no-store" {
+		t.Errorf("merge grant approved under a block rule on /now: %d %v", r.status, r.body)
+	}
+	// The merge service's own grant isn't the approver's.
+	body := map[string]any{"batch": map[string]any{"items": []any{del}, "source": map[string]any{"ns": "cat-r1", "at": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}
+	svc := w.idp.Grant(t, w.s.Now(), "svc:merge", []string{"cat"}, idCan, map[string]any{"groups": toAny(), "rules": []any{nowRule}})
+	if r := w.doWith("POST", "/merge-grants", svc, body, map[string]string{"Approver-Authorization": "Bearer " + plain}); r.status != 200 || r.body["grant"] == nil {
+		t.Errorf("a caller with the rule, for an approver without: %d %v", r.status, r.body)
+	}
+	if r := w.mergeAsk(plain, "", del); r.status != 200 || r.body["grant"] == nil {
+		t.Fatalf("merge grant approved without the rule: %d %v", r.status, r.body)
 	}
 }

@@ -16,7 +16,6 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/derived"
-	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/seal"
 )
@@ -109,7 +108,7 @@ func TestSealedNamespace(t *testing.T) {
 	}
 	// A reader of sec whole, under reads:sec (§A.4).
 	rd := k.Grant(t, s.Now(), "user:r", []string{"sec"}, []string{"read"})
-	gs := grantcheck.SubjectSetID([]string{"reads:sec"})
+	gs := readsGS("sec", k)
 	all := []string{"read", "create", "append", "purge", "config"}
 	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"sec", "pub", "schemas"}, all)), client.WithKeys(client.NewKeys(nil)))
 	// The schema lives in a public namespace (§E.2.5).

@@ -139,6 +139,67 @@ Implements spec **v0.85** (previously **v0.84**).
   end-to-end namespaces is `404` (`not_offered`), never the `410` with `last` (scenario 78); a
   client refuses a base's current namespace document naming a lower or unknown level, and
   keeps the level it holds (scenario 79).
+Access and coverage at the origin and the services (the answers to Open 32–71 and 88, and to
+Open 19 and 20):
+
+- **Index markers name their key: `reads:{ns}:key:{id}`** (§A.4 `gs`, Open 34; as the proposed
+  vector C.4 computes it). A reader with namespace-wide `read` gets the marker of the key that
+  verified its grant, by `kid` and `pub`, so readers through two keys have two `gs`, two sets
+  of prefixes and results, and a change to one key ends only its readers' cookies. It was
+  `reads:{ns}` for every key. **Private result URLs of such readers change**, and a cookie
+  minted before the upgrade is `403` until its reader exchanges again. Cookies of one marker
+  are still told apart by `exp`, and an exchange with no second left is still `503 behind`.
+- **An index exchange behind a key or role change is `503 behind`** (§A.4 `gs`, §12.1, Open 35,
+  scenario 134), with `Retry-After` and no cookie, ranked with an unreadable `requireAt` chain:
+  the index's checkpoint of a covered namespace is behind a change to the key that verified
+  the grant or to a role it reads through, or the namespace's document moved during the
+  exchange. Before, it minted a cookie that was `403` at its first use.
+- **A cookie on a purged sealed namespace is judged by the last document the index read**
+  (§A.4 Unavailable namespaces, Open 36, scenario 135): one a document the index applied ended
+  is `403`, not the purge's `410`. The index ends such cookies as it applies each namespace
+  document, so one stays ended should the document change back.
+- **A `requireAt` naming a purged namespace fails the scope: `403`** (§C.4, Open 42, scenario
+  77), with the one text of a rejected `at`, at the origin, which went on verifying an `at` in
+  the purged namespace's kept log, and at the services, where a sealed one was `502` and an
+  unsealed one's grant still verified. A catalog's key in a content namespace therefore signs
+  nothing that verifies once the catalog is purged.
+- **An uncovered purged namespace's filtered URLs are `403`, or `401`** (§B.11.9 Purged covered
+  namespaces, Open 43, scenario 141), never `410`: only a purged namespace filtered reads cover
+  answers them as its unfiltered forms.
+- **The caller's grant is judged in every namespace the catalog service follows** (§B.11.4,
+  Open 37, scenario 136): `POST /read-grants` and a `want` listing `read` refuse, `403`, a grant
+  that allows `read` in none it verifies in; one whose roles list `read` only in a content
+  namespace was refused before. **Listings and the service's exchange refuse such a grant too**
+  (§B.11.5 Listing URLs, Open 41, scenario 140): a grant without `read` no longer reads its
+  subject set's listings. **`POST /merge-grants` refuses an approver whose grant has a block or
+  key-scope rule on `/now`** (Open 40, scenario 139).
+- **A stopped namespace at the catalog service** (§B.5 Behind, Open 50, scenario 142): its
+  items are `502 upstream` whatever the service can still read of it, and no `checkpoint` names
+  it.
+- **`/problems` no longer lists `tooDeep`** (§B.5 Cycles, Open 68): only `subtree`, `ancestors`
+  and `where` report a path cut at depth 64, as `"tooDeep": true`. The playground follows.
+- **A listing that leaves values out until an epoch is judged is `no-store` and isn't stored**
+  (§E.2.6 Per-entry sealing, Open 20, scenario 73): the tree service computes it on each
+  request, and the same `at` URL carries the values once the epoch is judged.
+- **An implicit placement's values are its item's** (§E.2.6, Open 19, scenario 82): in a
+  sealed or end-to-end catalog nothing of it is sealed under the catalog's keys. Its item's
+  title and `born`, held only for items of namespaces that are neither, are on its entry in
+  the clear, with no `sealed`; they were sealed under the catalog node's `K_r` at the
+  catalog's current epoch. The playground shows them.
+- **A purged sealed catalog counts as no catalog at the index** (§B.11.9 Where, Open 88): its
+  document is `410` at its purge head, whatever the index read of it while it lived. A partial
+  reader of a namespace that trusts only such a catalog gets `403` with no marker, where the
+  trust recorded before kept the namespace covered and dark. An unsealed one is read at its
+  purge head, as before.
+- **The index reuses a successful `GET /` for a minute at most** (§B.11.9 Where, Open 46), and
+  nothing after a read that failed.
+- **A service's `502` carries nothing of the origin's answer** (§C.6 Upstream failures, Open
+  55): already so at the index, the tree and the catalog service, now tested; an origin answer
+  the catalog service met unwrapped, which was a `500` quoting it, is a `502` of its own.
+- Confirmed against the text, with tests where there were none: inherited access stops 64
+  levels up (§B.11.2, scenario 132), no exchange revives an ended cookie (§B.11.9 `gs`), a
+  mixed `want` gets the narrower `can`, and only a malformed request's `400` precedes the
+  caller's-grant `403`.
 
 
 ## v0.30.0

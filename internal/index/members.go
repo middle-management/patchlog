@@ -669,6 +669,15 @@ func (ix *Index) forgetMember(ctx context.Context, m string) error {
 	if err == nil && !again {
 		_, err = tx.ExecContext(ctx, `DELETE FROM member_checkpoints WHERE origin = ? AND ns = ?`, ix.origin, m)
 	}
+	if err == nil && !again && purged {
+		// A purged m that was sealed or end-to-end counts as no catalog
+		// (§B.11.9 Where, v0.85; purgedSealed), which its member_conf
+		// row, forgotten next, told: its trust goes with it.
+		var sealed bool
+		if sealed, err = ix.purgedSealedTx(ctx, tx, m); err == nil && sealed {
+			_, err = tx.ExecContext(ctx, `DELETE FROM catalog_trust WHERE ns = ?`, m)
+		}
+	}
 	if err == nil && !again {
 		_, err = tx.ExecContext(ctx, `DELETE FROM member_conf WHERE ns = ?`, m)
 	}

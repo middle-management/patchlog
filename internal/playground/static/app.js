@@ -3003,7 +3003,11 @@ async function openSealedEntries(v, view, from, filed, ctx) {
   // is named by its key, which a name of its own must agree with.
   const named = typeof v.name === 'string' ? v.name : typeof v.resource === 'string' ? v.resource : '';
   const node = isFiled || typeof v.name === 'string';
-  if (node && (ctx.perEntry || typeof v.sealed === 'string')) {
+  // An implicit placement ("self": true) has no revision in the catalog: what it carries in the clear, with no
+  // "sealed", are values of its item, of a namespace that is neither sealed nor end-to-end (§E.2.6 Per-entry
+  // sealing, v0.85), and stays.
+  const itemsOwn = v.self === true && typeof v.sealed !== 'string';
+  if (node && !itemsOwn && (ctx.perEntry || typeof v.sealed === 'string')) {
     // What §E.2.6 leaves in the clear, and what stands sealed in place (a born of another epoch, a file's
     // metadata), which opens or fails as itself. An item's file in the clear is of a namespace that isn't sealed.
     // An entry is filed, or has a name and an href. Anything else with a name is a value the answer carries
@@ -3392,7 +3396,6 @@ function renderCatProblems() {
     parts.push(line('cycles', p.cycles || [], (c) => h('span', { class: 'mono' }, [].concat(c).map((x) => nodeName(x) || x).join(' → '))),
       line('dangling items', p.danglingItems || [], (x) => [nodeLink(nodeName(x.href)), h('span', { class: 'muted small' }, ` (${x.reason || 'dangling'})`)]),
       line('dangling parents', p.danglingParents || [], (x) => [nodeLink(nodeName(x.href)), h('span', { class: 'muted small' }, ` → ${x.parent || ''} ${x.state || ''}`)]),
-      line('too deep', p.tooDeep || [], (x) => nodeLink(nodeName(x.href))),
       line('orphans', C.problems.orphans || [], (x) => nodeLink(x.name)));
   } else {
     $('catProbMeta').textContent = 'computed here from the documents';

@@ -2,6 +2,7 @@ package index
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"maps"
@@ -486,6 +487,34 @@ func isCatalog(doc map[string]any) bool {
 	return ok
 }
 
+// purgedSealed reports whether purged namespace ns was sealed or
+// end-to-end by the last document the index applied of it (ns_conf, or
+// member_conf for one followed for visibility): the origin then answers
+// 410 for its documents, its purge head's included (§8.5). False where
+// the index recorded no level of it.
+func (ix *Index) purgedSealed(ctx context.Context, ns string) (bool, error) {
+	return ix.purgedSealedTx(ctx, ix.db, ns)
+}
+
+// purgedSealedTx is purgedSealed read through db, a transaction or the
+// database. A member's row goes once its follower is forgotten
+// (forgetMember), which forgets a sealed one's catalog.trust with it.
+func (ix *Index) purgedSealedTx(ctx context.Context, db interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, ns string) (bool, error) {
+	for _, table := range []string{"ns_conf", "member_conf"} {
+		var level string
+		switch err := db.QueryRowContext(ctx, `SELECT level FROM `+table+` WHERE ns = ?`, ns).Scan(&level); {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return false, err
+		case derived.Protected(level):
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // fsTrust are the catalogs root trusts with document doc (§B.11.9 Where,
 // catvis.TrustedCatalogs), each with its document as of the id it is
 // taken at (memberAt): local, unpurged namespaces, and purged ones (gone),
@@ -497,11 +526,19 @@ func isCatalog(doc map[string]any) bool {
 // catalog.trust is that of its own document at its head, as the origin
 // stores it (remoteCatalog), and no follower is started for it. A purged
 // catalog's document is 410: its catalog.trust is the one the index last
-// applied (catalog_trust), as the origin reads its last stored document
-// ("as their documents alone decide"). One the index never applied a
-// document of counts as no catalog: root is not covered through it, the
-// reading that shows least (§A.4: no marker, 403). A catalog whose
-// document can't be read is an error (502), never no catalog.
+// applied (catalog_trust), which for a namespace that was neither sealed
+// nor end-to-end is that of its document at its purge head, where the
+// origin still serves it (§B.11.9 Where, v0.85: "A service reads it from
+// the catalog's document at its purge head where the origin serves that,
+// and one it can't read there counts as no catalog"). One the index
+// never applied a document of counts as no catalog, and so does one that
+// was sealed or end-to-end when it was purged, whose document is 410 at
+// its purge head (purgedSealed; before v0.85 the trust the index had
+// read of it while it lived was kept): root is not covered through it,
+// the reading that shows least (§A.4: no marker, 403). The origin, which
+// still holds a purged sealed catalog's last document, keeps root
+// covered through it, dark. A live catalog whose document can't be read
+// is an error (502), never no catalog.
 func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) ([]fsCat, error) {
 	var ferr error
 	ids, docs, gone := map[string]string{}, map[string]map[string]any{}, map[string]bool{}
@@ -529,6 +566,16 @@ func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) (
 				return nil
 			}
 			if !known {
+				return nil
+			}
+			// One whose document the origin doesn't serve at its
+			// purge head, a sealed or end-to-end namespace's (§8.5),
+			// counts as no catalog, whatever the index read of it
+			// while it lived (§B.11.9 Where, v0.85).
+			if sealed, err := ix.purgedSealed(ctx, cat); err != nil {
+				ferr = err
+				return nil
+			} else if sealed {
 				return nil
 			}
 			gone[cat] = true
@@ -1264,13 +1311,19 @@ func (ix *Index) mayBeCovered(ctx context.Context, ns string) (bool, error) {
 	return len(cats) > 0, nil
 }
 
+// authReuse bounds how long a successful read of the core's root is
+// reused (§B.11.9 Where, v0.85: "reusing a successful read for at most a
+// minute and none once a later read has failed").
+const authReuse = time.Minute
+
 // authOff reports whether the core runs with authentication disabled
-// (§1), as its root says, read again once CheckerTTL has passed since it
-// was last read.
+// (§1), as its root says, read again once CheckerTTL, a minute at most
+// (authReuse), has passed since it was last read. A read that fails
+// leaves nothing to reuse: what an earlier one said is forgotten.
 func (ix *Index) authOff(ctx context.Context) (bool, error) {
 	a := &ix.auth
 	a.mu.Lock()
-	if !a.at.IsZero() && time.Since(a.at) < ix.opt.CheckerTTL {
+	if !a.at.IsZero() && time.Since(a.at) < min(ix.opt.CheckerTTL, authReuse) {
 		off := a.off
 		a.mu.Unlock()
 		return off, nil
@@ -1278,6 +1331,9 @@ func (ix *Index) authOff(ctx context.Context) (bool, error) {
 	a.mu.Unlock()
 	off, err := ix.c.AuthDisabled(ctx)
 	if err != nil {
+		a.mu.Lock()
+		a.at = time.Time{}
+		a.mu.Unlock()
 		return false, &rootErr{err}
 	}
 	a.mu.Lock()

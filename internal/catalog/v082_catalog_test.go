@@ -455,6 +455,15 @@ func TestV082StoppedPublicNamespaceReadsPublicToNoOne(t *testing.T) {
 		if msg, _ := e["message"].(string); msg != "the catalog service can't read the document of namespace matches" {
 			t.Errorf("%s: the message %q relays the origin's answer", c.name, msg)
 		}
+		// Scenario 142 (§B.5 Behind, v0.85): "No checkpoint names the
+		// namespace", whose last one the service still holds; and POST
+		// /grants answers the same 502.
+		if cp, _ := r.body["checkpoint"].(map[string]any); cp == nil || cp["matches"] != nil || cp["cat"] == nil {
+			t.Errorf("%s: checkpoint %v, want the catalog's alone", c.name, r.body["checkpoint"])
+		}
+		if g := w.do("POST", "/grants", c.token, map[string]any{"item": "/r/matches/derby", "want": toAny("append")}); g.status != 502 || g.body["code"] != "upstream" || g.body["checkpoint"] != nil {
+			t.Errorf("%s: POST /grants for an item of a stopped namespace: %d %v, want 502 upstream", c.name, g.status, g.body)
+		}
 	}
 }
 

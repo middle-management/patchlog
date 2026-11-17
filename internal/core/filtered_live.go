@@ -80,7 +80,7 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, gs, since string, limi
 	var info *FilteredInfo
 	var until time.Time
 	err := e.read(ctx, func(t *tx) error {
-		n, fs, err := t.filteredOpen(ns, fform{live: true, since: since}, cred)
+		n, fs, err := t.filteredOpen(ns, cred)
 		if err != nil {
 			return err
 		}

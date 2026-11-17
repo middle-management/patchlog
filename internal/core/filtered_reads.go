@@ -58,26 +58,20 @@ func (t *tx) nsReaderOrRedirect(n *nsRow, cred Credentials) (*actor, error) {
 	return a, nil
 }
 
-// fform is the form of a filtered URL, which decides what a purged
-// namespace this section doesn't cover answers there (§B.11.9 Purged
-// namespaces, §8.5): /heads, at an at or without; a log range; or
-// long-poll and events (live), from since.
-type fform struct {
-	heads, live bool
-	since       string
-}
-
-// filteredOpen is the covered namespace a filtered URL of form f names, or
-// the answer for one that isn't covered (§B.11.9 Where): its credentials
-// are judged as at its unfiltered URLs (401 without, 403 for a
-// /ns/{ns}/g/{gs} cookie); then a purged namespace answers 410 where §8.5
-// answers the unfiltered form so (purgedFiltered); then 401 for a request
-// that carries neither a grant that verifies in {ns} nor a cookie the
-// origin verifies, as in a public namespace, whose unfiltered URLs ignore
-// an unusable grant; then 403, as no filtered URL serves it (§B.11.9
-// Purged namespaces: "answer these URLs as §8.5 answers their unfiltered
-// forms; other namespaces ... 403, or 401 as §B.11.5 says").
-func (t *tx) filteredOpen(ns string, f fform, cred Credentials) (*nsRow, *fscope, error) {
+// filteredOpen is the covered namespace a filtered URL names, or the
+// answer for one that isn't covered (§B.11.9 Where): its credentials are
+// judged as at its unfiltered URLs (401 without, 403 for a
+// /ns/{ns}/g/{gs} cookie); then 401 for a request that carries neither a
+// grant that verifies in {ns} nor a cookie the origin verifies, as in a
+// public namespace, whose unfiltered URLs ignore an unusable grant; then
+// 403, as no filtered URL serves it. A purged namespace this section
+// doesn't cover answers so too, never the 410 of its unfiltered forms
+// (§B.11.9 Purged covered namespaces, v0.85: "Purged covered namespaces
+// answer these URLs as §8.5 answers their unfiltered forms ... Other
+// namespaces this section doesn't cover, branches among them, answer
+// them 403, or 401, in §7's order"); before v0.85 its /heads, and its
+// live reads from the purge-ns entry, were 410.
+func (t *tx) filteredOpen(ns string, cred Credentials) (*nsRow, *fscope, error) {
 	n := t.nsByName(ns)
 	if n == nil {
 		return nil, nil, t.absentNS(ns, cred)
@@ -87,9 +81,6 @@ func (t *tx) filteredOpen(ns string, f fform, cred Credentials) (*nsRow, *fscope
 		if _, _, _, err := t.nsAccess(n, cred); err != nil {
 			return nil, nil, err
 		}
-		if t.purgedFiltered(n, f) {
-			return nil, nil, t.purgedRead(n)
-		}
 		if !t.e.opt.AuthDisabled && cred.Edge == nil && !t.grantVerifiesIn(n, cred) {
 			return nil, nil, apiErr(401, "unauthenticated", "message",
 				"no grant that verifies in "+ns+" and no cookie: "+ns+" isn't read filtered here (§B.11.9 Where, §B.11.5)")
@@ -97,24 +88,6 @@ func (t *tx) filteredOpen(ns string, f fform, cred Credentials) (*nsRow, *fscope
 		return nil, nil, forbidden(ns + " isn't read filtered here (§B.11.9 Where)")
 	}
 	return n, fs, nil
-}
-
-// purgedFiltered reports whether §8.5 answers the unfiltered form of f in
-// n 410: n is purged, and f is /heads (at any revision), or long-poll or
-// events from the purge-ns entry, or n is sealed, where log ranges, events
-// and long-poll are 410 too. A purged namespace's other forms are "served
-// as before" (§8.5), which for a namespace this section doesn't cover is
-// its 403 or 401 (§B.11.9 Purged namespaces).
-func (t *tx) purgedFiltered(n *nsRow, f fform) bool {
-	switch {
-	case !n.purged:
-		return false
-	case f.heads || t.sealedPurged(n):
-		return true
-	case f.live:
-		return t.fromPurgeEntry(n, f.since)
-	}
-	return false
 }
 
 // fromPurgeEntry reports whether since names purged n's purge-ns entry,
@@ -151,7 +124,7 @@ func (t *tx) grantVerifiesIn(n *nsRow, cred Credentials) bool {
 // *FilteredRedirect to the current one, after admission there (§B.11.9
 // URLs, at).
 func (t *tx) filteredAtView(ns, gs, at string, cred Credentials) (*nsRow, *fview, error) {
-	n, fs, err := t.filteredOpen(ns, fform{}, cred)
+	n, fs, err := t.filteredOpen(ns, cred)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -190,7 +163,7 @@ func (t *tx) filteredCurrentRedirect(n *nsRow, fs *fscope, gs string, cred Crede
 func (e *Engine) FilteredCurrent(ctx context.Context, ns, gs, suffix string, cred Credentials) error {
 	return e.filteredRead(ctx, func(t *tx) error {
 		heads := suffix == "/heads"
-		n, fs, err := t.filteredOpen(ns, fform{heads: heads}, cred)
+		n, fs, err := t.filteredOpen(ns, cred)
 		if err != nil {
 			return err
 		}
@@ -254,7 +227,7 @@ func (e *Engine) FilteredHeads(ctx context.Context, ns, gs, at, after, prefix st
 // a purged namespace it returns the checkpoint judged at and no view: the
 // read check is purgedHeadsCheck's, and the answer 410.
 func (t *tx) filteredHeadsView(ns, gs, at string, cred Credentials) (*nsRow, *fview, *fcp, error) {
-	n, fs, err := t.filteredOpen(ns, fform{heads: true}, cred)
+	n, fs, err := t.filteredOpen(ns, cred)
 	if err != nil {
 		return nil, nil, nil, err
 	}

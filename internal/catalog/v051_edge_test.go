@@ -120,10 +120,29 @@ func TestServiceEdgeGrants(t *testing.T) {
 		t.Errorf("two subject sets: %d %v", r.status, r.body)
 	}
 	// A grant that lasts less than 15 minutes bounds its cookie.
-	short := w.idp.Grant(t, w.s.Now(), "user:sam", []string{"cat"}, []string{}, map[string]any{"groups": toAny("fan-club"),
+	short := w.idp.Grant(t, w.s.Now(), "user:sam", []string{"cat"}, idCan, map[string]any{"groups": toAny("fan-club"),
 		"exp": w.s.Now().Add(90 * time.Second).Format(time.RFC3339)})
 	if r, cks := w.exchange(short, nil, ""); r.status != 200 || len(cks) != 1 || cks[0].MaxAge > 90 || cks[0].MaxAge < 80 {
 		t.Errorf("short grant: %d %v", r.status, cks)
+	}
+	// Scenario 140 (§B.11.5 Listing URLs, v0.85): a grant that allows
+	// read in no namespace the service follows, here an identity-only
+	// one and one narrowed to append, is 403 at the exchange and at its
+	// own /g/{gs}, as POST /read-grants refuses it; before v0.85 it read
+	// its subject set's listings.
+	for what, can := range map[string][]string{"an identity-only grant": {}, "a grant with append alone": {"append"}} {
+		tok := w.idp.Grant(t, w.s.Now(), "user:sam", []string{"cat"}, can, map[string]any{"groups": toAny("fan-club")})
+		if r, cks := w.exchange(tok, nil, ""); r.status != 403 || len(cks) != 0 {
+			t.Errorf("%s at the exchange: %d %v, want 403 and no cookie", what, r.status, r.body)
+		}
+		for _, path := range []string{"/cat/children?of=season", prefix + "/children?of=season"} {
+			if r := w.do("GET", path, tok, nil); r.status != 403 {
+				t.Errorf("%s at %s: %d %v, want 403", what, path, r.status, r.body)
+			}
+		}
+		if r := w.do("POST", "/read-grants", tok, map[string]any{"items": toAny("/r/matches/derby")}); r.status != 403 {
+			t.Errorf("%s at POST /read-grants: %d %v, want 403", what, r.status, r.body)
+		}
 	}
 	for _, tc := range []struct {
 		what        string

@@ -27,7 +27,7 @@
 //	edge_filters(marker, filter, exp) what each scope or g: marker of those stands for (markerRec)
 //	edge_gs(marker, subjects, kid, roles, pub, exp)  and, for a g: marker (§B.11.9), its subjects;
 //	                                      its kid, roles and pub are no longer read (edge_gs_keys)
-//	edge_gs_keys(marker, exp, kid, roles, pub, entry)  every key the cookie of a marker (reads:{ns}
+//	edge_gs_keys(marker, exp, kid, roles, pub, entry)  every key the cookie of a marker (reads:{ns}:{k}
 //	                                      included) that expires at exp came from, with its read
 //	                                      roles and the digest of its entry and theirs (gsKey),
 //	                                      written once: an exchange with other keys or entries
@@ -1252,6 +1252,11 @@ func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, table, ns string, doc
 	}
 	if err := recordTrust(ctx, tx, ns, docs[len(docs)-1].Value); err != nil {
 		return false, err
+	}
+	if table == "ns_conf" {
+		if err := endCookies(ctx, tx, ns, docs[len(docs)-1].Value); err != nil {
+			return false, err
+		}
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO `+table+` (ns, public, level) VALUES (?, ?, ?) ON CONFLICT (ns) DO UPDATE SET public = excluded.public, level = excluded.level`, ns, public, level)
 	return narrowed, err

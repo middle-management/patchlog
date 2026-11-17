@@ -288,8 +288,12 @@ func TestI23ViewKey(t *testing.T) {
 	t.Parallel()
 	p := loadAddendumI(t).I23
 	gs := grantcheck.SubjectSetID([]string{"group:match-desk", "user:anna"}) // I.8's
-	// The gs is an input only (§I.23): I.8's is a set of two principals,
-	// not one every reader of which reads demo whole. C.4 has such a gs.
+	// The premise is illustrative, like §I.19's plaintexts: I.8's gs is a
+	// set of two principals, and the reference serves a response sealed
+	// whole only at a gs every reader of which reads the namespace whole,
+	// that of a reads:demo:{k} marker (SERVICES §E.2.6 Whole-response
+	// sealing, §A.4; v0.85), which is no set of principals. The bytes
+	// don't depend on it.
 	vals := url.Values{"q": {p.Q}, "sort": {p.Sort}, "min": {nsID2}}
 	cq := derived.CanonicalQuery(vals, "min")
 	if cq != "?"+p.CanonicalQuery {

@@ -187,9 +187,9 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		v, err := s.grantViewer(ctx, b, "")
 		if _, chain := chainErr(err); !chain && client.IsPurged(err) {
 			// A purged sealed catalog's document is 410 (§8.5): the core
-			// makes the read check, as for a listing (serve). Not a
-			// requireAt chain's purged namespace: that is 502 upstream,
-			// never 403 (§C.4).
+			// makes the read check, as for a listing (serve). A purged
+			// namespace a requireAt key names is no such error: the
+			// checker refuses its grant 403 (§C.4, v0.85).
 			var head string
 			if head, err = s.checker.PurgedRead(ctx, s.actual(s.opt.Catalog), b); err == nil {
 				purged = head
