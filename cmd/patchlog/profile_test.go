@@ -334,6 +334,7 @@ func TestBearerFileCommands(t *testing.T) {
 		{"get", "ns/x"}, {"merge", "apply", "--branch", "b"}, {"janitor", "--ns", "n"}, {"tree", "--catalog", "c"}, {"index", "--ns", "n"},
 		{"schema", "import", "--ns", "n", "x.json"}, {"export", "--ns", "n"}, {"import", "-i", "b"}, {"bundle", "verify", "-i", "b"},
 		{"dav"}, {"grant", "check", "ns", "T"}, {"grant", "show", "ns", "G"},
+		{"search", "ns", "q"}, {"tree", "ls", "cat"}, {"verify", "ns"},
 	} {
 		var c cli
 		p, err := newParser(&c, nil)

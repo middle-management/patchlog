@@ -67,6 +67,7 @@ type cli struct {
 	Validate *validateCmd `arg:"subcommand:validate" group:"Client commands" help:"check a document against its schema, without writing it"`
 	Purge    *purgeCmd    `arg:"subcommand:purge" group:"Client commands" help:"purge a resource, destroying it for good (§8.3); needs --yes"`
 	Prune    *pruneCmd    `arg:"subcommand:prune" group:"Client commands" help:"prune a resource's history below a revision (§8.6); needs --yes"`
+	Search   *searchCmd   `arg:"subcommand:search" group:"Client commands" help:"query the search index (Addendum A)"`
 
 	Branch  *branchCmd  `arg:"subcommand:branch" group:"Branches, releases and bundles" help:"create or list a namespace's branches (§7.6)"`
 	Merge   *mergeCmd   `arg:"subcommand:merge" group:"Branches, releases and bundles" help:"merge a branch, or a release across namespaces (Addendum F)"`
@@ -84,6 +85,7 @@ type cli struct {
 	Archive    *archiveCmd `arg:"subcommand:archive" group:"Keys and operations" help:"restore pruned history from its archives (§8.6)"`
 	Whoami     *whoamiCmd  `arg:"subcommand:whoami" group:"Keys and operations" help:"print who the deployment takes you to be, and with a namespace what your grant can do there"`
 	Health     *healthCmd  `arg:"subcommand:health" group:"Keys and operations" help:"check a health endpoint (exit 0 on 200), for container healthchecks"`
+	Verify     *verifyCmd  `arg:"subcommand:verify" group:"Keys and operations" help:"check a namespace's hash chain and its resources' logs (§G.2)"`
 	VersionCmd *versionCmd `arg:"subcommand:version" group:"Keys and operations" help:"print the version"`
 }
 
@@ -168,7 +170,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
-	if slices.Contains(telemetryCommands, names[0]) {
+	if slices.Contains(telemetryCommands, names[0]) && !(names[0] == "tree" && len(names) > 1) { // tree ls is a client, not the service
 		// Flushed when the command returns (after a server's graceful
 		// shutdown), not on log.Fatal.
 		defer startTelemetry(names[0])()
