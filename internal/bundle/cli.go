@@ -127,13 +127,13 @@ func CLI(ctx context.Context, cmd string, args []string, stdout, stderr io.Write
 
 // ExportCmd is "patchlog export".
 type ExportCmd struct {
-	API            string   `arg:"--api" default:"http://localhost:8080" help:"source deployment base URL"`
+	API            string   `arg:"--api,env:PATCHLOG_API" default:"http://localhost:8080" help:"source deployment base URL"`
 	NS             string   `arg:"--ns" help:"namespaces to export (comma-separated)"`
 	Resource       string   `arg:"--resource" help:"resources to export (comma-separated names, or ns/name); default: every resource of --ns"`
 	Mode           string   `arg:"--mode" default:"history" help:"history (full) or snapshot"`
 	Out            string   `arg:"-o" help:"output file (default stdout)"`
-	Bearer         string   `arg:"--bearer" help:"grant sent as Authorization: Bearer (needs read, §G.2)"`
-	Author         string   `arg:"--author" help:"X-Author (development servers only)"`
+	Bearer         string   `arg:"--bearer,env:PATCHLOG_BEARER" help:"grant sent as Authorization: Bearer (needs read, §G.2)"`
+	Author         string   `arg:"--author,env:PATCHLOG_AUTHOR" help:"X-Author (development servers only)"`
 	External       string   `arg:"--external" help:"dependencies to leave out: ns or ns/name (comma-separated)"`
 	Authors        bool     `arg:"--authors" help:"include authors, creation times, signatures and gestures (§G.4.1)"`
 	UntypedRefs    bool     `arg:"--untyped-refs" help:"treat /r/… strings in untyped documents as references"`
@@ -369,15 +369,15 @@ func schemaNamespaces(open Opener) (map[string]bool, error) {
 
 // ImportCmd is "patchlog import".
 type ImportCmd struct {
-	API                string   `arg:"--api" default:"http://localhost:8080" help:"target deployment base URL"`
+	API                string   `arg:"--api,env:PATCHLOG_API" default:"http://localhost:8080" help:"target deployment base URL"`
 	NS                 string   `arg:"--ns" help:"target namespaces: name, or src=dst to map a source namespace (comma-separated). src=dst renames, to clone a set of namespaces together: references to src ($schema, $ref, x-ref) are rewritten where they are declared in every document, and documents that change get new ids; undeclared ones are listed, not rewritten. Onto a branch of src it keeps references and ids. A single plain name that isn't in the bundle maps its one document namespace to it, so it renames too, unless it is a branch of that namespace. Catalog placement names aren't renamed, and namespace configuration isn't in the bundle: create renamed targets with theirs first (§G.4.4, §G.7)"`
 	Only               string   `arg:"--only" help:"import only these source namespaces of the bundle (comma-separated): what their documents reference in the others must be in the target already, as the bundle has it, which is checked first (§G.4.1 external)"`
 	In                 string   `arg:"-i" help:"bundle file"`
 	DryRun             bool     `arg:"--dry-run" help:"classify, check and dry-run every batch; write nothing"`
 	Atomic             bool     `arg:"--atomic" help:"one batch per namespace; over the namespace's limits it needs an allowance there, up to the deployment maximums (patchlog serve --max-items-per-batch, --max-batch-size; by default 1000 items, 16 MiB) (§6.6)"`
 	Pace               string   `arg:"--pace" help:"backfill: split batches to fit the limits and pace them, dry runs included, at this fraction of the lower of the namespace's and the importer's rate, e.g. 0.5; an allowance of the importer's own in a namespace sets its batches and full rate there instead (§6.6)"`
-	Bearer             string   `arg:"--bearer" help:"grant sent as Authorization: Bearer"`
-	Author             string   `arg:"--author" help:"X-Author (development servers only)"`
+	Bearer             string   `arg:"--bearer,env:PATCHLOG_BEARER" help:"grant sent as Authorization: Bearer"`
+	Author             string   `arg:"--author,env:PATCHLOG_AUTHOR" help:"X-Author (development servers only)"`
 	Create             bool     `arg:"--create" default:"true" help:"create missing target and upstream namespaces (--create=false to refuse)"`
 	UpstreamSuffix     string   `arg:"--upstream-suffix" default:"-upstream" help:"suffix of upstream namespaces for snapshot documents, after the new name of a renamed namespace (--ns src=dst: dst-upstream); an upstream name over the 64 characters of a namespace name is refused before anything is written (§3.6, §G.4.4)"`
 	JSON               bool     `arg:"--json" help:"print the report as JSON"`
@@ -547,8 +547,8 @@ type VerifyCmd struct {
 	JSON       bool   `arg:"--json" help:"print JSON"`
 	Identity   string `arg:"--identity" help:"private key (JWK) that opens a sealed bundle"`
 	Source     string `arg:"--source" help:"the source deployment's base URL: checks the key of each grant line against its namespace log and operator key history (§C.3.1), so complete chains are verified, not only attested"`
-	Bearer     string `arg:"--bearer" help:"--source: grant sent as Authorization: Bearer (needs read)"`
-	Author     string `arg:"--author" help:"--source: X-Author (development servers only)"`
+	Bearer     string `arg:"--bearer,env:PATCHLOG_BEARER" help:"--source: grant sent as Authorization: Bearer (needs read)"`
+	Author     string `arg:"--author,env:PATCHLOG_AUTHOR" help:"--source: X-Author (development servers only)"`
 	Signatures bool   `arg:"--signatures" help:"list the signature status of every revision"`
 }
 

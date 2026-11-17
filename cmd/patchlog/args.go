@@ -93,9 +93,9 @@ type keyringArgs struct {
 // toolArgs are the connection flags of the client tools (merge, rebase,
 // janitor, e2e).
 type toolArgs struct {
-	API     string `arg:"--api" default:"http://localhost:8080" placeholder:"URL" help:"deployment base URL"`
-	Bearer  string `arg:"--bearer" placeholder:"GRANT" help:"grant sent as Authorization: Bearer"`
-	Author  string `arg:"--author" placeholder:"NAME" help:"X-Author (development servers only)"`
+	API     string `arg:"--api,env:PATCHLOG_API" default:"http://localhost:8080" placeholder:"URL" help:"deployment base URL"`
+	Bearer  string `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"grant sent as Authorization: Bearer"`
+	Author  string `arg:"--author,env:PATCHLOG_AUTHOR" placeholder:"NAME" help:"X-Author (development servers only)"`
 	JSON    bool   `arg:"--json" help:"print JSON"`
 	SignKey string `arg:"--sign-key,env:PATCHLOG_SIGN_KEY" placeholder:"KID:SEED" help:"kid:seed (the seed 32 bytes in base64url): sign every step this tool writes with this key (§C.3.1). The kid must be listed in the signers of the grant (--bearer) the writes are sent under. Original signatures are never carried over"`
 	Dev     bool   `arg:"--dev" help:"ignored, kept for scripts: whether the deployment runs with authentication disabled is read from GET / (§1, §7)"`

@@ -46,23 +46,56 @@ type runner interface{ run(name string) }
 
 // cli is the patchlog command line: one subcommand.
 type cli struct {
-	Serve      *serveCmd   `arg:"subcommand:serve" help:"run the patch-log server"`
-	VersionCmd *versionCmd `arg:"subcommand:version" help:"print the version"`
-	Keygen     *keygenCmd  `arg:"subcommand:keygen" help:"print a new Ed25519 key pair for minting grants"`
-	Grant      *grantCmd   `arg:"subcommand:grant" help:"mint, narrow or seal a grant (Biscuit v3, §C.8)"`
-	Index      *indexCmd   `arg:"subcommand:index" help:"run the search index service (Addendum A)"`
-	Tree       *treeCmd    `arg:"subcommand:tree" help:"run the tree service, or with --access the catalog service (Addendum B)"`
-	Dav        *davCmd     `arg:"subcommand:dav" help:"serve namespaces over WebDAV (a prototype)"`
-	Merge      *mergeCmd   `arg:"subcommand:merge" help:"merge a branch, or a release across namespaces (Addendum F)"`
-	Rebase     *rebaseCmd  `arg:"subcommand:rebase" help:"rebase a branch into a successor branch (§F.5)"`
-	Janitor    *janitorCmd `arg:"subcommand:janitor" help:"purge merged and abandoned branches (§F.6)"`
-	Export     *exportCmd  `arg:"subcommand:export" help:"export namespaces to a bundle (§G.4)"`
-	Import     *importCmd  `arg:"subcommand:import" help:"import a bundle into a namespace (§G.4.4)"`
-	Bundle     *bundleCmd  `arg:"subcommand:bundle" help:"verify a bundle, or make a bundle key"`
-	Archive    *archiveCmd `arg:"subcommand:archive" help:"restore pruned history from its archives (§8.6)"`
-	Schema     *schemaCmd  `arg:"subcommand:schema" help:"import external JSON Schemas into a namespace"`
-	Health     *healthCmd  `arg:"subcommand:health" help:"check a health endpoint (exit 0 on 200), for container healthchecks"`
-	E2E        *e2eCmd     `arg:"subcommand:e2e" help:"inspect e2e namespaces (Addendum E)"`
+	Serve *serveCmd `arg:"subcommand:serve" group:"Server commands" help:"run the patch-log server"`
+	Index *indexCmd `arg:"subcommand:index" group:"Server commands" help:"run the search index service (Addendum A)"`
+	Tree  *treeCmd  `arg:"subcommand:tree" group:"Server commands" help:"run the tree service, or with --access the catalog service (Addendum B)"`
+	Dav   *davCmd   `arg:"subcommand:dav" group:"Server commands" help:"serve namespaces over WebDAV (a prototype)"`
+
+	Get   *getCmd   `arg:"subcommand:get" group:"Client commands" help:"print a resource's document"`
+	Put   *putCmd   `arg:"subcommand:put" group:"Client commands" help:"create a resource"`
+	Patch *patchCmd `arg:"subcommand:patch" group:"Client commands" help:"append a JSON Patch to a resource"`
+	Rm    *rmCmd    `arg:"subcommand:rm" group:"Client commands" help:"delete (tombstone) a resource"`
+	Log   *logCmd   `arg:"subcommand:log" group:"Client commands" help:"print a resource's history"`
+	Watch *watchCmd `arg:"subcommand:watch" group:"Client commands" help:"follow a namespace's log as it is written"`
+	NS    *nsCmd    `arg:"subcommand:ns" group:"Client commands" help:"create, read and configure namespaces (create, get, config, log)"`
+
+	Merge   *mergeCmd   `arg:"subcommand:merge" group:"Branches, releases and bundles" help:"merge a branch, or a release across namespaces (Addendum F)"`
+	Rebase  *rebaseCmd  `arg:"subcommand:rebase" group:"Branches, releases and bundles" help:"rebase a branch into a successor branch (§F.5)"`
+	Janitor *janitorCmd `arg:"subcommand:janitor" group:"Branches, releases and bundles" help:"purge merged and abandoned branches (§F.6)"`
+	Export  *exportCmd  `arg:"subcommand:export" group:"Branches, releases and bundles" help:"export namespaces to a bundle (§G.4)"`
+	Import  *importCmd  `arg:"subcommand:import" group:"Branches, releases and bundles" help:"import a bundle into a namespace (§G.4.4)"`
+	Bundle  *bundleCmd  `arg:"subcommand:bundle" group:"Branches, releases and bundles" help:"verify a bundle, or make a bundle key"`
+	Schema  *schemaCmd  `arg:"subcommand:schema" group:"Branches, releases and bundles" help:"import external JSON Schemas into a namespace"`
+	E2E     *e2eCmd     `arg:"subcommand:e2e" group:"Branches, releases and bundles" help:"inspect e2e namespaces (Addendum E)"`
+
+	Keygen     *keygenCmd  `arg:"subcommand:keygen" group:"Keys and operations" help:"print a new Ed25519 key pair for minting grants"`
+	Grant      *grantCmd   `arg:"subcommand:grant" group:"Keys and operations" help:"mint, narrow or seal a grant (Biscuit v3, §C.8)"`
+	Archive    *archiveCmd `arg:"subcommand:archive" group:"Keys and operations" help:"restore pruned history from its archives (§8.6)"`
+	Health     *healthCmd  `arg:"subcommand:health" group:"Keys and operations" help:"check a health endpoint (exit 0 on 200), for container healthchecks"`
+	VersionCmd *versionCmd `arg:"subcommand:version" group:"Keys and operations" help:"print the version"`
+}
+
+// writeRootHelp writes patchlog's own help: the commands by their group
+// tag, which go-arg's help (a flat list) doesn't know.
+func writeRootHelp(w io.Writer) {
+	fmt.Fprintln(w, "Usage: patchlog <command> [<args>]")
+	t := reflect.TypeOf(cli{})
+	group := ""
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if g := f.Tag.Get("group"); g != group {
+			group = g
+			fmt.Fprintf(w, "\n%s:\n", group)
+		}
+		_, name, _ := strings.Cut(strings.Split(f.Tag.Get("arg"), ",")[0], ":")
+		fmt.Fprintf(w, "  %-9s %s\n", name, f.Tag.Get("help"))
+	}
+	fmt.Fprint(w, `
+Run patchlog <command> --help for a command's flags. The client commands and
+tools take --api, --bearer and --author, or $PATCHLOG_API, $PATCHLOG_BEARER and
+$PATCHLOG_AUTHOR; resources are named NS/NAME, and JSON is given inline, as
+@FILE, or - for stdin.
+`)
 }
 
 // telemetryCommands are the commands that set up OpenTelemetry, if
@@ -90,6 +123,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	switch err := p.Parse(args); {
+	case errors.Is(err, arg.ErrHelp) && len(p.SubcommandNames()) == 0:
+		writeRootHelp(stdout)
+		return 0
 	case errors.Is(err, arg.ErrHelp):
 		p.WriteHelpForSubcommand(stdout, p.SubcommandNames()...)
 		return 0
@@ -102,7 +138,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	r, ok := p.Subcommand().(runner)
 	if !ok {
 		// No command, or a group without its subcommand (patchlog merge).
-		p.WriteHelpForSubcommand(stderr, names...)
+		if len(names) == 0 {
+			writeRootHelp(stderr)
+		} else {
+			p.WriteHelpForSubcommand(stderr, names...)
+		}
 		return 2
 	}
 	if slices.Contains(telemetryCommands, names[0]) {

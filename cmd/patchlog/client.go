@@ -1,0 +1,411 @@
+package main
+
+// Client commands: the public API from the shell, as client.Client calls
+// (§7). Resources are named NS/NAME. Every write is conditional (§7.2),
+// and these commands supply the precondition: put and ns create send
+// If-None-Match: *, patch appends to the head it reads (trying again on
+// the head a lost race's 412 names, client.AppendLatest) unless --if pins
+// one, rm tombstones the head it reads, and ns config patches the config
+// revision in force unless --if pins one.
+//
+// A write prints the new id on stdout, so R=$(patchlog patch …) keeps it,
+// and what it did on stderr. --api, --bearer and --author default to
+// $PATCHLOG_API, $PATCHLOG_BEARER and $PATCHLOG_AUTHOR.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"strings"
+
+	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/jsonv"
+)
+
+// clientCommand is a client command: exec writes its output to out and
+// what it did to errw.
+type clientCommand interface {
+	exec(ctx context.Context, out, errw io.Writer) error
+}
+
+// runClient runs cmd, interruptible by SIGINT, exiting 1 if it fails.
+func runClient(cmd clientCommand) {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	err := cmd.exec(ctx, os.Stdout, os.Stderr)
+	stop()
+	if err != nil && ctx.Err() == nil {
+		toolFatal(err)
+	}
+}
+
+// writer returns the client of tf, signing writes with --sign-key if set.
+func (tf *toolArgs) writer() *client.Client {
+	c := tf.client()
+	if k := tf.signer(); k != nil {
+		c = c.With(client.WithSigner(*k))
+	}
+	return c
+}
+
+// resourceArg splits NS/NAME.
+func resourceArg(s string) (ns, name string, err error) {
+	ns, name, ok := strings.Cut(s, "/")
+	if !ok || ns == "" || name == "" || strings.Contains(name, "/") {
+		return "", "", fmt.Errorf("%q: want NS/NAME", s)
+	}
+	return ns, name, nil
+}
+
+// jsonArg reads a JSON argument: inline, @FILE, or - for stdin.
+func jsonArg(s string) (any, error) {
+	var b []byte
+	var err error
+	switch {
+	case s == "-":
+		b, err = io.ReadAll(os.Stdin)
+	case strings.HasPrefix(s, "@"):
+		b, err = os.ReadFile(s[1:])
+	default:
+		b = []byte(s)
+	}
+	if err != nil {
+		return nil, err
+	}
+	v, err := jsonv.Parse(b)
+	if err != nil {
+		return nil, fmt.Errorf("JSON argument: %w", err)
+	}
+	return v, nil
+}
+
+// wrote reports a write: as JSON with --json, else the id on out and what
+// was done on errw.
+func (tf *toolArgs) wrote(out, errw io.Writer, what, id, nsID string) error {
+	if tf.JSON {
+		return writeJSON(out, map[string]any{"id": id, "nsId": nsID})
+	}
+	fmt.Fprintf(errw, "%s (namespace entry %s)\n", what, nsID)
+	fmt.Fprintln(out, id)
+	return nil
+}
+
+func writeJSON(w io.Writer, v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(w, string(b))
+	return err
+}
+
+// liveHead returns the head revision of ns/name, an error unless it is
+// live.
+func liveHead(ctx context.Context, c *client.Client, ns, name string) (string, error) {
+	h, err := c.Head(ctx, ns, name)
+	if err != nil {
+		return "", err
+	}
+	if h.State != client.Live {
+		return "", fmt.Errorf("%s/%s: %v", ns, name, h.State)
+	}
+	return h.ID, nil
+}
+
+// getCmd is patchlog get NS/NAME.
+type getCmd struct {
+	toolArgs
+	Rev      string `arg:"--rev" placeholder:"ID" help:"read this revision (default: the head)"`
+	Meta     bool   `arg:"--meta" help:"print the revision id, Last-Modified and Repr-Digest on stderr"`
+	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
+}
+
+func (a *getCmd) run(string) { runClient(a) }
+
+func (a *getCmd) exec(ctx context.Context, out, errw io.Writer) error {
+	ns, name, err := resourceArg(a.Resource)
+	if err != nil {
+		return err
+	}
+	c := a.client()
+	id := a.Rev
+	if id == "" {
+		if id, err = liveHead(ctx, c, ns, name); err != nil {
+			return err
+		}
+	}
+	d, err := c.Doc(ctx, ns, name, id)
+	if err != nil {
+		return err
+	}
+	if a.Meta {
+		fmt.Fprintf(errw, "rev %s", d.ID)
+		if !d.Modified.IsZero() {
+			fmt.Fprintf(errw, "  modified %s", d.Modified.UTC().Format("2006-01-02T15:04:05Z"))
+		}
+		if d.Digest != "" {
+			fmt.Fprintf(errw, "  digest %s", d.Digest)
+		}
+		fmt.Fprintln(errw)
+	}
+	return writeJSON(out, d.Value)
+}
+
+// putCmd is patchlog put NS/NAME DOC.
+type putCmd struct {
+	toolArgs
+	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
+	Doc      string `arg:"positional,required" placeholder:"JSON|@FILE|-" help:"the document"`
+}
+
+func (a *putCmd) run(string) { runClient(a) }
+
+func (a *putCmd) exec(ctx context.Context, out, errw io.Writer) error {
+	ns, name, err := resourceArg(a.Resource)
+	if err != nil {
+		return err
+	}
+	doc, err := jsonArg(a.Doc)
+	if err != nil {
+		return err
+	}
+	w, err := a.writer().CreateDoc(ctx, ns, name, doc)
+	if err != nil {
+		return err
+	}
+	return a.wrote(out, errw, "created "+a.Resource, w.ID, w.NSID)
+}
+
+// patchCmd is patchlog patch NS/NAME PATCH.
+type patchCmd struct {
+	toolArgs
+	If       string `arg:"--if" placeholder:"ID" help:"append to this revision only, failing (412 stale) if the head has moved; by default to the head, trying again when another writer gets there first"`
+	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
+	Patch    string `arg:"positional,required" placeholder:"JSON|@FILE|-" help:"a JSON Patch (RFC 6902) array"`
+}
+
+func (a *patchCmd) run(string) { runClient(a) }
+
+func (a *patchCmd) exec(ctx context.Context, out, errw io.Writer) error {
+	ns, name, err := resourceArg(a.Resource)
+	if err != nil {
+		return err
+	}
+	p, err := jsonArg(a.Patch)
+	if err != nil {
+		return err
+	}
+	c := a.writer()
+	var w *client.WriteResult
+	if a.If != "" {
+		w, err = c.Append(ctx, ns, name, a.If, p)
+	} else {
+		w, err = c.AppendLatest(ctx, ns, name, "", client.Backoff{}, func(string) (any, error) { return p, nil })
+	}
+	if err != nil {
+		return err
+	}
+	return a.wrote(out, errw, "appended to "+a.Resource, w.ID, w.NSID)
+}
+
+// rmCmd is patchlog rm NS/NAME.
+type rmCmd struct {
+	toolArgs
+	If       string `arg:"--if" placeholder:"ID" help:"delete only if this is the head, failing (412 stale) otherwise; by default the head"`
+	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
+}
+
+func (a *rmCmd) run(string) { runClient(a) }
+
+func (a *rmCmd) exec(ctx context.Context, out, errw io.Writer) error {
+	ns, name, err := resourceArg(a.Resource)
+	if err != nil {
+		return err
+	}
+	c := a.writer()
+	head := a.If
+	if head == "" {
+		if head, err = liveHead(ctx, c, ns, name); err != nil {
+			return err
+		}
+	}
+	w, err := c.Delete(ctx, ns, name, head)
+	if err != nil {
+		return err
+	}
+	return a.wrote(out, errw, "deleted "+a.Resource, w.ID, w.NSID)
+}
+
+// logCmd is patchlog log NS/NAME.
+type logCmd struct {
+	toolArgs
+	Since    string `arg:"--since" placeholder:"ID" help:"only the entries after this revision"`
+	Resource string `arg:"positional,required" placeholder:"NS/NAME"`
+}
+
+func (a *logCmd) run(string) { runClient(a) }
+
+func (a *logCmd) exec(ctx context.Context, out, errw io.Writer) error {
+	ns, name, err := resourceArg(a.Resource)
+	if err != nil {
+		return err
+	}
+	es, err := a.client().Log(ctx, ns, name, "", a.Since)
+	if err != nil {
+		return err
+	}
+	for _, e := range es {
+		if a.JSON {
+			b, _ := json.Marshal(e.Raw)
+			fmt.Fprintln(out, string(b))
+			continue
+		}
+		line := fmt.Sprintf("%s  %-9s  %-10s  %s", e.ID, e.Kind, e.Author, e.Created)
+		if e.HasPatches {
+			p, _ := json.Marshal(e.Patches)
+			line += "  " + string(p)
+		}
+		fmt.Fprintln(out, line)
+	}
+	return nil
+}
+
+// nsEntryLine is the line patchlog ns log and watch print for e.
+func nsEntryLine(e client.NSEntry) string {
+	return strings.TrimRight(fmt.Sprintf("%s  %-9s  %-16s  %-33s  %s", e.ID, e.Kind, e.Resource, e.Target, e.Author), " ")
+}
+
+// watchCmd is patchlog watch NS.
+type watchCmd struct {
+	toolArgs
+	Since string `arg:"--since" placeholder:"ID" help:"start after this namespace entry (default: from the first)"`
+	NS    string `arg:"positional,required"`
+}
+
+func (a *watchCmd) run(string) { runClient(a) }
+
+func (a *watchCmd) exec(ctx context.Context, out, errw io.Writer) error {
+	return a.client().NSEvents(ctx, a.NS, a.Since, func(e client.NSEntry) error {
+		if a.JSON {
+			b, _ := json.Marshal(e.Raw)
+			_, err := fmt.Fprintln(out, string(b))
+			return err
+		}
+		_, err := fmt.Fprintln(out, nsEntryLine(e))
+		return err
+	})
+}
+
+// nsCmd is patchlog ns.
+type nsCmd struct {
+	Create *nsCreateCmd `arg:"subcommand:create" help:"create a namespace"`
+	Get    *nsGetCmd    `arg:"subcommand:get" help:"print the namespace document in force"`
+	Config *nsConfigCmd `arg:"subcommand:config" help:"patch the namespace document (its config)"`
+	Log    *nsLogCmd    `arg:"subcommand:log" help:"print the namespace log"`
+}
+
+type nsCreateCmd struct {
+	toolArgs
+	NS  string `arg:"positional,required"`
+	Doc string `arg:"positional" default:"{}" placeholder:"JSON|@FILE|-" help:"the namespace document"`
+}
+
+func (a *nsCreateCmd) run(string) { runClient(a) }
+
+func (a *nsCreateCmd) exec(ctx context.Context, out, errw io.Writer) error {
+	doc, err := jsonArg(a.Doc)
+	if err != nil {
+		return err
+	}
+	r, err := a.client().CreateNamespace(ctx, a.NS, doc)
+	if err != nil {
+		return err
+	}
+	return a.wrote(out, errw, "created namespace "+a.NS, r.Config, r.NSID)
+}
+
+type nsGetCmd struct {
+	toolArgs
+	At string `arg:"--at" placeholder:"ID" help:"the document in force at this namespace entry (default: the head)"`
+	NS string `arg:"positional,required"`
+}
+
+func (a *nsGetCmd) run(string) { runClient(a) }
+
+func (a *nsGetCmd) exec(ctx context.Context, out, errw io.Writer) error {
+	c := a.client()
+	at := a.At
+	if at == "" {
+		h, err := c.NSHead(ctx, a.NS)
+		if err != nil {
+			return err
+		}
+		at = h.ID
+	}
+	d, err := c.NSDoc(ctx, a.NS, at)
+	if err != nil {
+		return err
+	}
+	return writeJSON(out, d.Value)
+}
+
+type nsConfigCmd struct {
+	toolArgs
+	If    string `arg:"--if" placeholder:"CONFIG" help:"patch this config revision only, failing (412 stale) if another is in force; by default the one in force"`
+	NS    string `arg:"positional,required"`
+	Patch string `arg:"positional,required" placeholder:"JSON|@FILE|-" help:"a JSON Patch of the namespace document"`
+}
+
+func (a *nsConfigCmd) run(string) { runClient(a) }
+
+func (a *nsConfigCmd) exec(ctx context.Context, out, errw io.Writer) error {
+	p, err := jsonArg(a.Patch)
+	if err != nil {
+		return err
+	}
+	c := a.client()
+	cfg := a.If
+	if cfg == "" {
+		h, err := c.NSHead(ctx, a.NS)
+		if err != nil {
+			return err
+		}
+		cfg = h.Config
+	}
+	r, err := c.PatchConfig(ctx, a.NS, cfg, p)
+	if err != nil {
+		return err
+	}
+	return a.wrote(out, errw, "patched the config of "+a.NS, r.Config, r.NSID)
+}
+
+type nsLogCmd struct {
+	toolArgs
+	Since string `arg:"--since" placeholder:"ID" help:"only the entries after this one"`
+	NS    string `arg:"positional,required"`
+}
+
+func (a *nsLogCmd) run(string) { runClient(a) }
+
+func (a *nsLogCmd) exec(ctx context.Context, out, errw io.Writer) error {
+	c := a.client()
+	h, err := c.NSHead(ctx, a.NS)
+	if err != nil {
+		return err
+	}
+	es, err := c.NSLog(ctx, a.NS, h.ID, a.Since)
+	if err != nil {
+		return err
+	}
+	for _, e := range es {
+		if a.JSON {
+			b, _ := json.Marshal(e.Raw)
+			fmt.Fprintln(out, string(b))
+			continue
+		}
+		fmt.Fprintln(out, nsEntryLine(e))
+	}
+	return nil
+}

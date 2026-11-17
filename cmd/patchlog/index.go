@@ -60,12 +60,12 @@ import (
 // bucket of each principal it names (--exchange-rate RATE,BURST, default
 // 10,100), shared by the instances on one --db.
 type indexCmd struct {
-	API              string        `arg:"--api" default:"http://localhost:8080" placeholder:"URL" help:"base URL of the patch-log API"`
+	API              string        `arg:"--api,env:PATCHLOG_API" default:"http://localhost:8080" placeholder:"URL" help:"base URL of the patch-log API"`
 	DB               string        `arg:"--db" default:"index.db" placeholder:"PATH" help:"SQLite database path of the index"`
 	Addr             string        `arg:"--addr" default:":8081" help:"listen address of the query API"`
 	NS               string        `arg:"--ns,required" placeholder:"NS,NS" help:"comma-separated namespaces to follow"`
-	Bearer           string        `arg:"--bearer" placeholder:"GRANT" help:"grant for reading the namespaces (Authorization: Bearer)"`
-	Author           string        `arg:"--author" placeholder:"NAME" help:"X-Author for a --dev server"`
+	Bearer           string        `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"grant for reading the namespaces (Authorization: Bearer)"`
+	Author           string        `arg:"--author,env:PATCHLOG_AUTHOR" placeholder:"NAME" help:"X-Author for a --dev server"`
 	Branches         bool          `arg:"--branches" help:"also follow branches, building a preview index per branch (§F.8)"`
 	Rebuild          bool          `arg:"--rebuild" help:"drop the index and replay from the beginning (§A.6)"`
 	UntypedListing   bool          `arg:"--untyped-listing" default:"true" help:"list untyped documents in plain listings (never in text/facet/sort queries); --untyped-listing=false to leave them out"`

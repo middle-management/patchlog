@@ -4018,20 +4018,46 @@ The last row is the root: paste its path into a document's `$schema` (or another
 
 ### A short tour (dev mode)
 
-```sh
-B=http://localhost:8080; P='Content-Type: application/json-patch+json'
-A='X-Author: me'   # dev mode: every write names its author (§7.2), else 400
+The client commands call the public API (§7) through `internal/client`. Every write is
+conditional (§7.2), and they supply the precondition: `put` and `ns create` send
+`If-None-Match: *`, `patch` appends to the head it reads (trying again if another writer got
+there first), and `ns config` patches the config revision in force. `--if ID` pins one instead.
+A write prints the new id on stdout and what it did on stderr. `--api`, `--bearer` and
+`--author` default to `$PATCHLOG_API`, `$PATCHLOG_BEARER` and `$PATCHLOG_AUTHOR`, in the tools
+(merge, export, …) and services too.
 
-# Create a namespace (its document is the genesis patch set).
+```sh
+export PATCHLOG_API=http://localhost:8080
+export PATCHLOG_AUTHOR=me   # dev mode: every write names its author (§7.2), else 400
+
+patchlog ns create matches '{"read":"public"}'          # the namespace document
+patchlog put matches/derby '{"score":"0-0"}'            # create a resource
+patchlog patch matches/derby '[{"op":"replace","path":"/score","value":"1-0"}]'
+R=$(patchlog patch matches/derby '[{"op":"replace","path":"/score","value":"2-0"}]')
+patchlog patch matches/derby --if "$R" '[{"op":"replace","path":"/score","value":"2-1"}]'
+patchlog patch matches/derby --if "$R" '[…]'            # 412 stale: the head moved
+
+patchlog get matches/derby --meta                       # the document; its id, Last-Modified and Repr-Digest on stderr
+patchlog get matches/derby --rev "$R"                   # an earlier revision
+patchlog log matches/derby                              # its history, patch sets and authors
+patchlog ns config matches '[{"op":"add","path":"/x-note","value":"football"}]'
+patchlog ns get matches
+patchlog ns log matches                                 # the namespace log
+patchlog watch matches                                  # follow it (server-sent events, §7.4)
+patchlog rm matches/derby                               # a tombstone
+```
+
+JSON arguments are inline, `@file`, or `-` for stdin; `--json` prints entries and write
+results as JSON. The same over HTTP:
+
+```sh
+B=http://localhost:8080; P='Content-Type: application/json-patch+json'; A='X-Author: me'
 curl -X PATCH $B/ns/matches -H "$P" -H "$A" -H 'If-None-Match: *' \
   -d '[{"op":"add","path":"","value":{"read":"public"}}]'
-
-# Create a resource, then append to it with the id from ETag.
 curl -i -X PATCH $B/r/matches/derby -H "$P" -H "$A" -H 'If-None-Match: *' \
   -d '[{"op":"add","path":"","value":{"score":"0-0"}}]'
 curl -i -X PATCH $B/r/matches/derby -H "$P" -H "$A" -H 'If-Match: "1…"' \
-  -d '[{"op":"replace","path":"/score","value":"1-0"}]'
-
+  -d '[{"op":"replace","path":"/score","value":"1-0"}]'   # the id from ETag
 curl -i $B/r/matches/derby                  # 302 to /r/matches/derby/rev/{head}
 curl -L $B/r/matches/derby                  # the document
 curl -sIL $B/r/matches/derby                # its ETag, Last-Modified and Repr-Digest

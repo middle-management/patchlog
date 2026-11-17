@@ -5,7 +5,15 @@
 - **The CLI parses its flags with go-arg.** Help is generated: `patchlog <command> --help`.
   The docs and examples now write flags as `--flag` (`patchlog serve --addr :8080 --db x.db`).
   The single-dash spellings (`-addr :8080`) still parse, so existing scripts and compose files
-  keep working.
+  keep working. A value that starts with a dash is given with `=`: `--suffix=-b`.
+- **Client commands.** `patchlog get`, `put`, `patch`, `rm`, `log` and `watch` read and write
+  resources (`NS/NAME`), and `patchlog ns create|get|config|log` namespaces, through the public
+  API. Each write supplies its precondition (§7.2): `patch` appends to the head, trying again
+  after a lost race, unless `--if ID` pins one. See the README's short tour.
+- **`$PATCHLOG_API`, `$PATCHLOG_BEARER` and `$PATCHLOG_AUTHOR`** are the defaults of `--api`,
+  `--bearer` and `--author` in every command that takes them.
+- **`patchlog --help` groups the commands**: server commands, client commands, branches,
+  releases and bundles, and keys and operations.
 
 ## v0.29.0
 

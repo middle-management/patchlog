@@ -32,7 +32,7 @@ import (
 // trees' folders are listed from the tree service (§H.3, §H.7), as
 // serve's --tree-url names it; without, from the catalogs' node documents.
 type davCmd struct {
-	API              string        `arg:"--api" default:"http://localhost:8080" placeholder:"URL" help:"base URL of the patch-log API"`
+	API              string        `arg:"--api,env:PATCHLOG_API" default:"http://localhost:8080" placeholder:"URL" help:"base URL of the patch-log API"`
 	Addr             string        `arg:"--addr" default:"127.0.0.1:8090" help:"listen address of the WebDAV server"`
 	NS               []string      `arg:"--ns,separate" placeholder:"NS[,NS]" help:"flat namespace to serve, a directory of its files: raw ones by name, JSON documents as {name}.json (repeatable or comma-separated)"`
 	Catalog          []string      `arg:"--catalog,separate" placeholder:"NS[,NS]" help:"catalog namespace to serve as a file tree, one whose namespace document has catalog.files (§H.2; repeatable or comma-separated)"`
@@ -40,9 +40,9 @@ type davCmd struct {
 	InlinePDF        bool          `arg:"--inline-pdf" help:"serve PDFs for display in the browser rather than as attachments (Content-Disposition: attachment); either way without the sandbox (§7.8, §H.6)"`
 	TreeURL          []string      `arg:"--tree-url,separate" placeholder:"[CATALOG=]URL" help:"tree service (§B.5) following the --catalog trees, e.g. http://tree:8082, which their folders are listed from with each user's grant (§H.3, §H.7); CATALOG=URL maps one catalog to its own (repeatable). Without one, folders are listed from the catalogs' node documents"`
 	TreeWait         time.Duration `arg:"--tree-wait" default:"3s" placeholder:"DURATION" help:"how long a user's listing waits for the tree service to reach the user's own writes (?min=) before it reads the node documents"`
-	Bearer           string        `arg:"--bearer" placeholder:"GRANT" help:"local mode: the grant every request is sent with (Authorization: Bearer)"`
+	Bearer           string        `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"local mode: the grant every request is sent with (Authorization: Bearer)"`
 	BearerFile       string        `arg:"--bearer-file" placeholder:"FILE" help:"local mode: file holding --bearer"`
-	Author           string        `arg:"--author" placeholder:"NAME" help:"X-Author for a --dev server (local mode)"`
+	Author           string        `arg:"--author,env:PATCHLOG_AUTHOR" placeholder:"NAME" help:"X-Author for a --dev server (local mode)"`
 	PasswordFile     string        `arg:"--password-file" placeholder:"FILE" help:"local mode: file holding the Basic password WebDAV clients log in with (any user name); default a random one, logged at start"`
 	Gateway          bool          `arg:"--gateway" help:"gateway mode: each request's Basic password is the grant sent upstream, the user name ignored; over a core with authentication disabled, the Basic user name is the X-Author, and the user (§H.7)"`
 	Insecure         bool          `arg:"--insecure" help:"gateway mode: allow plain HTTP on an address other than loopback, so grants cross the network in the clear"`
@@ -73,7 +73,7 @@ func (a *davCmd) run(string) {
 	copts := []client.Option{client.WithIdleConns(a.FetchConcurrency)}
 	if a.Gateway {
 		if a.Bearer != "" || a.BearerFile != "" || a.PasswordFile != "" || a.Author != "" {
-			log.Fatal("dav: --gateway takes each request's grant; --bearer, --bearer-file, --password-file and --author are for local mode")
+			log.Fatal("dav: --gateway takes each request's grant; --bearer, --bearer-file, --password-file and --author are for local mode (unset $PATCHLOG_BEARER and $PATCHLOG_AUTHOR too)")
 		}
 		if !tls && !loopback(a.Addr) && !a.Insecure {
 			log.Fatalf("dav: --gateway on %s, not a loopback address, needs --tls-cert and --tls-key (grants must not cross plain HTTP), or --insecure", a.Addr)
