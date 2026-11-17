@@ -624,8 +624,9 @@ v0.82" (v0.81 Open 24).
     the repeat, a stream's grants never all expire while requests repeat, and §J.4 purges
     "once its read grants have expired". The reference counts `exp` from the stream's
     creation (the genesis entry's `created`, which a `412` doesn't give, so it reads the log's
-    first entry), answers `410` once that has passed, and purges then. *Question:* is `exp`
-    from creation what §J means?
+    first entry), answers `410` once that has passed, and purges then. Where that entry has
+    been pruned (§8.6) and the create was `412`, the creation time is gone, and the reference
+    hands out no further grant (`409`). *Question:* is `exp` from creation what §J means?
 98. **Closed by another proxy** (TOOLS §J.2 Restarts). "A stream with no append for a set time
     is closed by any proxy", but a proxy can't tell an orphan from a stream another proxy is
     carrying whose upstream is silent (a model thinking), and §J doesn't say what the carrying
