@@ -3941,8 +3941,12 @@ patchlog import -i all.jsonl --atomic --ns demo-schemas=demo2-schemas,demo=demo2
   grant line's `key` with a member §G.4.1 doesn't define rejects the bundle too, and since
   v0.82 so does a grant line whose `grant` isn't the id of its `root` or whose `stored` block
   isn't `canonical(root)`, one that doesn't decode included: whole, at import step 1, before
-  anything is written. The writer refuses such a line, and an export leaves a grant whose
-  record disagrees off the lines that would name it, with a note.
+  anything is written. Since v0.85 so does a grant line whose `key` has a `kid` other than
+  its root's, or whose `key` doesn't verify the `stored` block (its signature alone, whatever
+  the grant's `ns`, times or scope): such a bundle used to import with those signatures
+  reported as failed. The writer refuses such a line, an export leaves a grant whose
+  record disagrees off the lines that would name it, with a note, and writes a `key` only
+  where it verifies the root block.
 - **Authors** (`--authors`, `"authors": true`) adds each history line's author, creation time,
   signature, and its `gesture` and `undoes` (§G.4.1). Imports write the gestures with the
   revisions (batch step objects, §7.5), so undo history survives the move; authors and times

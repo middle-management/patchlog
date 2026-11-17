@@ -10,6 +10,13 @@ Implements spec **v0.85** (previously **v0.84**).
   block, an empty list included, is `403`. A grant its operator key's scope doesn't allow
   (`can`, `sub`, `maxTtl`, …) is now `403`, as on every other request, where it was `401`; an
   expired or badly signed one stays `401`.
+- **Bundles: a grant line's `key` must be its root's** (§G.4.1, v0.85; Import scenario 47).
+  A reader rejects the bundle whole, at step 1 of an import and before anything is written,
+  where a grant line's `key` has a `kid` other than `root.kid` or doesn't verify the `stored`
+  block (the block's signature alone). Such a bundle used to be read, with the signatures
+  under that grant reported as failed. The writer refuses such a line; `patchlog export`
+  already wrote only keys that verify. The two candidates of VECTORS-PROPOSED.md C.5
+  reproduce byte for byte and are rejected (`internal/vectors`, `TestV085C5GrantLineKey`).
 
 ## v0.30.0
 
