@@ -141,11 +141,14 @@ type Options struct {
 	// changed the verdict (validateStep); both give the same answer, and
 	// this is there to rule the shortcut out when looking for a fault.
 	FullValidation bool
-	// MaxValidationSteps bounds the work of validating one document
-	// against its schema (§6.2 step 5): a step is one schema applied to
-	// one value, and a document that takes more is refused with the limit
-	// validationSteps (§6.6 has none for this). Zero means
-	// DefaultMaxValidationSteps; negative, no limit.
+	// MaxValidationSteps is the deployment's validationSteps (§6.6
+	// Validation work, §12.2): it bounds the work of validating a write's
+	// resulting document against its schema (§6.2 step 5) and of the
+	// schema tests of the rules evaluated for that write, together. A step
+	// is one schema or subschema applied to one value, and a write that
+	// takes more is refused 422 with the limit validationSteps. Zero means
+	// DefaultMaxValidationSteps; negative, no limit, which §6.6 doesn't
+	// provide for: the limit is then left out of what /principal reports.
 	MaxValidationSteps int
 	// GroupCommitWait is at most how long a group waits for writes of its
 	// namespace still in their check phase (zero means 200µs; negative,
@@ -732,6 +735,10 @@ type tx struct {
 	// schemas are the schema paths resolved in this transaction, per
 	// writer (loadSchema).
 	schemas map[schemaKey]schemaLoaded
+	// meter, when set, is the validation meter of the write being
+	// checked, which its rules' schema tests draw on (writeMeter); nil
+	// for reads, which nothing bounds.
+	meter *writeMeter
 	// rateDrawn, when set, records that a write drew its rate-limit tokens,
 	// so a transaction run again doesn't draw them twice.
 	rateDrawn *bool

@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.85** (previously **v0.84**).
+
+- **`validationSteps` is §6.6's, and covers a write's rules** (§6.6 Validation work, §6.2
+  step 5, §12.2; CONFORMANCE LIM-7, scenario 82; v0.82 Open 92). The limit the reference
+  added in v0.30.0 for validating one document is now the spec's, with the same unit and
+  default (5,000,000 steps, one schema or subschema applied to one value), and wider:
+  - **One budget for a write's validation and its rules' `schema` tests together.** The rule
+    tests were not counted before. Grant, key-scope and role rules (step 1 and step 6) and
+    namespace rules draw on the same meter as step 5. Each step of each batch item has the
+    limit to itself (§7.5 checks every step with its own envelope); a config, branch or prune
+    write, a purge, a registration and a blob upload have one meter each for their rules, a
+    batch's `config` change its own, and a remote branch's creation one for its step 1 and one
+    for its step 6, which run in separate transactions. Every candidate verb tried at step 1
+    counts.
+  - **Running out is `422` `limit` at any stage**, also inside a grant rule whose own failure
+    is `403`, and at step 1, where it comes before the rate limits and draws no token. A write
+    that passed, or was `403` or `422 rule`, with rule `schema` tests that take more than the
+    limit is now refused this way.
+  - **`measured` is left out for a writer who can't read the resource**, as for the other
+    limits on the resulting document; `max` stays.
+  - **Listing an invalid document's failures takes what is left of the limit**, where it had
+    the limit anew: an invalid document near the limit may get a `422 invalid` that names its
+    first failure alone.
+  - **`validationSteps` is a deployment-only limit by name**: a namespace document that sets
+    `limits.validationSteps` is `422 invalid` as for the other deployment-only limits (it was
+    `422 invalid` as an unknown limit), and `GET /ns/{ns}/principal` lists it in
+    `writer.limits`. `serve --max-validation-steps 0` still lifts the limit, as an operator's
+    explicit choice the spec doesn't provide for; `/principal` then leaves it out.
+  - Reads are not bounded: the spec bounds writes, and rule `schema` tests evaluated for a
+    read, an exchange or a key request are not counted.
+  - `internal/rules`: `Meter`, `Rule.EvalMetered` and `EvalMetered`; `schema.Failures` takes
+    the steps it may spend.
+- **Refused writes keep their rate tokens: tests only** (§6.2 step 1, §6.6 Cost; CONFORMANCE
+  GATE-2, LIM-3, scenario 81; v0.82 Open 90). v0.85 says what the server did already: rate
+  limits come last in step 1, so a `412`, a tombstoned resource's `410`, a `428`, a frozen
+  namespace's `409`, a settled verb's `403` and an idempotent retry's `200` each spend a
+  token, and a step-1 `403` spends none. New tests pin each.
+- **Deployment maxima of `ratePerResource` and `ratePerPrincipal`** (`serve
+  --max-rate-per-resource`, `--max-rate-per-principal`) are what §6.6 intends, and an
+  allowance's writes stay held to the namespace's `ratePerResource` (v0.82 Open 89): no change.
+
 ## v0.30.0
 
 Implements spec **v0.84** (previously **v0.82**). v0.83 adds TOOLS.md's Addendum J, suggested

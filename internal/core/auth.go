@@ -432,7 +432,9 @@ func (t *tx) authorize(a *actor, verb, resource string) *Error {
 		return forbidden(fmt.Sprintf("the grant does not allow %s", verb))
 	}
 	env := t.basicEnvelope(verb, resource, a)
-	return t.grantRules(a, verb, roles, env, true)
+	// Only writes are authorised here, and a write's rules draw on its
+	// meter from step 1 on (§6.6 Validation work).
+	return t.grantRulesMode(a, verb, roles, env, true, nil, t.meter)
 }
 
 var ruleCache sync.Map // canonical rule -> *rules.Rule
@@ -705,7 +707,7 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 		return false
 	}
 	env := t.basicEnvelope("read", "", a)
-	return t.scopeRules(a, env, stepOne, nil) == nil && t.roleRules(a, "read", roles, env, false, nil) == nil
+	return t.scopeRules(a, env, stepOne, nil, nil) == nil && t.roleRules(a, "read", roles, env, false, nil, nil) == nil
 }
 
 // unrestrictedRoles reports whether a grant's rules leave every resource

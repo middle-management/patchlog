@@ -812,6 +812,10 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 	}
 	// 1. Authorisation, with create, append and restore as candidate verbs,
 	// then the rate limits.
+	// An upload is a write too: the schema tests of its step-1 rules draw
+	// on one validation meter, every verb tried counting (§6.6 Validation
+	// work, writeMeter).
+	defer t.metered(func() bool { return t.canRead(n, cfg, a, name) })()
 	var first *Error
 	allowed := false
 	for _, verb := range []string{"create", "append", "restore"} {
@@ -820,8 +824,11 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 			allowed = true
 			break
 		}
-		if first == nil {
+		if first == nil || t.meter.Over {
 			first = e
+		}
+		if t.meter.Over {
+			break
 		}
 	}
 	if !allowed {

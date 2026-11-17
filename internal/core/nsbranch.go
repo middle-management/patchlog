@@ -42,6 +42,8 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	if aerr != nil {
 		return nil, aerr
 	}
+	// The write's rules draw on one validation meter (§6.6, writeMeter).
+	defer t.metered(func() bool { return true })()
 	if err := t.authorize(a, "config", ""); err != nil {
 		return nil, err
 	}
@@ -130,6 +132,8 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if !ValidNSName(br.Name) {
 		return nil, badInput("invalid branch name")
 	}
+	// The write's rules draw on one validation meter (§6.6, writeMeter).
+	defer t.metered(func() bool { return t.readsNS(base, bcfg, a, true) })()
 	if err := t.authorize(a, "branch", br.Name); err != nil {
 		return nil, err
 	}

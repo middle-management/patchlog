@@ -75,6 +75,9 @@ func TestLimitsDoc(t *testing.T) {
 	l.RetryWindowMin = time.Minute
 	doc := jsonv.FromGo(l.Doc()).(map[string]any)
 	for k := range deploymentOnlyLimits {
+		if k == "validationSteps" {
+			continue // the engine's option, not a field: limitsInForce adds it
+		}
 		if _, ok := doc[k]; !ok {
 			t.Fatalf("no %s in %v", k, doc)
 		}

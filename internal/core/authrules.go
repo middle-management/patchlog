@@ -13,8 +13,66 @@ var stepOneRefs = []string{"action", "resource", "principal", "now"}
 // grantRules evaluates key-scope, block and role rules. With stepOne, only
 // rules that refer solely to action, resource, principal and now are
 // evaluated.
+//
+// It bounds nothing: reads come here, and §6.6 bounds the schema tests of
+// a write's rules only (grantRulesMode with the write's meter).
 func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool) *Error {
-	return t.grantRulesMode(a, verb, roles, env, stepOne, nil)
+	return t.grantRulesMode(a, verb, roles, env, stepOne, nil, nil)
+}
+
+// writeMeter counts the validation steps of one write against the
+// deployment's validationSteps (§6.6 Validation work, §12.2): the steps of
+// validating its resulting document (step 5, validateDoc) and of the
+// schema tests of the rules evaluated for it, at step 1 and at step 6,
+// together. A batch has one for each step of each item, as each is
+// checked with its own envelope and document (§7.5); a config, branch or
+// prune write, a purge, a registration and an upload have one each.
+//
+// readable reports whether the writer may read what the write results in:
+// the refusal leaves measured out for one who can't (§6.6), and where it
+// is nil.
+type writeMeter struct {
+	rules.Meter
+	readable func() bool
+}
+
+// newMeter is a meter for one write, at the deployment's limit.
+func (t *tx) newMeter(readable func() bool) *writeMeter {
+	return &writeMeter{Meter: rules.Meter{Max: max(t.e.opt.MaxValidationSteps, 0)}, readable: readable}
+}
+
+// metered gives the write this transaction checks its meter, which the
+// write's step-1 and step-6 rules draw on (authorize, checkGrantRules,
+// checkRules), until the function it returns is called. A write that has
+// one already keeps it.
+func (t *tx) metered(readable func() bool) func() {
+	if t.meter != nil {
+		return func() {}
+	}
+	t.meter = t.newMeter(readable)
+	return func() { t.meter = nil }
+}
+
+// rule is m as the rules package takes it, nil for no meter.
+func (m *writeMeter) rule() *rules.Meter {
+	if m == nil {
+		return nil
+	}
+	return &m.Meter
+}
+
+// over is the refusal of a write whose steps ran out, nil if they haven't:
+// 422 limit validationSteps at whatever stage, also where the rule that
+// was being evaluated would have refused with 403 (§6.6).
+func (m *writeMeter) over() *Error {
+	if m == nil || !m.Over {
+		return nil
+	}
+	err := limitErr(422, "validationSteps", int64(m.Steps), int64(m.Max), "validating the document against its schema and its rules' schema tests take too many steps together")
+	if m.readable == nil || !m.readable() {
+		delete(err.Body, "measured")
+	}
+	return err
 }
 
 // grantRulesMode is grantRules with the envelope members unknown names
@@ -23,19 +81,23 @@ func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]an
 // block rule refusing the request and a role with one not allowing it;
 // one that passes, or fails, whatever they hold is decided as usual
 // (§6.2, rules.EvalTri).
-func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[string]any, stepOne bool, unknown []string) *Error {
+//
+// The rules' schema tests draw on m, a write's meter, nil for a read: once
+// its steps run out the answer is its 422, whatever the rule would have
+// said (writeMeter.over).
+func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[string]any, stepOne bool, unknown []string, m *writeMeter) *Error {
 	if a.verified == nil {
 		return nil
 	}
-	if err := t.scopeRules(a, env, stepOne, unknown); err != nil {
+	if err := t.scopeRules(a, env, stepOne, unknown, m); err != nil {
 		return err
 	}
-	return t.roleRules(a, verb, roles, env, stepOne, unknown)
+	return t.roleRules(a, verb, roles, env, stepOne, unknown, m)
 }
 
 // scopeRules evaluates the key-scope and block rules of a's verified
 // grant, as grantRulesMode does.
-func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []string) *Error {
+func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []string, m *writeMeter) *Error {
 	for _, src := range [][]any{a.verified.KeyRules, a.verified.BlockRules} {
 		for _, rv := range src {
 			r, err := compileCached(rv)
@@ -50,7 +112,11 @@ func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []st
 			if stepOne && !r.OnlyRefs(stepOneRefs...) {
 				continue
 			}
-			switch r.EvalTri(env, unknown...) {
+			v := r.EvalMetered(env, m.rule(), unknown...)
+			if err := m.over(); err != nil {
+				return err
+			}
+			switch v {
 			case rules.Unknown:
 				return forbidden("the outcome of a grant or key rule depends on writes or /doc, which the server can't see for this write in an e2e namespace (§6.2, §E.3.2)")
 			case rules.False:
@@ -117,7 +183,7 @@ func readRoles(a *actor) (roles []string, ok bool) {
 // roles, as grantRulesMode does: roles are alternatives (§C.1.1), so the
 // rules evaluated must pass for one of roles, or with roles nil for one of
 // the effective roles that list verb.
-func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool, unknown []string) *Error {
+func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool, unknown []string, m *writeMeter) *Error {
 	if a.verified.HasRoles() {
 		if roles == nil {
 			_, roles = a.verified.Allows(verb)
@@ -136,7 +202,13 @@ func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any
 				if stepOne && !r.OnlyRefs(stepOneRefs...) {
 					continue
 				}
-				if r.EvalTri(env, unknown...) != rules.True {
+				v := r.EvalMetered(env, m.rule(), unknown...)
+				if err := m.over(); err != nil {
+					// Not a role that doesn't pass: the write's steps ran
+					// out, which no other role makes up for.
+					return err
+				}
+				if v != rules.True {
 					ok = false
 					break
 				}
@@ -162,12 +234,13 @@ func (t *tx) checkRules(cfg *Config, a *actor, env map[string]any, isConfig bool
 	if err := t.checkGrantRules(a, env, nil); err != nil {
 		return err
 	}
-	return checkNSRules(cfg, a, env, isConfig, nil)
+	return checkNSRules(cfg, a, env, isConfig, nil, t.meter)
 }
 
 // checkGrantRules is step 6's grant, key and role rules, all of them,
 // against the full envelope with the write's verb (§C.2 item 4): 403. The
-// envelope members unknown names are hidden (grantRulesMode).
+// envelope members unknown names are hidden (grantRulesMode). Their schema
+// tests draw on the write's meter (t.meter).
 func (t *tx) checkGrantRules(a *actor, env map[string]any, unknown []string) *Error {
 	verb := env["action"].(string)
 	if a.verified != nil {
@@ -175,7 +248,7 @@ func (t *tx) checkGrantRules(a *actor, env map[string]any, unknown []string) *Er
 			return forbidden(fmt.Sprintf("the grant does not allow %s", verb))
 		}
 	}
-	return t.grantRulesMode(a, verb, nil, env, false, unknown)
+	return t.grantRulesMode(a, verb, nil, env, false, unknown, t.meter)
 }
 
 // checkCreationRules is step 6 of a namespace's creation under the
@@ -189,6 +262,9 @@ func (t *tx) checkCreationRules(a *actor, patches any) *Error {
 	if a.verified == nil {
 		return nil
 	}
+	// A remote branch's creation comes here in a later transaction than
+	// its step 1, with a meter of its own.
+	defer t.metered(func() bool { return true })()
 	ops, err := patch.Parse(patches)
 	if err != nil {
 		return patchErr(err)
@@ -211,12 +287,17 @@ func (t *tx) checkCreationRules(a *actor, patches any) *Error {
 // own path /rules/{i} (§6.2). A config write under a * key, so any while
 // authentication is disabled, isn't judged by them (§1, §6.4.3); nor is a
 // namespace's creation under the operator grant, whose step 6 runs only
-// its grant and key rules (checkCreationRules).
-func checkNSRules(cfg *Config, a *actor, env map[string]any, isConfig bool, unknown []string) *Error {
+// its grant and key rules (checkCreationRules). Their schema tests draw on
+// m, the write's meter (writeMeter).
+func checkNSRules(cfg *Config, a *actor, env map[string]any, isConfig bool, unknown []string, m *writeMeter) *Error {
 	if isConfig && a.star {
 		return nil
 	}
-	switch i, path, v := rules.EvalTri(cfg.Rules, env, unknown...); v {
+	i, path, v := rules.EvalMetered(cfg.Rules, env, m.rule(), unknown...)
+	if err := m.over(); err != nil {
+		return err
+	}
+	switch v {
 	case rules.False:
 		return apiErr(422, "rule", "rule", i, "path", path)
 	case rules.Unknown:

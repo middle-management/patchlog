@@ -93,6 +93,8 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 	if !t.readsNS(n, cfg, a, true) {
 		return nil, forbidden("registering a remote branch needs unrestricted read (§2.1)")
 	}
+	// The write's rules draw on one validation meter (§6.6, writeMeter).
+	defer t.metered(func() bool { return true })()
 	if err := t.authorize(a, "export", ""); err != nil {
 		return nil, err
 	}

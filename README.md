@@ -1054,8 +1054,9 @@ What is instrumented:
 - **Schema validation**: `core.schema.validate`, one per typed document a write validates,
   with `patchlog.schema` (its `$schema`), `patchlog.document.size` (canonical bytes),
   `patchlog.document.nodes` (values in the document, containers included),
-  `patchlog.schema.valid`, `patchlog.schema.steps` (schemas applied to values, what the
-  `validationSteps` limit counts) and `patchlog.schema.mode` (`full`, or `change` for a patch
+  `patchlog.schema.valid`, `patchlog.schema.steps` (schemas applied to values in this
+  validation; the `validationSteps` limit counts them with the steps of the write's rule
+  `schema` tests) and `patchlog.schema.mode` (`full`, or `change` for a patch
   validated where it changed the document). Validation runs in the write's check phase, inside its read
   transaction and outside the write lock, so without this span its time read as a slow
   `core.db.read`. Loading the schemas is not part of it.
@@ -4882,7 +4883,8 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   and `ratePerPrincipal` up to the deployment maximums, which are the defaults (10/s burst 20,
   and 50/s burst 100) unless `serve --max-rate-per-resource RATE,BURST` and
   `--max-rate-per-principal RATE,BURST` raise them; the defaults themselves don't change. No
-  allowance lifts the per-resource rate (§6.6), so a document one writer writes more than ten
+  allowance lifts the per-resource rate: per-resource buckets still apply under one, at the
+  namespace's `ratePerResource` (§6.6), so a document one writer writes more than ten
   times a second needs either batch steps (one item of many steps draws one token) or a
   namespace with a raised `ratePerResource`. Several writers on one document mostly collide
   whatever the rate ([docs/CAPACITY.md](docs/CAPACITY.md), "Writes to one document"); the Go
@@ -4922,11 +4924,26 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   objects must be well-formed and name available blobs that match their type, size and nonce
   (`422`, `code: "blob"`). Allowances may also set `blobRate` and `blobPending`; the deployment
   maximums are set with `serve --max-blob-size` and `--max-blob-pending`.
-- **Validating a document may take 5,000,000 steps** (`validationSteps`), a step being one
-  schema applied to one value: a 1 MiB document of 9,500 small typed objects takes 85,503. A
-  write that needs more is refused `422` with `code: "limit"`, `limit: "validationSteps"`,
-  `measured` and `max`. §6.6 has no such limit; `serve --max-validation-steps` changes it and
-  `0` lifts it. Rule `test`s with a `schema` and annotation walks are not counted.
+- **A write's validation may take 5,000,000 steps** (`validationSteps`, §6.6 Validation work,
+  §12.2), a step being one schema or subschema applied to one value: a 1 MiB document of 9,500
+  small typed objects takes 85,503. The limit covers validating the resulting document against
+  its `$schema` (step 5) and the `schema` tests of the rules evaluated for the write, together:
+  grant, key-scope and role rules at step 1 and step 6, and namespace rules. Each step of each
+  batch item has the limit to itself, as each is checked with its own envelope and document
+  (§7.5); a config, branch or prune write, a purge, a registration and a blob upload have one
+  each for their rules, and a batch's `config` change its own. A write that needs more is
+  refused `422` with `code: "limit"`, `limit: "validationSteps"`, `max`, and `measured`, the
+  steps taken where it stopped, which is left out for a writer who can't read the resource.
+  It is `422` at whatever stage the steps run out, also inside a grant rule whose own failure
+  would be `403`, and at step 1 it comes before the rate limits and draws no token. Listing an
+  invalid document's failures takes what finding the first left of the limit; if that runs
+  out, the `422 invalid` names the first failure alone. The limit is the deployment's
+  (`serve --max-validation-steps`): a namespace document that sets `limits.validationSteps` is
+  `422 invalid`, and `GET /ns/{ns}/principal` lists it among `writer.limits`.
+  `--max-validation-steps 0` lifts it, which the spec doesn't provide for (it requires a
+  bound); `/principal` then leaves the limit out. Reads aren't bounded: the spec bounds writes,
+  and a rule's `schema` test evaluated for a read, an exchange or a key request is not
+  counted. Annotation walks are not counted either.
 - **A patch to a typed document is validated where it changes it**, when this instance has
   validated the document it applies to against the same schema revision: the changed values,
   and each schema's own keywords on the way to them. The verdict and the `422` are those of

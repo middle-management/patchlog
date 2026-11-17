@@ -100,8 +100,9 @@ func DefaultLimits() Limits {
 	}
 }
 
-// DefaultMaxValidationSteps is how many steps validating one document
-// against its schema may take by default (Options.MaxValidationSteps). A
+// DefaultMaxValidationSteps is §12.2's default of validationSteps: how
+// many steps a write's validation against its schema and its rules' schema
+// tests may take together (Options.MaxValidationSteps, §6.6). A
 // 1 MiB document of some 9,500 small typed objects takes 85,503, a
 // recursive union over 1,023 nodes 14,833 (docs/CAPACITY.md).
 const DefaultMaxValidationSteps = 5_000_000
@@ -143,7 +144,7 @@ var limitFields = map[string]func(*Limits) *int{
 // v0.63: a document stored with one still loads, its value ignored, until
 // a write changes it (parseLimits).
 var deploymentOnlyLimits = map[string]bool{"logPageSize": true, "logPageBytes": true, "branchDepth": true, "exchangeRate": true,
-	"grantSize": true, "rulesPerGrant": true}
+	"grantSize": true, "rulesPerGrant": true, "validationSteps": true}
 
 var rateFields = map[string]func(*Limits) *Rate{
 	"ratePerResource":  func(l *Limits) *Rate { return &l.RatePerResource },
@@ -1408,7 +1409,8 @@ func FormatDuration(d time.Duration) string {
 // Doc is l in the form of a namespace document's "limits" (§6.6): every
 // key of §6.6's table, sizes and counts as integers, durations as ISO 8601
 // durations and rates as { "rate", "burst" }. RetryWindowMin, the
-// deployment's floor, isn't one of them.
+// deployment's floor, isn't one of them, and validationSteps, which is
+// the engine's option and not a field of l, is added by limitsInForce.
 func (l Limits) Doc() map[string]any {
 	out := map[string]any{}
 	for k, f := range limitFields {
