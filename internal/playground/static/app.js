@@ -2978,7 +2978,15 @@ async function openSealedEntries(v, view, from, filed, ctx) {
   if (node && (ctx.perEntry || typeof v.sealed === 'string')) {
     // What §E.2.6 leaves in the clear, and what stands sealed in place (a born of another epoch, a file's
     // metadata), which opens or fails as itself. An item's file in the clear is of a namespace that isn't sealed.
-    for (const k of Object.keys(v)) if (!NODE_CLEAR.includes(k) && !lone(v[k])) delete v[k];
+    // An entry is filed, or has a name and an href. Anything else with a name is a value the answer carries
+    // whole, in the clear or just opened, such as an item's file metadata ({ name, size, type }): of it only
+    // what could pass for an entry's title and born goes, as before v0.85.
+    if (isFiled || typeof v.href === 'string') {
+      for (const k of Object.keys(v)) if (!NODE_CLEAR.includes(k) && !lone(v[k])) delete v[k];
+    } else {
+      delete v.title;
+      if (!lone(v.born)) delete v.born;
+    }
   } else if (!node && named && (ctx.sealed || typeof v.sealed === 'string')) {
     for (const k of Object.keys(v)) if (!['resource', 'id', 'url', 'ns', 'sealed'].includes(k)) delete v[k];
   }

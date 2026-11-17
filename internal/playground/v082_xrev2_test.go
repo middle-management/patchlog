@@ -383,7 +383,8 @@ func TestV085ClearNodeMembersAreAnAllowlist(t *testing.T) {
 	children := `{"children": [
 	  {"name":"matches.derby","href":"/r/cat/matches.derby","kind":"item","item":"/r/pub/derby","head":"1h","url":"https://cms.example/r/pub/derby/rev/1h",
 	   "self":true,"order":3,"title":"CLEAR","born":"1clear","summary":"CLEAR","tags":["CLEAR"],"access":{"reader":["CLEAR"]},
-	   "file":{"size":3,"type":"text/plain"},"extra":{"sealed":"` + s.val("cat", "matches.derby", `{"extra":2}`) + `"},
+	   "file":{"name":"derby.md","size":3,"type":"text/plain","modified":"2026-10-04T12:00:00Z"},"extra":{"sealed":"` + s.val("cat", "matches.derby", `{"extra":2}`) + `"},
+	   "meta":{"sealed":"` + s.val("cat", "matches.derby", `{"meta":{"name":"derby.md","size":3,"type":"text/plain"}}`) + `"},
 	   "children":[{"name":"docs","href":"/r/cat/docs","kind":"folder","summary":"CLEAR nested"}],
 	   "sealed":"` + s.val("cat", "matches.derby", `{"title":"T"}`) + `"}
 	 ]}`
@@ -407,6 +408,14 @@ func TestV085ClearNodeMembersAreAnAllowlist(t *testing.T) {
 		if _, has := c[k]; !has {
 			t.Errorf("%s, which §E.2.6 leaves in the clear, was dropped", k)
 		}
+	}
+	// File metadata has a name too, and is no entry: in the clear or just
+	// opened, it keeps its members.
+	if f, _ := c["file"].(map[string]any); f["name"] != "derby.md" || f["size"] != 3.0 || f["type"] != "text/plain" || f["modified"] == nil {
+		t.Errorf("an item's file in the clear lost members: %v", c["file"])
+	}
+	if m, _ := c["meta"].(map[string]any); m["meta"] == nil || m["meta"].(map[string]any)["size"] != 3.0 || m["meta"].(map[string]any)["type"] != "text/plain" {
+		t.Errorf("a value sealed in place, opened, lost members: %v", c["meta"])
 	}
 	if x, _ := c["extra"].(map[string]any); x["extra"] != 2.0 {
 		t.Errorf("a value sealed in place isn't opened: %v", c["extra"])
