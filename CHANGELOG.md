@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.30.0
 
 Implements spec **v0.84** (previously **v0.82**). v0.83 adds TOOLS.md's Addendum J, suggested
 and non-normative: a proxy that keeps an upstream's streamed response as a resource, shared
