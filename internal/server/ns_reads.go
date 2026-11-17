@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/middle-management/patchlog/internal/core"
@@ -45,6 +46,33 @@ func (s *Server) nsGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, g)
+}
+
+// nsList is GET /ns?after&prefix (§7.4, v0.84): a page of the deployment's
+// namespaces, for operator grants only (§C.4), or for everyone while
+// authentication is disabled. Its prefix is a namespace name (400
+// otherwise, a request-shape error, before the grant is looked at); after
+// is a plain bound, whatever it holds. Every answer is no-store, errors
+// included: the origin answers it with the grant, which no edge cookie
+// covers (§C.5).
+func (s *Server) nsList(w http.ResponseWriter, r *http.Request) {
+	noStore(w)
+	q := r.URL.Query()
+	prefix := q.Get("prefix")
+	if q.Has("prefix") && !core.ValidNSName(prefix) {
+		writeErr(w, badInput(fmt.Sprintf("prefix %q is not a namespace name (§3.6, §7.4)", prefix)))
+		return
+	}
+	page, err := s.e.Namespaces(r.Context(), q.Get("after"), prefix, creds(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	out := map[string]any{"namespaces": page.Items}
+	if page.Next != "" {
+		out["next"] = page.Next
+	}
+	writeJSON(w, 200, out)
 }
 
 func (s *Server) nsHead(w http.ResponseWriter, r *http.Request) {

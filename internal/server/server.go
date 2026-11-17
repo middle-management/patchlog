@@ -78,6 +78,7 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("GET /r/{ns}/{name}/blob/{bid}", s.blobGet)
 	m.HandleFunc("GET /r/{ns}/{name}/blob/{bid}/e/{e}", s.blobEpochGet)
 
+	m.HandleFunc("GET /ns", s.nsList)
 	m.HandleFunc("GET /ns/{ns}", s.nsHead)
 	m.HandleFunc("PATCH /ns/{ns}", s.nsPatch)
 	m.HandleFunc("GET /ns/{ns}/rev/{id}", s.nsRev)
@@ -150,6 +151,7 @@ var queryParams = map[string]map[string]string{
 	"GET /r/{ns}/{name}/log":            {"since": "", "live": "", "cursor": ""}, // §7.7 (longPoll checks live)
 	"GET /r/{ns}/{name}/events":         {"since": ""},                           // §7.3
 	"POST /r/{ns}/{name}/purge":         {"force": flag},                         // §6.1, §8.3
+	"GET /ns":                           {"after": "", "prefix": ""},             // §7.4 (nsList checks prefix)
 	"GET /ns/{ns}/rev/{id}/log":         {"since": ""},                           // §7.4
 	"GET /ns/{ns}/rev/{id}/heads":       {"after": "", "prefix": ""},             // §7.4 (headsPrefix checks prefix)
 	"GET /ns/{ns}/log":                  {"since": "", "live": "", "cursor": ""}, // §7.7
