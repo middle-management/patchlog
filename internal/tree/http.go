@@ -1281,6 +1281,8 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		s.rekeyAs(v, l.prof)
 		setPtr()
 		redirect(w, moved(l.at))
+	case l.nameOnly:
+		s.writeListingNoStore(w, l.st)
 	default:
 		s.writeListing(w, r, v, at, l.st)
 	}
@@ -1321,6 +1323,11 @@ type computed struct {
 	msg    string
 	// noStore: the refusal holds only until the reader exchanges again.
 	noStore bool
+	// nameOnly: the listing left values out because the epoch of the
+	// revision they derive from isn't judged yet (§E.2.6 Per-entry
+	// sealing, v0.85): it is served no-store, and neither stored nor
+	// kept.
+	nameOnly bool
 	// prof is the RoleView's profile at at (Profiler), the one recorded
 	// with it (recordAt), nil without one.
 	prof Profile
@@ -1478,6 +1485,9 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		prof     Profile
 		more     []keptPage
 		judged   map[string]*judgement
+		// unjudged is whether the listing, as last computed, left
+		// values out for an epoch that isn't judged.
+		unjudged bool
 	)
 	for {
 		// Sealed whole only where every reader the URL admits reads the
@@ -1666,9 +1676,11 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 				run()
 			}
 		})
-		if nameOnly || fs.pending {
+		unjudged = nameOnly || fs.pending
+		if unjudged {
 			// The fill that judges them drops the listings that left
-			// them out (backfillEpochs).
+			// them out (backfillEpochs): none is stored or kept since
+			// v0.85, but a sealed store from before may hold some.
 			s.nameOnly.Store(true)
 		}
 		if reread || fs.reread {
@@ -1731,9 +1743,17 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	if l.st, serr = stored(view, body, tags); serr != nil {
 		return nil, serr
 	}
-	if !keep {
+	if !keep || unjudged {
 		// Neither stored nor kept: whether it may be served depends on
-		// the reader. The kept generation guards it all the same, as it
+		// the reader, or it serves entries by name only, or leaves
+		// file metadata out, until the epoch of a revision is judged,
+		// "in a response that is no-store and isn't stored" (§E.2.6
+		// Per-entry sealing, Stored once, v0.85; scenario 73): once it
+		// is judged, a listing at the same at carries the values.
+		// Before v0.85 such a listing was stored and served as any
+		// other, until the fill that judged dropped it.
+		l.nameOnly = unjudged
+		// The kept generation guards it all the same, as it
 		// does a listing that is kept: one computed from what was read
 		// before a purge of what it shows is not served (§A.1, §B.5),
 		// and is computed again (currentListing).
@@ -2014,6 +2034,23 @@ func (s *Service) cdnAll() time.Duration {
 // stored with.
 func (s *Service) writeListing(w http.ResponseWriter, r *http.Request, v *viewer, at string, st derived.Stored) {
 	s.setListingHeaders(w, r, v, at, st.Tags)
+	if st.JSON {
+		w.Header().Set("Content-Type", "application/json")
+	} else {
+		w.Header().Set("Content-Type", seal.ContentType)
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write(st.Body)
+}
+
+// writeListingNoStore writes a listing that isn't stored, one that left
+// values out until an epoch is judged (computed.nameOnly; §E.2.6
+// Per-entry sealing, v0.85): no-store, for browsers and edges alike, and
+// without tags, since nothing keeps it.
+func (s *Service) writeListingNoStore(w http.ResponseWriter, st derived.Stored) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("CDN-Cache-Control", "no-store")
+	w.Header().Set("Surrogate-Control", "no-store")
 	if st.JSON {
 		w.Header().Set("Content-Type", "application/json")
 	} else {
