@@ -328,9 +328,18 @@ func TestV082LostTrustGoneStays(t *testing.T) {
 		if n := r.rows(x, "cat-sec"); n != 1 {
 			t.Fatalf("%d rows of cat-sec's trust once its purge is applied", n)
 		}
-		// With the trust it recorded while it followed cat-sec, matches
-		// is covered and dark: what the lost row takes away.
-		waitFor(t, "matches covered and dark", func() bool { return r.status(x, li) == 302 })
+		// A purged catalog whose document the origin doesn't serve at
+		// its purge head counts as no catalog, whatever the index read
+		// of it while it lived (§B.11.9 Where, v0.85: "one it can't read
+		// there counts as no catalog"): with the trust it recorded while
+		// it followed cat-sec, matches is uncovered here all the same,
+		// and li, a partial reader, has no marker (403). Before v0.85
+		// that row kept matches covered and dark (302).
+		waitFor(t, "matches without a catalog", func() bool { return r.status(x, li) == 403 })
+		time.Sleep(300 * time.Millisecond)
+		if st := r.status(x, li); st != 403 {
+			t.Fatalf("li once the sealed catalog is purged: %d, want 403 with no marker", st)
+		}
 		if n := must(x.ix.ExecForTest(ctx, `DELETE FROM catalog_trust WHERE ns = 'cat-sec'`)); n != 1 {
 			t.Fatalf("deleted %d rows", n)
 		}
