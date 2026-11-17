@@ -45,7 +45,7 @@ and serves immutable, CDN-cacheable revisions.
 | Limits (configurable, deployment maximums) and token-bucket rate limits; a refusal names the limit (`limit`) and, for sizes and counts, `measured` and `max` | §6.6, §12 | ✅ (see [Limit refusals](#design-notes)) |
 | `GET /ns/{ns}/principal`: what the grant in `Authorization` is in a namespace (principal, `kid`, the verifying key's thumbprint `key`, `operator`, verbs, roles as `{ name, can, rules }`, and a catalog namespace's `catalog` settings) and what a writer needs from the namespace document (frozen, successor, nonce, signatures, level, limits in force), to a grant limited to some resources or without `read` too | §7.4, §C.5, §C.7, §8.5 | ✅ (client `NSPrincipal`; see [Design notes](#design-notes)) |
 | File trees: `catalog.files` in catalog namespace documents, file metadata (`file: { size, type, modified }`) on placements in tree listings, sealed per entry for items of sealed namespaces, and the rendering of a JSON file shared by tools (`internal/files`) | §7.4, §H.1–§H.3, §E.2.6 | ✅ (tree service; see [File trees](#file-trees-h2-h3)) |
-| Streams and shared agent sessions: a proxy that keeps an upstream's streamed response as a resource, sessions of people and agents in one namespace, agents through MCP, recorded model calls | TOOLS Addendum J (suggested, non-normative; v0.83) | Partly: J.1–J.4, the stream proxy, are implemented by `patchlog streams` (see [Stream proxy](#stream-proxy-addendum-j1j4)): the stream document, writing, the narrowed read grant, resuming, abort and expiry, in plain and at-rest namespaces; sealed namespaces (J.4 Encryption) are refused at start. J.5–J.7 (shared sessions, agents through MCP, recording model calls) are not implemented: they are patterns built from core requests by tools outside this repository |
+| Streams and shared agent sessions: a proxy that keeps an upstream's streamed response as a resource, sessions of people and agents in one namespace, agents through MCP, recorded model calls | TOOLS Addendum J (suggested, non-normative; v0.83) | Partly: J.1–J.4, the stream proxy, are implemented by `patchlog streams` (see [Stream proxy](#stream-proxy-addendum-j1j4)): the stream document, writing, the narrowed read grant, resuming, abort and expiry, in plain and at-rest namespaces; sealed and end-to-end namespaces are refused at start, as the pattern is for neither (J.4 Encryption, v0.85). J.5–J.7 (shared sessions, agents through MCP, recording model calls) are not implemented: they are patterns built from core requests by tools outside this repository |
 | Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`, bounded by entries and by `logPageBytes`) | §6.2, §7.1–§7.2 | ✅ (`serve --log-page-size`, `--log-page-bytes`; see [Design notes](#design-notes)) |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
 | Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name, `?prefix=`), `/branches` | §7.4 | ✅ |
@@ -3790,9 +3790,10 @@ sessions, agents through MCP and recording model calls (J.5–J.7) are not imple
 | `--author` | `X-Author` for a `--dev` core. |
 | `--upstream` | An allowed upstream: a URL prefix (repeatable). An `Upstream-URL` must have the same scheme and host and a path under the prefix's, at a segment boundary; anything else is `403`. No `--upstream` refuses every request. Redirects are not followed: a `3xx` is kept as the stream. |
 | `--flush` | Least time between two appends to one stream (default 200 ms, §J.2 Pace). |
-| `--ttl` | How long read grants live from a stream's creation (default 24 h); a closed stream that old is purged (§J.4 Expiry). |
+| `--ttl` | How long read grants live from a stream's creation (default 24 h); a closed stream that old is purged with its continuations (§J.4 Expiry). |
 | `--idle-timeout` | A stream with no append for this long is closed with `"timeout"` (default 2 m). |
 | `--state` | A file with the names of the streams being written; a proxy started again closes those still open with `"error"` (§J.2 Restarts). Without it they are closed by the idle sweep, with `"timeout"`. |
+| `--segment-size` | The size at which a stream continues in its next resource, where that is below the namespace's `documentSize` (default: `documentSize`). Each append costs the stream's size so far, so where latency matters §J.1 suggests well below it, `256KiB` say. |
 | `--max-request-body`, `--max-segments`, `--max-streams` | Largest body forwarded upstream (1 MiB); most resources one response may fill (8); most streams carried at once (64, then `503` with `Retry-After`; requests that arrive together share the count, and a `Request-Key` request for a stream that exists needs no slot). |
 | `--public-url` | The core's base URL as callers reach it, for the `url` of an answer (default `--api`). |
 | `--create-ns` | Create `--ns` with `read: "grant"` if it is missing. Only over a `--dev` core: under grants a namespace is created with an operator grant and its document lists the key of the proxy's grant, neither of which the proxy holds. |
@@ -3807,7 +3808,7 @@ upstream then runs in the background, whether or not the caller stays connected.
 
 | Header | |
 | --- | --- |
-| `Authorization: Bearer <grant>` | The caller's own Patch Log grant. The proxy asks the core who it is (`GET /ns/{caller-ns}/principal`, §7.4), so the grant must name `--caller-ns` and be valid there; the principal's `sub` is the caller. Over a `--dev` core the caller is its `X-Author` instead. No caller is `401`. |
+| `Authorization: Bearer <grant>` | The caller's own Patch Log grant. The proxy asks the core who it is (`GET /ns/{caller-ns}/principal`, §7.4), so the grant must name `--caller-ns` and be valid there, and one narrowed to `"can": []` is enough (§J.1 Names); the principal's `sub` is the caller. Over a `--dev` core the caller is its `X-Author` instead. No caller is `401`. |
 | `Upstream-URL` | Required; under an `--upstream` prefix, else `403`. |
 | `Upstream-Method` | Default `POST`. |
 | `Upstream-Authorization` | Sent upstream as `Authorization`. Never stored or logged. |
@@ -3862,7 +3863,7 @@ says:
   that failed or was cut short, a body that isn't text or isn't UTF-8, a proxy that restarted
   or shut down; `aborted` an abort; `timeout` no append for `--idle-timeout`; `size` a stream
   that continues in `next`.
-- A stream about to pass the namespace's `documentSize` closes with `"size"` and
+- A stream about to pass the namespace's `documentSize`, or `--segment-size`, closes with `"size"` and
   `"next": "{id}.{n}"`, a resource of the same shape that carries on the same response. After
   `--max-segments` resources the response is cut: `"size"` with an `error` and no `next`.
 - On `429` the proxy waits `Retry-After` and appends again on the same parent, with what
@@ -3903,25 +3904,29 @@ nothing.
 
 **Expiry and orphans.** A sweep (every quarter of the lesser of `--idle-timeout` and `--ttl`,
 at most a minute) lists the namespace: an open stream that no proxy has appended to for
-`--idle-timeout` is closed with `"timeout"`, and a closed stream older than `--ttl`, whose read
-grants have expired, is purged (§8.3). A proxy closes its own stream the same way when
-upstream sends nothing for `--idle-timeout`. Documents in the namespace that aren't streams are
-left alone.
+`--idle-timeout` is closed with `"timeout"`, and a closed stream whose read grants have
+expired is purged (§8.3) with its continuations (§J.4, v0.85): all of them once the last
+resource it continued in is closed and `--ttl` has passed since the stream's creation, its
+first resource's. So no resource of a stream still being carried is purged, and a continuation
+doesn't outlive the grants by the time it was created after the first. A proxy closes its own
+stream the same way when upstream sends nothing for `--idle-timeout`, and one that sees its
+stream closed by another proxy, in the log it follows, cancels upstream at once and appends
+nothing more (§J.2 Restarts). Documents in the namespace that aren't streams are left alone.
 
 **Limits, and what isn't implemented.**
 
-- **Sealed namespaces** (§J.4 Encryption) are refused at start: the proxy would sign each
-  reader a root grant carrying the reader's `enc`, which needs a namespace signing key in the
-  proxy and the reader's key in the request. End-to-end namespaces are refused too, as §J.4
-  says the design doesn't work there. Plain and at-rest namespaces work, as do namespaces that
-  require nonces; ones that require signatures don't.
+- **Sealed and end-to-end namespaces** are refused at start: the design is for a `streams`
+  namespace that is neither (§J.4 Encryption, v0.85). A sealed namespace's keys are wrapped to
+  a grant's root block, so the narrowed read grant opens nothing for its reader, and
+  end-to-end the abort rule can't be judged. Plain and at-rest namespaces work, as do
+  namespaces that require nonces; ones that require signatures don't.
 - **Rates.** The proxy writes as one principal: at 200 ms a stream is 5 appends a second, so
   the default `ratePerPrincipal` (50 a second) carries about 10 streams at full pace, and more
   only with larger flushes after `429`s. An allowance or a higher namespace limit raises it
   (§J.2 Pace).
 - **Cost.** A stream is one growing document, so a flush costs its size so far
-  ([docs/CAPACITY.md](docs/CAPACITY.md)); a namespace `documentSize` below the default makes
-  streams continue sooner.
+  ([docs/CAPACITY.md](docs/CAPACITY.md)); `--segment-size`, or a namespace `documentSize`
+  below the default, makes streams continue sooner (§J.1 Size).
 - **Callers** are one namespace's principals (`--caller-ns`). Text bodies only (§J.1): a
   response that isn't `text/*`, JSON, NDJSON or XML closes with `"error"`. The request body is
   buffered, at most `--max-request-body`. The state is one proxy's: two proxies over one

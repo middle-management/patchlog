@@ -29,6 +29,24 @@ Implements spec **v0.85** (previously **v0.84**).
   fail the same way where they were served from the kept answer. A `502` now names the
   service and its status only; the core's or tree service's message is logged, not
   answered (§C.6 Upstream failures).
+- **Stream proxy (`patchlog streams`), TOOLS Addendum J as v0.85 has it.** Most of what
+  v0.85 writes down the proxy already did (continuations `{id}.{n}` covered by the read
+  grant, callers identified through `GET /ns/{ns}/principal`, `exp` counted from the stream's
+  creation, upstream error answers and `3xx` kept with their status, sealed and end-to-end
+  namespaces refused). What changes:
+  - **A stream is purged with its continuations** (§J.4 Expiry): all its resources once the
+    last one it continued in is closed and `--ttl` has passed since the stream's creation.
+    Before, each resource was judged by its own creation, so the first could be purged while
+    a continuation was still being written, and a continuation outlived the read grants.
+  - **A stream closed by another proxy stops at once** (§J.2 Restarts): the proxy sees
+    `closed` in the log it follows and cancels upstream then, not at its next append or its
+    own idle timeout. It appends nothing more, as before.
+  - **`--segment-size`** (`Options.SegmentSize`): the size at which a stream continues in its
+    next resource, below the namespace's `documentSize` (§J.1 Size suggests 256 KiB where
+    latency matters). Default: `documentSize`, as before.
+  - The refusal of a sealed namespace no longer speaks of a design v0.85 dropped.
+  A read grant's `exp` is still the earlier of the stream's creation plus `--ttl` and the
+  proxy grant's own `exp`: a narrowed grant can't outlive the grant it was narrowed from.
 
 ## v0.30.0
 
