@@ -4125,6 +4125,24 @@ patchlog ns purge matches --yes                 # destroy a frozen namespace (§
 The destructive commands, without `--yes`, print what they would destroy and exit 1. A deleted
 resource that moved (§8.1) is named in the error: `m/a is deleted (tombstone …); it moved to m/b`.
 
+**Encrypted namespaces** (Addendum E). The same commands read and write them: they learn the
+namespace's level and take the encrypted path. `--identity KEY.jwk` (`$PATCHLOG_IDENTITY`) is
+your X25519 private key (`patchlog bundle keygen -o KEY.jwk` makes one): in a sealed namespace
+the private key of your grant's `enc`, which `/keys` wraps the keys to; in an e2e namespace the
+key its keyring wraps them to, with `--keyring-sender ADMIN.jwk` naming the admin who wrapped
+them. Without it an e2e document is refused, never printed as ciphertext.
+
+```sh
+patchlog e2e init docs ann.pub.jwk --identity admin.jwk          # the keyring, wrapped for you and the readers given
+patchlog e2e add-reader docs bob.pub.jwk --identity admin.jwk    # --history wraps every older epoch's key too
+patchlog e2e readers docs                                        # whom each epoch's key is wrapped to, and by whom
+patchlog e2e rotate docs ann.pub.jwk --identity admin.jwk        # a new epoch for those given; lists the others unless --yes
+export PATCHLOG_IDENTITY=ann.jwk
+patchlog put docs/plan '{"q":3}' --keyring-sender admin.pub.jwk  # sealed by the client
+patchlog get docs/plan --keyring-sender admin.pub.jwk            # opened and folded; flagged revisions warned on stderr
+patchlog e2e keys vault                                          # what /keys gives your grant (--show-keys for the keys)
+```
+
 **Grants.** `patchlog grant inspect TOKEN` decodes a grant offline (its blocks, scopes, expiry;
 signatures aren't checked); `grant check NS TOKEN` verifies it as the namespace would, as of its
 head, and exits 1 with the reason if refused; `grant show NS GID` prints a recorded grant.

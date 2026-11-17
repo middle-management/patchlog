@@ -27,6 +27,14 @@
   `tree ls` lists a catalog. The destructive `purge`, `prune` and `ns purge` need `--yes`, and
   without it print what they would destroy. A deleted resource that moved is named in errors, and
   `log` of a pruned resource starts at the horizon.
+- **Encrypted namespaces from the CLI** (Addendum E). `e2e init`, `add-reader`, `rotate` and
+  `readers` administer an e2e namespace's keyring; `e2e keys` shows what `/keys` gives a grant.
+  `get` (and `--follow`), `put`, `patch`, `log` and `blob put|get` learn the namespace's level:
+  sealed namespaces are opened with the keys `/keys` gives, e2e ones sealed and folded by the
+  client with `--identity` (`$PATCHLOG_IDENTITY`), and refused without it. `log --follow` of an
+  e2e namespace isn't supported yet.
+- **`client.With` keeps the keyring senders**: a signing or keyed copy of a client lost
+  `--keyring-sender`.
 - **Grants.** `grant inspect` decodes a grant offline, `grant check NS TOKEN` verifies it as the
   namespace would (exit 1 if refused), `grant show NS GID` prints a recorded grant.
 - **`--bearer-file` and `--sign-key-file`** (`$PATCHLOG_BEARER_FILE`, `$PATCHLOG_SIGN_KEY_FILE`)
