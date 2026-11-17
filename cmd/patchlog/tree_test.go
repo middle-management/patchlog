@@ -41,7 +41,7 @@ func TestTreeCatalogFlags(t *testing.T) {
 // (repeatable or comma-separated, default origin), and no key the one
 // derived from the edge secret, which the origin may hold.
 func TestServiceEdgeGrantCookies(t *testing.T) {
-	cf := &corsFlags{credentials: new(bool)}
+	cf := &corsArgs{}
 	origin := originKids(nil)
 	ck, err := serviceEdgeGrantCookies("cat", "", origin, nil, nil, cf)
 	if err != nil || ck.Kid() != "catalog-cat" || ck.SameSite != http.SameSiteLaxMode {
@@ -90,7 +90,7 @@ func TestServiceEdgeGrantCookies(t *testing.T) {
 			t.Errorf("the origin's derived key accepted: %q", keys)
 		}
 	}
-	cf.credOrigins = multi{"https://app.example"}
+	cf.CORSCredentialsOrigin = []string{"https://app.example"}
 	if ck, err := serviceEdgeGrantCookies("cat", "cat-2026", origin, []string{own}, ev, cf); err != nil || ck.Kid() != "cat-2026" || ck.SameSite != http.SameSiteNoneMode {
 		t.Errorf("own key: %v %v", ck, err)
 	}

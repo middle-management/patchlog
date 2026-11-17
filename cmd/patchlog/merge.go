@@ -1,21 +1,13 @@
 package main
 
 // Addendum F tools: merge, rebase and the branch janitor. All of them are
-// clients of the public API (internal/merge, internal/janitor).
-//
-//	patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}  (cmd/patchlog/release.go)
-//	patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
-//	        [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]...
-//	        [-source-grant G]... [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
-//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch [-leave-out]] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]...
-//	        [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
-//	patchlog janitor -api URL -ns base1,base2 [-release LINK]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
+// clients of the public API (internal/merge, internal/janitor). Releases
+// across namespaces, patchlog merge release, are in release.go.
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -31,75 +23,38 @@ import (
 	"github.com/middle-management/patchlog/internal/sig"
 )
 
-const mergeUsage = `usage:
-  patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}   (§F.9; see patchlog merge release)
-  patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
-          [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]...
-          [-source-grant G]... [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
-  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch [-leave-out]] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]...
-          [-keyring-sender pub.jwk]... [-trusted-sender pub.jwk]... [-json]
-  patchlog janitor -api URL -ns base1,base2 [-release /r/{ns}/{release}]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]`
-
-// toolFlags are the connection flags shared by the Addendum F tools.
-type toolFlags struct {
-	api, bearer, author *string
-	asJSON, dev         *bool
-	signKey             *string
-	keyring             *keyringFlags
-}
-
-// signKeyEnv names the environment variable that sets -sign-key.
-const signKeyEnv = "PATCHLOG_SIGN_KEY"
-
-const signKeyHelp = "kid:seed (the seed 32 bytes in base64url; default $" + signKeyEnv + "): sign every step this tool writes with this key (§C.3.1). The kid must be listed in the signers of the grant (-bearer) the writes are sent under. Original signatures are never carried over"
-
-func addToolFlags(fs *flag.FlagSet) toolFlags {
-	return toolFlags{
-		api:     fs.String("api", "http://localhost:8080", "deployment base URL"),
-		bearer:  fs.String("bearer", "", "grant sent as Authorization: Bearer"),
-		author:  fs.String("author", "", "X-Author (development servers only)"),
-		asJSON:  fs.Bool("json", false, "print JSON"),
-		signKey: fs.String("sign-key", os.Getenv(signKeyEnv), signKeyHelp),
-		dev:     fs.Bool("dev", false, "ignored, kept for scripts: whether the deployment runs with authentication disabled is read from GET / (§1, §7)"),
-		keyring: addKeyringFlags(fs),
-	}
-}
-
-// signer returns the key of -sign-key (or $PATCHLOG_SIGN_KEY), nil if unset.
-func (tf toolFlags) signer() *sig.Key {
-	if *tf.signKey == "" {
+// signer returns the key of --sign-key (or $PATCHLOG_SIGN_KEY), nil if unset.
+func (tf *toolArgs) signer() *sig.Key {
+	if tf.SignKey == "" {
 		return nil
 	}
-	k, err := sig.ParseKey(*tf.signKey)
+	k, err := sig.ParseKey(tf.SignKey)
 	if err != nil {
-		toolFatal(fmt.Errorf("-sign-key: %w", err))
+		toolFatal(fmt.Errorf("--sign-key: %w", err))
 	}
 	return &k
 }
 
-func (tf toolFlags) client() *client.Client {
+func (tf *toolArgs) client() *client.Client {
 	var opts []client.Option
-	if *tf.bearer != "" {
-		opts = append(opts, client.WithBearer(*tf.bearer))
+	if tf.Bearer != "" {
+		opts = append(opts, client.WithBearer(tf.Bearer))
 	}
-	if *tf.author != "" {
-		opts = append(opts, client.WithAuthor(*tf.author))
+	if tf.Author != "" {
+		opts = append(opts, client.WithAuthor(tf.Author))
 	}
-	kopts, err := tf.keyring.options()
+	kopts, err := tf.keyringArgs.options()
 	if err != nil {
 		toolFatal(err)
 	}
-	c, err := client.New(*tf.api, append(opts, kopts...)...)
+	c, err := client.New(tf.API, append(opts, kopts...)...)
 	if err != nil {
 		toolFatal(err)
 	}
 	return c
 }
 
-// identityHelp describes -identity for merge and rebase.
-const identityHelp = "file with an X25519 private key (a private JWK {kty, crv, x, d}, or base64url d) for e2e namespaces (Addendum E.3): the key the keyrings (and -bearer's enc) name, to read the branch and re-encrypt for the target (§F.8); repeatable when they name different keys"
-
-// e2eView returns a key-holding view of c with the -identity keys, or nil
+// e2eView returns a key-holding view of c with the --identity keys, or nil
 // without any.
 func e2eView(c *client.Client, identities []string) *client.E2E {
 	if len(identities) == 0 {
@@ -113,7 +68,7 @@ func e2eView(c *client.Client, identities []string) *client.E2E {
 		}
 		priv, err := seal.ParseRecipientPrivate(b)
 		if err != nil {
-			toolFatal(fmt.Errorf("-identity %s: %w", f, err))
+			toolFatal(fmt.Errorf("--identity %s: %w", f, err))
 		}
 		x = x.WithRecipient(priv)
 	}
@@ -148,64 +103,55 @@ func short(id string) string {
 	return id
 }
 
-func mergeCmd(args []string) {
-	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, mergeUsage)
-		os.Exit(2)
-	}
-	sub := args[0]
-	switch sub {
-	case "status", "plan", "apply":
-	case "release":
-		releaseCmd(args[1:])
-		return
-	default:
-		fmt.Fprintln(os.Stderr, mergeUsage)
-		os.Exit(2)
-	}
-	fs := flag.NewFlagSet("merge "+sub, flag.ExitOnError)
-	tf := addToolFlags(fs)
-	base := fs.String("base", "", "target namespace (default: the branch's base)")
-	branch := fs.String("branch", "", "branch to merge")
-	freeze := fs.Bool("freeze", false, "apply: freeze the branch afterwards, recording merged.at")
-	squash := fs.Bool("squash", false, "one patch set per resource (loses per-set history and fast-forward ids)")
-	cfgFile := fs.String("config", "", "file with an explicit config change (a patch set) for the target")
-	var resolves multi
-	fs.Var(&resolves, "resolve", "name=file.json: resolution for a conflicting resource, against the target's head: a patch set, a list of steps, \"delete\", or \"keep\" (repeatable)")
-	var identities, srcGrants multi
-	fs.Var(&identities, "identity", identityHelp)
-	fs.Var(&srcGrants, "source-grant", "a grant sent as Source-Authorization with every batch and blob copy (reads the branch: its blobs, drafts; §7.5, §7.8); with unrestricted read on the branch, the batch's source makes its blobs available and nothing is copied (§F.3); repeatable")
-	fs.Parse(args[1:])
-	if *branch == "" {
-		fmt.Fprintln(os.Stderr, "merge: -branch is required")
-		os.Exit(2)
-	}
+// mergeCmd is patchlog merge.
+type mergeCmd struct {
+	Status  *mergeBranchCmd `arg:"subcommand:status" help:"show what merging a branch would do"`
+	Plan    *mergeBranchCmd `arg:"subcommand:plan" help:"print the batch a merge would submit"`
+	Apply   *mergeBranchCmd `arg:"subcommand:apply" help:"merge a branch into its base (§F.3)"`
+	Release *releaseCmd     `arg:"subcommand:release" help:"plan, approve and apply releases across namespaces (§F.9)"`
+}
+
+// mergeBranchCmd is patchlog merge status|plan|apply.
+type mergeBranchCmd struct {
+	toolArgs
+	Base    string   `arg:"--base" placeholder:"NS" help:"target namespace (default: the branch's base)"`
+	Branch  string   `arg:"--branch,required" placeholder:"NS" help:"branch to merge"`
+	Freeze  bool     `arg:"--freeze" help:"apply: freeze the branch afterwards, recording merged.at"`
+	Squash  bool     `arg:"--squash" help:"one patch set per resource (loses per-set history and fast-forward ids)"`
+	Config  string   `arg:"--config" placeholder:"FILE" help:"file with an explicit config change (a patch set) for the target"`
+	Resolve []string `arg:"--resolve,separate" placeholder:"NAME=FILE.json" help:"resolution for a conflicting resource, against the target's head: a patch set, a list of steps, \"delete\", or \"keep\" (repeatable)"`
+	identityArgs
+	SourceGrant []string `arg:"--source-grant,separate" placeholder:"GRANT" help:"a grant sent as Source-Authorization with every batch and blob copy (reads the branch: its blobs, drafts; §7.5, §7.8); with unrestricted read on the branch, the batch's source makes its blobs available and nothing is copied (§F.3); repeatable"`
+}
+
+func (a *mergeBranchCmd) run(sub string) {
+	tf := &a.toolArgs
 	ctx := context.Background()
 	c := tf.client()
-	target := *base
+	target := a.Base
 	if target == "" {
-		target = branchBase(ctx, c, *branch)
+		target = branchBase(ctx, c, a.Branch)
 	}
-	opt := merge.Options{Squash: *squash, E2E: e2eView(c, identities), Signer: tf.signer(), SourceAuthorizations: srcGrants}
-	if *cfgFile != "" {
-		v, err := readJSONFile(*cfgFile)
+	opt := merge.Options{Squash: a.Squash, E2E: e2eView(c, a.Identity), Signer: tf.signer(), SourceAuthorizations: a.SourceGrant}
+	if a.Config != "" {
+		v, err := readJSONFile(a.Config)
 		if err != nil {
 			toolFatal(err)
 		}
 		opt.Config = v
 	}
-	p, err := merge.NewPlan(ctx, c, target, *branch, opt)
+	p, err := merge.NewPlan(ctx, c, target, a.Branch, opt)
 	if err != nil {
 		toolFatal(err)
 	}
-	for _, r := range resolves {
+	for _, r := range a.Resolve {
 		name, file, ok := strings.Cut(r, "=")
 		if !ok {
-			toolFatal(fmt.Errorf("-resolve %q: want name=file.json", r))
+			toolFatal(fmt.Errorf("--resolve %q: want name=file.json", r))
 		}
 		steps, err := readResolution(file)
 		if err != nil {
-			toolFatal(fmt.Errorf("-resolve %s: %w", name, err))
+			toolFatal(fmt.Errorf("--resolve %s: %w", name, err))
 		}
 		if err := p.Resolve(name, steps...); err != nil {
 			toolFatal(err)
@@ -215,7 +161,7 @@ func mergeCmd(args []string) {
 	hints := mergeHints(p, tf)
 	switch sub {
 	case "status":
-		if *tf.asJSON {
+		if tf.JSON {
 			printJSON(map[string]any{"target": p.Target, "branch": p.Branch, "branchAt": p.BranchAt, "resources": p.Status(), "hints": hints})
 			return
 		}
@@ -243,7 +189,7 @@ func mergeCmd(args []string) {
 		printHints(hints)
 	case "plan":
 		dry, derr := p.DryRun(ctx)
-		if *tf.asJSON {
+		if tf.JSON {
 			out := map[string]any{"plan": p, "clean": p.Clean(), "batch": batchJSON(p), "hints": hints}
 			if dry != nil {
 				out["dryRun"] = dry.Items
@@ -283,12 +229,12 @@ func mergeCmd(args []string) {
 	case "apply":
 		res, err := p.Apply(ctx)
 		if errors.Is(err, merge.ErrConflicts) {
-			if *tf.asJSON {
+			if tf.JSON {
 				printJSON(map[string]any{"plan": p, "clean": false, "error": err.Error(), "hints": hints})
 			} else {
 				printPlan(p)
 				printHints(hints)
-				fmt.Fprintln(os.Stderr, "not merged: resolve the conflicting resources with -resolve name=file.json")
+				fmt.Fprintln(os.Stderr, "not merged: resolve the conflicting resources with --resolve name=file.json")
 			}
 			os.Exit(1)
 		}
@@ -296,7 +242,7 @@ func mergeCmd(args []string) {
 			toolFatal(err)
 		}
 		out := map[string]any{"result": res}
-		if *freeze {
+		if a.Freeze {
 			at := res.NSID
 			if at == "" {
 				h, err := c.NSHead(ctx, p.Target)
@@ -311,7 +257,7 @@ func mergeCmd(args []string) {
 			}
 			out["frozen"] = map[string]any{"config": fr.Config, "ns_id": fr.NSID, "merged": at}
 		}
-		if *tf.asJSON {
+		if tf.JSON {
 			printJSON(out)
 			return
 		}
@@ -323,7 +269,7 @@ func mergeCmd(args []string) {
 				fmt.Printf("  %-28s %-12s %s\n", r.Name, r.Class, strings.Join(shortAll(res.IDs[r.Name]), " "))
 			}
 		}
-		if *freeze {
+		if a.Freeze {
 			fmt.Printf("froze %s (merged.at %v)\n", p.Branch, out["frozen"].(map[string]any)["merged"])
 		}
 	}
@@ -376,7 +322,7 @@ func printPlan(p *merge.Plan) {
 		}
 	}
 	if !p.Clean() {
-		fmt.Println("needs a person: resolve with -resolve name=file.json (a patch set against the target's head)")
+		fmt.Println("needs a person: resolve with --resolve name=file.json (a patch set against the target's head)")
 	}
 }
 
@@ -384,16 +330,16 @@ func printPlan(p *merge.Plan) {
 // merge.authors in the target, earlier merge batches that don't count),
 // plus one if the merger itself isn't listed, so its batch won't serve as
 // a common ancestor for a later merge, nor verify a merged claim for the
-// janitor (§F.6). The merger is the root sub and kid of -bearer, or the
-// -author of a development server (no kid).
-func mergeHints(p *merge.Plan, tf toolFlags) []string {
+// janitor (§F.6). The merger is the root sub and kid of --bearer, or the
+// --author of a development server (no kid).
+func mergeHints(p *merge.Plan, tf *toolArgs) []string {
 	hints := p.Hints()
 	if !p.AuthorsDeclared {
 		return hints
 	}
-	sub, kid := *tf.author, ""
-	if *tf.bearer != "" {
-		g, err := grant.Decode(*tf.bearer, 0)
+	sub, kid := tf.Author, ""
+	if tf.Bearer != "" {
+		g, err := grant.Decode(tf.Bearer, 0)
 		if err != nil || len(g.Blocks) == 0 {
 			return hints
 		}
@@ -500,36 +446,34 @@ func branchBase(ctx context.Context, c *client.Client, branch string) string {
 	b, _ := d.Value["base"].(map[string]any)
 	ns, _ := b["ns"].(string)
 	if ns == "" {
-		toolFatal(fmt.Errorf("%s is not a branch; give -base", branch))
+		toolFatal(fmt.Errorf("%s is not a branch; give --base", branch))
 	}
 	return ns
 }
 
-func rebaseCmd(args []string) {
-	fs := flag.NewFlagSet("rebase", flag.ExitOnError)
-	tf := addToolFlags(fs)
-	branch := fs.String("branch", "", "branch to rebase")
-	newName := fs.String("new", "", "name of the successor branch (resumes if it exists)")
-	onto := fs.String("onto", "", "namespace to create the successor from (default: the branch's base)")
-	sw := fs.Bool("switch", false, "freeze the old branch with successor: NEW, then replay what it got meanwhile")
-	leaveOut := fs.Bool("leave-out", false, leaveOutHelp)
-	var identities, readers multi
-	fs.Var(&identities, "identity", identityHelp)
-	fs.Var(&readers, "reader", "e2e: file with the X25519 public key (a JWK {kty, crv, x}, or base64url x) of a reader the successor's keyring wraps its key for, besides those of the old branch's readers the identities know (repeatable, §F.8.1)")
-	fs.Parse(args)
-	if *branch == "" || *newName == "" {
-		fmt.Fprintln(os.Stderr, "rebase: -branch and -new are required")
-		os.Exit(2)
-	}
-	succReaders, err := readPublicKeys(readers)
+// rebaseCmd is patchlog rebase.
+type rebaseCmd struct {
+	toolArgs
+	Branch   string `arg:"--branch,required" placeholder:"NS" help:"branch to rebase"`
+	New      string `arg:"--new,required" placeholder:"NAME" help:"name of the successor branch (resumes if it exists)"`
+	Onto     string `arg:"--onto" placeholder:"NS" help:"namespace to create the successor from (default: the branch's base)"`
+	Switch   bool   `arg:"--switch" help:"freeze the old branch with successor: NEW, then replay what it got meanwhile"`
+	LeaveOut bool   `arg:"--leave-out" help:"with --switch: switch although the replay leaves resources the old branch changed unrecorded in the successor (left out of an item, purged in the successor only), giving them up (§F.5): their changes stay only in the frozen old branch"`
+	identityArgs
+	Reader []string `arg:"--reader,separate" placeholder:"PUB.JWK" help:"e2e: file with the X25519 public key (a JWK {kty, crv, x}, or base64url x) of a reader the successor's keyring wraps its key for, besides those of the old branch's readers the identities know (repeatable, §F.8.1)"`
+}
+
+func (a *rebaseCmd) run(string) {
+	tf := &a.toolArgs
+	succReaders, err := readPublicKeys(a.Reader)
 	if err != nil {
 		toolFatal(err)
 	}
 	ctx := context.Background()
 	c := tf.client()
-	res, err := merge.Rebase(ctx, c, merge.RebaseOptions{Branch: *branch, New: *newName, Onto: *onto, Switch: *sw, LeaveOut: *leaveOut, SuccessorReaders: succReaders,
-		Plan: merge.Options{E2E: e2eView(c, identities), Signer: tf.signer()}})
-	if *tf.asJSON {
+	res, err := merge.Rebase(ctx, c, merge.RebaseOptions{Branch: a.Branch, New: a.New, Onto: a.Onto, Switch: a.Switch, LeaveOut: a.LeaveOut, SuccessorReaders: succReaders,
+		Plan: merge.Options{E2E: e2eView(c, a.Identity), Signer: tf.signer()}})
+	if tf.JSON {
 		out := map[string]any{"result": res}
 		if err != nil {
 			out["error"] = err.Error()
@@ -553,7 +497,7 @@ func rebaseCmd(args []string) {
 			fmt.Printf("replayed into %s as batch %s\n", res.New, res.FirstResult.NSID)
 		}
 		if res.Switched {
-			fmt.Printf("switched: %s is frozen with successor %s\n", *branch, res.New)
+			fmt.Printf("switched: %s is frozen with successor %s\n", a.Branch, res.New)
 		}
 		if res.CatchUp != nil {
 			printPlan(res.CatchUp)
@@ -561,30 +505,27 @@ func rebaseCmd(args []string) {
 		if res.CatchUpResult != nil && !res.CatchUpResult.Noop {
 			fmt.Printf("caught up as batch %s\n", res.CatchUpResult.NSID)
 		}
-		printLeftOut(res, *branch)
+		printLeftOut(res, a.Branch)
 		if len(res.DroppedReaders) > 0 && err == nil {
-			fmt.Printf("%s's keyring holds no key for these readers of %s: %s\n", res.New, *branch, strings.Join(res.DroppedReaders, ", "))
+			fmt.Printf("%s's keyring holds no key for these readers of %s: %s\n", res.New, a.Branch, strings.Join(res.DroppedReaders, ", "))
 		}
 	}
 	if errors.Is(err, merge.ErrReadersDropped) {
-		fmt.Fprintf(os.Stderr, "error: %v\nname their public keys with -reader and run rebase again\n", err)
+		fmt.Fprintf(os.Stderr, "error: %v\nname their public keys with --reader and run rebase again\n", err)
 		os.Exit(1)
 	}
 	if errors.Is(err, merge.ErrConflicts) {
-		fmt.Fprintf(os.Stderr, "stopped on conflicts: resolve them with `patchlog merge apply -base %s -branch %s -resolve …`, then run rebase again\n", *newName, *branch)
+		fmt.Fprintf(os.Stderr, "stopped on conflicts: resolve them with `patchlog merge apply --base %s --branch %s --resolve …`, then run rebase again\n", a.New, a.Branch)
 		os.Exit(1)
 	}
 	if errors.Is(err, merge.ErrLeftOut) && res != nil && !res.Switched {
-		fmt.Fprintf(os.Stderr, "error: %v\nrecord them in %s and run rebase again, or give them up with -leave-out (§F.5)\n", err, *newName)
+		fmt.Fprintf(os.Stderr, "error: %v\nrecord them in %s and run rebase again, or give them up with --leave-out (§F.5)\n", err, a.New)
 		os.Exit(1)
 	}
 	if err != nil {
 		toolFatal(err)
 	}
 }
-
-// leaveOutHelp describes -leave-out for rebase and merge release rebase.
-const leaveOutHelp = "with -switch: switch although the replay leaves resources the old branch changed unrecorded in the successor (left out of an item, purged in the successor only), giving them up (§F.5): their changes stay only in the frozen old branch"
 
 // printLeftOut prints the resources a rebase of branch left unrecorded in
 // its successor (§F.5): given up when it switched, else holding it up.
@@ -599,40 +540,37 @@ func printLeftOut(res *merge.RebaseResult, branch string) {
 	}
 }
 
-func janitorCmd(args []string) {
-	fs := flag.NewFlagSet("janitor", flag.ExitOnError)
-	tf := addToolFlags(fs)
-	nsList := fs.String("ns", "", "comma-separated base namespaces to clean up")
-	dry := fs.Bool("dry-run", false, "only report what would be purged")
-	once := fs.Bool("once", false, "sweep once and exit instead of following the bases")
-	interval := fs.Duration("interval", time.Minute, "sweep interval while following")
-	var releases multi
-	fs.Var(&releases, "release", "release document /r/{ns}/{release} whose draft branches are purged after its other branches (§F.9); repeatable")
-	fs.Parse(args)
-	var bases []string
-	for _, s := range strings.Split(*nsList, ",") {
-		if s = strings.TrimSpace(s); s != "" {
-			bases = append(bases, s)
-		}
-	}
+// janitorCmd is patchlog janitor.
+type janitorCmd struct {
+	toolArgs
+	NS       string        `arg:"--ns,required" placeholder:"BASE,BASE" help:"comma-separated base namespaces to clean up"`
+	DryRun   bool          `arg:"--dry-run" help:"only report what would be purged"`
+	Once     bool          `arg:"--once" help:"sweep once and exit instead of following the bases"`
+	Interval time.Duration `arg:"--interval" default:"1m" placeholder:"DURATION" help:"sweep interval while following"`
+	Release  []string      `arg:"--release,separate" placeholder:"/r/{ns}/{release}" help:"release document whose draft branches are purged after its other branches (§F.9); repeatable"`
+}
+
+func (a *janitorCmd) run(string) {
+	tf := &a.toolArgs
+	bases := splitList(a.NS)
 	if len(bases) == 0 {
-		fmt.Fprintln(os.Stderr, "janitor: -ns is required")
+		fmt.Fprintln(os.Stderr, "janitor: --ns is required")
 		os.Exit(2)
 	}
 	c := tf.client()
 	report := func(d janitor.Decision) {
-		if *tf.asJSON {
+		if tf.JSON {
 			b, _ := json.Marshal(d)
 			fmt.Println(string(b))
 			return
 		}
 		fmt.Printf("%-24s %-12s %s\n", d.NS, d.Action, d.Reason)
 	}
-	opt := janitor.Options{Bases: bases, DryRun: *dry, Interval: *interval, Releases: releases,
+	opt := janitor.Options{Bases: bases, DryRun: a.DryRun, Interval: a.Interval, Releases: a.Release,
 		OnError: func(err error) { fmt.Fprintln(os.Stderr, "janitor:", err) }}
-	if *once {
+	if a.Once {
 		ds, err := janitor.New(c, opt).Sweep(context.Background())
-		if *tf.asJSON {
+		if tf.JSON {
 			printJSON(ds)
 		} else {
 			for _, d := range ds {

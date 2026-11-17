@@ -21,10 +21,10 @@ const SchemaImportPrefix = Prefix + "schema-import/"
 // Options configure what the playground serves beyond its static files.
 type Options struct {
 	// SchemaFetch lets the plan endpoint fetch http(s) URLs (serve
-	// -schema-fetch). Off: it takes uploaded files only.
+	// --schema-fetch). Off: it takes uploaded files only.
 	SchemaFetch bool
 	// SchemaFetchHosts, if not empty, limits fetching to these hosts, which
-	// are then also trusted with private addresses (-schema-fetch-hosts).
+	// are then also trusted with private addresses (--schema-fetch-hosts).
 	SchemaFetchHosts []string
 }
 

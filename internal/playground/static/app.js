@@ -288,7 +288,7 @@ function newEntry(o) {
   return e;
 }
 
-/* With authentication disabled (serve -dev), a write names its author in X-Author and one without it is 400
+/* With authentication disabled (serve --dev), a write names its author in X-Author and one without it is 400
  * (§7.2): until the author box is filled, requests without a bearer send DEV_AUTHOR, the name the server gave
  * such writes before it required the header. authDisabled is what GET / reported (initConn). */
 const DEV_AUTHOR = 'anonymous';
@@ -385,7 +385,7 @@ function initConn() {
     // GET / (§7): { spec, auth: "grants" | "disabled", origin }.
     const j = r.ok && r.json;
     authDisabled = !!(j && j.auth === 'disabled');
-    if (authDisabled) $('author').placeholder = `${DEV_AUTHOR} until set  (X-Author, serve -dev)`;
+    if (authDisabled) $('author').placeholder = `${DEV_AUTHOR} until set  (X-Author, serve --dev)`;
     $('origin').textContent = j && j.origin ? 'origin ' + j.origin + (j.auth === 'disabled' ? ' \u00b7 authentication disabled (development)' : '') : (r.neterr ? 'server unreachable' : 'HTTP ' + r.status);
   });
 }
@@ -2492,7 +2492,7 @@ function renderIdentity() {
       h('button', { class: 'tiny', onclick: () => { $('krReader').value = JSON.stringify(jwk); expandCard($('krReader')); toast('Reader field set'); } }, 'Use as reader below')),
     jsonPre(jwk),
     h('details', {}, h('summary', { class: 'muted small' }, 'a read grant that carries it (E2)'),
-      h('pre', { class: 'raw' }, `patchlog grant mint -key SEED -block '${JSON.stringify(block)}'`)));
+      h('pre', { class: 'raw' }, `patchlog grant mint --key SEED --block '${JSON.stringify(block)}'`)));
 }
 
 function renderKeysHeld() {
@@ -2740,7 +2740,7 @@ async function nsHeadDoc(ns) {
   return { status: 200, head, config: r.hdr('X-Config-Revision') || '', doc, sealed: r.jose };
 }
 
-/* probeProxy asks the core whether it proxies a tree service (-tree-url), and which catalogs it maps to their own. */
+/* probeProxy asks the core whether it proxies a tree service (--tree-url), and which catalogs it maps to their own. */
 async function probeProxy() {
   const p = await api('GET', `${TREE}/`, { auto: true, label: 'tree' });
   C.proxy = p.status === 200 && p.json && p.json.proxy === 'tree';
@@ -2819,7 +2819,7 @@ async function loadCatalog() {
     x.contentDocs[t] = cd.doc || {};
     x.contentHeads[t] = new Map((await allHeads(t, cd.head)).map((e) => [e.resource, e]));
   }));
-  // 4. The tree service, through the core's same-origin proxy (-tree-url).
+  // 4. The tree service, through the core's same-origin proxy (--tree-url).
   Object.assign(x, await loadTreeListing());
   if (x.listing) addDangling(x);
   if (gen !== C.gen) return;
@@ -3043,13 +3043,13 @@ async function openSealedEntries(v, view, from, filed, ctx) {
 async function loadTreeListing() {
   const x = { listing: null, at: '', view: '', problems: null, note: '', source: 'core', treeStatus: null, sealedView: false };
   if (C.proxy === null) await probeProxy();
-  if (!C.proxy) { x.note = 'Computed listings (the combined checkpoint, ordering and dangling detection by the service, access filtering, manifests) need the tree service. Start the core with -tree-url (compose does) to read it through the same-origin proxy at /playground/tree/. Showing the catalog documents read directly from the core API.'; return x; }
+  if (!C.proxy) { x.note = 'Computed listings (the combined checkpoint, ordering and dangling detection by the service, access filtering, manifests) need the tree service. Start the core with --tree-url (compose does) to read it through the same-origin proxy at /playground/tree/. Showing the catalog documents read directly from the core API.'; return x; }
   const roots = await treeGet('roots');
   if (!roots.body) {
     const r = roots.r;
     x.note = roots.sealedWhole ? 'The tree service answered with a sealed listing this browser has no key for: ' + roots.sealedWhole.error
       : r.status === 502 ? 'The tree service is not reachable through the proxy (502): it may still be starting. Showing core documents.'
-        : r.status === 404 ? `No tree service behind the proxy serves a catalog named ${C.ns} (404): add it to the tree service's -catalog flags, or map it to its own with the core's -tree-url ${C.ns}=URL. Showing core documents.`
+        : r.status === 404 ? `No tree service behind the proxy serves a catalog named ${C.ns} (404): add it to the tree service's --catalog flags, or map it to its own with the core's --tree-url ${C.ns}=URL. Showing core documents.`
           : `The tree service answered ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}. Showing core documents.`;
     return x;
   }
@@ -3818,11 +3818,11 @@ async function runExampleAll() {
  * ------------------------------------------------------------------ */
 const INDEX = '/playground/index';
 const SR = {
-  proxy: null, status: null, indexed: [], // the proxy exists (-index-url); GET /_status of the index
+  proxy: null, status: null, indexed: [], // the proxy exists (--index-url); GET /_status of the index
   ns: '', info: null, q: null, next: '', at: '', view: '', hits: [], counts: null, state: '', note: '', busy: false, gen: 0,
 };
 
-/* probeIndex asks the core whether it proxies a search index (-index-url), and what the index follows (/_status). */
+/* probeIndex asks the core whether it proxies a search index (--index-url), and what the index follows (/_status). */
 async function probeIndex() {
   const p = await api('GET', `${INDEX}/`, { auto: true, label: 'index' });
   SR.proxy = p.status === 200 && !!p.json && p.json.proxy === 'index';
@@ -3954,7 +3954,7 @@ function srFailure(ns, res) {
     : r.neterr ? 'Network error: ' + r.neterr
       : r.status === 502 ? 'The search index is not reachable through the proxy (502): it may still be starting.'
         : r.status === 404 && st && st.skipped ? `The index follows ${ns} but lacks its keys (404): ${st.reason || ''}`
-          : r.status === 404 ? `The index does not serve a namespace named ${ns} (404): it follows ${SR.indexed.length ? SR.indexed.join(', ') : 'only what its -ns flag lists'}.`
+          : r.status === 404 ? `The index does not serve a namespace named ${ns} (404): it follows ${SR.indexed.length ? SR.indexed.join(', ') : 'only what its --ns flag lists'}.`
             : r.status === 401 || r.status === 403 ? `The index refused the read (${r.status}): ${ns} is not public; put a read grant in the connection bar's bearer field.`
               : r.status === 503 ? `The index has not reached ${ns} yet (503 ${(r.json && r.json.code) || ''}): ${(r.json && r.json.message) || ''}`
                 : `The index answered ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}${r.json && r.json.message ? ': ' + r.json.message : ''}`;
@@ -4021,7 +4021,7 @@ function renderSearch() {
   if (SR.proxy !== null) markService('sr', !SR.proxy, '(not configured)');
   if (SR.proxy === false) {
     $('srStatus').replaceChildren();
-    return srMessage('info', 'Search needs the index service (Addendum A). Start the core with -index-url (compose does) to read it through the same-origin proxy at /playground/index/. Without it there is nothing to query: the core has no search of its own.');
+    return srMessage('info', 'Search needs the index service (Addendum A). Start the core with --index-url (compose does) to read it through the same-origin proxy at /playground/index/. Without it there is nothing to query: the core has no search of its own.');
   }
   if (SR.state !== 'ok') return;
   const st = srStatusOf(SR.ns);
@@ -4095,7 +4095,7 @@ function renderSIFetch() {
   markService('si', !p, '(not configured)');
   if (!p) { note.textContent = 'The core has no schema import endpoint (this playground is served without it): nothing to plan with.'; $('siPlan').disabled = true; return; }
   $('siPlan').disabled = SI.busy;
-  if (!p.fetch) { note.textContent = 'URL fetching is disabled on this server (serve -schema-fetch). Upload or paste schema files instead; $refs between them are resolved by file name.'; return; }
+  if (!p.fetch) { note.textContent = 'URL fetching is disabled on this server (serve --schema-fetch). Upload or paste schema files instead; $refs between them are resolved by file name.'; return; }
   note.textContent = p.hosts && p.hosts.length
     ? 'The core fetches URLs from these hosts only: ' + p.hosts.join(', ') + '.'
     : 'The core fetches URLs from public addresses only (private, loopback and link-local ones are refused).';

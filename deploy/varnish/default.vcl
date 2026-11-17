@@ -22,13 +22,13 @@ vcl 4.1;
 #   caches it publicly. Responses the origin marks `private` (non-public
 #   namespaces, §9 and §C.5) are not cached here, because this CDN doesn't
 #   verify edge grants: a cached copy would go to any caller. The origins run
-#   without -edge-secret, so they already mark those responses
+#   without --edge-secret, so they already mark those responses
 #   CDN-Cache-Control: no-store; this rule is belt and braces. The one
 #   exception is a response that also says `Vary: Authorization`, which is
 #   cached per credential.
 # - `PURGE` (or `BAN`) with `X-Purge-Tags: tag1 tag2 …` from the compose
 #   network bans every object whose Cache-Tag lists any of the tags, as a
-#   whole token. That is what internal/cdnpurge sends (-purge-url).
+#   whole token. That is what internal/cdnpurge sends (--purge-url).
 # - Identical misses are collapsed onto one backend request (Varnish's
 #   waiting list), which is what §7.7's long-poll URLs are built for. Event
 #   streams (…/events) are passed and streamed unbuffered.
@@ -43,7 +43,7 @@ import std;
 # stale-while-revalidate) and a quick 503 otherwise. Every origin answers
 # /_health without touching its database, 200 while serving and 503 once it
 # drains for shutdown, so a stopping origin leaves rotation (with several
-# instances behind one director, give them a -shutdown-delay of a probe
+# instances behind one director, give them a --shutdown-delay of a probe
 # interval or two).
 probe core_up {
 	.url = "/_health";
@@ -179,7 +179,7 @@ sub purge_tags {
 
 sub vcl_hash {
 	# The listener picks the origin; the Host header doesn't matter to the
-	# origins (they build URLs from -origin), so localhost:8080 and
+	# origins (they build URLs from --origin), so localhost:8080 and
 	# 127.0.0.1:8080 share one copy.
 	hash_data(local.socket);
 	hash_data(req.url);

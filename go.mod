@@ -3,6 +3,7 @@ module github.com/middle-management/patchlog
 go 1.26.1
 
 require (
+	github.com/alexflint/go-arg v1.6.1
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/klauspost/compress v1.20.2
 	github.com/middle-management/mmmigrate v0.7.0
@@ -27,7 +28,6 @@ require (
 )
 
 require (
-	github.com/alexflint/go-arg v1.6.1 // indirect
 	github.com/alexflint/go-scalar v1.2.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

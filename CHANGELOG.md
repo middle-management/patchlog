@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **The CLI parses its flags with go-arg.** Help is generated: `patchlog <command> --help`.
+  The docs and examples now write flags as `--flag` (`patchlog serve --addr :8080 --db x.db`).
+  The single-dash spellings (`-addr :8080`) still parse, so existing scripts and compose files
+  keep working.
+
 ## v0.29.0
 
 - **Capacity: large documents measured again** with the server's own validator, on the

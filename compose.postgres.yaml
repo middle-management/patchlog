@@ -6,7 +6,7 @@
 #
 # The core reads its database URL from PATCHLOG_DB (so the password stays
 # out of its arguments). Blob bytes go to files in the data volume
-# (-blob-dir); more core instances would all mount that same volume. The
+# (--blob-dir); more core instances would all mount that same volume. The
 # search index and tree service keep their own SQLite databases in the data
 # volume: they are derived state, rebuilt from the core's API.
 # `docker compose down -v` wipes Postgres's volume too.
@@ -30,22 +30,22 @@ services:
   patchlog:
     environment:
       PATCHLOG_DB: postgres://patchlog:patchlog@postgres:5432/patchlog?sslmode=disable
-    # compose.yaml's command without -db (PATCHLOG_DB names the database).
+    # compose.yaml's command without --db (PATCHLOG_DB names the database).
     command:
       - serve
-      - -dev
-      - -addr=:8080
-      - -origin=${PATCHLOG_ORIGIN:-http://localhost:8080}
-      - -blob-dir=/data/blobs
-      - -archive=file:///data/archive
-      - -master-key=/data/master.key
-      - -master-key-create
-      - -tree-url=http://tree:8082
-      - -index-url=http://index:8081
-      - -schema-fetch
-      - -schema-fetch-hosts=www.schemastore.org,json.schemastore.org,raw.githubusercontent.com
-      - -purge-url=http://cdn:8080/
-      - -shutdown-timeout=20s
+      - --dev
+      - --addr=:8080
+      - --origin=${PATCHLOG_ORIGIN:-http://localhost:8080}
+      - --blob-dir=/data/blobs
+      - --archive=file:///data/archive
+      - --master-key=/data/master.key
+      - --master-key-create
+      - --tree-url=http://tree:8082
+      - --index-url=http://index:8081
+      - --schema-fetch
+      - --schema-fetch-hosts=www.schemastore.org,json.schemastore.org,raw.githubusercontent.com
+      - --purge-url=http://cdn:8080/
+      - --shutdown-timeout=20s
     depends_on:
       postgres:
         condition: service_healthy

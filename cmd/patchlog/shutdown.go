@@ -3,36 +3,22 @@ package main
 import (
 	"context"
 	"errors"
-	"flag"
 	"log"
 	"net"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
-// shutdownFlags are the -shutdown-* flags of serve, index and tree.
-type shutdownFlags struct {
-	timeout, delay *time.Duration
-}
-
-func addShutdownFlags(fs *flag.FlagSet) *shutdownFlags {
-	return &shutdownFlags{
-		timeout: fs.Duration("shutdown-timeout", lifecycle.DefaultTimeout, "on SIGTERM/SIGINT, how long in-flight requests are waited for before they are cancelled (long-polls and event streams end at once)"),
-		delay:   fs.Duration("shutdown-delay", 0, "on SIGTERM/SIGINT, how long to keep serving with "+lifecycle.HealthPath+" answering 503 before stopping, so load balancers take the instance out of rotation first"),
-	}
-}
-
 // server wraps srv with the health endpoints (ready: /_ready's check, may
 // be nil) and the phased shutdown the flags configure.
-func (f *shutdownFlags) server(name string, srv *http.Server, ready func(context.Context) error) *lifecycle.Server {
+func (f *shutdownArgs) server(name string, srv *http.Server, ready func(context.Context) error) *lifecycle.Server {
 	allowH2C(srv)
 	// Traced inside the health endpoints lifecycle adds: probes aren't.
 	srv.Handler = telemetry.Handler(srv.Handler)
-	return lifecycle.New(srv, lifecycle.Options{Name: name, Timeout: *f.timeout, Delay: *f.delay, Ready: ready, Logf: log.Printf})
+	return lifecycle.New(srv, lifecycle.Options{Name: name, Timeout: f.ShutdownTimeout, Delay: f.ShutdownDelay, Ready: ready, Logf: log.Printf})
 }
 
 // allowH2C lets srv speak HTTP/2 without TLS (h2c, prior knowledge), as

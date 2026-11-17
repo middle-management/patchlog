@@ -36,7 +36,7 @@ import (
 type legacyE2E struct {
 	raised, remote []string
 	// pendingOnly: found in legacy_e2e_pending alone, the marker tables
-	// gone (a -purge-raised-e2e start that didn't finish).
+	// gone (a --purge-raised-e2e start that didn't finish).
 	pendingOnly bool
 }
 
@@ -57,8 +57,8 @@ func (l *legacyE2E) names() string {
 // errLegacyE2E is Open's refusal of a database that holds them.
 func errLegacyE2E(l *legacyE2E) error {
 	if l.pendingOnly {
-		return fmt.Errorf("core: a start with -purge-raised-e2e migrated this database but didn't finish purging what was stored before a raise to e2e, which this version would serve weaker than it was stored (Addendum E Levels; v0.78): %s. "+
-			"Start again with -purge-raised-e2e, which purges them and their local branches, destroying their keys: they then answer 410 purged", l.names())
+		return fmt.Errorf("core: a start with --purge-raised-e2e migrated this database but didn't finish purging what was stored before a raise to e2e, which this version would serve weaker than it was stored (Addendum E Levels; v0.78): %s. "+
+			"Start again with --purge-raised-e2e, which purges them and their local branches, destroying their keys: they then answer 410 purged", l.names())
 	}
 	return fmt.Errorf("core: this database holds content stored before a raise to e2e, which a namespace can no longer have (Addendum E Levels; v0.78) and this version would serve weaker than it was stored: %s. "+
 		"No reference tool makes it end-to-end: the importer takes an e2e namespace only under its own name, and no plaintext into one, "+
@@ -66,7 +66,7 @@ func errLegacyE2E(l *legacyE2E) error {
 		"to keep its content end-to-end, a key holder writes it into a new e2e namespace, with a third-party importer that re-seals it "+
 		"or by recreating its current documents with a client (CreateDocSealed). Then purge it, its local branches first; "+
 		"a remote branch is purged and created again against a source that is e2e from its creation. "+
-		"Or start once with -purge-raised-e2e, which purges them and their local branches now, destroying their keys and content: they then answer 410 purged", l.names())
+		"Or start once with --purge-raised-e2e, which purges them and their local branches now, destroying their keys and content: they then answer 410 purged", l.names())
 }
 
 // tableExists reports whether the schema has table name, before
@@ -83,7 +83,7 @@ func tableExists(db *sql.DB, pg bool, name string) (bool, error) {
 	return n > 0, err
 }
 
-// legacyPendingTable records, from a start with -purge-raised-e2e, what
+// legacyPendingTable records, from a start with --purge-raised-e2e, what
 // it is to purge (recordLegacyE2E): kind 'raised' or 'remote' and the
 // name, kept until the purges commit (purgeRaisedE2E).
 const legacyPendingTable = "legacy_e2e_pending"
@@ -152,7 +152,7 @@ func checkLegacyE2E(db *sql.DB, pg bool) (*legacyE2E, error) {
 
 // recordLegacyE2E records l in legacy_e2e_pending and commits, before
 // migration 016 drops the marker tables, so that what a start with
-// -purge-raised-e2e is to purge stays marked until purgeRaisedE2E does.
+// --purge-raised-e2e is to purge stays marked until purgeRaisedE2E does.
 func recordLegacyE2E(db *sql.DB, pg bool, l *legacyE2E) error {
 	if l.empty() {
 		return nil
@@ -229,7 +229,7 @@ func (e *Engine) purgeRaisedE2E(ctx context.Context, l *legacyE2E) error {
 				continue
 			}
 			t.purgeNSNow(n, false, author)
-			log.Printf("purged namespace %s at start (-purge-raised-e2e): it held content stored before a raise to e2e (Addendum E Levels)", n.name)
+			log.Printf("purged namespace %s at start (--purge-raised-e2e): it held content stored before a raise to e2e (Addendum E Levels)", n.name)
 		}
 		return nil
 	})

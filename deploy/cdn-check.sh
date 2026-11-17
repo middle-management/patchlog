@@ -120,7 +120,7 @@ while :; do
   get "$CDN/r/cdncheck/$name/rev/$rev1"
   [ "$(hdr X-Cache)" = HIT ] || break
   i=$((i + 1))
-  [ $i -le 25 ] || fail "revision still cached 5 s after the purge (is -purge-url set on the core?)"
+  [ $i -le 25 ] || fail "revision still cached 5 s after the purge (is --purge-url set on the core?)"
 done
 show "revision after" ""
 expect "revision after the purge" "$(hdr X-Cache)" MISS

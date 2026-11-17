@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -14,74 +13,73 @@ import (
 	"github.com/middle-management/patchlog/internal/schemaimport"
 )
 
-const schemaUsage = "usage: patchlog schema import -api URL -ns NS [-bearer GRANT] [-author A] [-name NAME] [-dry-run] [-json] [-declare-schema] [-max-docs N] [-max-bytes N] [-timeout D] URL|FILE..."
-
-// schemaCmd is `patchlog schema import`: external JSON Schemas into a
-// namespace as schema resources, references pinned to revision paths (§6.1).
-func schemaCmd(args []string) {
-	if len(args) < 1 || args[0] != "import" {
-		fmt.Fprintln(os.Stderr, schemaUsage)
-		os.Exit(2)
-	}
-	os.Exit(schemaImport(context.Background(), args[1:], os.Stdout, os.Stderr))
+// schemaCmd is patchlog schema import.
+type schemaCmd struct {
+	Import *schemaImportCmd `arg:"subcommand:import" help:"import external JSON Schemas into a namespace as schema resources"`
 }
 
-func schemaImport(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("schema import", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	api := fs.String("api", "", "base URL of the deployment (optional with -dry-run: then every resource is planned as a create)")
-	ns := fs.String("ns", "", "target namespace (not a branch)")
-	bearer := fs.String("bearer", "", "grant (Authorization: Bearer)")
-	author := fs.String("author", "", "X-Author (development mode)")
-	name := fs.String("name", "", "resource name of the root schema (default: from its URL)")
-	dry := fs.Bool("dry-run", false, "fetch, convert, compile and print the plan; write nothing")
-	asJSON := fs.Bool("json", false, "print the result as JSON")
-	maxDocs := fs.Int("max-docs", schemaimport.DefaultMaxDocs, "most documents to fetch")
-	maxBytes := fs.Int64("max-bytes", schemaimport.DefaultMaxBytes, "most bytes to fetch, in total")
-	timeout := fs.Duration("timeout", schemaimport.DefaultTimeout, "timeout of each fetch")
-	declare := fs.Bool("declare-schema", false, "add a $schema property to schemas that are closed at the document root, for servers before spec v0.36 (patchlog before v0.7.0), which validated it")
-	fs.Usage = func() { fmt.Fprintln(stderr, schemaUsage); fs.PrintDefaults() }
-	if err := fs.Parse(args); err != nil {
-		return 2
+// schemaImportCmd imports external JSON Schemas into a namespace as schema
+// resources, references pinned to revision paths (§6.1).
+type schemaImportCmd struct {
+	API           string        `arg:"--api" placeholder:"URL" help:"base URL of the deployment (optional with --dry-run: then every resource is planned as a create)"`
+	NS            string        `arg:"--ns,required" help:"target namespace (not a branch)"`
+	Bearer        string        `arg:"--bearer" placeholder:"GRANT" help:"grant (Authorization: Bearer)"`
+	Author        string        `arg:"--author" placeholder:"NAME" help:"X-Author (development mode)"`
+	Name          string        `arg:"--name" help:"resource name of the root schema (default: from its URL)"`
+	DryRun        bool          `arg:"--dry-run" help:"fetch, convert, compile and print the plan; write nothing"`
+	JSON          bool          `arg:"--json" help:"print the result as JSON"`
+	MaxDocs       int           `arg:"--max-docs" default:"100" placeholder:"N" help:"most documents to fetch"`
+	MaxBytes      int64         `arg:"--max-bytes" default:"33554432" placeholder:"N" help:"most bytes to fetch, in total"`
+	Timeout       time.Duration `arg:"--timeout" default:"30s" placeholder:"DURATION" help:"timeout of each fetch"`
+	DeclareSchema bool          `arg:"--declare-schema" help:"add a $schema property to schemas that are closed at the document root, for servers before spec v0.36 (patchlog before v0.7.0), which validated it"`
+	Sources       []string      `arg:"positional,required" placeholder:"URL|FILE" help:"the schemas to import"`
+}
+
+func (a *schemaImportCmd) run(string) {
+	if code := a.importSchemas(context.Background(), os.Stdout, os.Stderr); code != 0 {
+		os.Exit(code)
 	}
-	if *ns == "" || fs.NArg() == 0 || (*api == "" && !*dry) {
-		fs.Usage()
+}
+
+func (a *schemaImportCmd) importSchemas(ctx context.Context, stdout, stderr io.Writer) int {
+	if a.API == "" && !a.DryRun {
+		fmt.Fprintln(stderr, "schema import: --api is required without --dry-run")
 		return 2
 	}
 	var c *client.Client
-	if *api != "" {
+	if a.API != "" {
 		var opts []client.Option
-		if *bearer != "" {
-			opts = append(opts, client.WithBearer(*bearer))
+		if a.Bearer != "" {
+			opts = append(opts, client.WithBearer(a.Bearer))
 		}
-		if *author != "" {
-			opts = append(opts, client.WithAuthor(*author))
+		if a.Author != "" {
+			opts = append(opts, client.WithAuthor(a.Author))
 		}
 		var err error
-		if c, err = client.New(*api, opts...); err != nil {
+		if c, err = client.New(a.API, opts...); err != nil {
 			fmt.Fprintln(stderr, err)
 			return 2
 		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
-	res, err := schemaimport.Plan(ctx, c, fs.Args(), schemaimport.Options{
-		NS: *ns, Name: *name, MaxDocs: *maxDocs, MaxBytes: *maxBytes, Timeout: *timeout, DeclareSchema: *declare,
+	res, err := schemaimport.Plan(ctx, c, a.Sources, schemaimport.Options{
+		NS: a.NS, Name: a.Name, MaxDocs: a.MaxDocs, MaxBytes: a.MaxBytes, Timeout: a.Timeout, DeclareSchema: a.DeclareSchema,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "schema import:", err)
 		return 1
 	}
 	written := false
-	if !*dry && res.Changed() {
+	if !a.DryRun && res.Changed() {
 		if err := res.Write(ctx, c); err != nil {
 			fmt.Fprintln(stderr, "schema import:", err)
 			return 1
 		}
 		written = true
 	}
-	if *asJSON {
-		out := map[string]any{"ns": res.NS, "dryRun": *dry, "written": written, "entries": res.Entries}
+	if a.JSON {
+		out := map[string]any{"ns": res.NS, "dryRun": a.DryRun, "written": written, "entries": res.Entries}
 		if len(res.Bundled) > 0 {
 			out["bundled"] = res.Bundled
 		}
@@ -110,7 +108,7 @@ func schemaImport(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 	tw.Flush()
 	switch {
-	case *dry:
+	case a.DryRun:
 		fmt.Fprintln(stderr, "dry run: nothing written")
 	case !written:
 		fmt.Fprintln(stderr, "nothing to write: every schema is unchanged")

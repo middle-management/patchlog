@@ -19,14 +19,14 @@ import (
 // non-zero.
 func TestV081MigrateKeyringRemoved(t *testing.T) {
 	t.Parallel()
-	var out, errw bytes.Buffer
-	if code := runE2E([]string{"migrate-keyring", "-ns", "e", "-identity", "x"}, &out, &errw); code == 0 {
+	code, msg := runStatus("e2e", "migrate-keyring", "-ns", "e", "-identity", "x")
+	if code == 0 {
 		t.Fatalf("migrate-keyring exited 0")
 	}
-	if msg := errw.String(); !strings.Contains(msg, "removed in v0.81") || !strings.Contains(msg, "v0.26.1") || out.Len() != 0 {
-		t.Fatalf("migrate-keyring said %q / %q", msg, out.String())
+	if !strings.Contains(msg, "removed in v0.81") || !strings.Contains(msg, "v0.26.1") {
+		t.Fatalf("migrate-keyring said %q", msg)
 	}
-	if code := runE2E(nil, &out, &errw); code != 2 {
+	if code, _ := runStatus("e2e"); code != 2 {
 		t.Fatalf("no subcommand: %d", code)
 	}
 }
@@ -55,7 +55,8 @@ func TestV081SealStatusCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errw bytes.Buffer
-	if code := runE2E([]string{"seal-status", "-api", s.URL, "-author", "alice", "-ns", "e", "-name", "d", "-json"}, &out, &errw); code != 0 {
+	cmd := command(t, "e2e", "seal-status", "--api", s.URL, "--author", "alice", "--ns", "e", "--name", "d", "--json").(*sealStatusCmd)
+	if code := cmd.sealStatus(&out, &errw); code != 0 {
 		t.Fatalf("seal-status: %d %s", code, errw.String())
 	}
 	var got map[string]any
@@ -69,7 +70,7 @@ func TestV081SealStatusCommand(t *testing.T) {
 	if !strings.Contains(line, "rotation due") {
 		t.Fatalf("line %q", line)
 	}
-	if code := runE2E([]string{"seal-status", "-api", s.URL}, &out, &errw); code != 2 {
-		t.Fatalf("seal-status without -ns and -name: %d", code)
+	if code, _ := runStatus("e2e", "seal-status", "--api", s.URL); code != 2 {
+		t.Fatalf("seal-status without --ns and --name: %d", code)
 	}
 }

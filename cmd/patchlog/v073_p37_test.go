@@ -1,7 +1,6 @@
 package main
 
 import (
-	"flag"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +20,7 @@ func TestV073P37IndexEdgeGrantFlags(t *testing.T) {
 	if err := os.WriteFile(k1, []byte("the index's key, sixteen bytes or more\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cors := addCORSFlags(flag.NewFlagSet("t", flag.ContinueOnError))
+	cors := &corsArgs{}
 	ck, err := indexEdgeGrantCookies("index", []string{"origin"}, nil, nil, cors)
 	if err != nil || ck.Kid() != "index" {
 		t.Fatalf("random key: %v %v", ck, err)

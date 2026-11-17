@@ -127,7 +127,7 @@ func (st *reqState) scratchSet(name string, f *scratchFile) error {
 		return err
 	}
 	if len(f.data) > s.opt.MaxFileSize {
-		return overLimit("-max-file-size", int64(len(f.data)), int64(s.opt.MaxFileSize), "(this gateway's bound on a temporary file, kept in its memory)")
+		return overLimit("--max-file-size", int64(len(f.data)), int64(s.opt.MaxFileSize), "(this gateway's bound on a temporary file, kept in its memory)")
 	}
 	now := s.opt.Now()
 	f.mod, f.used = now, now

@@ -164,7 +164,7 @@ type Options struct {
 	// catalog service's listings depend on the subject set alone.
 	EdgeGrants *edge.Cookies
 	// EdgeGrantsOwnKey says EdgeGrants' key was made for this Service
-	// alone (a random one, -edge-grant-key not given): no cookie under it
+	// alone (a random one, --edge-grant-key not given): no cookie under it
 	// was minted before Open or by another instance, so the record of
 	// when each g/all cookie was first issued is exact. Otherwise a g/all
 	// cookie counts as issued at its exp less the longest lifetime
