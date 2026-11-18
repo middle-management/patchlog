@@ -4311,6 +4311,11 @@ The last row is the root: paste its path into a document's `$schema` (or another
 
 ### A short tour (dev mode)
 
+For how a client should cut its writes (small patch sets, gestures, retries, splitting large
+changes), when to work in a branch, and how to merge, squash and rebase, see the client guide
+[.claude/skills/patchlog-client/SKILL.md](.claude/skills/patchlog-client/SKILL.md). It is also a
+Claude Code skill: copy the folder into another project's `.claude/skills/` to use it there.
+
 The client commands call the public API (§7) through `internal/client`. Every write is
 conditional (§7.2), and they supply the precondition: `put` and `ns create` send
 `If-None-Match: *`, `patch` appends to the head it reads (trying again if another writer got
