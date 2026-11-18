@@ -4313,7 +4313,8 @@ The last row is the root: paste its path into a document's `$schema` (or another
 
 For how a client should cut its writes (small patch sets, gestures, retries, splitting large
 changes), when to work in a branch, and how to merge, squash and rebase, see the client guide
-[.claude/skills/patchlog-client/SKILL.md](.claude/skills/patchlog-client/SKILL.md). It is also a
+[.claude/skills/patchlog-client/SKILL.md](.claude/skills/patchlog-client/SKILL.md), with each command
+mapped to its HTTP requests in [http.md](.claude/skills/patchlog-client/http.md). It is also a
 Claude Code skill: copy the folder into another project's `.claude/skills/` to use it there.
 
 The client commands call the public API (§7) through `internal/client`. Every write is

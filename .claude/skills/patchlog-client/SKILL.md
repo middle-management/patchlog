@@ -11,6 +11,10 @@ audit trail, so **how you cut your writes matters as much as what they write.** 
 the practical part of TOOLS.md §11 (client behaviour) and Addendum F (branches), plus the
 `patchlog` CLI. The spec sections are named in brackets so you can check details.
 
+**HTTP clients:** the examples use the `patchlog` CLI, but every rule here is about the HTTP
+API. [http.md](http.md) maps each CLI command to its request, shows the save loop and batch
+bodies, and spells out merge and rebase as plain requests.
+
 ## Mental model (read first)
 
 - **Resource** `/r/{ns}/{name}`: one JSON document plus its log of revisions. The head is
@@ -179,6 +183,10 @@ patchlog merge status --branch fix-scores           # per resource: ahead, behin
 patchlog merge plan   --branch fix-scores           # the batch, plus a server dry run
 patchlog merge apply  --branch fix-scores --freeze  # one batch into the base, then freeze with merged.at
 ```
+
+Over HTTP, a merge is a sequence of reads and one batch: [http.md, Merge by hand](http.md#merge-by-hand).
+`merge plan --json` prints the exact batch body, so an HTTP client can submit a plan the CLI
+made.
 
 What the planner does per resource (§F.3):
 
