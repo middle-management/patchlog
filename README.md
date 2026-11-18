@@ -1260,6 +1260,35 @@ body is capped at 16 MiB and 50 files. The demo composes pass
 Run it with `./patchlog serve --dev` and open `http://localhost:8080/playground/`. Sealed and e2e
 namespaces need `--master-key FILE --master-key-create`.
 
+#### Playground on GitHub Pages
+
+The same page is published at **https://middle-management.github.io/patchlog/** by
+`.github/workflows/pages.yml` on every push to `main` that touches `internal/playground/static`.
+There it is standalone: it calls the server in the **Server** box of its top bar
+(`http://localhost:8080` until changed; `?server=URL` sets it too and makes a link to share), and
+that server has to allow the page's origin:
+
+```bash
+./patchlog serve --dev --cors-origin https://middle-management.github.io
+```
+
+or, for the compose stack, `PATCHLOG_CORS_ORIGINS=https://middle-management.github.io make up`.
+Until `GET /` answers, the page says so and shows the command for its own origin. Only the
+server's origin counts (the API is at its root), and a server on another port of `localhost` gets
+`--addr` in the suggested command. An HTTPS page can call plain `http://` on `localhost` only;
+any other server needs `https://`. Chrome may ask once whether the page may reach the local
+network.
+
+The page tells the two apart by its path: under `/playground/` it is the server's own and calls
+its origin, with the CSP header above; anywhere else it is standalone. The Pages copy carries the
+CSP as a meta tag, with `connect-src` open to `http:` and `https:` for the server it is pointed at.
+The tree and index proxies, the merge and schema-import planners and `selftest.json`'s vectors
+work as on the server (the vectors are the page's own file), and the namespaces, keys and boxes
+kept in localStorage belong to the Pages origin, shared by every server it is pointed at.
+
+To serve the copy yourself, any static file server will do, e.g. `python3 -m http.server -d
+internal/playground/static 8000` with `--cors-origin http://localhost:8000`.
+
 ### Undo and redo (§11.2)
 
 A client sends a `Gesture` with every write a user action produces (`client.NewGesture`,

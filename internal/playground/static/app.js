@@ -94,6 +94,22 @@ async function copy(text, what) {
   } catch (_) { toast('Copy failed'); }
 }
 
+/* Where the API is. Served by `patchlog serve`, the page is at /playground/ on the API's own origin and calls it
+ * there (BASE ''). Anywhere else, such as the GitHub Pages copy, it is standalone and calls the server named by
+ * ?server= or the Server box (kept in this browser), http://localhost:8080 until one is given; that server has to
+ * allow this page's origin (serve --cors-origin). Only the server's origin counts: the API is at its root. */
+const STANDALONE = !location.pathname.startsWith('/playground/');
+const DEFAULT_SERVER = 'http://localhost:8080';
+function serverOrigin(s) {
+  try { const u = new URL(String(s || '').trim()); return /^https?:$/.test(u.protocol) ? u.origin : ''; } catch (_) { return ''; }
+}
+const BASE = STANDALONE
+  ? serverOrigin(new URLSearchParams(location.search).get('server')) || serverOrigin(store.get('pl.server', '')) || DEFAULT_SERVER
+  : '';
+if (STANDALONE) store.set('pl.server', BASE);
+/* entryURL is the absolute URL an inspector entry requested: the API's, or the page's own for its static files. */
+const entryURL = (e) => (e.local ? new URL(e.path, location.href).href : (BASE || location.origin) + e.path);
+
 /* ------------------------------------------------------------------ *
  * state
  * ------------------------------------------------------------------ */
@@ -125,7 +141,7 @@ function toCurl(e) {
   if (e.sse) parts[0] = 'curl -i -N';
   if (e.method !== 'GET' && !e.sse) parts.push('-X ' + e.method);
   if (e.redirected) parts.push('-L');
-  parts.push(sq(location.origin + e.path));
+  parts.push(sq(entryURL(e)));
   for (const [k, v] of Object.entries(e.reqHeaders)) parts.push('-H ' + sq(k + ': ' + v));
   if (e.reqBody !== undefined) parts.push('--data-raw ' + sq(e.reqBody));
   else if (e.reqNote) parts.push('--data-binary @FILE');
@@ -184,7 +200,7 @@ function renderEntry(e) {
   }
   body.append(h('div', {},
     h('h3', {}, 'Request'),
-    h('div', { class: 'mono' }, e.method + ' ' + location.origin + e.path),
+    h('div', { class: 'mono' }, e.method + ' ' + entryURL(e)),
     Object.keys(e.reqHeaders).length ? reqHdrs : h('div', { class: 'muted small' }, '(no custom headers)'),
     e.reqBody !== undefined ? h('div', { style: 'margin-top:4px' }, jsonPre(pretty(e.reqBody))) : null,
     e.reqNote ? h('div', { class: 'muted small' }, e.reqNote) : null));
@@ -222,7 +238,7 @@ function renderEntry(e) {
 
   const actions = h('div', { class: 'actions' },
     h('button', { class: 'tiny', onclick: () => copy(toCurl(e), 'curl command') }, 'Copy as curl'),
-    h('button', { class: 'tiny', onclick: () => copy(location.origin + e.path, 'URL') }, 'Copy URL'),
+    h('button', { class: 'tiny', onclick: () => copy(entryURL(e), 'URL') }, 'Copy URL'),
     e.resBody ? h('button', { class: 'tiny', onclick: () => copy(e.resBody, 'response body') }, 'Copy response') : null);
   body.append(actions);
 
@@ -308,7 +324,8 @@ function authHeaders() {
   return hd;
 }
 
-/* api(method, path, {headers, body, ct, auto, label, stream, raw, binary, cache}) -> Response wrapper.
+/* api(method, path, {headers, body, ct, auto, label, stream, raw, binary, cache, local}) -> Response wrapper.
+ * path is the API's, sent to BASE; with local, it is one of the page's own files, relative to the page.
  * raw sends body (bytes) as is, binary keeps a 2xx body as bytes (wrapper .bin) instead of text. cache is the
  * fetch cache mode, 'no-store' unless given (tree listings use the HTTP cache, see treeGet). */
 async function api(method, path, o = {}) {
@@ -317,11 +334,11 @@ async function api(method, path, o = {}) {
   let body = o.body;
   if (body !== undefined && typeof body !== 'string' && !o.raw) body = JSON.stringify(body);
   if (body !== undefined && !headers['Content-Type']) headers['Content-Type'] = o.ct || 'application/json';
-  const e = newEntry({ method, path, reqHeaders: headers, reqBody: o.raw ? undefined : body, reqNote: o.raw ? `(${body.length} bytes of binary data, not shown)` : '', auto: !!o.auto && !insp.manual, label: o.label !== undefined ? o.label : insp.label });
+  const e = newEntry({ method, path, local: !!o.local, reqHeaders: headers, reqBody: o.raw ? undefined : body, reqNote: o.raw ? `(${body.length} bytes of binary data, not shown)` : '', auto: !!o.auto && !insp.manual, label: o.label !== undefined ? o.label : insp.label });
   const t0 = performance.now();
   const ctl = new AbortController();
   try {
-    const res = await fetch(path, { method, headers, body, cache: o.cache || 'no-store', redirect: 'follow', credentials: 'same-origin', signal: ctl.signal });
+    const res = await fetch(o.local ? path : BASE + path, { method, headers, body, cache: o.cache || 'no-store', redirect: 'follow', credentials: 'same-origin', signal: ctl.signal });
     e.status = res.status; e.statusText = res.statusText; e.resHeaders = res.headers;
     e.redirected = res.redirected;
     if (res.redirected) { const u = new URL(res.url); e.finalPath = u.pathname + u.search; }
@@ -381,13 +398,50 @@ function initConn() {
   $('bearer').value = store.get('pl.bearer', '');
   $('author').addEventListener('input', () => store.set('pl.author', $('author').value));
   $('bearer').addEventListener('input', () => { store.set('pl.bearer', $('bearer').value); updateLiveWarn(); });
+  if (STANDALONE) initServerBox();
   api('GET', '/', { label: 'connect' }).then((r) => {
     // GET / (§7): { spec, auth: "grants" | "disabled", origin }.
     const j = r.ok && r.json;
     authDisabled = !!(j && j.auth === 'disabled');
     if (authDisabled) $('author').placeholder = `${DEV_AUTHOR} until set  (X-Author, serve --dev)`;
     $('origin').textContent = j && j.origin ? 'origin ' + j.origin + (j.auth === 'disabled' ? ' \u00b7 authentication disabled (development)' : '') : (r.neterr ? 'server unreachable' : 'HTTP ' + r.status);
+    if (STANDALONE && !(j && j.spec)) showConnHelp(r);
   });
+}
+
+/* The Server box, standalone only: a new server reloads the page with ?server=, which starts everything afresh
+ * against it and makes a link to share. */
+function initServerBox() {
+  $('serverBox').hidden = false;
+  const box = $('server');
+  box.value = BASE;
+  const go = () => {
+    const v = serverOrigin(box.value);
+    if (!v) { box.value = BASE; return toast('Server: give an http(s) URL, e.g. ' + DEFAULT_SERVER); }
+    if (v === BASE) { box.value = BASE; return; }
+    store.set('pl.server', v);
+    const u = new URL(location.href); u.searchParams.set('server', v); location.assign(u.href);
+  };
+  box.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') go(); });
+  box.addEventListener('change', go);
+}
+
+/* showConnHelp says how to start a server this standalone page can call, after GET / failed. A cross-origin
+ * request the server doesn't allow fails like an unreachable one (the browser hides which), so it covers both. */
+function showConnHelp(r) {
+  const loopback = /^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(BASE);
+  const port = new URL(BASE).port;
+  const cmd = `patchlog serve --dev --cors-origin ${location.origin}` + (loopback && port && port !== '8080' ? ` --addr :${port}` : '');
+  const why = r.neterr
+    ? `Can't reach ${BASE}, or it doesn't allow this page's origin (${location.origin}).`
+    : `${BASE} answered GET / with HTTP ${r.status}, not a patchlog server's description.`;
+  const kids = [h('b', {}, 'No patchlog server. '), why, ' Start one that allows this page:',
+    h('div', { class: 'row', style: 'margin:4px 0' }, h('code', {}, cmd), h('button', { class: 'tiny', onclick: () => copy(cmd, 'command') }, 'Copy')),
+    'Or name another server in the Server box. With docker compose: ', h('code', {}, `PATCHLOG_CORS_ORIGINS=${location.origin} make up`), '.'];
+  if (location.protocol === 'https:' && BASE.startsWith('http:') && !loopback) {
+    kids.push(h('div', {}, 'This page is served over HTTPS, so the browser blocks plain-HTTP servers other than localhost: give the server an https:// URL.'));
+  }
+  const el = $('connHelp'); el.replaceChildren(...kids); el.hidden = false;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1600,7 +1654,7 @@ function startStream(kind) {
   const url = liveUrl(kind);
   if (!url) { $(kind === 'ns' ? 'liveNs' : 'liveRes').checked = false; return toast(kind === 'ns' ? 'Select a namespace first' : 'Select a resource first'); }
   const entry = newEntry({ method: 'SSE', path: url, sse: true, reqHeaders: { Accept: 'text/event-stream' }, label: 'live ' + kind, resBody: '' });
-  const es = new EventSource(url);
+  const es = new EventSource(BASE + url);
   const s = streams[kind] = { es, url, entry, seen: new Set() };
   $(kind === 'ns' ? 'liveNsUrl' : 'liveResUrl').textContent = url;
   setStreamState(kind, 'connecting\u2026', 'warn');
@@ -2712,7 +2766,7 @@ async function runSelfTest() {
   const out = $('selfOut');
   out.className = ''; out.textContent = 'Running…';
   try {
-    const r = await api('GET', '/playground/selftest.json', { label: 'self-test' });
+    const r = await api('GET', 'selftest.json', { label: 'self-test', local: true });
     if (!r.ok || !r.json) throw new Error('selftest.json: HTTP ' + r.status);
     const res = await Z.selfTest(r.json);
     const ok = res.every((x) => x.ok);
