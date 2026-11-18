@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **The playground is published on GitHub Pages** (`.github/workflows/pages.yml`, at
+  https://middle-management.github.io/patchlog/). Away from `/playground/` the page is
+  standalone: a **Server** box (and `?server=URL`) names the patchlog server it calls,
+  `http://localhost:8080` by default, which allows the page with `--cors-origin`; until `GET /`
+  answers, the page shows the command to start one for its origin. Served by `patchlog serve`, it
+  calls its own origin as before. `selftest.json` is now read relative to the page. See README,
+  "Playground on GitHub Pages".
+
 ## v0.31.0
 
 Implements spec **v0.85** (previously **v0.84**). v0.85 is the spec's answer to the reference's
