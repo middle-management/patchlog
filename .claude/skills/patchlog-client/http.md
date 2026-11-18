@@ -4,7 +4,7 @@ Companion to [SKILL.md](SKILL.md) for clients that talk to the API directly: bro
 apps, services in other languages, or agents with only `curl`. Every `patchlog` client command is
 a thin wrapper over the requests below (§7 of [docs/SPEC.md](../../../docs/SPEC.md)). Merge and
 rebase are the exception: the tools run a whole client-side procedure (Addendum F), written out
-step by step in [Merge by hand](#merge-by-hand).
+in [merging.md](merging.md#merge-over-http).
 
 ## Conventions
 
@@ -108,61 +108,7 @@ Content-Type: application/json
 - A step can be an object, to give it its own gesture:
   `{"patches":[…],"gesture":"…","undoes":"…"}` or `{"delete":true}`.
 
-## Merge by hand
+## Merge and rebase
 
-What `patchlog merge plan/apply` does (§F.3). Below, BASE is the base namespace and BR the branch.
-
-1. **Pin the branch.** `GET /ns/BR` → `ns_id` of the branch (call it `AT`). Its document's
-   `base` gives BASE.
-2. **Collect** the resources BR changed: `GET /ns/BR/rev/{AT}/log?since=` (paged). Take every
-   `resource` of `head` and `tombstone` entries, and every resource named in `batch` entries.
-3. **Classify** each resource:
-   - `H` = BR's head as of `AT`. `B` = BASE's current head (`GET /r/BASE/{name}`: `302`, a
-     `410` tombstone, or a `404` absent).
-   - Read H's chain: `GET /r/BR/{name}/rev/{H}/log?since=`. It crosses into the base's
-     revisions up to the foreign parent.
-   - **`B == H`:** already merged, so no item.
-   - **`B` is in H's chain** (or the resource is absent in BASE and H's chain starts with BR's
-     own genesis): **fast-forward.** The item is `ifMatch: B` (or `ifNoneMatch: "*"`), with the
-     entries after `B` as steps: a `rev` entry gives `{"patches": entry.patches, "gesture",
-     "undoes"}`, and a `tombstone` gives `{"delete": true}`. The resulting ids equal the branch's.
-   - **`H` is in B's chain** (`GET /r/BASE/{name}/rev/{B}/log?since=`): the base already has it,
-     so no item.
-   - **Neither:** **replay.** Find the latest common ancestor `A`. Compare the paths written by
-     BR's entries after `A` with the paths written by BASE's entries after `A`, widening any
-     write into an array to its whole outermost array. If they overlap, or one side deleted what
-     the other changed, a person must resolve it. Otherwise the item is BR's entries after `A`
-     with `ifMatch: B`, and new ids result.
-4. **Dry run** `POST /ns/BASE/batch?dry-run=1` with the items and
-   `"source": {"ns": "BR", "at": "AT"}`. Add `Source-Authorization` with a grant on BR if your
-   own grant doesn't read it, so its blobs are available.
-5. **Submit** without `dry-run`. Items whose base moved fail with `412`: classify those again
-   and resubmit. Keep the same `AT`.
-6. **Freeze the branch:** `PATCH /ns/BR`, `If-Match: "{config_id}"`,
-   `[{"op":"add","path":"/frozen","value":true},{"op":"add","path":"/merged","value":{"at":"<X-Namespace-Revision of the merge>"}}]`.
-
-**Squash** an item instead of fast-forwarding or replaying it: one step, the diff from B's
-document to H's document. Leave `$nonce` out of the diff, and add a fresh one where the namespace
-requires nonces. For a resource absent in BASE, the step is `[{"op":"add","path":"","value":H's doc}]`;
-for one H deleted, the step is `"delete"`. Squashing loses gestures and the branch's ids.
-
-**Rebase** (§F.5) uses the same pieces:
-
-1. `POST /ns/BASE/branches` for the successor, giving it the old branch's `read`.
-2. Replay the old branch into it with batches carrying `source: {ns: old, at}`.
-3. One config write on the old branch: `{"frozen": true, "successor": "<new>"}`.
-
-**Prefer the tools for merges.** Classifying replays correctly means handling array widening,
-delete-versus-change, earlier merge batches as common ancestors (`merge.authors`), pruned
-history and nonces. That's about 2,000 lines in `internal/merge`, not counting releases. An
-HTTP-only client can still plan with the CLI, which writes nothing:
-
-```sh
-patchlog merge plan --branch BR --json > plan.json
-```
-
-`plan.json` holds the per-resource classification (`plan`), whether it is conflict-free
-(`clean`), the server's dry-run report (`dryRun`), and `batch`, the exact body for
-`POST /ns/BASE/batch`. The client can review it and then submit `batch` itself, or have a person
-run `merge apply`. Write your own merge
-only for the fast-forward case, which is safe and simple.
+Merge and rebase are client procedures made of these requests. For the steps as plain HTTP, see
+[merging.md, Merge over HTTP](merging.md#merge-over-http).
