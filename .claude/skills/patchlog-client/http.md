@@ -41,7 +41,7 @@ Response headers to keep:
 | `log NS/NAME` | `GET R/rev/{head}/log?since=` (empty `since` = from genesis), paged by `X-Log-Next` |
 | `log --follow`, `get --follow` | `GET R/events?since={id}` (SSE), or `GET R/log?since={id}&live=long-poll&cursor={c}` |
 | `put NS/NAME DOC` | `PATCH R`, `If-None-Match: *`, body `[{"op":"add","path":"","value":DOC}]` → `201` |
-| `patch NS/NAME '[…]'` | `PATCH R`, `If-Match: "{head}"` → `201`; `412 {head}` if someone wrote first |
+| `patch NS/NAME '[…]'` | `PATCH R`, `If-Match: "{head}"` → `201`; `412 {"code":"stale","head"}` if someone wrote first |
 | `rm NS/NAME` | `DELETE R`, `If-Match: "{head}"` → `200 {tombstone}` |
 | `restore NS/NAME '[…]'` | `PATCH R`, `If-Match: "{tombstone}"`; the patches apply to the last live document |
 | `batch NS FILE [--dry-run]` | `POST N/batch[?dry-run=1]`, body as in §7.5 (see [Batches](#batches)) |
@@ -54,15 +54,43 @@ Response headers to keep:
 | `whoami NS` | `GET N/principal`: who you are there, your verbs and roles, and the limits in force |
 | `branch create BASE NAME` | `POST /ns/{base}/branches`, `If-None-Match: *`, body `{"name","at"?,"patches"?}` → `201`, `Location: /ns/{name}` |
 | `branch list BASE` | `GET /ns/{base}/branches` → `[{name, at, frozen, purged, successor?}]` |
-| `blob put NS/NAME FILE --at /p` | `PUT R/blob/{bid}` with the file's `Content-Type` (and `Blob-Nonce` if you use one); then write `{"$blob":bid,"type":…,"size":…}` at `/p` with an ordinary `PATCH`. A blob stays invisible until a write references it |
+| `blob put NS/NAME FILE --at /p` | `PUT R/blob/{bid}`, then a `PATCH` writing the reference at `/p` (see [Blobs](#blobs)) |
+| `blob get NS/NAME --at /p` | Read the reference at `/p`, then `GET R/blob/{bid}` |
 | `undo` / `redo` | `GET N/gestures/{g}` lists the gesture's revisions; write the inverse as one batch with a new `Gesture` and `Undoes: g` (TOOLS §11.2) |
 | freeze (part of `merge apply --freeze`, `rebase --switch`) | `PATCH N`, `If-Match: "{config_id}"`, `[{"op":"add","path":"/frozen","value":true}, …]` |
 | `prune NS/NAME --below REV` | `POST R/prune`, `{"horizon":REV}` (destroys history) |
 | `purge NS/NAME` | `POST R/purge`, `If-Match: "{head or tombstone}"` (destroys the resource) |
 | `ns purge NS` | `POST N/purge`, `If-Match: "{ns_id}"` (namespace must be frozen) |
 
-The blob id `bid` is computed by the client from the bytes (§3.7):
-`"1" + base32lower(first 20 bytes of sha256("patchlog-blob-v1\n" + type + "\n" + nonce + "\n" + bytes))`.
+## Blobs
+
+1. **Compute the id** over the exact bytes (§3.7). `type` is the media type in lower case without
+   parameters (`text/plain`, not `text/plain; charset=utf-8`). `nonce` is `""` for none, or 26
+   random characters of `[a-z2-7]`:
+
+   ```python
+   import base64, hashlib
+   def bid(data: bytes, type: str, nonce: str = "") -> str:
+       h = hashlib.sha256(b"patchlog-blob-v1\n" + type.encode() + b"\n" + nonce.encode() + b"\n" + data)
+       return "1" + base64.b32encode(h.digest()[:20]).decode().lower().rstrip("=")  # no padding
+   ```
+
+2. **Upload:** `PUT R/blob/{bid}` with the bytes, `Content-Type: {type}`, and `Blob-Nonce: {nonce}`
+   only when there is one (an empty header is `400`). It takes no precondition and answers `201`
+   with `ETag: "{bid}"`.
+   - An upload of the same bytes repeats safely.
+   - Bytes that don't hash to the id get `422 blob_mismatch`.
+   - Over `blobSize` (64 MiB) gets `413`.
+3. **Reference it** in an ordinary `PATCH` (or a batch step):
+   `{"op":"add","path":"/photo","value":{"$blob":"{bid}","type":"image/png","size":1843302}}`, plus
+   `"nonce"` exactly when the blob has one. A `type`, `size` or `nonce` that doesn't match is
+   `422 blob`. Until a write references it, the blob is pending: `GET` answers `404`, and the
+   upload is deleted after `blobGrace` (24 h).
+4. **Read:** `GET R/blob/{bid}` (immutable; ranges supported), served with the blob's type. Check
+   the bytes against the id with the same function.
+5. **Copy instead of re-uploading** into another resource: `PUT /r/{ns2}/{name2}/blob/{bid}` with
+   an empty body and `Blob-From: /r/{ns}/{name}/blob/{bid}`. Add `Source-Authorization` if your
+   grant doesn't read the source.
 
 ## The save loop
 
@@ -101,9 +129,13 @@ Content-Type: application/json
   "config": { "ifMatch": "<config_id>", "patches": [ … ] } }
 ```
 
-- The dry run returns `200` with a report per item: `status` `201` (would pass), or the error,
-  and the ids a submit would produce. Then send the same body without `?dry-run=1`.
-- Success is `201 {ns_id, items:[{resource, ids}]}`. On failure nothing is written, and the
+- The dry run returns `200` with a report per item and the ids a submit would produce. Each
+  item's `status` is one of:
+  - `201`: it would pass
+  - `200`: an identical write already happened, an idempotent retry
+  - the error Then send the same body without `?dry-run=1`.
+- Success is `201 {ns_id, items:[{resource, ids}]}`. Resubmitting an identical batch answers `200`
+  with the original result, as a single write does. On failure nothing is written, and the
   body is `{code:"batch", items:[{index, status, code, …}]}`.
 - A step can be an object, to give it its own gesture:
   `{"patches":[…],"gesture":"…","undoes":"…"}` or `{"delete":true}`.

@@ -7,7 +7,8 @@ description: Writing to a patchlog server well (HTTP API or `patchlog` CLI). Use
 
 Each resource is an append-only log of JSON Patch sets, and each set becomes a revision. The log
 is the history, the undo unit, the merge input and the audit trail, so cut writes with care.
-Section numbers (§) refer to `docs/SPEC.md` and `docs/TOOLS.md`.
+Everyday work needs only this skill. The § numbers point to `docs/SPEC.md` and `docs/TOOLS.md`
+in the patchlog repository, for edge cases.
 
 - **HTTP without the CLI:** [http.md](http.md) maps each command to its request.
 - **Branching, merging, squashing or rebasing:** read [merging.md](merging.md).
@@ -18,7 +19,8 @@ Section numbers (§) refer to `docs/SPEC.md` and `docs/TOOLS.md`.
   conditional:** `If-None-Match: *` creates, `If-Match: "{head}"` appends. Without a
   precondition you get `428`; a stale `If-Match` gets `412 {head}`.
 - **Namespace** `/ns/{ns}`: config, rules, grants and limits. It is the unit you branch, freeze
-  and purge.
+  and purge. Create one with `patchlog ns create NS '{"read":"public"}'` (or `"grant"`, readers
+  need a grant).
 - **Batch** `POST /ns/{ns}/batch`: several resources of **one** namespace, all or nothing.
   Nothing is atomic across namespaces.
 - **Gesture:** 26 characters of `[a-z2-7]`, chosen per *user action* and sent as `Gesture:` on
@@ -50,13 +52,38 @@ Limits default to the values below. A namespace may set lower ones: `GET /ns/{ns
 |---|---|---|
 | `patchSetSize` / `opsPerSet` | 256 KiB / 1,000 | Split into several appends, or chained steps of one batch item |
 | `documentSize` | 1 MiB | Split into resources linked with `x-ref` |
-| `valueSize` (largest string) | 64 KiB | Store as a blob (`PUT …/blob/{bid}`, then reference it) |
+| `valueSize` (largest string) | 64 KiB | Store it as a blob (below) |
 | `itemsPerBatch` / `batchSize` | 1,000 / 16 MiB | Several batches, or a branch |
 
 - Create a large document whole (up to `documentSize`), then edit it in parts.
 - Parts that must land together go in **one batch item as chained steps**:
   `"steps": [[…], […]]`.
 - A `422 limit` names the limit it hit (`limit`, `measured`, `max`). Split; don't retry.
+
+## Blobs
+
+Use a blob for any **file or binary content** (images, PDFs, attachments), and for **large text
+that is replaced, not edited**. A document holds only a small reference to it:
+`{"$blob": bid, "type": "image/png", "size": 1843302}`, plus `"nonce"` when the blob has one.
+That keeps documents within `documentSize` and keeps patches, history, undo and merges small,
+because a blob is stored once and never diffed.
+
+```sh
+patchlog blob put NS/NAME photo.png --at /photo     # upload and write the reference in one step
+patchlog blob get NS/NAME --at /photo -o photo.png  # download, checked against the id
+```
+
+- **Lifecycle.** An upload is **pending** and invisible (`404`) until a write references it.
+  Unreferenced uploads are deleted after `blobGrace` (24 h). Once referenced, it is immutable and
+  served at `/r/{ns}/{name}/blob/{bid}`.
+- **Ids** are content hashes the client computes. They are scoped to one resource: copy a blob
+  to another resource rather than re-upload it. Over HTTP, see [http.md](http.md#blobs).
+- **Nonces.** In sealed namespaces, and those that require nonces, every blob gets a random
+  nonce. Use one in any non-public namespace, so the id can't confirm a guess at the content
+  (`blob put --nonce`). End-to-end (E3) namespaces are the exception: there, clients encrypt
+  blobs instead.
+- **Limits:** `blobSize` 64 MiB, `blobsPerDocument` 1,000. To change a blob, upload the new bytes
+  and replace the reference.
 
 **Document design.**
 - Split documents by who reads them, who edits them and how big they grow.
@@ -70,9 +97,11 @@ Limits default to the values below. A namespace may set lower ones: `GET /ns/{ns
 | Response | Do |
 |---|---|
 | `201`, or `200` (an idempotent retry) | The returned id is your new head |
-| `412 {head}` | Rule 4 |
+| `412 {"code":"stale","head"}` | Rule 4 |
 | `422 invalid` | A `test` failed, a patch didn't apply, or the schema rejected it. Surface it; don't force it |
 | `422 limit` | Split |
+| `422 blob` | The reference's `type`, `size` or `nonce` doesn't match the upload, or the blob isn't available to you |
+| `422 blob_mismatch` | The uploaded bytes don't hash to the id |
 | `429` | Wait `Retry-After`; keep combining edits |
 | `409 frozen` + `successor` | Reload from the successor and replay your pending sets there |
 | `410` | Deleted, purged or pruned. Don't write blindly; offer a `successor` if one is given |
