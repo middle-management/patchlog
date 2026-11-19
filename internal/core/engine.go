@@ -716,7 +716,7 @@ type tx struct {
 	// name (wakeFor), or nil when one of them concerns the whole
 	// namespace: the live readers to wake after commit.
 	wake map[string]map[string]bool
-	tags   []string        // cache tags to purge after commit
+	tags []string // cache tags to purge after commit
 	// lastNS is the seq of the last namespace entry this transaction
 	// appended: what a CDN purge it sends is keyed on (repurge.go).
 	lastNS    int64
