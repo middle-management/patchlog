@@ -329,9 +329,13 @@ type Engine struct {
 	liveDone   liveDone
 	liveJoins  atomic.Int64
 	liveShared atomic.Int64
-	stop       chan struct{}
-	bg         sync.WaitGroup
-	closeOnce  sync.Once
+	// quiet keeps what resource long-polls learned of quiet resources,
+	// and liveQuiet counts the reads it answered (live.go).
+	quiet     quietCache
+	liveQuiet atomic.Int64
+	stop      chan struct{}
+	bg        sync.WaitGroup
+	closeOnce sync.Once
 	// grantRoots are the root sub and kid of stored grants (grantref.go).
 	grantRoots grantRootCache
 	// retentionSkipped remembers retention rules already logged as

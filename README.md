@@ -4997,9 +4997,18 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   resource (configuration changes, branches, namespace purges), not by writes to its other
   resources. So a client following its own document doesn't read it again on every write to the
   namespace; on Postgres the tailer wakes by resource too, from the `ns_log` entries it reads
-  ([docs/CAPACITY.md](docs/CAPACITY.md), "Resource followers"). When it was first measured
-  ([docs/CAPACITY.md](docs/CAPACITY.md), "Earlier measurements") one write to 5,000 private followers went from 3.7–4.1 s
-  of core CPU to 0.3–1 s. The local CDN's VCL lets a long-poll with credentials skip Varnish's
+  ([docs/CAPACITY.md](docs/CAPACITY.md), "Resource followers"). Nor does it read its quiet
+  resource at every interval boundary: a long-poll read that ends at the resource's head is
+  remembered, by resource and by credentials (any, in a public namespace or with authentication
+  off; the same bearer grant otherwise, never an edge grant), and a later long-poll from that
+  head is answered without a transaction while the resource's waiter channel is still open, the
+  read cache's meta counter hasn't moved, the grant hasn't expired and, on Postgres, the tailer
+  has polled within a quarter of the long-poll interval: more loosely than the read cache, since
+  the answer carries no content (`Engine.ResourceLiveLog`, `internal/core/live.go`). The metric
+  `patchlog.longpoll.resource.reads` counts these reads by answer: `memory`, `read`, or `stale`
+  (read because the tailer was behind). A write to 5,000 private followers at the origin costs the
+  core about 0.03–0.04 ms of CPU each ([docs/CAPACITY.md](docs/CAPACITY.md), "Long-poll followers
+  and the CDN"). The local CDN's VCL lets a long-poll with credentials skip Varnish's
   waiting list (`hash_ignore_busy`), so a private one isn't held behind an identical request in
   flight.
 - **Live reads** (§7.3, §7.7, v0.73). A long-poll without a cursor, or with one behind by an

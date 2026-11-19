@@ -267,9 +267,11 @@ func (s *Server) resourceLive(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(302)
 		return
 	}
+	// A quiet resource's long-poll from its head is answered without a
+	// transaction (core/live.go, quiet resources).
 	wait := func() <-chan struct{} { return s.e.WaitResource(ns, name) }
 	s.longPoll(w, r, ns, "X-Revision", resTags(ns, name), cursor, s.clockOf(resourceLogPath(ns, name)), wait, func(ctx context.Context, since string) (*core.Log, error) {
-		return s.e.ResourceLog(ctx, ns, name, "", since, lim, creds(r))
+		return s.e.ResourceLiveLog(ctx, ns, name, since, lim, creds(r))
 	})
 }
 

@@ -1,0 +1,2 @@
+rev 11a92073, backend postgres, 3 × c7g.xlarge, 3 × c7g.xlarge, DB db.m7g.large
+DEVICES 40000 STEP 5000 STEP_SECS 90 SETTLE 20 COMPLETIONS 50 BG 300

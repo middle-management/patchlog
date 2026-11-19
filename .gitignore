@@ -5,3 +5,4 @@
 /dev.key
 /cmd/patchlog/patchlog
 /cmd/capacity/capacity
+__pycache__/
