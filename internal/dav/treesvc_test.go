@@ -522,16 +522,21 @@ func TestTreeServiceOwnWrites(t *testing.T) {
 	viaTree("the listing after an edit")
 
 	// The tree service stops following: the writer's listing waits up to
-	// TreeWait (the tree service answers 503 sooner), then reads the node
-	// documents.
+	// TreeWait (the tree service answers 503 sooner) and is answered 503
+	// (§H.3, v0.86); the next reads the node documents, without asking
+	// the tree service.
 	tr.paused.Store(true)
 	ts.expect(ts.do("PUT", "/cat/Season/late.txt", "late"), 201, "PUT while the tree service lags")
 	log.take()
 	start := time.Now()
-	sameStrings(t, "Season while the tree service lags", names(ts.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json", "late.txt"})
+	ts.wantBehind(ts.do("PROPFIND", "/cat/Season/", "", "Depth", "1"), "the first listing while the tree service lags")
 	if d := time.Since(start); d > 3*time.Second {
 		t.Fatalf("the listing took %v", d)
 	}
+	if paths := log.take(); strings.Contains(strings.Join(paths, " "), "/ns/cat/rev/") {
+		t.Fatalf("the 503 read the node documents all the same: %q", paths)
+	}
+	sameStrings(t, "Season while the tree service lags", names(ts.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json", "late.txt"})
 	if paths := log.take(); !strings.Contains(strings.Join(paths, " "), "/ns/cat/rev/") {
 		t.Fatalf("not listed from the node documents: %q", paths)
 	}
@@ -670,6 +675,7 @@ func TestTreeServiceUserTokens(t *testing.T) {
 	// then reads the node documents; bob's listing doesn't wait.
 	a.tr.paused.Store(true)
 	g.expect(g.doAs(ann, "PUT", "/cat/Season/new.txt", "hello"), 201, "ann's PUT")
+	g.wantBehind(g.doAs(again, "PROPFIND", "/cat/Season/", "", "Depth", "1"), "the first listing through ann's other token")
 	sameStrings(t, "Season through ann's other token", names(g.propfindAs(again, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json", "new.txt"})
 	sameStrings(t, "bob's Season", names(g.propfindAs(bob, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
 	a.tr.paused.Store(false)
@@ -701,9 +707,9 @@ func TestTreeServiceDown(t *testing.T) {
 
 	failing.Store(true)
 	r := ts.expect(ts.do("PROPFIND", "/cat/Season/", "", "Depth", "1"), 503, "PROPFIND while the tree service fails")
-	if r.header.Get("Retry-After") != "7" {
-		t.Fatalf("503 without the tree service's Retry-After: %v", r.header)
-	}
+	// The gateway's own Retry-After, not the tree service's 7, and none
+	// of its text (§H.4 "Answers", v0.86).
+	ts.wantBehind(r, "PROPFIND while the tree service fails")
 	failing.Store(false)
 
 	down := treeDav(e, "http://127.0.0.1:1")
@@ -837,6 +843,11 @@ func TestTreeServiceStaleNameWrites(t *testing.T) {
 
 		a.tr.paused.Store(true)
 		g.expect(g.doAs(ann, "MOVE", "/cat/Season/cup.json", "", "Destination", "/cat/Season/final.json"), 201, w+"ann renames cup.json")
+		if viaTree {
+			// Her first request to ask the tree service, behind her
+			// rename, is answered 503 and moves nothing (§H.3, v0.86).
+			g.wantBehind(g.doAs(ann, "MOVE", "/cat/Season/derby.json", "", "Destination", "/cat/Hidden/derby.json"), w+"ann moves derby.json into Hidden, the tree service behind")
+		}
 		g.expect(g.doAs(ann, "MOVE", "/cat/Season/derby.json", "", "Destination", "/cat/Hidden/derby.json"), 201, w+"ann moves derby.json into Hidden")
 		g.expect(g.doAs(ann, "PUT", "/cat/Box/report.txt", "ann's report"), 201, w+"ann's PUT into Box")
 		g.expect(g.doAs(ann, "MKCOL", "/cat/Season/Sub", ""), 201, w+"ann's MKCOL of Season/Sub")
@@ -954,9 +965,17 @@ func TestTreeServiceOwnWritesUntilReached(t *testing.T) {
 
 	tr.paused.Store(true)
 	ts.expect(ts.do("PUT", "/cat/Season/new.txt", "hello"), 201, "PUT new.txt")
-	ts.expect(ts.do("MOVE", "/cat/Season/a.txt", "", "Destination", "/cat/Season/b.txt"), 201, "MOVE a.txt to b.txt")
+	// The first request that asks the tree service, behind the PUT, is
+	// answered 503 and moves nothing (§H.3, v0.86); asked again, it goes
+	// by the node documents.
+	ts.wantBehind(ts.do("MOVE", "/cat/Season/a.txt", "", "Destination", "/cat/Season/b.txt"), "MOVE a.txt to b.txt, the tree service behind")
+	ts.expect(ts.do("MOVE", "/cat/Season/a.txt", "", "Destination", "/cat/Season/b.txt"), 201, "MOVE a.txt to b.txt, again")
 	for _, d := range []time.Duration{0, 31 * time.Second, 9 * time.Minute} {
 		clk.add(d)
+		if d > 0 {
+			// The tree service is asked again, and is still behind.
+			ts.wantBehind(ts.do("PROPFIND", "/cat/Season/", "", "Depth", "1"), fmt.Sprintf("the first listing %v later", d))
+		}
 		sameStrings(t, fmt.Sprintf("Season %v later, the tree service behind", d), names(ts.propfind("/cat/Season/"), "/cat/Season/"),
 			[]string{"b.txt", "derby.json", "new.txt"})
 	}
@@ -1162,6 +1181,9 @@ func minRefusedPerNamespace(t *testing.T, slow bool) {
 	sameStrings(t, "the limited grant's Season", names(g.propfindAs(limited, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
 	tr.paused.Store(true)
 	g.expect(g.doAs(ann, "PUT", "/cat/Season/derby.json", `{"title": "Derby!"}`), 201, "ann's PUT of derby.json")
+	// The tree service is behind her first PUT: 503, nothing written
+	// (§H.3, v0.86); again, the path resolves from the node documents.
+	g.wantBehind(g.doAs(ann, "PUT", "/cat/Season/g.json", `{"text": "edited"}`), "ann's PUT of g.json, the tree service behind")
 	g.expect(g.doAs(ann, "PUT", "/cat/Season/g.json", `{"text": "edited"}`), 201, "ann's PUT of g.json, an item of ghost")
 	if h, doc := g.load("ghost", "g"); h.State != client.Live || doc.(map[string]any)["text"] != "edited" {
 		t.Fatalf("ghost/g: %v %v", h.State, doc)
@@ -1171,7 +1193,16 @@ func minRefusedPerNamespace(t *testing.T, slow bool) {
 	}
 	clk.add(6 * time.Second) // past slowFor, which the PUT's listing set
 	n := count()
-	g.propfindAs(ann, "/cat/Season/")
+	// Each listing that asks the tree service while it is behind matches
+	// is a 503 (§H.3, v0.86: the tree service's 503 behind, or no answer
+	// within TreeWait), whatever it learns of ghost's mins on the way.
+	listBehind := func(what string) {
+		t.Helper()
+		if r := g.doAs(ann, "PROPFIND", "/cat/Season/", "", "Depth", "1"); r.status != 503 || r.header.Get("Retry-After") == "" || strings.Contains(r.body, "matches") || strings.Contains(r.body, "ghost") {
+			t.Fatalf("%s: %d %q %v, want 503 with Retry-After, naming no namespace", what, r.status, r.body, r.header)
+		}
+	}
+	listBehind("the first listing after the writes")
 	if got := sentSince(n); !of("ghost", got) {
 		t.Fatalf("the first listing after the writes sent %q", got)
 	}
@@ -1181,7 +1212,7 @@ func minRefusedPerNamespace(t *testing.T, slow bool) {
 	for i := 0; ; i++ {
 		clk.add(6 * time.Second) // past slowFor, which a listing that waited set
 		n = count()
-		g.propfindAs(ann, "/cat/Season/")
+		listBehind("a listing while the tree service is behind matches")
 		got := sentSince(n)
 		if !of("ghost", got) {
 			if !of("matches", got) {
@@ -1249,10 +1280,14 @@ func TestTreeServiceMinsBounded(t *testing.T) {
 	clk.add(10 * time.Second)
 	g.expect(g.doAs(narrow, "PROPFIND", "/cat/Season/", "", "Depth", "1"), 503, "the limited token's PROPFIND 10 s after ann's write")
 	clk.add(time.Minute)
+	// The tree service is asked again, and its 503 answered (§H.3,
+	// v0.86); the listing that follows doesn't wait.
+	g.wantBehind(g.doAs(narrow, "PROPFIND", "/cat/Season/", "", "Depth", "1"), "the limited token's first PROPFIND a minute after ann's write")
 	g.expect(g.doAs(narrow, "PROPFIND", "/cat/Season/", "", "Depth", "1"), 207, "the limited token's PROPFIND a minute after ann's write")
 	g.expect(g.doAs(narrow, "GET", "/cat/Season/derby.json", ""), 200, "the limited token's GET")
 	n := withMin.Load()
 	clk.add(time.Minute)
+	g.wantBehind(g.doAs(ann, "PROPFIND", "/cat/Season/", "", "Depth", "1"), "ann's first PROPFIND 2 minutes after her write")
 	sameStrings(t, "ann's Season, from the node documents", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
 	if withMin.Load() == n {
 		t.Fatal("ann's listing 2 minutes after her write didn't wait for it")

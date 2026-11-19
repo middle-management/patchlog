@@ -1,12 +1,12 @@
 package dav
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -110,8 +110,10 @@ func limitRefusal(ae *client.APIError, more string) *davError {
 // writes alike (§H.4 "Answers", v0.85; FILE-18): 503 with Retry-After
 // after the core's 429 or 503, or where no answer came in time; else 502,
 // after its 408, any other 5xx, and where there is no connection. A 502
-// names the service and its status only: nothing of the answer that caused
-// it (§C.6 Upstream failures), which is logged with the core's address
+// and a 503 name only the upstream that failed, the core here, and carry
+// nothing of its answer (§H.4 "Answers", v0.86; §C.6 Upstream failures):
+// not its text, not its status, and the 503's Retry-After is this
+// server's own (upBusy). The answer is logged with the core's address
 // (davError.cause, record). Writes map 412 and patch failures themselves.
 // Elsewhere the text is the core's code and message: the status is the
 // answer's own, and the core's is named only where it differs.
@@ -134,12 +136,15 @@ func upstream(err error) error {
 	var ne net.Error
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &ne) && ne.Timeout() {
 		// 503 with Retry-After, like a 429 or 408 waited out (§H.4 Answers).
-		return &davError{status: http.StatusServiceUnavailable, msg: "the request was canceled or timed out", cause: err,
-			header: http.Header{"Retry-After": {"5"}}}
+		msg := theCore + " didn't answer in time"
+		if errors.Is(err, context.Canceled) {
+			msg = "the request was canceled"
+		}
+		return &davError{status: http.StatusServiceUnavailable, msg: msg, cause: err, header: http.Header{"Retry-After": {retryLate}}}
 	}
 	ae, ok := client.AsAPIError(err)
 	if !ok {
-		return &davError{status: http.StatusBadGateway, msg: "the core can't be reached", cause: err}
+		return &davError{status: http.StatusBadGateway, msg: theCore + " can't be reached", cause: err}
 	}
 	if e := limitRefusal(ae, ""); e != nil {
 		return e
@@ -171,9 +176,35 @@ func upstream(err error) error {
 		e.refresh = ae.Code == "nonce"
 		return e
 	case ae.Status == 429, ae.Status == http.StatusServiceUnavailable:
-		return busy(ae)
+		return upBusy(theCore, err)
 	}
-	return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("the core answered %d", ae.Status), cause: err}
+	return upFailed(theCore, err)
+}
+
+// theCore names the core in a 502 or 503, as a catalog's tree or catalog
+// service is named by its catalog.
+const theCore = "the core"
+
+// The Retry-After of this server's 503s, its own (§H.4 "Answers", v0.86):
+// never the upstream's, which would say how its limits stand.
+const (
+	retryBusy = "1" // an upstream that is busy or behind
+	retryLate = "5" // one that didn't answer in time
+)
+
+// upBusy is the 503 for an upstream (what: the core, or a catalog's
+// service) that answered 429 or 503: it names the upstream and nothing of
+// its answer (cause, which is logged), with this server's Retry-After.
+func upBusy(what string, cause error) *davError {
+	return &davError{status: http.StatusServiceUnavailable, msg: what + " is busy or behind for now; try again", cause: cause,
+		header: http.Header{"Retry-After": {retryBusy}}}
+}
+
+// upFailed is the 502 for an upstream that answered 408 or another 5xx,
+// or something this server can't use: it names the upstream and nothing
+// of its answer (cause, which is logged).
+func upFailed(what string, cause error) *davError {
+	return &davError{status: http.StatusBadGateway, msg: what + " failed", cause: cause}
 }
 
 // unreached is the answer for a request to a service (what names it) that
@@ -184,21 +215,9 @@ func unreached(what string, err error) *davError {
 	var ne net.Error
 	if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &ne) && ne.Timeout() {
 		return &davError{status: http.StatusServiceUnavailable, msg: what + " didn't answer in time", cause: err,
-			header: http.Header{"Retry-After": {"5"}}}
+			header: http.Header{"Retry-After": {retryLate}}}
 	}
 	return &davError{status: http.StatusBadGateway, msg: what + " can't be reached", cause: err}
-}
-
-// busy is the 503 the core's 429 or 503 turns into once waiting is no
-// longer brief (§6.6, §H.4 "Answers").
-func busy(ae *client.APIError) *davError {
-	e := fail(http.StatusServiceUnavailable, "the core answered %d: %s", ae.Status, apiText(ae))
-	secs := int(math.Ceil(ae.RetryAfter.Seconds()))
-	if secs < 1 {
-		secs = 1
-	}
-	e.header = http.Header{"Retry-After": {strconv.Itoa(secs)}}
-	return e
 }
 
 // apiText is an API error as text: its code and message (or, with
@@ -243,21 +262,63 @@ func isPatchFailure(err error) bool {
 
 // errWriter passes the WebDAV handler's answer through, except an error
 // status after one of the request's FileSystem calls failed with a
-// davError: that one is answered instead, with its text.
+// davError: that one is answered instead, with its text. And where a core
+// or service request made for the user's request failed for now
+// (reqState.upFailure), that failure is the answer, whatever the handler
+// made of the rest: a 200, a 207, a 404 or a 403 (§H.4 "Answers", v0.86:
+// "whether or not the answer needed it"; CONFORMANCE Grant scope 87).
+//
+// A 207 is held, with its body, until the handler returns (finish): a
+// PROPFIND's multistatus begins before its entries are read, and a
+// failure among them could no longer change the status.
 type errWriter struct {
 	http.ResponseWriter
 	st      *reqState
 	realm   string
 	wrote   bool
 	swallow bool
+	held    int // a 207 not sent yet
+	body    bytes.Buffer
 }
 
 func (w *errWriter) WriteHeader(code int) {
-	if w.wrote {
+	if w.wrote || w.held != 0 {
 		return
 	}
+	if code == http.StatusMultiStatus {
+		w.held = code
+		return
+	}
+	w.writeHeader(code)
+}
+
+// finish sends a held 207, or what answers in its place.
+func (w *errWriter) finish() {
+	if w.held == 0 || w.wrote {
+		return
+	}
+	w.writeHeader(w.held)
+	if !w.swallow {
+		w.ResponseWriter.Write(w.body.Bytes())
+	}
+}
+
+func (w *errWriter) writeHeader(code int) {
 	w.wrote = true
 	e := w.st.err
+	if up := w.st.upFailure(); up != nil && (code < 400 || e == nil || e.status != http.StatusBadGateway && e.status != http.StatusServiceUnavailable) {
+		w.st.s.opt.Logf("dav: %s %s: answered %d, not %d: %v", w.st.method, w.st.path, up.status, code, up)
+		if code < 400 {
+			// What the request did, it did: a DELETE's or MOVE's locks
+			// and properties follow the file (answered), though the
+			// client is told to try again.
+			w.st.answered(code)
+		} else {
+			w.st.answered(up.status)
+		}
+		w.fail(up)
+		return
+	}
 	if code == http.StatusOK || code == http.StatusPartialContent && wholeRange(w.Header().Get("Content-Range")) {
 		w.st.served()
 	}
@@ -277,8 +338,18 @@ func (w *errWriter) WriteHeader(code int) {
 		w.ResponseWriter.WriteHeader(code)
 		return
 	}
+	w.st.answered(e.status)
+	w.fail(e)
+}
+
+// fail answers e in place of the handler's answer.
+func (w *errWriter) fail(e *davError) {
 	h := w.Header()
-	for _, k := range []string{"ETag", "Last-Modified", "Content-Length", "Lock-Token"} {
+	if w.st.pdf {
+		h.Set("Content-Security-Policy", "sandbox")
+		h.Del("Content-Disposition")
+	}
+	for _, k := range []string{"ETag", "Last-Modified", "Content-Length", "Lock-Token", "Content-Range", "Accept-Ranges"} {
 		h.Del(k)
 	}
 	w.st.serve = nil
@@ -289,7 +360,6 @@ func (w *errWriter) WriteHeader(code int) {
 		h.Set("WWW-Authenticate", w.realm)
 	}
 	h.Set("Content-Type", "text/plain; charset=utf-8")
-	w.st.answered(e.status)
 	w.ResponseWriter.WriteHeader(e.status)
 	io.WriteString(w.ResponseWriter, e.msg+"\n")
 	w.swallow = true
@@ -310,6 +380,9 @@ func wholeRange(cr string) bool {
 }
 
 func (w *errWriter) Write(b []byte) (int, error) {
+	if w.held != 0 && !w.wrote {
+		return w.body.Write(b)
+	}
 	if !w.wrote {
 		w.WriteHeader(http.StatusOK)
 	}

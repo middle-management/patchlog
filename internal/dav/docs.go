@@ -89,6 +89,14 @@ func (s *Server) doc(ctx context.Context, tk *token, ns, name, rev string) (*doc
 		return e, nil
 	})
 	if err != nil {
+		if st := state(ctx); st != nil && failedRead(err) && !errors.Is(err, context.Canceled) {
+			// The read may have been another request's, shared with this
+			// one: its failure for now is this request's too (§H.4
+			// "Answers", v0.86).
+			if de, ok := upstream(err).(*davError); ok {
+				st.upstreamFailed("GET "+k, de)
+			}
+		}
 		return nil, err
 	}
 	return v.(*docEntry), nil

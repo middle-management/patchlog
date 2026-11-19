@@ -207,6 +207,24 @@ func (e *env) expect(r resp, status int, what string) resp {
 	return r
 }
 
+// behindBody is the gateway's 503 for catalog cat's tree service being
+// busy or behind (§H.3, §H.4 "Answers", v0.86): it names the service and
+// nothing of its answer.
+const behindBody = "catalog cat's tree service is busy or behind for now; try again\n"
+
+// wantBehind checks r, the answer to the first request that asked a tree
+// service behind the user's writes: 503 with the gateway's own
+// Retry-After, naming the service alone (§H.3 "A tree service that is
+// behind": "a tool answers 503", v0.86; before, the gateway listed from
+// the node documents in the same request, as it does for those that
+// follow).
+func (e *env) wantBehind(r resp, what string) {
+	e.t.Helper()
+	if r.status != 503 || r.header.Get("Retry-After") != "1" || r.body != behindBody {
+		e.t.Fatalf("%s: %d %q (Retry-After %q), want 503 naming the tree service alone, Retry-After 1", what, r.status, r.body, r.header.Get("Retry-After"))
+	}
+}
+
 // entry is one response of a PROPFIND.
 type entry struct {
 	size, etag, ctype, modified string
