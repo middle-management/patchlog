@@ -927,5 +927,13 @@ Options:
   own and needs the core run with `--max-rate-per-namespace`, `--max-rate-per-resource` and
   `--max-rate-per-principal` all at `1e9,1e9`. `--resource-waiters`, `--resource-writers` and
   `--resource-seconds` size it.
+- **Devices waiting on resources of their own, across machines**: `deploy/ec2-devices.sh` runs
+  `cmd/devicebench` on EC2 load generators of their own against `SERVERS` cores sharing an RDS
+  Postgres (or one on SQLite). Each step connects more devices, each long-polling its own
+  resource, and measures how long a write to a device's resource takes to reach it.
+  `deploy/devices-summary.py` prints a row per step, with the cores' and RDS's CPU, and names the
+  first step that looks broken. The script's header lists its settings and what it makes;
+  `./deploy/ec2-devices.sh cleanup` deletes the RDS instance and the IAM role. `devicebench`
+  also runs on its own against any core (`-help`).
 - **Sizes**: `-docs`, `-revs`, `-namespaces`, `-doc-size`, `-append-batch`. `-help` lists the
   rest.

@@ -181,6 +181,11 @@ Other changes for v0.86:
 
 Other work since v0.31.0:
 
+- **`cmd/devicebench` and `deploy/ec2-devices.sh` measure how many devices a deployment holds**
+  when each long-polls its own resource, as a device waits for the result of a run it started.
+  The script runs the cores and the load generators on EC2 instances of their own, with an RDS
+  Postgres the cores share; `deploy/devices-summary.py` merges the load generators' steps with
+  the cores' and RDS's CPU. See docs/CAPACITY.md, "Rerunning".
 - **The playground is published on GitHub Pages** (`.github/workflows/pages.yml`, at
   https://middle-management.github.io/patchlog/). Away from `/playground/` the page is
   standalone: a **Server** box (and `?server=URL`) names the patchlog server it calls,
