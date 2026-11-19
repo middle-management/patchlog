@@ -214,6 +214,20 @@ func b2i(b bool) int {
 func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 	g := newGraph(s.opt.Catalog)
 	g.Aliases = s.opt.Branches
+	// The catalog's base chain as last resolved (catalogOpts), before any
+	// node is parsed.
+	var bases string
+	switch err := q.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'bases'`).Scan(&bases); {
+	case err == nil:
+		l, _ := parseJSON(bases).([]any)
+		for _, b := range l {
+			if b, ok := b.(string); ok {
+				g.Bases = append(g.Bases, b)
+			}
+		}
+	case !errors.Is(err, sql.ErrNoRows):
+		return nil, err
+	}
 	var cfg string
 	err := q.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'config'`).Scan(&cfg)
 	switch {
@@ -320,7 +334,7 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 		if v := parseJSON(r.access.String); v != nil {
 			doc["$access"] = v
 		}
-		n := ParseNode(g.Catalog, r.name, r.head.String, doc)
+		n := g.parseNode(r.name, r.head.String, doc)
 		n.Born, n.BornUnknown = bornCol(r.born)
 		n.Epoch, n.BornEpoch = int(r.epoch.Int64), int(r.bornEpoch.Int64)
 		g.setExplicit(n)
@@ -382,7 +396,7 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 			srows.Close()
 			return nil, err
 		}
-		if n := parseSelf(g.Catalog, ns, name, map[string]any{"$parents": parseJSON(ps)}); n != nil {
+		if n := g.parseSelf(ns, name, map[string]any{"$parents": parseJSON(ps)}); n != nil {
 			n.Born, n.BornUnknown = bornCol(born)
 			selfs = append(selfs, n)
 		}

@@ -81,7 +81,8 @@ func TestValidationStepsLimit(t *testing.T) {
 		t.Fatalf("errors: %s", r.Body)
 	}
 
-	// No limit.
+	// The default, which a count that isn't positive stands for too
+	// (v0.86: no deployment leaves it unbounded), is ample for it.
 	e2 := newEnv(t, func(o *core.Options) { o.MaxValidationSteps = -1 })
 	e2.mkNS("s", map[string]any{})
 	rev2 := e2.create("s", "tree", unionSchemaDoc())
@@ -189,8 +190,8 @@ func TestV085ValidationStepsWithRules(t *testing.T) {
 // whose rule tests /doc against a schema that takes more than
 // validationSteps, the write is 422 limit, not the 403 a failing grant
 // rule gives, with max and, for a writer who can't read the resource,
-// without measured. A rule of step 1 counts too, and its 422 comes before
-// the rate limits, drawing nothing.
+// without measured. A rule of step 1 counts too, and its 422 comes after
+// the rate limits (TestV086StepOneRunOut).
 func TestV085ValidationStepsGrantRules(t *testing.T) {
 	t.Parallel()
 	const budget = 3000
@@ -232,33 +233,38 @@ func TestV085ValidationStepsGrantRules(t *testing.T) {
 	// A rule of step 1, on /resource: a billion steps and more on a name,
 	// for the write and again for the read check that decides whether the
 	// refusal may carry measured, which is held to the limit too. Its
-	// 422 comes before the rate limits, so it draws no token: the one the
-	// bucket of that resource holds is still there for a grant without
-	// the rule.
+	// 422 comes after the rate limits (v0.86, scenario 88) and costs the
+	// token the bucket of that resource holds for the principal: the
+	// next is 429, also for a grant of that principal without the rule.
 	onName := narrowed(t, root, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": doubling(30)}}})
-	for i := 0; i < 2; i++ {
-		r = e.write("PATCH", "sec", "named", "", addRoot(map[string]any{}), onName)
-		expectCode(t, r, 422, "limit")
-		if _, has := r.Obj()["measured"]; has || r.Obj()["limit"] != "validationSteps" {
-			t.Fatalf("step 1: %s", r.Body)
-		}
+	r = e.write("PATCH", "sec", "named", "", addRoot(map[string]any{}), onName)
+	expectCode(t, r, 422, "limit")
+	if _, has := r.Obj()["measured"]; has || r.Obj()["limit"] != "validationSteps" {
+		t.Fatalf("step 1: %s", r.Body)
 	}
-	expect(t, e.write("PATCH", "sec", "named", "", addRoot(map[string]any{}), root.Encode()), 201)
+	expectCode(t, e.write("PATCH", "sec", "named", "", addRoot(map[string]any{}), onName), 429, "rate")
 	expectCode(t, e.write("PATCH", "sec", "named", "", addRoot(map[string]any{}), root.Encode()), 429, "rate")
 }
 
-// A deployment run without a bound on validation (MaxValidationSteps
-// negative, serve --max-validation-steps 0), which §6.6 doesn't provide
-// for, bounds nothing and leaves validationSteps out of /principal.
-func TestV085ValidationStepsUnbounded(t *testing.T) {
+// §6.6 Validation work (v0.86), LIM-7: no deployment leaves
+// validationSteps unbounded. A count that isn't positive is the default,
+// which /principal reports and writes are held to.
+func TestV086ValidationStepsNeverUnbounded(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, func(o *core.Options) { o.MaxValidationSteps = -1 })
-	e.mkNS("s", map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": doubling(12)}}})
-	e.create("s", "a", map[string]any{})
-	r := e.principalOf("s", "")
-	expect(t, r, 200)
-	l, _ := r.Obj()["writer"].(map[string]any)["limits"].(map[string]any)
-	if _, has := l["validationSteps"]; has || l["documentSize"] == nil {
-		t.Fatalf("limits %v", l)
+	for _, n := range []int{-1, 0} {
+		e := newEnv(t, func(o *core.Options) { o.MaxValidationSteps = n })
+		// 2^24 steps and more: within no default.
+		e.mkNS("s", map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": doubling(24)}}})
+		r := e.write("PATCH", "s", "a", "", addRoot(map[string]any{}))
+		expectCode(t, r, 422, "limit")
+		if m := r.Obj(); m["limit"] != "validationSteps" || m["max"] != float64(core.DefaultMaxValidationSteps) {
+			t.Fatalf("%d: %s", n, r.Body)
+		}
+		r = e.principalOf("s", "")
+		expect(t, r, 200)
+		l, _ := r.Obj()["writer"].(map[string]any)["limits"].(map[string]any)
+		if l["validationSteps"] != float64(core.DefaultMaxValidationSteps) {
+			t.Fatalf("%d: limits %v", n, l)
+		}
 	}
 }

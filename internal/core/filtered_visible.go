@@ -44,11 +44,16 @@ func (fv *fview) CP() *fcp { return fv.cp }
 
 // newFview builds subjects' view at cp; filter judges item 2.
 func (t *tx) newFview(fs *fscope, cp *fcp, gs string, subjects []string, filter *grantcheck.ReadFilter, a *actor) *fview {
+	// Each item the view judges has its own budget of validationSteps
+	// for the rules' schema tests (§6.6 Validation work).
+	filter.Steps = t.e.opt.MaxValidationSteps
 	fv := &fview{fs: fs, cp: cp, gs: gs, subjects: subjects, filter: filter, a: a, memo: map[string]bool{}}
 	for i := range cp.cats {
 		c := t.catalogAt(&cp.cats[i], cp)
 		fv.cats = append(fv.cats, c)
-		fv.views = append(fv.views, c.View(subjects))
+		v := c.View(subjects)
+		v.Steps = t.e.opt.MaxValidationSteps
+		fv.views = append(fv.views, v)
 	}
 	return fv
 }

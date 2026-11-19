@@ -3421,7 +3421,18 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   MOVE, COPY or MKCOL like a save (TOOLS §H.4 "Answers"): a core or tree service request the
   answer depends on that fails for now fails the request, and never counts as a refusal. So a
   DELETE made while `GET /ns/{ns}/principal` answers `408` is `502`, where it was `403`, and
-  no write goes ahead on settings a failed read left unknown.
+  no write goes ahead on settings a failed read left unknown. Since v0.86 every core or service
+  request the gateway makes for a user's request counts, whether or not the answer needs it
+  (TOOLS §H.4 "Answers"; CONFORMANCE "Grant scope" 86, 87): a GET of a file while the core
+  answers `500` to a read of a sibling item's namespace document is `502`, where it was `200`
+  from the rest; a write that was made before such a read failed stays made, and the answer is
+  still the failure. A request counts by how it ends: a `429` waited out and sent again has not
+  failed. Requests the server makes outside a user's request (verifying a token again, its own
+  start-up reads) don't count. These `502` and `503` name only the upstream that failed
+  ("the core failed", "catalog cat's tree service is busy or behind for now; try again") and
+  carry nothing of its answer: no code, message or status of the upstream's, and the `503`'s
+  `Retry-After` is the gateway's own (1 s for a busy or behind upstream, 5 s where no answer
+  came in time), never the upstream's. What the upstream said is in the server's log.
   A raw file over a JSON document's, or the
   other way round, replaces its root. A purged one is `410`, as is any name of a purged
   namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
@@ -3731,8 +3742,9 @@ only.
   file or folder, a move or a delete, which
   the node documents decide, is `403`, saying so, a move before anything is written (onto another
   file, or to another tree or namespace, the copy is the first write). The tree service unreachable is
-  `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with its
-  `Retry-After`: never an empty folder. Its `401` and `403` are the user's grant refused, answered
+  `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with the
+  gateway's own `Retry-After` that names the tree service and nothing of its answer (v0.86; the
+  namespace a `503 behind` names stays in the log): never an empty folder. Its `401` and `403` are the user's grant refused, answered
   as the core's are (in local mode a `401` refuses `--bearer`: `502`, naming the tree service). A
   tree service answers `503` behind until it has caught up with every namespace the catalog
   trusts and can follow, not only with the catalog (started with a fresh database, rebuilt, or
@@ -3761,15 +3773,19 @@ only.
   `X-Namespace-Revision`, seen as the core answers it), which the tree service waits for (§B.5),
   until a listing that carried them came back, for at most 10 minutes (at most the last 4 entries
   of 64 namespaces a user); other users' listings don't wait. If it hasn't caught up within
-  `--tree-wait` (3 s; the tree service's own `--min-wait`, 2 s, answers sooner), the folder is
-  listed from the node documents instead, as without a tree service, and so are the user's
-  listings of that tree for 5 seconds, however long the tree service lags within those 10
+  `--tree-wait` (3 s; the tree service's own `--min-wait`, 2 s, answers sooner), the request
+  is answered `503` with `Retry-After: 1` (v0.86, §H.3 "A tree service that is behind": "a tool
+  answers `503`"; before, the folder was listed from the node documents in that same request),
+  and the user's requests of that tree for the next 5 seconds don't ask the tree service: their
+  folders are listed from the node documents, as without a tree service, however long the tree
+  service lags within those 10
   minutes: their new file stays listed, and a file they renamed doesn't come back by its old name;
   a grant that can't read the node documents gets `503` with `Retry-After` for 30 s after the
   write, then the tree service's listing without waiting. A `min` the tree service refuses
   (`400`: a namespace it doesn't follow, or the reader can't see) is found per namespace, each
   one's asked for alone: those refused, and those reached, aren't asked for again, the rest
-  are, and that listing is from the node documents.
+  are; that listing is from the node documents, unless the tree service is still behind one of
+  them, which is the `503` above.
 - **New files** (§H.4). A PUT of a new name creates an item in `files.ns` with an opaque name (13
   random base32 characters), and its placement titled with the name, under its folder: one
   `parents` entry, ordered after the folder's last ordered child, so new files list last, and
@@ -5072,15 +5088,29 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   refused `422` with `code: "limit"`, `limit: "validationSteps"`, `max`, and `measured`, the
   steps taken where it stopped, which is left out for a writer who can't read the resource.
   It is `422` at whatever stage the steps run out, also inside a grant rule whose own failure
-  would be `403`, and at step 1 it comes before the rate limits and draws no token. Listing an
+  would be `403`. At step 1 it answers only if no check there fails outright (a verb, or a
+  rule that is false whatever the tests cut short would have said, is `403` and draws
+  nothing), and after the rate limits: `429` if a bucket is empty, else a token from the
+  principal's bucket (or its allowance's) and from each per-resource bucket the write would
+  draw on, never from the namespace's; an exempt write still draws nothing, and an upload
+  none of its bytes. In a batch such an item counts as failing authorisation. Listing an
   invalid document's failures takes what finding the first left of the limit; if that runs
   out, the `422 invalid` names the first failure alone. The limit is the deployment's
-  (`serve --max-validation-steps`): a namespace document that sets `limits.validationSteps` is
-  `422 invalid`, and `GET /ns/{ns}/principal` lists it among `writer.limits`.
-  `--max-validation-steps 0` lifts it, which the spec doesn't provide for (it requires a
-  bound); `/principal` then leaves the limit out. Reads aren't bounded: the spec bounds writes,
-  and a rule's `schema` test evaluated for a read, an exchange or a key request is not
-  counted. Annotation walks are not counted either.
+  (`serve --max-validation-steps`, at least 1: no deployment is unbounded, and `0` is
+  refused): a namespace document that sets `limits.validationSteps` is `422 invalid`, and
+  `GET /ns/{ns}/principal` lists it among `writer.limits`.
+- **Read checks have the same budget each.** Every read check under a grant, every exchange
+  (`POST /edge-grants`, one budget for all the namespaces and names of the grant), every key
+  request, every read check a write makes (schema reads, `referencing`, branching's
+  unrestricted read, whether a refusal may carry `measured`) and every item a filtered read
+  judges has `validationSteps` steps for its rules' `schema` tests. Running out fails the
+  check with its usual refusal (`404` for a resource of a private namespace, `403` for the
+  namespace's log, an exchange, a key request and branching) or leaves the item out; a test
+  cut short never passes, under a `not` either. A key scope's `attrs` schema is held to the
+  same count. The index and tree services (the catalog with the tree) apply it per read check
+  and per item too; the limit is in no namespace document, so they take
+  `--max-validation-steps` themselves (default 5,000,000) and should be given the origin's.
+  Annotation walks are not counted.
 - **A patch to a typed document is validated where it changes it**, when this instance has
   validated the document it applies to against the same schema revision: the changed values,
   and each schema's own keywords on the way to them. The verdict and the `422` are those of

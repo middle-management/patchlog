@@ -125,6 +125,13 @@ type Options struct {
 	// CheckerTTL is how long namespace documents are cached for grant
 	// checks (default 30s).
 	CheckerTTL time.Duration
+	// ValidationSteps is the validation steps each read check and each
+	// item filtered by a grant may take in its rules' schema tests (§6.6
+	// Validation work, §12.2 validationSteps): a check that needs more
+	// fails, and the item is left out. It is the origin deployment's
+	// limit, which no namespace document carries, so the service is told
+	// it; zero, or less, means §12.2's default of 5,000,000.
+	ValidationSteps int
 	// Purger receives cache-tag purges (default: log).
 	Purger Purger
 	// RepurgeDelay is how long after a cache-tag purge it is sent again,
@@ -374,7 +381,7 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 	s := &Service{
 		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db), kept: kept.New(opt.Now, keepBytes),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
-		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
+		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL), grantcheck.WithValidationSteps(opt.ValidationSteps)),
 		cur:     map[string]string{}, purged: map[string]time.Time{}, changed: make(chan struct{}), unfollowed: map[string]string{},
 		caught: map[string]bool{}, target: map[string]string{},
 		running: map[string]context.CancelFunc{},
@@ -1133,6 +1140,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	// aren't sealed or end-to-end, when the catalog names a pointer.
 	s.mu.RLock()
 	tptr, hasTitle, fileTree := s.g.TitlePtr, s.g.HasTitle, s.g.Files
+	bases := s.g.Bases
 	s.mu.RUnlock()
 	var retitle map[[2]string]string
 	if isCat && cfg != nil {
@@ -1195,7 +1203,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 				}
 				// A node's born (§B.5): a catalog node's, or that of the
 				// implicit placement a content document makes (§B.9).
-				self := !isCat && s.opt.SelfPlacing && parseSelf(s.opt.Catalog, b.NS, ch.Resource, doc.Value) != nil
+				self := !isCat && s.opt.SelfPlacing && parseSelf(s.opt.Catalog, bases, b.NS, ch.Resource, doc.Value) != nil
 				switch {
 				case isCat || self && bornable:
 					if p.born, p.bornUnknown, p.bornEpoch, err = s.nodeBorn(ctx, fb.NS, ch.Resource, p.head, self, ch.Purged); err != nil {
@@ -1437,7 +1445,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 		for _, p := range preps {
 			changed[p.name] = true
 			if p.kind == "head" && p.doc != nil {
-				n := ParseNode(cat, p.name, p.head, p.doc)
+				n := g.parseNode(p.name, p.head, p.doc)
 				n.Born, n.BornUnknown, n.Epoch, n.BornEpoch = p.born, p.bornUnknown, p.epoch, carryBornEpoch(g.explicit[p.name], p)
 				if g.explicitGone[p.name] {
 					if err := saveGone(ctx, tx, p.name, false); err != nil {
@@ -1555,7 +1563,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			}
 			var sn *Node
 			if st == ItemLive && p.doc != nil {
-				sn = parseSelf(cat, ns, p.name, p.doc)
+				sn = g.parseSelf(ns, p.name, p.doc)
 			}
 			if sn != nil {
 				m, _ := p.doc.(map[string]any)

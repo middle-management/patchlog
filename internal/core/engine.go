@@ -147,9 +147,11 @@ type Options struct {
 	// resulting document against its schema (§6.2 step 5) and of the
 	// schema tests of the rules evaluated for that write, together. A step
 	// is one schema or subschema applied to one value, and a write that
-	// takes more is refused 422 with the limit validationSteps. Zero means
-	// DefaultMaxValidationSteps; negative, no limit, which §6.6 doesn't
-	// provide for: the limit is then left out of what /principal reports.
+	// takes more is refused 422 with the limit validationSteps. Each read
+	// check, exchange, key request and item filtered by a grant has such a
+	// budget of its own for its rules' schema tests, and one that runs out
+	// fails. Zero, or less, means DefaultMaxValidationSteps: no
+	// deployment leaves it unbounded.
 	MaxValidationSteps int
 	// GroupCommitWait is at most how long a group waits for writes of its
 	// namespace still in their check phase (zero means 200µs; negative,
@@ -444,7 +446,7 @@ func Open(opt Options) (*Engine, error) {
 	if opt.GroupCommit == 0 {
 		opt.GroupCommit = defaultGroupCommit
 	}
-	if opt.MaxValidationSteps == 0 {
+	if opt.MaxValidationSteps <= 0 {
 		opt.MaxValidationSteps = DefaultMaxValidationSteps
 	}
 	if opt.GroupCommitWait == 0 {
@@ -675,6 +677,12 @@ type Error struct {
 	// §9's short class and purges with its long one, which the server
 	// derives from it. Write responses leave it unset (no-store).
 	Public *bool
+	// ranOut marks the 422 of a write whose step-1 rules ran out of
+	// validationSteps while none of them failed outright (authorize): it
+	// answers only after the step's other checks and the rate limits,
+	// which draw on the caller's own buckets alone (§6.2 step 1, §6.6
+	// Validation work; stepOneRanOut).
+	ranOut bool
 }
 
 func (e *Error) Error() string {
@@ -750,9 +758,9 @@ type tx struct {
 	// checked, which its rules' schema tests draw on (writeMeter); nil
 	// for reads, which nothing bounds.
 	meter *writeMeter
-	// readMeter, set only while a write's refusal for validationSteps
-	// checks whether the writer may read the resource, bounds that
-	// check's rules (writeMeter.readsWithin).
+	// readMeter is the budget of validationSteps of the read checks made
+	// while it is set (readScope), nil outside one: every read check then
+	// gets a fresh budget.
 	readMeter *writeMeter
 	// rateDrawn, when set, records that a write drew its rate-limit tokens,
 	// so a transaction run again doesn't draw them twice.

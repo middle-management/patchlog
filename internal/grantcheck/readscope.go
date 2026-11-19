@@ -191,6 +191,13 @@ type ReadFilter struct {
 	KeyRules, BlockRules []any
 	Roles                [][]any // nil: the grant carries no roles
 	Principal            map[string]any
+	// Steps is the validation steps each Allows and AllowsItem may take
+	// in the rules' schema tests (§6.6 Validation work: each item a
+	// service filters by a grant has its own budget). One that needs more
+	// doesn't allow. It isn't part of what Encode keeps: 0, as a decoded
+	// filter has, is §12.2's default, and a service sets its own
+	// (Checker.ValidationSteps).
+	Steps int
 
 	once     sync.Once
 	compiled [][]*rules.Rule // KeyRules, BlockRules, then each role's
@@ -321,13 +328,16 @@ func (f *ReadFilter) allows(resource string, item bool) bool {
 		return false
 	}
 	env := map[string]any{"action": "read", "resource": resource, "principal": f.Principal}
+	m := rules.Budget(f.Steps)
 	pass := func(rs []*rules.Rule) bool {
 		for _, r := range rs {
-			if !r.Eval(env) {
+			if !r.Passes(env, m) {
 				return false
 			}
 		}
-		return true
+		// A role without rules doesn't make up for one before it that
+		// ran out of steps: that fails the whole check (§6.6).
+		return !m.Over
 	}
 	if !pass(f.compiled[0]) || !pass(f.compiled[1]) {
 		return false

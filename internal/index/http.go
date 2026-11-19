@@ -427,8 +427,10 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 	if !readsFixed(v, func(name string) bool { return ix.checker.AllowsRead(v, name) }) {
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant's rules pass for none of the names they fix /resource to in " + ns + " (§A.4, §C.5.2)"}
 	}
-	a := &access{v: v, filter: grantcheck.FilterOf(v),
-		derive: func(_ context.Context, cp *fcp) (*fview, error) { return grantFview(cp, v) }}
+	filter := grantcheck.FilterOf(v)
+	filter.Steps = ix.opt.ValidationSteps // each item's validation steps (§6.6)
+	a := &access{v: v, filter: filter,
+		derive: func(_ context.Context, cp *fcp) (*fview, error) { return grantFview(cp, v, ix.opt.ValidationSteps) }}
 	switch err := ix.cover(ctx, a, ns, ""); {
 	case err == nil:
 		return a, nil

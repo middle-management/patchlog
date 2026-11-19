@@ -145,10 +145,10 @@ func TestV073P20StoredRuleFormats(t *testing.T) {
 		}
 	}
 	attrs := map[string]any{"properties": map[string]any{"mail": map[string]any{"type": "string", "format": "idn-email"}}}
-	if err := validateAttrs(attrs, map[string]any{"mail": "eva@exämple.se"}); err != nil {
+	if err := validateAttrs(attrs, map[string]any{"mail": "eva@exämple.se"}, 0); err != nil {
 		t.Errorf("attrs inside the scope: %v", err)
 	}
-	if err := validateAttrs(attrs, map[string]any{"mail": "nope"}); err == nil {
+	if err := validateAttrs(attrs, map[string]any{"mail": "nope"}, 0); err == nil {
 		t.Error("attrs outside the scope were accepted")
 	}
 }

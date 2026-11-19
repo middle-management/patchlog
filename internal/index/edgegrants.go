@@ -141,8 +141,10 @@ func entryDigest(key map[string]any, roles map[string]any) string {
 // own, or for a local branch its base's current key of that kid, which
 // wins over the branch's, else the branch's own unless it copied that kid
 // from its base at creation and the base has removed it since
-// (copiedKids). ok is false for none.
-func (ix *Index) effectiveKey(ctx context.Context, cfg *grantcheck.Config, kid string, depth int) (key grant.Key, ok bool, err error) {
+// (copiedKids). ok is false for none. over, if any, gives documents that
+// stand in for the checker's of the namespaces it names (cookieEnds: a
+// document the index is applying, in the place of the head's).
+func (ix *Index) effectiveKey(ctx context.Context, cfg *grantcheck.Config, kid string, depth int, over map[string]*grantcheck.Config) (key grant.Key, ok bool, err error) {
 	i := slices.IndexFunc(cfg.Keys, func(k grant.Key) bool { return k.Kid == kid })
 	if cfg.Base == "" {
 		if i < 0 {
@@ -153,14 +155,17 @@ func (ix *Index) effectiveKey(ctx context.Context, cfg *grantcheck.Config, kid s
 	if depth >= maxChain {
 		return grant.Key{}, false, nil
 	}
-	base, err := ix.checker.Config(ctx, cfg.Base)
+	base := over[cfg.Base]
+	if base == nil {
+		base, err = ix.checker.Config(ctx, cfg.Base)
+	}
 	switch {
 	case client.IsPurged(err), client.IsNotFound(err):
 		return grant.Key{}, false, nil
 	case err != nil:
 		return grant.Key{}, false, lacksRead(cfg.Base, fmt.Errorf("the head of %s: %w", cfg.Base, err))
 	}
-	if key, ok, err := ix.effectiveKey(ctx, base, kid, depth+1); err != nil || ok {
+	if key, ok, err := ix.effectiveKey(ctx, base, kid, depth+1, over); err != nil || ok {
 		return key, ok, err
 	}
 	if i < 0 {
@@ -220,7 +225,13 @@ func (ix *Index) copiedKids(ctx context.Context, cfg *grantcheck.Config) (map[st
 // roles in cfg's namespace, with the key (effectiveKey); ok is false, and
 // the digest "", where the key or one of the roles is gone.
 func (ix *Index) entryOf(ctx context.Context, cfg *grantcheck.Config, kid string, roles []string) (entry string, key grant.Key, ok bool, err error) {
-	key, ok, err = ix.effectiveKey(ctx, cfg, kid, 0)
+	return ix.entryOfIn(ctx, cfg, kid, roles, nil)
+}
+
+// entryOfIn is entryOf with over's documents in the place of the
+// checker's (effectiveKey).
+func (ix *Index) entryOfIn(ctx context.Context, cfg *grantcheck.Config, kid string, roles []string, over map[string]*grantcheck.Config) (entry string, key grant.Key, ok bool, err error) {
+	key, ok, err = ix.effectiveKey(ctx, cfg, kid, 0, over)
 	if err != nil || !ok || key.Raw == nil {
 		return "", key, false, err
 	}
@@ -408,8 +419,11 @@ type gsKeyRow struct{ kid, roles, pub, entry string }
 // cookie, so that one key's change ends only the cookies it minted.
 // errNoSlot where no such second is left after now: nothing is recorded.
 //
-// A document changed and then changed back gives a key the entry it had:
-// a cookie minted before holds again, as its grant verifies again.
+// A document changed and then changed back gives a key the entry it had,
+// but a cookie minted before the change doesn't hold again: the index
+// ends its rows as it applies the entry that made the change (cookieEnds;
+// §B.11.9 gs, v0.86: "the cookie is 403 from that entry on, even where a
+// later entry undoes the change").
 func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.Time) error {
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -580,6 +594,7 @@ func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 	if err != nil {
 		return nil, false
 	}
+	f.Steps = ix.opt.ValidationSteps // each item's validation steps (§6.6)
 	rec := &markerRec{f: f}
 	if subjects.Valid {
 		var ok bool
@@ -800,7 +815,7 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string, exp int64) (*ac
 // keys by but the last document the index read (§A.4 Unavailable
 // namespaces, v0.85): a cookie passes with every key recorded with its
 // entry and pub, as a cookie that never held, or that a document the
-// index applied ended (endCookies), isn't (purgedKeysHold). One whose
+// index applied ended (cookieEnds), isn't (purgedKeysHold). One whose
 // key or role changed after its exchange in a document the index never
 // read before the purge still gets the 410 and its head until it
 // expires.
@@ -834,7 +849,7 @@ func (ix *Index) keysHold(ctx context.Context, ns, m string, exp int64, also fun
 // purgedKeysHold is keysHold where the namespace's document is 410 too
 // (§8.5): errRulesChanged for a cookie with no key recorded, or with one
 // recorded without its entry or its pub, which never held or which the
-// last document the index read of the namespace ended (endCookies).
+// last document the index read of the namespace ended (cookieEnds).
 func purgedKeysHold(recorded []gsKey) error {
 	if len(recorded) == 0 || slices.ContainsFunc(recorded, func(k gsKey) bool { return k.entry == "" || k.pub == "" }) {
 		return errRulesChanged
@@ -842,70 +857,250 @@ func purgedKeysHold(recorded []gsKey) error {
 	return nil
 }
 
-// endCookies ends, in tx, the cookies of ns's markers whose key or roles
-// doc, a document of ns the index has just read, no longer gives as their
-// exchange recorded them: the key gone, with another pub or without read,
-// a role gone, or the entry digest another (entryHolds). Their rows lose
-// their entry, which then never holds again (purgedKeysHold, entryHolds).
+// cookieEnds is what applying a batch of ns ends of the cookies recorded
+// (edge_gs_keys), worked out before the batch's transaction, since it
+// reads other namespaces' documents, and written in it (apply).
 //
-// A live namespace's cookie is judged by the document at its head on
-// every read (keysHold), which this only anticipates. It is for a sealed
-// namespace that is then purged, whose document is 410 and judges nothing
-// any more: its 410 is for a request that passes the read check "against
-// the last namespace document the service read" (§A.4 Unavailable
-// namespaces, v0.85; scenario 135), so a cookie the index saw end gets
-// 403, not the purge's 410 and head. Before v0.85 every cookie recorded
-// with an entry passed.
+// "Once an entry after its exchange changes one of them [the key its key:
+// string names, or a key or role its rules came from], the cookie is 403
+// from that entry on, even where a later entry undoes the change"
+// (SERVICES §B.11.9 gs, §A.4 gs, v0.86; CONFORMANCE Tree 145). A live
+// namespace's cookie is judged by the document at its head on every read
+// (keysHold), which sees a change and not a change undone; so every
+// namespace document a batch brings, each config entry's in order, is
+// judged as it is applied: a row whose key or roles that document no
+// longer gives as its exchange recorded them (the key gone, with another
+// pub or without read, a role gone, or the entry digest another:
+// entryHolds) loses its entry, which then never holds again
+// (purgedKeysHold, entryHolds), whatever a later document says. One
+// entry that changes nothing in sum brings one document, and ends
+// nothing. Before v0.86 only a batch's last document was judged, so a
+// change and its undo in one batch of the follower left the cookie
+// reading.
 //
-// A row ended stays ended should the document change back, as a cookie
-// of the origin's does (§B.11.9 gs: "No exchange revives a cookie minted
-// before the change"). A cookie minted against a newer document than doc,
-// the index being behind several changes of its key, is ended too, and
-// its reader exchanges again. A local branch's keys are its base's
-// (effectiveKey), which doc alone doesn't give: its rows are left to
-// keysHold.
-func endCookies(ctx context.Context, tx *sql.Tx, ns string, doc map[string]any) error {
-	cfg, err := grantcheck.ParseConfig(ns, "", doc)
-	if err != nil || cfg.Base != "" {
-		return nil
+// It also serves a sealed namespace that is then purged, whose document
+// is 410 and judges nothing any more: its 410 is for a request that
+// passes the read check "against the last namespace document the service
+// read" (§A.4 Unavailable namespaces, v0.85; scenario 135), so a cookie
+// the index saw end gets 403, not the purge's 410 and head.
+//
+// A cookie minted against a newer document than the one applied, the
+// index being behind several changes of its key, is ended too, and its
+// reader exchanges again.
+//
+// A local branch's keys are its base's (effectiveKey): a document of ns
+// is judged for the rows of ns and for those of every namespace with
+// rows whose chain of bases reaches ns, with that document in the place
+// of ns's at the head and every other namespace's as the checker holds
+// it. Before v0.86 a branch's rows were left to keysHold alone. A base
+// the index doesn't follow brings no batch: a change there and back is
+// seen only if a read falls between the two.
+//
+// A snapshot (all) starts ns from its /heads at one entry, whose document
+// alone it reads: the entries it skipped may have changed a key and
+// changed it back, and the rows, which a restart and a rebuild keep,
+// can't tell. Every row of ns, and of the namespaces that draw on it, is
+// ended: their readers exchange again.
+type cookieEnds struct {
+	all bool
+	// ns is the batch's namespace and own its documents, parsed, where
+	// none of them names a base: such a document alone gives its keys
+	// and roles, so a row of ns recorded since is judged in tx (holds).
+	ns  string
+	own []*grantcheck.Config
+	// seen are, per namespace judged, the rows judged, true for one that
+	// ends. Any other row recorded since, which no document was judged
+	// for, ends too (apply): what can't be told is refused.
+	seen map[string]map[gsKeyRow]bool
+}
+
+// holds judges a row of ce's namespace by its documents alone (own), as
+// entryOfIn does for a namespace without a base.
+func (ce *cookieEnds) holds(k gsKeyRow) bool {
+	roles, ok := decodeStrings(k.roles)
+	if !ok || len(ce.own) == 0 {
+		return false
 	}
-	prefix := "reads:" + ns + ":"
-	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT kid, roles, pub, entry FROM edge_gs_keys WHERE substr(marker, 1, ?) = ? AND entry <> ''`, len(prefix), prefix)
-	if err != nil {
-		return err
-	}
-	var ended []gsKeyRow
-	defs, _ := doc["roles"].(map[string]any)
-	for rows.Next() {
-		var k gsKeyRow
-		if err := rows.Scan(&k.kid, &k.roles, &k.pub, &k.entry); err != nil {
-			rows.Close()
-			return err
+	for _, cfg := range ce.own {
+		i := slices.IndexFunc(cfg.Keys, func(o grant.Key) bool { return o.Kid == k.kid })
+		if i < 0 || cfg.Keys[i].Raw == nil {
+			return false
 		}
-		holds := false
-		if i := slices.IndexFunc(cfg.Keys, func(o grant.Key) bool { return o.Kid == k.kid }); i >= 0 && cfg.Keys[i].Raw != nil {
-			key := cfg.Keys[i]
-			roles, ok := decodeStrings(k.roles)
-			rs := make(map[string]any, len(roles))
-			for _, r := range roles {
-				def, has := defs[r]
-				ok = ok && has
-				rs[r] = def
+		key := cfg.Keys[i]
+		defs, _ := cfg.Doc["roles"].(map[string]any)
+		rs := make(map[string]any, len(roles))
+		for _, r := range roles {
+			def, has := defs[r]
+			if !has {
+				return false
 			}
-			holds = ok && k.pub != "" && keyPub(key) == k.pub && key.Lists("read") && entryDigest(key.Raw, rs) == k.entry
+			rs[r] = def
 		}
-		if !holds {
-			ended = append(ended, k)
+		if k.pub == "" || keyPub(key) != k.pub || !key.Lists("read") || entryDigest(key.Raw, rs) != k.entry {
+			return false
+		}
+	}
+	return true
+}
+
+// cookieEnds judges the documents docs of ns, in the order a batch brings
+// them, and all for a snapshot. nil where the batch brings none.
+func (ix *Index) cookieEnds(ctx context.Context, ns string, docs []*client.NSDoc, all bool) (*cookieEnds, error) {
+	if len(docs) == 0 && !all {
+		return nil, nil
+	}
+	rows, err := ix.db.QueryContext(ctx, `SELECT DISTINCT marker, kid, roles, pub, entry FROM edge_gs_keys WHERE entry <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	live := map[string][]gsKeyRow{}
+	for rows.Next() {
+		var m string
+		var k gsKeyRow
+		if err := rows.Scan(&m, &k.kid, &k.roles, &k.pub, &k.entry); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if n, ok := markerNS(m); ok && !slices.Contains(live[n], k) {
+			live[n] = append(live[n], k)
 		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
-	for _, k := range ended {
-		if _, err := tx.ExecContext(ctx, `UPDATE edge_gs_keys SET entry = '' WHERE substr(marker, 1, ?) = ? AND kid = ? AND roles = ? AND pub = ? AND entry = ?`,
-			len(prefix), prefix, k.kid, k.roles, k.pub, k.entry); err != nil {
+	ce := &cookieEnds{all: all, ns: ns, seen: map[string]map[gsKeyRow]bool{ns: {}}}
+	for _, d := range docs {
+		at, err := grantcheck.ParseConfig(ns, "", d.Value)
+		if err != nil || at.Base != "" {
+			ce.own = nil
+			break
+		}
+		ce.own = append(ce.own, at)
+	}
+	for n, ks := range live {
+		// cfg is n's document where n isn't ns, as the checker holds it.
+		var cfg *grantcheck.Config
+		if n != ns {
+			var draws bool
+			if cfg, draws = ix.drawsOn(ctx, n, ns); !draws {
+				continue
+			}
+		}
+		seen := ce.seen[n]
+		if seen == nil {
+			seen = map[gsKeyRow]bool{}
+			ce.seen[n] = seen
+		}
+		for _, k := range ks {
+			seen[k] = all || n != ns && cfg == nil
+		}
+		for _, d := range docs {
+			at, err := grantcheck.ParseConfig(ns, "", d.Value)
+			if err != nil {
+				continue
+			}
+			over := map[string]*grantcheck.Config{ns: at}
+			in := cfg
+			if n == ns {
+				in = at
+			}
+			for _, k := range ks {
+				if seen[k] {
+					continue
+				}
+				roles, ok := decodeStrings(k.roles)
+				if !ok {
+					seen[k] = true
+					continue
+				}
+				entry, key, ok, err := ix.entryOfIn(ctx, in, k.kid, roles, over)
+				seen[k] = err != nil || !ok || k.pub == "" || keyPub(key) != k.pub || !key.Lists("read") || entry != k.entry
+			}
+		}
+	}
+	return ce, nil
+}
+
+// drawsOn reports whether the keys of namespace n may come from ns: n is
+// a local branch whose chain of bases reaches ns, by the documents the
+// checker holds, with n's. A namespace that is purged or gone draws on
+// nothing any more: its last document is the one its cookies are judged
+// by (purgedKeysHold). One whose chain can't be read for now may: true
+// with no document, and its rows end.
+func (ix *Index) drawsOn(ctx context.Context, n, ns string) (*grantcheck.Config, bool) {
+	cfg, err := ix.checker.Config(ctx, n)
+	if client.IsPurged(err) || client.IsNotFound(err) {
+		return nil, false
+	}
+	if err != nil {
+		return nil, true
+	}
+	cur := cfg
+	for depth := 0; cur.Base != "" && depth < maxChain; depth++ {
+		if cur.Base == ns {
+			return cfg, true
+		}
+		next, err := ix.checker.Config(ctx, cur.Base)
+		if client.IsPurged(err) || client.IsNotFound(err) {
+			return nil, false
+		}
+		if err != nil {
+			return nil, true
+		}
+		cur = next
+	}
+	return nil, false
+}
+
+// markerNS is the namespace of a marker reads:{ns}:….
+func markerNS(m string) (string, bool) {
+	rest, ok := strings.CutPrefix(m, "reads:")
+	if !ok {
+		return "", false
+	}
+	ns, _, ok := strings.Cut(rest, ":")
+	return ns, ok && ns != ""
+}
+
+// apply ends, in tx, the rows ce found ended, and every row of the
+// namespaces it judged that it didn't see: one recorded between its
+// reading and tx, by an exchange that may have verified its grant under
+// a document the batch is only now applying.
+func (ce *cookieEnds) apply(ctx context.Context, tx *sql.Tx) error {
+	if ce == nil {
+		return nil
+	}
+	for n, seen := range ce.seen {
+		prefix := "reads:" + n + ":"
+		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT kid, roles, pub, entry FROM edge_gs_keys WHERE substr(marker, 1, ?) = ? AND entry <> ''`, len(prefix), prefix)
+		if err != nil {
 			return err
+		}
+		var ended []gsKeyRow
+		for rows.Next() {
+			var k gsKeyRow
+			if err := rows.Scan(&k.kid, &k.roles, &k.pub, &k.entry); err != nil {
+				rows.Close()
+				return err
+			}
+			end, judged := seen[k]
+			if !judged {
+				end = n != ce.ns || !ce.holds(k)
+			}
+			if end || ce.all {
+				ended = append(ended, k)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, k := range ended {
+			if _, err := tx.ExecContext(ctx, `UPDATE edge_gs_keys SET entry = '' WHERE substr(marker, 1, ?) = ? AND kid = ? AND roles = ? AND pub = ? AND entry = ?`,
+				len(prefix), prefix, k.kid, k.roles, k.pub, k.entry); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

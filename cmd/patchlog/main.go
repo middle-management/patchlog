@@ -255,7 +255,7 @@ type serveCmd struct {
 	MaxBatchSize        *byteSize     `arg:"--max-batch-size" placeholder:"SIZE" help:"deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB); allowances may go up to it (§6.6)"`
 	DocumentSize        *byteSize     `arg:"--document-size" placeholder:"SIZE" help:"default documentSize of namespaces that don't set one, e.g. \"4 MiB\" (default 1 MiB, where §6.6 says 4 MiB; see docs/CAPACITY.md), at most --max-document-size"`
 	MaxDocumentSize     *byteSize     `arg:"--max-document-size" placeholder:"SIZE" help:"deployment maximum documentSize, which namespaces may set in their limits, e.g. \"8 MiB\" (default 4 MiB, §6.6's default)"`
-	MaxValidationSteps  int           `arg:"--max-validation-steps" default:"5000000" placeholder:"N" help:"validationSteps (§6.6, §12.2): steps a write's validation against its schema and its rules' schema tests may take together, a step being one schema or subschema applied to one value; a write that needs more is refused (422 limit, validationSteps); 0 for no limit, which the spec doesn't provide for (it requires a bound) and which leaves the limit out of /principal"`
+	MaxValidationSteps  int           `arg:"--max-validation-steps" default:"5000000" placeholder:"N" help:"validationSteps (§6.6, §12.2): steps a write's validation against its schema and its rules' schema tests may take together, a step being one schema or subschema applied to one value; a write that needs more is refused (422 limit, validationSteps), and each read check, exchange, key request and item filtered by a grant has as many for its rules' schema tests, failing if it needs more; at least 1: no deployment leaves it unbounded"`
 	FullValidation      bool          `arg:"--full-validation" help:"validate the whole document on every write; by default a patch to a document this instance has validated against the same schema revision is validated only where it can have changed the verdict"`
 	GrantCache          int           `arg:"--grant-cache" placeholder:"N" help:"verified bearer grants kept per instance, the least recently used evicted (default 65536; every request whose grant isn't kept verifies it, docs/CAPACITY.md)"`
 	DocCacheSize        *byteSize     `arg:"--doc-cache-size" placeholder:"SIZE" help:"documents kept in memory by revision id, e.g. \"1 GiB\" (default 256 MiB)"`
@@ -296,6 +296,17 @@ type serveCmd struct {
 	edgeArgs
 	corsArgs
 	shutdownArgs
+}
+
+// validationSteps checks --max-validation-steps, of serve and of the
+// services: no deployment leaves validationSteps unbounded (§6.6
+// Validation work), so 0 no longer lifts it and is refused, as a negative
+// count is.
+func validationSteps(n int) (int, error) {
+	if n <= 0 {
+		return 0, fmt.Errorf("--max-validation-steps %d: validationSteps is at least 1; no deployment leaves it unbounded (§6.6, §12.2)", n)
+	}
+	return n, nil
 }
 
 func (a *serveCmd) run(string) {
@@ -439,8 +450,8 @@ func (a *serveCmd) run(string) {
 		opt.GroupCommit = 1 // off
 	}
 	opt.FullValidation = a.FullValidation
-	if opt.MaxValidationSteps = a.MaxValidationSteps; a.MaxValidationSteps <= 0 {
-		opt.MaxValidationSteps = -1 // no limit
+	if opt.MaxValidationSteps, err = validationSteps(a.MaxValidationSteps); err != nil {
+		log.Fatal(err)
 	}
 	if opt.GroupCommitWait <= 0 {
 		opt.GroupCommitWait = -1 // none

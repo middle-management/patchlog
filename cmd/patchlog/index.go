@@ -60,19 +60,20 @@ import (
 // bucket of each principal it names (--exchange-rate RATE,BURST, default
 // 10,100), shared by the instances on one --db.
 type indexCmd struct {
-	API              string        `arg:"--api,env:PATCHLOG_API" default:"http://localhost:8080" placeholder:"URL" help:"base URL of the patch-log API"`
-	DB               string        `arg:"--db" default:"index.db" placeholder:"PATH" help:"SQLite database path of the index"`
-	Addr             string        `arg:"--addr" default:":8081" help:"listen address of the query API"`
-	NS               string        `arg:"--ns,required" placeholder:"NS,NS" help:"comma-separated namespaces to follow"`
-	Bearer           string        `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"grant for reading the namespaces (Authorization: Bearer)"`
-	BearerFile       string        `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"file holding --bearer (exclusive with it)"`
-	Author           string        `arg:"--author,env:PATCHLOG_AUTHOR" placeholder:"NAME" help:"X-Author for a --dev server"`
-	Branches         bool          `arg:"--branches" help:"also follow branches, building a preview index per branch (§F.8)"`
-	Rebuild          bool          `arg:"--rebuild" help:"drop the index and replay from the beginning (§A.6)"`
-	UntypedListing   bool          `arg:"--untyped-listing" default:"true" help:"list untyped documents in plain listings (never in text/facet/sort queries); --untyped-listing=false to leave them out"`
-	MinWait          time.Duration `arg:"--min-wait" default:"2s" placeholder:"DURATION" help:"how long ?min= waits for the index to catch up (§A.5)"`
-	SSE              bool          `arg:"--sse" help:"follow by server-sent events instead of long-poll"`
-	FetchConcurrency int           `arg:"--fetch-concurrency" default:"8" placeholder:"N" help:"how many documents the index fetches at once while applying the log, across all namespaces"`
+	API                string        `arg:"--api,env:PATCHLOG_API" default:"http://localhost:8080" placeholder:"URL" help:"base URL of the patch-log API"`
+	DB                 string        `arg:"--db" default:"index.db" placeholder:"PATH" help:"SQLite database path of the index"`
+	Addr               string        `arg:"--addr" default:":8081" help:"listen address of the query API"`
+	NS                 string        `arg:"--ns,required" placeholder:"NS,NS" help:"comma-separated namespaces to follow"`
+	Bearer             string        `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"grant for reading the namespaces (Authorization: Bearer)"`
+	BearerFile         string        `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"file holding --bearer (exclusive with it)"`
+	Author             string        `arg:"--author,env:PATCHLOG_AUTHOR" placeholder:"NAME" help:"X-Author for a --dev server"`
+	Branches           bool          `arg:"--branches" help:"also follow branches, building a preview index per branch (§F.8)"`
+	Rebuild            bool          `arg:"--rebuild" help:"drop the index and replay from the beginning (§A.6)"`
+	UntypedListing     bool          `arg:"--untyped-listing" default:"true" help:"list untyped documents in plain listings (never in text/facet/sort queries); --untyped-listing=false to leave them out"`
+	MaxValidationSteps int           `arg:"--max-validation-steps" default:"5000000" placeholder:"N" help:"validationSteps (§6.6, §12.2) as the origin's deployment sets it (serve --max-validation-steps), which no namespace document carries: the steps each read check and each item filtered by a grant may take in its rules' schema tests; one that needs more fails, or the item is left out; at least 1"`
+	MinWait            time.Duration `arg:"--min-wait" default:"2s" placeholder:"DURATION" help:"how long ?min= waits for the index to catch up (§A.5)"`
+	SSE                bool          `arg:"--sse" help:"follow by server-sent events instead of long-poll"`
+	FetchConcurrency   int           `arg:"--fetch-concurrency" default:"8" placeholder:"N" help:"how many documents the index fetches at once while applying the log, across all namespaces"`
 	encKeyArgs
 	keyringArgs
 	purgeArgs
@@ -116,7 +117,11 @@ func (a *indexCmd) run(string) {
 
 	ctx, sigs := shutdownSignals("patchlog index")
 
-	opt := index.Options{Client: c, DB: a.DB, Namespaces: nss, Branches: a.Branches, Rebuild: a.Rebuild,
+	steps, err := validationSteps(a.MaxValidationSteps)
+	if err != nil {
+		log.Fatal(err)
+	}
+	opt := index.Options{ValidationSteps: steps, Client: c, DB: a.DB, Namespaces: nss, Branches: a.Branches, Rebuild: a.Rebuild,
 		UntypedListing: a.UntypedListing, MinWait: a.MinWait, Recipient: recipient, FetchConcurrency: a.FetchConcurrency}
 	if a.SSE {
 		opt.FollowOptions = append(opt.FollowOptions, followSSE())

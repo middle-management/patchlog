@@ -192,9 +192,11 @@ func nsNotNamed(ns string) *Error {
 // in force, or against keysOverride (operator keys).
 func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, keysOverride []grant.Key) (*actor, *Error) {
 	env := grant.Env{
-		Now:           t.now,
-		NS:            nsName,
-		ValidateAttrs: validateAttrs,
+		Now: t.now,
+		NS:  nsName,
+		ValidateAttrs: func(schema any, attrs map[string]any) error {
+			return validateAttrs(schema, attrs, t.e.opt.MaxValidationSteps)
+		},
 	}
 	if keysOverride != nil {
 		// Operator grants (§C.4 bootstrapping) name the namespace, which
@@ -272,8 +274,10 @@ func contains(xs []string, s string) bool {
 }
 
 // validateAttrs checks key-scope attrs against a JSON Schema by evaluating a
-// rule with that schema.
-func validateAttrs(schema any, attrs map[string]any) error {
+// rule with that schema, within a budget of steps validation steps of its
+// own: attrs whose check takes more don't match (§6.6 Validation work
+// names no budget for it; none is left unbounded).
+func validateAttrs(schema any, attrs map[string]any, steps int) error {
 	r, err := rules.Compile(map[string]any{"op": "test", "path": "/attrs", "schema": schema})
 	if err != nil {
 		return fmt.Errorf("invalid attrs schema: %v", err)
@@ -282,7 +286,7 @@ func validateAttrs(schema any, attrs map[string]any) error {
 	if attrs != nil {
 		a = attrs
 	}
-	if !r.Eval(map[string]any{"attrs": a}) {
+	if !r.Passes(map[string]any{"attrs": a}, rules.Budget(steps)) {
 		return fmt.Errorf("attrs do not match the key scope")
 	}
 	return nil
@@ -431,6 +435,12 @@ func (t *tx) basicEnvelope(action, resource string, a *actor) map[string]any {
 
 // authorize is step 1 of §6.2 for one verb: verbs, and the grant, key and
 // role rules that refer only to the request. It does not rate-limit.
+//
+// The rules' schema tests draw on the write's meter. If they run out and
+// no rule fails outright, the error is the write's 422 marked ranOut,
+// which its caller answers only after the step's other checks and the
+// rate limits (§6.6 Validation work, stepOneRanOut); answering it as it
+// is refuses the write all the same.
 func (t *tx) authorize(a *actor, verb, resource string) *Error {
 	if a.verified == nil {
 		return nil
@@ -442,7 +452,41 @@ func (t *tx) authorize(a *actor, verb, resource string) *Error {
 	env := t.basicEnvelope(verb, resource, a)
 	// Only writes are authorised here, and a write's rules draw on its
 	// meter from step 1 on (§6.6 Validation work).
-	return t.grantRulesMode(a, verb, roles, env, true, nil, t.meter)
+	defer t.metered(nil)()
+	m := t.meter
+	m.stepOne = true
+	defer func() { m.stepOne = false }()
+	return t.grantRulesMode(a, verb, roles, env, true, nil, m)
+}
+
+// stepOneRanOut ends step 1 for a write that authorize refused, once the
+// step's other checks have passed: err as it is unless the write's rules
+// ran out of validationSteps there, and then the rate limits first, 429
+// if a bucket of draws is empty, else its tokens deducted and the 422
+// (§6.2 step 1, §6.6 Validation work). draws are the caller's own buckets
+// only (ownDraws), none for a write that is exempt.
+func (t *tx) stepOneRanOut(err *Error, draws []draw) *Error {
+	if err == nil || !err.ranOut || len(draws) == 0 {
+		return err
+	}
+	if rerr := t.admitOnce(draws); rerr != nil {
+		return rerr
+	}
+	return err
+}
+
+// ownDraws are writeDraws without the namespace's bucket: what a write
+// whose step 1 ran out of validationSteps draws, only buckets keyed by
+// its principal (§6.6 Validation work), which the reference's
+// per-resource buckets are too.
+func (t *tx) ownDraws(n *nsRow, cfg *Config, a *actor, resources []string, items int) []draw {
+	var out []draw
+	for _, d := range t.writeDraws(n, cfg, a, resources, items) {
+		if d.name != "ratePerNamespace" {
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 var ruleCache sync.Map // canonical rule -> *rules.Rule
@@ -715,6 +759,8 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 		return false
 	}
 	env := t.basicEnvelope("read", "", a)
+	// One budget of validationSteps for the check (§6.6 Validation work).
+	defer t.readScope()()
 	return t.scopeRules(a, env, stepOne, nil, t.readMeter) == nil && t.roleRules(a, "read", roles, env, false, nil, t.readMeter) == nil
 }
 
@@ -925,6 +971,22 @@ func (t *tx) admit(draws []draw) *Error {
 		e := apiErr(429, "rate", "message", "rate limit exceeded", "limit", hit, "retryAfter", math.Ceil(wait.Seconds()*1000)/1000)
 		e.Header = map[string][]string{"Retry-After": {fmt.Sprint(secs)}}
 		return e
+	}
+	return nil
+}
+
+// admitOnce is admit, once for a request: a write that runs again, as one
+// that reads a remote branch's base does (withRemoteSource), keeps its
+// draw (rateDrawn).
+func (t *tx) admitOnce(draws []draw) *Error {
+	if t.rateDrawn != nil && *t.rateDrawn {
+		return nil
+	}
+	if err := t.admit(draws); err != nil {
+		return err
+	}
+	if t.rateDrawn != nil {
+		*t.rateDrawn = true
 	}
 	return nil
 }

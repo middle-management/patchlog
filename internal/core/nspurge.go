@@ -27,8 +27,9 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		}
 		// The write's rules draw on one validation meter (§6.6, writeMeter).
 		defer t.metered(func() bool { return t.canRead(n, cfg, a, name) })()
-		if err := t.authorize(a, "purge", name); err != nil {
-			return err
+		ran := t.authorize(a, "purge", name)
+		if ran != nil && !ran.ranOut {
+			return ran
 		}
 		// ?force=1 under a grant that can't force is 403 at step 1,
 		// whether or not the purge needs it (§6.1).
@@ -36,6 +37,12 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 			if err := t.mayForce(n, a, operator); err != nil {
 				return err
 			}
+		}
+		if ran != nil {
+			// Its rules ran out of validationSteps and no check of step 1
+			// failed outright: 422, drawing nothing, a purge being exempt
+			// (§6.6).
+			return ran
 		}
 		// 410 after authorisation, like every write (§6.2).
 		if n.purged {
@@ -876,14 +883,20 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		}
 		// The write's rules draw on one validation meter (§6.6, writeMeter).
 		defer t.metered(nil)()
-		if err := t.authorize(a, "purge-ns", ""); err != nil {
-			return err
+		ran := t.authorize(a, "purge-ns", "")
+		if ran != nil && !ran.ranOut {
+			return ran
 		}
 		// ?force=1 under a grant that can't force is 403 at step 1 (§6.1).
 		if force {
 			if err := t.mayForce(n, a, operator); err != nil {
 				return err
 			}
+		}
+		if ran != nil {
+			// Out of validationSteps with no check of step 1 failing
+			// outright: 422, drawing nothing, as a purge is exempt (§6.6).
+			return ran
 		}
 		// In §6.2's order (§8.5): 410 after authorisation, like every
 		// write (step 2.1); not frozen (step 2.4); then the precondition

@@ -189,6 +189,13 @@ type Options struct {
 	// CheckerTTL is how long namespace documents are cached for grant
 	// checks before head pointers are re-read (default 30s).
 	CheckerTTL time.Duration
+	// ValidationSteps is the validation steps each read check and each
+	// item filtered by a grant may take in its rules' schema tests (§6.6
+	// Validation work, §12.2 validationSteps): a check that needs more
+	// fails, and the item is left out. It is the origin deployment's
+	// limit, which no namespace document carries, so the service is told
+	// it; zero, or less, means §12.2's default of 5,000,000.
+	ValidationSteps int
 	// Logf logs; default log.Printf.
 	Logf func(format string, args ...any)
 	// OnApply is called after each batch commits (tests, metrics).
@@ -328,7 +335,7 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db),
 		kept: kept.New(opt.Now, keepBytes), refs: kept.New(opt.Now, refsKeepBytes),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
-		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
+		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL), grantcheck.WithValidationSteps(opt.ValidationSteps)),
 		schemas: NewSchemaCache(opt.Client),
 		fetches: semaphore.NewWeighted(int64(opt.FetchConcurrency)),
 		roots:   map[string]bool{}, cur: map[string]string{}, purged: map[string]bool{}, stopped: map[string]string{}, changed: make(chan struct{}),
@@ -918,6 +925,17 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		}
 	}
 
+	// The cookies the batch's documents end, each judged in order, and
+	// all of them at a snapshot's start (cookieEnds; §B.11.9 gs, v0.86).
+	cdocs := configDocs(b)
+	if snapDoc != nil {
+		cdocs = append(cdocs, snapDoc)
+	}
+	ends, err := ix.cookieEnds(ctx, b.NS, cdocs, b.Replaces())
+	if err != nil {
+		return err
+	}
+
 	ix.wmu.Lock()
 	defer ix.wmu.Unlock()
 	tx, err := ix.db.BeginTx(ctx, nil)
@@ -925,6 +943,9 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := ends.apply(ctx, tx); err != nil {
+		return err
+	}
 	if b.Replaces() || co.PurgedNS {
 		// A snapshot is the complete state (its later pages add to the
 		// first); a purge-ns drops everything (Coalesce keeps only the
@@ -1252,11 +1273,6 @@ func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, table, ns string, doc
 	}
 	if err := recordTrust(ctx, tx, ns, docs[len(docs)-1].Value); err != nil {
 		return false, err
-	}
-	if table == "ns_conf" {
-		if err := endCookies(ctx, tx, ns, docs[len(docs)-1].Value); err != nil {
-			return false, err
-		}
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO `+table+` (ns, public, level) VALUES (?, ?, ?) ON CONFLICT (ns) DO UPDATE SET public = excluded.public, level = excluded.level`, ns, public, level)
 	return narrowed, err

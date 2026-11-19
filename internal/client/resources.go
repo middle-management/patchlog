@@ -233,8 +233,8 @@ func (c *Client) Doc(ctx context.Context, ns, name, id string) (*Doc, error) {
 	if r.status != 200 {
 		return nil, r.apiError()
 	}
-	// A namespace held as e2e serves no document but its keyring in the
-	// clear (§7.1, levels.go).
+	// A namespace held as sealed serves no document in the clear, and one
+	// held as e2e none but its keyring (§7.1, levels.go).
 	if err := c.refusePlain(ns, name, r); err != nil {
 		return nil, err
 	}
