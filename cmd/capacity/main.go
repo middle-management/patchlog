@@ -66,32 +66,43 @@ type config struct {
 	singleSecs  int
 	singleRate  float64
 	backoffMax  time.Duration
+
+	branchCount, branchFrozen, branchChildren, branchDocs, branchDepth int
+	purgeRuns                                                          int
+	purgeListen                                                        string
 }
 
 // args are the harness's flags (go-arg), copied into config.
 type args struct {
-	URL         string        `arg:"--url" default:"http://localhost:8080" help:"the core; several instances of one deployment comma-separated: a namespace's writes go to one of them by a hash of its name (README: one writer per namespace), reads and followers to each in turn"`
-	Big         string        `arg:"--ns" default:"cap-big" help:"the large namespace"`
-	Docs        int           `arg:"--docs" default:"1000000" help:"documents in the large namespace"`
-	Revs        int           `arg:"--revs" default:"5000000" help:"revisions in the large namespace (at least --docs)"`
-	DocSize     int           `arg:"--doc-size" default:"512" help:"approximate bytes per seeded document"`
-	Small       int           `arg:"--namespaces" default:"1000" help:"small namespaces (cap-0001, …) besides the large one"`
-	SmallDocs   int           `arg:"--namespace-docs" default:"10" help:"documents per small namespace"`
-	Workers     int           `arg:"--seed-workers" default:"16" help:"concurrent seeding requests"`
-	AppendBatch int           `arg:"--append-batch" default:"1" help:"appends per seeding request: 1 writes each on its own, as most clients do, so the namespace log holds an entry per append; more makes batch entries (§7.5) of that many"`
-	Samples     int           `arg:"--samples" default:"2000" help:"requests per latency measurement"`
-	Fetch       int           `arg:"--fetch" default:"20000" help:"documents fetched in the bootstrap measurement"`
-	Large       string        `arg:"--large-sizes" default:"16384,262144,1048576,3670016" help:"document sizes for the large-document appends ('' to skip)"`
-	Out         string        `arg:"--json" help:"also write the results to this file"`
-	LiveURL     string        `arg:"--live-url" help:"where long-poll followers connect: a CDN in front of --url (default --url itself)"`
-	Waiters     string        `arg:"--waiters" default:"100,1000,5000" help:"long-poll followers of one namespace to measure ('' to skip)"`
-	Pid         string        `arg:"--pid" help:"the core's process ids, comma-separated, to report the CPU time they spend per measurement and their memory (Linux)"`
-	Operator    string        `arg:"--operator-seed" help:"grants profile: the private seed of the core's --operator-key (patchlog keygen); namespaces are then read: grant, and every request carries a signed grant (§C)"`
-	Readers     int           `arg:"--readers" default:"5000" help:"grants profile: distinct reader grants the reads draw from (past the core's 1,024 cached bearers, most reads verify their grant)"`
-	SingleSecs  int           `arg:"--single-seconds" default:"15" help:"seconds each single-document write measurement runs"`
-	SingleRate  float64       `arg:"--single-rate" help:"single-document measurements: writes a second (and burst) the namespace allows per resource, per principal and in all, in place of the defaults (10, 50 and 500 a second); the core needs --max-rate-per-resource, --max-rate-per-principal and --max-rate-per-namespace raised to it"`
-	BackoffMax  time.Duration `arg:"--single-backoff-max" help:"single-document measurements: the longest wait of the client's backoff after lost races (default: the client's, 16ms)"`
-	Only        string        `arg:"--only" help:"run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live"`
+	URL            string        `arg:"--url" default:"http://localhost:8080" help:"the core; several instances of one deployment comma-separated: a namespace's writes go to one of them by a hash of its name (README: one writer per namespace), reads and followers to each in turn"`
+	Big            string        `arg:"--ns" default:"cap-big" help:"the large namespace"`
+	Docs           int           `arg:"--docs" default:"1000000" help:"documents in the large namespace"`
+	Revs           int           `arg:"--revs" default:"5000000" help:"revisions in the large namespace (at least --docs)"`
+	DocSize        int           `arg:"--doc-size" default:"512" help:"approximate bytes per seeded document"`
+	Small          int           `arg:"--namespaces" default:"1000" help:"small namespaces (cap-0001, …) besides the large one"`
+	SmallDocs      int           `arg:"--namespace-docs" default:"10" help:"documents per small namespace"`
+	Workers        int           `arg:"--seed-workers" default:"16" help:"concurrent seeding requests"`
+	AppendBatch    int           `arg:"--append-batch" default:"1" help:"appends per seeding request: 1 writes each on its own, as most clients do, so the namespace log holds an entry per append; more makes batch entries (§7.5) of that many"`
+	Samples        int           `arg:"--samples" default:"2000" help:"requests per latency measurement"`
+	Fetch          int           `arg:"--fetch" default:"20000" help:"documents fetched in the bootstrap measurement"`
+	Large          string        `arg:"--large-sizes" default:"16384,262144,1048576,3670016" help:"document sizes for the large-document appends ('' to skip)"`
+	Out            string        `arg:"--json" help:"also write the results to this file"`
+	LiveURL        string        `arg:"--live-url" help:"where long-poll followers connect: a CDN in front of --url (default --url itself)"`
+	Waiters        string        `arg:"--waiters" default:"100,1000,5000" help:"long-poll followers of one namespace to measure ('' to skip)"`
+	Pid            string        `arg:"--pid" help:"the core's process ids, comma-separated, to report the CPU time they spend per measurement and their memory (Linux)"`
+	Operator       string        `arg:"--operator-seed" help:"grants profile: the private seed of the core's --operator-key (patchlog keygen); namespaces are then read: grant, and every request carries a signed grant (§C)"`
+	Readers        int           `arg:"--readers" default:"5000" help:"grants profile: distinct reader grants the reads draw from (past the core's 1,024 cached bearers, most reads verify their grant)"`
+	SingleSecs     int           `arg:"--single-seconds" default:"15" help:"seconds each single-document write measurement runs"`
+	SingleRate     float64       `arg:"--single-rate" help:"single-document measurements: writes a second (and burst) the namespace allows per resource, per principal and in all, in place of the defaults (10, 50 and 500 a second); the core needs --max-rate-per-resource, --max-rate-per-principal and --max-rate-per-namespace raised to it"`
+	BackoffMax     time.Duration `arg:"--single-backoff-max" help:"single-document measurements: the longest wait of the client's backoff after lost races (default: the client's, 16ms)"`
+	Only           string        `arg:"--only" help:"run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live; branches runs only when named"`
+	BranchCount    int           `arg:"--branch-count" default:"100" help:"branches phase: live branches of the base"`
+	BranchFrozen   int           `arg:"--branch-frozen" help:"branches phase: frozen branches of the base besides the live ones"`
+	BranchChildren int           `arg:"--branch-children" help:"branches phase: branches under each live branch"`
+	BranchDocs     int           `arg:"--branch-docs" default:"20" help:"branches phase: documents in the base"`
+	BranchDepth    int           `arg:"--branch-depth" default:"-1" help:"branches phase: measure a chain of this many branches of branches instead of one base's branches (0: a plain namespace)"`
+	PurgeRuns      int           `arg:"--purge-runs" default:"5" help:"branches phase: purges per purge measurement"`
+	PurgeListen    string        `arg:"--purge-listen" help:"branches phase: listen here as the core's --purge-url and count the purge tags it sends"`
 }
 
 func (args) Description() string {
@@ -124,6 +135,8 @@ func main() {
 		singleRate:  a.SingleRate,
 		backoffMax:  a.BackoffMax,
 		only:        a.Only,
+		branchCount: a.BranchCount, branchFrozen: a.BranchFrozen, branchChildren: a.BranchChildren,
+		branchDocs: a.BranchDocs, branchDepth: a.BranchDepth, purgeListen: a.PurgeListen, purgeRuns: a.PurgeRuns,
 	}
 	if c.revs < c.docs {
 		fail(errors.New("--revs must be at least --docs"))
@@ -320,6 +333,9 @@ func (r *runner) run() {
 	}
 	if on("live") {
 		r.live()
+	}
+	if r.c.only != "" && on("branches") {
+		r.branches()
 	}
 	for k, pid := range r.pids() {
 		b, err := os.ReadFile("/proc/" + pid + "/status")

@@ -249,6 +249,8 @@ type serveCmd struct {
 	IndexURL            string        `arg:"--index-url" placeholder:"URL" help:"search index (Addendum A) the playground reads through a read-only proxy at /playground/index/, e.g. http://index:8081; one index serves several namespaces"`
 	SchemaFetch         bool          `arg:"--schema-fetch" help:"let the playground's schema import fetch http(s) URLs (off: it takes uploaded files only); private, loopback and link-local addresses are refused unless the host is in --schema-fetch-hosts"`
 	SchemaFetchHosts    string        `arg:"--schema-fetch-hosts" placeholder:"H,H" help:"comma-separated hosts --schema-fetch is limited to, e.g. www.schemastore.org,raw.githubusercontent.com (also trusted with private addresses)"`
+	MaxBranchDepth      int           `arg:"--max-branch-depth" placeholder:"N" help:"branchDepth (§6.6): how deep local branches of branches may stack (default 8); deployment-wide"`
+	MaxBranchesPerNS    int           `arg:"--max-branches-per-namespace" placeholder:"N" help:"deployment maximum of branchesPerNamespace (§6.6; default: the namespace default, 100); a namespace document's limits may go up to it"`
 	MaxItemsPerBatch    int           `arg:"--max-items-per-batch" placeholder:"N" help:"deployment maximum items per batch (default: the namespace default, 1000); allowances may go up to it, so an atomic import of more items needs it raised (§6.6)"`
 	MaxBatchSize        *byteSize     `arg:"--max-batch-size" placeholder:"SIZE" help:"deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB); allowances may go up to it (§6.6)"`
 	DocumentSize        *byteSize     `arg:"--document-size" placeholder:"SIZE" help:"default documentSize of namespaces that don't set one, e.g. \"4 MiB\" (default 1 MiB, where §6.6 says 4 MiB; see docs/CAPACITY.md), at most --max-document-size"`
@@ -342,6 +344,15 @@ func (a *serveCmd) run(string) {
 	max := core.DefaultMaximums()
 	if a.MaxItemsPerBatch > 0 {
 		max.ItemsPerBatch = a.MaxItemsPerBatch
+	}
+	if a.MaxBranchDepth < 0 || a.MaxBranchesPerNS < 0 {
+		log.Fatal("--max-branch-depth and --max-branches-per-namespace must be positive")
+	}
+	if a.MaxBranchDepth > 0 {
+		max.BranchDepth = a.MaxBranchDepth
+	}
+	if a.MaxBranchesPerNS > 0 {
+		max.BranchesPerNamespace = a.MaxBranchesPerNS
 	}
 	if a.LogPageSize < 0 {
 		log.Fatal("--log-page-size must be positive")
