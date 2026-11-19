@@ -181,6 +181,11 @@ func (c *Client) DocKid(ctx context.Context, ns, name, id string) (string, error
 	if r.status != 200 {
 		return "", r.apiError()
 	}
+	// "Not sealed" is an answer its caller acts on: refused, as Doc
+	// refuses the document itself, where sealed or e2e is held (levels.go).
+	if err := c.refusePlain(ctx, ns, name, r); err != nil {
+		return "", err
+	}
 	if !isJOSE(r) {
 		return "", nil
 	}
