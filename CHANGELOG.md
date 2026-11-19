@@ -227,8 +227,10 @@ Other work since v0.31.0:
   first use of a base in a transaction now takes a shared lock on the whole local chain.
 - **A namespace locked for itself alone takes no separate log lock** (Postgres). Every
   appender takes the namespace's lock before its log's, so the second lock added nothing
-  there; a purge reaching 10,000 branches held 20,000 advisory locks, the size of Postgres's
-  default lock table, and now holds half.
+  there; a purge reaching 10,000 branches held 20,000 advisory locks and now holds half. That is
+  still one lock per branch reached: Postgres's lock table holds `max_locks_per_transaction`
+  × `max_connections` locks, 6,400 as installed, so a purge reaching more branches than that
+  needs one of the two raised (the measurements ran with `max_connections=300`, 19,200).
 - **`namespaces.frozen` is set for branches created frozen**, with a migration that corrects
   existing rows. The count of a namespace's live branches (§6.6) now reads that column.
 - **A namespace's branches are found by an index** (`namespaces_base`). A purge asks for the

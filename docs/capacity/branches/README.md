@@ -5,7 +5,8 @@ host that also ran the load generator. Each run started from a new, empty databa
 grants profile, with `--samples 500`, the core's `--max-branch-depth 64` and
 `--max-branches-per-namespace 1000000`.
 
-- `pg-*`: the core at 2 vCPU / 4 GB, Postgres 16 at 2 vCPU / 4 GB, each in a container.
+- `pg-*`: the core at 2 vCPU / 4 GB, Postgres 16 at 2 vCPU / 4 GB with `max_connections=300`,
+  each in a container.
 - `sqlite-*`: the core in a container with no limit.
 
 | Name | Run |

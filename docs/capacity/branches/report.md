@@ -251,10 +251,16 @@ The raw results are next to this file; `README.md` there names the runs.
   and about 0.005 ms per branch that doesn't (the search still looks each one up by key).
 - The cache tags per purge are what they were: two per branch that sees the document.
 - The slowest write to another namespace during a purge was 37 ms.
-- **The refused purge of a referenced schema is not fixed.** The cap on `referencing` lets
-  the search stop at a page only where the caller may read more than a page of referencing
-  namespaces, and the purge is still planned over every branch before it is refused. Here it
-  is 40 s at 10,000 branches.
+- **The refused purge of a referenced schema is not fixed.** Two things keep it at 40 s with
+  10,000 branches. The purge is still planned over every branch before it is refused. And
+  the cap on `referencing` lets the search stop only once it has found a page of namespaces
+  the caller may read and one more: the grant used here reads the base alone, so the search
+  ran to the end. A caller who may read the branches would be answered sooner; that was not
+  measured.
+- **A purge takes one Postgres lock per branch it reaches** (two before). Postgres's lock
+  table holds `max_locks_per_transaction` × `max_connections` locks: 6,400 as installed,
+  19,200 in these runs, which set `max_connections=300`. As installed, a purge that 10,000
+  branches see would fail for want of lock space; one they don't see takes none for them.
 - On SQLite at 10,000 branches: 39 ms where the branches don't see the document, 0.77 s
   where they read it through, 1.0 s where each has its own revision, and other namespaces'
   writes still wait for the purge (0.75 s at most).
