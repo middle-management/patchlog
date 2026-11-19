@@ -127,7 +127,9 @@ func TestV086CoreFailureNamesOnlyTheCore(t *testing.T) {
 				t.Parallel()
 				e, rt := failingEnv(t, f.status)
 				e.create("docs", "x", map[string]any{"a": "1"})
-				rt.match.Store(func(q *http.Request) bool { return strings.HasPrefix(q.URL.Path, "/r/docs/") || strings.HasPrefix(q.URL.Path, "/ns/docs") })
+				rt.match.Store(func(q *http.Request) bool {
+					return strings.HasPrefix(q.URL.Path, "/r/docs/") || strings.HasPrefix(q.URL.Path, "/ns/docs")
+				})
 				rt.armed.Store(true)
 				body := ""
 				if c.method == "PUT" {

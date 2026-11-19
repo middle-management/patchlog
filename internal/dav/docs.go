@@ -230,7 +230,9 @@ func (s *Server) nsInfo(ctx context.Context, tk *token, ns string) nsInfo {
 	if st := state(ctx); err != nil && st != nil && st.writes() && failedRead(err) {
 		// What a request's writes need is among what its answer depends
 		// on (§H.4 "Answers", v0.85): it fails before it writes
-		// (saveInfo), a save as any other writing request.
+		// (saveInfo), a save as any other writing request. A request that
+		// only reads fails too, since v0.86, when it answers: the read
+		// that failed here is one it made (writeGuard, sawUpstream).
 		st.unread.CompareAndSwap(nil, &err)
 	}
 	return in
@@ -243,8 +245,9 @@ func (s *Server) nsInfo(ctx context.Context, tk *token, ns string) nsInfo {
 // the error, and the request fails before the write: a failed read of
 // what the answer depends on fails it, and never counts as a refusal or
 // as settings to go by (§H.4 "Answers", v0.85; before, a save's alone).
-// A request that only reads goes by the settings a fresh $nonce on every
-// write stands for, as nsInfo does.
+// A request that only reads goes on by the settings a fresh $nonce on
+// every write stands for, as nsInfo does, and is answered with the
+// failure all the same (errWriter; §H.4 "Answers", v0.86).
 func (st *reqState) saveInfo(ctx context.Context, ns string) (nsInfo, error) {
 	in, err := st.s.nsInfoErr(ctx, st.tk, ns)
 	if !st.writes() {

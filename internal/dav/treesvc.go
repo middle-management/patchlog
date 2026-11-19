@@ -57,8 +57,10 @@ import (
 // listing that asked for them came back, for at most maxWroteAge:
 // however long the tree service lags within that, a user's own new file
 // stays listed and a file they renamed doesn't come back by its old name.
-// Past TreeWait the folder is listed from the node documents instead, as
-// without a tree service, for slowFor; a token whose grant can't read
+// Past TreeWait the request is answered 503 (§H.3 "A tree service that is
+// behind", v0.86), and the user's requests that follow, for slowFor, list
+// the folder from the node documents, as without a tree service, without
+// asking the tree service; a token whose grant can't read
 // them either gets a 503 for limitedWait after the user's write, then the
 // tree service's listing without waiting. Entries the tree service
 // refuses to wait for (400: a namespace it doesn't follow, or the reader
@@ -90,7 +92,8 @@ const (
 	// service's most, and maxTreePages the pages one folder lists.
 	treePage, maxTreePages = 1000, 10
 	// slowFor is how long a catalog whose tree service didn't reach the
-	// user's writes in time is listed from its node documents.
+	// user's writes in time (a 503 for the request that asked) is listed
+	// from its node documents, without asking it.
 	slowFor = 5 * time.Second
 	// maxWroteNS bounds the namespaces a user's writes are kept for, and
 	// maxWroteIDs the entries of one; maxWroteAge how long an entry the
