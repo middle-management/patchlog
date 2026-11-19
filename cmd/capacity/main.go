@@ -66,6 +66,9 @@ type config struct {
 	singleSecs  int
 	singleRate  float64
 	backoffMax  time.Duration
+	resWaiters  string
+	resWriters  int
+	resSecs     int
 }
 
 // args are the harness's flags (go-arg), copied into config.
@@ -91,7 +94,10 @@ type args struct {
 	SingleSecs  int           `arg:"--single-seconds" default:"15" help:"seconds each single-document write measurement runs"`
 	SingleRate  float64       `arg:"--single-rate" help:"single-document measurements: writes a second (and burst) the namespace allows per resource, per principal and in all, in place of the defaults (10, 50 and 500 a second); the core needs --max-rate-per-resource, --max-rate-per-principal and --max-rate-per-namespace raised to it"`
 	BackoffMax  time.Duration `arg:"--single-backoff-max" help:"single-document measurements: the longest wait of the client's backoff after lost races (default: the client's, 16ms)"`
-	Only        string        `arg:"--only" help:"run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live"`
+	ResWaiters  string        `arg:"--resource-waiters" default:"256,1024" help:"resource-live: long-poll followers, each of a resource of its own in one namespace, to measure ('' to skip)"`
+	ResWriters  int           `arg:"--resource-writers" default:"16" help:"resource-live: concurrent writers, each appending to a resource of its own in the followers' namespace"`
+	ResSecs     int           `arg:"--resource-seconds" default:"20" help:"resource-live: seconds the writers write for each follower count"`
+	Only        string        `arg:"--only" help:"run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live, resource-live"`
 }
 
 func (args) Description() string {
@@ -123,6 +129,9 @@ func main() {
 		singleSecs:  a.SingleSecs,
 		singleRate:  a.SingleRate,
 		backoffMax:  a.BackoffMax,
+		resWaiters:  a.ResWaiters,
+		resWriters:  a.ResWriters,
+		resSecs:     a.ResSecs,
 		only:        a.Only,
 	}
 	if c.revs < c.docs {
@@ -320,6 +329,9 @@ func (r *runner) run() {
 	}
 	if on("live") {
 		r.live()
+	}
+	if on("resource-live") {
+		r.resourceLive()
 	}
 	for k, pid := range r.pids() {
 		b, err := os.ReadFile("/proc/" + pid + "/status")
@@ -1237,6 +1249,170 @@ func (r *runner) live() {
 		out[fmt.Sprint(w)] = res
 	}
 	r.record("long_poll_fanout", out)
+}
+
+// resourceLive measures writes to a namespace while followers long-poll
+// resources of their own in it (§7.7), as a workflow runner's clients each
+// follow their run's document while a coordinator writes the namespace's
+// other resources. Each follower should cost nothing while its resource is
+// quiet: the writes' throughput, latency and core CPU are recorded, and the
+// long-poll answers the followers got meanwhile (a 204 at each interval
+// boundary, one per follower, is expected; more means unrelated writes
+// woke them). Then a write to one follower's resource is timed to it.
+//
+// The namespace allows the writers 1e9 writes a second: the core needs
+// --max-rate-per-resource, --max-rate-per-principal and
+// --max-rate-per-namespace raised to it (1e9,1e9).
+func (r *runner) resourceLive() {
+	if r.c.resWaiters == "" {
+		return
+	}
+	var counts []int
+	most := 0
+	for _, s := range strings.Split(r.c.resWaiters, ",") {
+		var n int
+		if _, err := fmt.Sscan(s, &n); err != nil {
+			fail(fmt.Errorf("--resource-waiters: %w", err))
+		}
+		counts = append(counts, n)
+		most = max(most, n)
+	}
+	ns := fmt.Sprintf("%s-rlive-%d", r.c.big, time.Now().Unix())
+	b := map[string]any{"rate": 1e9, "burst": 1e9}
+	r.createNS(ns, map[string]any{"ratePerResource": b, "ratePerPrincipal": b, "ratePerNamespace": b})
+	w := r.w(ns)
+	// The followers' resources, and the writers'.
+	heads := make([]string, most)
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for k := 0; k < 32; k++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := int(next.Add(1)) - 1; i < most; i = int(next.Add(1)) - 1 {
+				heads[i] = must(retry(func() (*client.WriteResult, error) {
+					return w.CreateDoc(r.ctx, ns, fmt.Sprintf("run%05d", i), map[string]any{"state": "queued"})
+				})).ID
+			}
+		}()
+	}
+	wg.Wait()
+	writers := make([]string, r.c.resWriters)
+	for k := range writers {
+		writers[k] = must(w.CreateDoc(r.ctx, ns, fmt.Sprintf("coord%03d", k), map[string]any{"n": 0})).ID
+	}
+	out := map[string]any{"writers": r.c.resWriters, "seconds": r.c.resSecs}
+	for _, n := range counts {
+		hc := sharedHTTP(n + 16)
+		lcs := make([]*client.Client, n)
+		for i := range lcs {
+			opts := []client.Option{client.WithHTTPClient(hc)}
+			if r.op != nil {
+				opts = append(opts, client.WithBearer(r.mint(r.key, map[string]any{"kid": keyKid, "sub": fmt.Sprintf("user:runner-%d", i), "ns": []any{ns}, "can": []any{"read"}})))
+			}
+			lcs[i] = must(client.New(r.urls[i%len(r.urls)], opts...))
+		}
+		ctx, cancel := context.WithCancel(r.ctx)
+		var parked, answers, errs atomic.Int64
+		got := make(chan time.Time, n)
+		var lw sync.WaitGroup
+		for i := 0; i < n; i++ {
+			lw.Add(1)
+			go func() {
+				defer lw.Done()
+				since, cursor := heads[i], ""
+				parked.Add(1)
+				for ctx.Err() == nil {
+					res, err := lcs[i].ResourceLongPoll(ctx, ns, fmt.Sprintf("run%05d", i), since, cursor)
+					if ctx.Err() != nil {
+						return
+					}
+					if err != nil && cursor != "" && client.IsBadInput(err) {
+						cursor = ""
+						continue
+					}
+					if err != nil {
+						if errs.Add(1) == 1 {
+							r.logf("resource long-poll: %v", err)
+						}
+						time.Sleep(100 * time.Millisecond)
+						continue
+					}
+					answers.Add(1)
+					if len(res.Entries) > 0 {
+						got <- time.Now()
+					}
+					since, cursor = res.Since, res.Cursor
+				}
+			}()
+		}
+		for parked.Load() < int64(n) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		time.Sleep(2 * time.Second) // their first requests reach the core
+		r.settle()
+		answers.Store(0)
+		cpu0 := r.cpu()
+		t0 := time.Now()
+		deadline := t0.Add(time.Duration(r.c.resSecs) * time.Second)
+		var mu sync.Mutex
+		var lat []time.Duration
+		var failed atomic.Int64
+		var ww sync.WaitGroup
+		for k := range writers {
+			ww.Add(1)
+			go func() {
+				defer ww.Done()
+				name := fmt.Sprintf("coord%03d", k)
+				for v := 0; time.Now().Before(deadline); v++ {
+					t := time.Now()
+					res, err := w.Append(r.ctx, ns, name, writers[k], []any{map[string]any{"op": "replace", "path": "/n", "value": v}})
+					if err != nil {
+						if failed.Add(1) == 1 {
+							r.logf("write: %v", err)
+						}
+						if h, herr := w.Head(r.ctx, ns, name); herr == nil {
+							writers[k] = h.ID
+						}
+						continue
+					}
+					writers[k] = res.ID
+					mu.Lock()
+					lat = append(lat, time.Since(t))
+					mu.Unlock()
+				}
+			}()
+		}
+		ww.Wait()
+		wall := time.Since(t0)
+		cpu := r.cpu() - cpu0
+		woken := answers.Load()
+		res := map[string]any{"long_poll_answers": woken, "long_poll_errors": errs.Load(), "write_errors": failed.Load()}
+		if len(lat) > 0 {
+			res["writes"] = summary(lat, wall)
+		}
+		if r.c.pid != "" {
+			res["origin_cpu_seconds"] = cpu
+			res["origin_cores"] = cpu / wall.Seconds()
+		}
+		// One follower's own write reaches it.
+		for len(got) > 0 {
+			<-got
+		}
+		t1 := time.Now()
+		h0 := must(w.Append(r.ctx, ns, "run00000", heads[0], []any{map[string]any{"op": "replace", "path": "/state", "value": "done"}}))
+		select {
+		case at := <-got:
+			res["own_write_delivered_ms"] = float64(at.Sub(t1).Microseconds()) / 1000
+		case <-time.After(30 * time.Second):
+			res["own_write_delivered_ms"] = "not within 30s"
+		}
+		heads[0] = h0.ID
+		cancel()
+		lw.Wait()
+		out[fmt.Sprint(n)] = res
+	}
+	r.record("resource_long_poll_writes", out)
 }
 
 // waitEntries long-polls ns from since (§7.7), echoing each answer's

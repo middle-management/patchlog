@@ -9,6 +9,18 @@
   answers, the page shows the command to start one for its origin. Served by `patchlog serve`, it
   calls its own origin as before. `selftest.json` is now read relative to the page. See README,
   "Playground on GitHub Pages".
+- **A resource's long-polls and event streams are woken by its own commits only** (§7.7,
+  §7.3). They waited on the namespace's channel, so every write to the namespace made each of
+  them read its log again: with clients each following their own document while a coordinator
+  wrote the namespace's other resources, the cost was followers × writes a second, and at 256
+  followers and ~1,000 writes a second the core spent its CPU on reads that found nothing.
+  Now the engine keeps a waiter channel per resource (`Engine.WaitResource`), closed by a
+  commit whose namespace entry names the resource (a write, a batch item, a purge, a prune)
+  or names none (configuration, branch, namespace purge), which wakes all of them. Namespace
+  long-polls and streams wait on the namespace as before. On Postgres the tailer wakes by
+  resource as well, from the `ns_log` entries it reads (a batch's items from its body).
+  docs/CAPACITY.md, "Resource followers", has the before and after; `cmd/capacity -only
+  resource-live` measures it.
 
 ## v0.31.0
 

@@ -59,7 +59,11 @@ func judgeCursor(now time.Time, interval time.Duration, reqCursor int64) (int64,
 }
 
 // longPoll implements §7.7 for a log fetched by fetch, with the request's
-// cursor (liveQuery), -1 without one.
+// cursor (liveQuery), -1 without one. wait returns the channel closed on
+// the next commit that may change what fetch returns: the namespace's
+// (Engine.Wait) for its log, the resource's (Engine.WaitResource) for a
+// resource's, so a resource's waiters sleep through the namespace's other
+// writes.
 //
 // A cursor more than an hour's worth of intervals ahead of or behind this
 // server's is 400; the client then omits it. A request without a cursor,
@@ -68,7 +72,7 @@ func judgeCursor(now time.Time, interval time.Duration, reqCursor int64) (int64,
 // one ahead, waits until this server's interval boundary at the latest
 // (§7.7 Intervals and cursors).
 func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header string, tags []string, reqCursor int64,
-	fetch func(ctx context.Context, since string) (*core.Log, error)) {
+	wait func() <-chan struct{}, fetch func(ctx context.Context, since string) (*core.Log, error)) {
 	since := r.URL.Query().Get("since")
 	interval := s.e.LongPollInterval()
 	current, err := judgeCursor(time.Now(), interval, reqCursor)
@@ -79,7 +83,10 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 	atOnce := reqCursor < current
 	deadline := time.Unix(0, (current+1)*int64(interval))
 	for {
-		wait := s.e.Wait(ns)
+		woken := wait()
+		if testLongPollFetch != nil {
+			testLongPollFetch()
+		}
 		lg, err := fetch(r.Context(), since)
 		if err != nil {
 			// A partial reader, by its grant: the filtered long-poll
@@ -110,7 +117,7 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 		}
 		if !atOnce {
 			select {
-			case <-wait:
+			case <-woken:
 				continue
 			case <-time.After(time.Until(deadline)):
 			case <-lifecycle.Stopping(r.Context()):
@@ -135,6 +142,10 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 		return
 	}
 }
+
+// testLongPollFetch, if set, is called before each read of a long-poll
+// (tests count them).
+var testLongPollFetch func()
 
 // setLive sets the headers of a long-poll answer (§7.7, §9), private as
 // cache sets them.
@@ -194,7 +205,8 @@ func (s *Server) resourceLive(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(302)
 		return
 	}
-	s.longPoll(w, r, ns, "X-Revision", resTags(ns, name), cursor, func(ctx context.Context, since string) (*core.Log, error) {
+	wait := func() <-chan struct{} { return s.e.WaitResource(ns, name) }
+	s.longPoll(w, r, ns, "X-Revision", resTags(ns, name), cursor, wait, func(ctx context.Context, since string) (*core.Log, error) {
 		return s.e.ResourceLog(ctx, ns, name, "", since, lim, creds(r))
 	})
 }
@@ -234,7 +246,8 @@ func (s *Server) nsLive(w http.ResponseWriter, r *http.Request) {
 	// The request's read check, while it holds, stands for its later
 	// reads, which are then shared with the other waiters (core/live.go).
 	var pass *core.LivePass
-	s.longPoll(w, r, ns, "X-Namespace-Revision", []string{"ns:" + ns}, cursor, func(ctx context.Context, since string) (*core.Log, error) {
+	wait := func() <-chan struct{} { return s.e.Wait(ns) }
+	s.longPoll(w, r, ns, "X-Namespace-Revision", []string{"ns:" + ns}, cursor, wait, func(ctx context.Context, since string) (*core.Log, error) {
 		// A partial reader's first read is redirected to the filtered
 		// long-poll (§B.11.9 URLs), which longPoll answers.
 		lg, p, err := s.e.NamespaceLiveLog(ctx, ns, since, lim, creds(r), pass)
@@ -420,8 +433,10 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	cred := creds(r)
 	since := sinceParam(r)
-	// Wait before every fetch, so no entry committed in between is missed.
-	wait := s.e.Wait(ns)
+	// Wait before every fetch, so no entry committed in between is missed:
+	// on the resource, whose writes, purges and prunes are what the stream
+	// sends, and which commits concerning the whole namespace also wake.
+	wait := s.e.WaitResource(ns, name)
 	// Catching up reads a log page at a time (§7.1 Paging), as nsEvents.
 	page := s.e.Limits().LogPageSize
 	// The namespace log is followed for this resource's purges and prunes
@@ -506,7 +521,7 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		}
-		wait = s.e.Wait(ns)
+		wait = s.e.WaitResource(ns, name)
 		sent = false
 		if ok, done := nsEntries(); !ok || done {
 			return

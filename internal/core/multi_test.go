@@ -493,6 +493,65 @@ func TestPGWakeOtherInstance(t *testing.T) {
 	}
 }
 
+// A resource's live reader on one instance is woken by the other's write
+// to it, a batch naming it, or a configuration change, and not by its
+// writes to the namespace's other resources: the tailer wakes by resource.
+func TestPGWakeResourceOtherInstance(t *testing.T) {
+	a, b := twoInstances(t)
+	cfg := mkNS(t, a, "n", map[string]any{"read": "public"})
+	r1, err := put(a, "n", "r", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o, err := put(a, "n", "o", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(3 * tailEvery) // the writes' own wake-ups
+	wait, nsWait := b.WaitResource("n", "r"), b.Wait("n")
+	for i := 1; i <= 10; i++ {
+		if o, err = put(a, "n", "o", o, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req := who
+	req.NS = "n"
+	add := []any{map[string]any{"op": "add", "path": "", "value": map[string]any{}}}
+	if _, err := a.Batch(context.Background(), req, []Item{{Resource: "x", IfNoneMatch: true, Steps: []Step{{Patches: add}}}}, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-nsWait:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the other instance's namespace reader wasn't woken")
+	}
+	time.Sleep(5 * tailEvery)
+	select {
+	case <-wait:
+		t.Fatal("r's reader woken by writes to other resources")
+	default:
+	}
+	steps := []Step{{Patches: []any{map[string]any{"op": "replace", "path": "/n", "value": 1.0}}}}
+	if _, err := a.Batch(context.Background(), req, []Item{{Resource: "r", IfMatch: r1, Steps: steps}, {Resource: "y", IfNoneMatch: true, Steps: []Step{{Patches: add}}}}, nil, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-wait:
+	case <-time.After(5 * time.Second):
+		t.Fatal("r's reader not woken by a batch naming r")
+	}
+	time.Sleep(3 * tailEvery)
+	wait = b.WaitResource("n", "r")
+	if _, err := a.WriteConfig(context.Background(), req, ConfigChange{IfMatch: cfg, Patches: []any{map[string]any{"op": "add", "path": "/x-d", "value": "d"}}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-wait:
+	case <-time.After(5 * time.Second):
+		t.Fatal("r's reader not woken by a configuration change")
+	}
+}
+
 // A purge on one instance: the other stops serving the content from its
 // transaction-free cache within freshFor of the purge's commit.
 func TestPGPurgeStopsOtherInstance(t *testing.T) {

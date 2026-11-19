@@ -4949,7 +4949,13 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   while the read cache's meta counter (configuration, purges, prunes, restores, key destruction;
   on Postgres while the tailer is fresh) hasn't moved, and before the grant's earliest `exp`
   (since v0.78 a rule on `/now` never passes for a read, so it no longer matters here); edge
-  grants and resource long-polls are read on their own, as before. When it was first measured
+  grants and resource long-polls are read on their own, as before. A resource's long-polls and
+  event streams wait on the resource, not the namespace (`Engine.WaitResource`): they are woken
+  by commits naming it (a write, a batch item, a purge or a prune) and by entries that name no
+  resource (configuration changes, branches, namespace purges), not by writes to its other
+  resources. So a client following its own document doesn't read it again on every write to the
+  namespace; on Postgres the tailer wakes by resource too, from the `ns_log` entries it reads
+  ([docs/CAPACITY.md](docs/CAPACITY.md), "Resource followers"). When it was first measured
   ([docs/CAPACITY.md](docs/CAPACITY.md), "Earlier measurements") one write to 5,000 private followers went from 3.7–4.1 s
   of core CPU to 0.3–1 s. The local CDN's VCL lets a long-poll with credentials skip Varnish's
   waiting list (`hash_ignore_busy`), so a private one isn't held behind an identical request in
