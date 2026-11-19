@@ -216,6 +216,11 @@ func (r *runner) branchWidth(tag string, stub *purgeStub) {
 	}
 	sw := must(cb.CreateDoc(r.ctx, base, "schema", structuredSchema()))
 	schemaRef := fmt.Sprintf("/r/%s/schema/rev/%s", base, sw.ID)
+	// Typed documents of the base, which every branch reads through: each
+	// branch then references the schema too.
+	for i := 0; i < 20; i++ {
+		must(cb.CreateDoc(r.ctx, base, fmt.Sprintf("typed-%d", i), structuredDoc(2048, schemaRef)))
+	}
 
 	// With no branch anywhere: the purge of a document of another
 	// namespace, and of one of the base.
