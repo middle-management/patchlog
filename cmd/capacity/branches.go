@@ -135,6 +135,9 @@ func body(i int) map[string]any {
 // purges purges names of ns one after another and reports the times and
 // the purge tags the core sent for each.
 func (r *runner) purges(c *client.Client, ns string, names []string, stub *purgeStub) map[string]any {
+	if len(names) == 0 {
+		return map[string]any{"n": 0}
+	}
 	heads := make([]string, len(names))
 	for i, n := range names {
 		heads[i] = must(c.Head(r.ctx, ns, n)).ID
