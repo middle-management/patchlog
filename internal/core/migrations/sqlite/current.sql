@@ -6,7 +6,3 @@
 --
 -- Example usage:
 -- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
--- The distinct $schema values of the deployment, one index probe each
--- (drafts.go, possiblyReferenced): what a purge asks before it would read
--- every document for references to what it removes (§6.1).
-CREATE INDEX IF NOT EXISTS revisions_schema_ref ON revisions (schema_ref) WHERE schema_ref IS NOT NULL;

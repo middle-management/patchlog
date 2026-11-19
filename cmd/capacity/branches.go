@@ -352,6 +352,21 @@ func (r *runner) branchWidth(tag string, stub *purgeStub) {
 			return r.purges(cb, base, names(kind), stub)
 		}))
 	}
+	// The purge that still runs the full check: of the schema the typed
+	// documents reference, refused (409 in_use).
+	if n > 0 && r.c.purgeRuns > 0 {
+		head := must(cb.Head(r.ctx, base, "schema")).ID
+		r.record("purge_schema_refused", timesOf(3, func(int) error {
+			_, err := cb.Purge(r.ctx, base, "schema", head, false)
+			if err == nil {
+				return fmt.Errorf("the referenced schema was purged")
+			}
+			if !strings.Contains(err.Error(), "in_use") {
+				return err
+			}
+			return nil
+		}))
+	}
 }
 
 func (r *runner) branchChain(tag string, stub *purgeStub) {
