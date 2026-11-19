@@ -9,11 +9,12 @@ import (
 	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
-// countRefusedPurge builds a schema in namespace s that a document of
-// base n names, and branches branches of n, each of which reads that
-// document through and so references the schema; it returns the
-// statements of the refused purge of the schema and the refusal.
-func countRefusedPurge(t *testing.T, branches, page int) (int, *Error) {
+// countRefusedPurge builds a schema in namespace schemaNS ("s", or the
+// base "n" itself) that a document of base n names, and branches
+// branches of n, each of which reads that document through and so
+// references the schema; it returns the statements of the refused purge
+// of the schema and the refusal.
+func countRefusedPurge(t *testing.T, schemaNS string, branches, page int) (int, *Error) {
 	t.Helper()
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
@@ -41,8 +42,8 @@ func countRefusedPurge(t *testing.T, branches, page int) (int, *Error) {
 		}
 		return res.Items[0].IDs[0]
 	}
-	sid := write("s", "team", map[string]any{"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object"})
-	write("n", "x", map[string]any{"$schema": "/r/s/team/rev/" + sid})
+	sid := write(schemaNS, "team", map[string]any{"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object"})
+	write("n", "x", map[string]any{"$schema": "/r/" + schemaNS + "/team/rev/" + sid})
 	for i := 0; i < branches; i++ {
 		r := who
 		r.NS = "n"
@@ -58,7 +59,7 @@ func countRefusedPurge(t *testing.T, branches, page int) (int, *Error) {
 		mu.Unlock()
 	}
 	r := who
-	r.NS = "s"
+	r.NS = schemaNS
 	_, err = e.Purge(ctx, r, "team", sid, false)
 	e.onStatement = nil
 	ae, _ := err.(*Error)
@@ -77,21 +78,25 @@ func countRefusedPurge(t *testing.T, branches, page int) (int, *Error) {
 func TestV086RefusedPurgeStopsAtAPage(t *testing.T) {
 	t.Parallel()
 	const page = 5
-	few, fe := countRefusedPurge(t, 20, page)
-	many, me := countRefusedPurge(t, 60, page)
-	t.Logf("%d statements with 20 branches, %d with 60", few, many)
-	if many != few {
-		t.Errorf("%d statements with 60 referencing branches, %d with 20: the search didn't stop at the page", many, few)
-	}
-	for _, ae := range []*Error{fe, me} {
-		// The first five by name; the base n sorts after every branch.
-		if got := fmt.Sprint(ae.Body["referencing"]); got != "[b000 b001 b002 b003 b004]" || ae.Body["more"] != true {
-			t.Errorf("refusal %v", ae.Body)
+	// The schema in a namespace of its own, and in the base whose
+	// branches read it through (docs/capacity's purge_schema_refused).
+	for _, schemaNS := range []string{"s", "n"} {
+		few, fe := countRefusedPurge(t, schemaNS, 20, page)
+		many, me := countRefusedPurge(t, schemaNS, 60, page)
+		t.Logf("schema in %s: %d statements with 20 branches, %d with 60", schemaNS, few, many)
+		if many != few {
+			t.Errorf("schema in %s: %d statements with 60 referencing branches, %d with 20: the search didn't stop at the page", schemaNS, many, few)
 		}
-	}
-	// Up to a page of them, the search is whole and there is no more.
-	_, ae := countRefusedPurge(t, 4, page)
-	if got := fmt.Sprint(ae.Body["referencing"]); got != "[b000 b001 b002 b003 n]" || ae.Body["more"] != nil {
-		t.Errorf("a page of referencing namespaces: %v", ae.Body)
+		for _, ae := range []*Error{fe, me} {
+			// The first five by name; the base n sorts after every branch.
+			if got := fmt.Sprint(ae.Body["referencing"]); got != "[b000 b001 b002 b003 b004]" || ae.Body["more"] != true {
+				t.Errorf("schema in %s: refusal %v", schemaNS, ae.Body)
+			}
+		}
+		// Up to a page of them, the search is whole and there is no more.
+		_, ae := countRefusedPurge(t, schemaNS, 4, page)
+		if got := fmt.Sprint(ae.Body["referencing"]); got != "[b000 b001 b002 b003 n]" || ae.Body["more"] != nil {
+			t.Errorf("schema in %s: a page of referencing namespaces: %v", schemaNS, ae.Body)
+		}
 	}
 }

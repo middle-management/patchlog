@@ -533,8 +533,9 @@ async function refreshNS() {
   if (ns !== S.ns) return;
   if (lg.status === 200) { const v = await nsLogRead(ns, lg); if (ns !== S.ns) return; S.nsLog = v; }
   if (hd.status === 200 && hd.json) { S.heads = headsOf(hd.json); S.headsNext = hd.json.next || ''; }
-  S.branches = await branchesAll(ns, br);
+  const branches = await branchesAll(ns, br);
   if (ns !== S.ns) return;
+  S.branches = branches;
   renderNsAll();
   updateLiveUrls();
 }

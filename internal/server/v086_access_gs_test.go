@@ -32,8 +32,17 @@ func TestV086FilteredCookieStaysEnded(t *testing.T) {
 	refused := func(what string, ck map[string]string) {
 		t.Helper()
 		for _, p := range paths() {
-			if r := w.do(req{method: "GET", path: p, hdr: ck}); r.Code != 403 {
-				t.Errorf("%s: GET %s: %d %s, want 403", what, p, r.Code, r.Body)
+			// A stream or a long-poll that is served never answers
+			// here: it is given five seconds to refuse.
+			done := make(chan *resp, 1)
+			go func() { done <- w.do(req{method: "GET", path: p, hdr: ck}) }()
+			select {
+			case r := <-done:
+				if r.Code != 403 {
+					t.Errorf("%s: GET %s: %d %s, want 403", what, p, r.Code, r.Body)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("%s: GET %s is being served, want 403", what, p)
 			}
 		}
 	}

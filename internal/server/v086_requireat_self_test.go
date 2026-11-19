@@ -33,6 +33,9 @@ func TestV086RequireAtOwnNamespacePurged(t *testing.T) {
 		return e.grant(kp, "user:li", []string{ns}, []string{"read", "append"}, map[string]any{"at": map[string]any{"ns": "matches", "id": id}, "exp": exp()})
 	}
 	before := e.nsHead("matches", admin)
+	// The key naming matches reads in the branch while matches lives.
+	inBranch := grantAt(named, "matches-b", before)
+	expect(t, e.get("/ns/matches-b/log", inBranch), 302)
 	keys := map[string]keyPair{"requireAt: true": self, `requireAt: "matches"`: named}
 	live := map[string]string{}
 	for name, kp := range keys {
@@ -64,8 +67,10 @@ func TestV086RequireAtOwnNamespacePurged(t *testing.T) {
 	// In the branch, which takes the base's keys (§C.4), "matches" is a
 	// namespace other than the one the grant is checked in: the scope's
 	// 403, as for any purged namespace a requireAt names.
-	if r := e.get("/ns/matches-b/log", grantAt(named, "matches-b", purge)); r.Code != 403 {
-		t.Errorf(`requireAt: "matches" checked in its purged branch: %d %s, want the scope's 403`, r.Code, r.Body)
+	for an, g := range map[string]string{"at the purge-ns entry": grantAt(named, "matches-b", purge), "the grant that read before": inBranch} {
+		if r := e.get("/ns/matches-b/log", g); r.Code != 403 {
+			t.Errorf(`requireAt: "matches" checked in its purged branch, %s: %d %s, want the scope's 403`, an, r.Code, r.Body)
+		}
 	}
 }
 
