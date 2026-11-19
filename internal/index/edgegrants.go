@@ -118,11 +118,13 @@ type gsKey struct {
 	pub   string // the key's pub member, as its namespace document gives it
 	entry string
 	// conf is, at an exchange, the namespace documents entry was drawn
-	// from, by namespace: the marker's own and, for a local branch, each
-	// base's the checker could read, each as confPos gives it.
-	// recordCookies keeps of them those the index hasn't reached yet
-	// (gsKeyRow.pending). nil for a key read back from the database.
-	conf map[string]string
+	// from that the index was found to be behind (exchangeEntry, ahead),
+	// by namespace, each as confPos gives it. recordCookies keeps of them
+	// those the index still hasn't reached (gsKeyRow.pending). chain are
+	// the bases of a local branch entry was drawn through, nearest first
+	// (gsKeyRow.chain). Both nil for a key read back from the database.
+	conf  map[string]string
+	chain []string
 }
 
 // confDigest names a namespace document by its content.
@@ -136,29 +138,47 @@ func confDigest(doc map[string]any) string {
 // confPos is where in a namespace's log an exchange read the document
 // cfg: "{ns_id} {digest}", the head the checker read it at and the
 // document's digest. The index has reached it once it has applied the
-// entry of that ns_id (seen), or, for a log it doesn't meet entry by
-// entry, a document that says the same.
+// entry of that ns_id (seen); the digest is kept for reading the table.
 func confPos(cfg *grantcheck.Config) string { return cfg.Head + " " + confDigest(cfg.Doc) }
 
-// confsOf are the documents a key of cfg's namespace is drawn from at an
-// exchange (gsKey.conf): cfg's and, for a local branch, those of its
-// chain of bases as the checker holds them. A base it can't read is left
-// out, with those above it: a document of one is then judged for the
-// cookie whenever it is applied (cookieEnds), which only refuses more.
-func (ix *Index) confsOf(ctx context.Context, cfg *grantcheck.Config) map[string]string {
-	out := map[string]string{cfg.NS: confPos(cfg)}
-	for depth := 0; cfg.Base != "" && depth < maxChain; depth++ {
+// chainOf are the documents of cfg's chain of bases, nearest first, as
+// the checker holds them, where cfg's namespace is a local branch: the
+// ones an exchange draws its key from (exchangeEntry), each read once, so
+// that the entry it records and the positions it records for it come
+// from the same documents. A base it can't read ends the list.
+func (ix *Index) chainOf(ctx context.Context, cfg *grantcheck.Config) []*grantcheck.Config {
+	var out []*grantcheck.Config
+	seen := map[string]bool{cfg.NS: true}
+	for cfg.Base != "" && len(out) < maxChain && !seen[cfg.Base] {
 		base, err := ix.checker.Config(ctx, cfg.Base)
 		if err != nil {
 			break
 		}
-		if _, seen := out[base.NS]; seen {
-			break
-		}
-		out[base.NS] = confPos(base)
+		seen[base.NS] = true
+		out = append(out, base)
 		cfg = base
 	}
 	return out
+}
+
+// ahead reports whether head, the ns_id the checker read ns's document
+// at, is known to lie after the index's checkpoint of ns: the index
+// follows ns, hasn't applied the entry (seen), and the origin serves the
+// range from its checkpoint up to head, so the checkpoint is in head's
+// chain (§7.1 Paging) and the follower will meet the entry. Anything
+// else is not ahead: a head the checker read before the index started
+// ns from a snapshot past it is in no batch to come, and a cookie
+// recorded as waiting for it would have every later document skipped
+// for it. Such a cookie is judged by every document instead.
+func (ix *Index) ahead(ctx context.Context, ns, head string) bool {
+	cur, purged, _ := ix.state(ns)
+	if cur == "" || purged || head == "" || cur == head || ix.seen(ctx, ns, head) {
+		return false
+	}
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_, _, err := ix.c.NSLogPage(cctx, ns, head, cur)
+	return err == nil
 }
 
 // encodePending and decodePending are gsKeyRow.pending's form: "" for
@@ -349,35 +369,54 @@ func (ix *Index) entryHolds(ctx context.Context, cfg *grantcheck.Config, k gsKey
 // document moved during the exchange (head is the one read before v was
 // verified), so that what verified v can't be told from what a read is
 // judged by. Before v0.85 either minted a cookie that never held.
-func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, v *grant.Verified, k gsKey) (entry string, behind bool) {
+func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, v *grant.Verified, k gsKey) (out gsKey, behind bool) {
+	out = k
+	out.entry = ""
 	cfg, err := ix.checker.Config(ctx, ns)
 	if err != nil {
-		return "", false
+		return out, false
 	}
 	if cfg.Head != head {
-		return "", true
+		return out, true
 	}
-	entry, key, ok, err := ix.entryOf(ctx, cfg, k.kid, k.roles)
+	// The chain's documents, read once: the entry and the positions
+	// recorded with it are those of the same documents.
+	chain := ix.chainOf(ctx, cfg)
+	over := make(map[string]*grantcheck.Config, len(chain))
+	for _, b := range chain {
+		over[b.NS] = b
+	}
+	entry, key, ok, err := ix.entryOfIn(ctx, cfg, k.kid, k.roles, over)
 	if err != nil || !ok || !bytes.Equal(jsonv.Canonical(key.Raw), jsonv.Canonical(v.Key.Raw)) {
-		return "", false
+		return out, false
 	}
 	if a.cov != nil {
 		doc, err := ix.docAt(ctx, ns, a.cov.cp.reads[ns])
 		if err != nil {
-			return "", false
+			return out, false
 		}
 		at, err := grantcheck.ParseConfig(ns, "", doc)
 		if err != nil {
-			return "", false
+			return out, false
 		}
-		switch e, _, ok, err := ix.entryOf(ctx, at, k.kid, k.roles); {
+		switch e, _, ok, err := ix.entryOfIn(ctx, at, k.kid, k.roles, over); {
 		case err != nil:
-			return "", false
+			return out, false
 		case !ok || e != entry:
-			return "", true
+			return out, true
 		}
 	}
-	return entry, false
+	out.entry = entry
+	out.conf = map[string]string{}
+	for _, c := range append([]*grantcheck.Config{cfg}, chain...) {
+		if c != cfg {
+			out.chain = append(out.chain, c.NS)
+		}
+		if ix.ahead(ctx, c.NS, c.Head) {
+			out.conf[c.NS] = confPos(c)
+		}
+	}
+	return out, false
 }
 
 // errExchangeBehind is an exchange whose cookie would be 403 at once
@@ -472,7 +511,12 @@ var errNoSlot = errors.New("no exp left for an edge grant of its own")
 // exchange changes one of them"). A namespace leaves pending as the
 // index applies the document named. Rows from before v0.86's second
 // migration have none, and are judged by every document.
-type gsKeyRow struct{ kid, roles, pub, entry, pending string }
+//
+// chain is the bases of a local branch the row's key was drawn through,
+// as a JSON array, "" for none: a document of one of them is judged for
+// the row whether or not the checker can say, as it is applied, that the
+// branch draws on it.
+type gsKeyRow struct{ kid, roles, pub, entry, pending, chain string }
 
 // recordCookies records what the markers of the edge grants recs, minted
 // at now, stand for (edge_filters, and for g: markers edge_gs), and the
@@ -504,6 +548,11 @@ type gsKeyRow struct{ kid, roles, pub, entry, pending string }
 // §B.11.9 gs, v0.86: "the cookie is 403 from that entry on, even where a
 // later entry undoes the change").
 func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.Time) error {
+	// With the batches' lock: a batch's transaction reads the rows before
+	// it writes (cookieEnds.apply), and one committed here in between
+	// would fail its first write on a stale snapshot.
+	ix.wmu.Lock()
+	defer ix.wmu.Unlock()
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -531,7 +580,7 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 		if by, ok := taken[m]; ok {
 			return by, nil
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT exp, kid, roles, pub, entry, pending FROM edge_gs_keys WHERE marker = ? ORDER BY exp, kid, roles, pub`, m)
+		rows, err := tx.QueryContext(ctx, `SELECT exp, kid, roles, pub, entry, pending, chain FROM edge_gs_keys WHERE marker = ? ORDER BY exp, kid, roles, pub`, m)
 		if err != nil {
 			return nil, err
 		}
@@ -542,7 +591,7 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 				exp int64
 				k   gsKeyRow
 			)
-			if err := rows.Scan(&exp, &k.kid, &k.roles, &k.pub, &k.entry, &k.pending); err != nil {
+			if err := rows.Scan(&exp, &k.kid, &k.roles, &k.pub, &k.entry, &k.pending, &k.chain); err != nil {
 				return nil, err
 			}
 			by[exp] = append(by[exp], k)
@@ -550,11 +599,11 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 		taken[m] = by
 		return by, rows.Err()
 	}
-	// pendingOf keeps of conf the positions the index hasn't reached: the
-	// entry at that ns_id isn't among those it applied (seen). Read in
-	// this transaction, which a batch's can't interleave with: an entry
-	// is either applied already, or will be met by the row written here.
-	// A checker's document older than the index's is one it has seen.
+	// pendingOf keeps of conf, the positions the exchange found ahead of
+	// the index (ahead), those it still hasn't reached: the entry at that
+	// ns_id isn't among those it applied (seen). Read in this
+	// transaction, which a batch's can't interleave with: an entry is
+	// either applied already, or will be met by the row written here.
 	reached := map[string]bool{}
 	pendingOf := func(conf map[string]string) (string, error) {
 		p := map[string]string{}
@@ -589,7 +638,10 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 				if err != nil {
 					return err
 				}
-				row := gsKeyRow{k.kid, enc(k.roles), k.pub, k.entry, pending}
+				row := gsKeyRow{k.kid, enc(k.roles), k.pub, k.entry, pending, ""}
+				if len(k.chain) > 0 {
+					row.chain = enc(k.chain)
+				}
 				i := slices.IndexFunc(ks, func(o gsKeyRow) bool { return o.kid == row.kid && o.roles == row.roles && o.pub == row.pub })
 				switch {
 				case i < 0:
@@ -647,8 +699,8 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 				continue
 			}
 			for _, k := range want[m] {
-				if _, err := tx.ExecContext(ctx, `INSERT INTO edge_gs_keys (marker, exp, kid, roles, pub, entry, pending) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-					m, exp, k.kid, k.roles, k.pub, k.entry, k.pending); err != nil {
+				if _, err := tx.ExecContext(ctx, `INSERT INTO edge_gs_keys (marker, exp, kid, roles, pub, entry, pending, chain) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+					m, exp, k.kid, k.roles, k.pub, k.entry, k.pending, k.chain); err != nil {
 					return err
 				}
 			}
@@ -996,8 +1048,8 @@ func purgedKeysHold(recorded []gsKey) error {
 // (gsKeyRow.pending, confPos), and the documents of the backlog, up to
 // and including the entry at it, are from before the exchange and are
 // not judged for the row, which leaves pending as the batch brings that
-// entry (or, should the log not be met entry by entry, a document that
-// says the same). So an index catching up on several config entries
+// entry. A position is recorded only where the origin says the index's
+// checkpoint is in its chain (ahead), so the follower meets it. So an index catching up on several config entries
 // ends no cookie minted meanwhile for what its key was before, and the
 // first change after the exchange ends it. A row without a position,
 // one from before positions were kept among them, is judged by every
@@ -1063,8 +1115,7 @@ func (ce *cookieEnds) judge(k gsKeyRow, holds func(cfg *grantcheck.Config) bool)
 	p := decodePending(k.pending)
 	for _, st := range ce.steps {
 		if pos, waits := p[ce.ns]; waits {
-			head, digest, _ := strings.Cut(pos, " ")
-			if st.id != "" && st.id == head || st.hasDoc && st.digest == digest {
+			if head, _, _ := strings.Cut(pos, " "); st.id != "" && st.id == head {
 				delete(p, ce.ns)
 			}
 			continue
@@ -1127,7 +1178,7 @@ func (ix *Index) cookieEnds(ctx context.Context, ns string, b *follow.Batch, sna
 	if !b.Partial() {
 		step(b.NewCheckpoint, nil)
 	}
-	q := `SELECT DISTINCT marker, kid, roles, pub, entry, pending FROM edge_gs_keys WHERE entry <> ''`
+	q := `SELECT DISTINCT marker, kid, roles, pub, entry, pending, chain FROM edge_gs_keys WHERE entry <> ''`
 	if docs == 0 && !ce.all {
 		// No document to judge: only rows waiting for an entry matter.
 		q += ` AND pending <> ''`
@@ -1140,7 +1191,7 @@ func (ix *Index) cookieEnds(ctx context.Context, ns string, b *follow.Batch, sna
 	for rows.Next() {
 		var m string
 		var k gsKeyRow
-		if err := rows.Scan(&m, &k.kid, &k.roles, &k.pub, &k.entry, &k.pending); err != nil {
+		if err := rows.Scan(&m, &k.kid, &k.roles, &k.pub, &k.entry, &k.pending, &k.chain); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -1154,11 +1205,18 @@ func (ix *Index) cookieEnds(ctx context.Context, ns string, b *follow.Batch, sna
 	}
 	for n, ks := range live {
 		// cfg is n's document where n isn't ns, as the checker holds it.
+		// A row whose own chain names ns draws on it whatever the checker
+		// says now; without n's document it ends at the first document
+		// judged.
 		var cfg *grantcheck.Config
 		if n != ns {
 			var draws bool
 			if cfg, draws = ix.drawsOn(ctx, n, ns); !draws {
-				continue
+				ks = slices.DeleteFunc(slices.Clone(ks), func(k gsKeyRow) bool { return !k.drawsOn(ns) })
+				if len(ks) == 0 {
+					continue
+				}
+				cfg = nil
 			}
 		}
 		seen := ce.seen[n]
@@ -1222,6 +1280,13 @@ func (ix *Index) drawsOn(ctx context.Context, n, ns string) (*grantcheck.Config,
 	return nil, false
 }
 
+// drawsOn reports whether the row's key was drawn through base ns
+// (chain).
+func (k gsKeyRow) drawsOn(ns string) bool {
+	chain, _ := decodeStrings(k.chain)
+	return k.chain != "" && slices.Contains(chain, ns)
+}
+
 // markerNS is the namespace of a marker reads:{ns}:….
 func markerNS(m string) (string, bool) {
 	rest, ok := strings.CutPrefix(m, "reads:")
@@ -1239,14 +1304,19 @@ func markerNS(m string) (string, bool) {
 // namespace by the batch's documents alone where they say everything
 // (own); one of another namespace that waits for an entry of this one,
 // or whose namespace was judged, by no document, so it ends if the
-// batch brings one. What can't be told is refused. (A branch whose first
-// row is recorded in that interval, already past this namespace's
-// position, isn't known to draw on it: keysHold alone judges it.)
+// whose own chain names it (gsKeyRow.chain), or whose namespace was
+// judged, by no document, so it ends if the batch brings one. What can't
+// be told is refused.
+//
+// The statements match a namespace's markers by substr(marker, 1, n)
+// with n a length in bytes, where SQLite counts characters: a namespace
+// name is ASCII (§3.6, client.ValidNSName: [a-z0-9][a-z0-9_-]{0,63}), so
+// the two agree.
 func (ce *cookieEnds) apply(ctx context.Context, tx *sql.Tx) error {
 	if ce == nil {
 		return nil
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT marker, kid, roles, pub, entry, pending FROM edge_gs_keys WHERE entry <> ''`)
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT marker, kid, roles, pub, entry, pending, chain FROM edge_gs_keys WHERE entry <> ''`)
 	if err != nil {
 		return err
 	}
@@ -1260,7 +1330,7 @@ func (ce *cookieEnds) apply(ctx context.Context, tx *sql.Tx) error {
 	for rows.Next() {
 		var m string
 		var k gsKeyRow
-		if err := rows.Scan(&m, &k.kid, &k.roles, &k.pub, &k.entry, &k.pending); err != nil {
+		if err := rows.Scan(&m, &k.kid, &k.roles, &k.pub, &k.entry, &k.pending, &k.chain); err != nil {
 			rows.Close()
 			return err
 		}
@@ -1276,7 +1346,7 @@ func (ce *cookieEnds) apply(ctx context.Context, tx *sql.Tx) error {
 		r, judged := ce.seen[n][k]
 		switch {
 		case judged:
-		case n != ce.ns && ce.seen[n] == nil && !waits:
+		case n != ce.ns && ce.seen[n] == nil && !waits && !k.drawsOn(ce.ns):
 			continue
 		case ce.all:
 			r = rowEnd{end: true}
@@ -1299,8 +1369,8 @@ func (ce *cookieEnds) apply(ctx context.Context, tx *sql.Tx) error {
 		if !c.r.end {
 			set, arg = `pending = ?`, []any{c.r.pending}
 		}
-		arg = append(arg, len(prefix), prefix, c.k.kid, c.k.roles, c.k.pub, c.k.entry, c.k.pending)
-		if _, err := tx.ExecContext(ctx, `UPDATE edge_gs_keys SET `+set+` WHERE substr(marker, 1, ?) = ? AND kid = ? AND roles = ? AND pub = ? AND entry = ? AND pending = ?`, arg...); err != nil {
+		arg = append(arg, len(prefix), prefix, c.k.kid, c.k.roles, c.k.pub, c.k.entry, c.k.pending, c.k.chain)
+		if _, err := tx.ExecContext(ctx, `UPDATE edge_gs_keys SET `+set+` WHERE substr(marker, 1, ?) = ? AND kid = ? AND roles = ? AND pub = ? AND entry = ? AND pending = ? AND chain = ?`, arg...); err != nil {
 			return err
 		}
 	}
@@ -1841,13 +1911,13 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		// verified the grant here and its entry (§A.4 gs).
 		rec := markerRecOf(a, v)
 		var behind bool
-		if rec.key.entry, behind = ix.exchangeEntry(ctx, ns, cfg.Head, a, v, rec.key); behind {
+		// With the entry, the documents it was drawn from that the index
+		// has yet to reach, for it to tell those of its backlog from the
+		// ones after (cookieEnds).
+		if rec.key, behind = ix.exchangeEntry(ctx, ns, cfg.Head, a, v, rec.key); behind {
 			fail(errExchangeBehind)
 			continue
 		}
-		// The documents that entry was drawn from, for the index to
-		// tell those of its backlog from the ones after (cookieEnds).
-		rec.key.conf = ix.confsOf(ctx, cfg)
 		ex.filters[a.marker] = rec
 		if _, _, ok := edgeGS(nsPrefix(ns, a.gs)); ok {
 			ex.issues = append(ex.issues, svcedge.Issue{Prefix: nsPrefix(ns, a.gs), Exp: exp})

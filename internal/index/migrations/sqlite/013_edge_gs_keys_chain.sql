@@ -1,0 +1,26 @@
+-- Migration: edge gs keys chain
+-- Created: 2026-11-19T17:11:40Z
+-- Checksum: 11fea1600f9c70ecf9ff60d5178ecc706c1625a5312ae07defc45f45e3a44848
+-- Chain: cebc4095028be0eda19845cefb2adde853acee64699fe0ce80057e894e8b45a1
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- edge_gs_keys.chain: the bases of a local branch a cookie's key was
+-- drawn through at its exchange, nearest first, as a JSON array of
+-- namespace names, '' for none. A document of one of them is judged for
+-- the row as the index applies it, whether or not the branch's document
+-- can be read then. edge_gs_keys.pending (migration 012) holds, by
+-- namespace, "{ns_id} {document digest}" for the positions the exchange
+-- found ahead of the index's checkpoint; only the ns_id is read.
+ALTER TABLE edge_gs_keys ADD COLUMN chain TEXT NOT NULL DEFAULT '';
