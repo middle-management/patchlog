@@ -317,6 +317,31 @@ How to read the table:
 
 The raw results are `docs/capacity/resource-live-*.json`.
 
+**How far it goes.** The same run on SQLite, with the follower count swept on one server and
+12,288 on a fresh one:
+
+| Followers | Writes/s | Write p50 / p99 | Write max | Core CPU |
+|---|---|---|---|---|
+| 0 | 1,921 | 6.2 / 20 ms | 44 ms | 1.45 cores |
+| 2,048 | 1,807 | 6.2 / 22 ms | 0.28 s | 1.44 cores |
+| 4,096 | 1,668 | 6.6 / 25 ms | 0.53 s | 1.44 cores |
+| 8,192 | 1,667 | 6.5 / 23 ms | 1.09 s | 1.51 cores |
+| 12,288 | 1,708 | 6.2 / 22 ms | 1.68 s | 1.59 cores |
+
+- **No cliff up to 12,288 followers.** Throughput stays within 1,650–1,810 writes/s (1,746 at
+  1,024 in the table above). The 16 writers alone reach 1,921, which is the ceiling here: the
+  harness shares the core's 4 vCPU. Quiet followers cost the core almost no CPU.
+- **What does grow is the worst write, about 0.13 ms per follower.** At each interval boundary
+  (§7.7) every follower is answered 204 at once and polls again at once: a burst of one request
+  per follower, which the writes queue behind. p99 doesn't move, because this happens once per
+  20 s window.
+- **Past ~12k the host is the limit, not patchlog.** The core and the harness each hold one
+  socket per follower, and the host caps a process at 20,000 open files. At 16,384 both ran out:
+  the core couldn't accept connections or open the SQLite file. A larger fleet needs a raised
+  `nofile` limit on the core, and followers on more than one client host.
+
+The sweep is `docs/capacity/resource-live-sqlite-after-sweep.json`.
+
 ## Large documents, by shape and schema
 
 **Every write works on the whole document, so a small patch to a large document costs the

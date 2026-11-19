@@ -1395,21 +1395,26 @@ func (r *runner) resourceLive() {
 			res["origin_cpu_seconds"] = cpu
 			res["origin_cores"] = cpu / wall.Seconds()
 		}
-		// One follower's own write reaches it.
-		for len(got) > 0 {
-			<-got
+		// One follower's own write reaches it (with none: the writers'
+		// baseline).
+		if n > 0 {
+			for len(got) > 0 {
+				<-got
+			}
+			t1 := time.Now()
+			h0 := must(w.Append(r.ctx, ns, "run00000", heads[0], []any{map[string]any{"op": "replace", "path": "/state", "value": "done"}}))
+			select {
+			case at := <-got:
+				res["own_write_delivered_ms"] = float64(at.Sub(t1).Microseconds()) / 1000
+			case <-time.After(30 * time.Second):
+				res["own_write_delivered_ms"] = "not within 30s"
+			}
+			heads[0] = h0.ID
 		}
-		t1 := time.Now()
-		h0 := must(w.Append(r.ctx, ns, "run00000", heads[0], []any{map[string]any{"op": "replace", "path": "/state", "value": "done"}}))
-		select {
-		case at := <-got:
-			res["own_write_delivered_ms"] = float64(at.Sub(t1).Microseconds()) / 1000
-		case <-time.After(30 * time.Second):
-			res["own_write_delivered_ms"] = "not within 30s"
-		}
-		heads[0] = h0.ID
 		cancel()
 		lw.Wait()
+		// Their connections, so the next count's don't add to them.
+		hc.CloseIdleConnections()
 		out[fmt.Sprint(n)] = res
 	}
 	r.record("resource_long_poll_writes", out)
