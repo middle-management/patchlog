@@ -1042,7 +1042,7 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		if de.status != http.StatusServiceUnavailable {
 			de = &davError{status: http.StatusBadGateway, msg: what + "'s answer was cut short", cause: err}
 		}
-		st.upstreamFailed(req.Method+" "+req.URL.String(), de)
+		st.upstreamFailed(st.upKey(req), de)
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}

@@ -65,9 +65,10 @@ func (s *Server) doc(ctx context.Context, tk *token, ns, name, rev string) (*doc
 	s.docMu.Unlock()
 	st := state(ctx)
 	if ok {
-		if st != nil {
-			st.upstreamOK("GET " + k)
-		}
+		// A read of the request's that failed stays its failure though
+		// the document has come into the cache since, by another
+		// request: every request it makes counts (§H.4 "Answers",
+		// v0.86), and only its own, made again and answered, clears one.
 		return e, nil
 	}
 	// One read per token and revision at a time; another token's read
@@ -105,7 +106,8 @@ func (s *Server) doc(ctx context.Context, tk *token, ns, name, rev string) (*doc
 		}
 		return nil, err
 	}
-	if st != nil {
+	if st != nil && !shared {
+		// Its own read, answered: a failure it shared before is past.
 		st.upstreamOK("GET " + k)
 	}
 	return v.(*docEntry), nil

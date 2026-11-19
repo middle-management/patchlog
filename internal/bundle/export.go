@@ -463,8 +463,12 @@ func (p *ExportPlan) baseHeads(ctx context.Context, ns string) (map[string]clien
 		if err != nil {
 			return nil, fmt.Errorf("export: the namespace log of branch %s: %w", ns, err)
 		}
-		if len(page) == 0 {
-			return nil, fmt.Errorf("export: the namespace log of branch %s has no first entry", ns)
+		// The first entry is the branch's config genesis (§G.3, §10
+		// Branches), before any write of its own. A log that starts
+		// otherwise doesn't place the fork: a resource's own first write
+		// would pass for its foreign parent, and go unexported.
+		if len(page) == 0 || page[0].Kind != "config" {
+			return nil, fmt.Errorf("export: the namespace log of branch %s does not start with its config genesis, so its foreign parents can't be told from its own /heads (§G.4.1)", ns)
 		}
 		items, err := p.c.Heads(ctx, ns, page[0].ID)
 		if err != nil {
