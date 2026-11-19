@@ -47,6 +47,7 @@ under [Earlier measurements](#earlier-measurements) and
 - [The envelope](#the-envelope)
 - [What limits server X](#what-limits-server-x)
 - [Long-poll followers and the CDN](#long-poll-followers-and-the-cdn)
+  - [Resource followers](#resource-followers)
 - [Large documents, by shape and schema](#large-documents-by-shape-and-schema)
 - [Many writers](#many-writers)
   - [Writes to one document](#writes-to-one-document)
@@ -259,6 +260,62 @@ For followers that reach the origin:
   there.
 - Every follower is a connection the origin holds open. (A CDN in front holds them instead when
   it verifies edge grants.)
+
+### Resource followers
+
+**A follower of one resource costs nothing while its resource is quiet**, however busy the
+rest of its namespace is.
+
+Until 2026-11-19 a resource long-poll (`GET /r/{ns}/{name}/log?live=long-poll`) or event stream
+waited on its namespace's channel. Every write to the namespace woke it, and it read its
+resource's log again, found nothing and waited on. Resource long-polls aren't shared like the
+namespace's ([Origin-side collapse](#origin-side-collapse)), and a CDN can't collapse them,
+since each follower's URL is its own. The cost was **followers × namespace writes a second**.
+
+A workflow-runner prototype hit this. Each client long-polled its own run document while a
+coordinator wrote 500–1,400 times a second to the same namespace (SQLite `serve --dev`,
+4 vCPU):
+
+- at 256 clients, throughput fell from 61 to 4.8 runs a second, write p50 rose to about 10 s,
+  and the core used 3.2 cores;
+- at 1,024 clients the run didn't finish in 150 s.
+
+Now each resource has its own waiters (`Engine.WaitResource`):
+
+- **What wakes them:** a commit whose namespace entry names the resource (a write, a batch
+  item, a purge, a prune), or an entry that names no resource (a configuration change, a
+  branch, a namespace purge). The second kind wakes every waiter of the namespace.
+- **On Postgres**, the tailer wakes by resource as well, from the `ns_log` rows it reads. It
+  takes a batch's items from the batch's body.
+
+**Measured** with `cmd/capacity -only resource-live`. N followers each long-poll a resource of
+their own, while 16 writers append to 16 other resources of the same namespace, as fast as
+they can, for 20 s. The setup was the 4-vCPU host, no containers, the harness on the same host,
+and `serve --dev` with the namespace's rates raised. SQLite was a file. Postgres 16 shared the
+host (`fsync=off`).
+
+| Followers | Before: writes/s | Before: write p50 / p99 | Before: core CPU | After: writes/s | After: write p50 / p99 | After: core CPU |
+|---|---|---|---|---|---|---|
+| SQLite, 256 | 45 | 338 ms / 1.6 s | 3.1 cores | **1,798** | 6.4 / 22 ms | 1.4 cores |
+| SQLite, 1,024 | 12 | 1.25 s / 2.2 s | 3.3 cores | **1,746** | 6.5 / 24 ms | 1.4 cores |
+| Postgres, 256 | 269 | 57 / 131 ms | 1.7 cores | **1,660** | 9.2 / 16 ms | 1.0 cores |
+| Postgres, 1,024 | 70 | 199 / 663 ms | 1.7 cores | **1,277** | 11.8 / 22 ms | 0.8 cores |
+
+How to read the table:
+
+- **Core CPU** is the core process alone. On Postgres the database took the rest of the host,
+  which is why the "before" core stops at 1.7 cores.
+- **Before**, the core spent its CPU re-reading logs that hadn't changed, and writes queued
+  behind it. Throughput fell with every follower added.
+- **After**, throughput and latency are the same at 256 and at 1,024 followers. The CPU is the
+  writes' own.
+- **A write to a follower's own resource** reached it in 1–15 ms on both databases, against
+  37–252 ms before.
+- **Each follower got one answer** in every run: the 204 at the long-poll interval's boundary
+  (§7.7), which every 20 s window crosses. Unrelated writes caused no answers before or after;
+  they caused reads.
+
+The raw results are `docs/capacity/resource-live-*.json`.
 
 ## Large documents, by shape and schema
 
@@ -719,6 +776,10 @@ These were limits and are not any more:
   ([A recursive union schema](#a-recursive-union-schema)).
 - **Compiled schemas and their documents** were kept forever. Now the 512 and 2,048 most
   recently used are kept.
+- **Resource long-polls and event streams** were woken by every write to their namespace, and
+  each read its resource's log again. At 1,024 followers and 16 writers on SQLite that held
+  writes to 12 a second. Now they are woken by their resource's commits and by
+  namespace-wide ones only: 1,746 writes a second ([Resource followers](#resource-followers)).
 - **Long-polls of a namespace** each read the log on their own when woken. Now the read is
   shared ([Origin-side collapse](#origin-side-collapse);
   [Earlier measurements](#earlier-measurements) has the before and after).
@@ -815,5 +876,9 @@ Options:
 - **A public namespace's followers** need a namespace made without grants: run the core with
   `--dev` and give `--ns` a name not used before, since `-only live` reuses `<ns>-live` if it
   exists.
+- **Resource followers**: `-only resource-live` needs no seeding. It makes a namespace of its
+  own and needs the core run with `--max-rate-per-namespace`, `--max-rate-per-resource` and
+  `--max-rate-per-principal` all at `1e9,1e9`. `--resource-waiters`, `--resource-writers` and
+  `--resource-seconds` size it.
 - **Sizes**: `-docs`, `-revs`, `-namespaces`, `-doc-size`, `-append-batch`. `-help` lists the
   rest.
