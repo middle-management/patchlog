@@ -359,6 +359,41 @@ With phases, the worst write at 12,288 followers is that of no followers at all 
 and p99 are unchanged (6.6–7.0 ms, 24–26 ms). The runs are in
 `docs/capacity/resource-live-sqlite-phase.json`.
 
+**Across machines, on AWS: Postgres's CPU is the limit, at 45,000–60,000 waiting devices.**
+`deploy/ec2-devices.sh`, run once on 2026-11-19 in eu-west-1 (commit 7379385):
+
+- **Setup:** three cores (`c7g.xlarge`) sharing an RDS `db.m7g.large` (2 vCPU), and three load
+  generators of their own.
+- **Load:** devices were added 15,000 a step, each long-polling a resource of its own. Each
+  step ran 90 s. It had 150 writes a second to random devices' resources, and 300 others to the
+  same namespace.
+
+| Devices | Writes to devices/s | Delivered | Delivery p50 / p99 | That write's p50 / p99 | Re-polls/s | Cores' CPU | RDS CPU |
+|---|---|---|---|---|---|---|---|
+| 15,000 | 145 | 100% | 64 / 162 ms | 25 / 75 ms | 751 | 0.45 + 0.14 + 0.14 | 64% |
+| 30,000 | 140 | 99.9% | 69 / 204 ms | 30 / 110 ms | 1,499 | 0.51 + 0.24 + 0.24 | 89% |
+| 45,000 | 112 | 99.9% | 87 / 323 ms | 44 / 238 ms | 2,252 | 0.52 + 0.34 + 0.32 | 97% |
+| 60,000 | 39 | 100% | 139 / 949 ms | 87 / 646 ms | 3,003 | 0.51 + 0.43 + 0.41 | 99% |
+| 75,000 | 0.1 | — | 35 / 65 s | 38 / 61 s | 3,660 | 0.46 + 0.49 + 0.50 | 100% |
+| 120,000 | 0 | — | — | 45 / 61 s | 3,547 | 0.46 + 0.50 + 0.48 | 98–100% |
+
+- **Re-polls** are the 204s at each device's interval boundary (§7.7) and the requests that
+  follow them: devices ÷ 20 a second. Every long-poll request reads its resource's log in a
+  transaction (`Engine.ResourceLog`) before it waits, even when nothing has changed.
+- **RDS ran out first.** Its CPU went from 64% to 89% as 750 more re-polls a second arrived, about
+  0.65 ms of a vCPU each. Re-polls stopped growing at about 3,600 a second, and writes then
+  queued behind them for a minute or more.
+- **The cores had room.** They used 0.5 of 4 cores each, about 58 KB of memory per device
+  (2.3 GB at 40,000), and held 40,000 connections each without errors. At 90,000 devices and
+  more, some devices' requests timed out on the client (two minutes), behind the database.
+- **What would move the limit:**
+  - a larger database, in proportion to its CPU;
+  - answering a re-poll without a transaction when the resource hasn't changed since `since`;
+  - a longer long-poll interval: each doubling halves the re-polls, but the interval isn't
+    configurable.
+
+The run's files are in `docs/capacity/devices-aws-2026-11-19/`.
+
 ## Large documents, by shape and schema
 
 **Every write works on the whole document, so a small patch to a large document costs the

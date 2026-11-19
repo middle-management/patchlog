@@ -1,0 +1,90 @@
+{
+    "Label": "CPUUtilization",
+    "Datapoints": [
+        {
+            "Timestamp": "2026-11-19T15:39:00+01:00",
+            "Average": 99.61666666666666,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:30:00+01:00",
+            "Average": 70.91796777364904,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:31:00+01:00",
+            "Average": 88.95833333333333,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:40:00+01:00",
+            "Average": 99.58499308321805,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:28:00+01:00",
+            "Average": 13.05963929726306,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:37:00+01:00",
+            "Average": 99.61666666666666,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:29:00+01:00",
+            "Average": 57.2021537281835,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:38:00+01:00",
+            "Average": 99.59000683321945,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:35:00+01:00",
+            "Average": 99.38167697205047,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:34:00+01:00",
+            "Average": 96.54327572126202,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:43:00+01:00",
+            "Average": 96.78333333333333,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:36:00+01:00",
+            "Average": 99.2349872497875,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:44:00+01:00",
+            "Average": 3.0666666666666664,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:32:00+01:00",
+            "Average": 88.11666666666666,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:41:00+01:00",
+            "Average": 99.6,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:33:00+01:00",
+            "Average": 96.90161502691711,
+            "Unit": "Percent"
+        },
+        {
+            "Timestamp": "2026-11-19T15:42:00+01:00",
+            "Average": 99.6,
+            "Unit": "Percent"
+        }
+    ]
+}
