@@ -182,7 +182,7 @@ func (st *reqState) catalogPost(ctx context.Context, cat, path string, body []by
 			if de.status != http.StatusServiceUnavailable {
 				de = &davError{status: http.StatusBadGateway, msg: what + "'s answer was cut short", cause: err}
 			}
-			st.upstreamFailed(req.Method+" "+req.URL.String(), de)
+			st.upstreamFailed(st.upKey(req), de)
 			return de
 		}
 		if res.StatusCode == http.StatusOK {

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -58,6 +59,44 @@ type levelTable struct {
 	// base: one, as a base never changes, unless a server lied, and then
 	// each counts, since a link only ever raises what is held.
 	base map[string][]string
+	// read marks the namespaces whose current document was asked for and
+	// answered, readable or not (unread).
+	read map[string]bool
+}
+
+// unread reports whether the client holds any level at all and has not
+// yet asked for ns's current namespace document: its chain of bases is
+// then unknown, and what is held for a base can't yet hold for it.
+func (t *levelTable) unread(ns string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.read[ns] {
+		return false
+	}
+	for _, lv := range t.m {
+		if lv != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// markRead records that ns's current namespace document was asked for
+// and answered.
+func (t *levelTable) markRead(ns string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.read == nil {
+		t.read = map[string]bool{}
+	}
+	t.read[ns] = true
+}
+
+// bases lists the local bases the documents of ns named.
+func (t *levelTable) bases(ns string) []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]string(nil), t.base[ns]...)
 }
 
 // held is the level held for ns, "" for none: the highest of its own and
@@ -165,6 +204,36 @@ func (t *levelTable) learn(ns, level string) (string, error) {
 	return level, nil
 }
 
+// learnChain reads the current namespace document of ns, and of the local
+// bases those documents name, where the client holds any level and hasn't
+// asked for them yet (unread), learning their levels and bases. A document
+// that names a lower level than held is ErrLevelLowered. One the client
+// may not read, or that isn't there, teaches nothing and isn't asked for
+// again; a failure of the moment (transport, 429, 5xx) is returned, and
+// asked for again next time.
+func (c *Client) learnChain(ctx context.Context, ns string) error {
+	todo := []string{ns}
+	for n := 0; len(todo) > 0 && n < 16; n++ {
+		cur := todo[0]
+		todo = todo[1:]
+		if c.levels.unread(cur) {
+			_, _, _, err := c.currentLevel(ctx, cur)
+			var ae *APIError
+			switch {
+			case err == nil:
+			case errors.Is(err, ErrLevelLowered):
+				return err
+			case errors.As(err, &ae) && !Retryable(err):
+				c.levels.markRead(cur)
+			default:
+				return err
+			}
+		}
+		todo = append(todo, c.levels.bases(cur)...)
+	}
+	return nil
+}
+
 // WithExpectedLevel configures the encryption level namespace ns is known
 // to have: "at-rest", "sealed" or "e2e" (§7.1, Levels). The client holds
 // it from its first request on, so a server that claims a lower one is
@@ -217,6 +286,7 @@ func (c *Client) heldOver(ns, level string) string {
 // link only raises what is held. A sealed document's base is learnt where
 // it is opened (NSDoc).
 func (c *Client) learnDocLevel(ns string, r *response) (string, error) {
+	c.levels.markRead(ns)
 	lv := "sealed"
 	if !isJOSE(r) {
 		doc := r.obj()
@@ -232,9 +302,19 @@ func (c *Client) learnDocLevel(ns string, r *response) (string, error) {
 // r isn't a JWE: a sealed namespace serves every document as one, and an
 // end-to-end one every document but its keyring (§7.1; v0.86 scenario 94
 // for sealed).
-func (c *Client) refusePlain(ns, name string, r *response) error {
+//
+// A client that holds any level and has read no namespace document of ns
+// doesn't know whether ns is a branch of a namespace it holds a level
+// for. So before the first such 200 is trusted it reads ns's current
+// document, and those of the local bases it names, once each per client
+// (learnChain): scenario 94's client "has learnt no level for Z". A
+// client that holds no level asks for nothing.
+func (c *Client) refusePlain(ctx context.Context, ns, name string, r *response) error {
 	if isJOSE(r) {
 		return nil
+	}
+	if err := c.learnChain(ctx, ns); err != nil {
+		return fmt.Errorf("client: %s/%s: the server answered 200 %s, and its namespace's level could not be confirmed: %w", ns, name, r.header.Get("Content-Type"), err)
 	}
 	held := c.levels.held(ns)
 	if hr, _ := levelRank(held); hr < 2 || held == "e2e" && name == KeyringName {

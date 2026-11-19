@@ -235,7 +235,7 @@ func (c *Client) Doc(ctx context.Context, ns, name, id string) (*Doc, error) {
 	}
 	// A namespace held as sealed serves no document in the clear, and one
 	// held as e2e none but its keyring (§7.1, levels.go).
-	if err := c.refusePlain(ns, name, r); err != nil {
+	if err := c.refusePlain(ctx, ns, name, r); err != nil {
 		return nil, err
 	}
 	body := r.body

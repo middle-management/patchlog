@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -263,5 +264,103 @@ func TestV086SealedBranchDocumentTeachesItsBase(t *testing.T) {
 	}
 	if d := must(c.Doc(ctx, "z", "derby", r1.ID)); d.Value.(map[string]any)["n"] != 1.0 {
 		t.Fatalf("read through the sealed branch: %+v", d)
+	}
+}
+
+// v86Asked counts the requests st was asked that start with prefix.
+func v86Asked(st *e3Stub, prefix string) int {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	n := 0
+	for _, a := range st.asked {
+		if strings.HasPrefix(a, prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// v0.86 scenario 94, its first case as written: "A client that holds
+// sealed for N from its configuration and has learnt no level for branch
+// Z of N → GET /r/Z/derby read through, answered with a plaintext 200 →
+// refused". The client has read no document of z, so nothing tells it z
+// is a branch of n: before it trusts the first plaintext 200 of a
+// namespace whose document it hasn't asked for, a client that holds any
+// level reads that namespace's current document, and those of the local
+// bases it names, once each. A document it may not read teaches nothing
+// and isn't asked for again. A client that holds no level asks nothing.
+func TestV086FirstPlaintextReadsTheNamespaceDocument(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	id := ids.Revision(nil, []byte("x")).String()
+	plain := func(st *e3Stub, ns string) {
+		st.set("/r/"+ns+"/derby/rev/"+id, st.json(200, map[string]any{"title": "in the clear"}))
+	}
+	// z's document names n and claims at-rest, or nothing.
+	for what, enc := range map[string]map[string]any{"at-rest": {"level": "at-rest"}, "no encryption": nil} {
+		st := newE3Stub(t)
+		doc := map[string]any{"base": v86Base("n")}
+		if enc != nil {
+			doc["encryption"] = enc
+		}
+		v86NS(st, "z", doc)
+		plain(st, "z")
+		c, _ := client.New(st.server().URL, client.WithExpectedLevel("n", "sealed"))
+		for i := 0; i < 2; i++ {
+			if d, err := c.Doc(ctx, "z", "derby", id); !errors.Is(err, client.ErrLevelLowered) {
+				t.Fatalf("%s: a first plaintext 200 of /r/z/derby, no document of z read: %+v %v", what, d, err)
+			}
+		}
+		if c.HeldLevel("z") != "sealed" {
+			t.Fatalf("%s: z held at %q", what, c.HeldLevel("z"))
+		}
+	}
+	// Through a chain: z a branch of n, a branch of m, held as e2e.
+	st := newE3Stub(t)
+	v86NS(st, "z", map[string]any{"base": v86Base("n")})
+	v86NS(st, "n", map[string]any{"base": v86Base("m")})
+	plain(st, "z")
+	c, _ := client.New(st.server().URL, client.WithExpectedLevel("m", "e2e"))
+	if d, err := c.Doc(ctx, "z", "derby", id); !errors.Is(err, client.ErrLevelLowered) {
+		t.Fatalf("a first plaintext 200 under a chain to an e2e base: %+v %v", d, err)
+	}
+
+	// A namespace that is no branch of n: read as served, its document
+	// asked for once, whether it is readable or not.
+	st = newE3Stub(t)
+	v86NS(st, "p", map[string]any{})
+	st.set("/ns/q", st.json(403, map[string]any{"code": "forbidden"}))
+	plain(st, "p")
+	plain(st, "q")
+	c, _ = client.New(st.server().URL, client.WithExpectedLevel("n", "sealed"))
+	for i := 0; i < 3; i++ {
+		for _, ns := range []string{"p", "q"} {
+			if _, err := c.With(client.WithAuthor("a")).Doc(ctx, ns, "derby", id); err != nil {
+				t.Fatalf("a plaintext 200 of %s, no branch of n: %v", ns, err)
+			}
+		}
+	}
+	if p, q := v86Asked(st, "GET /ns/p"), v86Asked(st, "GET /ns/q"); p != 2 || q != 1 {
+		t.Fatalf("p's document was asked for in %d requests (want 2: the head and the document), q's in %d (want 1)", p, q)
+	}
+	// An answer of the moment is no answer: asked again next time.
+	st = newE3Stub(t)
+	st.set("/ns/t", st.json(503, map[string]any{"code": "behind"}))
+	plain(st, "t")
+	c, _ = client.New(st.server().URL, client.WithExpectedLevel("n", "sealed"))
+	if d, err := c.Doc(ctx, "t", "derby", id); err == nil {
+		t.Fatalf("a plaintext 200 while the namespace document answers 503: %+v", d)
+	}
+	v86NS(st, "t", map[string]any{"base": v86Base("n")})
+	if d, err := c.Doc(ctx, "t", "derby", id); !errors.Is(err, client.ErrLevelLowered) {
+		t.Fatalf("after the 503: %+v %v", d, err)
+	}
+
+	// A client that holds no level asks for no namespace document.
+	st = newE3Stub(t)
+	plain(st, "z")
+	c, _ = client.New(st.server().URL)
+	if _, err := c.Doc(ctx, "z", "derby", id); err != nil || v86Asked(st, "GET /ns/") != 0 {
+		t.Fatalf("no level held: %v, %d namespace requests", err, v86Asked(st, "GET /ns/"))
 	}
 }

@@ -187,6 +187,24 @@ async function nsInfo(ns) { return { level: 'e2e', doc: docs[ns] || null }; }
   out['remote n'] = await nsChainOK('r', 'n', at()); out['remote m'] = await nsChainOK('r', 'm', at());
   out['remote past the fork'] = await nsChainOK('r', 'm', at([I.F1]));
   out['remote, not in the chain'] = await nsChainOK('r', 'x', at());
+  // A partial reader's /heads is a redirect to its filtered listing, which api follows: it places no fork.
+  nsChainOK.forks = new Map();
+  routes['/ns/r/rev/' + I.G + '/heads'] = Object.assign(heads(I.F1), { finalPath: '/ns/r/g/' + I.W + '/rev/' + I.G + '/heads' });
+  out['filtered /heads'] = await nsChainOK('r', 'n', at());
+  routes['/ns/r/rev/' + I.G + '/heads'] = heads(I.F1);
+  routes['/ns/r/log'] = { status: 200, json: [{ id: I.G, prev: '', kind: 'config' }], finalPath: '/ns/r/g/' + I.W + '/rev/' + I.X + '/log' };
+  out['filtered namespace log'] = await nsChainOK('r', 'n', at());
+  routes['/ns/r/log'] = { status: 200, json: [{ id: I.G, prev: '', kind: 'config' }], finalPath: '/ns/r/rev/' + I.X + '/log' };
+  out['the range at the head'] = await nsChainOK('r', 'n', at());
+  // Whether since precedes the fork: an answer of the moment concludes nothing and isn't kept.
+  routes['/r/r/d/rev/' + I.F1 + '/log?since=' + I.W] = { status: 503, json: { code: 'behind' } };
+  try { await nsChainOK('r', 'n', at([], I.W)); out['503 throws'] = false; } catch (e) { out['503 throws'] = true; }
+  routes['/r/r/d/rev/' + I.F1 + '/log?since=' + I.W] = { status: 429, json: { code: 'rate_limited' } };
+  try { await nsChainOK('r', 'n', at([], I.W)); out['429 throws'] = false; } catch (e) { out['429 throws'] = true; }
+  routes['/r/r/d/rev/' + I.F1 + '/log?since=' + I.W] = { status: 200, json: [] };
+  out['after the 503'] = await nsChainOK('r', 'n', at([], I.W));
+  routes['/r/r/d/rev/' + I.F1 + '/log?since=' + I.X] = { status: 404, json: { code: 'not_found' } };
+  out['a refusal is an answer'] = await nsChainOK('r', 'n', at([], I.X));
   // The base had no such resource: nothing is read through.
   routes['/ns/r/rev/' + I.G + '/heads'] = { status: 200, json: { heads: [{ resource: 'c', kind: 'head', target: I.W }] } };
   nsChainOK.forks = new Map();
@@ -201,6 +219,8 @@ async function nsInfo(ns) { return { level: 'e2e', doc: docs[ns] || null }; }
 		"m, placed from n's own /heads": true, "m past it": false, "no config genesis": false,
 		"remote, unplaced": false, "remote asked no base": true, "remote n": true, "remote m": true,
 		"remote past the fork": false, "remote, not in the chain": false, "the base had none": false,
+		"filtered /heads": false, "filtered namespace log": false, "the range at the head": true,
+		"503 throws": true, "429 throws": true, "after the 503": true, "a refusal is an answer": false,
 	} {
 		if got, ok := out[key]; !ok || got != want {
 			t.Errorf("%s: %v (present %v), want %v", key, got, ok, want)
