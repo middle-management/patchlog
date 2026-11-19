@@ -13,37 +13,43 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// p28AfterBoundary waits until the current long-poll interval has at least
-// three quarters of it left, so a request that waits for the boundary
-// takes that long (§7.7).
-func p28AfterBoundary(interval time.Duration) {
-	if rem := interval - time.Duration(time.Now().UnixNano()%int64(interval)); rem < interval*3/4 {
-		time.Sleep(rem + 10*time.Millisecond)
-	}
+// p28Logs are the long-poll URL paths of p28LongPollEnv's two logs, whose
+// intervals are each counted from the log's own phase (§7.7).
+const p28NSLog, p28ResLog = "/ns/docs/log", "/r/docs/a/log"
+
+// p28AfterBoundary waits until the log's current long-poll interval has at
+// least three quarters of it left, so a request that waits for the
+// boundary takes that long (§7.7), and returns the log's cursor then.
+func p28AfterBoundary(t testing.TB, interval time.Duration, log string) int64 {
+	t.Helper()
+	return waitCursor(t, newLiveClock(interval, log), interval*3/4)
 }
 
-// p28Cursor is this instant's interval number (§7.7).
-func p28Cursor(interval time.Duration) int64 { return time.Now().UnixNano() / int64(interval) }
+// p28Cursor is the log's interval number at this instant (§7.7).
+func p28Cursor(interval time.Duration, log string) int64 {
+	return newLiveClock(interval, log).cursor(time.Now())
+}
 
 // p28LongPollEnv is a namespace with one resource, for the long-poll
-// cursor tests, its intervals counted from the epoch itself (withFixedEpoch), with helpers that check an answer came at once and what
+// cursor tests, with helpers that check an answer came at once and what
 // its cursor is.
 //
-// atOnce builds its request's path from the cursor of the instant it is
-// sent, after waiting for the boundary, never from one taken before: a
+// atOnce builds its request's path from the cursor log has at the instant
+// it is sent (log is the path's log, p28NSLog or p28ResLog: each has its
+// own boundaries), after waiting for the boundary, never from one taken
+// before: a
 // cursor an hour's worth behind in one interval is more than that behind
 // in the next, and 400 (§7.7). With at least three quarters of the
 // interval left when it is sent and the answer due within half of it, the
 // server judges the request in the interval its path was built in.
-func p28LongPollEnv(t *testing.T, interval time.Duration) (e *tenv, r1, head string, atOnce func(what string, path func(cur int64) string) (*resp, int64), cursorIs func(what string, r *resp, want int64)) {
-	e = newEnv(t, withLongPoll(interval), withFixedEpoch)
+func p28LongPollEnv(t *testing.T, interval time.Duration) (e *tenv, r1, head string, atOnce func(what, log string, path func(cur int64) string) (*resp, int64), cursorIs func(what string, r *resp, want int64)) {
+	e = newEnv(t, withLongPoll(interval))
 	e.mkNS("docs", map[string]any{"read": "public"})
 	r1 = e.create("docs", "a", map[string]any{"n": 1.0})
 	head = e.nsHead("docs")
-	atOnce = func(what string, path func(cur int64) string) (*resp, int64) {
+	atOnce = func(what, log string, path func(cur int64) string) (*resp, int64) {
 		t.Helper()
-		p28AfterBoundary(interval)
-		cur := p28Cursor(interval)
+		cur := p28AfterBoundary(t, interval, log)
 		start := time.Now()
 		r := e.get(path(cur))
 		if d := time.Since(start); d > interval/2 {
@@ -68,20 +74,20 @@ func TestV073P28LongPollNoCursor(t *testing.T) {
 	const interval = 2 * time.Second
 	_, r1, head, atOnce, cursorIs := p28LongPollEnv(t, interval)
 
-	r, cur := atOnce("no cursor", func(int64) string { return "/ns/docs/log?since=" + head + "&live=long-poll" })
+	r, cur := atOnce("no cursor", p28NSLog, func(int64) string { return "/ns/docs/log?since=" + head + "&live=long-poll" })
 	expect(t, r, 204)
 	cursorIs("no cursor", r, cur)
 	if r.H.Get("X-Namespace-Revision") != head {
 		t.Fatalf("no cursor: %v", r.H)
 	}
-	r, cur = atOnce("resource, no cursor", func(int64) string { return "/r/docs/a/log?since=" + r1 + "&live=long-poll" })
+	r, cur = atOnce("resource, no cursor", p28ResLog, func(int64) string { return "/r/docs/a/log?since=" + r1 + "&live=long-poll" })
 	expect(t, r, 204)
 	cursorIs("resource, no cursor", r, cur)
 	if r.H.Get("X-Revision") != r1 {
 		t.Fatalf("resource, no cursor: %v", r.H)
 	}
 	// With entries: 200 at once, as before.
-	r, _ = atOnce("entries", func(int64) string { return "/ns/docs/log?since=&live=long-poll" })
+	r, _ = atOnce("entries", p28NSLog, func(int64) string { return "/ns/docs/log?since=&live=long-poll" })
 	expect(t, r, 200)
 }
 
@@ -96,26 +102,25 @@ func TestV073P28LongPollCursorBehind(t *testing.T) {
 	hour := int64(time.Hour / interval)
 
 	for _, behind := range []int64{1, 5, hour} {
-		r, cur := atOnce("behind "+strconv.FormatInt(behind, 10), func(cur int64) string {
+		r, cur := atOnce("behind "+strconv.FormatInt(behind, 10), p28NSLog, func(cur int64) string {
 			return "/ns/docs/log?since=" + head + "&live=long-poll&cursor=" + strconv.FormatInt(cur-behind, 10)
 		})
 		expect(t, r, 204)
 		cursorIs("behind", r, cur)
 	}
-	r, _ := atOnce("resource, behind", func(cur int64) string {
+	r, _ := atOnce("resource, behind", p28ResLog, func(cur int64) string {
 		return "/r/docs/a/log?since=" + r1 + "&live=long-poll&cursor=" + strconv.FormatInt(cur-1, 10)
 	})
 	expect(t, r, 204)
 
 	// Behind by more than an hour's worth: 400, the client then omits it.
-	for _, path := range []string{"/ns/docs/log?since=" + head, "/r/docs/a/log?since=" + r1} {
-		expectCode(t, e.get(path+"&live=long-poll&cursor="+strconv.FormatInt(p28Cursor(interval)-hour-2, 10)), 400, "bad_input")
-		expectCode(t, e.get(path+"&live=long-poll&cursor="+strconv.FormatInt(p28Cursor(interval)+hour+2, 10)), 400, "bad_input")
+	for log, path := range map[string]string{p28NSLog: p28NSLog + "?since=" + head, p28ResLog: p28ResLog + "?since=" + r1} {
+		expectCode(t, e.get(path+"&live=long-poll&cursor="+strconv.FormatInt(p28Cursor(interval, log)-hour-2, 10)), 400, "bad_input")
+		expectCode(t, e.get(path+"&live=long-poll&cursor="+strconv.FormatInt(p28Cursor(interval, log)+hour+2, 10)), 400, "bad_input")
 	}
 
 	// A current cursor waits for the interval boundary.
-	p28AfterBoundary(interval)
-	cur := p28Cursor(interval)
+	cur := p28AfterBoundary(t, interval, p28NSLog)
 	start := time.Now()
 	r = e.get("/ns/docs/log?since=" + head + "&live=long-poll&cursor=" + strconv.FormatInt(cur, 10))
 	expect(t, r, 204)
@@ -130,12 +135,18 @@ func TestV073P28LongPollCursorBehind(t *testing.T) {
 // behind or ahead is accepted, one more is 400; and one exactly an hour's
 // worth behind when it was taken is 400 once the server's interval has
 // moved on, as TestV073P28LongPollCursorBehind's requests must allow for.
+// The interval is the log's: number k starts at epoch + phase + k ×
+// interval (§7.7 as of v0.86), not at a multiple of the interval.
 func TestV073P28JudgeCursor(t *testing.T) {
 	t.Parallel()
 	const interval = 2 * time.Second
 	hour := int64(time.Hour / interval)
 	const k = int64(890_000_000) // an interval number, in 2026
-	start := time.Unix(0, k*int64(interval))
+	clock := newLiveClock(interval, "/ns/docs/log")
+	if clock.phase <= 0 || clock.phase >= interval {
+		t.Fatalf("phase %v", clock.phase)
+	}
+	start := time.Unix(0, k*int64(interval)+int64(clock.phase))
 	last := start.Add(interval - time.Nanosecond)
 	for _, c := range []struct {
 		what   string
@@ -156,8 +167,12 @@ func TestV073P28JudgeCursor(t *testing.T) {
 		{"ahead by more", last, k + hour + 1, true},
 		{"zero", start, 0, true},
 	} {
-		cur, err := judgeCursor(c.now, liveClock{interval: interval}, c.cursor)
-		if want := c.now.UnixNano() / int64(interval); cur != want {
+		cur, err := judgeCursor(c.now, clock, c.cursor)
+		want := k
+		if c.now.Before(start) {
+			want = k - 1
+		}
+		if cur != want {
 			t.Errorf("%s: current %d, want %d", c.what, cur, want)
 		}
 		if c.bad != (err != nil) {
@@ -172,7 +187,7 @@ func TestV073P28JudgeCursor(t *testing.T) {
 // 404 (short) stays, and a grant that may not read the resource gets 404.
 func TestV073P28LongPollNoEntries(t *testing.T) {
 	const interval = 20 * time.Second
-	e := newEnv(t, withLongPoll(interval), withFileDB(t), withFixedEpoch)
+	e := newEnv(t, withLongPoll(interval), withFileDB(t))
 	e.mkNS("docs", map[string]any{"read": "public"})
 
 	// No cursor: 204 at once, without X-Revision.
@@ -188,11 +203,8 @@ func TestV073P28LongPollNoEntries(t *testing.T) {
 	}
 
 	// With the current cursor it waits, and the create wakes it.
-	if rem := interval - time.Duration(time.Now().UnixNano()%int64(interval)); rem < 2*time.Second {
-		time.Sleep(rem + 10*time.Millisecond)
-	}
 	done := make(chan *resp, 1)
-	cur := strconv.FormatInt(p28Cursor(interval), 10)
+	cur := strconv.FormatInt(waitCursor(t, newLiveClock(interval, "/r/docs/new/log"), 2*time.Second), 10)
 	go func() { done <- e.get("/r/docs/new/log?live=long-poll&cursor=" + cur) }()
 	time.Sleep(100 * time.Millisecond)
 	select {
@@ -219,7 +231,7 @@ func TestV073P28LongPollNoEntries(t *testing.T) {
 	expect(t, e.get("/r/docs/none/log?since="+g+"&live=long-poll"), 404)
 
 	// A grant that may not read the resource: 404, not a wait.
-	a := newAuthEnv(t, withLongPoll(interval), withFixedEpoch)
+	a := newAuthEnv(t, withLongPoll(interval))
 	k := newKey("k")
 	a.mkNS("p", map[string]any{"keys": []any{k.entry("*")}})
 	other := a.grant(k, "bob", []string{"p"}, []string{"read"}, map[string]any{

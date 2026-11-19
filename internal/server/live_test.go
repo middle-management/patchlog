@@ -244,12 +244,8 @@ func TestLongPollWakes(t *testing.T) {
 	// A long-poll ends at the log's next boundary (§7.7, liveClock): start
 	// well before one, so the write below comes first.
 	const interval = 20 * time.Second
-	clock := newLiveClock(interval, false, "/ns/docs/log")
-	if rem := time.Until(clock.end(clock.cursor(time.Now()))); rem < time.Second {
-		time.Sleep(rem + 10*time.Millisecond)
-	}
 	// With the current cursor: one without a cursor is answered at once.
-	cur := strconv.FormatInt(clock.cursor(time.Now()), 10)
+	cur := strconv.FormatInt(waitCursor(t, newLiveClock(interval, "/ns/docs/log"), time.Second), 10)
 	done := make(chan *resp, 1)
 	go func() { done <- e.get("/ns/docs/log?since=" + head + "&live=long-poll&cursor=" + cur) }()
 	time.Sleep(100 * time.Millisecond)
@@ -273,13 +269,26 @@ func TestResourceLongPollIsolated(t *testing.T) {
 	lim := core.DefaultLimits()
 	fast := core.Rate{Rate: 1e6, Burst: 1e6}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	// One boundary for all fifty logs, so one cursor waits on each.
-	e := newEnv(t, withLongPoll(interval), withFileDB(t), withFixedEpoch, func(o *core.Options) { o.Limits, o.Maximums = lim, lim })
+	e := newEnv(t, withLongPoll(interval), withFileDB(t), func(o *core.Options) { o.Limits, o.Maximums = lim, lim })
 	e.mkNS("docs", map[string]any{"read": "public"})
 	const waiters, writes = 50, 100
+	// Each log's intervals are counted from its own phase (§7.7), so fifty
+	// logs taken as they come end their waits all over the interval. These
+	// fifty are the first whose phases fall in its first four seconds:
+	// their boundaries come within four seconds of each other, and a
+	// request sent after them has the rest of the interval to wait.
+	const window = 4 * time.Second
+	var names []string
+	var clocks []liveClock
+	for i := 0; len(names) < waiters; i++ {
+		name := fmt.Sprintf("r%d", i)
+		if c := newLiveClock(interval, resourceLogPath("docs", name)); c.phase < window {
+			names, clocks = append(names, name), append(clocks, c)
+		}
+	}
 	heads := make([]string, waiters)
 	for i := range heads {
-		heads[i] = e.create("docs", fmt.Sprintf("r%d", i), map[string]any{"n": 0.0})
+		heads[i] = e.create("docs", names[i], map[string]any{"n": 0.0})
 	}
 	other := e.create("docs", "other", map[string]any{"n": 0.0})
 	// On Postgres, the tailer's wake-ups for the creates, which would
@@ -290,16 +299,24 @@ func TestResourceLongPollIsolated(t *testing.T) {
 	var reads atomic.Int64
 	testLongPollFetch = func() { reads.Add(1) }
 	t.Cleanup(func() { testLongPollFetch = nil })
-	// Start well before a cursor boundary (§7.7), which would end them.
-	if rem := interval - time.Duration(time.Now().UnixNano()%int64(interval)); rem < 5*time.Second {
-		time.Sleep(rem + 10*time.Millisecond)
+	// Start well before any of their boundaries (§7.7), which would end
+	// them: after the window's last, and five seconds or more before its
+	// next first. Each waits with its own log's cursor.
+	if in := time.Duration(time.Now().UnixNano() % int64(interval)); in < window {
+		time.Sleep(window - in + 10*time.Millisecond)
+	} else if rem := interval - in; rem < 5*time.Second {
+		time.Sleep(rem + window + 10*time.Millisecond)
 	}
-	cur := strconv.FormatInt(time.Now().UnixNano()/int64(interval), 10)
+	now := time.Now()
 	done := make([]chan *resp, waiters)
 	for i := range done {
 		done[i] = make(chan *resp, 1)
+		cur := clocks[i].cursor(now)
+		if rem := clocks[i].end(cur).Sub(now); rem < 5*time.Second {
+			t.Fatalf("%s: %v to its boundary, want 5 s or more", names[i], rem)
+		}
 		go func() {
-			done[i] <- e.get(fmt.Sprintf("/r/docs/r%d/log?since=%s&live=long-poll&cursor=%s", i, heads[i], cur))
+			done[i] <- e.get(fmt.Sprintf("/r/docs/%s/log?since=%s&live=long-poll&cursor=%d", names[i], heads[i], cur))
 		}()
 	}
 	// A long-poll takes its waiter's channel before its first read.
@@ -327,22 +344,22 @@ func TestResourceLongPollIsolated(t *testing.T) {
 		t.Fatalf("%d writes to another resource: %d long-poll reads, want %d", writes, n, base)
 	}
 
-	// r7's write answers r7's long-poll alone.
-	h7 := e.appendRev("docs", "r7", heads[7], ops(op("replace", "/n", 1.0)))
+	// The eighth's write answers its long-poll alone.
+	h7 := e.appendRev("docs", names[7], heads[7], ops(op("replace", "/n", 1.0)))
 	select {
 	case r := <-done[7]:
 		if r.Code != 200 || len(r.Arr()) != 1 || r.H.Get("X-Revision") != h7 {
-			t.Fatalf("r7's long-poll %d %s", r.Code, r.Body)
+			t.Fatalf("%s's long-poll %d %s", names[7], r.Code, r.Body)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("r7's long-poll not woken by its write")
+		t.Fatalf("%s's long-poll not woken by its write", names[7])
 	}
 	if err := e.e.SyncTail(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond)
 	if n := reads.Load(); n != base+1 {
-		t.Fatalf("after r7's write: %d long-poll reads, want %d", n, base+1)
+		t.Fatalf("after %s's write: %d long-poll reads, want %d", names[7], n, base+1)
 	}
 
 	// A configuration change wakes every waiter of the namespace: each
@@ -355,14 +372,14 @@ func TestResourceLongPollIsolated(t *testing.T) {
 		if i == 7 {
 			continue
 		}
-		h := e.appendRev("docs", fmt.Sprintf("r%d", i), heads[i], ops(op("replace", "/n", 1.0)))
+		h := e.appendRev("docs", names[i], heads[i], ops(op("replace", "/n", 1.0)))
 		select {
 		case r := <-done[i]:
 			if r.Code != 200 || r.H.Get("X-Revision") != h {
-				t.Fatalf("r%d's long-poll %d %s", i, r.Code, r.Body)
+				t.Fatalf("%s's long-poll %d %s", names[i], r.Code, r.Body)
 			}
 		case <-time.After(5 * time.Second):
-			t.Fatalf("r%d's long-poll not woken by its write", i)
+			t.Fatalf("%s's long-poll not woken by its write", names[i])
 		}
 	}
 }
@@ -455,9 +472,9 @@ func TestEventsPaged(t *testing.T) {
 	}
 }
 
-// A log's phase (logPhase, docs/SPEC-FEEDBACK.md v0.85 Open 61): the
-// first 8 bytes of the SHA-256 of its path, big-endian, modulo the
-// interval in milliseconds; spread evenly over the interval across logs.
+// A log's phase (LongPollPhase; §7.7, §I.25): the first 8 bytes of the
+// SHA-256 of its path, big-endian, modulo the interval in milliseconds;
+// spread evenly over the interval across logs.
 func TestLogPhase(t *testing.T) {
 	t.Parallel()
 	const interval = 20 * time.Second
@@ -466,14 +483,14 @@ func TestLogPhase(t *testing.T) {
 		"/r/docs/b/log": 1327 * time.Millisecond,  // d88ca141ae2485cf…
 		"/ns/docs/log":  18318 * time.Millisecond, // 7a75dc61743845ce…
 	} {
-		if got := logPhase(path, interval); got != want {
+		if got := LongPollPhase(path, interval); got != want {
 			t.Errorf("phase of %s: %v, want %v", path, got, want)
 		}
 	}
 	// 2,000 logs over twenty one-second buckets: about 100 each.
 	var buckets [20]int
 	for i := range 2000 {
-		p := logPhase(fmt.Sprintf("/r/n/r%d/log", i), interval)
+		p := LongPollPhase(fmt.Sprintf("/r/n/r%d/log", i), interval)
 		if p < 0 || p >= interval || p%time.Millisecond != 0 {
 			t.Fatalf("phase %v", p)
 		}
@@ -485,15 +502,16 @@ func TestLogPhase(t *testing.T) {
 		}
 	}
 	// The clock: an interval ends where the next begins, shifted by the
-	// phase; without one (the fixed epoch) at multiples of the interval.
-	c := newLiveClock(interval, false, "/r/docs/a/log")
+	// phase, and every log has one (no deployment counts them all from
+	// the epoch itself, v0.86).
+	c := newLiveClock(interval, "/r/docs/a/log")
 	const k = int64(89_000_000)
 	if end := c.end(k); c.cursor(end.Add(-time.Nanosecond)) != k || c.cursor(end) != k+1 ||
 		end.UnixNano() != (k+1)*int64(interval)+int64(15777*time.Millisecond) {
 		t.Fatalf("interval %d ends %v", k, c.end(k))
 	}
-	if f := newLiveClock(interval, true, "/r/docs/a/log"); f.phase != 0 || f.end(k).UnixNano() != (k+1)*int64(interval) {
-		t.Fatalf("fixed epoch: %+v", f)
+	if start := c.end(k - 1); start.UnixNano() != k*int64(interval)+int64(15777*time.Millisecond) || c.cursor(start) != k {
+		t.Fatalf("interval %d starts %v, want epoch + phase + %d × interval", k, start, k)
 	}
 	// The server's cursor is the log's.
 	now := c.end(k).Add(time.Second)
@@ -514,7 +532,7 @@ func TestLongPollPhase(t *testing.T) {
 	var clocks []liveClock
 	for i := 0; len(names) < 2; i++ {
 		name := fmt.Sprintf("p%d", i)
-		c := newLiveClock(interval, false, "/r/docs/"+name+"/log")
+		c := newLiveClock(interval, resourceLogPath("docs", name))
 		if len(clocks) == 1 {
 			d := (c.phase - clocks[0].phase + interval) % interval
 			if d < interval/4 || d > interval*3/4 {

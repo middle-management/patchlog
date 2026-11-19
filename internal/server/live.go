@@ -42,40 +42,54 @@ func liveQuery(q url.Values) (live bool, cursor int64, err error) {
 	return live, cursor, nil
 }
 
-// liveClock is a log's long-poll intervals (§7.7): fixed intervals counted
-// from the Unix epoch and shifted by the log's phase (logPhase), so the
-// logs of a deployment don't all end their waits at one instant. Every
+// liveClock is a log's long-poll intervals (§7.7 Intervals and cursors):
+// fixed intervals counted from the Unix epoch plus the log's phase
+// (LongPollPhase), so the logs of a deployment don't all end their waits at
+// one instant. Interval n starts at epoch + phase + n × interval. Every
 // follower of one log URL, on any instance, shares its boundaries and
 // cursors, so identical waits still collapse at a CDN.
 type liveClock struct{ interval, phase time.Duration }
 
-// clockOf is the long-poll clock of the log at path ("/r/{ns}/{name}/log",
-// "/ns/{ns}/log" or "/ns/{ns}/g/{gs}/log"): without a phase when the
-// deployment keeps the fixed epoch (core.Options.LongPollFixedEpoch).
+// The path of a log's long-poll URL, without the query, which its phase
+// is drawn from (§7.7): built from the names, never from the request's
+// URL, so a prefix an edge adds or another spelling of the path can't
+// change it. Namespace and resource names (§3.6) and a gs need no
+// escaping in a path.
+func resourceLogPath(ns, name string) string { return "/r/" + ns + "/" + name + "/log" }
+func nsLogPath(ns string) string             { return "/ns/" + ns + "/log" }
+func filteredLogPath(ns, gs string) string   { return "/ns/" + ns + "/g/" + gs + "/log" }
+
+// clockOf is the long-poll clock of the log at path (resourceLogPath,
+// nsLogPath or filteredLogPath).
 func (s *Server) clockOf(path string) liveClock {
-	return newLiveClock(s.e.LongPollInterval(), s.e.LongPollFixedEpoch(), path)
+	return newLiveClock(s.e.LongPollInterval(), path)
 }
 
-func newLiveClock(interval time.Duration, fixed bool, path string) liveClock {
-	c := liveClock{interval: interval}
-	if !fixed {
-		c.phase = logPhase(path, interval)
-	}
-	return c
+func newLiveClock(interval time.Duration, path string) liveClock {
+	return liveClock{interval: interval, phase: LongPollPhase(path, interval)}
 }
 
-// logPhase is a log's phase: the first 8 bytes of the SHA-256 of its
-// path, as an unsigned big-endian integer, modulo the interval in
-// milliseconds, in milliseconds. The path is the log URL's, without the
-// query: one phase for all its followers, spread evenly over the interval
-// across logs.
-func logPhase(path string, interval time.Duration) time.Duration {
+// LongPollPhase is a log's phase (§7.7, §I.25): the first 8 bytes of the
+// SHA-256 of its long-poll URL's path ("/ns/{ns}/log", "/r/{ns}/{name}/log"
+// or "/ns/{ns}/g/{gs}/log", no query), as an unsigned big-endian integer,
+// modulo the interval in milliseconds, in milliseconds: one phase for all
+// the log's followers, spread evenly over the interval across logs. An
+// interval is counted in whole milliseconds, and one under a millisecond
+// has no phase.
+func LongPollPhase(path string, interval time.Duration) time.Duration {
 	ms := uint64(interval / time.Millisecond)
 	if ms == 0 {
 		return 0
 	}
 	h := sha256.Sum256([]byte(path))
 	return time.Duration(binary.BigEndian.Uint64(h[:8])%ms) * time.Millisecond
+}
+
+// LongPollCursor is the cursor at t of the log at path (§7.7): the number
+// of the interval t falls in, counted from the Unix epoch plus the log's
+// phase.
+func LongPollCursor(path string, interval time.Duration, t time.Time) int64 {
+	return newLiveClock(interval, path).cursor(t)
 }
 
 // cursor is the number of the interval t falls in.
@@ -107,8 +121,8 @@ func judgeCursor(now time.Time, clock liveClock, reqCursor int64) (int64, error)
 }
 
 // longPoll implements §7.7 for a log fetched by fetch, with the request's
-// cursor (liveQuery), -1 without one, on the log's clock (clockOf). wait returns the channel closed on
-// the next commit that may change what fetch returns: the namespace's
+// cursor (liveQuery), -1 without one, on the log's clock (clockOf). wait
+// returns the channel closed on the next commit that may change what fetch returns: the namespace's
 // (Engine.Wait) for its log, the resource's (Engine.WaitResource) for a
 // resource's, so a resource's waiters sleep through the namespace's other
 // writes.
@@ -254,7 +268,7 @@ func (s *Server) resourceLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wait := func() <-chan struct{} { return s.e.WaitResource(ns, name) }
-	s.longPoll(w, r, ns, "X-Revision", resTags(ns, name), cursor, s.clockOf("/r/"+ns+"/"+name+"/log"), wait, func(ctx context.Context, since string) (*core.Log, error) {
+	s.longPoll(w, r, ns, "X-Revision", resTags(ns, name), cursor, s.clockOf(resourceLogPath(ns, name)), wait, func(ctx context.Context, since string) (*core.Log, error) {
 		return s.e.ResourceLog(ctx, ns, name, "", since, lim, creds(r))
 	})
 }
@@ -295,7 +309,7 @@ func (s *Server) nsLive(w http.ResponseWriter, r *http.Request) {
 	// reads, which are then shared with the other waiters (core/live.go).
 	var pass *core.LivePass
 	wait := func() <-chan struct{} { return s.e.Wait(ns) }
-	s.longPoll(w, r, ns, "X-Namespace-Revision", []string{"ns:" + ns}, cursor, s.clockOf("/ns/"+ns+"/log"), wait, func(ctx context.Context, since string) (*core.Log, error) {
+	s.longPoll(w, r, ns, "X-Namespace-Revision", []string{"ns:" + ns}, cursor, s.clockOf(nsLogPath(ns)), wait, func(ctx context.Context, since string) (*core.Log, error) {
 		// A partial reader's first read is redirected to the filtered
 		// long-poll (§B.11.9 URLs), which longPoll answers.
 		lg, p, err := s.e.NamespaceLiveLog(ctx, ns, since, lim, creds(r), pass)

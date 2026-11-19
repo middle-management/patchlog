@@ -542,30 +542,19 @@ func (w *v75s) longPoll(path, bearer string) longPollRes {
 	return longPollRes{r.Code, r.H.Get("X-Namespace-Revision"), r.Body, time.Since(start)}
 }
 
-// waitCursor is the cursor of the current long-poll interval, after
-// waiting out one that ends within margin, so a poll with it waits. The
-// server must count intervals from the epoch itself (withFixedEpoch).
-func waitCursor(interval, margin time.Duration) int64 {
-	now := time.Now()
-	cur := now.UnixNano() / int64(interval)
-	if end := time.Unix(0, (cur+1)*int64(interval)); time.Until(end) < margin {
-		time.Sleep(time.Until(end) + 10*time.Millisecond)
-		cur++
-	}
-	return cur
-}
-
 // §B.11.9 Long-poll (scenario 72): only visible entries answer 200 or end
 // a wait; an interval with none ends 204, its X-Namespace-Revision the
 // newest entry scanned, which the next poll is accepted with.
 func TestV075FilteredLongPoll(t *testing.T) {
 	t.Parallel()
 	interval := 2 * time.Second
-	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval), withLogPageSize(5), withFixedEpoch}})
+	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval), withLogPageSize(5)}})
 	w.seed([]string{"derby"}, nil, nil)
 	li := w.li()
 	gs, _ := w.filtered(li)
 	lp := "/ns/matches/g/" + gs + "/log?live=long-poll&since="
+	// The filtered log's own intervals (§7.7): its path's phase.
+	clock := newLiveClock(interval, filteredLogPath("matches", gs))
 	since := w.nsHead("matches", w.admin)
 	// Answered at once: twenty hidden entries are scanned past, page by
 	// page, to 204 with the newest.
@@ -578,7 +567,7 @@ func TestV075FilteredLongPoll(t *testing.T) {
 	}
 	// Waiting: hidden writes during the interval don't end it.
 	since = res.rev
-	cur := waitCursor(interval, 1500*time.Millisecond)
+	cur := waitCursor(t, clock, 1500*time.Millisecond)
 	done := make(chan longPollRes, 1)
 	go func() { done <- w.longPoll(lp+since+"&cursor="+strconv.FormatInt(cur, 10), li) }()
 	time.Sleep(200 * time.Millisecond)
@@ -592,7 +581,7 @@ func TestV075FilteredLongPoll(t *testing.T) {
 	}
 	// The next poll from it is accepted, and a visible write answers it.
 	since = res.rev
-	cur = waitCursor(interval, 1500*time.Millisecond)
+	cur = waitCursor(t, clock, 1500*time.Millisecond)
 	go func() { done <- w.longPoll(lp+since+"&cursor="+strconv.FormatInt(cur, 10), li) }()
 	time.Sleep(200 * time.Millisecond)
 	w.put("matches", "w9", map[string]any{})
@@ -606,19 +595,23 @@ func TestV075FilteredLongPoll(t *testing.T) {
 
 // §B.11.9 Cost: waiters of two subject sets on one since are answered
 // apart: a write visible to one gs alone answers it 200 and the other 204.
+// Each gs's log has its own interval boundaries (§7.7), so each waiter
+// sends its own log's cursor, at an instant when both have 1.5 s left.
 func TestV075FilteredLongPollPerGS(t *testing.T) {
 	t.Parallel()
-	interval := 2 * time.Second
-	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval), withFixedEpoch}})
+	interval := 4 * time.Second
+	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval)}})
 	w.seed([]string{"derby"}, []string{"secret"}, []string{"secret"})
 	li, bo := w.li(), w.bo()
 	lgs, _ := w.filtered(li)
 	bgs, _ := w.filtered(bo)
 	since := w.nsHead("matches", w.admin)
-	cur := strconv.FormatInt(waitCursor(interval, 1500*time.Millisecond), 10)
+	curs := waitCursors(t, 1500*time.Millisecond,
+		newLiveClock(interval, filteredLogPath("matches", lgs)), newLiveClock(interval, filteredLogPath("matches", bgs)))
+	lcur, bcur := strconv.FormatInt(curs[0], 10), strconv.FormatInt(curs[1], 10)
 	lc, bc := make(chan longPollRes, 1), make(chan longPollRes, 1)
-	go func() { lc <- w.longPoll("/ns/matches/g/"+lgs+"/log?live=long-poll&cursor="+cur+"&since="+since, li) }()
-	go func() { bc <- w.longPoll("/ns/matches/g/"+bgs+"/log?live=long-poll&cursor="+cur+"&since="+since, bo) }()
+	go func() { lc <- w.longPoll("/ns/matches/g/"+lgs+"/log?live=long-poll&cursor="+lcur+"&since="+since, li) }()
+	go func() { bc <- w.longPoll("/ns/matches/g/"+bgs+"/log?live=long-poll&cursor="+bcur+"&since="+since, bo) }()
 	time.Sleep(200 * time.Millisecond)
 	w.put("matches", "derby", map[string]any{})
 	l, b := <-lc, <-bc

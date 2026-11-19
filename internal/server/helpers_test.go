@@ -71,10 +71,42 @@ func withLongPoll(d time.Duration) envOpt {
 	return func(o *core.Options) { o.LongPollInterval = d }
 }
 
-// withFixedEpoch counts every log's long-poll intervals from the epoch
-// itself (§7.7 as of v0.85): one boundary for all, which tests that build
-// cursors and boundaries from the time alone rely on.
-func withFixedEpoch(o *core.Options) { o.LongPollFixedEpoch = true }
+// waitCursors waits for an instant at which every one of the logs' long-poll
+// intervals (§7.7: each log's are counted from its own phase) has at least
+// margin left, and returns each log's cursor at that instant, so a poll of
+// each with its cursor waits at least that long. For more than one log the
+// margins must leave such an instant: n logs, n × margin under the interval.
+func waitCursors(t testing.TB, margin time.Duration, clocks ...liveClock) []int64 {
+	t.Helper()
+	var total time.Duration
+	for _, c := range clocks {
+		total += margin
+		if total >= c.interval {
+			t.Fatalf("no instant leaves %d logs %v of a %v interval each", len(clocks), margin, c.interval)
+		}
+	}
+	for {
+		now := time.Now()
+		var wait time.Duration
+		curs := make([]int64, len(clocks))
+		for i, c := range clocks {
+			curs[i] = c.cursor(now)
+			if rem := c.end(curs[i]).Sub(now); rem < margin {
+				wait = max(wait, rem+10*time.Millisecond)
+			}
+		}
+		if wait == 0 {
+			return curs
+		}
+		time.Sleep(wait)
+	}
+}
+
+// waitCursor is waitCursors for one log.
+func waitCursor(t testing.TB, clock liveClock, margin time.Duration) int64 {
+	t.Helper()
+	return waitCursors(t, margin, clock)[0]
+}
 
 func withFileDB(t *testing.T) envOpt {
 	return func(o *core.Options) {
