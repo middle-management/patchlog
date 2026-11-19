@@ -440,7 +440,8 @@ async function refreshNS() {
     } else { S.nsDoc = r.json; S.nsSeal = null; }
     // The current document names the level: learnt, and held to the highest this browser has learnt (§7.1, Levels).
     // One that names a lower level is refused: the level held stays, and nothing of that document is acted on.
-    const lv = Z.learnLevel(ns, r.jose ? 'sealed' : ((r.json && r.json.encryption && r.json.encryption.level) || ''));
+    // It names the namespace's base too: a branch is held at least at its bases' level (v0.86).
+    const lv = Z.learnDoc(ns, r.jose, S.nsDoc);
     S.nsLevel = lv.level; S.nsLowered = lv.lowered;
     nsInfoCache.set(ns, { level: S.nsLevel, doc: lv.lowered ? null : S.nsDoc, lowered: lv.lowered });
     syncSealBoxes();
@@ -1691,7 +1692,8 @@ function holdEpoch(kid, key, from) { KEYS.epoch.set(kid, key); keyFrom(kid, '', 
 function holdRes(kid, resource, key, from) { KEYS.res.set(kid + '\n' + resource, key); keyFrom(kid, resource, from); }
 
 /* nsInfo returns a namespace's encryption level and (plaintext or decrypted) document. The level is learnt from the
- * current document and held to the highest this browser has learnt (§7.1, Levels; seal.js): an unreadable document
+ * current document and held to the highest this browser has learnt for the namespace or a base in its chain, which
+ * the document names (§7.1, Levels; seal.js): an unreadable document
  * teaches nothing, and one naming a lower level is refused, leaving the level held, no document and lowered, why.
  * What is no namespace name (§3.6) is never asked for: no level, no document, and refused, why. */
 async function nsInfo(ns) {
@@ -1700,7 +1702,7 @@ async function nsInfo(ns) {
     const r = await api('GET', `/ns/${ns}`, { auto: true });
     let info = { level: '', doc: null };
     if (r.status === 200) {
-      const lv = Z.learnLevel(ns, r.jose ? 'sealed' : ((r.json && r.json.encryption && r.json.encryption.level) || ''));
+      const lv = Z.learnDoc(ns, r.jose, r.jose ? null : r.json);
       info = { level: lv.level, doc: r.jose || lv.lowered ? null : r.json };
       if (lv.lowered) info.lowered = lv.lowered;
     }
@@ -2011,7 +2013,8 @@ async function readDoc(ns, name, id, r, retried) {
     } catch (err) { return { doc: null, foldErr: err.message, raw: r.text }; }
   }
   if (r.status !== 200) return { doc: null, foldErr: `HTTP ${r.status}` + (r.json && r.json.code ? ' ' + r.json.code : ''), raw: r.text };
-  const e2e = name !== 'keyring' && (await nsInfo(ns)).level === 'e2e';
+  const level = (await nsInfo(ns)).level;
+  const e2e = name !== 'keyring' && level === 'e2e';
   let pl = null;
   if (r.jose) { try { pl = Z.parseJWE(r.text.trim()).header.pl; } catch (_) { /* reported when it is opened */ } }
   if (r.jose && (e2e || (name !== 'keyring' && pl && pl.kind === undefined))) {
@@ -2024,40 +2027,84 @@ async function readDoc(ns, name, id, r, retried) {
   }
   if (e2e) return { doc: null, foldErr: `${ns}/${name}@${short(id)}: the server answered 200 ${r.hdr('Content-Type') || ''}, not a sealed snapshot; the server never folds, and never serves an e2e document in the clear (§7.1)`, raw: r.text };
   if (r.jose) { const d = await decrypted(r, ns, name, { ns, name, id, kind: 'doc' }); return { doc: d.value, seal: d, raw: r.text }; }
+  // A sealed namespace serves every document as a JWE: one in the clear where sealed is held, for the namespace or
+  // for a base it is a branch of, is refused (§7.1; v0.86 scenario 94).
+  if (level === 'sealed') return { doc: null, foldErr: `${ns}/${name}@${short(id)}: the server answered 200 ${r.hdr('Content-Type') || ''} in a namespace this browser holds as sealed, not application/jose (§7.1)`, raw: r.text };
   return { doc: r.json };
 }
 
+/* nsFirstEntry is the first entry of ns's namespace log, null where it can't be read. Only the first page is
+ * asked for, which holds it (§7.1 Paging): nothing here is a read of the range. */
+async function nsFirstEntry(ns) {
+  const l = await api('GET', `/ns/${ns}/log`, { auto: true, label: 'fork' });
+  const first = l.status === 200 && Array.isArray(l.json) ? l.json[0] : null;
+  return first && typeof first === 'object' && (first.prev || '') === '' ? first : null;
+}
+
+/* revPrecedes says whether revision a precedes revision b in the chain of ns/name: the server serves the range after
+ * a up to b only then. The answer's status is all that is read. */
+async function revPrecedes(ns, name, a, b) {
+  return (await api('GET', `/r/${ns}/${name}/rev/${b}/log?since=${a}`, { auto: true, label: 'fork' })).status === 200;
+}
+
 /* nsChainOK: a branch reads its bases' ciphertext, sealed under their keys (§F.8), up to the resource's foreign parent
- * (§E.2.2, §E.3.1, v0.85). With at = { name, seen }, the resource whose log is folded and the ids the fold has moved
- * past (the snapshot it starts from included), a base's namespace is refused once the fold is past the fork from that
- * base: the base's head of the resource as of the branch's at, which its /heads gives, or none where the base had no
- * such resource. A fork this reader can't place (a remote base, a /heads it may not read) isn't checked. */
+ * (§E.2.2, §E.3.1, v0.85). Without at it says only whether kns is ns or a base in its chain. With at = { name, seen,
+ * since, ids }, the resource whose log is folded, the ids the fold has moved past, the revision the range starts
+ * after ('' from the genesis) and the ids of the range, a base's namespace is refused once the fold is past the fork
+ * from that base: the base's head of the resource as of the branch's at, or none where the base had no such
+ * resource. The fork is what the base's /heads lists at at, or else what the branch's own /heads lists at its first
+ * namespace entry (§G.4.1), which is all there is for a remote base (§G.3), whose chain, base.chain, lies behind
+ * that one fork. Where this reader can place a fork by neither, no namespace behind it is accepted (v0.86: the op
+ * fails the check), as internal/client's chainCheck has it. */
 async function nsChainOK(ns, kns, at) {
+  if (kns === ns) return true;
   const forks = nsChainOK.forks || (nsChainOK.forks = new Map());
-  for (let cur = ns, i = 0; cur && i < 16; i++) {
-    if (cur === kns) return true;
-    const info = await nsInfo(cur);
-    const b = info.doc && info.doc.base;
-    cur = b && b.ns;
-    if (!at || !cur || !b || typeof b !== 'object' || b.origin !== undefined || typeof b.at !== 'string') continue;
-    const k = cur + ' ' + b.at + ' ' + at.name;
-    if (!forks.has(k)) {
-      // The base's entry for the resource at at: pages start just before its name, a plain bound (§7.4).
-      let fork = null, after = Array.from(at.name).slice(0, -1).join('');
-      for (let page = 0; page < 20 && fork === null; page++) {
-        const r = await api('GET', `/ns/${cur}/rev/${b.at}/heads` + (after ? `?after=${encodeURIComponent(after)}` : ''), { auto: true, label: 'fork' });
-        if (r.status !== 200 || !r.json) break;
-        const rows = r.json.heads || r.json.items || [];
-        const row = rows.find((x) => x && x.resource >= at.name);
-        if (row) fork = row.resource === at.name && row.kind !== 'purge' && typeof row.target === 'string' ? row.target : '';
-        else if (!r.json.next) fork = '';
-        else after = r.json.next;
-      }
-      if (fork !== null) forks.set(k, fork);
-      else continue;
+  // headAt: the entry of the resource in ns's /heads as of nsID, '' for none, null where it can't be read. Pages
+  // start just before its name, a plain bound (§7.4).
+  const headAt = async (of, nsID, name) => {
+    let after = Array.from(name).slice(0, -1).join('');
+    for (let page = 0; page < 20; page++) {
+      const r = await api('GET', `/ns/${of}/rev/${nsID}/heads` + (after ? `?after=${encodeURIComponent(after)}` : ''), { auto: true, label: 'fork' });
+      if (r.status !== 200 || !r.json) return null;
+      const rows = r.json.heads || r.json.items || [];
+      const row = rows.find((x) => x && x.resource >= name);
+      if (row) return row.resource === name && row.kind !== 'purge' && typeof row.target === 'string' ? row.target : '';
+      if (!r.json.next) return '';
+      after = r.json.next;
     }
-    const fork = forks.get(k);
-    if (fork === '' || at.seen.has(fork)) return false;
+    return null;
+  };
+  // ownFork: the fork as the branch itself gives it, its head of the resource at its first namespace entry, the
+  // config entry its log starts with.
+  const ownFork = async (branch, name) => {
+    const first = await nsFirstEntry(branch);
+    return first && first.kind === 'config' && typeof first.id === 'string' ? headAt(branch, first.id, name) : null;
+  };
+  for (let cur = ns, i = 0; i < 16; i++) {
+    const b = ((await nsInfo(cur)).doc || {}).base;
+    if (!b || typeof b !== 'object' || typeof b.ns !== 'string' || typeof b.at !== 'string') return false;
+    const remote = b.origin !== undefined;
+    if (at) {
+      const k = cur + ' ' + at.name;
+      let fork = forks.get(k);
+      if (fork === undefined) {
+        fork = remote ? null : await headAt(b.ns, b.at, at.name);
+        if (fork === null) fork = await ownFork(cur, at.name);
+        // A fork that isn't placed is asked for again: the /heads may be readable later.
+        if (fork !== null) forks.set(k, fork);
+      }
+      // Unplaced, or the base had none, or the fold is past it.
+      if (fork === null || fork === '' || at.seen.has(fork)) return false;
+      if (at.since && fork !== at.since && !(at.ids && at.ids.has(fork))) {
+        // The range starts after since and doesn't hold the fork: the fork comes later, or since lies past it. The
+        // server serves the range after since up to the fork only where since precedes it.
+        const kk = k + ' ' + at.since;
+        if (!forks.has(kk)) forks.set(kk, await revPrecedes(ns, at.name, at.since, fork));
+        if (!forks.get(kk)) return false;
+      }
+    }
+    if (remote) return kns === b.ns || (Array.isArray(b.chain) && b.chain.includes(kns));
+    if ((cur = b.ns) === kns) return true;
   }
   return false;
 }
@@ -2101,6 +2148,8 @@ async function openSnapshot(ns, name, h, r) {
   const hdr = Z.parseJWE(jwe).header;
   const kns = Z.parseKid(hdr.kid).ns;
   if (!(await nsChainOK(ns, kns))) throw new Error(`e2e snapshot of ${ns}/${name} at ${h}: sealed under ${hdr.kid}`);
+  // A base's snapshot is read through only up to the foreign parent, and not where it can't be placed (§E.2.2).
+  if (kns !== ns && !(await nsChainOK(ns, kns, { name, seen: new Set(), since: h }))) throw new Error(`e2e snapshot of ${ns}/${name} at ${h}: sealed under a base's key ${hdr.kid} past the resource's foreign parent, or where this reader can't place it (§E.2.2)`);
   return openSealed(kns, jwe, name, { ns: kns, name, id: h });
 }
 
@@ -2112,6 +2161,7 @@ async function foldLog(ns, name, id, since, arr) {
   const bad = (msg) => { throw new Error(`e2e log of ${ns}/${name}: ${msg}`); };
   let doc, exists = false, prev = '';
   const passed = new Set(); // the ids the fold has moved past: a base's key seals nothing after the fork (nsChainOK)
+  const rangeIDs = new Set(arr.map((e) => e && e.id));
   const cfg = ((await nsInfo(ns)).doc || {}).encryption || {};
   if (since) {
     // A namespace is end-to-end from its creation or never (Addendum E Levels): the start is always a snapshot.
@@ -2143,7 +2193,7 @@ async function foldLog(ns, name, id, since, arr) {
     let hdr, kns;
     try { hdr = Z.parseJWE(jwe).header; kns = Z.parseKid(hdr.kid).ns; } catch (err) { flag('sealed patch set: ' + err.message); continue; }
     if (!(await nsChainOK(ns, kns))) { flag('sealed under another namespace\'s key ' + hdr.kid); continue; }
-    if (kns !== ns && !(await nsChainOK(ns, kns, { name, seen: passed }))) { flag('sealed under a base\'s key ' + hdr.kid + ' past the foreign parent (\u00a7E.2.2)'); continue; }
+    if (kns !== ns && !(await nsChainOK(ns, kns, { name, seen: passed, since, ids: rangeIDs }))) { flag('sealed under a base\'s key ' + hdr.kid + ' past the resource\'s foreign parent, or where this reader can\'t place it (\u00a7E.2.2)'); continue; }
     e._sealed = hdr.kid;
     // Under the resource's K_r only (§E.3.1): one sealed otherwise, as under K_e before v0.65, is flagged (v0.78).
     let o;
@@ -2922,7 +2972,7 @@ async function branchBase(ns, none) {
   const d = await nsHeadDoc(ns);
   const doc = d.status === 200 && d.doc && typeof d.doc === 'object' && !Array.isArray(d.doc) ? d.doc : null;
   // The level the answer names, as nsInfo reads it: a sealed document's is sealed, a clear one's its own word.
-  const lowered = d.status === 200 && Z.learnLevel(ns, d.sealed ? 'sealed' : (doc && doc.encryption && doc.encryption.level) || '').lowered;
+  const lowered = d.status === 200 && Z.learnDoc(ns, d.sealed, doc).lowered;
   const b = doc && !lowered ? doc.base : null;
   if (!b || typeof b !== 'object' || typeof b.ns !== 'string' || b.origin !== undefined) { if (none) none.add(ns); return ''; }
   known.set(ns, b.ns);
@@ -2987,7 +3037,6 @@ async function openSealedEntries(v, view, from, filed, ctx) {
   if (Array.isArray(v)) { for (const x of v) await openSealedEntries(x, view, undefined, undefined, ctx); return; }
   if (!v || typeof v !== 'object') return;
   const isFiled = typeof filed === 'string' && filed !== '';
-  const isBranch = async (b, base) => !!base && (await branchBase(b, ctx.notBranch)) === base;
   // b is a branch of base, or a branch of such a branch, up to 8 levels (§7.6): each by its own document.
   const branchesFrom = async (b, base) => {
     for (let i = 0, cur = b; base && i < 8; i++) {
@@ -3039,7 +3088,7 @@ async function openSealedEntries(v, view, from, filed, ctx) {
         // The entry's own value: of the namespace the answer is of, or of the one its href names where the caller
         // gave none, or of a branch of that one. With neither there is nothing to compare its kid with.
         const want = entryNS(v);
-        if (want && ens !== want && !(await isBranch(ens, want))) {
+        if (want && ens !== want && !(await branchesFrom(ens, want))) {
           throw new Error(`a value sealed for namespace ${ens} in an entry of ${want}, which ${ens} isn't known to be a branch of (§E.2.6)`);
         }
       }
@@ -3049,7 +3098,7 @@ async function openSealedEntries(v, view, from, filed, ctx) {
       if (other && !from) {
         // A value that hangs on no entry (an element of an array, a member of what has neither name nor item):
         // there is no resource to compare its pl with, so it is at least of the namespace the answer is of.
-        if (!ctx.ns || (ens !== ctx.ns && !(await isBranch(ens, ctx.ns)))) {
+        if (!ctx.ns || (ens !== ctx.ns && !(await branchesFrom(ens, ctx.ns)))) {
           throw new Error(`a sealed value of ${ens}/${rname} on no entry` + (ctx.ns ? `, in an answer of ${ctx.ns}, which ${ens} isn't known to be a branch of` : ', in an answer of no known namespace') + ' (§E.2.6)');
         }
       }
@@ -3057,7 +3106,7 @@ async function openSealedEntries(v, view, from, filed, ctx) {
         const item = /^\/r\/([^/]+)\/(.+)$/.exec(typeof from.item === 'string' ? from.item : '');
         // The entry's own namespace: the one its own sealed value opened under, else, that value being absent or
         // unopened, the one the entry is of (from.of), or a branch of that one. With neither it is nobody's own.
-        const fromOwn = !!from.name && rname === from.name && (from.ns ? ens === from.ns : !!from.of && (ens === from.of || await isBranch(ens, from.of)));
+        const fromOwn = !!from.name && rname === from.name && (from.ns ? ens === from.ns : !!from.of && (ens === from.of || await branchesFrom(ens, from.of)));
         // The resource the entry's content URL names, where it names the item's (§B.5): in a release preview
         // the item is read in the release's branch of its namespace, and the value is that branch's resource,
         // never the base's. Without such a URL it is the item's own.
@@ -3070,7 +3119,7 @@ async function openSealedEntries(v, view, from, filed, ctx) {
         }
         // Where the entry names no item there is no resource to compare such a member with (the service names
         // none), but it is still of the namespace the entry is of, or a branch of it, where that one is known.
-        if (!item && from.key !== 'born' && from.of && ens !== from.of && !(await isBranch(ens, from.of))) {
+        if (!item && from.key !== 'born' && from.of && ens !== from.of && !(await branchesFrom(ens, from.of))) {
           throw new Error(`a sealed value of ${ens}/${rname} in an entry of ${from.of}, which names no item and which ${ens} isn't known to be a branch of (§E.2.6)`);
         }
         // The URL is the service's word, in the clear: its namespace stands for the item's only where that

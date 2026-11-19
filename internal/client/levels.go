@@ -155,7 +155,8 @@ func (t *levelTable) learn(ns, level string) (string, error) {
 	if r < h || !ok && h > 0 {
 		return held, fmt.Errorf("client: namespace %s: level %q where %q is held: %w", ns, level, held, ErrLevelLowered)
 	}
-	if ok && r > h {
+	if own, _ := levelRank(t.m[ns]); ok && r > own {
+		// Kept as the namespace's own, though a base's already holds it.
 		if t.m == nil {
 			t.m = map[string]string{}
 		}
