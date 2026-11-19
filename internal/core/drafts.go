@@ -586,13 +586,13 @@ func (t *tx) schemaRefsOf(p string) []string {
 	return nil
 }
 
-// mayBreak reports whether ch touches a copy of a schema revision that
-// anything may reference: brokenReferences' own test of a path, over
-// possiblyReferenced's superset. False means brokenReferences is empty,
-// without schemaUses' pass over every document of the deployment.
-func (t *tx) mayBreak(ch refChange) bool {
+// touchedPaths lists the schema revision paths anything may reference of
+// which ch touches a copy: brokenReferences' own test of a path, over
+// possiblyReferenced's superset. None means brokenReferences is empty.
+func (t *tx) touchedPaths(ch refChange) []string {
 	t.noLock++
 	defer func() { t.noLock-- }()
+	var out []string
 	for _, p := range t.possiblyReferenced() {
 		ref, ok := schema.ParseRef(p)
 		if !ok || ch.name != "" && ref.Name != ch.name {
@@ -604,11 +604,181 @@ func (t *tx) mayBreak(ch refChange) bool {
 		}
 		for _, cr := range t.copyRows(id, ref.Name) {
 			if _, ok := ch.cfg[cr.ns]; ok || ch.removed(t.nsRowUnlocked(cr.ns), ref.Name) {
-				return true
+				out = append(out, p)
+				break
 			}
 		}
 	}
-	return false
+	return out
+}
+
+// schemaUsesOf is schemaUses for the paths in targets alone, at the cost
+// of what references them and not of the deployment. A namespace
+// references a target through a chain of $refs that starts at a $schema
+// it holds or reads through, every path of which reaches the target in
+// possiblyReferenced's graph. So only those paths' revisions are looked
+// at: the resources holding one, in the namespaces that hold or read them
+// through, resolved as schemaUses resolves every resource.
+func (t *tx) schemaUsesOf(targets []string, exclude func(ns *nsRow, res string) bool) map[string]map[int64]*nsRow {
+	uses := map[string]map[int64]*nsRow{}
+	if len(targets) == 0 {
+		return uses
+	}
+	t.noLock++ // as schemaUses
+	defer func() { t.noLock-- }()
+	// The paths that reach a target, the targets among them.
+	back := map[string][]string{}
+	for _, q := range t.possiblyReferenced() {
+		for _, x := range t.schemaRefsOf(q) {
+			back[x] = append(back[x], q)
+		}
+	}
+	reach := map[string]bool{}
+	queue := append([]string(nil), targets...)
+	for _, p := range targets {
+		reach[p] = true
+	}
+	for len(queue) > 0 {
+		p := queue[0]
+		queue = queue[1:]
+		for _, q := range back[p] {
+			if !reach[q] {
+				reach[q] = true
+				queue = append(queue, q)
+			}
+		}
+	}
+	// The resources with a revision whose $schema is one of them, by
+	// namespace (revisions_schema_ref).
+	holds := map[int64]map[string]bool{}
+	for _, q := range sortedKeys(reach) {
+		rows, err := t.Query(`SELECT DISTINCT s.ns, s.name FROM revisions r JOIN resources s ON s.res = r.res WHERE r.schema_ref = ?`, q)
+		t.must(err)
+		for rows.Next() {
+			var ns int64
+			var name string
+			t.must(rows.Scan(&ns, &name))
+			if holds[ns] == nil {
+				holds[ns] = map[string]bool{}
+			}
+			holds[ns][name] = true
+		}
+		t.must(rows.Err())
+		rows.Close()
+	}
+	if len(holds) == 0 {
+		return uses
+	}
+	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces`)
+	t.must(err)
+	var all []*nsRow
+	byID := map[int64]*nsRow{}
+	for rows.Next() {
+		n, err := scanNS(rows)
+		t.must(err)
+		all = append(all, n)
+		byID[n.id] = n
+	}
+	rows.Close()
+	copies := map[string][]copyRow{}
+	docs := map[string]any{}
+	for _, n := range all {
+		if n.purged || strings.HasPrefix(n.name, "~") {
+			continue
+		}
+		// What n holds or reads through of those resources.
+		names := map[string]bool{}
+		for m := n; m != nil; m = byID[m.base.Int64] {
+			for name := range holds[m.id] {
+				names[name] = true
+			}
+			if !m.isBranch() {
+				break
+			}
+		}
+		if len(names) == 0 {
+			continue
+		}
+		var queue []string
+		add := func(p string) {
+			if !reach[p] {
+				return
+			}
+			if uses[p] == nil {
+				uses[p] = map[int64]*nsRow{}
+			}
+			if uses[p][n.id] == nil {
+				uses[p][n.id] = n
+				queue = append(queue, p)
+			}
+		}
+		for _, name := range sortedKeys(names) {
+			if exclude(n, name) {
+				continue
+			}
+			v := t.resolve(n, name, nil)
+			if v.state == NotFound || v.state == Purged || v.head == nil {
+				continue
+			}
+			var ref sql.NullString
+			ll := t.lastLive(v.head)
+			t.must(t.QueryRow(`SELECT schema_ref FROM revisions WHERE seq = ?`, ll.seq).Scan(&ref))
+			if ref.Valid {
+				add(ref.String)
+			}
+		}
+		if n.isBranch() && holds[n.id] != nil {
+			// Every revision a branch wrote (schemaUses).
+			rr, err := t.Query(`SELECT DISTINCT s.name, r.schema_ref FROM revisions r JOIN resources s ON s.res = r.res
+				WHERE s.ns = ? AND s.state <> ? AND r.schema_ref IS NOT NULL`, n.id, statePurged)
+			t.must(err)
+			type use struct{ name, ref string }
+			var us []use
+			for rr.Next() {
+				var u use
+				t.must(rr.Scan(&u.name, &u.ref))
+				us = append(us, u)
+			}
+			t.must(rr.Err())
+			rr.Close()
+			for _, u := range us {
+				if !exclude(n, u.name) {
+					add(u.ref)
+				}
+			}
+		}
+		for len(queue) > 0 {
+			p := queue[0]
+			queue = queue[1:]
+			ref, ok := schema.ParseRef(p)
+			if !ok {
+				continue
+			}
+			d, ok := docs[p]
+			if !ok {
+				cr, ok := copies[p]
+				if !ok {
+					if id, err := ids.Parse(ref.Rev); err == nil {
+						cr = t.copyRows(id, ref.Name)
+					}
+					copies[p] = cr
+				}
+				cs := t.satisfyingCopies(ref, n, nil, cr)
+				if len(cs) == 0 {
+					continue
+				}
+				var err error
+				if d, err = t.docAt(t.rev(cs[0].seq)); err != nil {
+					continue
+				}
+				docs[p] = d
+			}
+			for _, x := range schema.Refs(d) {
+				add(x.Path())
+			}
+		}
+	}
+	return uses
 }
 
 // SchemaScans is the number of passes over every document of the
@@ -620,6 +790,36 @@ func (t *tx) referencedPaths() map[string]bool {
 	out := map[string]bool{}
 	for p := range t.schemaUses(func(*nsRow, string) bool { return false }) {
 		out[p] = true
+	}
+	return out
+}
+
+// referencedOf is the referenced schema revision paths (§6.1) among the
+// revisions of resource name of namespace ns: referencedPaths' of that
+// resource, without its pass over every document.
+func (t *tx) referencedOf(ns, name string) map[string]bool {
+	var targets []string
+	for _, p := range t.possiblyReferenced() {
+		if ref, ok := schema.ParseRef(p); ok && ref.NS == ns && ref.Name == name {
+			targets = append(targets, p)
+		}
+	}
+	out := map[string]bool{}
+	for p := range t.schemaUsesOf(targets, func(*nsRow, string) bool { return false }) {
+		out[p] = true
+	}
+	if validateBoth {
+		prefix, full := "/r/"+ns+"/"+name+"/rev/", t.referencedPaths()
+		for p := range full {
+			if strings.HasPrefix(p, prefix) && !out[p] {
+				panic("referencedOf: missed " + p)
+			}
+		}
+		for p := range out {
+			if !full[p] {
+				panic("referencedOf: " + p + " isn't referenced")
+			}
+		}
 	}
 	return out
 }
@@ -651,13 +851,29 @@ func (t *tx) brokenReferences(ch refChange) []*nsRow {
 	if ch.removed == nil {
 		ch.removed = none
 	}
-	// Most changes touch no schema revision anything references: those
-	// are told without reading every document (mayBreak).
-	may := t.mayBreak(ch)
-	if !may && !validateBoth {
-		return nil
+	// Most changes touch no schema revision anything references, and one
+	// that does is judged by what references those revisions: neither
+	// reads every document of the deployment (touchedPaths, schemaUsesOf).
+	var out []*nsRow
+	if touched := t.touchedPaths(ch); len(touched) > 0 {
+		out = t.brokenAmong(ch, t.schemaUsesOf(touched, ch.exclude))
 	}
-	uses := t.schemaUses(ch.exclude)
+	if validateBoth {
+		full := t.brokenAmong(ch, t.schemaUses(ch.exclude))
+		same := len(full) == len(out)
+		for i := 0; same && i < len(full); i++ {
+			same = full[i].id == out[i].id
+		}
+		if !same {
+			panic(fmt.Sprintf("brokenReferences: %d namespaces by what references the touched revisions, %d by every document", len(out), len(full)))
+		}
+	}
+	return out
+}
+
+// brokenAmong is brokenReferences given the uses of the schema revisions
+// (schemaUses, or schemaUsesOf the touched ones).
+func (t *tx) brokenAmong(ch refChange, uses map[string]map[int64]*nsRow) []*nsRow {
 	broken := map[int64]*nsRow{}
 	for _, p := range sortedKeys(uses) {
 		ref, ok := schema.ParseRef(p)
@@ -712,9 +928,6 @@ func (t *tx) brokenReferences(ch refChange) []*nsRow {
 		out = append(out, m)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
-	if !may && len(out) > 0 {
-		panic(fmt.Sprintf("brokenReferences: mayBreak missed the references of %s", out[0].name))
-	}
 	return out
 }
 

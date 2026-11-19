@@ -6,10 +6,10 @@ import (
 	"testing"
 )
 
-// A purge of a document nothing references as a schema doesn't read every
-// document of the deployment for references (§6.1): only a change that
-// touches a copy of a schema revision something may reference does. Not
-// parallel: it counts the engine's scans.
+// No purge reads every document of the deployment for schema references
+// (§6.1): one of a document nothing references asks only which revisions
+// are referenced at all, and one of a referenced schema reads what
+// references it. Not parallel: it counts the engine's scans.
 func TestPurgeReferenceScan(t *testing.T) {
 	// PATCHLOG_TEST_VALIDATE_BOTH scans on every purge, to compare.
 	counted := !validateBothSet()
@@ -36,15 +36,15 @@ func TestPurgeReferenceScan(t *testing.T) {
 	if got := e.e.SchemaScans() - scans; counted && got != 0 {
 		t.Fatalf("%d scans for purges of unreferenced documents", got)
 	}
-	// Referenced only through $ref: refused, after a scan.
+	// Referenced only through $ref: refused, by what references it.
 	r := e.purge("schemas", "base", base, "admin")
 	expectCode(t, r, 409, "in_use")
 	if got := fmt.Sprint(referencing(r)); got != "[docs docs-b]" {
 		t.Fatalf("referencing %s", got)
 	}
 	expectCode(t, e.purge("schemas", "outer", outer, "admin"), 409, "in_use")
-	if e.e.SchemaScans() == scans {
-		t.Fatal("no scan for a referenced schema")
+	if got := e.e.SchemaScans() - scans; counted && got != 0 {
+		t.Fatalf("%d scans for refused purges of referenced schemas", got)
 	}
 	// With the referencing documents gone, the schemas may go; the
 	// branch's read-through reference went with d1's purge in the base.

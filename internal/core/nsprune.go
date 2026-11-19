@@ -354,7 +354,7 @@ func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 // revisions already below an earlier horizon, which keep the snapshot they
 // have.
 func (t *tx) keptBelow(n *nsRow, name string, own *resRow, h *revRow, keep []*revRow) (keepSeqs map[int64]*revRow, preserve map[int64]bool) {
-	refs := t.referencedPaths()
+	refs := t.referencedOf(n.name, name)
 	keepSeqs = map[int64]*revRow{}
 	keepSeqs[t.lastLive(h).seq] = t.lastLive(h)
 	for _, k := range keep {

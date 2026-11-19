@@ -2,18 +2,20 @@
 
 ## Unreleased
 
-- **A purge no longer reads every document of the deployment.** Before it removes anything, a
-  purge of a document or a namespace (and a narrowing of `drafts.for`) checks that it leaves no
-  schema reference without a copy (§6.1). That check listed the `$schema` of every document
-  every namespace sees, read-through ones included, so one purge cost a second with ten
-  branches and a few thousand documents on Postgres, and 40 seconds with a thousand branches,
-  whatever was purged. Now the server first asks which schema revisions anything references at
-  all (the distinct `$schema` values stored, by a new index `revisions_schema_ref`, and the
-  schemas those reach by `$ref`), and runs the full check only when the change touches a copy
-  of one of them. A purge of a document nothing uses as a schema costs what it did with an
-  empty database. A refused or forced purge of a referenced schema still pays for the full
-  check. `PATCHLOG_TEST_VALIDATE_BOTH=1` runs both on every change and panics if the short
-  check misses a reference.
+- **A purge no longer reads every document of the deployment, and neither does a prune.**
+  Before it removes anything, a purge of a document or a namespace (and a narrowing of
+  `drafts.for`) checks that it leaves no schema reference without a copy (§6.1). That check
+  listed the `$schema` of every document every namespace sees, read-through ones included, so
+  one purge cost a second with ten branches and a few thousand documents on Postgres, and 40
+  seconds with a thousand branches, whatever was purged. A prune made the same pass once for
+  every document it pruned, to keep referenced schema revisions. Now the server first asks
+  which schema revisions anything references at all (the distinct `$schema` values stored, by a
+  new index `revisions_schema_ref`, and the schemas those reach by `$ref`). A purge that
+  touches no copy of one of them is done with the check there, at what it cost with an empty
+  database. One that does, a referenced schema's, reads only the documents typed by that
+  schema or by one that reaches it, in the namespaces that hold them or read them through: its
+  cost follows what references the schema, not the deployment. `PATCHLOG_TEST_VALIDATE_BOTH=1`
+  also makes the old pass on every such change and panics if the two answers differ.
 - **`serve --max-branch-depth` and `--max-branches-per-namespace`** set the deployment's
   `branchDepth` and the maximum a namespace document's `limits.branchesPerNamespace` may ask
   for (§6.6). The defaults stay 8 and 100.
