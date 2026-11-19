@@ -321,3 +321,64 @@ func TestV086CookieMintedBehindOutlivesBacklog(t *testing.T) {
 		})
 	}
 }
+
+// TestV086CookieOfAStaleHeadIsJudged: a position is kept with a cookie's
+// row only where the index is known to be behind it. The grant checker
+// holds docs' document as read at head H; the index then starts docs
+// from a snapshot at a later head, so H is in no batch it will ever
+// apply; li exchanges while the checker still holds H. Her row must not
+// wait for H: k1 changes and changes back, and her cookie is 403 from
+// the change on (CONFORMANCE Tree 145). Recorded as waiting, the row had
+// every later document skipped for it, and the cookie read again after
+// the undo.
+func TestV086CookieOfAStaleHeadIsJudged(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	d := &v77docs{t: t, s: s, admin: clienttest.NewKey("admin"), k1: clienttest.NewKey("k1"), k2: clienttest.NewKey("k2")}
+	op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "docs")))
+	must(op.CreateNamespace(ctx, "docs", map[string]any{"read": "grant", "keys": []any{d.admin.Entry("*"), d.k1.Entry("read"), d.k2.Entry("read")},
+		"roles": map[string]any{"reader": map[string]any{"can": []any{"read"}}}}))
+	d.w = s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "user:root", []string{"docs"}, []string{"read", "create", "append", "config"})))
+	must(d.w.CreateDoc(ctx, "docs", "a", map[string]any{"title": "word a"}))
+	ev := must(edge.New([]byte("s3cret"), "", ""))
+	d.x = startSvcWith(t, s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "svc:indexer", []string{"docs"}, []string{"read"}))),
+		svcOpts{db: t.TempDir() + "/i.db", ns: []string{"docs"}, untyped: true, now: s.Now, noRun: true},
+		func(o *indexOpts) {
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+			o.CheckerTTL = time.Hour
+			o.FollowOptions = append(o.FollowOptions, follow.WithSnapshot())
+		})
+	li := v86GrantFor(d, "docs")
+	// The checker reads docs' document at H, whatever the index, which
+	// has reached nothing, answers.
+	stale := must(d.w.NSHead(ctx, "docs")).ID
+	d.x.raw("/docs?q=word", li)
+	must(d.w.CreateDoc(ctx, "docs", "b", map[string]any{"title": "word b"}))
+	// The index starts docs from a snapshot past H.
+	rctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { d.x.ix.Run(rctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+	head := d.x.caughtUp("docs")
+	if bs := d.x.appliedUpTo(head); !bs[0].Replaces() || head == stale {
+		t.Fatalf("the index didn't start docs from a snapshot past %s: the test shows nothing", stale)
+	}
+	prefix, c := v86Exchange(d, li)
+	status := func() int {
+		t.Helper()
+		r, _ := p37Follow(t, d.x, prefix+"?q=word", c, "")
+		return r.status
+	}
+	if got := status(); got != 200 {
+		t.Fatalf("li under her cookie: %d", got)
+	}
+	d.patch(v86Change)
+	if got := status(); got != 403 {
+		t.Errorf("li under her cookie once k1 changed: %d, want 403", got)
+	}
+	d.patch(v86Undo)
+	if got := status(); got != 403 {
+		t.Errorf("li under her cookie once the change was undone: %d, want 403 until she exchanges again", got)
+	}
+}
