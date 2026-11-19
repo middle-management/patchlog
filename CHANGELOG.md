@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.32.0
 
 Implements spec **v0.86** (previously **v0.85**). v0.86 is the spec's answer to the reference's
 61 open notes on v0.85 and to its measurements of the branch limits (docs/SPEC-FEEDBACK.md,
