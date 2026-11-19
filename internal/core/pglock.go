@@ -359,8 +359,14 @@ func (t *tx) lockLogs(nss ...int64) {
 	for _, ns := range nss {
 		t.logPlan[lockKey(ns)] = true
 	}
-	if len(nss) > 0 {
-		t.lockLog(nss[0])
+	// lockLog takes every planned lock with the one it is asked for: one
+	// not held yet, or it would take none (a second purge of a
+	// transaction that follows a remote base, whose first log is held).
+	for _, ns := range nss {
+		if !t.logLocks[lockKey(ns)] {
+			t.lockLog(ns)
+			break
+		}
 	}
 }
 

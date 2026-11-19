@@ -236,6 +236,9 @@ func (p *purgePlan) covers(t *tx, ns *nsRow) bool {
 	if p.reached[ns.id] {
 		return true
 	}
+	// A namespace that isn't purged has no purged base: a namespace is
+	// purged only once its branches are (PurgeNamespace, purgeRaisedE2E),
+	// and none is made in a purged one.
 	if ns.purged || p.root.purged {
 		return false
 	}
@@ -274,23 +277,20 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 	// namespace log position from which a branch made of the namespace may
 	// see the name: 0 if the namespace may read it through its own base,
 	// else the first entry of its own row, else none (NULL).
+	//
+	// What is asked of each namespace of sub is a scalar subquery, not
+	// EXISTS: Postgres answers EXISTS from a hash of the whole table's rows
+	// of that name when it expects many namespaces (a hashed subplan over a
+	// sequential scan of resources and of sealed, for every purge, with or
+	// without branches), and a scalar subquery by the index on (ns, name),
+	// once per namespace of sub.
 	type cand struct {
 		id   int64
 		base sql.NullInt64
 	}
 	var cands []cand
 	isCand := map[int64]bool{}
-	if t.e.pg {
-		// The planner's cost estimate of the recursive statement grows
-		// with the tables, and past jit_above_cost Postgres compiles its
-		// expressions before running it: measured at 0.3 to 1.1 s for a
-		// statement that then ran in 10 to 40 ms. Not for this
-		// transaction, whose statements are all short.
-		const q = `SET LOCAL jit = off`
-		t.counted(q)
-		_, err := t.Tx.Exec(q)
-		t.must(err)
-	}
+	restore := t.planByIndex()
 	rows, err := t.Query(`WITH RECURSIVE sub(ns, base, lo) AS (
 			SELECT n.ns, n.base, CASE WHEN ? = 1 THEN 0 ELSE
 					(SELECT MIN(h.ns_seq) FROM resources r JOIN head_history h ON h.res = r.res WHERE r.ns = n.ns AND r.name = ?) END
@@ -301,9 +301,9 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 				FROM namespaces c JOIN sub ON c.base = sub.ns WHERE c.purged = 0)
 		SELECT s.ns, s.base FROM sub s
 		WHERE s.ns = ? OR s.lo = 0
-			OR EXISTS (SELECT 1 FROM resources r WHERE r.ns = s.ns AND r.name = ?)
-			OR EXISTS (SELECT 1 FROM sealed x WHERE x.ns = s.ns AND x.name = ?)
-			OR EXISTS (SELECT 1 FROM blob_epochs x WHERE x.ns = s.ns AND x.name = ?)`,
+			OR (SELECT 1 FROM resources r WHERE r.ns = s.ns AND r.name = ? LIMIT 1) IS NOT NULL
+			OR (SELECT 1 FROM sealed x WHERE x.ns = s.ns AND x.name = ? LIMIT 1) IS NOT NULL
+			OR (SELECT 1 FROM blob_epochs x WHERE x.ns = s.ns AND x.name = ? LIMIT 1) IS NOT NULL`,
 		through, name, n.id, name, n.id, name, name, name)
 	t.must(err)
 	for rows.Next() {
@@ -314,6 +314,7 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 	}
 	t.must(rows.Err())
 	rows.Close()
+	restore()
 	// The bases the candidates' names resolve through that aren't
 	// candidates themselves: skipped branches between a candidate and n,
 	// and n's own bases.
@@ -491,6 +492,40 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 		t.purgeCheck(p, false)
 	}
 	return p
+}
+
+// planByIndex makes Postgres plan the statements that follow, until the
+// function it returns is called, as nested loops over index scans, and
+// without compiling them: for the statement that finds a purge's
+// candidates, whose work must stay in proportion to the branches below the
+// purged namespace whatever the tables' sizes and statistics are.
+//
+// Left to its costs, the planner joined each level of branches by a hash
+// of a sequential scan of namespaces where the statistics say a base has
+// thousands of branches (measured: every purge then read the whole table
+// once per level, with or without branches of its own), and past
+// jit_above_cost it compiled the statement's expressions first, which took
+// 0.3 to 1.1 s for a statement that then ran in 10 to 40 ms. The settings
+// are the transaction's own (SET LOCAL), and are put back for the
+// statements after it, whose plans are not this function's business.
+func (t *tx) planByIndex() (restore func()) {
+	if !t.e.pg {
+		return func() {}
+	}
+	// The CTE is read before the row that changes the settings is made.
+	const q = `WITH old AS MATERIALIZED (SELECT current_setting('jit') AS a, current_setting('enable_seqscan') AS b,
+			current_setting('enable_hashjoin') AS c, current_setting('enable_mergejoin') AS d)
+		SELECT old.a, old.b, old.c, old.d, set_config('jit', 'off', true), set_config('enable_seqscan', 'off', true),
+			set_config('enable_hashjoin', 'off', true), set_config('enable_mergejoin', 'off', true) FROM old`
+	t.counted(q)
+	old, set := make([]string, 4), make([]string, 4)
+	t.must(t.Tx.QueryRow(q).Scan(&old[0], &old[1], &old[2], &old[3], &set[0], &set[1], &set[2], &set[3]))
+	return func() {
+		const q = `SELECT set_config('jit', $1, true), set_config('enable_seqscan', $2, true),
+			set_config('enable_hashjoin', $3, true), set_config('enable_mergejoin', $4, true)`
+		t.counted(q)
+		t.must(t.Tx.QueryRow(q, old[0], old[1], old[2], old[3]).Scan(&set[0], &set[1], &set[2], &set[3]))
+	}
 }
 
 // purgeApply carries out a planned purge (purgeResource). It returns the id
