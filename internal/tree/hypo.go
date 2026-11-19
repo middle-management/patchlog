@@ -53,7 +53,7 @@ func (g *Graph) With(changes map[string]any) *Graph {
 	for ns := range g.Trust {
 		h.Trust[ns] = true
 	}
-	h.Aliases = g.Aliases
+	h.Aliases, h.Bases = g.Aliases, g.Bases
 	for ns, c := range g.Content {
 		h.Content[ns] = c
 	}
@@ -94,7 +94,7 @@ func (g *Graph) With(changes map[string]any) *Graph {
 		if doc == nil {
 			continue
 		}
-		n := ParseNode(g.Catalog, name, "", doc)
+		n := g.parseNode(name, "", doc)
 		if old := g.explicit[name]; old != nil {
 			n.copyItem(old)
 		} else if s := g.self[name]; s != nil {
