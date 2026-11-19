@@ -6,11 +6,11 @@ Implements spec **v0.86** (previously **v0.85**). v0.86 is the spec's answer to 
 61 open notes on v0.85 and to its measurements of the branch limits (docs/SPEC-FEEDBACK.md,
 "Settled in v0.86"): by its own count 22 already matched the text or are the implementation's
 business, and the rest got a clause each. What the reference changed for them is below,
-breaking changes first; the 67 notes this work leaves are the new list, "v0.86 Open n".
+breaking changes first; the 68 notes this work leaves are the new list, "v0.86 Open n".
 
 - **`GET /` answers `"spec": "0.86"`**, and the docs mirror v0.86 (SPEC, SERVICES, TOOLS,
   CONFORMANCE, the spec's change log). The proposed-vectors file that came with it is still
-  v0.85's (v0.86 Open 42).
+  v0.85's (v0.86 Open 43).
 
 Breaking:
 
@@ -93,15 +93,19 @@ Breaking:
   - At the origin: the exchange after a change gives a cookie that reads, with any grant.
     Where it must be told apart from an earlier cookie it expires whole seconds earlier
     (§C.5.2), and `POST /edge-grants` answers `503` (`behind`, with `Retry-After`) where no
-    second is left before the grant's `exp`. Cookies issued before the upgrade are `403`
-    once, and their readers exchange again (migrations `023_filtered_gs_exps` on SQLite,
-    `024_…` on Postgres). A namespace that writes more than 64 config entries within a
-    cookie's life, 15 minutes at most, ends it.
+    second is left before the grant's `exp`. Several grants in one exchange that give the
+    same subject set give one cookie, lasting as long as the longest of them allows. Cookies
+    issued before the upgrade are `403` once, and their readers exchange again (migrations
+    `023_filtered_gs_exps` on SQLite, `024_…` on Postgres). A cookie is judged over at most
+    64 namespace documents after the one its exchange read: at a checkpoint further on it is
+    `403`, while it still reads at an earlier `at`, so a namespace that writes more than 64
+    config entries within a cookie's life, 15 minutes at most, ends it there.
   - At the index: only the config entries after a cookie's exchange are judged, so an index
     catching up on a backlog doesn't end cookies minted meanwhile. This also covers a branch
     whose keys come from a base the index follows. An index that starts a namespace from a
-    snapshot ends that namespace's cookies. Index migration 012 adds a column; cookies
-    recorded before it may be ended once by the next config entry applied.
+    snapshot ends that namespace's cookies. Index migrations 012 and 013 add two columns to
+    its cookie rows (position and base chain); cookies recorded before them may be ended
+    once by the next config entry applied.
 - **Breaking: clients refuse content of a base they can't place** (§E.2.2, ENC-14; Encryption
   scenario 87). A reader of an end-to-end branch accepts content sealed under a base's keys only
   up to the point where the branch forked. The Go client and the playground take that point from
@@ -118,12 +122,15 @@ Breaking:
   as a plaintext `200`. Now a branch is held at least at the level held for any base in its
   local `base` chain, so `--expect-level N=sealed` (`client.WithExpectedLevel`) also refuses
   a branch of `N` that claims less; and a holder of `sealed` refuses a plaintext document too
-  (`client.ErrLevelLowered`). To know the chain, a client that holds any level reads a
-  namespace's current document once before it trusts a first document served in the clear
-  from it, so such a branch is refused without having been looked at first. That is one more
-  namespace-document read per namespace and client; a client that holds no level makes none.
-  `Client.HeldLevel` may report a level inherited from a base. A remote base isn't followed
-  (v0.86 Open 4).
+  (`client.ErrLevelLowered`), from `Client.DocKid` as from `Client.Doc`. To know the chain,
+  a client that holds `sealed` or `e2e` for some namespace reads a namespace's current
+  document once before it trusts a first document served in the clear from it, so such a
+  branch is refused without having been looked at first. That is one more namespace-document
+  read per namespace and client; a client that holds only `at-rest`, or nothing, makes none.
+  A refusal of the namespace document is remembered per grant, so a client copy with a wider
+  grant still reads it. `Client.HeldLevel` may report a level inherited from a base. A remote
+  base isn't followed, and the check rests on the document the server serves: against a
+  hostile server, configure the level for the branch itself (v0.86 Open 2, 5).
 - **Breaking: `409 in_use` lists a page** (§6.1 Refusals, §8.5; SCH-6, Grant scope scenario
   94). `referencing` named every namespace you may read that still references the schema. It
   now holds the first `logPageSize` of them by name, with `"more": true` where you may read
