@@ -859,7 +859,11 @@ func (t *tx) brokenReferences(ch refChange) []*nsRow {
 		out = t.brokenAmong(ch, t.schemaUsesOf(touched, ch.exclude))
 	}
 	if validateBoth {
+		// The oracle's statements aren't a purge's: tests that count
+		// statements don't see them (asOracle).
+		t.oracle++
 		full := t.brokenAmong(ch, t.schemaUses(ch.exclude))
+		t.oracle--
 		same := len(full) == len(out)
 		for i := 0; same && i < len(full); i++ {
 			same = full[i].id == out[i].id

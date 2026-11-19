@@ -562,14 +562,30 @@ func (t *tx) publicDependents(n *nsRow) []string {
 
 // liveBranches counts n's direct branches that are live (§6.6): neither
 // frozen nor purged, leaving out except.
+//
+// It counts by the frozen and purged columns, through the index on base,
+// without loading the rows of every branch n ever had: frozen mirrors the
+// branch's namespace document, written with it at creation and by every
+// config write (insertConfig).
 func (t *tx) liveBranches(n, except *nsRow) int {
-	live := 0
-	for _, b := range t.branchesOf(n) {
-		if except != nil && b.id == except.id {
-			continue
-		}
-		if !b.purged && !t.config(b.configSeq).Frozen {
-			live++
+	var skip int64 // no namespace's id
+	if except != nil {
+		skip = except.id
+	}
+	var live int
+	t.must(t.QueryRow(`SELECT COUNT(*) FROM namespaces WHERE base = ? AND purged = 0 AND frozen = 0 AND ns <> ?`, n.id, skip).Scan(&live))
+	if validateBoth {
+		// The oracle: the branches' documents, one by one.
+		byDoc := 0
+		t.asOracle(func() {
+			for _, b := range t.branchesOf(n) {
+				if (except == nil || b.id != except.id) && !b.purged && !t.config(b.configSeq).Frozen {
+					byDoc++
+				}
+			}
+		})
+		if byDoc != live {
+			panic(fmt.Sprintf("liveBranches of %s: %d by the frozen column, %d by the branches' documents", n.name, live, byDoc))
 		}
 	}
 	return live

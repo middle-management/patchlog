@@ -266,7 +266,11 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	}
 	// Step 7.
 	author := t.actorID(a)
-	bid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?) RETURNING ns`, br.Name, base.id, atSeq, base.configSeq)
+	// frozen mirrors the document, as after every config write
+	// (insertConfig): a branch may be created frozen, and liveBranches
+	// counts by the column.
+	bid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq, frozen) VALUES (?,?,?,?,?) RETURNING ns`,
+		br.Name, base.id, atSeq, base.configSeq, cfg.Frozen)
 	cseq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?) RETURNING seq`,
 		bid, cfgID[:], string(gcanon), string(jsonv.Canonical(nd)), author, t.now.UnixMilli())
 	bn := t.nsByIDLocked(bid, lockExclusive)

@@ -21,6 +21,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdh"
 	"database/sql"
@@ -798,9 +799,10 @@ type tx struct {
 	logLocks  map[int32]bool
 	maxLogKey int32
 	logPlan   map[int32]bool
-	// logHeads, when set (a group commit's transaction), are the heads of
-	// the chains it appended to, which it knows while it holds their log
-	// locks.
+	// logHeads, when set (a group commit's transaction, or a purge's on
+	// Postgres, which reads them in one statement, purgeApply), are the
+	// heads of the chains it appended to or read under their log locks,
+	// which it knows while it holds those.
 	logHeads map[int64]logHead
 	// cancelDue, when set (a group commit's transaction), cancels its ctx
 	// right before the commit if every request of the group is cancelled:
@@ -808,6 +810,9 @@ type tx struct {
 	// functions run in goroutines that may not have run yet.
 	cancelDue func()
 	noLock    int
+	// oracle > 0 while a check of PATCHLOG_TEST_VALIDATE_BOTH runs
+	// (asOracle): its statements aren't reported to onStatement.
+	oracle int
 	// sharedNS is the namespace a resource write or batch appends to
 	// holding its lock only shared (pglock.go); 0 if none.
 	sharedNS int64
@@ -1350,6 +1355,15 @@ func (t *tx) logHeadOf(n *nsRow) (*ids.ID, any) {
 		// The head this transaction appended last, under the log lock it
 		// still holds (group commit).
 		n.headSeq, headID = sql.NullInt64{Int64: h.seq, Valid: true}, h.id[:]
+		if validateBoth {
+			// The oracle: the head as the database has it now.
+			var seq sql.NullInt64
+			var id []byte
+			t.must(t.uncounted(`SELECT head_seq, head_id FROM namespaces WHERE ns = ?`, n.id).Scan(&seq, &id))
+			if seq != n.headSeq || !bytes.Equal(id, headID) {
+				panic(fmt.Errorf("the log head known of namespace %d is %d, the database has %v", n.id, h.seq, seq))
+			}
+		}
 	} else {
 		t.must(t.QueryRow(`SELECT head_seq, head_id FROM namespaces WHERE ns = ?`, n.id).Scan(&n.headSeq, &headID))
 		t.forget() // read after the log lock

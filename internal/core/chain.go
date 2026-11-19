@@ -133,6 +133,32 @@ func (t *tx) readChain(id int64) {
 	t.must(rows.Err())
 }
 
+// readChains reads the links of the chains of bases from each of ids up,
+// in one statement however many they are: those of the namespaces a purge
+// reaches (nspurge.go).
+func (t *tx) readChains(ids []int64) {
+	seed := `SELECT unnest(?::bigint[])`
+	if !t.e.pg {
+		seed = `SELECT value FROM json_each(?)`
+	}
+	rows, err := t.Query(`WITH RECURSIVE c(ns) AS (
+			`+seed+`
+			UNION
+			SELECT n.base FROM namespaces n JOIN c ON n.ns = c.ns WHERE n.base IS NOT NULL)
+		SELECT ns, name, base FROM namespaces WHERE ns IN (SELECT ns FROM c)`, t.e.arrayArg(ids))
+	t.must(err)
+	defer rows.Close()
+	if t.links == nil {
+		t.links = map[int64]nsLink{}
+	}
+	for rows.Next() {
+		var l nsLink
+		t.must(rows.Scan(&l.id, &l.name, &l.base))
+		t.links[l.id] = l
+	}
+	t.must(rows.Err())
+}
+
 func (t *tx) keep(n *nsRow) {
 	if t.kept == nil {
 		t.kept = map[int64]nsRow{}
@@ -195,6 +221,23 @@ func (t *tx) uncounted(q string, args ...any) *sql.Row {
 		q = rebind(q)
 	}
 	return t.Tx.QueryRow(q, args...)
+}
+
+// asOracle runs f, a check of the PATCHLOG_TEST_VALIDATE_BOTH oracle that
+// reads through the transaction's own helpers: tests that count statements
+// don't see its statements, it takes no lock, and what it read, unlocked,
+// stays neither in the transaction's memo nor among a write's dependencies.
+func (t *tx) asOracle(f func()) {
+	m, deps := t.memo, t.deps
+	t.memo, t.deps = memo{}, nil
+	t.oracle++
+	t.noLock++
+	defer func() {
+		t.oracle--
+		t.noLock--
+		t.memo, t.deps = m, deps
+	}()
+	f()
 }
 
 // base returns the base of branch n as nsByID does, its lock taken shared

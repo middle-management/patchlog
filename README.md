@@ -709,7 +709,10 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   in ascending order. Writes that change a namespace's configuration or state (config writes,
   purges, prunes, branch operations, freezing, the pending-blob sweep) take them exclusive on
   every namespace they change (the written one; a branch's base, which receives the `branch`
-  entry; every branch and remote shadow a purge reaches). Resource writes, batches and blob
+  entry; every branch and remote shadow a purge reaches: the branches that hold the purged
+  name or see it, found by name and locked in one statement, while a branch that does neither
+  is skipped and stays unlocked, since nothing can give it the name without the purged
+  namespace's lock; `internal/core/nspurge.go`). Resource writes, batches and blob
   uploads take their own namespace's lock **shared**, like every namespace a decision read
   (bases whose keys and revocations a branch write re-checks, the namespaces `$schema` and
   `$ref` resolve into, a batch source), so writers of different resources of one namespace
@@ -719,7 +722,8 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   the loser re-check and answer `412` with the new head (or the idempotent retry), as on
   SQLite. The namespace entry is appended last, under a separate advisory **log lock**,
   `pg_advisory_xact_lock(0x504e, ns)`, taken after every other lock, in ascending order when a
-  write appends to several logs (purge propagation, branch creation), and held through commit,
+  write appends to several logs (purge propagation, which takes them in one statement, and
+  branch creation), and held through commit,
   so entries commit, and their sequence numbers grow, in chain order. A transaction holding a
   log lock never waits for a namespace lock (it tries, and restarts with the lock taken up
   front if that fails). An uploader's pending blob total (§7.8) is ordered by a row of its

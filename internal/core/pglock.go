@@ -22,8 +22,11 @@ import (
 //
 //   - exclusive on every namespace whose configuration or state it
 //     changes: a config write, a purge, a prune, a branch or freeze, the
-//     base that receives a branch entry, every branch and remote shadow a
-//     purge propagates to, a sweep of expired pending blobs;
+//     base that receives a branch entry, every branch a purge has
+//     something to do in (the ones that hold the purged name or see it:
+//     a branch that does neither is skipped and stays unlocked, see
+//     nspurge.go) and every remote shadow it reaches, a sweep of expired
+//     pending blobs;
 //   - shared on the namespace a resource write or batch (without a config
 //     change) appends to (nsForResources), or a blob upload adds a pending
 //     entry to, and on every other namespace
@@ -198,7 +201,7 @@ func (t *tx) lock(k int32, mode lockMode) {
 // counted reports a lock statement, which doesn't go through tx's QueryRow
 // or Exec, to a test that counts statements (onStatement).
 func (t *tx) counted(q string) {
-	if h := t.e.onStatement; h != nil {
+	if h := t.e.onStatement; h != nil && t.oracle == 0 {
 		h(q, nil)
 	}
 }
@@ -251,6 +254,12 @@ func (t *tx) held(k int32, mode lockMode) {
 // key order: one above every log lock held is waited for, one below only
 // tried, and if it is busy the transaction restarts and takes them all in
 // order at its first append (logPlan).
+//
+// More than a couple (a purge's, one per branch it appends to) are taken in
+// one statement, or two, however many they are, as lockAll takes namespace
+// locks: those only tried in one, in which their order doesn't matter since
+// none is waited for; then those waited for, each above every log lock
+// held, in one that takes them in ascending order.
 func (t *tx) lockLog(ns int64) {
 	if !t.locking() {
 		return
@@ -266,26 +275,75 @@ func (t *tx) lockLog(ns int64) {
 		}
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	if t.logLocks == nil {
+		t.logLocks = map[int32]bool{}
+	}
+	if len(keys) > 2 {
+		t.lockLogKeys(k, keys)
+		t.logPlan = nil
+		return
+	}
 	for _, k2 := range keys {
 		if len(t.logLocks) == 0 || k2 > t.maxLogKey {
+			const q = `SELECT pg_advisory_xact_lock($1, $2)`
+			t.counted(q)
 			done := lockTimer("log")
-			_, err := t.Tx.ExecContext(t.waitCtx(), `SELECT pg_advisory_xact_lock($1, $2)`, logClass, k2)
+			_, err := t.Tx.ExecContext(t.waitCtx(), q, logClass, k2)
 			done()
 			t.must(err)
 		} else {
+			const q = `SELECT pg_try_advisory_xact_lock($1, $2)`
+			t.counted(q)
 			var ok bool
-			t.must(t.Tx.QueryRow(`SELECT pg_try_advisory_xact_lock($1, $2)`, logClass, k2).Scan(&ok))
+			t.must(t.Tx.QueryRow(q, logClass, k2).Scan(&ok))
 			if !ok {
 				t.relock(0, 0, k2)
 			}
-		}
-		if t.logLocks == nil {
-			t.logLocks = map[int32]bool{}
 		}
 		t.logLocks[k2] = true
 		t.maxLogKey = max(t.maxLogKey, k2)
 	}
 	t.logPlan = nil
+}
+
+// lockLogKeys takes the log locks keys, sorted and none held, in at most two
+// statements (lockLog). k is the one asked for, the others are planned.
+func (t *tx) lockLogKeys(k int32, keys []int32) {
+	// As lockLog decides, key by key: the keys waited for are above the
+	// ones tried, so taking those first leaves these above every one held.
+	var try, wait []int32
+	for _, k2 := range keys {
+		if len(t.logLocks) == 0 || k2 > t.maxLogKey {
+			wait = append(wait, k2)
+		} else {
+			try = append(try, k2)
+		}
+	}
+	if len(try) > 0 {
+		const q = `SELECT COALESCE(bool_and(pg_try_advisory_xact_lock($1, k)), true) FROM unnest($2::int4[]) AS u(k)`
+		t.counted(q)
+		var ok bool
+		t.must(t.Tx.QueryRow(q, logClass, try).Scan(&ok))
+		if !ok {
+			// All of them again, in order, at the restarted transaction's
+			// first append: the planned ones are in logPlan still.
+			t.relock(0, 0, k)
+		}
+	}
+	if len(wait) > 0 {
+		// The subquery's ORDER BY is the order the locks are taken in, as
+		// in lockAll.
+		const q = `SELECT count(pg_advisory_xact_lock($1, k)::text) FROM (SELECT k FROM unnest($2::int4[]) AS u(k) ORDER BY k) AS s`
+		t.counted(q)
+		done := lockTimer("log")
+		_, err := t.Tx.ExecContext(t.waitCtx(), q, logClass, wait)
+		done()
+		t.must(err)
+	}
+	for _, k2 := range keys {
+		t.logLocks[k2] = true
+		t.maxLogKey = max(t.maxLogKey, k2)
+	}
 }
 
 // lockLogs takes the log locks of several namespaces, in ascending key

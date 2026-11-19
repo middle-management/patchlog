@@ -32,6 +32,17 @@
 // transaction holds on it covers; a row kept under a shared lock on
 // Postgres, whose head other writers may move, is handed out with a head
 // that is no entry's, so that whatever read it would fail (core, chain.go).
+// A purge of a resource, which finds the branches it has something to do in
+// by name, also walks every branch below the purged namespace as it used
+// to, read-only, twice: before its first write, panicking unless every
+// branch where the walk would purge the name, append an entry or delete
+// stored sealings is one the purge planned to, seeing the same head there;
+// and after its last, panicking if the walk would still do anything
+// anywhere (core, purgeCheck). The count of a base's live branches by the
+// frozen and purged columns is compared with the count by the branches'
+// namespace documents (core, liveBranches), and a log head a transaction
+// keeps in memory with the row it stands for (core, logHeadOf). None of
+// these checks' statements are reported to tests that count statements.
 package testenv
 
 import (
