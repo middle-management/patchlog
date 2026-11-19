@@ -27,13 +27,43 @@ type configPlan struct {
 	exempt bool
 }
 
+// configExempt reports whether a config write draws no rate tokens, being
+// by a * key or only a freeze (§6.6 Exempt), which a speculative apply of
+// its patches decides.
+func configExempt(cur *Config, a *actor, cc *ConfigChange) bool {
+	if a.star {
+		return true
+	}
+	ops, err := patch.Parse(cc.Patches)
+	if err != nil {
+		return false
+	}
+	d, w, err := patch.Apply(cur.Doc, true, ops, patch.Options{})
+	return err == nil && freezeOnly(patch.WritesStrings(w), d)
+}
+
+// configRanOut is stepOneRanOut for a config write whose authorize
+// refused it with err: one whose rules ran out of validationSteps draws a
+// token from its principal's bucket before its 422, unless it is exempt,
+// and then draws nothing as ever.
+func (t *tx) configRanOut(n *nsRow, cur *Config, a *actor, cc *ConfigChange, err *Error) *Error {
+	if !err.ranOut || configExempt(cur, a, cc) {
+		return err
+	}
+	return t.stepOneRanOut(err, t.ownDraws(n, cur, a, nil, 1))
+}
+
 // planConfig runs steps 1–6 of a config write on an existing namespace.
 func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBatch bool) (*configPlan, error) {
 	// Step 1.
 	// The write's rules draw on one validation meter (§6.6, writeMeter).
 	defer t.metered(func() bool { return t.readsNS(n, cur, a, false) })()
 	if err := t.authorize(a, "config", ""); err != nil {
-		return nil, err
+		if inBatch {
+			// The batch answered the change's step 1 itself (checkItems).
+			return nil, err
+		}
+		return nil, t.configRanOut(n, cur, a, cc, err)
 	}
 	p := &configPlan{}
 	curID := t.configID(n.configSeq)

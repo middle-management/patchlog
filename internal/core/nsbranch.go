@@ -34,7 +34,9 @@ func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
 		return err
 	}
 	if err := t.authorize(a, "config", ""); err != nil {
-		return err
+		// A run-out of validationSteps answers instead of the 412, after
+		// the same draw (§6.6 Validation work).
+		return t.stepOneRanOut(err, []draw{t.principalDraw(n, cfg, a, 1)})
 	}
 	if a.verified == nil {
 		return nil
@@ -150,11 +152,18 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	}
 	// The write's rules draw on one validation meter (§6.6, writeMeter).
 	defer t.metered(func() bool { return t.readsNS(base, bcfg, a, true) })()
-	if err := t.authorize(a, "branch", br.Name); err != nil {
-		return nil, err
+	ran := t.authorize(a, "branch", br.Name)
+	if ran != nil && !ran.ranOut {
+		return nil, ran
 	}
 	if !t.readsNS(base, bcfg, a, true) {
 		return nil, forbidden("branching needs unrestricted read on the base (§2.1)")
+	}
+	if ran != nil {
+		// Its rules ran out of validationSteps and no check of step 1
+		// failed outright: the rate limits, on its own buckets, then the
+		// 422 (§6.6 Validation work).
+		return nil, t.stepOneRanOut(ran, t.ownDraws(base, bcfg, a, nil, 1))
 	}
 	if err := t.rateLimit(base, bcfg, a, nil, 1); err != nil {
 		return nil, err

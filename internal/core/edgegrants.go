@@ -232,6 +232,10 @@ func (c *edgeCollect) add(eg EdgeGrant) bool {
 // each with g's exp. It returns the key of g's principal's buckets, as a
 // write's are keyed (§6.6), and the first refusal of the lowest rank.
 func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) (string, *Error) {
+	// The exchange of g has one budget of validationSteps for the rules
+	// it evaluates, whatever namespaces and names they are for (§6.6
+	// Validation work).
+	defer t.readScope()()
 	exp := grantExp(g)
 	var bucket string
 	var refused *Error
@@ -373,7 +377,7 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 		for _, name := range names[1:] {
 			env := t.basicEnvelope("read", name, a)
 			for _, r := range each {
-				if !r.Eval(env) {
+				if !t.readRule(r, env) {
 					return nil, forbidden("the grant's rules refuse reading " + name + " in " + ns + ", a name they fix (§C.5.2)")
 				}
 			}
@@ -425,7 +429,7 @@ func (t *tx) qualifies(a *actor, rs []any, names []string) bool {
 			list = once
 		}
 		for _, r := range list {
-			if !r.Eval(env) {
+			if !t.readRule(r, env) {
 				return false
 			}
 		}

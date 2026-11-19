@@ -1032,7 +1032,9 @@ type fview struct {
 func newFview(cp *fcp, subjects []string, filter *grantcheck.ReadFilter) *fview {
 	fv := &fview{cp: cp, gs: grantcheck.SubjectSetID(subjects), subjects: subjects, filter: filter, memo: map[string]bool{}}
 	for _, c := range cp.cats {
-		fv.views = append(fv.views, c.View(subjects))
+		v := c.View(subjects)
+		v.Steps = filter.Steps // each item's validation steps (§6.6)
+		fv.views = append(fv.views, v)
 	}
 	return fv
 }
@@ -1108,7 +1110,7 @@ func (fv *fview) itemLive(n *tree.Node) bool {
 // its filter the grant's (grantcheck.FilterOf). A grant whose key-scope
 // or block rules refer to /now, or whose roles all do, can't read this
 // way: 403 (§C.2 item 5).
-func grantFview(cp *fcp, v *grant.Verified) (*fview, error) {
+func grantFview(cp *fcp, v *grant.Verified, steps int) (*fview, error) {
 	digest, ok := grantcheck.ReadsScope(v)
 	if !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "a rule limiting the grant's reads refers to /now"}
@@ -1121,7 +1123,9 @@ func grantFview(cp *fcp, v *grant.Verified) (*fview, error) {
 	pub, _ := v.Key.Raw["pub"].(string)
 	subjects := append(catvis.FilteredSubjects(deciding, v.Principal.Groups, scopeKeyDigest(digest, v.Key.Kid, pub)), catvis.KeySubject(v.Key.Kid, pub))
 	slices.Sort(subjects)
-	return newFview(cp, subjects, grantcheck.FilterOf(v)), nil
+	f := grantcheck.FilterOf(v)
+	f.Steps = steps
+	return newFview(cp, subjects, f), nil
 }
 
 // errRulesChanged and errPartial refuse a cookie for a marker

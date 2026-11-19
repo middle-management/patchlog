@@ -96,7 +96,7 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 	// The write's rules draw on one validation meter (§6.6, writeMeter).
 	defer t.metered(func() bool { return true })()
 	if err := t.authorize(a, "export", ""); err != nil {
-		return nil, err
+		return nil, t.stepOneRanOut(err, t.ownDraws(n, cfg, a, nil, 1))
 	}
 	if err := t.rateLimit(n, cfg, a, nil, 1); err != nil {
 		return nil, err

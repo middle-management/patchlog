@@ -824,11 +824,18 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 			allowed = true
 			break
 		}
-		if first == nil || t.meter.Over {
-			first = e
+		if e.ranOut {
+			// Out of validationSteps, whatever another verb would say:
+			// the rate limits on the caller's own buckets, a token each
+			// and none of its bytes, then the 422 (§7.8 check 1, §6.6
+			// Validation work).
+			if !draw {
+				return nil, e
+			}
+			return nil, t.stepOneRanOut(e, t.ownDraws(n, cfg, a, []string{name}, 1))
 		}
-		if t.meter.Over {
-			break
+		if first == nil {
+			first = e
 		}
 	}
 	if !allowed {

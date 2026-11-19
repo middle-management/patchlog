@@ -580,6 +580,7 @@ func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 	if err != nil {
 		return nil, false
 	}
+	f.Steps = ix.opt.ValidationSteps // each item's validation steps (§6.6)
 	rec := &markerRec{f: f}
 	if subjects.Valid {
 		var ok bool

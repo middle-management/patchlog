@@ -10,16 +10,41 @@ import (
 
 var stepOneRefs = []string{"action", "resource", "principal", "now"}
 
-// grantRules evaluates key-scope, block and role rules. With stepOne, only
-// rules that refer solely to action, resource, principal and now are
-// evaluated.
+// grantRules evaluates key-scope, block and role rules for a read. With
+// stepOne, only rules that refer solely to action, resource, principal
+// and now are evaluated.
 //
-// It bounds nothing: reads come here, and §6.6 bounds the schema tests of
-// a write's rules only (grantRulesMode with the write's meter).
-// The one read that is bounded is the check a write's refusal makes to
-// decide whether it may carry measured (writeMeter.over, t.readMeter).
+// Their schema tests draw on the read check's budget of validationSteps,
+// a fresh one unless the caller holds one for all the checks of its
+// exchange or key request (readScope): running out fails the check as a
+// rule that refuses does, so with the check's usual refusal (§6.6
+// Validation work).
 func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool) *Error {
+	defer t.readScope()()
 	return t.grantRulesMode(a, verb, roles, env, stepOne, nil, t.readMeter)
+}
+
+// readScope gives the read checks made until the function it returns is
+// called one budget of validationSteps between them, as an exchange and
+// a key request have for all the names they judge (§6.6 Validation work:
+// "each read, exchange and key request a grant is presented for"). Inside
+// another's scope it keeps that budget. Every other read check, a write's
+// own included, is made outside any scope and gets a fresh budget
+// (grantRules, readsNS, readRule).
+func (t *tx) readScope() func() {
+	if t.readMeter != nil {
+		return func() {}
+	}
+	t.readMeter = &writeMeter{Meter: *rules.Budget(t.e.opt.MaxValidationSteps), read: true, t: t}
+	return func() { t.readMeter = nil }
+}
+
+// readRule reports whether r passes against the read envelope env within
+// the read check's budget (readScope): a rule whose schema tests run out
+// of validationSteps doesn't, under a not either (§6.6 Validation work).
+func (t *tx) readRule(r *rules.Rule, env map[string]any) bool {
+	defer t.readScope()()
+	return r.Passes(env, &t.readMeter.Meter)
 }
 
 // writeMeter counts the validation steps of one write against the
@@ -37,11 +62,18 @@ type writeMeter struct {
 	rules.Meter
 	readable func() bool
 	t        *tx
+	// read: the meter is a read check's budget, not a write's (readScope).
+	// Running out fails the check, as a rule that refuses does.
+	read bool
+	// stepOne is set while the write's step 1 draws on the meter
+	// (authorize): running out there doesn't answer at once, since a check
+	// that fails outright answers before it (§6.6 Validation work).
+	stepOne bool
 }
 
 // newMeter is a meter for one write, at the deployment's limit.
 func (t *tx) newMeter(readable func() bool) *writeMeter {
-	return &writeMeter{Meter: rules.Meter{Max: max(t.e.opt.MaxValidationSteps, 0)}, readable: readable, t: t}
+	return &writeMeter{Meter: *rules.Budget(t.e.opt.MaxValidationSteps), readable: readable, t: t}
 }
 
 // metered gives the write this transaction checks its meter, which the
@@ -78,17 +110,60 @@ func (m *writeMeter) over() *Error {
 	return err
 }
 
-// readsWithin is m.readable, with the read check's own rules held to the
-// limit too: the grant whose rule just took too many steps on the write
-// may take as many on the read envelope, and the refusal must not cost
-// what it refuses. A check that runs out counts as can't read.
+// deferred is over for a write whose step 1 has been through all its
+// rules without one failing outright: the 422 that answers after the
+// step's other checks and the rate limits (Error.ranOut), nil if the
+// steps haven't run out.
+func (m *writeMeter) deferred() *Error {
+	err := m.over()
+	if err != nil {
+		err.ranOut = true
+	}
+	return err
+}
+
+// cut decides what a rule that evaluated to v means once the meter's
+// steps have run out, for scopeRules and roleRules. stop is the refusal
+// that answers at once: the write's 422 at steps 5 and 6, whatever the
+// rule said (§6.6), and at step 1 the 403 of a rule that is False, which
+// fails whatever the tests cut short would have said. Without one, at
+// step 1, the rule is neither passed nor failed: the caller goes on to the
+// rules left, any of which may still fail outright, and the run-out
+// answers at the end (deferred). ok is false if the steps haven't run
+// out, and v is to be read as usual.
+func (m *writeMeter) cut(v rules.Tri) (stop *Error, ok bool) {
+	if m == nil || !m.Over {
+		return nil, false
+	}
+	if m.read {
+		return errReadRanOut(), true
+	}
+	if !m.stepOne {
+		return m.over(), true
+	}
+	if v == rules.False {
+		return forbidden("a grant or key rule refuses the request"), true
+	}
+	return nil, true
+}
+
+// errReadRanOut is how a read check whose rules ran out of validationSteps
+// fails: as one a rule refuses (§6.6 Validation work).
+func errReadRanOut() *Error {
+	return forbidden("the grant's rules take more than validationSteps steps for this read, which fails it (§6.6)")
+}
+
+// readsWithin is m.readable, each read check of which has a budget of its
+// own, as every read check a write makes has (§6.6 Validation work): the
+// grant whose rule just took too many steps on the write may take as many
+// on the read envelope, and the refusal must not cost what it refuses. A
+// check that runs out counts as can't read.
 func (m *writeMeter) readsWithin() bool {
 	t := m.t
 	prev := t.readMeter
-	rm := t.newMeter(nil)
-	t.readMeter = rm
+	t.readMeter = nil
 	defer func() { t.readMeter = prev }()
-	return m.readable() && !rm.Over
+	return m.readable()
 }
 
 // grantRulesMode is grantRules with the envelope members unknown names
@@ -98,9 +173,12 @@ func (m *writeMeter) readsWithin() bool {
 // one that passes, or fails, whatever they hold is decided as usual
 // (§6.2, rules.EvalTri).
 //
-// The rules' schema tests draw on m, a write's meter, nil for a read: once
-// its steps run out the answer is its 422, whatever the rule would have
-// said (writeMeter.over).
+// The rules' schema tests draw on m, a write's meter or a read check's
+// budget (readScope). Once a write's steps run out the answer is its 422,
+// whatever the rule would have said (writeMeter.over); a read check
+// fails, whatever role might still have passed. At step 1 (m.stepOne, authorize) that 422 waits:
+// every rule is still evaluated, one that fails outright answers 403, and
+// only if none does is the answer the run-out (writeMeter.deferred).
 func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[string]any, stepOne bool, unknown []string, m *writeMeter) *Error {
 	if a.verified == nil {
 		return nil
@@ -108,12 +186,24 @@ func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[strin
 	if err := t.scopeRules(a, env, stepOne, unknown, m); err != nil {
 		return err
 	}
-	return t.roleRules(a, verb, roles, env, stepOne, unknown, m)
+	if err := t.roleRules(a, verb, roles, env, stepOne, unknown, m); err != nil {
+		return err
+	}
+	if m != nil && m.stepOne {
+		// No rule of step 1 failed outright: if its steps ran out, that
+		// answers, after the rate limits.
+		return m.deferred()
+	}
+	return nil
 }
 
 // scopeRules evaluates the key-scope and block rules of a's verified
 // grant, as grantRulesMode does.
 func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []string, m *writeMeter) *Error {
+	if m != nil && m.read && m.Over {
+		// The budget its exchange or key request shares is spent.
+		return errReadRanOut()
+	}
 	for _, src := range [][]any{a.verified.KeyRules, a.verified.BlockRules} {
 		for _, rv := range src {
 			r, err := compileCached(rv)
@@ -129,8 +219,10 @@ func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []st
 				continue
 			}
 			v := r.EvalMetered(env, m.rule(), unknown...)
-			if err := m.over(); err != nil {
-				return err
+			if stop, cut := m.cut(v); stop != nil {
+				return stop
+			} else if cut {
+				continue
 			}
 			switch v {
 			case rules.Unknown:
@@ -200,6 +292,9 @@ func readRoles(a *actor) (roles []string, ok bool) {
 // rules evaluated must pass for one of roles, or with roles nil for one of
 // the effective roles that list verb.
 func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool, unknown []string, m *writeMeter) *Error {
+	if m != nil && m.read && m.Over {
+		return errReadRanOut()
+	}
 	if a.verified.HasRoles() {
 		if roles == nil {
 			_, roles = a.verified.Allows(verb)
@@ -219,10 +314,21 @@ func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any
 					continue
 				}
 				v := r.EvalMetered(env, m.rule(), unknown...)
-				if err := m.over(); err != nil {
-					// Not a role that doesn't pass: the write's steps ran
-					// out, which no other role makes up for.
-					return err
+				if stop, cut := m.cut(v); cut {
+					if m.read || !m.stepOne {
+						// Not a role that doesn't pass: the steps of the
+						// write, or of the read check, ran out, which no
+						// other role makes up for.
+						return stop
+					}
+					if v == rules.False {
+						// At step 1 the role fails outright.
+						ok = false
+						break
+					}
+					// The role may have passed: the request doesn't fail
+					// outright, and its run-out answers (grantRulesMode).
+					continue
 				}
 				if v != rules.True {
 					ok = false

@@ -32,7 +32,7 @@ func (t *tx) filteredEdgeGrant(n *nsRow, fs *fscope, a *actor, exp time.Time) (*
 			if refersToNow(r) {
 				return nil, forbidden("the grant's rules refuse reading " + n.name + ": a rule that refers to /now passes no read (§C.2 item 5)")
 			}
-			if !r.Refs()["resource"] && !r.Eval(env) {
+			if !r.Refs()["resource"] && !t.readRule(r, env) {
 				return nil, forbidden("the grant's rules refuse reading " + n.name)
 			}
 		}

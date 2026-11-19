@@ -105,7 +105,7 @@ func DefaultLimits() Limits {
 // tests may take together (Options.MaxValidationSteps, §6.6). A
 // 1 MiB document of some 9,500 small typed objects takes 85,503, a
 // recursive union over 1,023 nodes 14,833 (docs/CAPACITY.md).
-const DefaultMaxValidationSteps = 5_000_000
+const DefaultMaxValidationSteps = rules.DefaultValidationSteps
 
 // MaxDocumentSize is the deployment maximum documentSize by default: the
 // §6.6 default, which namespaces may set.

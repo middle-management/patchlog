@@ -125,6 +125,13 @@ type Options struct {
 	// CheckerTTL is how long namespace documents are cached for grant
 	// checks (default 30s).
 	CheckerTTL time.Duration
+	// ValidationSteps is the validation steps each read check and each
+	// item filtered by a grant may take in its rules' schema tests (§6.6
+	// Validation work, §12.2 validationSteps): a check that needs more
+	// fails, and the item is left out. It is the origin deployment's
+	// limit, which no namespace document carries, so the service is told
+	// it; zero, or less, means §12.2's default of 5,000,000.
+	ValidationSteps int
 	// Purger receives cache-tag purges (default: log).
 	Purger Purger
 	// RepurgeDelay is how long after a cache-tag purge it is sent again,
@@ -374,7 +381,7 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 	s := &Service{
 		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db), kept: kept.New(opt.Now, keepBytes),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
-		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
+		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL), grantcheck.WithValidationSteps(opt.ValidationSteps)),
 		cur:     map[string]string{}, purged: map[string]time.Time{}, changed: make(chan struct{}), unfollowed: map[string]string{},
 		caught: map[string]bool{}, target: map[string]string{},
 		running: map[string]context.CancelFunc{},
