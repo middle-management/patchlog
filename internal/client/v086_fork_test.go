@@ -243,3 +243,76 @@ func TestV086FilteredHeadsDoNotPlaceAFork(t *testing.T) {
 		t.Fatalf("both /heads filtered: flags %q", flags)
 	}
 }
+
+// v0.86 §E.2.2 ("Where they can't place that parent, the op fails the
+// check"): a branch whose document names a base without the entry it was
+// forked at, local or remote, as no deployment writes, gives nothing to
+// place the fork by. Nothing sealed under the base is accepted. The first
+// cut of v0.86 stopped there without a fork and so checked none.
+func TestV086BaseWithoutAtFailsClosed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for _, remote := range []bool{false, true} {
+		v, fork, forgedID, forged := v85Branch(t)
+		rt := v85Splice(fork, forgedID, forged, func(ns string, doc map[string]any) {
+			if b, ok := doc["base"].(map[string]any); ok && ns == "eb" {
+				delete(b, "at")
+				if remote {
+					b["origin"], b["chain"] = "https://a.example", []any{"e"}
+				}
+			}
+		})
+		x := v.s.Client(t, client.WithBearer(v.grant), client.WithHTTPClient(&http.Client{Transport: rt})).E2E(v.priv)
+		if d, err := x.DocE2E(ctx, "eb", "d", forgedID); err == nil {
+			t.Fatalf("remote %v: a base without at: %+v, want no valid revision", remote, d)
+		}
+		es, flags := must2(x.OpenLog(ctx, "eb", "d", must(v.c.Log(ctx, "eb", "d", fork, ""))))
+		if len(es) != 2 || !strings.Contains(flags[0], "foreign parent") || !strings.Contains(flags[1], "foreign parent") {
+			t.Fatalf("remote %v: a base without at: flags %q", remote, flags)
+		}
+	}
+}
+
+// v0.86 §E.2.2: a fork that couldn't be placed is asked for again by the
+// next fold, not remembered for the life of the view: a /heads refused
+// for a moment doesn't flag a resource's read-through entries from then
+// on. A placed fork is kept, a branch's at never changing.
+func TestV086UnplacedForkIsNotKept(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	v, fork, _, _ := v85Branch(t)
+	var mu sync.Mutex
+	deny := true
+	inner, denied := v86NoHeads(nil, v86HeadsOfBoth)
+	open := http.DefaultTransport.(*http.Transport).Clone()
+	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		d := deny
+		mu.Unlock()
+		if d {
+			return inner.RoundTrip(req)
+		}
+		if strings.HasSuffix(req.URL.Path, "/heads") {
+			mu.Lock()
+			deny = true // from the next /heads on: refused again
+			mu.Unlock()
+		}
+		return open.RoundTrip(req)
+	})
+	x := v.s.Client(t, client.WithBearer(v.grant), client.WithHTTPClient(&http.Client{Transport: rt})).E2E(v.priv)
+	log := must(v.c.Log(ctx, "eb", "d", fork, ""))
+	if _, flags := must2(x.OpenLog(ctx, "eb", "d", log)); flags[0] == "" || flags[1] == "" {
+		t.Fatalf("the /heads refused: flags %q", flags)
+	}
+	mu.Lock()
+	deny = false
+	mu.Unlock()
+	if _, flags := must2(x.OpenLog(ctx, "eb", "d", log)); flags[0] != "" || flags[1] != "" {
+		t.Fatalf("the /heads readable again, the same view: flags %q", flags)
+	}
+	// Placed once, it is kept: the /heads is refused again and not asked.
+	n := denied()
+	if _, flags := must2(x.OpenLog(ctx, "eb", "d", log)); flags[0] != "" || flags[1] != "" || denied() != n {
+		t.Fatalf("a placed fork wasn't kept: flags %q, %d more /heads refused", flags, denied()-n)
+	}
+}

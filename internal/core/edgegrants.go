@@ -406,6 +406,11 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 			}
 		}
 	}
+	if t.readSpent() {
+		// The exchange's budget of validationSteps ran out along the
+		// way: it fails as a whole (§6.6).
+		return nil, forbidden("the grant's rules take more than validationSteps steps for this exchange, which fails it (§6.6): " + ns)
+	}
 	// A purged namespace is decided last, once the grant verifies and may
 	// read there, as its URLs answer 410 after the read check (§8.5). Its
 	// 410 names the namespace, since a request may name several (§12).

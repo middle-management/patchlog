@@ -37,9 +37,18 @@ func (t *tx) filteredEdgeGrant(n *nsRow, fs *fscope, a *actor, exp time.Time) (*
 			}
 		}
 	}
+	// An exchange whose budget of validationSteps is spent, by the check
+	// of unrestricted read that brought it here or by a rule above, fails
+	// as a whole: no cookie for the subject set either (§6.6).
+	if t.readSpent() {
+		return nil, forbidden("the grant's rules take more than validationSteps steps for this exchange, which fails it (§6.6): " + n.name)
+	}
 	fv, err := t.grantView(fs, t.filteredCurrent(fs), a)
 	if err != nil {
 		return nil, err
+	}
+	if t.readSpent() {
+		return nil, forbidden("the grant's rules take more than validationSteps steps for this exchange, which fails it (§6.6): " + n.name)
 	}
 	if n.purged {
 		pe := t.purgedNS(n)

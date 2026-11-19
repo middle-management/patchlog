@@ -1,0 +1,28 @@
+-- Migration: edge gs keys pending
+-- Created: 2026-11-19T15:50:28Z
+-- Checksum: 80be7509bb17d4894cc11a350222d8d8752601a4a50bc13c2199e2a0af55db8d
+-- Chain: 6ab238c3f0fb69e0046e32d0856df64c1c11d23d52ce47664cac49ae46d45dba
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- edge_gs_keys.pending (§B.11.9 gs, v0.86: "Once an entry after its
+-- exchange changes one of them, the cookie is 403 from that entry on"):
+-- the namespace documents a cookie's exchange drew its key and roles
+-- from that the index had not reached when the row was recorded, as the
+-- canonical JSON object of namespace to "{ns_id} {document digest}", ''
+-- for none. The index, catching up, judges for the row only the config
+-- entries after that position in each namespace. Rows kept before have
+-- none: every document the index applies is judged for them, which may
+-- end a cookie minted while it was behind, once.
+ALTER TABLE edge_gs_keys ADD COLUMN pending TEXT NOT NULL DEFAULT '';

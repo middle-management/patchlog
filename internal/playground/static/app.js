@@ -2110,14 +2110,20 @@ async function readDoc(ns, name, id, r, retried) {
  * asked for, which holds it (§7.1 Paging): nothing here is a read of the range. */
 async function nsFirstEntry(ns) {
   const l = await api('GET', `/ns/${ns}/log`, { auto: true, label: 'fork' });
-  const first = l.status === 200 && Array.isArray(l.json) ? l.json[0] : null;
+  // The range at the head, not a partial reader's filtered log (§B.11.9), which may leave the first entry out.
+  const whole = l.finalPath === undefined || new RegExp(`^/ns/${ns}(/rev/1[a-z2-7]{32})?/log$`).test(l.finalPath.split('?')[0]);
+  const first = l.status === 200 && whole && Array.isArray(l.json) ? l.json[0] : null;
   return first && typeof first === 'object' && (first.prev || '') === '' ? first : null;
 }
 
 /* revPrecedes says whether revision a precedes revision b in the chain of ns/name: the server serves the range after
- * a up to b only then. The answer's status is all that is read. */
+ * a up to b only then. The answer's status is all that is read: 200 is yes and a refusal no, while an answer of the
+ * moment (429, 408, 5xx, no answer) is neither and throws, so that nothing is concluded, or kept, from it. */
 async function revPrecedes(ns, name, a, b) {
-  return (await api('GET', `/r/${ns}/${name}/rev/${b}/log?since=${a}`, { auto: true, label: 'fork' })).status === 200;
+  const st = (await api('GET', `/r/${ns}/${name}/rev/${b}/log?since=${a}`, { auto: true, label: 'fork' })).status;
+  if (st === 200) return true;
+  if (st >= 400 && st < 500 && st !== 408 && st !== 429) return false;
+  throw new Error(`placing the fork of ${ns}/${name}: the range after ${a} up to ${b} answered ${st}`);
 }
 
 /* nsChainOK: a branch reads its bases' ciphertext, sealed under their keys (§F.8), up to the resource's foreign parent
@@ -2138,8 +2144,10 @@ async function nsChainOK(ns, kns, at) {
   const headAt = async (of, nsID, name) => {
     let after = Array.from(name).slice(0, -1).join('');
     for (let page = 0; page < 20; page++) {
-      const r = await api('GET', `/ns/${of}/rev/${nsID}/heads` + (after ? `?after=${encodeURIComponent(after)}` : ''), { auto: true, label: 'fork' });
-      if (r.status !== 200 || !r.json) return null;
+      const path = `/ns/${of}/rev/${nsID}/heads`;
+      const r = await api('GET', path + (after ? `?after=${encodeURIComponent(after)}` : ''), { auto: true, label: 'fork' });
+      // A partial reader is redirected to its filtered listing (§B.11.9), which places no fork.
+      if (r.status !== 200 || !r.json || (r.finalPath || path).split('?')[0] !== path) return null;
       const rows = r.json.heads || r.json.items || [];
       const row = rows.find((x) => x && x.resource >= name);
       if (row) return row.resource === name && row.kind !== 'purge' && typeof row.target === 'string' ? row.target : '';
