@@ -331,16 +331,32 @@ The raw results are `docs/capacity/resource-live-*.json`.
 - **No cliff up to 12,288 followers.** Throughput stays within 1,650–1,810 writes/s (1,746 at
   1,024 in the table above). The 16 writers alone reach 1,921, which is the ceiling here: the
   harness shares the core's 4 vCPU. Quiet followers cost the core almost no CPU.
-- **What does grow is the worst write, about 0.13 ms per follower.** At each interval boundary
-  (§7.7) every follower is answered 204 at once and polls again at once: a burst of one request
-  per follower, which the writes queue behind. p99 doesn't move, because this happens once per
-  20 s window.
+- **What grew was the worst write, about 0.13 ms per follower.** This sweep counted every log's
+  intervals from one epoch, as §7.7 says. At each boundary every follower was answered 204 at
+  once and polled again at once: a burst of one request per follower, which the writes queued
+  behind. p99 didn't move, because this happened once per 20 s window. Per-log phases, below,
+  remove it.
 - **Past ~12k the host is the limit, not patchlog.** The core and the harness each hold one
   socket per follower, and the host caps a process at 20,000 open files. At 16,384 both ran out:
   the core couldn't accept connections or open the SQLite file. A larger fleet needs a raised
   `nofile` limit on the core, and followers on more than one client host.
 
 The sweep is `docs/capacity/resource-live-sqlite-after-sweep.json`.
+
+**Per-log phases.** The core now shifts each log's interval boundaries by a phase drawn from
+the log's path (docs/SPEC-FEEDBACK.md, v0.85 Open 61). Followers of one URL still share their
+boundaries, so a CDN still collapses them, but different resources' boundaries spread over the
+interval. `serve --long-poll-fixed-epoch` keeps the spec's single epoch. The same run, with
+each setting:
+
+| Followers | Fixed epoch: writes/s, worst write | Per-log phase: writes/s, worst write |
+|---|---|---|
+| 8,192 | 1,610, 1.10 s | 1,654, **100 ms** |
+| 12,288 | 1,564, 1.52 s | 1,669, **51 ms** |
+
+With phases, the worst write at 12,288 followers is that of no followers at all (44 ms), and p50
+and p99 are unchanged (6.6–7.0 ms, 24–26 ms). The runs are in
+`docs/capacity/resource-live-sqlite-phase.json`.
 
 ## Large documents, by shape and schema
 
@@ -805,6 +821,11 @@ These were limits and are not any more:
   each read its resource's log again. At 1,024 followers and 16 writers on SQLite that held
   writes to 12 a second. Now they are woken by their resource's commits and by
   namespace-wide ones only: 1,746 writes a second ([Resource followers](#resource-followers)).
+- **Every long-poll of a deployment ended its wait at the same instant**, so at each interval
+  boundary the writes queued behind one request per follower: 1.5 s for the worst write at
+  12,288 resource followers. Now each log's boundaries are shifted by a phase drawn from its
+  path: 51 ms ([Resource followers](#resource-followers)). `serve --long-poll-fixed-epoch` keeps
+  the spec's single epoch.
 - **Long-polls of a namespace** each read the log on their own when woken. Now the read is
   shared ([Origin-side collapse](#origin-side-collapse);
   [Earlier measurements](#earlier-measurements) has the before and after).

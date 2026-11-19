@@ -21,6 +21,15 @@
   resource as well, from the `ns_log` entries it reads (a batch's items from its body).
   docs/CAPACITY.md, "Resource followers", has the before and after; `cmd/capacity -only
   resource-live` measures it.
+- **Each log's long-poll intervals have a phase of their own** (§7.7; docs/SPEC-FEEDBACK.md,
+  v0.85 Open 61). Every wait of a deployment ended at the one interval boundary, so at each
+  boundary every follower was answered and polled again together, and writes queued behind
+  them: the worst write of a 20 s window took 1.5 s with 12,288 resource followers on SQLite.
+  Now a log's intervals start at the epoch plus a phase, the first 8 bytes of the SHA-256 of
+  the log's path modulo the interval in milliseconds, and that worst write took 51 ms. All
+  followers of one URL share its boundaries and cursors, so CDN collapsing is unchanged, and
+  cursors stay within one of the old ones. `serve --long-poll-fixed-epoch` (Options
+  `LongPollFixedEpoch`) keeps the spec's single epoch.
 
 ## v0.31.0
 

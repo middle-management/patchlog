@@ -32,7 +32,9 @@ runs, which started from a new, empty one.
 host without containers: `-only resource-live` against `serve --dev`, before and after resource
 long-polls stopped waking on the namespace's other writes. They started from a new, empty
 database, and Postgres 16 shared the host (`fsync=off`). See "Resource followers" in
-CAPACITY.md.
+CAPACITY.md. `resource-live-sqlite-after-sweep.json` sweeps the follower count up to 12,288, and
+`resource-live-sqlite-phase.json` compares 8,192 and 12,288 followers with one epoch for every
+log (`--long-poll-fixed-epoch`) and with per-log phases.
 
 [`2026-10-15/`](2026-10-15/) holds the first measurements (spec 0.52, another host). CAPACITY.md
 uses them only under "Earlier measurements".

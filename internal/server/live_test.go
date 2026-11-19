@@ -241,14 +241,15 @@ func TestLongPollWakes(t *testing.T) {
 	e := newEnv(t, withLongPoll(20*time.Second), withFileDB(t))
 	e.mkNS("docs", map[string]any{"read": "public"})
 	head := e.nsHead("docs")
-	// A long-poll ends at the next cursor boundary (§7.7): start well
-	// before one, so the write below comes first.
+	// A long-poll ends at the log's next boundary (§7.7, liveClock): start
+	// well before one, so the write below comes first.
 	const interval = 20 * time.Second
-	if rem := interval - time.Duration(time.Now().UnixNano()%int64(interval)); rem < time.Second {
+	clock := newLiveClock(interval, false, "/ns/docs/log")
+	if rem := time.Until(clock.end(clock.cursor(time.Now()))); rem < time.Second {
 		time.Sleep(rem + 10*time.Millisecond)
 	}
 	// With the current cursor: one without a cursor is answered at once.
-	cur := strconv.FormatInt(time.Now().UnixNano()/int64(interval), 10)
+	cur := strconv.FormatInt(clock.cursor(time.Now()), 10)
 	done := make(chan *resp, 1)
 	go func() { done <- e.get("/ns/docs/log?since=" + head + "&live=long-poll&cursor=" + cur) }()
 	time.Sleep(100 * time.Millisecond)
@@ -272,7 +273,8 @@ func TestResourceLongPollIsolated(t *testing.T) {
 	lim := core.DefaultLimits()
 	fast := core.Rate{Rate: 1e6, Burst: 1e6}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e := newEnv(t, withLongPoll(interval), withFileDB(t), func(o *core.Options) { o.Limits, o.Maximums = lim, lim })
+	// One boundary for all fifty logs, so one cursor waits on each.
+	e := newEnv(t, withLongPoll(interval), withFileDB(t), withFixedEpoch, func(o *core.Options) { o.Limits, o.Maximums = lim, lim })
 	e.mkNS("docs", map[string]any{"read": "public"})
 	const waiters, writes = 50, 100
 	heads := make([]string, waiters)
@@ -450,5 +452,109 @@ func TestEventsPaged(t *testing.T) {
 	expect(t, e.purge("docs", "a", tomb, "admin"), 204)
 	if ev := next(t, resCh); ev.event != "purge" {
 		t.Fatalf("purge %v", ev)
+	}
+}
+
+// A log's phase (logPhase, docs/SPEC-FEEDBACK.md v0.85 Open 61): the
+// first 8 bytes of the SHA-256 of its path, big-endian, modulo the
+// interval in milliseconds; spread evenly over the interval across logs.
+func TestLogPhase(t *testing.T) {
+	t.Parallel()
+	const interval = 20 * time.Second
+	for path, want := range map[string]time.Duration{
+		"/r/docs/a/log": 15777 * time.Millisecond, // sha-256 c6b6521efdba5aa1…
+		"/r/docs/b/log": 1327 * time.Millisecond,  // d88ca141ae2485cf…
+		"/ns/docs/log":  18318 * time.Millisecond, // 7a75dc61743845ce…
+	} {
+		if got := logPhase(path, interval); got != want {
+			t.Errorf("phase of %s: %v, want %v", path, got, want)
+		}
+	}
+	// 2,000 logs over twenty one-second buckets: about 100 each.
+	var buckets [20]int
+	for i := range 2000 {
+		p := logPhase(fmt.Sprintf("/r/n/r%d/log", i), interval)
+		if p < 0 || p >= interval || p%time.Millisecond != 0 {
+			t.Fatalf("phase %v", p)
+		}
+		buckets[p/time.Second]++
+	}
+	for i, n := range buckets {
+		if n < 50 || n > 150 {
+			t.Errorf("second %d of the interval: %d of 2,000 logs, want about 100", i, n)
+		}
+	}
+	// The clock: an interval ends where the next begins, shifted by the
+	// phase; without one (the fixed epoch) at multiples of the interval.
+	c := newLiveClock(interval, false, "/r/docs/a/log")
+	const k = int64(89_000_000)
+	if end := c.end(k); c.cursor(end.Add(-time.Nanosecond)) != k || c.cursor(end) != k+1 ||
+		end.UnixNano() != (k+1)*int64(interval)+int64(15777*time.Millisecond) {
+		t.Fatalf("interval %d ends %v", k, c.end(k))
+	}
+	if f := newLiveClock(interval, true, "/r/docs/a/log"); f.phase != 0 || f.end(k).UnixNano() != (k+1)*int64(interval) {
+		t.Fatalf("fixed epoch: %+v", f)
+	}
+	// The server's cursor is the log's.
+	now := c.end(k).Add(time.Second)
+	if cur, err := judgeCursor(now, c, k); cur != k+1 || err != nil {
+		t.Fatalf("judged %d %v, want %d", cur, err, k+1)
+	}
+}
+
+// §7.7 with phases: two resources' long-polls with the current cursor
+// each end at their own log's boundary, not at one instant, and the 204's
+// cursor is the log's next. Not parallel: it times answers.
+func TestLongPollPhase(t *testing.T) {
+	const interval = 2 * time.Second
+	e := newEnv(t, withLongPoll(interval))
+	e.mkNS("docs", map[string]any{"read": "public"})
+	// Two resources whose boundaries are at least half a second apart.
+	var names []string
+	var clocks []liveClock
+	for i := 0; len(names) < 2; i++ {
+		name := fmt.Sprintf("p%d", i)
+		c := newLiveClock(interval, false, "/r/docs/"+name+"/log")
+		if len(clocks) == 1 {
+			d := (c.phase - clocks[0].phase + interval) % interval
+			if d < interval/4 || d > interval*3/4 {
+				continue
+			}
+		}
+		names, clocks = append(names, name), append(clocks, c)
+	}
+	heads := []string{e.create("docs", names[0], map[string]any{}), e.create("docs", names[1], map[string]any{})}
+	// Sent while neither boundary is within 300 ms.
+	for {
+		now := time.Now()
+		if time.Until(clocks[0].end(clocks[0].cursor(now))) > 300*time.Millisecond &&
+			time.Until(clocks[1].end(clocks[1].cursor(now))) > 300*time.Millisecond {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	type answer struct {
+		r  *resp
+		at time.Time
+	}
+	done := make([]chan answer, 2)
+	curs := make([]int64, 2)
+	for i := range 2 {
+		done[i] = make(chan answer, 1)
+		curs[i] = clocks[i].cursor(time.Now())
+		go func() {
+			r := e.get(fmt.Sprintf("/r/docs/%s/log?since=%s&live=long-poll&cursor=%d", names[i], heads[i], curs[i]))
+			done[i] <- answer{r, time.Now()}
+		}()
+	}
+	for i := range 2 {
+		a := <-done[i]
+		expect(t, a.r, 204)
+		if off := a.at.Sub(clocks[i].end(curs[i])); off < -50*time.Millisecond || off > 300*time.Millisecond {
+			t.Errorf("%s answered %v from its boundary", names[i], off)
+		}
+		if got := a.r.H.Get("X-Cursor"); got != strconv.FormatInt(curs[i]+1, 10) {
+			t.Errorf("%s: X-Cursor %s, want %d", names[i], got, curs[i]+1)
+		}
 	}
 }

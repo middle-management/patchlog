@@ -71,6 +71,11 @@ func withLongPoll(d time.Duration) envOpt {
 	return func(o *core.Options) { o.LongPollInterval = d }
 }
 
+// withFixedEpoch counts every log's long-poll intervals from the epoch
+// itself (§7.7 as of v0.85): one boundary for all, which tests that build
+// cursors and boundaries from the time alone rely on.
+func withFixedEpoch(o *core.Options) { o.LongPollFixedEpoch = true }
+
 func withFileDB(t *testing.T) envOpt {
 	return func(o *core.Options) {
 		if pgtest.Enabled() {

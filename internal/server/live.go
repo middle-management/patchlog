@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -40,15 +42,61 @@ func liveQuery(q url.Values) (live bool, cursor int64, err error) {
 	return live, cursor, nil
 }
 
+// liveClock is a log's long-poll intervals (§7.7): fixed intervals counted
+// from the Unix epoch and shifted by the log's phase (logPhase), so the
+// logs of a deployment don't all end their waits at one instant. Every
+// follower of one log URL, on any instance, shares its boundaries and
+// cursors, so identical waits still collapse at a CDN.
+type liveClock struct{ interval, phase time.Duration }
+
+// clockOf is the long-poll clock of the log at path ("/r/{ns}/{name}/log",
+// "/ns/{ns}/log" or "/ns/{ns}/g/{gs}/log"): without a phase when the
+// deployment keeps the fixed epoch (core.Options.LongPollFixedEpoch).
+func (s *Server) clockOf(path string) liveClock {
+	return newLiveClock(s.e.LongPollInterval(), s.e.LongPollFixedEpoch(), path)
+}
+
+func newLiveClock(interval time.Duration, fixed bool, path string) liveClock {
+	c := liveClock{interval: interval}
+	if !fixed {
+		c.phase = logPhase(path, interval)
+	}
+	return c
+}
+
+// logPhase is a log's phase: the first 8 bytes of the SHA-256 of its
+// path, as an unsigned big-endian integer, modulo the interval in
+// milliseconds, in milliseconds. The path is the log URL's, without the
+// query: one phase for all its followers, spread evenly over the interval
+// across logs.
+func logPhase(path string, interval time.Duration) time.Duration {
+	ms := uint64(interval / time.Millisecond)
+	if ms == 0 {
+		return 0
+	}
+	h := sha256.Sum256([]byte(path))
+	return time.Duration(binary.BigEndian.Uint64(h[:8])%ms) * time.Millisecond
+}
+
+// cursor is the number of the interval t falls in.
+func (c liveClock) cursor(t time.Time) int64 {
+	return (t.UnixNano() - int64(c.phase)) / int64(c.interval)
+}
+
+// end is when interval cursor ends: the next boundary.
+func (c liveClock) end(cursor int64) time.Time {
+	return time.Unix(0, (cursor+1)*int64(c.interval)+int64(c.phase))
+}
+
 // judgeCursor judges a long-poll's cursor (-1: none) at now (§7.7
 // Intervals and cursors): it returns this server's cursor, the number of
 // the interval now falls in, or 400 for a cursor more than an hour's worth
 // of intervals ahead of or behind it. Exactly an hour's worth is not more:
 // a cursor that is that far behind in one interval is too far behind in
 // the next, since the server's cursor advanced.
-func judgeCursor(now time.Time, interval time.Duration, reqCursor int64) (int64, error) {
-	current := now.UnixNano() / int64(interval)
-	hour := int64(time.Hour / interval)
+func judgeCursor(now time.Time, clock liveClock, reqCursor int64) (int64, error) {
+	current := clock.cursor(now)
+	hour := int64(time.Hour / clock.interval)
 	switch {
 	case reqCursor > current+hour:
 		return current, badInput("cursor too far ahead (§7.7)")
@@ -59,7 +107,7 @@ func judgeCursor(now time.Time, interval time.Duration, reqCursor int64) (int64,
 }
 
 // longPoll implements §7.7 for a log fetched by fetch, with the request's
-// cursor (liveQuery), -1 without one. wait returns the channel closed on
+// cursor (liveQuery), -1 without one, on the log's clock (clockOf). wait returns the channel closed on
 // the next commit that may change what fetch returns: the namespace's
 // (Engine.Wait) for its log, the resource's (Engine.WaitResource) for a
 // resource's, so a resource's waiters sleep through the namespace's other
@@ -71,17 +119,17 @@ func judgeCursor(now time.Time, interval time.Duration, reqCursor int64) (int64,
 // after since, or else 204 with the current cursor. A current cursor, or
 // one ahead, waits until this server's interval boundary at the latest
 // (§7.7 Intervals and cursors).
-func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header string, tags []string, reqCursor int64,
+func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header string, tags []string, reqCursor int64, clock liveClock,
 	wait func() <-chan struct{}, fetch func(ctx context.Context, since string) (*core.Log, error)) {
 	since := r.URL.Query().Get("since")
-	interval := s.e.LongPollInterval()
-	current, err := judgeCursor(time.Now(), interval, reqCursor)
+	interval := clock.interval
+	current, err := judgeCursor(time.Now(), clock, reqCursor)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	atOnce := reqCursor < current
-	deadline := time.Unix(0, (current+1)*int64(interval))
+	deadline := clock.end(current)
 	for {
 		woken := wait()
 		if testLongPollFetch != nil {
@@ -111,7 +159,7 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 			// up to a fixed id; a live reader polls again at once anyway.
 			s.setLive(w, r, lg.Public, fmt.Sprintf("public, max-age=0, s-maxage=%d", int(interval.Seconds())), tags)
 			w.Header().Set(header, lg.Last)
-			w.Header().Set("X-Cursor", strconv.FormatInt(time.Now().UnixNano()/int64(interval), 10))
+			w.Header().Set("X-Cursor", strconv.FormatInt(clock.cursor(time.Now()), 10))
 			writeLogBody(w, lg)
 			return
 		}
@@ -127,7 +175,7 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 				return
 			}
 		}
-		cur := time.Now().UnixNano() / int64(interval)
+		cur := clock.cursor(time.Now())
 		if reqCursor+1 > cur {
 			cur = reqCursor + 1
 		}
@@ -206,7 +254,7 @@ func (s *Server) resourceLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	wait := func() <-chan struct{} { return s.e.WaitResource(ns, name) }
-	s.longPoll(w, r, ns, "X-Revision", resTags(ns, name), cursor, wait, func(ctx context.Context, since string) (*core.Log, error) {
+	s.longPoll(w, r, ns, "X-Revision", resTags(ns, name), cursor, s.clockOf("/r/"+ns+"/"+name+"/log"), wait, func(ctx context.Context, since string) (*core.Log, error) {
 		return s.e.ResourceLog(ctx, ns, name, "", since, lim, creds(r))
 	})
 }
@@ -247,7 +295,7 @@ func (s *Server) nsLive(w http.ResponseWriter, r *http.Request) {
 	// reads, which are then shared with the other waiters (core/live.go).
 	var pass *core.LivePass
 	wait := func() <-chan struct{} { return s.e.Wait(ns) }
-	s.longPoll(w, r, ns, "X-Namespace-Revision", []string{"ns:" + ns}, cursor, wait, func(ctx context.Context, since string) (*core.Log, error) {
+	s.longPoll(w, r, ns, "X-Namespace-Revision", []string{"ns:" + ns}, cursor, s.clockOf("/ns/"+ns+"/log"), wait, func(ctx context.Context, since string) (*core.Log, error) {
 		// A partial reader's first read is redirected to the filtered
 		// long-poll (§B.11.9 URLs), which longPoll answers.
 		lg, p, err := s.e.NamespaceLiveLog(ctx, ns, since, lim, creds(r), pass)
