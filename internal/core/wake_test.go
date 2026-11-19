@@ -30,11 +30,14 @@ func woken(c <-chan struct{}, d time.Duration) bool {
 	}
 }
 
-// settle lets the tailer, on Postgres, see what has committed, so a wake-up
-// it would publish has been published.
-func settle() {
-	if pgtest.Enabled() {
-		time.Sleep(5 * tailEvery)
+// settle waits, on Postgres, until the tailer has read what has committed:
+// the wake-ups it publishes for it are published.
+func settle(t *testing.T, e *Engine) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := e.SyncTail(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -54,7 +57,7 @@ func TestWaitResource(t *testing.T) {
 		}
 		heads[name] = id
 	}
-	settle()
+	settle(t, e)
 
 	wa, wb, wc := e.WaitResource("n", "a"), e.WaitResource("n", "b"), e.WaitResource("n", "c")
 	wns := e.Wait("n")
@@ -74,7 +77,7 @@ func TestWaitResource(t *testing.T) {
 	}, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	settle()
+	settle(t, e)
 	if !woken(wns, 5*time.Second) {
 		t.Fatal("the namespace's waiter wasn't woken")
 	}
@@ -92,7 +95,7 @@ func TestWaitResource(t *testing.T) {
 	if !woken(wa, 5*time.Second) {
 		t.Fatal("a batch naming a didn't wake its waiter")
 	}
-	settle()
+	settle(t, e)
 	if !isOpen(wb) || !isOpen(wc) {
 		t.Fatal("a batch woke the waiter of a resource it doesn't name")
 	}
@@ -104,7 +107,7 @@ func TestWaitResource(t *testing.T) {
 	if !woken(wb, 5*time.Second) {
 		t.Fatal("a write to b didn't wake its waiter")
 	}
-	settle()
+	settle(t, e)
 	if !isOpen(wc) {
 		t.Fatal("a write to b woke c's waiter")
 	}
@@ -122,7 +125,7 @@ func TestWaitResource(t *testing.T) {
 	ws := []<-chan struct{}{e.WaitResource("n", "a"), e.WaitResource("n", "other"), e.WaitResource("n", "nonesuch")}
 	other := e.WaitResource("m", "a")
 	mkNS(t, e, "m", map[string]any{"read": "public"})
-	settle()
+	settle(t, e)
 	if !woken(other, 5*time.Second) {
 		t.Fatal("creating namespace m didn't wake its waiters")
 	}

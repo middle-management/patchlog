@@ -507,7 +507,7 @@ func TestPGWakeResourceOtherInstance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(3 * tailEvery) // the writes' own wake-ups
+	settle(t, b) // the writes' own wake-ups
 	wait, nsWait := b.WaitResource("n", "r"), b.Wait("n")
 	for i := 1; i <= 10; i++ {
 		if o, err = put(a, "n", "o", o, i); err != nil {
@@ -525,7 +525,7 @@ func TestPGWakeResourceOtherInstance(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the other instance's namespace reader wasn't woken")
 	}
-	time.Sleep(5 * tailEvery)
+	settle(t, b)
 	select {
 	case <-wait:
 		t.Fatal("r's reader woken by writes to other resources")
@@ -540,7 +540,7 @@ func TestPGWakeResourceOtherInstance(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("r's reader not woken by a batch naming r")
 	}
-	time.Sleep(3 * tailEvery)
+	settle(t, b)
 	wait = b.WaitResource("n", "r")
 	if _, err := a.WriteConfig(context.Background(), req, ConfigChange{IfMatch: cfg, Patches: []any{map[string]any{"op": "add", "path": "/x-d", "value": "d"}}}); err != nil {
 		t.Fatal(err)

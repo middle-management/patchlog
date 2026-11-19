@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/core"
-	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
 type sseEvent struct{ event, id, data string }
@@ -281,10 +280,10 @@ func TestResourceLongPollIsolated(t *testing.T) {
 		heads[i] = e.create("docs", fmt.Sprintf("r%d", i), map[string]any{"n": 0.0})
 	}
 	other := e.create("docs", "other", map[string]any{"n": 0.0})
-	if pgtest.Enabled() {
-		// The tailer's wake-ups for the creates, which would wake the
-		// long-polls below once each.
-		time.Sleep(500 * time.Millisecond)
+	// On Postgres, the tailer's wake-ups for the creates, which would
+	// wake the long-polls below once each.
+	if err := e.e.SyncTail(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	var reads atomic.Int64
 	testLongPollFetch = func() { reads.Add(1) }
@@ -313,13 +312,17 @@ func TestResourceLongPollIsolated(t *testing.T) {
 		}
 	}
 	waitFor(waiters, "the first reads")
+	base := reads.Load()
 
 	for i := 1; i <= writes; i++ {
 		other = e.appendRev("docs", "other", other, ops(op("replace", "/n", float64(i))))
 	}
-	time.Sleep(300 * time.Millisecond) // on Postgres, the tailer's wake-ups too
-	if n := reads.Load(); n != waiters {
-		t.Fatalf("%d writes to another resource: %d long-poll reads, want %d", writes, n, waiters)
+	if err := e.e.SyncTail(context.Background()); err != nil { // the tailer's wake-ups too
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // the reads any wake-up would cause
+	if n := reads.Load(); n != base {
+		t.Fatalf("%d writes to another resource: %d long-poll reads, want %d", writes, n, base)
 	}
 
 	// r7's write answers r7's long-poll alone.
@@ -332,15 +335,18 @@ func TestResourceLongPollIsolated(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("r7's long-poll not woken by its write")
 	}
-	time.Sleep(300 * time.Millisecond)
-	if n := reads.Load(); n != waiters+1 {
-		t.Fatalf("after r7's write: %d long-poll reads, want %d", n, waiters+1)
+	if err := e.e.SyncTail(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := reads.Load(); n != base+1 {
+		t.Fatalf("after r7's write: %d long-poll reads, want %d", n, base+1)
 	}
 
 	// A configuration change wakes every waiter of the namespace: each
 	// reads again, finds nothing new and waits on.
 	expect(t, e.patchNS("docs", []any{map[string]any{"op": "add", "path": "/x-d", "value": "d"}}, ""), 201)
-	waitFor(2*waiters, "after a configuration change")
+	waitFor(base+waiters, "after a configuration change")
 
 	// Each of the others is answered by its own write.
 	for i := range done {

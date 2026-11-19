@@ -331,6 +331,7 @@ type Engine struct {
 	// background loops (pglock.go).
 	epoch      time.Time
 	lastPoll   atomic.Int64
+	tailFrom   atomic.Uint64 // the tailer's position: every xid below it is read (SyncTail)
 	leaderMu   sync.Mutex
 	leaderConn *sql.Conn
 	// afterWriteLock, if set, is called by resource writes and batches

@@ -55,6 +55,9 @@ func (e *Engine) tailStart(ctx context.Context) (tailState, error) {
 		return s, err
 	}
 	s.from, err = strconv.ParseUint(xmin, 10, 64)
+	if err == nil {
+		e.tailFrom.Store(s.from)
+	}
 	return s, err
 }
 
@@ -155,6 +158,34 @@ func (e *Engine) tailPoll(ctx context.Context, s *tailState) error {
 		e.invalidate(inv, true)
 	}
 	s.from, s.gen = max(s.from, to), gen
+	e.tailFrom.Store(s.from)
+	return nil
+}
+
+// SyncTail waits until the tailer has read every transaction committed
+// before the call, so the wake-ups and cache invalidations for them have
+// been applied, or ctx ends. The tailer reads up to the oldest transaction
+// still running anywhere in the cluster (tailPoll), so a long one, in any
+// database, delays it. Without a tailer (SQLite) it returns at once.
+func (e *Engine) SyncTail(ctx context.Context) error {
+	if !e.pg {
+		return nil
+	}
+	var xmax string
+	if err := e.db.QueryRowContext(ctx, `SELECT pg_snapshot_xmax(pg_current_snapshot())::text`).Scan(&xmax); err != nil {
+		return err
+	}
+	want, err := strconv.ParseUint(xmax, 10, 64)
+	if err != nil {
+		return err
+	}
+	for e.tailFrom.Load() < want {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(e.opt.TailInterval / 4):
+		}
+	}
 	return nil
 }
 
