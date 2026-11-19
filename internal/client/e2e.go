@@ -1491,7 +1491,14 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) (forkList, error) {
 		if err != nil {
 			return forkList{}, err
 		}
-		if cfg.Base == "" || cfg.At == "" {
+		if cfg.Base == "" {
+			break
+		}
+		if cfg.At == "" {
+			// A base named without the entry it was forked at, as no
+			// deployment writes: nothing places the fork, and nothing
+			// behind it is accepted.
+			forks.unplaced = true
 			break
 		}
 		fork, err := "", error(nil)
@@ -1518,9 +1525,14 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) (forkList, error) {
 		}
 		cur = cfg.Base
 	}
-	x.forks.mu.Lock()
-	x.forks.m[key] = forks
-	x.forks.mu.Unlock()
+	// Only a list placed in full is kept: a refusal may be of the moment
+	// (a grant renewed, a namespace restored), and the next fold asks
+	// again. One fold asks once (chainCheck.loadForks).
+	if !forks.unplaced {
+		x.forks.mu.Lock()
+		x.forks.m[key] = forks
+		x.forks.mu.Unlock()
+	}
 	return forks, nil
 }
 
