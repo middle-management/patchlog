@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,5 +66,51 @@ func TestV086RequireAtOwnNamespacePurged(t *testing.T) {
 	// 403, as for any purged namespace a requireAt names.
 	if r := e.get("/ns/matches-b/log", grantAt(named, "matches-b", purge)); r.Code != 403 {
 		t.Errorf(`requireAt: "matches" checked in its purged branch: %d %s, want the scope's 403`, r.Code, r.Body)
+	}
+}
+
+// Access scenario 84 (§C.4 requireAt; v0.86): a grant a requireAt:
+// "cat-season" key signs without at, or with neither nbf nor a key
+// maxTtl, is 403 naming no namespace; its body may differ from the
+// others', while the bodies for an at outside the chain and for a
+// namespace that doesn't exist are identical.
+func TestV086RequireAtRefusalsNameNoNamespace(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t)
+	k, timed, untimed, nope := newKey("k"), newKey("timed"), newKey("untimed"), newKey("nope")
+	scoped := func(kp keyPair, at, maxTTL string) map[string]any {
+		en := kp.entry("read")
+		en["requireAt"] = at
+		if maxTTL != "" {
+			en["maxTtl"] = maxTTL
+		}
+		return en
+	}
+	e.mkNS("cat-season", map[string]any{"read": "grant", "keys": []any{k.entry("*")}})
+	e.mkNS("matches", map[string]any{"read": "grant", "keys": []any{k.entry("*"),
+		scoped(timed, "cat-season", "PT15M"), scoped(untimed, "cat-season", ""), scoped(nope, "cat-gone", "PT15M")}})
+	admin := e.grant(k, "user:root", []string{"matches", "cat-season"}, allVerbs)
+	head := e.nsHead("cat-season", admin)
+	exp := e.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)
+	at := func(ns, id string) map[string]any { return map[string]any{"at": map[string]any{"ns": ns, "id": id}, "exp": exp} }
+	inNoChain := hashID(t, "", []byte("in no chain"))
+	expect(t, e.get("/ns/matches/log", e.grant(timed, "user:li", []string{"matches"}, []string{"read"}, at("cat-season", head))), 302)
+	shape := map[string]*resp{
+		"without at":                   e.get("/ns/matches/log", e.grant(timed, "user:li", []string{"matches"}, []string{"read"}, map[string]any{"exp": exp})),
+		"neither nbf nor a key maxTtl": e.get("/ns/matches/log", e.grant(untimed, "user:li", []string{"matches"}, []string{"read"}, at("cat-season", head))),
+	}
+	chain := map[string]*resp{
+		"an at outside the chain":      e.get("/ns/matches/log", e.grant(timed, "user:li", []string{"matches"}, []string{"read"}, at("cat-season", inNoChain))),
+		"a namespace that isn't there": e.get("/ns/matches/log", e.grant(nope, "user:li", []string{"matches"}, []string{"read"}, at("cat-gone", inNoChain))),
+	}
+	for name, r := range shape {
+		if r.Code != 403 || strings.Contains(r.String(), "cat-season") {
+			t.Errorf("%s: %d %s, want 403 naming no namespace", name, r.Code, r.Body)
+		}
+	}
+	for name, r := range chain {
+		if r.Code != 403 || strings.Contains(r.String(), "cat-") || r.String() != chain["an at outside the chain"].String() {
+			t.Errorf("%s: %d %s, want the one 403 body, %s", name, r.Code, r.Body, chain["an at outside the chain"].Body)
+		}
 	}
 }
