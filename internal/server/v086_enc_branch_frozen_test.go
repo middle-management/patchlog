@@ -84,47 +84,67 @@ func TestV086BranchPruneWithArchiveWritesNothing(t *testing.T) {
 }
 
 // v086FrozenRotation builds a frozen sealed namespace s whose K_n is at
-// the bound that makes a rotation due, with a namespace bucket of burst
-// tokens that doesn't refill within the test, rotates it if rotate, and
-// returns how many resource writes the namespace bucket then admits to
-// their 409 frozen before it is empty (429).
-func v086FrozenRotation(t *testing.T, rotate bool) int {
+// the bound that makes a rotation due, with a namespace bucket of 12
+// tokens that doesn't refill within the test. Then, by then: "rotate",
+// the origin rotates by itself; "config", a request under a grant that
+// isn't a * key's writes a config entry; "nothing". It returns how many
+// resource writes the namespace bucket admits after that to their 409
+// frozen before it is empty (429): the tokens it was left with.
+func v086FrozenRotation(t *testing.T, then string) int {
 	t.Helper()
-	e := newSealedEnv(t, withSealBound(1<<20, 6, 1))
-	e.mkNS("s", sealedDoc(map[string]any{"read": "public",
+	e := newSealedAuthEnv(t, withSealBound(1<<20, 6, 1))
+	k, issuer := newKey("k"), newKey("issuer")
+	e.mkNS("s", sealedDoc(map[string]any{"read": "grant",
+		"keys":   []any{k.entry("*"), issuer.entry("read", "create", "append", "config")},
 		"limits": map[string]any{"ratePerNamespace": map[string]any{"rate": 0.001, "burst": 12.0}}}))
+	g := e.grant(issuer, "user:bob", []string{"s"}, []string{"read", "create", "append", "config"})
 	heads := map[string]string{}
 	for _, name := range []string{"a", "b", "c"} {
-		heads[name] = e.wr("s", name, "", withNonce(addRoot(map[string]any{"v": 1.0})))
+		heads[name] = e.wr("s", name, "", withNonce(addRoot(map[string]any{"v": 1.0})), g)
 	}
-	first := e.plainNSLog("s", e.nsHead("s")).Entries[0]["id"].(string)
-	expect(t, e.patchNS("s", ops(op("add", "/frozen", true)), ""), 201)
-	head := e.nsHead("s")
-	expect(t, e.get("/ns/s/rev/"+head+"/log?since="+first), 200)
-	if rotate {
+	expect(t, e.patchNS("s", ops(op("add", "/frozen", true)), g), 201)
+	head := e.nsHead("s", g)
+	// Sealings under K_n until its rotation is due: distinct ranges.
+	for _, since := range v82encLog(t, e, "s", g) {
+		expect(t, e.get("/ns/s/rev/"+head+"/log?since="+since["id"].(string), g), 200)
+	}
+	switch then {
+	case "rotate":
 		done, err := e.e.RetryRotations(context.Background())
 		if err != nil || len(done) != 1 || done[0] != "s" {
 			t.Fatalf("rotated %v %v, want the frozen namespace s rotated", done, err)
 		}
 		// The origin's own config entry: system:rotate, no grant, no via
 		// (§7.4), and the namespace is still frozen.
-		last := v82encLastEntry(t, e, "s")
+		es := v82encLog(t, e, "s", g)
+		last := es[len(es)-1]
 		if last["kind"] != "config" || last["author"] != core.RotateAuthor {
 			t.Fatalf("the rotation's entry: %v", last)
 		}
 		v82encOwnRotation(t, "a frozen namespace's rotation", last)
-		cfg := e.configOf("s")
-		if cfg["frozen"] != true || cfg["encryption"].(map[string]any)["epoch"] != 2.0 {
-			t.Fatalf("after the rotation: %v", cfg)
+		if e.nsHead("s", g) == head {
+			t.Fatal("the rotation wrote no entry")
 		}
-	} else if e.nsHead("s") != head {
-		t.Fatal("the namespace moved without a rotation")
+	case "config":
+		// A frozen namespace takes config writes (§8.4), and a request's
+		// draws the namespace's token.
+		expect(t, e.patchNS("s", ops(op("add", "/x-note", "a request's config write")), g), 201)
+	default:
+		if e.nsHead("s", g) != head {
+			t.Fatal("the namespace moved by itself")
+		}
 	}
-	// Resource writes stay 409 frozen, each drawing the namespace's
-	// token (§6.6 Cost), until its bucket is empty.
+	return v086Admitted(t, e, g, heads["a"])
+}
+
+// v086Admitted counts the resource writes s's namespace bucket admits to
+// their 409 frozen until it is empty. Resource writes stay 409 frozen,
+// each drawing the namespace's token (§6.6 Cost).
+func v086Admitted(t *testing.T, e *tenv, g, head string) int {
+	t.Helper()
 	admitted := 0
 	for ; admitted < 40; admitted++ {
-		r := e.write("PATCH", "s", "a", heads["a"], withNonce(ops(op("replace", "/v", 2.0))), "bob")
+		r := e.write("PATCH", "s", "a", head, withNonce(ops(op("replace", "/v", 2.0))), g)
 		if r.Code == 429 {
 			if r.Str("limit") != "ratePerNamespace" {
 				t.Fatalf("429 %s, want the namespace's bucket", r.Body)
@@ -133,7 +153,7 @@ func v086FrozenRotation(t *testing.T, rotate bool) int {
 		}
 		expectCode(t, r, 409, "frozen")
 	}
-	if e.head("s", "a") != heads["a"] {
+	if e.head("s", "a", g) != head {
 		t.Fatal("a resource write was written in a frozen namespace")
 	}
 	return admitted
@@ -143,13 +163,13 @@ func v086FrozenRotation(t *testing.T, rotate bool) int {
 // §6.6 Exempt: "entries the server writes itself (§7.4)"; v0.86): in a
 // frozen sealed namespace whose K_n nears the bound the origin rotates
 // by itself: the config entry has no grant or via, is not 409 frozen,
-// and draws no token, so the namespace's bucket admits as many requests
-// after it as where no rotation ran. Resource writes stay 409 frozen.
+// and draws no token, where a request's config write there draws one
+// from the namespace's bucket. Resource writes stay 409 frozen.
 func TestV086FrozenRotationDrawsNoToken(t *testing.T) {
 	t.Parallel()
-	with, without := v086FrozenRotation(t, true), v086FrozenRotation(t, false)
-	t.Logf("the namespace bucket admitted %d writes after the rotation, %d without one", with, without)
-	if with != without || with == 0 || with >= 40 {
-		t.Fatalf("the namespace bucket admitted %d writes after the origin's rotation and %d without one: want the same, the bucket's remaining tokens", with, without)
+	rotated, config, nothing := v086FrozenRotation(t, "rotate"), v086FrozenRotation(t, "config"), v086FrozenRotation(t, "nothing")
+	t.Logf("the namespace bucket admitted %d writes after the origin's rotation, %d after a request's config write, %d after neither", rotated, config, nothing)
+	if rotated != nothing || config != nothing-1 || rotated == 0 || rotated >= 40 {
+		t.Fatalf("the namespace bucket admitted %d writes after the origin's rotation, %d after a request's config write and %d after neither: want the rotation to draw nothing and the request one token", rotated, config, nothing)
 	}
 }
