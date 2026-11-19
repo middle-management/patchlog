@@ -306,11 +306,15 @@ type Engine struct {
 	deks       *dekCache
 	comp       storeCodec // compressed patch sets (compress.go)
 	ekeys      epochKeyCache
-	cfgMu      sync.Mutex
-	cfgCache   map[int64]*Config
-	stmts      stmtCache
-	rc         readCache
-	bearers    grantCache
+	// refsCache is the $refs of schema revisions by path (schemaRefsOf).
+	refsMu      sync.Mutex
+	refsCache   lru.Cache[string, []string]
+	schemaScans atomic.Int64
+	cfgMu       sync.Mutex
+	cfgCache    map[int64]*Config
+	stmts       stmtCache
+	rc          readCache
+	bearers     grantCache
 	// liveReads shares long-poll reads of a namespace log among their
 	// waiters (live.go), and liveDone keeps their recent answers;
 	// liveJoins counts the reads asked of them, and liveShared those made.
@@ -493,6 +497,7 @@ func Open(opt Options) (*Engine, error) {
 		stop:       make(chan struct{}),
 		started:    opt.Now().UTC(),
 	}
+	e.refsCache.MaxEntries = 65536
 	e.rc.maxBytes = opt.ReadCacheBytes
 	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
 	if err := e.checkKeyStore(); err != nil {

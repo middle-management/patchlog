@@ -23,7 +23,9 @@
 //
 // is read by the core itself, once: every write step that is validated by
 // its patch's changes is also validated in full, and the process panics if
-// the two disagree (core, validateBoth).
+// the two disagree (core, validateBoth). Likewise every purge and
+// drafts.for change runs the full check for broken schema references next
+// to the short one (core, mayBreak).
 package testenv
 
 import (

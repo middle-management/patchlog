@@ -55,7 +55,7 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		reached := t.purgeReach(n)
 		gone := func(ns *nsRow, res string) bool { return res == name && reached[ns.id] }
 		forced := false
-		if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
+		if broken := t.brokenReferences(refChange{exclude: gone, removed: gone, name: name}); len(broken) > 0 {
 			if !force {
 				return t.inUse(broken, "the purge would remove the last available copy of a referenced schema revision (§6.1)")
 			}

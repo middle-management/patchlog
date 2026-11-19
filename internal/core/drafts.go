@@ -422,6 +422,7 @@ func (t *tx) schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map
 	// shared before relying on a copy (brokenReferences).
 	t.noLock++
 	defer func() { t.noLock-- }()
+	t.e.schemaScans.Add(1)
 	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
 	t.must(err)
 	var all []*nsRow
@@ -511,6 +512,109 @@ func (t *tx) schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map
 	return uses
 }
 
+// possiblyReferenced lists every schema revision path a document of the
+// deployment may reference: a superset of schemaUses' paths, at the cost
+// of one index probe per distinct $schema stored and, the first time, one
+// read per schema revision, whatever the number of namespaces and
+// documents. It takes every revision's $schema (schemaUses: the last live
+// ones of unpurged resources, and those a branch wrote) and follows $ref
+// from any readable copy (schemaUses: from a copy that satisfies the
+// referencing namespace).
+func (t *tx) possiblyReferenced() []string {
+	t.noLock++ // as schemaUses
+	defer func() { t.noLock-- }()
+	seen := map[string]bool{}
+	var out []string
+	for last := ""; ; {
+		// The next distinct value in revisions_schema_ref's order.
+		var v sql.NullString
+		t.must(t.QueryRow(`SELECT min(schema_ref) FROM revisions WHERE schema_ref IS NOT NULL AND schema_ref > ?`, last).Scan(&v))
+		if !v.Valid {
+			break
+		}
+		last = v.String
+		seen[last] = true
+		out = append(out, last)
+	}
+	for i := 0; i < len(out); i++ {
+		for _, x := range t.schemaRefsOf(out[i]) {
+			if !seen[x] {
+				seen[x] = true
+				out = append(out, x)
+			}
+		}
+	}
+	return out
+}
+
+// schemaRefsOf is the paths the schema revision at path p references by
+// $ref, read from any copy of it. A revision's id determines its document
+// everywhere (§3.3), so what was read once is kept for the engine's life;
+// a revision with no readable copy is looked for again each time.
+func (t *tx) schemaRefsOf(p string) []string {
+	t.e.refsMu.Lock()
+	refs, ok := t.e.refsCache.Get(p)
+	t.e.refsMu.Unlock()
+	if ok {
+		return refs
+	}
+	ref, ok := schema.ParseRef(p)
+	if !ok {
+		return nil
+	}
+	id, err := ids.Parse(ref.Rev)
+	if err != nil {
+		return nil
+	}
+	for _, cr := range t.copyRows(id, ref.Name) {
+		if cr.state == statePurged {
+			continue
+		}
+		d, err := t.docAt(t.rev(cr.seq))
+		if err != nil {
+			continue
+		}
+		refs = []string{}
+		for _, x := range schema.Refs(d) {
+			refs = append(refs, x.Path())
+		}
+		t.e.refsMu.Lock()
+		t.e.refsCache.Put(p, refs, 0)
+		t.e.refsMu.Unlock()
+		return refs
+	}
+	return nil
+}
+
+// mayBreak reports whether ch touches a copy of a schema revision that
+// anything may reference: brokenReferences' own test of a path, over
+// possiblyReferenced's superset. False means brokenReferences is empty,
+// without schemaUses' pass over every document of the deployment.
+func (t *tx) mayBreak(ch refChange) bool {
+	t.noLock++
+	defer func() { t.noLock-- }()
+	for _, p := range t.possiblyReferenced() {
+		ref, ok := schema.ParseRef(p)
+		if !ok || ch.name != "" && ref.Name != ch.name {
+			continue
+		}
+		id, err := ids.Parse(ref.Rev)
+		if err != nil {
+			continue
+		}
+		for _, cr := range t.copyRows(id, ref.Name) {
+			if _, ok := ch.cfg[cr.ns]; ok || ch.removed(t.nsRowUnlocked(cr.ns), ref.Name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// SchemaScans is the number of passes over every document of the
+// deployment made for schema references so far (schemaUses), for tests.
+func (e *Engine) SchemaScans() int64 { return e.schemaScans.Load() }
+
 // referencedPaths is the set of referenced schema revision paths (§6.1).
 func (t *tx) referencedPaths() map[string]bool {
 	out := map[string]bool{}
@@ -529,6 +633,9 @@ type refChange struct {
 	removed func(ns *nsRow, res string) bool
 	// cfg: namespace documents the change writes.
 	cfg map[int64]*Config
+	// name: the only resource name removed answers true for, if the
+	// change removes copies of one name alone.
+	name string
 }
 
 // brokenReferences returns the namespaces holding a reference that a copy
@@ -543,6 +650,12 @@ func (t *tx) brokenReferences(ch refChange) []*nsRow {
 	}
 	if ch.removed == nil {
 		ch.removed = none
+	}
+	// Most changes touch no schema revision anything references: those
+	// are told without reading every document (mayBreak).
+	may := t.mayBreak(ch)
+	if !may && !validateBoth {
+		return nil
 	}
 	uses := t.schemaUses(ch.exclude)
 	broken := map[int64]*nsRow{}
@@ -599,6 +712,9 @@ func (t *tx) brokenReferences(ch refChange) []*nsRow {
 		out = append(out, m)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
+	if !may && len(out) > 0 {
+		panic(fmt.Sprintf("brokenReferences: mayBreak missed the references of %s", out[0].name))
+	}
 	return out
 }
 
