@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // v0.86 SERVICES §B.5 Previews (SVC-25), CONFORMANCE Tree 150: "A catalog
@@ -128,5 +129,41 @@ func TestV086BranchCatalogLinksThroughBase(t *testing.T) {
 	z.caughtUp("cat", "matches")
 	if got := names(z.get("/cat/children?of=root", "")["children"]); got != "season,derbies,later" {
 		t.Errorf("the base's children of root: %s", got)
+	}
+}
+
+// A release preview of a catalog that is itself a branch (§B.5 Previews,
+// v0.86): cat-b is a branch of cat, and the preview serves cat-b from its
+// release branch cat-r. The namespace followed is cat-r, whose local base
+// chain is cat-b, the catalog's own name, and cat: the nodes read through
+// from cat, with parents naming /r/cat/…, stand in the preview's tree as
+// in cat's, beside what cat-b and cat-r wrote.
+func TestV086PreviewOfABranchCatalogLinksThroughBase(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := setup(t)
+	w.seed(t)
+	at := func(ns, name, order string) []any {
+		return []any{map[string]any{"href": "/r/" + ns + "/" + name, "order": order}}
+	}
+	must(w.c.CreateBranch(ctx, "cat", client.BranchRequest{Name: "cat-b"}))
+	must(w.c.CreateDoc(ctx, "cat-b", "own", map[string]any{"title": "The branch's own", "parents": at("cat-b", "root", "b1")}))
+	must(w.c.CreateBranch(ctx, "cat-b", client.BranchRequest{Name: "cat-r"}))
+	must(w.c.CreateDoc(ctx, "cat-r", "rel", map[string]any{"title": "The release's", "parents": at("cat", "root", "b2")}))
+	x := startSvc(t, w.c, svcOpts{catalog: "cat-b"}, func(o *tree.Options) { o.Branches = map[string]string{"cat-b": "cat-r"} })
+	waitFor(t, "the preview to catch up", func() bool {
+		hr, err1 := w.c.NSHead(ctx, "cat-r")
+		hm, err2 := w.c.NSHead(ctx, "matches")
+		return err1 == nil && err2 == nil && x.s.Checkpoint("cat-b") == hr.ID && x.s.Checkpoint("matches") == hm.ID
+	})
+	for _, c := range []struct{ path, key, want string }{
+		{"/cat-b/children?of=root", "children", "season,derbies,own,rel"},
+		{"/cat-b/children?of=season", "children", "matches.opener,matches.derby"},
+		{"/cat-b/roots", "roots", "root"},
+		{"/cat-b/orphans", "orphans", ""},
+	} {
+		if got := names(x.get(c.path, "")[c.key]); got != c.want {
+			t.Errorf("%s lists %q, want %q", c.path, got, c.want)
+		}
 	}
 }

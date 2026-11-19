@@ -2,7 +2,10 @@ package index_test
 
 import (
 	"context"
+	"io"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -162,36 +165,9 @@ func TestV086BranchCookieEndedByBaseChange(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			ctx := context.Background()
-			s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
-			d := &v77docs{t: t, s: s, admin: clienttest.NewKey("admin"), k1: clienttest.NewKey("k1"), k2: clienttest.NewKey("k2")}
-			op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "docs")))
-			must(op.CreateNamespace(ctx, "docs", map[string]any{"read": "grant", "keys": []any{d.admin.Entry("*"), d.k1.Entry("read"), d.k2.Entry("read")},
-				"roles": map[string]any{"reader": map[string]any{"can": []any{"read"}}}}))
-			nss := []string{"docs", "docs-b"}
-			d.w = s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "user:root", nss, []string{"read", "create", "append", "config", "branch"})))
-			must(d.w.CreateDoc(ctx, "docs", "a", map[string]any{"title": "word a"}))
-			must(d.w.CreateBranch(ctx, "docs", client.BranchRequest{Name: "docs-b"}))
-			ev := must(edge.New([]byte("s3cret"), "", ""))
-			d.x = startSvcWith(t, s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "svc:indexer", nss, []string{"read"}))),
-				svcOpts{db: t.TempDir() + "/i.db", ns: nss, untyped: true, now: s.Now},
-				func(o *indexOpts) {
-					o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
-				})
-			d.x.caughtUp("docs")
-			d.x.caughtUp("docs-b")
-			grantFor := func(ns string) string {
-				return d.k1.Grant(t, s.Now(), "user:li", []string{ns}, []string{"read"},
-					map[string]any{"roles": []any{"reader"}, "exp": s.Now().Add(10 * time.Minute).Format(time.RFC3339)})
-			}
-			exchange := func(tok string) (string, []*http.Cookie) {
-				t.Helper()
-				r := p37Do(t, d.x, "POST", "/edge-grants", tok, "", nil, "")
-				if r.status != 200 || len(r.body["prefixes"].([]any)) == 0 {
-					t.Fatalf("exchange: %d %v", r.status, r.body)
-				}
-				return r.body["prefixes"].([]any)[0].(string), r.cookies
-			}
+			d, nss := newV86Branch(t)
+			grantFor := func(ns string) string { return v86GrantFor(d, ns) }
+			exchange := func(tok string) (string, []*http.Cookie) { t.Helper(); return v86Exchange(d, tok) }
 			pb, cb := exchange(grantFor("docs-b"))
 			pd, cd := exchange(grantFor("docs"))
 			status := func(p string, c []*http.Cookie) int {
@@ -220,6 +196,137 @@ func TestV086BranchCookieEndedByBaseChange(t *testing.T) {
 			pb2, cb2 := exchange(grantFor("docs-b"))
 			if got := status(pb2, cb2); got != 200 {
 				t.Errorf("li, having exchanged again for docs-b: %d, want 200", got)
+			}
+		})
+	}
+}
+
+// newV86Branch is private docs with keys k1 and k2, read whole, one
+// document, and its local branch docs-b, both served by an index.
+func newV86Branch(t *testing.T) (*v77docs, []string) {
+	t.Helper()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	d := &v77docs{t: t, s: s, admin: clienttest.NewKey("admin"), k1: clienttest.NewKey("k1"), k2: clienttest.NewKey("k2")}
+	op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "docs")))
+	must(op.CreateNamespace(ctx, "docs", map[string]any{"read": "grant", "keys": []any{d.admin.Entry("*"), d.k1.Entry("read"), d.k2.Entry("read")},
+		"roles": map[string]any{"reader": map[string]any{"can": []any{"read"}}}}))
+	nss := []string{"docs", "docs-b"}
+	d.w = s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "user:root", nss, []string{"read", "create", "append", "config", "branch"})))
+	must(d.w.CreateDoc(ctx, "docs", "a", map[string]any{"title": "word a"}))
+	must(d.w.CreateBranch(ctx, "docs", client.BranchRequest{Name: "docs-b"}))
+	ev := must(edge.New([]byte("s3cret"), "", ""))
+	d.x = startSvcWith(t, s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "svc:indexer", nss, []string{"read"}))),
+		svcOpts{db: t.TempDir() + "/i.db", ns: nss, untyped: true, now: s.Now},
+		func(o *indexOpts) {
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+		})
+	d.x.caughtUp("docs")
+	d.x.caughtUp("docs-b")
+	return d, nss
+}
+
+// v86GrantFor is k1's grant for user:li to read ns with the role reader.
+func v86GrantFor(d *v77docs, ns string) string {
+	return d.k1.Grant(d.t, d.s.Now(), "user:li", []string{ns}, []string{"read"},
+		map[string]any{"roles": []any{"reader"}, "exp": d.s.Now().Add(10 * time.Minute).Format(time.RFC3339)})
+}
+
+// v86Exchange exchanges tok and returns its first prefix and its cookies.
+func v86Exchange(d *v77docs, tok string) (string, []*http.Cookie) {
+	d.t.Helper()
+	r := p37Do(d.t, d.x, "POST", "/edge-grants", tok, "", nil, "")
+	if r.status != 200 || len(r.body["prefixes"].([]any)) == 0 {
+		d.t.Fatalf("exchange: %d %v", r.status, r.body)
+	}
+	return r.body["prefixes"].([]any)[0].(string), r.cookies
+}
+
+// v86Stall answers the index's reads of namespace logs 503 while on, so
+// that its followers stay where they are, and passes the rest on: the
+// grant checker still reads the documents at the heads.
+type v86Stall struct{ on atomic.Bool }
+
+func (f *v86Stall) RoundTrip(r *http.Request) (*http.Response, error) {
+	if f.on.Load() && strings.HasPrefix(r.URL.Path, "/ns/") && (strings.HasSuffix(r.URL.Path, "/log") || strings.HasSuffix(r.URL.Path, "/events")) {
+		return &http.Response{StatusCode: 503, Header: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"0"}}, Request: r,
+			Body: io.NopCloser(strings.NewReader(`{"code":"unavailable","message":"stalled"}`))}, nil
+	}
+	return transport.RoundTrip(r)
+}
+
+// TestV086CookieMintedBehindOutlivesBacklog (SERVICES §B.11.9 gs, v0.86:
+// "Once an entry after its exchange changes one of them, the cookie is
+// 403 from that entry on"): only entries after the exchange count. The
+// index is behind by three config entries, each of which changes k1; li
+// exchanges, her grant verified against the document at the head; the
+// index then applies the backlog, a batch at a time or all in one. Her
+// cookie holds: those entries are from before her exchange. The next
+// change to k1 ends it, and its undo doesn't bring it back. Without the
+// position kept with the cookie's row, the first document of the backlog
+// ended a cookie minted seconds before, and a reader exchanged again for
+// every such batch while the index caught up.
+func TestV086CookieMintedBehindOutlivesBacklog(t *testing.T) {
+	t.Parallel()
+	backlog := []map[string]any{
+		v86Change,
+		{"op": "add", "path": "/keys/1/maxTtl", "value": "PT2H"},
+		v86Undo,
+	}
+	for _, branch := range []bool{false, true} {
+		name := "the namespace's own cookie"
+		if branch {
+			name = "a branch's cookie, its base behind"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var d *v77docs
+			nss, ns := []string{"docs"}, "docs"
+			if branch {
+				d, nss = newV86Branch(t)
+				ns = "docs-b"
+			} else {
+				d = newV82Whole(t)
+			}
+			stall := &v86Stall{}
+			v86Restart(d, nss, false, func(o *indexOpts) { o.Client = o.Client.With(client.WithHTTPClient(&http.Client{Transport: stall})) })
+			was := d.x.ix.Checkpoint("docs")
+			stall.on.Store(true)
+			for _, op := range backlog {
+				v86Config(d, "docs", op)
+			}
+			d.x.ix.ExpireGrantChecks()
+			prefix, c := v86Exchange(d, v86GrantFor(d, ns))
+			if got := d.x.ix.Checkpoint("docs"); got != was {
+				t.Fatalf("the index moved to %s while stalled at %s: the test shows nothing", got, was)
+			}
+			status := func() int {
+				t.Helper()
+				r, _ := p37Follow(t, d.x, prefix+"?q=word", c, "")
+				return r.status
+			}
+			stall.on.Store(false)
+			d.x.caughtUp("docs")
+			d.x.ix.ExpireGrantChecks()
+			if got := status(); got != 200 {
+				t.Fatalf("li under the cookie minted against the head, once the index applied the %d config entries before it: %d, want 200", len(backlog), got)
+			}
+			// An entry of docs that changes nothing of its keys or roles.
+			d.patch(map[string]any{"op": "add", "path": "/maxLag", "value": "PT30S"})
+			if got := status(); got != 200 {
+				t.Fatalf("li under her cookie after a config entry that leaves k1 as it was: %d, want 200", got)
+			}
+			d.patch(v86Change)
+			if got := status(); got != 403 {
+				t.Errorf("li under her cookie once k1 changed after her exchange: %d, want 403", got)
+			}
+			d.patch(v86Undo)
+			if got := status(); got != 403 {
+				t.Errorf("li under her cookie once that change was undone: %d, want 403 still", got)
+			}
+			_, c = v86Exchange(d, v86GrantFor(d, ns))
+			if got := status(); got != 200 {
+				t.Errorf("li, having exchanged again: %d, want 200", got)
 			}
 		})
 	}
