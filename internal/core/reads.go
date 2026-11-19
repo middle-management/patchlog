@@ -565,6 +565,15 @@ type Log struct {
 // logPageBytes, at E2 bytes of the entries' JWEs, though always one entry;
 // namespace logs carry no patch sets.
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
+	return e.resourceLog(ctx, ns, name, id, since, limit, cred, nil)
+}
+
+// resourceLog is ResourceLog, recording in q, if given, what its read
+// check decided (live.go, quiet resources).
+func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials, q *quietRead) (*Log, error) {
+	if testResourceLogRead != nil {
+		testResourceLogRead()
+	}
 	var out *Log
 	var jobs []*sealJob
 	var nsRowID int64
@@ -579,6 +588,9 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		}
 		if n.purged {
 			return t.purgedRead(n)
+		}
+		if q != nil {
+			q.ok, q.anyone, q.until = standing(t, n, cred, a)
 		}
 		out = &Log{Public: t.cachePublic(n), Until: t.admittedUntil(n, cred, a)}
 		v := t.resolve(n, name, nil)
@@ -676,6 +688,10 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 	}
 	return out, err
 }
+
+// testResourceLogRead, if set, runs at the start of every resource log
+// read (tests count the transactions).
+var testResourceLogRead func()
 
 // NSInfo is the answer for GET /ns/{ns}.
 type NSInfo struct {

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"strconv"
 	"sync"
@@ -101,20 +102,30 @@ func (l *liveRead) decided(t *tx, n *nsRow, cred Credentials, a *actor) {
 	if l.meta%2 != 0 {
 		return
 	}
-	p := &LivePass{ns: n.name, meta: l.meta}
+	ok, _, until := standing(t, n, cred, a)
+	if ok {
+		l.pass = &LivePass{ns: n.name, meta: l.meta, until: until}
+	}
+}
+
+// standing reports whether a read check that passed can stand for later
+// reads (see above), and if so whether it holds for any credentials (a
+// public namespace, or authentication disabled) and until when (zero: no
+// grant expiry).
+func standing(t *tx, n *nsRow, cred Credentials, a *actor) (ok, anyone bool, until time.Time) {
 	cfg := t.config(n.configSeq)
 	switch {
 	case cfg.Read == "public" || t.e.opt.AuthDisabled:
+		return true, true, time.Time{}
 	case cred.Edge != nil || a == nil || a.verified == nil || a.grant == nil:
-		return
-	default:
-		for _, b := range a.grant.Blocks {
-			if b.Exp != nil && (p.until.IsZero() || b.Exp.Before(p.until)) {
-				p.until = *b.Exp
-			}
+		return false, false, time.Time{}
+	}
+	for _, b := range a.grant.Blocks {
+		if b.Exp != nil && (until.IsZero() || b.Exp.Before(until)) {
+			until = *b.Exp
 		}
 	}
-	l.pass = p
+	return true, false, until
 }
 
 // valid reports whether p still stands for its request's read check of ns.
@@ -176,4 +187,177 @@ func (e *Engine) NamespaceLiveLog(ctx context.Context, ns, since string, limit i
 		return nil, nil, err
 	}
 	return lg, live.pass, nil
+}
+
+// Quiet resources (§7.7).
+//
+// A resource long-poll reads its resource's log before it waits, and a
+// device that follows its own resource asks again at every interval
+// boundary: one read transaction per follower and interval, though the
+// resource rarely changes. With tens of thousands of followers that is
+// thousands of transactions a second that find nothing, and they are
+// what limits the database (docs/CAPACITY.md, Resource followers).
+//
+// So a read that finds a resource's log at its head records the head, by
+// resource and credentials, in quiet. A later long-poll of the same
+// resource whose since is that head, with the same credentials, is
+// answered "nothing after since" without a transaction while
+//
+//   - the resource's waiters' channel (WaitResource), taken before that
+//     read's transaction began, is still open: no commit naming the
+//     resource, nor one concerning the whole namespace, has been seen
+//     since;
+//   - the read check's decision still stands, as for a LivePass: the
+//     meta counter holds the even value loaded before that transaction,
+//     on Postgres the tailer is fresh, and the grant hasn't expired. A
+//     public namespace's, or any while authentication is disabled, holds
+//     for every request; another's only for the same bearer grant, never
+//     for an edge grant.
+//
+// On Postgres a commit on another instance closes the channel when the
+// tailer sees it, as it wakes this instance's waiters: until then a
+// request answered here waits, as one that read would have, and the
+// tailer's wake sends it to read.
+
+// quietCache holds quiet resources by resource and credentials.
+type quietCache struct {
+	mu sync.Mutex
+	m  map[string]quietEntry
+}
+
+type quietEntry struct {
+	head   string
+	public bool
+	meta   uint64
+	until  time.Time
+	woken  <-chan struct{}
+}
+
+// maxQuiet bounds the quiet resources kept; past it a quarter of them,
+// in map order (random), are dropped.
+const maxQuiet = 1 << 18
+
+// quietRead is resourceLog's part in a live read: the meta counter and
+// the resource's waiters' channel, both taken before its transaction
+// began, and what its read check decided (standing).
+type quietRead struct {
+	meta   uint64
+	woken  <-chan struct{}
+	ok     bool
+	anyone bool
+	until  time.Time
+}
+
+func closed(c <-chan struct{}) bool {
+	select {
+	case <-c:
+		return true
+	default:
+		return false
+	}
+}
+
+// quietKeys are the keys a request's quiet entry may be under: any
+// credentials', and its bearer grant's.
+func quietKeys(ns, name string, cred Credentials) (anyone, own string) {
+	anyone = ns + "\x00" + name + "\x00"
+	if cred.Edge == nil && cred.Bearer != "" {
+		sum := sha256.Sum256([]byte(cred.Bearer))
+		own = anyone + string(sum[:])
+	}
+	return anyone, own
+}
+
+// quietLog answers a long-poll from since without a transaction, or nil.
+func (e *Engine) quietLog(ns, name, since string, cred Credentials) *Log {
+	anyone, own := quietKeys(ns, name, cred)
+	for _, k := range []string{anyone, own} {
+		if k == "" {
+			continue
+		}
+		q, ok := e.quiet.get(k)
+		if !ok || q.head != since {
+			continue
+		}
+		if closed(q.woken) || q.meta != e.rc.meta.Load() || !q.until.IsZero() && !e.now().Before(q.until) {
+			e.quiet.drop(k)
+			continue
+		}
+		if !e.rc.serving() {
+			return nil
+		}
+		return &Log{Status: 200, Public: q.public, Until: q.until, Last: since}
+	}
+	return nil
+}
+
+// rememberQuiet records a live read that ended at its resource's head.
+func (e *Engine) rememberQuiet(ns, name string, cred Credentials, lg *Log, q *quietRead) {
+	if !q.ok || lg.Status != 200 || lg.More || lg.Last == "" || q.meta%2 != 0 ||
+		e.rc.meta.Load() != q.meta || !e.rc.serving() || closed(q.woken) {
+		return
+	}
+	anyone, own := quietKeys(ns, name, cred)
+	k := anyone
+	if !q.anyone {
+		if own == "" {
+			return
+		}
+		k = own
+	}
+	e.quiet.put(k, quietEntry{head: lg.Last, public: lg.Public, meta: q.meta, until: q.until, woken: q.woken})
+}
+
+func (c *quietCache) get(k string) (quietEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	q, ok := c.m[k]
+	return q, ok
+}
+
+func (c *quietCache) drop(k string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.m, k)
+}
+
+func (c *quietCache) put(k string, q quietEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.m == nil {
+		c.m = map[string]quietEntry{}
+	}
+	if _, ok := c.m[k]; !ok && len(c.m) >= maxQuiet {
+		n := len(c.m) / 4
+		for d := range c.m {
+			if n == 0 {
+				break
+			}
+			delete(c.m, d)
+			n--
+		}
+	}
+	c.m[k] = q
+}
+
+// ResourceLiveLog is ResourceLog from the current head for a long-poll
+// (§7.7): from a quiet resource's head it answers without a transaction
+// (see above), and a read that ends at the head is recorded for the next.
+func (e *Engine) ResourceLiveLog(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
+	if since != "" {
+		if lg := e.quietLog(ns, name, since, cred); lg != nil {
+			e.liveQuiet.Add(1)
+			return lg, nil
+		}
+	}
+	// The channel before the counter, both before the transaction: a
+	// commit the snapshot misses has yet to bump the counter, or close
+	// the channel, or both.
+	q := &quietRead{woken: e.WaitResource(ns, name)}
+	q.meta = e.rc.meta.Load()
+	lg, err := e.resourceLog(ctx, ns, name, "", since, limit, cred, q)
+	if err == nil && lg != nil {
+		e.rememberQuiet(ns, name, cred, lg, q)
+	}
+	return lg, err
 }

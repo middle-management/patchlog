@@ -193,6 +193,18 @@ Other work since v0.31.0:
   answers, the page shows the command to start one for its origin. Served by `patchlog serve`, it
   calls its own origin as before. `selftest.json` is now read relative to the page. See README,
   "Playground on GitHub Pages".
+- **A long-poll of a quiet resource from its head costs no transaction** (§7.7). A device
+  following its own resource asked again at every interval boundary, and each request read the
+  resource's log before waiting: one read transaction per follower and interval. On AWS, three
+  cores sharing a 2-vCPU RDS held 45,000 waiting devices before those reads took the database's
+  CPU and starved writes, while the cores used half a core each. Now a long-poll read that ends at
+  the resource's head is remembered, by resource and credentials, and a later long-poll from that
+  head is answered from memory while nothing that could change its answer has happened: the
+  resource's waiter channel is open, the meta counter (configuration, purges, prunes, restores,
+  key destruction) hasn't moved, on Postgres the tailer is fresh, and the grant hasn't expired.
+  A public namespace's answer holds for every request, another's for the same bearer grant only,
+  never for an edge grant (`Engine.ResourceLiveLog`). docs/CAPACITY.md, "Resource followers",
+  has the measurements.
 - **A resource's long-polls and event streams are woken by its own commits only** (§7.7,
   §7.3). They waited on the namespace's channel, so every write to the namespace made each of
   them read its log again: with clients each following their own document while a coordinator
