@@ -4973,8 +4973,8 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   the log's phase (§7.7 as of v0.86, vectors §I.25): the first 8 bytes of the SHA-256 of
   `/r/{ns}/{name}/log`, `/ns/{ns}/log` or `/ns/{ns}/g/{gs}/log`, modulo the interval in
   milliseconds, so the waits of a deployment's logs don't all end at one instant. Every
-  deployment counts them so: `serve --long-poll-fixed-epoch`, which kept v0.85's one epoch for
-  all logs, is gone. Followers of one URL share its boundaries and cursors; a cursor carried from
+  deployment counts them so; there is no option to count them from the epoch alone. Followers of
+  one URL share its boundaries and cursors; a cursor carried from
   one log to another (a partial reader's long-poll, redirected to its filtered log) is at most one
   off there, and answered as any cursor behind or ahead is. A long-poll or stream of a resource with no entries
   waits for its first. A stream judges its read check again before each page and keep-alive,

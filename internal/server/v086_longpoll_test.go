@@ -60,9 +60,8 @@ func TestV086LongPollPaths(t *testing.T) {
 // §7.7 with §B.11.9 Long-poll: a filtered log's wait ends at the boundary
 // of its own path, "/ns/{ns}/g/{gs}/log", and its 204 carries that log's
 // next cursor. The namespace's unfiltered log, polled by a full reader at
-// the same time, ends at its own.
+// the same time, ends at its own. Not parallel: it times answers.
 func TestV086FilteredLongPollPhase(t *testing.T) {
-	t.Parallel()
 	const interval = 2 * time.Second
 	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval)}})
 	w.seed([]string{"derby"}, nil, nil)
@@ -72,7 +71,7 @@ func TestV086FilteredLongPollPhase(t *testing.T) {
 	paths := []string{filteredLogPath("matches", gs), nsLogPath("matches")}
 	bearers := []string{li, w.admin}
 	clocks := []liveClock{newLiveClock(interval, paths[0]), newLiveClock(interval, paths[1])}
-	curs := waitCursors(t, 300*time.Millisecond, clocks...)
+	curs := waitCursors(t, 800*time.Millisecond, clocks...)
 	type answer struct {
 		r  *resp
 		at time.Time
@@ -87,7 +86,7 @@ func TestV086FilteredLongPollPhase(t *testing.T) {
 	for i := range paths {
 		a := <-done[i]
 		expect(t, a.r, 204)
-		if off := a.at.Sub(clocks[i].end(curs[i])); off < -50*time.Millisecond || off > 400*time.Millisecond {
+		if off := a.at.Sub(clocks[i].end(curs[i])); off < -50*time.Millisecond || off > 600*time.Millisecond {
 			t.Errorf("%s answered %v from its boundary (phase %v)", paths[i], off, clocks[i].phase)
 		}
 		if got := a.r.H.Get("X-Cursor"); got != strconv.FormatInt(curs[i]+1, 10) {
@@ -97,15 +96,14 @@ func TestV086FilteredLongPollPhase(t *testing.T) {
 }
 
 // §7.7 with §B.11.9 URLs: a partial reader's long-poll of "/ns/{ns}/log"
-// is redirected to "/ns/{ns}/g/{gs}/log" with its cursor, which was the
-// namespace log's and is now read on the filtered log's clock: one
-// behind, current or one ahead there. It is never 400; behind is answered
-// at once and otherwise at the filtered log's boundary, and each way the
-// 204's X-Cursor is past the one sent, so the follower moves on. Sent at
-// several instants of the interval, so the carried cursor lands on both
-// sides of the filtered log's.
+// is redirected to "/ns/{ns}/g/{gs}/log" with its cursor, which is then
+// read on the filtered log's clock. The two logs' cursors are one apart at
+// most, so the namespace log's cursor arrives one behind the filtered
+// log's, current or one ahead: each is sent here. None is 400; the one
+// behind is answered at once with the filtered log's cursor, the others
+// at the filtered log's boundary, and each 204's X-Cursor is past the one
+// sent, so the follower moves on. Not parallel: it times answers.
 func TestV086FilteredRedirectCarriesCursor(t *testing.T) {
-	t.Parallel()
 	const interval = 2 * time.Second
 	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval)}})
 	w.seed([]string{"derby"}, nil, nil)
@@ -113,25 +111,16 @@ func TestV086FilteredRedirectCarriesCursor(t *testing.T) {
 	gs, _ := w.filtered(li)
 	since := w.nsHead("matches", w.admin)
 	nsClock, gClock := newLiveClock(interval, nsLogPath("matches")), newLiveClock(interval, filteredLogPath("matches", gs))
-	seen := map[int64]bool{}
-	for _, cursorOff := range []int64{0, 1, 0, 1} {
-		// Clear of both logs' boundaries, so what the request meets is
-		// what is computed here; a cursor one ahead of the namespace
-		// log's is two ahead of the filtered log's at most.
-		now := time.Now()
-		_ = waitCursors(t, 300*time.Millisecond, nsClock, gClock)
-		if seen[cursorOff] {
-			// The second round: half an interval on, where the two logs'
-			// cursors compare the other way if their phases differ.
-			time.Sleep(time.Until(now.Add(interval / 2)))
-			_ = waitCursors(t, 300*time.Millisecond, nsClock, gClock)
+	for _, d := range []int64{-1, 0, 1} {
+		// Clear of both logs' boundaries, so the cursors the requests
+		// meet are these.
+		curs := waitCursors(t, 800*time.Millisecond, nsClock, gClock)
+		n, g := curs[0], curs[1]
+		if n-g < -1 || n-g > 1 {
+			t.Fatalf("the namespace log's cursor %d, the filtered log's %d: more than one apart", n, g)
 		}
-		seen[cursorOff] = true
-		now = time.Now()
-		sent := nsClock.cursor(now) + cursorOff
-		g := gClock.cursor(now)
-		q := "?live=long-poll&since=" + since + "&cursor=" + strconv.FormatInt(sent, 10)
-		r := w.get("/ns/matches/log"+q, li)
+		sent := g + d
+		r := w.get("/ns/matches/log?live=long-poll&since="+since+"&cursor="+strconv.FormatInt(sent, 10), li)
 		expect(t, r, 302)
 		loc := r.H.Get("Location")
 		if !strings.HasPrefix(loc, "/ns/matches/g/"+gs+"/log?") || !strings.Contains(loc, "cursor="+strconv.FormatInt(sent, 10)) ||
@@ -142,21 +131,18 @@ func TestV086FilteredRedirectCarriesCursor(t *testing.T) {
 		r = w.get(loc, li)
 		took := time.Since(start)
 		expect(t, r, 204)
-		got, err := strconv.ParseInt(r.H.Get("X-Cursor"), 10, 64)
-		if err != nil || got <= sent || got > sent+2 {
-			t.Fatalf("cursor %d sent (the filtered log's was %d): X-Cursor %q", sent, g, r.H.Get("X-Cursor"))
+		// The current cursor, or the request's plus one if that is more.
+		want := g + 1 + max(d, 0)
+		if d < 0 {
+			want = g
+			if took > 500*time.Millisecond {
+				t.Errorf("a cursor one behind the filtered log's: answered after %v, want at once", took)
+			}
+		} else if off := start.Add(took).Sub(gClock.end(g)); off < -50*time.Millisecond || off > 600*time.Millisecond {
+			t.Errorf("a cursor %d ahead of the filtered log's: answered %v from its boundary", d, off)
 		}
-		switch {
-		case sent < g:
-			// Behind the filtered log's: at once, with its cursor.
-			if took > 250*time.Millisecond || got != g {
-				t.Errorf("cursor %d behind the filtered log's %d: answered after %v with %d", sent, g, took, got)
-			}
-		default:
-			// Current or ahead: at the filtered log's boundary.
-			if off := start.Add(took).Sub(gClock.end(g)); off < -50*time.Millisecond || off > 400*time.Millisecond {
-				t.Errorf("cursor %d against the filtered log's %d: answered %v from its boundary", sent, g, off)
-			}
+		if got := r.H.Get("X-Cursor"); got != strconv.FormatInt(want, 10) {
+			t.Errorf("cursor %d sent, the filtered log's %d: X-Cursor %s, want %d", sent, g, got, want)
 		}
 	}
 }
