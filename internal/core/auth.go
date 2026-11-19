@@ -301,7 +301,7 @@ func (t *tx) effectiveKeys(n *nsRow, cfg *Config) []grant.Key {
 	if !n.isBranch() || t.remoteShadow(n) != nil {
 		return cfg.Keys
 	}
-	base := t.nsByID(n.base.Int64)
+	base := t.base(n)
 	copied := t.config(n.baseConfigSeq.Int64)
 	baseKeys := t.effectiveKeys(base, t.config(base.configSeq))
 	out := append([]grant.Key(nil), baseKeys...)
@@ -336,7 +336,7 @@ func (t *tx) effectiveRevoked(n *nsRow, cfg *Config) map[string]bool {
 		out[k] = true
 	}
 	for b := n; b.isBranch() && t.remoteShadow(b) == nil; {
-		b = t.nsByID(b.base.Int64)
+		b = t.base(b)
 		for k := range t.config(b.configSeq).Revoked {
 			out[k] = true
 		}

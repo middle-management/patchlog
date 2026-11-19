@@ -186,7 +186,7 @@ func (t *tx) prefetchHeads(n *nsRow, names []string, asOf *int64) {
 			return
 		}
 		at := n.baseAt.Int64
-		n, names, asOf = t.nsByID(n.base.Int64), rest, &at
+		n, names, asOf = t.base(n), rest, &at
 	}
 }
 
@@ -352,7 +352,9 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 		}
 	}
 	if n.isBranch() {
-		base := t.nsByID(n.base.Int64)
+		base := t.base(n)
+		// name's rows in all the bases it may be read through, at once.
+		t.seedResources(base, name)
 		at := n.baseAt.Int64
 		bv := t.resolve(base, name, &at)
 		v.state, v.head, v.src = bv.state, bv.head, bv.src

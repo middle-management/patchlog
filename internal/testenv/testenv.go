@@ -26,7 +26,12 @@
 // the two disagree (core, validateBoth). Likewise every purge, prune and
 // drafts.for change also looks for schema references in every document of
 // the deployment, as well as in what references the revisions it touches
-// (core, brokenReferences and referencedOf).
+// (core, brokenReferences and referencedOf). And every use of a namespace
+// row a transaction keeps of a branch's chain of bases reads the row from
+// the database again, and panics if it differs in anything the lock the
+// transaction holds on it covers; a row kept under a shared lock on
+// Postgres, whose head other writers may move, is handed out with a head
+// that is no entry's, so that whatever read it would fail (core, chain.go).
 package testenv
 
 import (

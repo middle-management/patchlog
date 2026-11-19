@@ -140,6 +140,11 @@ func (t *tx) relock(k int32, mode lockMode, logKey int32) {
 	if mode != 0 {
 		want[k] = mode
 	}
+	t.relockAll(want, logKey)
+}
+
+// relockAll is relock for several namespace locks.
+func (t *tx) relockAll(want map[int32]lockMode, logKey int32) {
 	for k2, m := range t.locks {
 		want[k2] = max(want[k2], m)
 	}
@@ -182,11 +187,20 @@ func (t *tx) lock(k int32, mode lockMode) {
 		fn = `SELECT pg_try_advisory_xact_lock_shared($1, $2)`
 	}
 	var ok bool
+	t.counted(fn)
 	t.must(t.Tx.QueryRow(fn, lockClass, k).Scan(&ok))
 	if !ok {
 		t.relock(k, mode, -1)
 	}
 	t.held(k, mode)
+}
+
+// counted reports a lock statement, which doesn't go through tx's QueryRow
+// or Exec, to a test that counts statements (onStatement).
+func (t *tx) counted(q string) {
+	if h := t.e.onStatement; h != nil {
+		h(q, nil)
+	}
 }
 
 // acquire waits for a lock.
@@ -195,6 +209,7 @@ func (t *tx) acquire(k int32, mode lockMode) {
 	if mode == lockShared {
 		fn = `SELECT pg_advisory_xact_lock_shared($1, $2)`
 	}
+	t.counted(fn)
 	done := lockTimer("ns")
 	_, err := t.Tx.ExecContext(t.waitCtx(), fn, lockClass, k)
 	done()
@@ -222,6 +237,13 @@ func (t *tx) held(k int32, mode lockMode) {
 	t.locks[k] = max(t.locks[k], mode)
 	t.maxKey = max(t.maxKey, k)
 	t.forget()
+	// A row kept of the namespace is as of the lock held until now
+	// (chain.go).
+	for id := range t.kept {
+		if lockKey(id) == k {
+			delete(t.kept, id)
+		}
+	}
 }
 
 // lockLog takes ns's log lock (logClass, D.8), last, just before its entry
@@ -286,17 +308,79 @@ func (t *tx) lockLogs(nss ...int64) {
 
 // lockAll takes several locks in ascending order: all waited for at the
 // start of a transaction, or tried as lockNS does below keys already held.
+//
+// Several are taken in one statement, or two, however many they are (the
+// bases of a deeply stacked branch, chain.go): those lockNS would only try,
+// which are the lowest, in one, in which their order doesn't matter since
+// none is waited for; then those it would wait for, each above every key
+// held, in one that takes them in ascending order. If a lock tried is
+// busy, the transaction runs again with all of them taken up front.
 func (t *tx) lockAll(want map[int32]lockMode) {
 	if !t.locking() {
 		return
 	}
 	keys := make([]int32, 0, len(want))
-	for k := range want {
-		keys = append(keys, k)
+	for k, m := range want {
+		if t.locks[k] < m {
+			keys = append(keys, k)
+		}
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	if len(keys) < 2 {
+		for _, k := range keys {
+			t.lock(k, want[k])
+		}
+		return
+	}
+	// As lock decides, key by key: the keys waited for are above the ones
+	// tried, so taking those first leaves these above every key held.
+	var try, wait []int32
 	for _, k := range keys {
-		t.lock(k, want[k])
+		if len(t.logLocks) == 0 && (len(t.locks) == 0 || k > t.maxKey) {
+			wait = append(wait, k)
+		} else {
+			try = append(try, k)
+		}
+	}
+	exclusive := func(ks []int32) []bool {
+		out := make([]bool, len(ks))
+		for i, k := range ks {
+			out[i] = want[k] == lockExclusive
+		}
+		return out
+	}
+	if len(try) > 0 {
+		const q = `SELECT COALESCE(bool_and(CASE WHEN x THEN pg_try_advisory_xact_lock($1, k)
+				ELSE pg_try_advisory_xact_lock_shared($1, k) END), true)
+			FROM unnest($2::int4[], $3::bool[]) AS u(k, x)`
+		t.counted(q)
+		var ok bool
+		t.must(t.Tx.QueryRow(q, lockClass, try, exclusive(try)).Scan(&ok))
+		if !ok {
+			need := map[int32]lockMode{}
+			for _, k := range keys {
+				need[k] = want[k]
+			}
+			t.relockAll(need, -1)
+		}
+		for _, k := range try {
+			t.held(k, want[k])
+		}
+	}
+	if len(wait) > 0 {
+		// The subquery's ORDER BY is the order the locks are taken in: the
+		// functions are evaluated above its sort, row by row.
+		const q = `SELECT count(CASE WHEN x THEN pg_advisory_xact_lock($1, k)::text
+				ELSE pg_advisory_xact_lock_shared($1, k)::text END)
+			FROM (SELECT k, x FROM unnest($2::int4[], $3::bool[]) AS u(k, x) ORDER BY k) AS s`
+		t.counted(q)
+		done := lockTimer("ns")
+		_, err := t.Tx.ExecContext(t.waitCtx(), q, lockClass, wait, exclusive(wait))
+		done()
+		t.must(err)
+		for _, k := range wait {
+			t.held(k, want[k])
+		}
 	}
 }
 

@@ -753,8 +753,12 @@ type tx struct {
 	rateDrawn *bool
 	// memo and dirty: rows read in this transaction, and whether it has
 	// written (memo.go).
-	memo    memo
-	dirty   bool
+	memo  memo
+	dirty bool
+	// links and kept: the chains of bases read in this transaction, as
+	// what never changes of a namespace and as whole rows (chain.go).
+	links   map[int64]nsLink
+	kept    map[int64]nsRow
 	ownRevs map[int64]revRow
 	revIDs  map[int64]ids.ID
 	// grants maps an author authenticated in this transaction under a
@@ -1180,7 +1184,9 @@ func (t *tx) nsByNameLocked(name string, mode lockMode) *nsRow {
 }
 
 // nsByID returns a namespace, taking its lock shared on Postgres. A read
-// transaction reads each namespace once (memo.ns).
+// transaction reads each namespace once (memo.ns); a write transaction
+// reads it again each time, head included. For a branch's base, read again
+// and again along its chain, see base (chain.go).
 func (t *tx) nsByID(id int64) *nsRow {
 	return t.nsByIDLocked(id, lockShared)
 }
@@ -1190,6 +1196,13 @@ func (t *tx) nsByIDLocked(id int64, mode lockMode) *nsRow {
 	if n, ok := t.memo.ns[id]; ok {
 		t.deps.addNS(&n)
 		return &n
+	}
+	if !t.write {
+		// Read with its branch's chain (chain.go).
+		if n, ok := t.keptRow(id); ok {
+			t.deps.addNS(n)
+			return n
+		}
 	}
 	n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE ns = ?`, id))
 	t.must(err)

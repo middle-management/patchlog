@@ -95,8 +95,9 @@ func sameStrings(a, b []string) bool {
 }
 
 // nsRowUnlocked reads a namespace row without taking its lock: for the
-// base chain, which never changes, and for the structural scans of purges,
-// which lock what they rely on themselves.
+// structural scans of purges, which lock what they rely on themselves.
+// (What walks a chain of bases, which never changes, reads its links:
+// chain.go.)
 func (t *tx) nsRowUnlocked(id int64) *nsRow {
 	n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE ns = ?`, id))
 	t.must(err)
@@ -110,9 +111,9 @@ func (t *tx) draftRoot(n *nsRow) string {
 	if !n.isBranch() || n.isShadow() {
 		return ""
 	}
-	b := n
+	b := linkOf(n)
 	for b.isBranch() {
-		b = t.nsRowUnlocked(b.base.Int64)
+		b = t.link(b.base.Int64)
 		if b.isShadow() {
 			return ""
 		}
@@ -138,14 +139,14 @@ func (t *tx) isDraftCandidate(c *nsRow, root string, over map[int64]*Config) boo
 // ccfg, serves writes to w: w is c or one of its branches, or w or one of
 // its bases is listed in ccfg's drafts.for (§6.1).
 func (t *tx) draftsServe(c *nsRow, ccfg *Config, w *nsRow) bool {
-	for x := w; ; {
+	for x := linkOf(w); ; {
 		if x.id == c.id || DraftsMatch(ccfg.DraftsFor, x.name) {
 			return true
 		}
 		if !x.isBranch() {
 			return false
 		}
-		x = t.nsRowUnlocked(x.base.Int64)
+		x = t.link(x.base.Int64)
 		if x.isShadow() {
 			return false
 		}
@@ -162,11 +163,11 @@ func (t *tx) schemaReadsServe(n *nsRow, w *nsRow) bool {
 	if cfg.SchemaReadsFor == nil || cfg.level >= levelSealed || n.isBranch() {
 		return false
 	}
-	for x := w; ; {
+	for x := linkOf(w); ; {
 		if !x.isBranch() {
 			return x.id == n.id || DraftsMatch(cfg.SchemaReadsFor, x.name)
 		}
-		x = t.nsRowUnlocked(x.base.Int64)
+		x = t.link(x.base.Int64)
 		if x.isShadow() {
 			return false
 		}
@@ -294,12 +295,11 @@ func (sc *schemaCtx) copiesIn(t *tx) []int64 {
 	}
 	sc.copies = []int64{}
 	add := func(n *nsRow) {
-		for x := n; x != nil; {
+		for x := linkOf(n); ; x = t.link(x.base.Int64) {
 			sc.copies = append(sc.copies, x.id)
 			if !x.isBranch() {
 				return
 			}
-			x = t.nsRowUnlocked(x.base.Int64)
 		}
 	}
 	if sc.target != nil {

@@ -21,6 +21,9 @@ import (
 //     it writes or takes another lock: on Postgres a write transaction
 //     sees each statement's own snapshot, and what it reads after a lock
 //     must be as of that lock (pglock.go).
+//   - the namespace rows of a branch's chain of bases, which a write
+//     transaction keeps too, each under its own lock and until it writes a
+//     namespaces row itself: they have rules of their own (chain.go).
 
 // idCache maps immutable names to ids and back.
 type idCache struct {
