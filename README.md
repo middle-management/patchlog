@@ -5006,9 +5006,9 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   has polled within a quarter of the long-poll interval: more loosely than the read cache, since
   the answer carries no content (`Engine.ResourceLiveLog`, `internal/core/live.go`). The metric
   `patchlog.longpoll.resource.reads` counts these reads by answer: `memory`, `read`, or `stale`
-  (read because the tailer was behind). When it was first measured
-  ([docs/CAPACITY.md](docs/CAPACITY.md), "Earlier measurements") one write to 5,000 private followers went from 3.7–4.1 s
-  of core CPU to 0.3–1 s. The local CDN's VCL lets a long-poll with credentials skip Varnish's
+  (read because the tailer was behind). A write to 5,000 private followers at the origin costs the
+  core about 0.03–0.04 ms of CPU each ([docs/CAPACITY.md](docs/CAPACITY.md), "Long-poll followers
+  and the CDN"). The local CDN's VCL lets a long-poll with credentials skip Varnish's
   waiting list (`hash_ignore_busy`), so a private one isn't held behind an identical request in
   flight.
 - **Live reads** (§7.3, §7.7, v0.73). A long-poll without a cursor, or with one behind by an

@@ -1,13 +1,11 @@
 # Capacity
 
-What one deployment of this implementation handles, measured. For each limit it found, this
-document says whether the limit is **by design** (the spec's model; changing it means changing
-how data is laid out), a **gap** (this implementation; fixable without changing the spec) or
+What this implementation is known to handle, as of 2026-11-19: what was measured, on what, and
+what limits it. Each limit is **by design** (the spec's model; changing it means changing how
+data is laid out), a **gap** (this implementation; fixable without changing the spec) or
 **deployment** (hardware and configuration; buy or tune your way past it).
 
-Every figure here is from one set of runs on one host on 2026-11-13, at spec 0.82, except those
-under [Earlier measurements](#earlier-measurements) and
-[A recursive union schema](#a-recursive-union-schema), and the dated notes. See
+Each section names the setup its figures come from:
 [What was measured, and on what](#what-was-measured-and-on-what).
 
 ## At a glance
@@ -58,19 +56,26 @@ under [Earlier measurements](#earlier-measurements) and
   - [Fairness between writers](#fairness-between-writers)
   - [Batches](#batches)
   - [Long histories](#long-histories)
-  - [A prototype that was set aside](#a-prototype-that-was-set-aside)
 - [Limits, by kind](#limits-by-kind)
-- [Recommended settings](#recommended-settings)
-- [Earlier measurements](#earlier-measurements)
+- [Settings](#settings)
 - [Rerunning](#rerunning)
 
 ## What was measured, and on what
 
-The numbers come from `cmd/capacity` (see [Rerunning](#rerunning)). They are taken over HTTP,
-so they include the HTTP stack. The raw results are in [`capacity/`](capacity/).
+The numbers come from `cmd/capacity`, `cmd/devicebench` and `deploy/ec2-devices.sh` (see
+[Rerunning](#rerunning)). They are taken over HTTP, so they include the HTTP stack. The raw
+results are in [`capacity/`](capacity/), whose README says which run each file is.
 
-**One host, one day, one version.** Everything was run on 2026-11-13 at spec 0.82 on one
-4-vCPU / 15 GB host. Two databases were measured on it:
+Three setups were measured:
+
+- **One 4-vCPU / 15 GB host** (2026-11-13 and 14, spec 0.82): server X and SQLite, below. All
+  sections but the two on resource followers.
+- **The same host without containers** (2026-11-19): `serve --dev` on SQLite or on a Postgres 16
+  sharing the host, with resource followers ([Resource followers](#resource-followers)).
+- **AWS** (2026-11-19, eu-west-1): three `c7g.xlarge` cores on an RDS `db.m7g.large`, with load
+  generators of their own ([Resource followers](#resource-followers)).
+
+On the host, two databases were measured:
 
 - **Server X** (the "Postgres" or "server X" figures):
   - the core in a container limited to **2 vCPU / 4 GB**;
@@ -91,7 +96,7 @@ like-for-like comparison of databases.
 bytes. Seeding took 45 minutes on server X and 39 on SQLite. On disk it is 6.8 GB in Postgres
 and 3.7 GB in SQLite.
 
-**What makes the numbers conservative, and what makes them vary:**
+**What makes the host's numbers conservative, and what makes them vary:**
 
 - The load generator ran on the same host, and so did Varnish. With the two server X containers
   that is more work than the host has CPUs for, so the server X figures are a floor.
@@ -134,8 +139,7 @@ measurements later in that same pass were back to the figures above. That pass i
 ### What data size costs
 
 **None of the per-request numbers above depends on the namespace's size.** Pages and reads use
-indexes (see the fixes under Unreleased in the CHANGELOG). So a namespace of 1M documents and
-5M revisions answers like a small one.
+indexes, so a namespace of 1M documents and 5M revisions answers like a small one.
 
 What does grow with size:
 
@@ -166,9 +170,9 @@ What the table shows:
   3,830 against 2,430–2,830). A smaller core leaves more of the shared 4-vCPU host to Postgres
   and the load generator. That points at the rest of the host, not the core, as the limit in
   this test.
-- **These runs do not show that Postgres is the limit.** Its CPU was not recorded. The earlier
-  measurements did record it (about 1.3 of its 2 vCPU under the read measurements), and that is
-  why the advice has been to size Postgres first.
+- **These runs don't show whether Postgres is the limit:** its CPU wasn't recorded. On AWS a
+  2-vCPU RDS ran at 68–70% for 450 writes a second ([Resource followers](#resource-followers)),
+  so size Postgres for the writes first.
 - **More core instances pay off once the core's own CPU is the limit.** That happens with grant
   checks at fleet scale, with large documents, and with followers that reach the origin.
 - **Grants cost 20–30% of read throughput when the grant isn't cached** (2,540–2,860/s against
@@ -352,9 +356,9 @@ of long strings. A schema that types them adds little: nothing measurable for a 
 member, and about a quarter when the patch changes a large array.** Keep a frequently edited
 document of many small values under about 250 KiB if its appends should stay near 10 ms.
 
-This section was measured again on 2026-11-14, on the same host and containers as the rest,
-after the server got its own schema validator (`internal/jsv`). Each figure is the median of 60
-appends, one after another, to one document.
+Measured on 2026-11-14, on the host and containers of the rest, with the server's own schema
+validator (`internal/jsv`). Each figure is the median of 60 appends, one after another, to one
+document.
 
 Three documents were measured at each size:
 
@@ -408,29 +412,23 @@ What the table shows:
   (about 35–40% of an append in a profile) and serialising and measuring the result (about
   40%).
 
-**Before the server had its own validator** (the runs of 2026-11-13, with a third-party
-library and the whole document validated on every write), the one-member append to the schema
-document took 19 / 55 / 187 ms at 256 KiB / 1 MiB / 3.5 MiB on server X, and 14 / 52 / 172 ms
-on SQLite. Those results are `pg-grants-serverX.json` and `sqlite-public-4vcpu.json`; the new
-ones are the `*-large-change.json` and `*-large-full.json` files.
+The results are the `*-large-change.json` and `*-large-full.json` files.
 
 ### A recursive union schema
 
-**A schema whose `oneOf` branches each recurse no longer costs exponential time, and validation
-work is bounded.** The third-party validator the server used until 2026-11-14 checked every branch in
-full, children included, even where the branch's discriminator had already failed, so a node at
-depth *d* was validated once per branch per level above it. The server now validates with its
-own validator (`internal/jsv`), which stops a branch at its first failure and checks a value's
-own keywords and scalar members before its objects and arrays.
+**A schema whose `oneOf` branches each recurse costs time in proportion to the document, and
+validation work is bounded.** The validator (`internal/jsv`) stops a branch at its first failure
+and checks a value's own keywords and scalar members before its objects and arrays, so a
+branch whose discriminator fails doesn't descend into the children.
 
 Measured on 2026-11-14 on a development machine, in the validator alone, not through the
 server: a binary tree whose nodes are one of 4 kinds, against a `oneOf` of 4 node schemas, each
 with `children`.
 
-| | Before | Now |
+| Document | Validation | Steps |
 |---|---|---|
-| Tree of depth 10 (1,023 nodes) | 4.2 s (7.3 s when first measured, on another machine) | 0.39 ms, 14,833 steps |
-| The 1 MiB **schema** document of [the section above](#large-documents-by-shape-and-schema) (9,500 typed objects) | 43 ms | 4.2 ms, 85,503 steps |
+| Tree of depth 10 (1,023 nodes) | 0.39 ms | 14,833 |
+| The 1 MiB **schema** document of [the section above](#large-documents-by-shape-and-schema) (9,500 typed objects) | 4.2 ms | 85,503 |
 
 - **Validation is bounded by steps** (`validationSteps`, §6.6 since v0.85), a step being one
   schema or subschema applied to one value: 5,000,000 for a write unless
@@ -444,8 +442,7 @@ with `children`.
   twelve levels fit in a kilobyte of a grant. Counted against the same limit, it is refused
   as a document over it is. That holds for writes only; see the gaps below.
 - Keeping the recursion out of the union (declaring `children` once on the node schema, with
-  only the discriminator and each kind's own members in the branches) is still the cheaper
-  schema, but no longer needed to stay out of trouble.
+  only the discriminator and each kind's own members in the branches) is the cheaper schema.
 
 
 ## Many writers
@@ -554,9 +551,9 @@ structural, and are listed at the top of [Many writers](#many-writers).
 **When each writer creates resources of its own, nothing collides, every writer gets the same
 share, and throughput grows with the number of writers.**
 
-The same writers as above. Each now creates resources of its own in the namespace
-(`If-None-Match: *`, a name the client chose, a 450-byte document) where before they appended to
-one shared document. No experimental code. The rate is lifted as above.
+The same writers as above, but each creates resources of its own in the namespace
+(`If-None-Match: *`, a name the client chose, a 450-byte document) instead of appending to one
+shared document. The rate is lifted as above.
 
 | Writers | Creates/s (SQLite / server X) | Attempts `412` | Fewest and most by one writer (server X) | One write p50 / p99 / max (server X) |
 |---|---|---|---|---|
@@ -667,42 +664,13 @@ caches, 20 samples each. They show that nothing scans the history. They do not s
 read of an old revision costs; the "cold reads of old revisions" row of
 [the envelope](#the-envelope) does.
 
-### A prototype that was set aside
-
-**An experimental alternative was built, measured and set aside. It is not in this code.**
-
-The prototype is on branch `capacity-schema-single`. docs/SPEC-FEEDBACK.md's v0.82 Open 91 had
-the rules and what it left open (in git history: v0.85 answered the note, and a write applied
-on the current head is now one of the spec's own open questions, §13). It let the server:
-
-- apply a stale append to the current head when nothing written since overlapped it;
-- write the waiting appends of a document in one transaction;
-- recognise repeats by a producer key.
-
-It was measured on the same host and containers as everything else here, in a new, empty
-database, each writer replacing a member of its own in the shared document. What it showed:
-
-- **It removed the `412`s and shared the document evenly.** 3,270 and 3,450 appends a second
-  from 8 and 32 writers on SQLite, 450 and 410 on server X. That is more than a resource per
-  item on SQLite (1,830 and 1,970) and less on server X (940 and 1,420). On server X it did not
-  grow from 8 writers to 32. (An earlier run with an unconstrained core and Postgres, without
-  grants, did 917 and 1,334; that is the figure in the prototype's pull request.)
-- **It was fair**: 192 and 193 appends by the least and the most served of 32 writers on
-  server X.
-- **It needed a document's writes to go to one instance.** An earlier measurement on another
-  setup (in the prototype's pull request) had throughput halve and the shares come apart when a
-  document's writers were spread over two instances. That was not measured again here.
-- **It cost** about 900 lines in the write path, a table and a change to §7.2's contract.
-
-A resource per item needs none of that, so the prototype is not in this code.
-
 ## Limits, by kind
 
 Each limit is one of three kinds:
 
 - [By design](#by-design): the spec's model.
 - [Gaps in this implementation](#gaps-in-this-implementation): fixable without changing the
-  spec. Some are already [fixed in this branch](#fixed-in-this-branch).
+  spec.
 - [Deployment](#deployment): hardware and configuration.
 
 ### By design
@@ -748,17 +716,18 @@ Each limit is one of three kinds:
   - 50 items/s a principal (burst 100);
   - 500 items/s a namespace (burst 1,000);
   - 10/s a resource (burst 20).
-  - Since v0.73 the instances of a Postgres deployment share the buckets (`rate_buckets`, about
-    +1.2 ms a write). They are per instance only with `serve --local-rate-buckets`.
+  - The instances of a Postgres deployment share the buckets (`rate_buckets`, about +1.2 ms a
+    write). They are per instance only with `serve --local-rate-buckets`.
 - *Measured:* 500/s a namespace is about half of server X's single-namespace ceiling.
 - *Lever:* allowances (§6.6) replace a principal's and its namespace's buckets, for loaders and
   importers. The per-resource rate always applies.
 
 **Followers are cheapest through the CDN** (§7.7, §9).
 
-- *Limit:* through the CDN, followers cost the origin nothing per follower. At the origin they
-  cost a connection each and a shared read per write. SSE streams (§7.3) are collapsed neither
-  at the CDN nor at the origin.
+- *Limit:* through the CDN, followers of a namespace cost the origin nothing per follower. At
+  the origin they cost a connection each and a shared read per write. A follower of its own
+  resource costs a connection and about 60 KB of a core's memory, and nothing while its
+  resource is quiet. SSE streams (§7.3) are collapsed neither at the CDN nor at the origin.
 - *Measured:* see the table under [Long-poll followers and the CDN](#measured).
 - *Lever:* devices long-poll. Services that need every entry use the log and checkpoints (§10).
 
@@ -781,91 +750,31 @@ Each limit is one of three kinds:
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
 | **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.0 GB on server X and 1.4 GB on SQLite over a whole run. Scans, reads and small writes alone peaked at 0.2–0.3 GB; the rest came with 3.5 MiB documents and 5,000 followers. | Run with `GOMEMLIMIT` under container limits; profile the large-document path (an opt-in pprof listener would help). |
 
-### Fixed in this branch
-
-These were limits and are not any more:
-
-- **Namespace log pages** bounded entries but not items, so a page of 1,000 batch entries of
-  1,000 items held a million. Now a page holds at most the page size in resource entries too, a
-  batch counting as its items.
-- **The bearer grant cache** held 1,024 grants and emptied itself when full. So a fleet of 5,000
-  devices with grants of their own verified on nearly every request. Now it holds 65,536, least
-  recently used out first. ([Earlier measurements](#earlier-measurements) has the before and
-  after.)
-- **The document cache** was bounded by count: 4,096 documents, which is up to 16 GiB of 4 MiB
-  ones. Now it is bounded at 256 MiB.
-- **The read cache** emptied itself when full. Now it evicts a quarter.
-- **Rate-limit buckets**, one per (namespace, resource, principal) written, were never dropped.
-  Now they are swept once full again, which is the same as new.
-- **Nothing bounded schema validation time**, and the validator evaluated every `oneOf`/`anyOf`
-  branch in full, so a recursive union schema took seconds on a document of a thousand nodes.
-  Now validation stops a branch at its first failure and is bounded by steps
-  ([A recursive union schema](#a-recursive-union-schema)).
-- **Compiled schemas and their documents** were kept forever. Now the 512 and 2,048 most
-  recently used are kept.
-- **Resource long-polls and event streams** were woken by every write to their namespace, and
-  each read its resource's log again. At 1,024 followers and 16 writers on SQLite that held
-  writes to 12 a second. Now they are woken by their resource's commits and by
-  namespace-wide ones only: 1,746 writes a second ([Resource followers](#resource-followers)).
-- **Every long-poll of a deployment ended its wait at the same instant**, so at each interval
-  boundary the writes queued behind one request per follower: 1.5 s for the worst write at
-  12,288 resource followers. Now each log's boundaries are shifted by a phase drawn from its
-  path: 51 ms ([Resource followers](#resource-followers)), which spec v0.86 made the rule
-  (§7.7).
-- **Long-polls of a namespace** each read the log on their own when woken. Now the read is
-  shared ([Origin-side collapse](#origin-side-collapse);
-  [Earlier measurements](#earlier-measurements) has the before and after).
-- **Namespace log pages** scanned and sorted the whole namespace, and the config-retry lookup
-  scanned the whole log. Now both are indexed (CHANGELOG, Unreleased).
-- **A consumer's snapshot bootstrap** held the whole `/heads` listing in memory and one
-  transaction. Now it is paged and resumable.
-
 ### Deployment
 
 | Resource | Measured | Notes |
 |---|---|---|
 | **Core CPU** | Grant checks, canonicalisation, validation, folds and page serialisation are core CPU. On server X a 1-vCPU core kept up with the reads, writes and scans measured. | Scales with instances once it is the limit (it wasn't on server X). |
 | **Postgres round trips** | A single write is ~13 statements; on server X one writer did 200–240 writes/s (about 4 ms each). | Keep the core near Postgres (sub-millisecond); concurrency, not speed, is what instances add. |
-| **Postgres CPU and memory** | 3.3 of 4 GB at the end of the runs; CPU not recorded in them. In the earlier measurements it was the limit (~1.3 of 2 vCPU under reads), and here a smaller core was no slower. | Size Postgres first; a read replica takes bulk reads and private followers' log reads (a gap, above). |
+| **Postgres CPU and memory** | Server X: 3.3 of 4 GB at the end of the runs, CPU not recorded, and a smaller core was no slower. AWS: a 2-vCPU RDS at 68–70% for 450 writes a second, unmoved by 120,000 waiting followers. | Size Postgres for the writes first; a read replica takes bulk reads and private followers' log reads (a gap, above). |
 | **Storage** | 6.8 GB on Postgres, 3.7 GB on SQLite for 5M revisions of ~500-byte documents. | Linear in revisions; pruning (§8.6) bounds it. |
-| **Memory** | Core: 0.2–0.3 GB through scans, reads and small writes, 0.4–0.6 GB after a whole run, 1.0 GB peak (1.4 GB on SQLite) with 3.5 MiB documents and 5,000 followers. The caches are bounded: up to 256 MiB of documents, 64 MiB of read-cache revisions and 65,536 grants (a few hundred MB at most) by default. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves large documents or many followers; size the caches with `serve --doc-cache-size`, `--read-cache-size` and `--grant-cache`. |
+| **Memory** | Core: 0.2–0.3 GB through scans, reads and small writes, 0.4–0.6 GB after a whole run, 1.0 GB peak (1.4 GB on SQLite) with 3.5 MiB documents and 5,000 followers; about 60 KB more a waiting resource follower (2.3–2.6 GB at 40,000). The caches are bounded: up to 256 MiB of documents, 64 MiB of read-cache revisions and 65,536 grants (a few hundred MB at most) by default. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves large documents or many followers; size the caches with `serve --doc-cache-size`, `--read-cache-size` and `--grant-cache`. |
+| **Open files** | One socket a follower. | A `nofile` limit above the followers a core holds. |
 | **Upgrades** | Schema migrations run in a transaction at start (README "Schema migrations"); one that builds an index on a large table blocks writes to it while the index builds. | Create the index `CONCURRENTLY` beforehand under the same name: migrations are written with `IF NOT EXISTS`, so they then find it. |
 
-## Recommended settings
+## Settings
 
-Changes to limits that these measurements recommend. Most are done.
+The defaults, and when to change them.
 
-| Setting | Status | Detail |
+| Setting | Default | Change it when |
 |---|---|---|
-| **Bearer cache** | Done | 65,536 grants, at most 32 MiB of tokens, least recently used out first (`serve --grant-cache`). |
-| **Document and read caches** | Done | 256 MiB and 64 MiB, evicting gradually (`serve --doc-cache-size`, `--read-cache-size`). |
-| **`documentSize`** | Done | 1 MiB by default, 4 MiB a namespace may set (`serve --document-size`, `--max-document-size`). Appends at 3.5 MiB are 4× slower than at 16 KiB for documents of long strings on server X, and 14× for documents of many small values ([above](#large-documents-by-shape-and-schema)); every revision of a large document weighs on the caches. |
-| **Per-resource and per-principal maximums** | Done | `serve --max-rate-per-resource` and `--max-rate-per-principal` let a namespace set its own above the defaults (10/s and 50/s), for small documents one writer writes often. The defaults stay. |
-| **Log pages** | Recommended | Bound items or bytes as well as entries. |
-| **The rates** | Keep | 500/s a namespace is about half of one namespace's ceiling on server X, which leaves room for reads. |
-| **`itemsPerBatch`** | Keep | 1,000. Batches are for imports; give importers allowances. |
-| **The snapshot cadence, the long-poll interval and the log page size** | Keep | |
-
-## Earlier measurements
-
-The first measurements were taken on 2026-10-15 at spec 0.52, on another host, with the same
-data and the same container sizes. Their raw results are in
-[`capacity/2026-10-15/`](capacity/2026-10-15/).
-
-**Their absolute figures are not comparable with this document's.** They were about half of
-today's (1,000–1,600 reads a second and 590 writes a second into one namespace). The host, the
-network path (a published port then, container addresses now) and thirty spec versions all
-differ, and nothing here separates their effects.
-
-What they are still good for is before and after, since each pair was taken on that one host
-on that one day:
-
-- **Sharing the followers' read at the origin**: a write to 5,000 private followers went from
-  3.7–4.1 s of core CPU and 3.1 s to deliver, to 0.3–1 s of CPU and 0.35–0.7 s. That is from
-  about 1 ms of CPU per follower to 0.1–0.2 ms. (Today's 0.03–0.04 ms is on the faster host.)
-- **The bearer grant cache**: a warm fleet of 5,000 readers went from 1,490 reads a second,
-  p50 4.9 ms, to 1,710–1,770, p50 3.2–4.4 ms.
-- **The CDN collapse, counted**: 1,100 followers of a public namespace made 4 origin requests.
+| **Bearer cache** (`serve --grant-cache`) | 65,536 grants, at most 32 MiB of tokens, least recently used out first | More distinct grants than that read often: every request whose grant isn't kept verifies it. |
+| **Document and read caches** (`serve --doc-cache-size`, `--read-cache-size`) | 256 MiB and 64 MiB | Large documents or a large working set of revisions. |
+| **`documentSize`** (`serve --document-size`, `--max-document-size`) | 1 MiB; a namespace may set up to 4 MiB | Rarely: appends at 3.5 MiB cost 4× those at 16 KiB for documents of long strings, and 14× for many small values ([Large documents](#large-documents-by-shape-and-schema)). |
+| **Per-resource and per-principal rates** (`serve --max-rate-per-resource`, `--max-rate-per-principal`, and the namespace's `limits`) | 10/s and 50/s | One writer writes a small document often. |
+| **`ratePerNamespace`** | 500/s | Leave it: about half of one namespace's ceiling on server X, which leaves room for reads. Give importers and loaders allowances. |
+| **`itemsPerBatch`** | 1,000 | Leave it: batches are for imports; give importers allowances. |
+| **The snapshot cadence, the long-poll interval and the log page size** | as shipped | — |
 
 ## Rerunning
 
