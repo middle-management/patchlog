@@ -3430,9 +3430,11 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   request the gateway makes for a user's request counts, whether or not the answer needs it
   (TOOLS §H.4 "Answers"; CONFORMANCE "Grant scope" 86, 87): a GET of a file while the core
   answers `500` to a read of a sibling item's namespace document is `502`, where it was `200`
-  from the rest; a write that was made before such a read failed stays made, and the answer is
-  still the failure. A request counts by how it ends: a `429` waited out and sent again has not
-  failed. Requests the server makes outside a user's request (verifying a token again, its own
+  from the rest. Once a read has failed, the request's first write to the core isn't sent, so
+  nothing is written and then answered "try again"; a write that was made before such a read
+  failed stays made, what follows it is still sent, and the answer is the failure. A request
+  counts by how it ends: a `429` waited out and sent again has not failed, where "again" is the
+  same request (for a POST, the same body), not another to the same URL. Requests the server makes outside a user's request (verifying a token again, its own
   start-up reads) don't count. These `502` and `503` name only the upstream that failed
   ("the core failed", "catalog cat's tree service is busy or behind for now; try again") and
   carry nothing of its answer: no code, message or status of the upstream's, and the `503`'s

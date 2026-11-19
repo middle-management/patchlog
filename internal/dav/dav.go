@@ -296,9 +296,29 @@ func (g writeGuard) RoundTrip(r *http.Request) (*http.Response, error) {
 			}
 		}
 	}
+	write := r.Method != http.MethodGet && r.Method != http.MethodHead
+	if write && st != nil && !st.sent.Load() {
+		// A read made for the request has failed for now, so the request
+		// is going to be answered with that failure (errWriter): its
+		// first write isn't sent, rather than made and then answered
+		// "try again" (§H.4 "Answers", v0.86). Once it has written, what
+		// follows is sent: the rest of a sequence, or what puts a
+		// principal's own delete back, is better made than left half
+		// done; and a write that failed blocks nothing, its own retry
+		// least of all.
+		if e := st.readFailure(); e != nil {
+			if r.Body != nil {
+				r.Body.Close()
+			}
+			return nil, e
+		}
+	}
 	res, err := g.next.RoundTrip(r)
 	if st != nil {
 		st.sawUpstream(theCore, r, res, err)
+		if write && err == nil && res.StatusCode < 300 {
+			st.sent.Store(true)
+		}
 	}
 	return res, err
 }
@@ -306,8 +326,35 @@ func (g writeGuard) RoundTrip(r *http.Request) (*http.Response, error) {
 // upFailure is a core or service request made for the user's request
 // that failed for now, as the request is answered for it.
 type upFailure struct {
-	key string // the method and URL, which the same request made again and answered clears
-	e   *davError
+	// key: the method and URL, and for a request with a body its digest,
+	// which the same request made again and answered clears
+	key  string
+	e    *davError
+	read bool   // a GET or HEAD
+	seq  uint64 // in the order kept (upMark, upForgive)
+}
+
+// upKey is the key of upstream request r (upFailure.key): the same
+// request sent again has the same, and no other: a POST to one URL with
+// another body (another item's grant, another patch set) is another
+// request. One whose body can't be read again has a key of its own, which
+// nothing clears.
+func (st *reqState) upKey(r *http.Request) string {
+	key := r.Method + " " + r.URL.String()
+	if r.Body == nil || r.Body == http.NoBody {
+		return key
+	}
+	if r.GetBody != nil {
+		if b, err := r.GetBody(); err == nil {
+			h := sha256.New()
+			_, err = io.Copy(h, b)
+			b.Close()
+			if err == nil {
+				return key + " " + hex.EncodeToString(h.Sum(nil))
+			}
+		}
+	}
+	return fmt.Sprintf("%s #%d", key, st.upSeq.Add(1))
 }
 
 // sawUpstream keeps how a request to an upstream (what: the core, or a
@@ -320,7 +367,8 @@ type upFailure struct {
 // request this server gave up itself (its context canceled, not timed
 // out) isn't the upstream's failure.
 func (st *reqState) sawUpstream(what string, r *http.Request, res *http.Response, err error) {
-	key := r.Method + " " + r.URL.String()
+	key := st.upKey(r)
+	read := r.Method == http.MethodGet || r.Method == http.MethodHead
 	var e *davError
 	switch {
 	case err != nil:
@@ -350,8 +398,33 @@ func (st *reqState) sawUpstream(what string, r *http.Request, res *http.Response
 	case e == nil && i >= 0:
 		st.upFail = slices.Delete(st.upFail, i, i+1)
 	case e != nil && i < 0:
-		st.upFail = append(st.upFail, upFailure{key, e})
+		st.upFail = append(st.upFail, upFailure{key, e, read, st.upSeq.Add(1)})
 	}
+}
+
+// readFailure is the first read made for st's request that failed for
+// now and wasn't answered since, nil if none (writeGuard).
+func (st *reqState) readFailure() *davError {
+	st.upMu.Lock()
+	defer st.upMu.Unlock()
+	for _, f := range st.upFail {
+		if f.read {
+			return f.e
+		}
+	}
+	return nil
+}
+
+// upMark marks the failures kept so far, for upForgive.
+func (st *reqState) upMark() uint64 { return st.upSeq.Load() }
+
+// upForgive drops the failures kept since mark: those of an attempt that
+// is waited out and made again whole (retrying), whose requests the new
+// attempt makes afresh, a write perhaps with another body ($nonce).
+func (st *reqState) upForgive(mark uint64) {
+	st.upMu.Lock()
+	defer st.upMu.Unlock()
+	st.upFail = slices.DeleteFunc(st.upFail, func(f upFailure) bool { return f.seq > mark })
 }
 
 // upstreamFailed keeps a failure for now that reached st's request
@@ -362,7 +435,7 @@ func (st *reqState) upstreamFailed(key string, e *davError) {
 	st.upMu.Lock()
 	defer st.upMu.Unlock()
 	if !slices.ContainsFunc(st.upFail, func(f upFailure) bool { return f.key == key }) {
-		st.upFail = append(st.upFail, upFailure{key, e})
+		st.upFail = append(st.upFail, upFailure{key, e, true, st.upSeq.Add(1)})
 	}
 }
 
@@ -2557,6 +2630,9 @@ type reqState struct {
 	// failed for now (sawUpstream), the first of which is its answer
 	upMu   sync.Mutex
 	upFail []upFailure
+	upSeq  atomic.Uint64
+	// sent: a write of the request's was made at the core (writeGuard)
+	sent atomic.Bool
 	// newLock: the token of the lock the request's LOCK created
 	// (boundedLS.Create), released if it is answered a failure
 	newLock string

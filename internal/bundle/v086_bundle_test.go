@@ -3,9 +3,12 @@ package bundle_test
 import (
 	"bytes"
 	"crypto/ecdh"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -134,6 +137,58 @@ func TestV086ForeignParentFromBranchHeads(t *testing.T) {
 		t.Fatalf("the export read the base's resources: %v", got)
 	}
 	must(bundle.Verify(bytes.NewReader(buf.Bytes())))
+}
+
+// The foreign parents are read at the branch's first ns_id only where
+// that entry is the branch's config genesis (§G.3, §10 Branches), before
+// any write of its own. A log that starts otherwise would make a
+// resource's own first write its foreign parent, which then isn't
+// exported: the export fails instead, and writes nothing.
+func TestV086ForeignParentNeedsConfigGenesis(t *testing.T) {
+	t.Parallel()
+	src := newDeployment(t, stagingOrigin)
+	src.ns("matches", nil)
+	src.create("matches", "derby", map[string]any{"score": "0-0"})
+	must(src.c.CreateBranch(ctx, "matches", client.BranchRequest{Name: "r7"}))
+	src.append("r7", "derby", op("replace", "/score", "2-0"))
+	src.create("r7", "final", map[string]any{"title": "Final"})
+	// The branch's log as a server would give it without its genesis.
+	cut := 0
+	c := src.c.With(client.WithTransport(func(next http.RoundTripper) http.RoundTripper {
+		return v86RoundTrip(func(r *http.Request) (*http.Response, error) {
+			res, err := next.RoundTrip(r)
+			if err != nil || res.StatusCode != 200 || !strings.HasPrefix(r.URL.Path, "/ns/r7/rev/") || !strings.HasSuffix(r.URL.Path, "/log") || r.URL.Query().Get("since") != "" {
+				return res, err
+			}
+			b, err := io.ReadAll(res.Body)
+			res.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+			var entries []json.RawMessage
+			if err := json.Unmarshal(b, &entries); err != nil || len(entries) < 2 {
+				t.Errorf("the branch's log page: %v, %d entries", err, len(entries))
+				res.Body = io.NopCloser(bytes.NewReader(b))
+				return res, nil
+			}
+			cut++
+			b, _ = json.Marshal(entries[1:])
+			res.Body, res.ContentLength = io.NopCloser(bytes.NewReader(b)), int64(len(b))
+			res.Header.Set("Content-Length", strconv.Itoa(len(b)))
+			return res, nil
+		})
+	}))
+	var out bytes.Buffer
+	_, _, err := bundle.Export(ctx, c, &out, bundle.ExportOptions{Select: []string{"r7"}, ForeignParents: true})
+	if cut == 0 {
+		t.Fatal("the export didn't read the branch's log")
+	}
+	if err == nil || !strings.Contains(err.Error(), "does not start with its config genesis") {
+		t.Fatalf("export of a branch whose log doesn't start with its config genesis: %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("the refused export wrote %d bytes", out.Len())
+	}
 }
 
 // The same for a branch of a branch: the foreign parent is the head as
