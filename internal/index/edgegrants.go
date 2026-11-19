@@ -166,18 +166,20 @@ func (ix *Index) chainOf(ctx context.Context, cfg *grantcheck.Config) []*grantch
 // follows ns, hasn't applied the entry (seen), and the origin serves the
 // range from its checkpoint up to head, so the checkpoint is in head's
 // chain (§7.1 Paging) and the follower will meet the entry. Anything
-// else is not ahead: a head the checker read before the index started
-// ns from a snapshot past it is in no batch to come, and a cookie
-// recorded as waiting for it would have every later document skipped
-// for it. Such a cookie is judged by every document instead.
+// else is not ahead: a head the checker read before ns was started from
+// a snapshot past it (by another instance on this database: this one's
+// batches drop what the checker holds, Observe) is in no batch to come,
+// and a cookie recorded as waiting for it would have every later
+// document skipped for it. Such a cookie is judged by every document
+// instead.
 func (ix *Index) ahead(ctx context.Context, ns, head string) bool {
-	cur, purged, _ := ix.state(ns)
-	if cur == "" || purged || head == "" || cur == head || ix.seen(ctx, ns, head) {
+	cur, purged, err := ix.committed(ctx, ns)
+	if err != nil || cur == "" || purged || head == "" || cur == head || ix.seen(ctx, ns, head) {
 		return false
 	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	_, _, err := ix.c.NSLogPage(cctx, ns, head, cur)
+	_, _, err = ix.c.NSLogPage(cctx, ns, head, cur)
 	return err == nil
 }
 
