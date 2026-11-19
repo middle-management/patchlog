@@ -58,8 +58,7 @@ func TestV086BranchCatalogIssuesNoContentGrant(t *testing.T) {
 			return err == nil && svc.Tree().Checkpoint(ns) == h.ID
 		})
 	}
-	b := *w
-	b.http = hs
+	b := &world{t: t, http: hs}
 
 	bob := func(ns string) string {
 		return w.idp.Grant(t, w.s.Now(), "user:bob", []string{ns}, idCan, map[string]any{"groups": toAny("match-desk")})
