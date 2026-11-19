@@ -16,325 +16,349 @@ Each entry gives the section, what the reference does now (the conservative read
 had a choice) and the question. The six implementers' notes and the four analyses' are merged
 here, each case once. Notes from v0.85 that v0.86 leaves open are carried in place, by subject,
 marked "was v0.85 Open n" and cut to what remains. The order is: levels, the foreign parent and
-archives (1–9), access, cookies and services (10–24), tree answers and branch catalogs (25–28),
-documents, bundles and the gateway (29–39), vectors (40), playground (41), index (42), rates
-and validation (43–54), listings, refusals and the branch limits (55–60) and long-poll
-intervals (61–64).
+archives (1–10), access, cookies and services (11–26), tree answers and branch catalogs (27–30),
+documents, bundles and the gateway (31–41), vectors (42), playground (43), index (44), rates
+and validation (45–56), listings, refusals and the branch limits (57–63) and long-poll
+intervals (64–67).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 Scenario numbers repeat across CONFORMANCE's groups; here "Encryption scenario n" is one under
 "Encryption levels and epochs", "Grant scope scenario n" one under "Grant scope", and a bare
 scenario number, all above 100, one under "Tree-derived access".
 
-64 are open: 48 from this version's work and 16 carried.
+67 are open: 51 from this version's work and 16 carried.
 
 1. **How a client learns a branch's chain** (§7.1 End-to-end namespaces, HTTP-68, Encryption
-   scenario 94). "It holds for a branch at least the level it holds for any base in the
-   branch's `base` chain" presumes the client knows that `Z` is a branch of `N`. The only
-   source is `Z`'s own namespace document, from the server the rule defends against. The
-   reference takes each link from a namespace document as it reads one, any revision of it,
-   and holds nothing for a `Z` it has read no document of: the Go client then accepts a first
-   plaintext `200` from `Z`, where the playground reads `Z`'s document before any resource.
-   *Question:* must a client fetch `/ns/Z` before it trusts a first plaintext `200`, or be
-   configured with the chain?
+   scenario 94). "It holds for a branch at least the level it holds for any base in the branch's
+   `base` chain" presumes the client knows that `Z` is a branch of `N`. The only source is `Z`'s
+   own namespace document, from the server the rule defends against. A client of the reference
+   that holds any level, one learnt from `/keys` included, reads a namespace's current document,
+   and those of the local bases it names, once before it trusts a first plaintext `200` from
+   that namespace; a client that holds none asks nothing. A document it may not read (`403`,
+   `404`) teaches nothing, and the plaintext is then accepted. *Question:* is that fetch what
+   scenario 94 intends; and what does a client do where `Z`'s document is unreadable to it, or
+   sealed and it has no key to see `base`?
 2. **A `sealed` holder and a plaintext `200`** (§7.1, Encryption scenario 94). §7.1 says only
    that "a reader that expects end-to-end refuses any other resource's `200` that isn't
    `application/jose`"; scenario 94 has a holder of `sealed` refuse one. The reference now
    refuses at `sealed` too, in the namespace itself as in a branch, a resource named `keyring`
    included (the keyring exception stays end-to-end's). *Question:* which text governs?
-3. **A remote branch and its base's level** (Encryption scenario 94, last sentence). "A remote
+3. **A namespace document read by id** (§7.1, HTTP-68, Encryption scenarios 79, 94). Scenario 79
+   has `N`'s document, read by id at an `ns_id` before its raise, teach nothing and not be
+   refused, and §7.1 names "the current namespace document (not one read by id)". The reference
+   so accepts a plaintext namespace document read by id where `sealed` is held, at any `ns_id`,
+   and takes its `base` link; scenario 94's "a `Z` document claiming `at-rest`" it reads as the
+   current one. *Question:* is a by-id document from after the raise meant to be refused, and
+   how would a client tell before from after?
+4. **A remote branch and its base's level** (Encryption scenario 94, last sentence). "A remote
    `Z` that lags behind `N`'s raise fails closed meanwhile." The reference follows local `base`
-   links only: it holds levels per deployment, by namespace name, and a remote base is
-   `{ origin, ns }` on another. A local branch can't lag, since a base's raise is `409 in_use`
+   links only: it holds levels per deployment, by namespace name, and a remote base is `{
+   origin, ns }` on another. A local branch can't lag, since a base's raise is `409 in_use`
    while a local branch is lower. *Question:* does a level held for `N` at one origin bind a
    remote branch at another, and keyed how?
-4. **A refused document's `base`** (§7.1 "learns nothing from either"). The reference keeps the
-   `base` link of a document it refuses for its level, since a link can only raise what is
-   held. *Question:* allowed?
-5. **The foreign parent in a chain of branches** (§E.2.2, ENC-14, Encryption scenario 87). "The
+5. **A refused document's `base`** (§7.1 "learns nothing from either"). The reference keeps the
+   `base` link of a document it refuses for its level, since a link can only raise what is held.
+   *Question:* allowed?
+6. **The foreign parent in a chain of branches** (§E.2.2, ENC-14, Encryption scenario 87). "The
    resource's foreign parent" is singular. With `Z` a branch of `N` and `N` of `M`, the
    reference places a fork for each level and fails closed for each: where `N`'s fork from `M`
    can't be placed, `M`'s `ns` is refused while `N`'s is still accepted up to `Z`'s fork.
    *Question:* intended, or is only the serving branch's parent meant?
-6. **A filtered `/heads` and the fork** (§E.2.2, SERVICES §B.11.9 `/heads`). A partial reader's
+7. **A filtered `/heads` and the fork** (§E.2.2, SERVICES §B.11.9 `/heads`). A partial reader's
    `/heads` redirects to its filtered listing. The reference counts that as unable to place a
    fork, so such a reader of an end-to-end branch loses what the branch reads through.
    *Question:* may a filtered listing place one?
-7. **A reader who can't read the base's namespace document** (Encryption scenario 87, §E.3.1).
+8. **A reader who can't read the base's namespace document** (Encryption scenario 87, §E.3.1).
    The reference walks the bases' namespace documents for the chain at E3, so a reader whose
    grant covers the branch alone fails with the base's `403` before any fork is checked.
    Scenario 87's "flagged and folded as `[]`" is reached only by a reader who reads the base's
    document and not its `/heads`. *Question:* should the branch's own document suffice for its
    direct base?
-8. **A tool configured with a level it doesn't know** (§7.1, Encryption scenario 86). The Go
+9. **A tool configured with a level it doesn't know** (§7.1, Encryption scenario 86). The Go
    client and the playground hold it as `e2e`. `patchlog --expect-level ns=level` refuses the
    value when it starts, which fails closed too. *Question:* may a tool refuse it, or must it
    count as `e2e`?
-9. **Encrypted archives** (§8.6, §G.5.1.1; was v0.85 Open 14). The per-resource archive key
-   still has no export path. E3 archives are sealed twice (`internal/core/archiveseal.go`),
-   which the unchanged bullet covers, since it excepts no level. *Question:* how does an
-   archive's key leave the deployment; confirm the double sealing.
-10. **How a service learns of an unsealed purge** (§C.4, §8.5; was v0.85 Open 17). A purged
+10. **Encrypted archives** (§8.6, §G.5.1.1; was v0.85 Open 14). The per-resource archive key
+    still has no export path. E3 archives are sealed twice (`internal/core/archiveseal.go`),
+    which the unchanged bullet covers, since it excepts no level. *Question:* how does an
+    archive's key leave the deployment; confirm the double sealing.
+11. **How a service learns of an unsealed purge** (§C.4, §8.5; was v0.85 Open 17). A purged
     unsealed namespace still serves its document and log, and an `at` equal to its `purge-ns`
     entry is its head. The reference asks `/heads` once per head of a frozen target; a purge of
-    a target that isn't frozen is learnt from the log alone. *Question:* is there a cheaper
-    sign of a purge at the head?
-11. **Older sealed log ranges for a `requireAt` check** (§C.4, §E.2.3; was v0.85 Open 19). A
+    a target that isn't frozen is learnt from the log alone. *Question:* is there a cheaper sign
+    of a purge at the head?
+12. **Older sealed log ranges for a `requireAt` check** (§C.4, §E.2.3; was v0.85 Open 19). A
     checker's grant issued after a rotation gets no key for the older epoch's stored range, so
     every `requireAt` `at` from before the rotation is a lasting `502` for it. *Question:*
     expected?
-12. **The `503` for an exchange with no `exp` left** (SERVICES §A.4 `gs`, §12.1 `behind`,
+13. **The `503` for an exchange with no `exp` left** (SERVICES §A.4 `gs`, §12.1 `behind`,
     scenario 144). §A.4 gives it where every `exp` the minter may give "is that of a cookie for
-    the same prefix that is `403`"; scenario 144 and §12.1 say only that no second is left.
-    The reference skips a second held by any cookie it must tell this one apart from, ended or
-    not, as the scenario has it. The exchange has drawn its `exchangeRate` token by then.
-    *Propose:* "that of another cookie for the same prefix that it must tell it apart from".
-    *Question:* does this `503` keep its token?
-13. **A document that moves during the exchange** (SERVICES §A.4 `gs`, scenario 148; was v0.85
+    the same prefix that is `403`"; scenario 144 and §12.1 say only that no second is left. The
+    reference skips a second held by any cookie it must tell this one apart from, ended or not,
+    as the scenario has it. The exchange has drawn its `exchangeRate` token by then. *Propose:*
+    "that of another cookie for the same prefix that it must tell it apart from". *Question:*
+    does this `503` keep its token?
+14. **Seconds taken off at the origin** (§C.5.2, SERVICES §B.11.9 `gs`). The origin keeps a
+    record for each expiry second of a `gs`, and takes whole seconds off only for filtered `gs`
+    cookies. A reader whose grant has under a second left gets `503` (`behind`), not a cookie
+    that expires at once. Where an exchange carries several subject sets, a `503` for a later
+    one leaves the earlier ones' seconds recorded with no cookie minted. *Question:* is either a
+    problem?
+15. **A document that moves during the exchange** (SERVICES §A.4 `gs`, scenario 148; was v0.85
     Open 21). The text covers a key or role that changed since the checkpoint, and scenario 148
     answers for the whole exchange. Left: the reference answers `503` (`behind`) also when the
     namespace document moved between its read and the grant's verification without changing
     either. *Question:* is any move meant?
-14. **A cookie at an earlier `at`, and in a branch** (SERVICES §B.11.9 `gs`; was v0.85 Open 23).
-    "`403` from that entry on": readers of one `gs` share a record, and a cookie carries only
-    its prefix and expiry. While the record stands the origin is exact, `403` from the changing
-    entry on and served at an `at` before it. Once any reader exchanges after the change,
-    earlier cookies are `403` at every `at`, those before the change included, as is one from
-    the same second as the last before the change, and paging in flight at an earlier `at` is
-    stranded. The index ends a cookie at every `at` at once. For a branch the
+16. **A cookie at an earlier `at`, and in a branch** (SERVICES §B.11.9 `gs`; was v0.85 Open 23).
+    A cookie from before a change is `403` from the changing entry on and still reads at an `at`
+    before it, whoever exchanged since. Left: the cookie of a new exchange is `403` at an `at`
+    from before the change, so paging in flight there can't go on under it. For a branch the
     reference takes the effective key's source entry, the base's current entry where the base
-    has that `kid`. *Question:* must a cookie stay readable at an earlier `at`, or is a `302`
-    to the current one meant; which document's entry counts for a branch, and is a `kid` the
-    branch copied and the base later removed "gone"?
-15. **How far back a cookie is judged** (SERVICES §B.11.9 `gs`, scenario 145). To keep a changed
+    has that `kid`. *Question:* `403` at the earlier `at` for the new cookie, or a `302` to the
+    current one; which document's entry counts for a branch, and is a `kid` the branch copied
+    and the base later removed "gone"?
+17. **How far back a cookie is judged** (SERVICES §B.11.9 `gs`, scenario 145). To keep a changed
     cookie ended the origin judges every namespace document between the cookie's exchange and
     the checkpoint, at most 64 of them, and refuses beyond that: a namespace that writes more
     config entries within a cookie's life, 15 minutes at most, ends it. *Question:* does the
     text allow such a bound?
-16. **Changes an index can't judge** (SERVICES §B.11.9 `gs`, §A.1, scenario 145). The index
-    judges each config document as it applies it. A base it doesn't follow is never judged for
-    a branch's cookies. Where it can't read a namespace's document during a batch, and where it
-    starts a namespace from a snapshot, it ends all of that namespace's cookies, which the text
-    doesn't say; a namespace it first meets already purged so answers its cookies `403`, where
-    v0.85's reference gave the `410`. *Question:* is ending them right, and what of the base?
-17. **An operator grant at a gateway** (§C.4 Operator grants, TOOLS §H.7). §C.4 now says a
+18. **Changes an index can't judge** (SERVICES §B.11.9 `gs`, §A.1, scenario 145). The index
+    judges, for a cookie, the config documents after its exchange, which it places in each
+    namespace's log by the `ns_id` its grant checker read the document at, or by a document of
+    the same digest. A cookie whose place it never meets is judged by the head's document alone.
+    A base it doesn't follow is never judged for a branch's cookies. Where it can't read a
+    namespace's document during a batch, and where it starts a namespace from a snapshot, it
+    ends all of that namespace's cookies, which the text doesn't say; a namespace it first meets
+    already purged so answers its cookies `403`, where v0.85's reference gave the `410`.
+    *Question:* should the text say how a service tells the entries before an exchange from
+    those after; is ending them right, and what of the base?
+19. **An operator grant at a gateway** (§C.4 Operator grants, TOOLS §H.7). §C.4 now says a
     request under an operator grant "at the origin or a service (§C.6)" is `401`. TOOLS §H.7,
     unchanged, says operator grants "are never users of a gateway (`403`)". The reference's
     gateway answers `403`; its index, tree service, catalog service and stream proxy `401`.
     *Question:* which is a gateway's?
-18. **An operator grant where a public answer exists** (§C.4, Grant scope scenario 85). The
+20. **An operator grant where a public answer exists** (§C.4, Grant scope scenario 85). The
     scenario has `GET /_refs` under an operator grant `401`. Where the index follows a public
     namespace the reference ignores the grant, as §C.4 says of requests that ignore any grant,
-    and gives the public answer; it is `401` only where nothing public is followed.
-    *Question:* should the scenario say so?
-19. **A purged sealed catalog at the origin and at a service** (SERVICES §B.11.9 Where; was
+    and gives the public answer; it is `401` only where nothing public is followed. *Question:*
+    should the scenario say so?
+21. **A purged sealed catalog at the origin and at a service** (SERVICES §B.11.9 Where; was
     v0.85 Open 26). The origin keeps the last stored `catalog.trust`, so a namespace trusting
     only a purged sealed catalog stays covered there (a partial reader gets `302`, sees
-    nothing). A service can't read that document, counts no catalog, and answers the same
-    reader `403` with no marker. *Question:* intended?
-20. **A grant that verifies only in a content namespace, at a listing** (SERVICES §B.11.6 Whose
+    nothing). A service can't read that document, counts no catalog, and answers the same reader
+    `403` with no marker. *Question:* intended?
+22. **A grant that verifies only in a content namespace, at a listing** (SERVICES §B.11.6 Whose
     claims, §B.11.5, scenario 149). The scenario has "no `docs` item shown". The reference
     refuses the request `401`, as the catalog namespace would answer the grant, where the
     scenario can be read as an empty listing. *Question:* is either acceptable?
-21. **"Unseen" in scenario 148** (SERVICES §A.4 Coverage). The scenario leaves `docs` out of
-    the exchange as unseen. Coverage lists a namespace not yet reached, purged, or whose keys
-    the index lacks. The reference also leaves out one whose document doesn't list the grant's
-    key, which is how its test makes the case. *Question:* is that one "unseen" too?
-22. **Public reads where not everything is public** (SERVICES §B.11.5, §A.4; was v0.85 Open
-    29). Left: a public listing with a `?min` naming a namespace of another catalog behind the
-    same service still uses the grant to decide whether the reader sees that namespace; and at
+23. **"Unseen" in scenario 148** (SERVICES §A.4 Coverage). The scenario leaves `docs` out of the
+    exchange as unseen. Coverage lists a namespace not yet reached, purged, or whose keys the
+    index lacks. The reference also leaves out one whose document doesn't list the grant's key,
+    which is how its test makes the case. *Question:* is that one "unseen" too?
+24. **Public reads where not everything is public** (SERVICES §B.11.5, §A.4; was v0.85 Open 29).
+    Left: a public listing with a `?min` naming a namespace of another catalog behind the same
+    service still uses the grant to decide whether the reader sees that namespace; and at
     `/_refs` of an index that also follows private namespaces an oversized grant is still `413`
     while an anonymous request gets the public hits. *Question:* each.
-23. **A stopped namespace, subject sets and `at`** (SERVICES §B.5 Behind; was v0.85 Open 30).
+25. **A stopped namespace, subject sets and `at`** (SERVICES §B.5 Behind; was v0.85 Open 30).
     When a stopped namespace's roles stop counting, a subject set's listings shrink without its
     `gs` changing. After a resume with nothing written anywhere, `at` is the same as before the
     stop, though it moved at the stop and at the resume. *Question:* is a new `gs` expected; is
     returning to the earlier `at` intended, given listings cached at immutable `at` URLs from
     before the stop?
-24. **Item 2's roles and the digest** (SERVICES §B.11.9 Visible, §A.4; was v0.85 Open 31). A
+26. **Item 2's roles and the digest** (SERVICES §B.11.9 Visible, §A.4; was v0.85 Open 31). A
     read role testing `/principal/sub` never allows anything through filtered reads, yet its
     rules still enter the digest. *Question:* why; intended?
-25. **`/problems` and deep nodes** (SERVICES §B.5; was v0.85 Open 34). The reference no longer
+27. **`/problems` and deep nodes** (SERVICES §B.5; was v0.85 Open 34). The reference no longer
     lists them. *Question:* may a service list them under a member of its own?
-26. **Which links count as the branch's own** (SERVICES §B.5 Previews, §B.3, scenario 150). The
+28. **Which links count as the branch's own** (SERVICES §B.5 Previews, §B.3, scenario 150). The
     reference counts a link into a namespace of the catalog's local `base` chain as a link to
     the branch's node for `parents` and for a content document's `$parents`, in nodes read
     through and in nodes the branch wrote itself. A remote base, or a base whose document the
     service can't read, ends the chain, and links further up stay links to another namespace.
     `children?of=/r/{base}/f` still resolves as an item reference, not the branch's node.
     *Question:* each; does `of=` count as such a link?
-27. **A content grant asked of a branch catalog** (scenario 150, TOOLS §F.8). "No content grant
+29. **A content grant asked of a branch catalog** (scenario 150, TOOLS §F.8). "No content grant
     is issued from `cat-b`" names no status. The reference's catalog service answers `404
     not_offered` to a content want at `POST /grants`, and for each item at `POST /read-grants`,
     where its catalog's document names a `base`, local or remote, and in a preview. Organising
-    grants and the branch's own node keys are still given. *Question:* the status; do
-    organising grants remain?
-28. **Writing through a branch catalog's file tree** (TOOLS §H.5, SERVICES §B.5 Previews). A
+    grants and the branch's own node keys are still given. *Question:* the status; do organising
+    grants remain?
+30. **Writing through a branch catalog's file tree** (TOOLS §H.5, SERVICES §B.5 Previews). A
     gateway on a branch catalog whose content namespace isn't branched deletes the item itself
     when a file is deleted, and the base's placement then dangles. *Question:* is a branch
     catalog meant to be writable through a file tree?
-29. **An undefined member an earlier draft stored** (§7.4 Versions; was v0.85 Open 36). "As a
+31. **An undefined member an earlier draft stored** (§7.4 Versions; was v0.85 Open 36). "As a
     config write does" still names no exemption. The reference lets a config write keep such a
     member unchanged, so a namespace written before an upgrade can be frozen or rotated.
     *Question:* may a write keep it, under §1's earlier-drafts clause as §4 Valid now cites it,
     or must it be `422` until removed?
-30. **Grant lines: `stored` as an array** (§G.4.1; was v0.85 Open 38). The pre-v0.73 array form
+32. **Grant lines: `stored` as an array** (§G.4.1; was v0.85 Open 38). The pre-v0.73 array form
     of `stored` is still read, its first element checked, though §G.4.1 defines `stored` as one
     string and rejects what it doesn't define. *Question:* is the array a rejected form now?
-31. **A `sealed` op in a namespace not labelled `e2e`** (§G.5.1 Importing, §8.6; was v0.85 Open
+33. **A `sealed` op in a namespace not labelled `e2e`** (§G.5.1 Importing, §8.6; was v0.85 Open
     40). An archive or bundle without `access` reads as private. The reference refuses such a
     bundle at step 1, override or not, so an e2e prune archive from before v0.82, which has no
     `access`, can be restored and never imported. *Question:* should that be a stated step-1
     refusal?
-32. **A pinned tombstone below a horizon** (TOOLS §G.4.2, FED-15). "Neither purged nor pruned
-    without a kept document": the core serves a tombstone revision `410 tombstone` at any
-    level, below a horizon too, and the reference takes such a pin as in the target.
-    *Question:* does it count as pruned without a kept document?
-33. **A pinned revision the importer can't open** (TOOLS §G.4.2). A revision the target serves
+34. **A pinned tombstone below a horizon** (TOOLS §G.4.2, FED-15). "Neither purged nor pruned
+    without a kept document": the core serves a tombstone revision `410 tombstone` at any level,
+    below a horizon too, and the reference takes such a pin as in the target. *Question:* does
+    it count as pruned without a kept document?
+35. **A pinned revision the importer can't open** (TOOLS §G.4.2). A revision the target serves
     and the importer has no key for, such as an end-to-end target's horizon snapshot, counts as
     in the target: the reference asks for it without opening it. *Question:* confirm.
-34. **An upstream request the gateway waited out** (TOOLS §H.4 Answers, FILE-18). The reference
-    counts an upstream request by its last outcome: a `429` or `503` that was retried and then
-    answered is no failure. It clears by method and URL, so any later success of the same URL
-    within the user's request clears it, not only a retry. *Question:* intended?
-35. **A fallback that could answer in full** (TOOLS §H.4, §H.3, Grant scope scenario 86). Read
-    literally, "whether or not the answer needed it" fails a request whose tree service
-    answered `503` (`behind`) though the node documents could answer in full. The reference
-    does that: while the service lags past `--tree-wait` a user gets one `503` about every 5 s,
-    on writes that resolve a path through the service too, and the requests in between are
-    listed from node documents without asking the service. *Question:* may a gateway list from
-    node documents in the same request?
-36. **Requests not made for the user's request** (TOOLS §H.4). A token's re-verification and
-    the gateway's refreshes of its shared caches aren't counted. *Question:* confirm.
-37. **A write that committed before a read failed** (TOOLS §H.4, §H.5). Such a request answers
-    `502` or `503` and stays written; a `DELETE`'s or `MOVE`'s locks still follow the file. The
-    reference has no test of the case. *Question:* is a failure the right answer after a
-    commit?
-38. **What "nothing of its answer" covers** (TOOLS §H.4, §C.6). The reference drops the
+36. **An upstream request the gateway waited out** (TOOLS §H.4 Answers, FILE-18). The reference
+    counts an upstream request by its last outcome. A failure is cleared only by the same
+    request made again and answered, for a request with a body the same body, or by a whole
+    write attempt the gateway waits out and makes again after a `429`. A document that reaches
+    its cache through another user's request doesn't clear it. *Question:* intended?
+37. **A fallback that could answer in full** (TOOLS §H.4, §H.3, Grant scope scenario 86). Read
+    literally, "whether or not the answer needed it" fails a request whose tree service answered
+    `503` (`behind`) though the node documents could answer in full. The reference does that:
+    while the service lags past `--tree-wait` a user gets one `503` about every 5 s, on writes
+    that resolve a path through the service too, and the requests in between are listed from
+    node documents without asking the service. *Question:* may a gateway list from node
+    documents in the same request?
+38. **Requests not made for the user's request** (TOOLS §H.4). A token's re-verification and the
+    gateway's refreshes of its shared caches aren't counted. *Question:* confirm.
+39. **A read that fails before a write, or after one** (TOOLS §H.4, §H.5). A read that failed
+    before the request's first write stops that write, so nothing is written and then answered
+    as a failure. A read that fails after a write was made doesn't stop the writes that follow,
+    the rest of a sequence or a restore: the request answers `502` or `503` with the work done,
+    and a `DELETE`'s or `MOVE`'s locks still follow the file. *Question:* is a failure the right
+    answer after a commit, and should the later writes of the sequence be sent?
+40. **What "nothing of its answer" covers** (TOOLS §H.4, §C.6). The reference drops the
     upstream's status number with its code and text, and sends a `Retry-After` of its own: 1 s
     for busy or behind, 5 s for no answer in time. In local mode its `502` still says the core
-    refused the gateway's own grant, with no number. A `4xx` passed through keeps the
-    upstream's text. *Question:* each.
-39. **Folder deletes by readers who list through the tree service** (TOOLS §H.5, §H.7; was
-    v0.85 Open 44). Such a reader can't read the node documents a folder's emptiness is taken
-    from, so it can't delete a folder or move one to another tree. The reference answers `403`,
-    which the text doesn't state. *Question:* say so, or let a tree service's `children`
-    listing stand for emptiness?
-40. **VECTORS-PROPOSED.md and §I.26.** The file that came with v0.86 is v0.85's, unchanged: its
+    refused the gateway's own grant, with no number. A `4xx` passed through keeps the upstream's
+    text. *Question:* each.
+41. **Folder deletes by readers who list through the tree service** (TOOLS §H.5, §H.7; was v0.85
+    Open 44). Such a reader can't read the node documents a folder's emptiness is taken from, so
+    it can't delete a folder or move one to another tree. The reference answers `403`, which the
+    text doesn't state. *Question:* say so, or let a tree service's `children` listing stand for
+    emptiness?
+42. **VECTORS-PROPOSED.md and §I.26.** The file that came with v0.86 is v0.85's, unchanged: its
     candidates are "computed independently from the v0.85 draft … for §I.25", and its script
     "reproduces every value of Addendum I, §I.1–§I.24". In v0.86 §I.25 is the long-poll phases,
     "Still to come" is §I.26, and §I.17's last row changed, none of which the file mentions.
     §I.26 still calls C.4 and C.5 "not yet confirmed by the reference implementation". The
-    reference reproduced both in its v0.85 work (Settled in v0.85, 85; docs/TESTVECTORS.md),
-    and nothing v0.86 changed touches them. *Propose:* regenerate the file from v0.86 and take
-    C.4 and C.5 into Addendum I.
-41. **A branch of a release branch** (SERVICES §B.5 Previews, Encryption scenarios 92, 93). The
+    reference reproduced both in its v0.85 work (Settled in v0.85, 85; docs/TESTVECTORS.md), and
+    nothing v0.86 changed touches them. *Propose:* regenerate the file from v0.86 and take C.4
+    and C.5 into Addendum I.
+43. **A branch of a release branch** (SERVICES §B.5 Previews, Encryption scenarios 92, 93). The
     clause says "local `base` chain" for an entry's seal and for a value's; the scenarios show
     only an unreadable and a remote namespace. The playground follows the chain for both, up to
     8 levels. *Question:* should a scenario show an entry sealed under a branch of the release
     branch?
-42. **The index's range filters** (SERVICES §A.4; was v0.85 Open 48). `gt`, `ge`, `lt` and `le`
+44. **The index's range filters** (SERVICES §A.4; was v0.85 Open 48). `gt`, `ge`, `lt` and `le`
     with a `sort` mark remain the reference's own, against Canonical URLs' "a parameter the
     service doesn't define … is `400`" if that means the spec's parameters. *Propose:* specify
     or drop them.
-43. **"Buckets keyed by its principal"** (§6.6 Validation work, §6.2 step 1, Grant scope
+45. **"Buckets keyed by its principal"** (§6.6 Validation work, §6.2 step 1, Grant scope
     scenario 88). For a write that ran out at step 1 the reference checks and draws the
     principal's bucket, its allowance's if it has one, and each per-resource bucket, whose key
     includes the principal. It neither checks nor draws the namespace's. *Question:* is the
     namespace bucket checked though not drawn, and do per-resource buckets count?
-44. **An upload that runs out, and `blobRate`** (§7.8 check 1, §6.6). The reference draws one
+46. **An upload that runs out, and `blobRate`** (§7.8 check 1, §6.6). The reference draws one
     token from each of those buckets and none of the declared bytes from `blobRate`, which is
     keyed by the principal too. *Question:* should `blobRate` be drawn?
-45. **A batch with items that ran out** (§7.5, §6.6 Validation work). "Counts as failing
+47. **A batch with items that ran out** (§7.5, §6.6 Validation work). "Counts as failing
     authorisation" doesn't say what the batch costs. In the reference a batch whose only
-    failures are run-outs draws what the batch would, a token per item, one per resource and
-    its `config` change's unless exempt, less the namespace bucket. One that mixes run-outs
-    with items that fail outright draws nothing, takes the outright item's status and lists
-    both kinds, the run-outs as `422` (`limit`). *Question:* each.
-46. **A batch whose `config` change fails after its step 1 while an item fails step 1** (§7.5,
+    failures are run-outs draws what the batch would, a token per item, one per resource and its
+    `config` change's unless exempt, less the namespace bucket. One that mixes run-outs with
+    items that fail outright draws nothing, takes the outright item's status and lists both
+    kinds, the run-outs as `422` (`limit`). *Question:* each.
+48. **A batch whose `config` change fails after its step 1 while an item fails step 1** (§7.5,
     §6.6 Cost; was v0.85 Open 55). The change's error answers the batch, as v0.86 says. Left:
     whether the change's token is drawn. The reference draws nothing, since the batch didn't
-    pass step 1 as a whole, though §7.5 runs the change's steps first. *Question:* does it
-    draw?
-47. **Candidate verbs and a run-out** (§C.2 item 2, §6.6 Validation work). Candidates share the
+    pass step 1 as a whole, though §7.5 runs the change's steps first. *Question:* does it draw?
+49. **Candidate verbs and a run-out** (§C.2 item 2, §6.6 Validation work). Candidates share the
     budget. Where one runs out the item ran out, though another would pass, and it is an
     outright `403` only if every candidate fails outright. In an item of several steps an
     outright failure in any step beats a run-out in another. An upload stops at the first
     candidate that passes without running out. *Question:* intended?
-48. **Exempt writes that run out** (§6.6 Exempt, Validation work). Purges, config writes under a
-    `*` key or that only freeze, and an operator's creation, when they run out at step 1,
-    answer `422` and draw nothing. *Question:* does "after the rate limits, drawing only…" make
-    an exempt write pay when it runs out?
-49. **A creation's `412` under a `*` key** (§6.6 Cost, Exempt, Grant scope scenario 93). "Under
+50. **Exempt writes that run out** (§6.6 Exempt, Validation work). Purges, config writes under a
+    `*` key or that only freeze, and an operator's creation, when they run out at step 1, answer
+    `422` and draw nothing. *Question:* does "after the rate limits, drawing only…" make an
+    exempt write pay when it runs out?
+51. **A creation's `412` under a `*` key** (§6.6 Cost, Exempt, Grant scope scenario 93). "Under
     any but an operator grant" against the exemption of config writes under a `*` key. The
     reference charges it. *Question:* which?
-50. **"That grant's principal bucket in `{ns}`"** (§6.6 Cost, §12.2). The reference keys a
+52. **"That grant's principal bucket in `{ns}`"** (§6.6 Cost, §12.2). The reference keys a
     principal's bucket by the root block's `sub` and `kid`, with no namespace, so a key listed
-    in two namespaces has one bucket. §12.2's row doesn't say "per namespace". *Question:*
-    which is meant?
-51. **What "a read" is for its budget** (§6.6 Validation work, LIM-7, Grant scope scenario 89).
+    in two namespaces has one bucket. §12.2's row doesn't say "per namespace". *Question:* which
+    is meant?
+53. **What "a read" is for its budget** (§6.6 Validation work, LIM-7, Grant scope scenario 89).
     The reference gives one budget to an exchange per grant, over all its namespaces and fixed
-    names, so a run-out for one namespace fails the rest of that grant's exchange; one to a key
-    request; otherwise one to each read check, so a request that makes several gets several,
-    and a long-poll a fresh one each time it is admitted. *Question:* is a read the request or
-    the check?
-52. **Several roles and one item** (SERVICES §B.11.5, Grant scope scenario 90). A catalog's
+    names, so a run-out for one namespace fails the rest of that grant's exchange and it gets no
+    cookie, a filtered `gs` one included; one to a key request, however many names it carries;
+    otherwise one to each read check, so a request that makes several gets several, and a
+    long-poll a fresh one each time it is admitted. *Question:* is a read the request or the
+    check?
+54. **Several roles and one item** (SERVICES §B.11.5, Grant scope scenario 90). A catalog's
     listings judge each role as the grant carrying it, so the budget is per item and role: a
     role that runs out doesn't count and another may still show the item. One budget for all of
     a node's roles would make the answer depend on their order. For one grant with several
-    roles, at the origin and at a service's read check, a role that runs out fails the whole
-    check, whatever role follows. *Question:* intended?
-53. **Key-scope `attrs` schemas** (§C.4, §6.6 Validation work). No clause names them. The
+    roles, at the origin and in every read check of a service (whether it reads, reads
+    unrestricted, or reads namespace-wide), a role that runs out fails the whole check, whatever
+    role follows. *Question:* intended?
+55. **Key-scope `attrs` schemas** (§C.4, §6.6 Validation work). No clause names them. The
     reference gives each check of a grant's attributes against a key's `attrs` schema a budget
     of its own, and attributes whose check runs out don't match. *Question:* do they count, and
     against whose budget?
-54. **Which `validationSteps` a service applies** (SERVICES §A.4, §B.11.5, §12.2). The limit is
+56. **Which `validationSteps` a service applies** (SERVICES §A.4, §B.11.5, §12.2). The limit is
     the deployment's, no namespace document carries it, and SERVICES doesn't say how a service
     learns it. The reference's index and tree service take it as an option that defaults to
-    §12.2's value. One set lower than the origin's hides items the origin would show, and
-    higher the reverse. *Question:* should the origin publish it where a service reads it?
-55. **A config write's `dependents`** (§7.4, §8.5 item 4, §12.1). The reference caps
+    §12.2's value. One set lower than the origin's hides items the origin would show, and higher
+    the reverse. *Question:* should the origin publish it where a service reads it?
+57. **A config write's `dependents`** (§7.4, §8.5 item 4, §12.1). The reference caps
     `referencing` everywhere and a namespace purge's `dependents`. It leaves a config write's
     `dependents` whole (sealing, raising the level, requiring nonces, leaving `public`), at any
     depth, leaves first, as the text does. *Question:* are those capped too, and how does
     "leaves first" combine with "by name"?
-56. **`after` on `/branches`** (§7.4, §12.4). §12.4 calls it "a name, or a `/branches` key",
+58. **`after` on `/branches`** (§7.4, §12.4). §12.4 calls it "a name, or a `/branches` key",
     §7.4 "a plain bound". The reference takes any string as a bound and never answers `400` for
     it, as at `GET /ns`. *Question:* which?
-57. **What `more` promises** (§6.1 Refusals, Grant scope scenario 94). The reference sets `more`
+59. **What `more` promises** (§6.1 Refusals, Grant scope scenario 94). The reference sets `more`
     only once it has found a further namespace the caller may read. For a caller who reads few
-    of them the search so runs to the end, and one who reads none gets `[]` without `more`
-    after a whole search. *Question:* may a server say `more` without having found one?
-58. **The per-level product of `branchesPerNamespace`** (§6.6, §12.2;
+    of them the search so runs to the end, and one who reads none gets `[]` without `more` after
+    a whole search. *Question:* may a server say `more` without having found one?
+60. **A namespace purge's `dependents` and who may read them** (§8.5 item 4, §6.1 Refusals,
+    TERM-1). `dependents` names every unpurged direct branch, readable or not, to a caller who
+    needs only `purge-ns`, where `referencing` names only namespaces the caller may read. The
+    reference follows the text. *Question:* should `dependents` be filtered alike, and would
+    `more` then mean others the caller may read?
+61. **The per-level product of `branchesPerNamespace`** (§6.6, §12.2;
     docs/capacity/branches/report.md, question 2). Not answered. The limit bounds each
     namespace's direct live branches, so at the defaults a base may have 100 branches, each 100
     of its own, to depth 8, and a purge in the root reaches all of them: 100 branches with 100
     each cost a purge 25.0 s on Postgres, the same as 10,000 direct ones. *Question:* is the
     product intended? A limit meant to bound a purge's work would bound the namespaces a purge
     reaches.
-59. **What a purge owes a frozen branch** (§8.3, Changes; the report's question 1). "Frozen
-    branches are free" is in the summary alone, and nothing bounds how many a base collects:
-    100 live and 10,000 frozen cost a purge 25.4 s in the report. A refused purge's search for
+62. **What a purge owes a frozen branch** (§8.3, Changes; the report's question 1). "Frozen
+    branches are free" is in the summary alone, and nothing bounds how many a base collects: 100
+    live and 10,000 frozen cost a purge 25.4 s in the report. A refused purge's search for
     references now stops at a page, but the reference still plans the purge over every branch
     before it answers `409`. *Question:* should §8.3 say what a purge owes a frozen branch?
-60. **Base cache tags** (§9 Branches, §8.3, CACHE-6, Grant scope scenarios 95, 96). The
-    reference adds none and purges each branch's own tags as before, which the text keeps as
-    the default. Left unsaid for a deployment that adds them: `heads:{branch}` of a branch with
-    its own chain for the name, where the exception names only `r:{branch}/{name}`; and that a
+63. **Base cache tags** (§9 Branches, §8.3, CACHE-6, Grant scope scenarios 95, 96). The
+    reference adds none and purges each branch's own tags as before, which the text keeps as the
+    default. Left unsaid for a deployment that adds them: `heads:{branch}` of a branch with its
+    own chain for the name, where the exception names only `r:{branch}/{name}`; and that a
     restore or an E3 prune in the base, which purges `r:{base}/{name}`, then clears the
     branches' copies too. *Question:* both.
-61. **"The long-poll phase as the default"** (Changes; §7.7, CONF-5). §7.7 and CONF-5 make
-    phases byte-exact with no alternative, so the reference removed its switch. *Question:*
-    does "default" mean anything, or should it read "the rule"?
-62. **The path that is hashed** (§7.7 Intervals and cursors). The reference hashes the path
+64. **"The long-poll phase as the default"** (Changes; §7.7, CONF-5). §7.7 and CONF-5 make
+    phases byte-exact with no alternative, so the reference removed its switch. *Question:* does
+    "default" mean anything, or should it read "the rule"?
+65. **The path that is hashed** (§7.7 Intervals and cursors). The reference hashes the path
     built from the names (`/r/{ns}/{name}/log`, `/ns/{ns}/log`, `/ns/{ns}/g/{gs}/log`), never
     the request's URL as received, so an edge's prefix or another spelling can't change it.
     Names and `gs` need no escaping, so it equals the URL's path. *Propose:* "built from the
     names".
-63. **Intervals that aren't whole milliseconds** (§7.7). "Modulo the interval in milliseconds"
+66. **Intervals that aren't whole milliseconds** (§7.7). "Modulo the interval in milliseconds"
     is undefined for an interval under 1 ms or with a fraction of one. The reference truncates
-    to whole milliseconds and gives an interval under 1 ms phase 0. *Question:* must an
-    interval be whole milliseconds?
-64. **A cursor carried over the filtered redirect** (§7.7, SERVICES §B.11.9 URLs). A partial
+    to whole milliseconds and gives an interval under 1 ms phase 0. *Question:* must an interval
+    be whole milliseconds?
+67. **A cursor carried over the filtered redirect** (§7.7, SERVICES §B.11.9 URLs). A partial
     reader's long-poll of `/ns/{ns}/log` is redirected to `/ns/{ns}/g/{gs}/log` with its
     `cursor`, which then belongs to a log with another phase and may be one off. The reference
     judges it by the ordinary rules on the target's clock: behind is answered at once, current
@@ -348,7 +372,7 @@ v0.86 answers the 61 notes open from v0.85 and the four questions of the branch-
 implementation's business and the rest got a clause each; it gives no list, so the answers
 were found in the text. By the reference's reading 45 notes are settled and 16 stay open and
 are rewritten above, marked "was v0.85 Open n", three of them in part (21, 23, 55); the
-report's second question is v0.86 Open 58. "n" below means v0.85 Open n. "No clause" means no
+report's second question is v0.86 Open 61. "n" below means v0.85 Open n. "No clause" means no
 changed line was found in the SPEC, SERVICES, TOOLS and CONFORMANCE diffs, not that the whole
 text was searched. A test named is the one that shows the answer, `TestV086…` where this
 version's work added it. Where the text went against the reference, the reference changed, in
@@ -365,16 +389,21 @@ the area named:
   Changed, for the clause that came with 2's answer: a client holds a branch at least at the
   level it holds for any base in its local chain, and a holder of `sealed` refuses a plaintext
   `200` (`TestV086BranchHeldAtBasesLevel`, `TestV086SealedHolderRefusesPlaintext`; the
-  playground alike). New: v0.86 Open 1–4, 8.
+  playground alike). A client that holds any level reads a namespace's document once before
+  it trusts a first plaintext `200` from it (`TestV086FirstPlaintextReadsTheNamespaceDocument`).
+  New: v0.86 Open 1–5, 9.
 - **The foreign parent** (4, 39): a reader that can't place it accepts no base's `ns` (4), and
   §G.4.1 defines it as the resource's head as the branch's own `/heads` lists it at the
   branch's first `ns_id` (39). Changed, both. The Go client and the playground place the fork
   from the base's `/heads` or else the branch's own, and where neither does, flag the base's
   entries, fold them as `[]` and refuse a base's snapshot, where they opened them unchecked
-  (`TestV086UnplaceableForeignParentFailsClosed`, `TestV086ForkUnplacedWithNode`). The
-  exporter reads the branch's own `/heads` and nothing in the base, so a branch of a remote
-  base exports like a local one (`TestV086ForeignParentFromBranchHeads`,
-  `TestV086ForeignParentRemoteBase`). New: v0.86 Open 5–7.
+  (`TestV086UnplaceableForeignParentFailsClosed`, `TestV086ForkUnplacedWithNode`). A base
+  named without `at` places none (`TestV086BaseWithoutAtFailsClosed`), and a fork that
+  couldn't be placed is asked for again at the next read (`TestV086UnplacedForkIsNotKept`).
+  The exporter reads the branch's own `/heads` and nothing in the base, so a branch of a
+  remote base exports like a local one (`TestV086ForeignParentFromBranchHeads`,
+  `TestV086ForeignParentRemoteBase`); it refuses a branch whose log doesn't start with its
+  config genesis (`TestV086ForeignParentNeedsConfigGenesis`). New: v0.86 Open 6–8.
 - **Derived views and previews** (8, 9, 10, 11, 47): at E2 a service takes a pending head's
   epoch from the `kid` of the revision as the origin serves it, the sentence proposed (8;
   `TestV085E2EpochFromOriginSealing`). A value from a namespace that is neither sealed nor
@@ -386,10 +415,10 @@ the area named:
   item's namespace in that one's local `base` chain, and shows the entry by name only
   otherwise (47). 8 to 11 as the reference had them. Changed for 47: the playground follows
   the chain for an entry's own seal too, where it looked one level up
-  (`TestV086PlaygroundPreviewChainWithNode`). New: v0.86 Open 41.
+  (`TestV086PlaygroundPreviewChainWithNode`). New: v0.86 Open 43.
 - **No clause in federation and stored data** (12, 13): a cross-draft remote branch's `502` is
   §12.1's, and re-sealed rows with their old `ETag` are data of an earlier draft; both are the
-  implementation's. Left open: 14 (v0.86 Open 9).
+  implementation's. Left open: 14 (v0.86 Open 10).
 - **`requireAt`** (15, 16, 18): a grant that a purged catalog's `requireAt` key signs is `403`,
   and scenario 133 now says which key signs li's grant (15;
   `TestV085RequireAtPurgedNamespaceOrigin`). The `403` is for a purged namespace "other than
@@ -398,20 +427,25 @@ the area named:
   `TestV086RequireAtRefusalsNameNoNamespace`). 15, 18 and 16's `requireAt: true` as the
   reference had them. Changed: a key that names its own namespace gets the purged namespace's
   `410`, not `403`, at the origin and at a service (`TestV086RequireAtOwnNamespacePurged`).
-  Left open: 17, 19 (v0.86 Open 10, 11).
+  Left open: 17, 19 (v0.86 Open 11, 12).
 - **Cookies and the index's exchange** (20, 22, 25): a minter may take whole seconds off a
   cookie's `exp` to tell it from another, and answers `503` (`behind`) with none left (20;
   `TestV086CookiesToldApartByExp`). A cookie is `403` from the entry that changes a key, rule
   or role it drew on, even where a later entry undoes the change; both changes in one entry
   end nothing (22, scenario 145). The exchange answers `502` or `503` as a whole where a
   `requireAt` chain can't be read (25; `TestV086ExchangeChainUnreadMixed`). 20 and 25 as the
-  reference had them. Changed for 22, at the origin too: the note's "the origin never revives
-  one" was wrong where nobody exchanged between the change and its undoing. The origin now
-  judges every namespace document since the exchange (`TestV086FilteredCookieStaysEnded`,
-  `TestV086AccessGSChangeUndone`), and the index every config document of a batch, and a
-  base's for its branches' cookies (`TestV086CookieEndedStaysEnded`,
-  `TestV086BranchCookieEndedByBaseChange`). Left open: 21 and 23 in part (v0.86 Open 13, 14);
-  new: v0.86 Open 12, 15, 16.
+  reference's index had them. Changed for 22, at the origin too: the note's "the origin never
+  revives one" was wrong where nobody exchanged between the change and its undoing. The
+  origin now keeps a record for each expiry second of a `gs` and judges a cookie by its own,
+  over every namespace document since its exchange (`TestV086FilteredCookieStaysEnded`,
+  `TestV086AccessGSChangeUndone`). Its exchange takes seconds off as 20 says, so the exchange
+  after a change gives a cookie that reads, or `503` with no second left
+  (`TestV086AccessGSExchangeAgainSameGrant`, `TestV086AccessGSNoSecondLeft`), and a cookie
+  from before a change still reads at an `at` before it. The index judges every config
+  document after a cookie's exchange, a base's for its branches' cookies too
+  (`TestV086CookieEndedStaysEnded`, `TestV086BranchCookieEndedByBaseChange`,
+  `TestV086CookieMintedBehindOutlivesBacklog`). Left open: 21 and 23 in part (v0.86 Open 15,
+  16); new: v0.86 Open 13, 14, 17, 18.
 - **Operator grants and the caller's grant** (24, 27, 28): an operator grant is `401` at a
   service as at the origin, so none reads under a cookie and the empty `pub` has no case (24,
   Grant scope scenario 85). A catalog service takes the caller's `sub` and groups from the
@@ -422,19 +456,19 @@ the area named:
   operator grant `401` already (`TestV086OperatorGrantAtTheIndex`, `…AtTheTreeService`,
   `…AtTheCatalogService`). Changed: the stream proxy answers `401` to an
   operator grant presented as a caller's, where it created the stream
-  (`TestV086OperatorGrantIsNoCaller`). Left open: 26 (v0.86 Open 19); new: v0.86 Open 17, 18,
-  20, 21.
+  (`TestV086OperatorGrantIsNoCaller`). Left open: 26 (v0.86 Open 21); new: v0.86 Open 19, 20,
+  22, 23.
 - **No clause in access and tree answers** (32, 33): unchanged §B.11.9 gives the
   `/ns/{ns}/g/{gs}` prefix only to a grant that doesn't fix `/resource` (32), and puts `next`
   on every full page of a filtered `/heads` (33), both as the reference does. Carried: 29, 30,
-  31, 34 (v0.86 Open 22–25), and the index's range filters, 48 (v0.86 Open 42).
+  31, 34 (v0.86 Open 24–27), and the index's range filters, 48 (v0.86 Open 44).
 - **Branch catalogs** (35): in a catalog branch a link into a namespace of its local `base`
   chain counts as a link to the branch's node of that name, and no content grant is issued
   from the branch (scenario 150). Changed: the tree service and the gateway resolve such
   links, where the base's nodes were roots and orphans
   (`TestV086BranchCatalogLinksThroughBase`, `TestV086BranchCatalogTree`), and a catalog
   service on a branch refuses content and read grants
-  (`TestV086BranchCatalogIssuesNoContentGrant`). New: v0.86 Open 26–28.
+  (`TestV086BranchCatalogIssuesNoContentGrant`). New: v0.86 Open 28–30.
 - **Documents and bundles** (37, 41, 45): §4 Valid excepts a revision or schema written under
   an earlier draft, as proposed (37; `TestV073StoredPatternInV073Closure`). A pinned revision
   is in the target if it is in the chain and "neither purged nor pruned without a kept
@@ -444,19 +478,20 @@ the area named:
   one case. Changed: a pin to a revision that an end-to-end target serves and the importer
   can't open, its horizon snapshot, failed the import on the key and is now in the target
   (`TestV086PrunedPinNotInE2ETarget`; plain targets in `TestV086PrunedPinNotInTarget`). Left
-  open: 36, 38, 40, 44 (v0.86 Open 29–31, 39); new: v0.86 Open 32, 33.
+  open: 36, 38, 40, 44 (v0.86 Open 31–33, 41); new: v0.86 Open 34, 35.
 - **The gateway** (42, 43): every core or service request a gateway makes for the user's
   request counts toward its failure, "whether or not the answer needed it" (42, Grant scope
   scenario 87), and its `502` and `503` name only the upstream that failed, with a
   `Retry-After` of the gateway's own (43, Grant scope scenario 86). Changed, both: a `GET` or
-  `PROPFIND` that answered from the rest now fails (`TestV086SiblingReadFailsRequest`), and
+  `PROPFIND` that answered from the rest now fails (`TestV086SiblingReadFailsRequest`), no
+  first write is sent after a failed read (`TestV086NoWriteAfterFailedRead`), and
   the bodies carry no upstream code, text or status number
   (`TestV086CoreFailureNamesOnlyTheCore`, `TestV086TreeServiceFailureNamesOnlyTheService`).
-  New: v0.86 Open 34–38.
+  New: v0.86 Open 36–40.
 - **Vectors** (46): §I.17's last row makes the `Q` an `A`, which keeps the tag canonical, as
   proposed. Changed: the vector data, and the row is checked as a decryption failure
   (`TestI17SealedBundle`). §I.25's four phases reproduce (`TestI25LongPollPhases`). New: v0.86
-  Open 40.
+  Open 42.
 - **Rates and validation** (49, 50, 51, 52, 53, 54): the budget is per document a write
   produces, each step of a batch item counting alone (49; `TestV085ValidationStepsWithRules`),
   and running out of it is `422` even inside a rule whose own failure is `403` (50), both as
@@ -467,11 +502,12 @@ the area named:
   costs a token under any but an operator grant (54). Changed: step-1 run-outs, which
   answered at once and cost nothing (`TestV086StepOneRunOut`, `TestV086StepOneOutrightFirst`,
   `TestV086StepOneRunOutOtherWrites`); budgets for reads at the origin and at services
-  (`TestV086ReadCheckBudget`, `TestV086IndexItemBudget`); `--max-validation-steps 0` is
+  (`TestV086ReadCheckBudget`, `TestV086IndexItemBudget`), an exchange whose budget is spent
+  issuing no cookie (`TestV086FilteredExchangeSpent`); `--max-validation-steps 0` is
   refused (`TestV086ValidationStepsNeverUnbounded`); and the `412` under a namespace's own
   grant (`TestV086CreationTakenDraws`; the operator's as it was). Left open: 55's draw (v0.86
-  Open 46), its error answering the batch as the reference had it; new: v0.86 Open 43–45,
-  47–54.
+  Open 48), its error answering the batch as the reference had it; new: v0.86 Open 45–47,
+  49–56.
 - **Streams** (56, 57, 58): an orphan, whose proxy died before calling upstream, ends
   `"timeout"` (56; `TestIdleTimeout`). The timeout is the deployment's, one for all its
   proxies (57; the option's help and the README now say so). A read grant never outlives the
@@ -481,13 +517,13 @@ the area named:
   address" (60; `TestV084NamespacesRows`).
 - **Long-poll intervals** (61): the phase is §7.7's, as proposed, with vectors in §I.25. The
   reference had it as its default. Changed: `serve --long-poll-fixed-epoch`, which kept the
-  single epoch, is removed (`TestV086LongPollPaths`). New: v0.86 Open 61–64.
+  single epoch, is removed (`TestV086LongPollPaths`). New: v0.86 Open 64–67.
 - **The branch-limit report** (its questions 1, 3 and 4): frozen branches stay free, by the
-  summary alone (1; v0.86 Open 59). `GET /ns/{ns}/branches` is paged, and an `in_use`
+  summary alone (1; v0.86 Open 62). `GET /ns/{ns}/branches` is paged, and an `in_use`
   refusal's `referencing` and a namespace purge's `dependents` list a page with `"more": true`
   (3). Changed: both (`TestV086BranchesPaged`, `TestV086ReferencingCapped`,
   `TestV086DependentsCapped`). Base cache tags are a MAY the reference doesn't use (4; v0.86
-  Open 60). Question 2 has no answer (v0.86 Open 58). New: v0.86 Open 55–57.
+  Open 63). Question 2 has no answer (v0.86 Open 61). New: v0.86 Open 57–60.
 
 ## Settled in v0.85
 

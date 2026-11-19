@@ -14,8 +14,8 @@ import (
 )
 
 // Spec v0.85, TOOLS Addendum J as it answers the reference's notes on
-// streams (v0.82 Open 93–100, settled in v0.85; what is left is
-// SPEC-FEEDBACK v0.85 Open 56–58).
+// streams (v0.82 Open 93–100, settled in v0.85; what that left, v0.85
+// Open 56–58, is under SPEC-FEEDBACK's "Settled in v0.86").
 
 // J.1 Names (v0.85): the proxy learns its caller from GET
 // /ns/{ns}/principal, and "a grant narrowed to "can": [] suffices". Such

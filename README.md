@@ -2477,10 +2477,11 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   claims a lower one (`client.ErrLevelLowered`), and a document served in the clear in a
   namespace held as sealed or e2e (only e2e before v0.86); with the flag it holds that level
   from its first request. Since v0.86 the level also binds the namespace's branches: a branch is
-  held at least at the level held for any base in its local `base` chain, as the namespace
-  documents the client has read name it, so `--expect-level N=sealed` refuses a branch of `N`
-  that claims less or serves a document in the clear. A remote base isn't followed, and a
-  branch whose namespace document the client hasn't read yet isn't known to be one. Keyring writes (`InitKeyring`, `AddReader`, `RotateEpoch`, and the playground's) carry a
+  held at least at the level held for any base in its local `base` chain, so
+  `--expect-level N=sealed` refuses a branch of `N` that claims less or serves a document in
+  the clear. To know the chain, a client that holds any level reads a namespace's current
+  document, and its local bases', once before it trusts a first document served in the clear
+  from it; a document it may not read teaches nothing. A remote base isn't followed. Keyring writes (`InitKeyring`, `AddReader`, `RotateEpoch`, and the playground's) carry a
   fresh `$nonce` where the keyring read has one, so the next one mends a keyring whose `$nonce`
   predates v0.76, which `/keys` doesn't relay meanwhile (v0.81). A keyring in the format before
   v0.63 is no longer relayed or read, and keys wrapped

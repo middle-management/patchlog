@@ -6,11 +6,11 @@ Implements spec **v0.86** (previously **v0.85**). v0.86 is the spec's answer to 
 61 open notes on v0.85 and to its measurements of the branch limits (docs/SPEC-FEEDBACK.md,
 "Settled in v0.86"): by its own count 22 already matched the text or are the implementation's
 business, and the rest got a clause each. What the reference changed for them is below,
-breaking changes first; the 64 notes this work leaves are the new list, "v0.86 Open n".
+breaking changes first; the 67 notes this work leaves are the new list, "v0.86 Open n".
 
 - **`GET /` answers `"spec": "0.86"`**, and the docs mirror v0.86 (SPEC, SERVICES, TOOLS,
   CONFORMANCE, the spec's change log). The proposed-vectors file that came with it is still
-  v0.85's (v0.86 Open 40).
+  v0.85's (v0.86 Open 42).
 
 Breaking:
 
@@ -45,15 +45,16 @@ Breaking:
   5,000,000.
 - **Breaking: reads have a validation budget too** (§6.6 Validation work, LIM-7; Grant scope
   scenarios 89, 90, 92). Only writes were bounded, as the v0.31.0 notes below still say. Now
-  every read check, every exchange (`POST /edge-grants`), every key request, every read check
-  a write makes, and every item a filtered read or a service listing judges has
-  `validationSteps` steps for its rules' `schema` tests. One that needs more fails as that
-  check usually does: `404` for a private resource, `403` for a namespace log, an exchange, a
-  key request or a branch's creation; a filtered item is left out and the rest listed. A test
-  cut short never passes, under `not` either. A grant whose rules were this expensive read
-  slowly before and is refused now. `patchlog index` and `patchlog tree` (and the catalog
-  service with it) take `--max-validation-steps` (default 5,000,000): give them the origin's
-  value, since a service set lower hides items the origin would show.
+  every read check, every exchange (`POST /edge-grants`), every key request, every read check a
+  write makes, and every item a filtered read or a service listing judges has `validationSteps`
+  steps for its rules' `schema` tests. One that needs more fails as that check usually does:
+  `404` for a private resource, `403` for a namespace log, an exchange, a key request or a
+  branch's creation; a filtered item is left out and the rest listed. A test cut short never
+  passes, under `not` either. An exchange whose budget is spent issues no cookie, and where one
+  of a grant's roles ran out a service doesn't go on to a later role. A grant whose rules were
+  this expensive read slowly before and is refused now. `patchlog index` and `patchlog tree`
+  (and the catalog service with it) take `--max-validation-steps` (default 5,000,000): give them
+  the origin's value, since a service set lower hides items the origin would show.
 - **Breaking: a write that runs out of `validationSteps` in its grant's rules costs a token**
   (§6.2 step 1, §6.6; Grant scope scenario 88). When the grant, key-scope or role rules checked
   before anything is read ran out of steps, the `422` (`limit`) came at once, before the rate
@@ -70,7 +71,10 @@ Breaking:
   makes to the core or to a tree or catalog service for your request that fails for now
   (`408`, `429`, `5xx`, unreachable, no answer in time) fails your request: `503` after a
   `429`, a `503` or a timeout, else `502`, never `200`, `207`, `404` or `403` from the rest.
-  A request the gateway retried and got answered is no failure.
+  A failure is cleared only by the same request made again and answered (for one with a
+  body, the same body), so a request the gateway waited out and got answered is no failure.
+  Once a read made for your request has failed, its first write isn't sent, so nothing is
+  written and then answered "try again"; a write already made stays made.
   - The `502` and `503` name only what failed, "the core" or a catalog's tree or catalog
     service, and carry none of its code, text or status number. `Retry-After` is the
     gateway's own, 1 s for busy or behind and 5 s for no answer in time. The upstream's
@@ -83,31 +87,43 @@ Breaking:
   changes** (SERVICES §B.11.9 `gs`, scenario 145). When a later config entry undid the change
   and nobody had exchanged in between, the old cookie read again at the origin; at the index
   it held when both entries arrived in one batch. Now it is `403` on `/heads`, log ranges,
-  long-poll and events from the change on, until the reader exchanges again. A change made
-  and undone within one config entry ends nothing.
-  - At the origin: cookies issued before the upgrade are `403` once, and their readers
-    exchange again (the migration adds the column `filtered_gs.conf`). A namespace that
-    writes more than 64 config entries within a cookie's life, 15 minutes at most, ends it.
-  - At the index: this also covers a branch whose keys come from a base the index follows.
-    An index that starts a namespace from a snapshot ends that namespace's cookies.
+  long-poll and events from the change on, until the reader exchanges again; at an `at`
+  before the change it still reads. A change made and undone within one config entry ends
+  nothing.
+  - At the origin: the exchange after a change gives a cookie that reads, with any grant.
+    Where it must be told apart from an earlier cookie it expires whole seconds earlier
+    (§C.5.2), and `POST /edge-grants` answers `503` (`behind`, with `Retry-After`) where no
+    second is left before the grant's `exp`. Cookies issued before the upgrade are `403`
+    once, and their readers exchange again (migrations `023_filtered_gs_exps` on SQLite,
+    `024_…` on Postgres). A namespace that writes more than 64 config entries within a
+    cookie's life, 15 minutes at most, ends it.
+  - At the index: only the config entries after a cookie's exchange are judged, so an index
+    catching up on a backlog doesn't end cookies minted meanwhile. This also covers a branch
+    whose keys come from a base the index follows. An index that starts a namespace from a
+    snapshot ends that namespace's cookies. Index migration 012 adds a column; cookies
+    recorded before it may be ended once by the next config entry applied.
 - **Breaking: clients refuse content of a base they can't place** (§E.2.2, ENC-14; Encryption
-  scenario 87). A reader of an end-to-end branch accepts content sealed under a base's keys
-  only up to the point where the branch forked. The Go client and the playground take that
-  point from the base's `/heads`, or else from the branch's own `/heads` at its first entry.
-  Where they could read neither, they opened such entries unchecked, anywhere in the branch's
-  log. Now those entries are flagged and folded as `[]`, and a base's snapshot is refused. A
-  reader with a narrow grant (one fixed to a resource, or a partial reader) may lose content
-  the branch reads through. The playground now also checks remote bases and prune snapshots.
+  scenario 87). A reader of an end-to-end branch accepts content sealed under a base's keys only
+  up to the point where the branch forked. The Go client and the playground take that point from
+  the base's `/heads`, or else from the branch's own `/heads` at its first entry. Where they
+  could read neither, they opened such entries unchecked, anywhere in the branch's log. Now
+  those entries are flagged and folded as `[]`, and a base's snapshot is refused. A reader with
+  a narrow grant (one fixed to a resource, or a partial reader) may lose content the branch
+  reads through. A fork that couldn't be placed is asked for again at the next read, and a
+  branch whose document names a base without `at` gets no read-through content. The playground
+  now also checks remote bases and prune snapshots.
 - **Breaking: clients hold a branch at its base's encryption level, and refuse plaintext
   under `sealed`** (§7.1, HTTP-68; Encryption scenario 94). The Go client and the playground
   kept a level for each namespace alone, and only a holder of `e2e` refused a document served
   as a plaintext `200`. Now a branch is held at least at the level held for any base in its
-  local `base` chain, as the namespace documents read so far name it, so
-  `--expect-level N=sealed` (`client.WithExpectedLevel`) also refuses a branch of `N` that
-  claims less; and a holder of `sealed` refuses a plaintext document too
-  (`client.ErrLevelLowered`). `Client.HeldLevel` may report a level inherited from a base. A
-  remote base isn't followed, and a branch whose namespace document the client hasn't read
-  yet isn't known to be one (v0.86 Open 1, 3).
+  local `base` chain, so `--expect-level N=sealed` (`client.WithExpectedLevel`) also refuses
+  a branch of `N` that claims less; and a holder of `sealed` refuses a plaintext document too
+  (`client.ErrLevelLowered`). To know the chain, a client that holds any level reads a
+  namespace's current document once before it trusts a first document served in the clear
+  from it, so such a branch is refused without having been looked at first. That is one more
+  namespace-document read per namespace and client; a client that holds no level makes none.
+  `Client.HeldLevel` may report a level inherited from a base. A remote base isn't followed
+  (v0.86 Open 4).
 - **Breaking: `409 in_use` lists a page** (§6.1 Refusals, §8.5; SCH-6, Grant scope scenario
   94). `referencing` named every namespace you may read that still references the schema. It
   now holds the first `logPageSize` of them by name, with `"more": true` where you may read
@@ -139,7 +155,9 @@ Other changes for v0.86:
   `export --foreign-parents`, and every export of an end-to-end branch, take each document's
   foreign parent from the branch's own `/heads` at its first entry, where they read the
   base's. Branches of a remote base now export in full: an end-to-end one exported only the
-  documents that were its own from the start, and a plain one failed with `404`.
+  documents that were its own from the start, and a plain one failed with `404`. Such an
+  export fails, writing nothing, if the branch's namespace log doesn't start with its config
+  entry.
 - **Bundles: import accepts a pinned revision it can't decrypt** (TOOLS §G.4.2, FED-15). A pin
   to a revision that an end-to-end or sealed target serves but the importer has no key for,
   such as an end-to-end target's horizon snapshot, failed the import. It now counts as in the
