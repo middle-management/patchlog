@@ -288,7 +288,6 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 	}
 	cands := []cand{{n.id, n.base}}
 	isCand := map[int64]bool{n.id: true}
-	restore := t.planByIndex()
 	const firstEntry = `(SELECT MIN(h.ns_seq) FROM resources r JOIN head_history h ON h.res = r.res WHERE r.ns = c.ns AND r.name = ?)`
 	rootLo := sql.NullInt64{}
 	if n.isBranch() {
@@ -300,6 +299,9 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 			rootLo.Valid = true
 		}
 	}
+	// Only the discovery statements run under the forced plans: the base's
+	// chain and rows above are read as any other request reads them.
+	restore := t.planByIndex()
 	if !rootLo.Valid {
 		t.must(t.QueryRow(`SELECT `+firstEntry+` FROM namespaces c WHERE c.ns = ?`, name, n.id).Scan(&rootLo))
 	}
