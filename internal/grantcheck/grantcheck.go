@@ -1019,7 +1019,13 @@ func (ch *Checker) ReadsUnrestricted(v *grant.Verified) bool {
 		return true
 	}
 	for _, role := range roles {
-		if ch.passWhole(v.RoleRules(role), env, m) {
+		pass := ch.passWhole(v.RoleRules(role), env, m)
+		if m.Over {
+			// The check's steps ran out, which no other role makes up
+			// for: the whole check fails, as at the origin (§6.6).
+			return false
+		}
+		if pass {
 			return true
 		}
 	}
@@ -1074,7 +1080,12 @@ func (ch *Checker) NamespaceWide(v *grant.Verified) bool {
 		return true
 	}
 	for _, role := range roles {
-		if ch.passWholeRefs(v.RoleRules(role), env, m, "resource", "now") {
+		pass := ch.passWholeRefs(v.RoleRules(role), env, m, "resource", "now")
+		if m.Over {
+			// As ReadsUnrestricted: a spent budget fails the whole check.
+			return false
+		}
+		if pass {
 			return true
 		}
 	}
