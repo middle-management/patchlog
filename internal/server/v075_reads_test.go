@@ -543,7 +543,8 @@ func (w *v75s) longPoll(path, bearer string) longPollRes {
 }
 
 // waitCursor is the cursor of the current long-poll interval, after
-// waiting out one that ends within margin, so a poll with it waits.
+// waiting out one that ends within margin, so a poll with it waits. The
+// server must count intervals from the epoch itself (withFixedEpoch).
 func waitCursor(interval, margin time.Duration) int64 {
 	now := time.Now()
 	cur := now.UnixNano() / int64(interval)
@@ -560,7 +561,7 @@ func waitCursor(interval, margin time.Duration) int64 {
 func TestV075FilteredLongPoll(t *testing.T) {
 	t.Parallel()
 	interval := 2 * time.Second
-	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval), withLogPageSize(5)}})
+	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval), withLogPageSize(5), withFixedEpoch}})
 	w.seed([]string{"derby"}, nil, nil)
 	li := w.li()
 	gs, _ := w.filtered(li)
@@ -608,7 +609,7 @@ func TestV075FilteredLongPoll(t *testing.T) {
 func TestV075FilteredLongPollPerGS(t *testing.T) {
 	t.Parallel()
 	interval := 2 * time.Second
-	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval)}})
+	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval), withFixedEpoch}})
 	w.seed([]string{"derby"}, []string{"secret"}, []string{"secret"})
 	li, bo := w.li(), w.bo()
 	lgs, _ := w.filtered(li)

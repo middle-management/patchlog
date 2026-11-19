@@ -22,7 +22,7 @@ import (
 func TestV082AccessGSCookieEndsOnKeyChange(t *testing.T) {
 	t.Parallel()
 	interval := 2 * time.Second
-	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval)}})
+	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval), withFixedEpoch}})
 	w.seed([]string{"derby"}, nil, []string{"derby"})
 	li := w.li()
 	c, gs := w.cookie(li)

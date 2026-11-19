@@ -450,3 +450,8 @@ td.wrap, td.wrap code { white-space: normal; overflow-wrap: anywhere; }
   #mgTbl td:first-child, #mgTbl td:last-child, #mgTbl tr.mg-detail > td { flex: 1 1 100%; }
   #mgTbl td:empty { display: none; }
 }
+
+/* ---- standalone page (GitHub Pages): no server yet ----------------- */
+.conn-help { margin: 8px 16px; }
+.conn-help code { overflow-wrap: anywhere; }
+#server { width: 190px; }
