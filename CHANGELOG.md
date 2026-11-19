@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.33.0
 
 - **A long-poll of a quiet resource from its head costs no transaction** (§7.7). A device
   following its own resource asked again at every interval boundary, and each request read the
@@ -24,6 +24,10 @@
   The script runs the cores and the load generators on EC2 instances of their own, with an RDS
   Postgres the cores share; `deploy/devices-summary.py` merges the load generators' steps with
   the cores' and RDS's CPU. See docs/CAPACITY.md, "Rerunning".
+- **docs/CAPACITY.md states what is known now**: what each setup measured and what limits it,
+  as of 2026-11-19, with the defaults and when to change them. The history (the 2026-10-15
+  measurements, the limits fixed since, the prototype set aside) and the raw files that backed
+  only it are gone.
 
 ## v0.32.0
 
