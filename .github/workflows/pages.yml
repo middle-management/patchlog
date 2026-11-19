@@ -1,0 +1,53 @@
+name: Pages
+
+# Publishes the playground (internal/playground/static) to GitHub Pages. The
+# hosted page is standalone: it calls the patchlog server named in its Server
+# box (http://localhost:8080 until changed), which has to allow the page's
+# origin with --cors-origin. See README, "Playground on GitHub Pages".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - internal/playground/static/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - name: assemble the site
+        run: |
+          mkdir _site
+          cp -r internal/playground/static/. _site/
+          # The server sends the playground's CSP as a header; Pages can't, so
+          # the copy carries it in a meta tag, with connect-src opened to the
+          # server the page is pointed at (frame-ancestors has no meta form).
+          csp="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' http: https:; base-uri 'none'; form-action 'none'"
+          sed -i "s|<meta charset=\"utf-8\">|<meta charset=\"utf-8\">\n<meta http-equiv=\"Content-Security-Policy\" content=\"$csp\">|" _site/index.html
+          grep -q 'http-equiv="Content-Security-Policy"' _site/index.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

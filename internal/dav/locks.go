@@ -57,7 +57,25 @@ func (l *boundedLS) Create(now time.Time, d webdav.LockDetails) (string, error) 
 		return "", err
 	}
 	sc.locked[tok] = heldLock{exp: now.Add(d.Duration), root: slashClean(d.Root)}
+	st.newLock = tok
 	return tok, nil
+}
+
+// dropNewLock releases the lock st's LOCK created, where the request is
+// answered with a failure instead (errWriter): the client is given no
+// token, so the lock would refuse its next LOCK (423) until it timed out.
+func (st *reqState) dropNewLock() {
+	tok := st.newLock
+	if tok == "" {
+		return
+	}
+	st.newLock = ""
+	err := st.sc.locks.Unlock(st.s.opt.Now(), tok)
+	st.sc.p.mu.Lock()
+	if _, ok := st.sc.locked[tok]; ok && (err == nil || err == webdav.ErrNoSuchLock) {
+		delete(st.sc.locked, tok)
+	}
+	st.sc.p.mu.Unlock()
 }
 
 func (l *boundedLS) Refresh(now time.Time, token string, d time.Duration) (webdav.LockDetails, error) {

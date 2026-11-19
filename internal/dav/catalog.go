@@ -1963,7 +1963,7 @@ func (st *reqState) notCopiedInto(ctx context.Context, f *treeFiles, src, dst ta
 	now := st.s.opt.Now()
 	behind := func() error {
 		e := fail(http.StatusServiceUnavailable, "folder %s isn't copied yet: catalog %s's tree service hasn't caught up with your latest writes, so that %s isn't in it can't be checked, and your grant doesn't read the catalog's nodes otherwise; try again in a moment (§H.5, §H.7 \"Limited grants\")", src.path, src.ns, dst.dir)
-		e.header = http.Header{"Retry-After": {"1"}}
+		e.header = http.Header{"Retry-After": {retryBusy}}
 		return e
 	}
 	// Folders' parents are the catalog's alone.
@@ -1986,7 +1986,7 @@ func (st *reqState) notCopiedInto(ctx context.Context, f *treeFiles, src, dst ta
 	var a *svcAnswer
 	for hops := 0; a == nil; hops++ {
 		if hops > 4 {
-			return fail(http.StatusBadGateway, "catalog %s's tree service redirected the ancestors of %s more than 4 times", src.ns, dst.dir)
+			return upFailed(fmt.Sprintf("catalog %s's tree service", src.ns), fmt.Errorf("redirected the ancestors of %s more than 4 times", dst.dir))
 		}
 		var loc *url.URL
 		a, loc, err = st.svcGet(ctx, src.ns, u, len(mins) > 0)

@@ -104,15 +104,20 @@ func (t *tx) link(id int64) nsLink {
 // too: the links, and where rows change only by this transaction's own
 // statements (snapshotRows) the rows as well, which costs nothing more.
 func (t *tx) readChain(id int64) {
-	cols := `ns, name, base`
+	cols, colsN := `ns, name, base`, `n.ns, n.name, n.base`
 	if t.snapshotRows() {
-		cols = nsCols
+		cols, colsN = nsCols, nsColsN
 	}
-	rows, err := t.Query(`WITH RECURSIVE c(ns) AS (
-			SELECT ns FROM namespaces WHERE ns = ?
+	// The rows travel with the recursion, each base found by its key from
+	// the row below it. Read afterwards from namespaces by the ids the
+	// recursion returned (ns IN (SELECT ns FROM c)), Postgres hashed those
+	// and scanned the whole table, so a read through a branch cost in
+	// proportion to the deployment's namespaces.
+	rows, err := t.Query(`WITH RECURSIVE c(`+cols+`) AS (
+			SELECT `+cols+` FROM namespaces WHERE ns = ?
 			UNION ALL
-			SELECT n.base FROM namespaces n JOIN c ON n.ns = c.ns WHERE n.base IS NOT NULL)
-		SELECT `+cols+` FROM namespaces WHERE ns IN (SELECT ns FROM c)`, id)
+			SELECT `+colsN+` FROM c JOIN namespaces n ON n.ns = c.base)
+		SELECT `+cols+` FROM c`, id)
 	t.must(err)
 	defer rows.Close()
 	if t.links == nil {
@@ -137,15 +142,11 @@ func (t *tx) readChain(id int64) {
 // in one statement however many they are: those of the namespaces a purge
 // reaches (nspurge.go).
 func (t *tx) readChains(ids []int64) {
-	seed := `SELECT unnest(?::bigint[])`
-	if !t.e.pg {
-		seed = `SELECT value FROM json_each(?)`
-	}
-	rows, err := t.Query(`WITH RECURSIVE c(ns) AS (
-			`+seed+`
+	rows, err := t.Query(`WITH RECURSIVE c(ns, name, base) AS (
+			SELECT ns, name, base FROM namespaces WHERE `+t.e.inArray("ns", "bigint")+`
 			UNION
-			SELECT n.base FROM namespaces n JOIN c ON n.ns = c.ns WHERE n.base IS NOT NULL)
-		SELECT ns, name, base FROM namespaces WHERE ns IN (SELECT ns FROM c)`, t.e.arrayArg(ids))
+			SELECT n.ns, n.name, n.base FROM c JOIN namespaces n ON n.ns = c.base)
+		SELECT ns, name, base FROM c`, t.e.arrayArg(ids))
 	t.must(err)
 	defer rows.Close()
 	if t.links == nil {

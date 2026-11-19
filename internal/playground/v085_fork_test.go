@@ -120,7 +120,7 @@ func TestV085ForkBoundWithNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	var fns []string
-	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "revTarget", "notOffered", "readDoc", "nsChainOK",
+	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "revTarget", "notOffered", "readDoc", "nsFirstEntry", "revPrecedes", "nsChainOK",
 		"epochKey", "contentKey", "openSealed", "decrypted", "openSnapshot", "foldLog", "nsDocPL", "nsHeadDoc", "openSealedEntries", "loadHistory", "openEntries"} {
 		fns = append(fns, jsFunction(t, js, f))
 	}

@@ -34,7 +34,7 @@ func TestV082AccessGSCookieEndsOnKeyChange(t *testing.T) {
 	expect(t, w.do(req{method: "GET", path: at, hdr: ck}), 200)
 
 	since := w.nsHead("matches", w.admin)
-	cur := waitCursor(interval, 1500*time.Millisecond)
+	cur := waitCursor(t, newLiveClock(interval, filteredLogPath("matches", gs)), 1500*time.Millisecond)
 	done := make(chan *resp, 1)
 	go func() {
 		done <- w.do(req{method: "GET", path: base + "/log?live=long-poll&since=" + since + "&cursor=" + strconv.FormatInt(cur, 10), hdr: ck})

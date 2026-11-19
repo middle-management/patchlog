@@ -15,11 +15,13 @@ through production code and
 candidates P.1–P.7 of v0.81, which v0.82 took into the Addendum; §I.17 as v0.85 recomputed it,
 which the reference confirms),
 [internal/vectors/addendum_i22_test.go](internal/vectors/addendum_i22_test.go) §I.22–§I.24 (the
-candidates C.1–C.3 of v0.82, in the Addendum since v0.85), and
+candidates C.1–C.3 of v0.82, in the Addendum since v0.85),
+[internal/vectors/addendum_i25_test.go](internal/vectors/addendum_i25_test.go) §I.25 (long-poll
+phases, v0.86), and
 [docs/TESTVECTORS.md](docs/TESTVECTORS.md) points there and records which candidate vectors of
 [docs/VECTORS-PROPOSED.md](docs/VECTORS-PROPOSED.md) the reference confirms (C.4 and C.5,
 v0.85). The
-additions the reference proposes to the spec writer (for §I.25's list, "Still to come", and the
+additions the reference proposes to the spec writer (for §I.26's list, "Still to come", and the
 writer's own: RE2 `\u`, key
 wraps, sealed payloads, blobs and bundles, the plan digest, Biscuit tokens, file renderings and
 more) live in [internal/vectors/testdata](internal/vectors/testdata), each naming the production
@@ -722,9 +724,11 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   the loser re-check and answer `412` with the new head (or the idempotent retry), as on
   SQLite. The namespace entry is appended last, under a separate advisory **log lock**,
   `pg_advisory_xact_lock(0x504e, ns)`, taken after every other lock, in ascending order when a
-  write appends to several logs (purge propagation, which takes them in one statement, and
-  branch creation), and held through commit,
-  so entries commit, and their sequence numbers grow, in chain order. A transaction holding a
+  write appends to several logs, and held through commit,
+  so entries commit, and their sequence numbers grow, in chain order. A write that holds a
+  namespace's lock exclusively takes no log lock for it: every appender holds the namespace's
+  lock first, so none is there (a purge that reaches thousands of branches holds one lock for
+  each, and appends their entries in one statement). A transaction holding a
   log lock never waits for a namespace lock (it tries, and restarts with the lock taken up
   front if that fails). An uploader's pending blob total (§7.8) is ordered by a row of its
   own (`blob_uploaders`), so concurrent uploads can't together exceed `blobPending`. Details in
@@ -1263,6 +1267,35 @@ body is capped at 16 MiB and 50 files. The demo composes pass
 
 Run it with `./patchlog serve --dev` and open `http://localhost:8080/playground/`. Sealed and e2e
 namespaces need `--master-key FILE --master-key-create`.
+
+#### Playground on GitHub Pages
+
+The same page is published at **https://middle-management.github.io/patchlog/** by
+`.github/workflows/pages.yml` on every push to `main` that touches `internal/playground/static`.
+There it is standalone: it calls the server in the **Server** box of its top bar
+(`http://localhost:8080` until changed; `?server=URL` sets it too and makes a link to share), and
+that server has to allow the page's origin:
+
+```bash
+./patchlog serve --dev --cors-origin https://middle-management.github.io
+```
+
+or, for the compose stack, `PATCHLOG_CORS_ORIGINS=https://middle-management.github.io make up`.
+Until `GET /` answers, the page says so and shows the command for its own origin. Only the
+server's origin counts (the API is at its root), and a server on another port of `localhost` gets
+`--addr` in the suggested command. An HTTPS page can call plain `http://` on `localhost` only;
+any other server needs `https://`. Chrome may ask once whether the page may reach the local
+network.
+
+The page tells the two apart by its path: under `/playground/` it is the server's own and calls
+its origin, with the CSP header above; anywhere else it is standalone. The Pages copy carries the
+CSP as a meta tag, with `connect-src` open to `http:` and `https:` for the server it is pointed at.
+The tree and index proxies, the merge and schema-import planners and `selftest.json`'s vectors
+work as on the server (the vectors are the page's own file), and the namespaces, keys and boxes
+kept in localStorage belong to the Pages origin, shared by every server it is pointed at.
+
+To serve the copy yourself, any static file server will do, e.g. `python3 -m http.server -d
+internal/playground/static 8000` with `--cors-origin http://localhost:8000`.
 
 ### Undo and redo (§11.2)
 
@@ -3388,7 +3421,18 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   MOVE, COPY or MKCOL like a save (TOOLS §H.4 "Answers"): a core or tree service request the
   answer depends on that fails for now fails the request, and never counts as a refusal. So a
   DELETE made while `GET /ns/{ns}/principal` answers `408` is `502`, where it was `403`, and
-  no write goes ahead on settings a failed read left unknown.
+  no write goes ahead on settings a failed read left unknown. Since v0.86 every core or service
+  request the gateway makes for a user's request counts, whether or not the answer needs it
+  (TOOLS §H.4 "Answers"; CONFORMANCE "Grant scope" 86, 87): a GET of a file while the core
+  answers `500` to a read of a sibling item's namespace document is `502`, where it was `200`
+  from the rest; a write that was made before such a read failed stays made, and the answer is
+  still the failure. A request counts by how it ends: a `429` waited out and sent again has not
+  failed. Requests the server makes outside a user's request (verifying a token again, its own
+  start-up reads) don't count. These `502` and `503` name only the upstream that failed
+  ("the core failed", "catalog cat's tree service is busy or behind for now; try again") and
+  carry nothing of its answer: no code, message or status of the upstream's, and the `503`'s
+  `Retry-After` is the gateway's own (1 s for a busy or behind upstream, 5 s where no answer
+  came in time), never the upstream's. What the upstream said is in the server's log.
   A raw file over a JSON document's, or the
   other way round, replaces its root. A purged one is `410`, as is any name of a purged
   namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
@@ -3698,8 +3742,9 @@ only.
   file or folder, a move or a delete, which
   the node documents decide, is `403`, saying so, a move before anything is written (onto another
   file, or to another tree or namespace, the copy is the first write). The tree service unreachable is
-  `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with its
-  `Retry-After`: never an empty folder. Its `401` and `403` are the user's grant refused, answered
+  `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with the
+  gateway's own `Retry-After` that names the tree service and nothing of its answer (v0.86; the
+  namespace a `503 behind` names stays in the log): never an empty folder. Its `401` and `403` are the user's grant refused, answered
   as the core's are (in local mode a `401` refuses `--bearer`: `502`, naming the tree service). A
   tree service answers `503` behind until it has caught up with every namespace the catalog
   trusts and can follow, not only with the catalog (started with a fresh database, rebuilt, or
@@ -3728,15 +3773,19 @@ only.
   `X-Namespace-Revision`, seen as the core answers it), which the tree service waits for (§B.5),
   until a listing that carried them came back, for at most 10 minutes (at most the last 4 entries
   of 64 namespaces a user); other users' listings don't wait. If it hasn't caught up within
-  `--tree-wait` (3 s; the tree service's own `--min-wait`, 2 s, answers sooner), the folder is
-  listed from the node documents instead, as without a tree service, and so are the user's
-  listings of that tree for 5 seconds, however long the tree service lags within those 10
+  `--tree-wait` (3 s; the tree service's own `--min-wait`, 2 s, answers sooner), the request
+  is answered `503` with `Retry-After: 1` (v0.86, §H.3 "A tree service that is behind": "a tool
+  answers `503`"; before, the folder was listed from the node documents in that same request),
+  and the user's requests of that tree for the next 5 seconds don't ask the tree service: their
+  folders are listed from the node documents, as without a tree service, however long the tree
+  service lags within those 10
   minutes: their new file stays listed, and a file they renamed doesn't come back by its old name;
   a grant that can't read the node documents gets `503` with `Retry-After` for 30 s after the
   write, then the tree service's listing without waiting. A `min` the tree service refuses
   (`400`: a namespace it doesn't follow, or the reader can't see) is found per namespace, each
   one's asked for alone: those refused, and those reached, aren't asked for again, the rest
-  are, and that listing is from the node documents.
+  are; that listing is from the node documents, unless the tree service is still behind one of
+  them, which is the `503` above.
 - **New files** (§H.4). A PUT of a new name creates an item in `files.ns` with an opaque name (13
   random base32 characters), and its placement titled with the name, under its folder: one
   `parents` entry, ordered after the folder's last ordered child, so new files list last, and
@@ -3849,7 +3898,7 @@ sessions, agents through MCP and recording model calls (J.5–J.7) are not imple
 | `--upstream` | An allowed upstream: a URL prefix (repeatable). An `Upstream-URL` must have the same scheme and host and a path under the prefix's, at a segment boundary; anything else is `403`. No `--upstream` refuses every request. Redirects are not followed: a `3xx` is kept as the stream. |
 | `--flush` | Least time between two appends to one stream (default 200 ms, §J.2 Pace). |
 | `--ttl` | How long read grants live from a stream's creation (default 24 h); a closed stream that old is purged with its continuations (§J.4 Expiry). |
-| `--idle-timeout` | A stream with no append for this long is closed with `"timeout"` (default 2 m). |
+| `--idle-timeout` | A stream with no append for this long is closed with `"timeout"`, by any proxy (default 2 m). The time is the deployment's, one for all its proxies (§J.2 Restarts): give every proxy of `--ns` the same value. Nothing checks that they agree, and with different values the shortest closes every proxy's streams. |
 | `--state` | A file with the names of the streams being written; a proxy started again closes those still open with `"error"` (§J.2 Restarts). Without it they are closed by the idle sweep, with `"timeout"`. |
 | `--segment-size` | The size at which a stream continues in its next resource, where that is below the namespace's `documentSize` (default: `documentSize`). Each append costs the stream's size so far, so where latency matters §J.1 suggests well below it, `--segment-size "256 KiB"` say. |
 | `--max-request-body`, `--max-segments`, `--max-streams` | Largest body forwarded upstream (1 MiB); most resources one response may fill (8); most streams carried at once (64, then `503` with `Retry-After`; requests that arrive together share the count, and a `Request-Key` request for a stream that exists needs no slot). |
@@ -4128,6 +4177,9 @@ patchlog import -i all.jsonl --atomic --ns demo-schemas=demo2-schemas,demo=demo2
   missing ones first, listing the importer's key and allowance; a `401` or `403` on the first
   read of a target namespace says so.
 - **Branches** export with the base's history included, or with `--foreign-parents` naming the base revisions in `requires`.
+  The foreign parent is the resource's head as the branch's own `/heads` lists it at the
+  branch's first `ns_id` (§G.4.1, v0.86): the exporter reads nothing in the base, needs no
+  grant there, and a branch of a remote base (§G.3) exports the same way.
   An e2e branch's documents always export the second way, its keyring aside (v0.82, §G.5.1; see
   E3 under Encryption below).
 - **Blobs** (§G.4.1) travel as blob lines (unpadded base64url; padded is accepted), each
@@ -4189,13 +4241,16 @@ patchlog import --ns secret -i s.plb --identity me.jwk --atomic
   target's keyring must share the bundle's history, else the import is refused at step 1. An
   e2e branch's export writes no line the branch reads through from its base, whose sealed ops
   name the base (v0.82, §G.5.1 Importing): a document continued in the branch starts after its
-  foreign parent, the base's head at `base.at`, named in `requires` (a `requires` before it, or
+  foreign parent, its head as the branch's `/heads` lists it at the branch's first `ns_id`,
+  named in `requires` (a `requires` before it, or
   a foreign parent that isn't in the chain, refuses the document); one the branch never wrote
   is `external`, pinned to its revision; the keyring comes whole, unless the export asks for
   `--foreign-parents`; and a branch of a remote base
-  exports only documents that start with a line of its own. The importer looks a pinned
-  `external` up in the target's chain where an e2e target serves no document by revision, and
-  for a tombstone at any level. Lines
+  exports the same way (v0.86; before, only documents that start with a line of its own). The
+  importer asks the target for a pinned `external` without opening it, so it needs no key of a
+  sealed or e2e target; it looks the pin up in the target's chain where an e2e target serves
+  no document by revision, and for a tombstone at any level; a pin pruned without a kept
+  document is not in the target (§G.4.2, v0.86). Lines
   go in batches per epoch, in epoch order, each epoch's raise of `encryption.epoch` in the batch
   with the keyring line that brings its key (so atomic mode is atomic per epoch); an existing
   target is refused only below the bundle's lowest epoch, or past the epoch of a sealed line it
@@ -4285,6 +4340,13 @@ The last row is the root: paste its path into a document's `$schema` (or another
   `--schema-fetch-hosts`.
 
 ### A short tour (dev mode)
+
+For how a client should cut its writes (small patch sets, gestures, retries, splitting large
+changes), when to work in a branch, and how to merge, squash and rebase, see the client guide
+[.claude/skills/patchlog-client/SKILL.md](.claude/skills/patchlog-client/SKILL.md), with branches and
+merging in [merging.md](.claude/skills/patchlog-client/merging.md) and each command mapped to its HTTP
+requests in [http.md](.claude/skills/patchlog-client/http.md). It is also a
+Claude Code skill: copy the folder into another project's `.claude/skills/` to use it there.
 
 The client commands call the public API (§7) through `internal/client`. Every write is
 conditional (§7.2), and they supply the precondition: `put` and `ns create` send
@@ -4917,7 +4979,13 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   while the read cache's meta counter (configuration, purges, prunes, restores, key destruction;
   on Postgres while the tailer is fresh) hasn't moved, and before the grant's earliest `exp`
   (since v0.78 a rule on `/now` never passes for a read, so it no longer matters here); edge
-  grants and resource long-polls are read on their own, as before. When it was first measured
+  grants and resource long-polls are read on their own, as before. A resource's long-polls and
+  event streams wait on the resource, not the namespace (`Engine.WaitResource`): they are woken
+  by commits naming it (a write, a batch item, a purge or a prune) and by entries that name no
+  resource (configuration changes, branches, namespace purges), not by writes to its other
+  resources. So a client following its own document doesn't read it again on every write to the
+  namespace; on Postgres the tailer wakes by resource too, from the `ns_log` entries it reads
+  ([docs/CAPACITY.md](docs/CAPACITY.md), "Resource followers"). When it was first measured
   ([docs/CAPACITY.md](docs/CAPACITY.md), "Earlier measurements") one write to 5,000 private followers went from 3.7–4.1 s
   of core CPU to 0.3–1 s. The local CDN's VCL lets a long-poll with credentials skip Varnish's
   waiting list (`hash_ignore_busy`), so a private one isn't held behind an identical request in
@@ -4925,7 +4993,14 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
 - **Live reads** (§7.3, §7.7, v0.73). A long-poll without a cursor, or with one behind by an
   hour's worth of intervals or less, is answered at once (`200`, or `204` with the current
   `X-Cursor`); one further behind is `400 bad_input`, which followers and `cmd/capacity` answer
-  by dropping the cursor and polling again. A long-poll or stream of a resource with no entries
+  by dropping the cursor and polling again. Each log's intervals are counted from the epoch plus
+  the log's phase (§7.7 as of v0.86, vectors §I.25): the first 8 bytes of the SHA-256 of
+  `/r/{ns}/{name}/log`, `/ns/{ns}/log` or `/ns/{ns}/g/{gs}/log`, modulo the interval in
+  milliseconds, so the waits of a deployment's logs don't all end at one instant. Every
+  deployment counts them so; there is no option to count them from the epoch alone. Followers of
+  one URL share its boundaries and cursors; a cursor carried from
+  one log to another (a partial reader's long-poll, redirected to its filtered log) is at most one
+  off there, and answered as any cursor behind or ahead is. A long-poll or stream of a resource with no entries
   waits for its first. A stream judges its read check again before each page and keep-alive,
   ends at the latest when the grant or cookie it was admitted under expires, and a namespace
   stream ends after its `purge-ns` event.

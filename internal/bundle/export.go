@@ -71,7 +71,8 @@ type ExportOptions struct {
 	// are bundled. By default their chains include the base's entries back
 	// to genesis (§G.4.1), under the branch's name, so the bundle stands
 	// alone. With ForeignParents, a chain starts after its foreign parent
-	// (the base's head as of the branch's at), which goes in requires, and
+	// (its head as the branch's own /heads lists it at the branch's first
+	// ns_id, §G.4.1), which goes in requires, and
 	// a read-through resource (no entries of its own) is not bundled but
 	// listed in external as "{branch}/{name}/rev/{head}": the target must
 	// already hold the base, e.g. by importing with the branch mapped onto
@@ -163,10 +164,7 @@ type ExportPlan struct {
 	ext     map[string]bool
 	queue   []string
 	schemas map[string]any                        // schema revision path → document
-	bases   map[string]map[string]client.HeadItem // branch ns → its base's heads as of at (nil: not a branch)
-	// remoteBase marks the e2e branches whose base is in another
-	// deployment (§G.3), which have no base heads here.
-	remoteBase map[string]bool
+	bases   map[string]map[string]client.HeadItem // branch ns → its own heads at its first ns_id, the foreign parents (nil: not a branch)
 }
 
 func (p *ExportPlan) reason(d *PlannedDoc, format string, args ...any) {
@@ -195,7 +193,7 @@ func PlanExport(ctx context.Context, c *client.Client, opt ExportOptions) (*Expo
 		return nil, fmt.Errorf("export: origin: %w", err)
 	}
 	p := &ExportPlan{Origin: origin, At: map[string]string{}, Docs: map[string]*PlannedDoc{}, Access: map[string]string{}, c: c, opt: opt,
-		heads: map[string]map[string]client.HeadItem{}, bases: map[string]map[string]client.HeadItem{}, remoteBase: map[string]bool{}, ext: map[string]bool{}, schemas: map[string]any{}}
+		heads: map[string]map[string]client.HeadItem{}, bases: map[string]map[string]client.HeadItem{}, ext: map[string]bool{}, schemas: map[string]any{}}
 
 	// Take the selected namespaces' at first (§G.4.1 consistency).
 	var sel []string
@@ -444,7 +442,12 @@ func (p *ExportPlan) need(ctx context.Context, from *PlannedDoc, t Target, force
 	return nil
 }
 
-// baseHeads returns the heads of ns's base as of the branch's at, or nil
+// baseHeads returns, for a branch ns, its foreign parents: each resource's
+// head as the branch's own /heads lists it at the branch's first ns_id
+// (§G.4.1, v0.86; §10), which is what the branch read through when it was
+// made, whatever its base is: a local namespace, another branch, or one
+// in another deployment (§G.3), whose shadow the branch is a branch of.
+// Nothing is read in the base, so the exporter needs no access there. nil
 // if ns isn't a branch.
 func (p *ExportPlan) baseHeads(ctx context.Context, ns string) (map[string]client.HeadItem, error) {
 	if m, ok := p.bases[ns]; ok {
@@ -455,20 +458,17 @@ func (p *ExportPlan) baseHeads(ctx context.Context, ns string) (map[string]clien
 		return nil, fmt.Errorf("export: namespace %s: %w", ns, err)
 	}
 	var m map[string]client.HeadItem
-	if b, ok := doc.Value["base"].(map[string]any); ok {
-		bns, _ := b["ns"].(string)
-		at, _ := b["at"].(string)
-		if origin, _ := b["origin"].(string); origin != "" && p.Access[ns] == AccessE2E {
-			// A remote base (§G.3) has no heads to read here: an e2e
-			// branch of one exports only the documents that are its own
-			// from genesis (afterForeignParent).
-			p.remoteBase[ns] = true
-			p.bases[ns] = nil
-			return nil, nil
-		}
-		items, err := p.c.Heads(ctx, bns, at)
+	if _, ok := doc.Value["base"].(map[string]any); ok {
+		page, _, err := p.c.NSLogPage(ctx, ns, p.At[ns], "")
 		if err != nil {
-			return nil, fmt.Errorf("export: base %s of %s: %w", bns, ns, err)
+			return nil, fmt.Errorf("export: the namespace log of branch %s: %w", ns, err)
+		}
+		if len(page) == 0 {
+			return nil, fmt.Errorf("export: the namespace log of branch %s has no first entry", ns)
+		}
+		items, err := p.c.Heads(ctx, ns, page[0].ID)
+		if err != nil {
+			return nil, fmt.Errorf("export: branch %s as of its first entry %s: %w", ns, page[0].ID, err)
 		}
 		m = map[string]client.HeadItem{}
 		for _, it := range items {
@@ -851,18 +851,6 @@ func (p *ExportPlan) afterForeignParent(ctx context.Context, d *PlannedDoc, entr
 	bh, err := p.baseHeads(ctx, d.NS)
 	if err != nil {
 		return err
-	}
-	if p.remoteBase[d.NS] {
-		// Where the base's history ends can't be read: only a chain that
-		// starts with a line of the branch's own has none of it.
-		if len(entries) > 0 && entries[0].Kind == "rev" {
-			if jwe, sealed := seal.SealedJWE(entries[0].Patches); sealed {
-				if _, _, _, own, err := sealedOpFor(d.NS, jwe); err == nil && own {
-					return nil
-				}
-			}
-		}
-		return fmt.Errorf("e2e branch %s has its base in another deployment, and %s doesn't start with a line of the branch's own: where its read-through history ends can't be told here, so it isn't exported (§G.5.1)", d.NS, d.Name)
 	}
 	b, ok := bh[d.Name]
 	if !ok || b.Kind == "purge" {

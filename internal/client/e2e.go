@@ -129,7 +129,7 @@ type E2E struct {
 // from in its local bases (chainCheck): a branch's at never changes.
 type e2eForks struct {
 	mu sync.Mutex
-	m  map[string][]string
+	m  map[string]forkList
 }
 
 // e2ePads caches, per namespace, whether it padded when each of its
@@ -183,7 +183,7 @@ func (c *Client) E2E(recipient *ecdh.PrivateKey) *E2E {
 		keys:    &e2eKeys{m: map[string][]byte{}, from: map[string]string{}},
 		schemas: newE2ESchemas(),
 		pads:    &e2ePads{m: map[string]*padHistory{}},
-		forks:   &e2eForks{m: map[string][]string{}},
+		forks:   &e2eForks{m: map[string]forkList{}},
 		seals:   &e2eSeals{m: map[string]*sealCount{}}}
 }
 
@@ -1316,8 +1316,11 @@ func (x *E2E) chain(ctx context.Context, ns string) (depth map[string]int, remot
 // chain forked from that base (Addendum E Levels, §E.3.1): its head of the
 // resource as of the branch's at, the fork, which /heads gives. Past the
 // fork, every entry is the branch's own. A remote base's fork is the head
-// the branch lists at its first entry (remoteFork; §G.3, v0.85). A fork a
-// reader without access to those /heads can't place isn't checked.
+// the branch lists at its first entry (ownFork; §G.3, v0.85), and so is a
+// local base's where the reader may not read the base's /heads (§G.4.1).
+// Where a reader can place a fork by neither, the check fails closed: no
+// namespace beyond that fork is accepted, anywhere in the log (§E.2.2,
+// v0.86), while the bases up to it are checked as ever.
 type chainCheck struct {
 	x      *E2E
 	ctx    context.Context
@@ -1334,11 +1337,15 @@ type chainCheck struct {
 	seen  []string // ids passed before the forks were loaded
 	// forks[d] is the revision of name that the chain at depth d forked
 	// from in the base at depth d+1, "" where that base had none; passed[d]
-	// is set once the check is past it. loaded is set once they are known
-	// (nil forks: not checked).
-	forks  []string
-	passed []bool
-	loaded bool
+	// is set once the check is past it. unplaced says the fork at depth
+	// len(forks) couldn't be placed: nothing deeper is accepted. loaded is
+	// set once they are known.
+	forks    []string
+	passed   []bool
+	unplaced bool
+	loaded   bool
+	// blind is set where ok last refused for an unplaced fork.
+	blind bool
 }
 
 func (x *E2E) inChain(ctx context.Context, ns string) *chainCheck {
@@ -1359,6 +1366,7 @@ func (x *E2E) inChainOf(ctx context.Context, ns, name, since string, ids []strin
 
 func (c *chainCheck) ok(kns string) (bool, error) {
 	d := 0
+	c.blind = false
 	if kns != c.ns {
 		if c.depth == nil {
 			var err error
@@ -1373,6 +1381,12 @@ func (c *chainCheck) ok(kns string) (bool, error) {
 		if c.name != "" {
 			if err := c.loadForks(); err != nil {
 				return false, err
+			}
+			if c.unplaced && d > len(c.forks) {
+				// The foreign parent between here and kns can't be
+				// placed: the op fails the check (§E.2.2, §E.3.2).
+				c.blind = true
+				return false, nil
 			}
 			for j := 0; j < d && j < len(c.passed); j++ {
 				if c.passed[j] {
@@ -1412,8 +1426,8 @@ func (c *chainCheck) loadForks() error {
 	if err != nil {
 		return err
 	}
-	c.loaded, c.forks, c.passed = true, forks, make([]bool, len(forks))
-	for d, f := range forks {
+	c.loaded, c.forks, c.unplaced, c.passed = true, forks.ids, forks.unplaced, make([]bool, len(forks.ids))
+	for d, f := range forks.ids {
 		switch {
 		case f == "":
 			// The base had no revision of it: nothing is read through.
@@ -1437,12 +1451,24 @@ func (c *chainCheck) loadForks() error {
 	return nil
 }
 
+// forkList is the forks of one resource along a namespace's chain of
+// bases: ids[d] is the revision the chain at depth d forked from in the
+// base at depth d+1, "" where that base had none. unplaced says the fork
+// at depth len(ids) couldn't be placed, so neither could any deeper one.
+type forkList struct {
+	ids      []string
+	unplaced bool
+}
+
 // forksOf returns, for ns and its bases, the forks of resource name
-// (chainCheck.forks), nil where they can't be had: ns isn't a branch, or
-// this reader can't read a local base's /heads, or a remote branch's own
-// log and /heads. A remote base ends the list with the one fork every
-// namespace of its chain lies behind (remoteFork).
-func (x *E2E) forksOf(ctx context.Context, ns, name string) ([]string, error) {
+// (chainCheck.forks). A fork is the base's head of the resource as of the
+// branch's at, which is also the head the branch itself lists at its first
+// entry (ownFork; §G.4.1): the base's /heads is asked first, and the
+// branch's own where this reader may not read the base's, or the base is
+// in another deployment. A remote base ends the list with the one fork
+// every namespace of its chain lies behind. A fork that neither places
+// ends the list as unplaced (§E.2.2: the op fails the check).
+func (x *E2E) forksOf(ctx context.Context, ns, name string) (forkList, error) {
 	key := ns + "/" + name
 	x.forks.mu.Lock()
 	f, ok := x.forks.m[key]
@@ -1450,42 +1476,46 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) ([]string, error) {
 	if ok {
 		return f, nil
 	}
-	var forks []string
+	// A listing this reader may not read, or that isn't there for it: a
+	// refusal, or the redirect a partial reader gets to its filtered
+	// listing (§B.11.9), which isn't the one a fork is placed by.
+	cant := func(err error) bool {
+		var ae *APIError
+		return IsAuth(err) || IsNotFound(err) || IsGone(err) || errors.Is(err, errNoGenesis) ||
+			errors.As(err, &ae) && ae.Status >= 300 && ae.Status < 400
+	}
+	var forks forkList
 	for cur, seen := ns, map[string]bool{}; !seen[cur]; {
 		seen[cur] = true
 		cfg, err := x.config(ctx, cur)
 		if err != nil {
-			return nil, err
+			return forkList{}, err
 		}
 		if cfg.Base == "" || cfg.At == "" {
 			break
 		}
+		fork, err := "", error(nil)
 		if cfg.Remote {
 			// The base is in another deployment, whose /heads this
 			// reader may not reach: the foreign parent is the head the
 			// branch itself lists at its first entry, which is what it
 			// reads through as of at (§G.3, §7.6). Every namespace of
 			// the remote chain lies behind this one fork.
-			fork, err := x.remoteFork(ctx, cur, name)
-			if IsAuth(err) || IsNotFound(err) || IsGone(err) || errors.Is(err, errNoGenesis) {
-				forks = nil
-				break
-			}
-			if err != nil {
-				return nil, err
-			}
-			forks = append(forks, fork)
-			break
+			fork, err = x.ownFork(ctx, cur, name)
+		} else if fork, err = x.headAt(ctx, cfg.Base, cfg.At, name); cant(err) {
+			fork, err = x.ownFork(ctx, cur, name)
 		}
-		fork, err := x.headAt(ctx, cfg.Base, cfg.At, name)
-		if IsAuth(err) || IsNotFound(err) || IsGone(err) {
-			forks = nil
+		if cant(err) {
+			forks.unplaced = true
 			break
 		}
 		if err != nil {
-			return nil, err
+			return forkList{}, err
 		}
-		forks = append(forks, fork)
+		forks.ids = append(forks.ids, fork)
+		if cfg.Remote {
+			break
+		}
 		cur = cfg.Base
 	}
 	x.forks.mu.Lock()
@@ -1494,15 +1524,16 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) ([]string, error) {
 	return forks, nil
 }
 
-// errNoGenesis is a remote branch whose log doesn't start with its config
-// genesis, as a deployment's (§G.3) does: its fork can't be placed.
+// errNoGenesis is a branch whose log doesn't start with its config
+// genesis, as a deployment's (§G.3, §10 Branches) does: its fork can't be
+// placed from its own /heads.
 var errNoGenesis = errors.New("the log does not start with a config genesis")
 
-// remoteFork is the revision of name a remote branch ns forked from in its
-// base: its head of name as of its own first namespace entry, the config
-// genesis its log starts with, before any write of its own (§G.3, §10
-// Branches). "" if it read none through.
-func (x *E2E) remoteFork(ctx context.Context, ns, name string) (string, error) {
+// ownFork is the revision of name a branch ns forked from in its base, as
+// the branch itself gives it (§G.4.1): its head of name as of its own first
+// namespace entry, the config genesis its log starts with, before any
+// write of its own (§G.3, §10 Branches). "" if it read none through.
+func (x *E2E) ownFork(ctx context.Context, ns, name string) (string, error) {
 	h, err := x.c.NSHead(ctx, ns)
 	if err != nil {
 		return "", err
@@ -1513,7 +1544,7 @@ func (x *E2E) remoteFork(ctx context.Context, ns, name string) (string, error) {
 		return "", err
 	}
 	if len(entries) == 0 || entries[0].Kind != "config" {
-		return "", fmt.Errorf("client: remote branch %s: %w", ns, errNoGenesis)
+		return "", fmt.Errorf("client: branch %s: %w", ns, errNoGenesis)
 	}
 	return x.headAt(ctx, ns, entries[0].ID, name)
 }
@@ -1591,6 +1622,9 @@ func (x *E2E) openSealed(ctx context.Context, name string, e LogEntry, nsOK *cha
 	if ok, err := nsOK.ok(kns); err != nil {
 		return nil, "", "", err
 	} else if !ok {
+		if nsOK.blind {
+			return nil, "sealed under a base's key " + h.Kid + ", where this reader can't place the resource's foreign parent (§E.2.2)", "", nil
+		}
 		return nil, "sealed under another namespace's key " + h.Kid, "", nil
 	}
 	key, err := x.keyVia(ctx, h.Kid, nsOK.ns)
@@ -1961,6 +1995,9 @@ func (x *E2E) openSnapshot(ctx context.Context, ns, name, h string, r *response,
 	if ok, err := nsOK.ok(kns); err != nil {
 		return nil, "", err
 	} else if !ok {
+		if nsOK.blind {
+			return nil, "", bad("sealed under a base's key %s, where this reader can't place the resource's foreign parent (§E.2.2)", hd.Kid)
+		}
 		return nil, "", bad("sealed under %s", hd.Kid)
 	}
 	key, err := x.keyVia(ctx, hd.Kid, ns)

@@ -1,5 +1,5 @@
 {
- "source": "docs/SPEC.md Addendum I, §I.15–§I.24 (v0.85; §I.17 as v0.85 recomputed it, §I.22–§I.24 the candidates C.1–C.3 of v0.82); the expected values are copied from it, never computed",
+ "source": "docs/SPEC.md Addendum I, §I.15–§I.25 (v0.86; §I.17 as v0.85 recomputed it, its last row as v0.86 changed it, §I.22–§I.24 the candidates C.1–C.3 of v0.82, §I.25 the long-poll phases of v0.86); the expected values are copied from it, never computed",
  "I.15": {
   "releaseDoc": "{\"branches\":{\"matches\":{\"at\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\",\"ns\":\"matches-r7\"}},\"name\":\"release-7\"}",
   "releaseGenesis": "1bx3m7usot3btfia44al7op7h4tbzwprh",
@@ -173,8 +173,8 @@
     "rule": "a blank one included"
    },
    {
-    "change": "line 2's last character `Q` made `B`",
-    "sha256": "b0f519c88e36960476e5fcc3c13133a0965bc1e3c452ff1dd28ea54e6678f63f",
+    "change": "line 2's last character `Q` made `A`",
+    "sha256": "f69e76d711dec63dd3d892b5dc9b6073587ce8b4f624aafb4627ac137fb54613",
     "rule": "any line fails to decrypt"
    }
   ]
@@ -417,6 +417,31 @@
     "change": "the header with `\"x-note\":\"hi\"`",
     "sha256": "eff926c75ff1a289375536562a090a02c1fabb11c921abfe43a5b95735548954",
     "rule": "a member §G.4.1 doesn't define"
+   }
+  ]
+ },
+ "I.25": {
+  "intervalMs": 20000,
+  "rows": [
+   {
+    "path": "/r/docs/a/log",
+    "first8": "c6b6521efdba5aa1",
+    "phaseMs": 15777
+   },
+   {
+    "path": "/r/docs/b/log",
+    "first8": "d88ca141ae2485cf",
+    "phaseMs": 1327
+   },
+   {
+    "path": "/ns/docs/log",
+    "first8": "7a75dc61743845ce",
+    "phaseMs": 18318
+   },
+   {
+    "path": "/ns/matches/g/17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm/log",
+    "first8": "557cd01ce3897ae3",
+    "phaseMs": 15523
    }
   ]
  }

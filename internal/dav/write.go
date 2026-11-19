@@ -1190,7 +1190,7 @@ func (st *reqState) retrying(ctx context.Context, attempt func() (retry bool, er
 		if client.IsRateLimited(err) {
 			ae := errAPI(err)
 			if waits >= 2 || ae.RetryAfter > st.s.opt.MaxRetryWait {
-				return busy(ae)
+				return upBusy(theCore, err)
 			}
 			waits++
 			t := time.NewTimer(ae.RetryAfter)

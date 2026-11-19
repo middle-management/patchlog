@@ -28,5 +28,14 @@ runs, which started from a new, empty one.
 | `sqlite-public-4vcpu-single-unlimited.json`, `sqlite-public-4vcpu-direct-longpoll.json` | as the server X files of those names |
 | `{pg-grants-serverX,sqlite-public-4vcpu}-prototype-member.json` | the prototype of branch `capacity-schema-single` on the same setup: its core with `-experimental-rebase -experimental-combine`, its harness with `-only single -single-rate 1000000 -single-rebase -single-workload member`. `_rebase` are the writes sent with `X-Experimental-Rebase`, `_rebase_producer` those that also carry a producer key |
 
+`resource-live-{sqlite,pg}-{before,after}-{256,1024}.json` are from 2026-11-19, on the same
+host without containers: `-only resource-live` against `serve --dev`, before and after resource
+long-polls stopped waking on the namespace's other writes. They started from a new, empty
+database, and Postgres 16 shared the host (`fsync=off`). See "Resource followers" in
+CAPACITY.md. `resource-live-sqlite-after-sweep.json` sweeps the follower count up to 12,288, and
+`resource-live-sqlite-phase.json` compares 8,192 and 12,288 followers with one epoch for every
+log (`--long-poll-fixed-epoch`, an option the core had until spec v0.86 made the phase the rule)
+and with per-log phases.
+
 [`2026-10-15/`](2026-10-15/) holds the first measurements (spec 0.52, another host). CAPACITY.md
 uses them only under "Earlier measurements".

@@ -667,7 +667,7 @@ func TestV073LiveQuery(t *testing.T) {
 	// hour's worth of intervals behind is 400 (§7.7, RH-39).
 	expect(t, e.get("/r/pub/a/log"), 302)
 	expect(t, e.get("/ns/pub/log?cursor=0"), 302)
-	cur := strconv.FormatInt(time.Now().UnixNano()/int64(e.e.LongPollInterval()), 10)
+	cur := strconv.FormatInt(newLiveClock(e.e.LongPollInterval(), "/r/pub/a/log").cursor(time.Now()), 10)
 	expect(t, e.get("/r/pub/a/log?live=long-poll&cursor=00"+cur), 200)
 	expect(t, e.get("/ns/pub/log?live=long-poll"), 200)
 }

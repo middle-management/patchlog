@@ -230,14 +230,15 @@ func (s *Server) gLive(w http.ResponseWriter, r *http.Request) {
 func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, gs string, reqCursor int64) {
 	since := r.URL.Query().Get("since")
 	tags := []string{"ns:" + ns}
-	interval := s.e.LongPollInterval()
-	current, err := judgeCursor(time.Now(), interval, reqCursor)
+	clock := s.clockOf(filteredLogPath(ns, gs))
+	interval := clock.interval
+	current, err := judgeCursor(time.Now(), clock, reqCursor)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	atOnce := reqCursor < current
-	deadline := time.Unix(0, (current+1)*int64(interval))
+	deadline := clock.end(current)
 	lim := s.e.Limits().LogPageSize
 	cred := creds(r)
 	for {
@@ -257,7 +258,7 @@ func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, gs
 		if len(lg.Entries) > 0 {
 			s.setLive(w, r, false, fmt.Sprintf("public, max-age=0, s-maxage=%d", int(interval.Seconds())), tags)
 			w.Header().Set("X-Namespace-Revision", lg.Last)
-			w.Header().Set("X-Cursor", strconv.FormatInt(time.Now().UnixNano()/int64(interval), 10))
+			w.Header().Set("X-Cursor", strconv.FormatInt(clock.cursor(time.Now()), 10))
 			writeLogBody(w, lg)
 			return
 		}
@@ -280,7 +281,7 @@ func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, gs
 				return
 			}
 		}
-		cur := time.Now().UnixNano() / int64(interval)
+		cur := clock.cursor(time.Now())
 		if reqCursor+1 > cur {
 			cur = reqCursor + 1
 		}

@@ -17,10 +17,10 @@ Notes from v0.82 that v0.85 leaves open are carried in place, by subject, marked
 Open n" and cut to what remains. The order is: sealed forms and end-to-end reads (1–14), access,
 coverage and services (15–33), tree answers (34–35), documents, bundles and tools (36–45),
 vectors (46), playground (47), index (48), rates and validation (49–55), streams (56–58) and
-`GET /ns` (59–60).
+`GET /ns` (59–60) and long-poll intervals (61).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
 
-60 are open: 36 from this version's work and 24 carried.
+61 are open: 37 from this version's work and 24 carried.
 
 1. **A tombstone's `/raw`** (§7.1 table, Changes). The row says a sealed or end-to-end namespace
    answers `404 not_offered` "whatever the document URL would answer", and scenario 78 agrees;
@@ -299,6 +299,31 @@ Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are
     lists every namespace the API can address. The copies of a remote base it keeps to read
     through have names starting with `~`, which §3.6 excludes, and aren't listed. *Propose:*
     "every namespace the API can address".
+61. **Every wait of a deployment ends at one instant** (§7.7 Intervals and cursors, HTTP-14).
+    Intervals are counted "from a fixed epoch", and "a wait ends at the latest at the interval
+    boundary", so every long-poll on every log of a deployment is answered at the same instant.
+    Answering early doesn't help: the 204's cursor is the next interval's, the client polls again
+    at once, and that wait ends at the same boundary. Followers of one public log collapse at the
+    CDN, so the burst there is one request per log. But resource long-polls of distinct
+    resources, and private ones without an edge that verifies edge grants, all reach the origin
+    together, and their writes queue behind them. On SQLite, 4 vCPU, 16 writers, the worst write
+    of each 20 s window took 1.1 s with 8,192 resource followers and 1.5 s with 12,288; p99 didn't
+    move (docs/CAPACITY.md, "Resource followers"). The reference now shifts each log's intervals
+    by a phase drawn from the log's path, and keeps the text's reading behind `serve
+    --long-poll-fixed-epoch`. The worst write was then 100 ms and 51 ms, as with no followers.
+    *Propose:* in Intervals and cursors, "The server divides time into fixed intervals (default 20
+    seconds), counted for each log from the epoch plus the log's **phase**: the first 8 bytes of
+    the SHA-256 of the log URL's path (`/ns/{ns}/log`, `/r/{ns}/{name}/log`,
+    `/ns/{ns}/g/{gs}/log`; no query), read as an unsigned big-endian integer, modulo the interval
+    in milliseconds, in milliseconds. Interval `n` of a log starts at `epoch + phase + n ×
+    interval`." Everything else stays: all followers of one URL share its boundaries and cursors,
+    so identical waits still collapse; instances agree; there is no jitter; clients only echo
+    `X-Cursor`. Cursors stay within one of the text's, so a client that builds a first cursor
+    from the time alone is still well inside the hour's tolerance. Vectors, at a 20 s interval:
+    `/r/docs/a/log` has phase 15,777 ms (SHA-256 begins `c6b6521efdba5aa1`), `/r/docs/b/log`
+    1,327 ms (`d88ca141ae2485cf`), `/ns/docs/log` 18,318 ms (`7a75dc61743845ce`). HTTP-14's
+    "fixed intervals from a fixed epoch" would change with it. *Question:* adopt the phase, or
+    otherwise let a server spread its logs' boundaries?
 
 ## Settled in v0.85
 
