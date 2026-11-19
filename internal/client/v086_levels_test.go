@@ -3,8 +3,10 @@ package client_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -348,8 +350,8 @@ func TestV086FirstPlaintextReadsTheNamespaceDocument(t *testing.T) {
 	st.set("/ns/t", st.json(503, map[string]any{"code": "behind"}))
 	plain(st, "t")
 	c, _ = client.New(st.server().URL, client.WithExpectedLevel("n", "sealed"))
-	if d, err := c.Doc(ctx, "t", "derby", id); err == nil {
-		t.Fatalf("a plaintext 200 while the namespace document answers 503: %+v", d)
+	if d, err := c.Doc(ctx, "t", "derby", id); err == nil || !strings.Contains(err.Error(), "reading the current namespace document of t") {
+		t.Fatalf("a plaintext 200 while the namespace document answers 503: %+v %v, want an error naming what wasn't read", d, err)
 	}
 	v86NS(st, "t", map[string]any{"base": v86Base("n")})
 	if d, err := c.Doc(ctx, "t", "derby", id); !errors.Is(err, client.ErrLevelLowered) {
@@ -362,5 +364,102 @@ func TestV086FirstPlaintextReadsTheNamespaceDocument(t *testing.T) {
 	c, _ = client.New(st.server().URL)
 	if _, err := c.Doc(ctx, "z", "derby", id); err != nil || v86Asked(st, "GET /ns/") != 0 {
 		t.Fatalf("no level held: %v, %d namespace requests", err, v86Asked(st, "GET /ns/"))
+	}
+}
+
+// v0.86 scenario 94, the limits of the first read (review of v0.86):
+//
+//   - A refusal of the namespace document is the grant's, not the
+//     client's: With copies share what is learnt, and a copy whose grant
+//     may not read z's document doesn't stop a copy that may from reading
+//     it and refusing the plaintext.
+//   - Only a level that refuses plaintext, sealed or e2e, is a reason to
+//     ask: a client that holds at-rest alone asks for nothing.
+//   - The chain is read to its end, however long, not to a fixed depth.
+//   - Concurrent first reads make one read of the document.
+//   - DocKid's "not sealed" is refused like the document itself.
+func TestV086FirstPlaintextReadLimits(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	id := ids.Revision(nil, []byte("x")).String()
+
+	// Per grant.
+	st := newE3Stub(t)
+	v86NS(st, "z", map[string]any{"base": v86Base("n")})
+	st.set("/r/z/derby/rev/"+id, st.json(200, map[string]any{"title": "in the clear"}))
+	inner := st.server()
+	var mu sync.Mutex
+	limitedAsked := 0
+	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+		if req.Header.Get("Authorization") == "Bearer limited" && req.URL.Path == "/ns/z" {
+			mu.Lock()
+			limitedAsked++
+			mu.Unlock()
+			h := http.Header{}
+			h.Set("Content-Type", "application/json")
+			body := `{"error":"forbidden","code":"forbidden"}`
+			return &http.Response{StatusCode: 403, Header: h, Body: io.NopCloser(strings.NewReader(body)), ContentLength: int64(len(body)), Request: req}, nil
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+	c, _ := client.New(inner.URL, client.WithExpectedLevel("n", "sealed"), client.WithHTTPClient(&http.Client{Transport: rt}))
+	limited, full := c.With(client.WithBearer("limited")), c.With(client.WithBearer("full"))
+	for i := 0; i < 2; i++ {
+		if _, err := limited.Doc(ctx, "z", "derby", id); err != nil {
+			t.Fatalf("a grant that may not read z's document: %v", err)
+		}
+	}
+	if limitedAsked != 1 {
+		t.Fatalf("the limited grant asked for z's document %d times, want once", limitedAsked)
+	}
+	if d, err := full.Doc(ctx, "z", "derby", id); !errors.Is(err, client.ErrLevelLowered) {
+		t.Fatalf("a grant that may read z's document, after one that may not: %+v %v", d, err)
+	}
+	// What the full grant learnt holds for the limited one too.
+	if d, err := limited.Doc(ctx, "z", "derby", id); !errors.Is(err, client.ErrLevelLowered) {
+		t.Fatalf("the limited grant, once the chain is known: %+v %v", d, err)
+	}
+
+	// At-rest alone asks for nothing.
+	st = newE3Stub(t)
+	st.set("/r/z/derby/rev/"+id, st.json(200, map[string]any{"title": "plain"}))
+	c, _ = client.New(st.server().URL, client.WithExpectedLevel("n", "at-rest"))
+	if _, err := c.Doc(ctx, "z", "derby", id); err != nil || v86Asked(st, "GET /ns/") != 0 {
+		t.Fatalf("at-rest held: %v, %d namespace requests", err, v86Asked(st, "GET /ns/"))
+	}
+
+	// A chain of 40 bases, read to its end.
+	st = newE3Stub(t)
+	name := func(i int) string { return "c" + string(rune('a'+i/26)) + string(rune('a'+i%26)) }
+	for i := 0; i < 40; i++ {
+		v86NS(st, name(i), map[string]any{"base": v86Base(name(i + 1))})
+	}
+	st.set("/r/"+name(0)+"/derby/rev/"+id, st.json(200, map[string]any{"title": "in the clear"}))
+	c, _ = client.New(st.server().URL, client.WithExpectedLevel(name(40), "sealed"))
+	if d, err := c.Doc(ctx, name(0), "derby", id); !errors.Is(err, client.ErrLevelLowered) {
+		t.Fatalf("a branch 40 bases from a sealed namespace: %+v %v", d, err)
+	}
+	if d, err := c.DocKid(ctx, name(0), "derby", id); !errors.Is(err, client.ErrLevelLowered) {
+		t.Fatalf("DocKid of the same: %q %v", d, err)
+	}
+
+	// Concurrent first reads: one read of the namespace document.
+	st = newE3Stub(t)
+	v86NS(st, "p", map[string]any{})
+	st.set("/r/p/derby/rev/"+id, st.json(200, map[string]any{"title": "plain"}))
+	c, _ = client.New(st.server().URL, client.WithExpectedLevel("n", "sealed"))
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := c.Doc(ctx, "p", "derby", id); err != nil {
+				t.Errorf("a concurrent first read: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := v86Asked(st, "GET /ns/p"); n != 2 {
+		t.Fatalf("8 concurrent first reads asked for p's document in %d requests, want 2 (the head and the document)", n)
 	}
 }
