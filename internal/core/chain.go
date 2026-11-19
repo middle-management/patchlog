@@ -254,11 +254,11 @@ func (t *tx) seedResources(base *nsRow, name string) {
 	}
 	ids := []int64{base.id}
 	for l := linkOf(base); l.isBranch() && !l.isShadow(); {
-		n, ok := t.kept[l.base.Int64]
+		n, ok := t.keptRow(l.base.Int64)
 		if !ok {
 			break
 		}
-		l = linkOf(&n)
+		l = linkOf(n)
 		if _, ok := t.memo.res[resKey{l.id, name}]; !ok {
 			ids = append(ids, l.id)
 		}
