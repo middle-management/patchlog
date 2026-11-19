@@ -388,11 +388,31 @@ and p99 are unchanged (6.6–7.0 ms, 24–26 ms). The runs are in
   more, some devices' requests timed out on the client (two minutes), behind the database.
 - **What would move the limit:**
   - a larger database, in proportion to its CPU;
-  - answering a re-poll without a transaction when the resource hasn't changed since `since`;
+  - answering a re-poll without a transaction when the resource hasn't changed since `since`
+    (done since: below);
   - a longer long-poll interval: each doubling halves the re-polls, but the interval isn't
     configurable.
 
 The run's files are in `docs/capacity/devices-aws-2026-11-19/`.
+
+**Quiet resources: a re-poll from the head costs no transaction.** A long-poll read that ends
+at its resource's head is now remembered, and a later long-poll from that head is answered from
+memory while nothing that could change its answer has happened (`Engine.ResourceLiveLog`; README,
+"Long-poll reads are shared"). Measured with `cmd/devicebench` on the 4-vCPU host: 15,000
+devices each long-polling their own resource of a public namespace for 60 s, one core
+(`serve --dev`, pinned to one vCPU) on Postgres 16 (two vCPUs), the load generator on the
+fourth.
+
+| Load | Before: core / Postgres CPU | After: core / Postgres CPU | Delivery p50 / p99, before → after |
+|---|---|---|---|
+| Waiting only (750 re-polls/s) | 0.42 / **0.26** cores | 0.16 / **0** cores | — |
+| With 50 writes/s to devices and 200 others | 0.66 / 0.72 cores | 0.46 / 0.48 cores | 8.7 / 51 → 7.4 / 24 ms |
+
+- **A waiting device now costs the database nothing.** Before, the 750 re-polls a second took
+  0.26 cores of Postgres, about 0.35 ms each; after, none. What remains is the writes' own cost.
+- **On AWS that cost was the limit** (above): RDS ran out at about 3,600 re-polls a second. Now
+  waiting devices are bounded by the cores' memory and connections (about 58 KB a device), which
+  more cores add to.
 
 ## Large documents, by shape and schema
 
