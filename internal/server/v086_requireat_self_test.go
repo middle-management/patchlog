@@ -92,7 +92,9 @@ func TestV086RequireAtRefusalsNameNoNamespace(t *testing.T) {
 	admin := e.grant(k, "user:root", []string{"matches", "cat-season"}, allVerbs)
 	head := e.nsHead("cat-season", admin)
 	exp := e.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)
-	at := func(ns, id string) map[string]any { return map[string]any{"at": map[string]any{"ns": ns, "id": id}, "exp": exp} }
+	at := func(ns, id string) map[string]any {
+		return map[string]any{"at": map[string]any{"ns": ns, "id": id}, "exp": exp}
+	}
 	inNoChain := hashID(t, "", []byte("in no chain"))
 	expect(t, e.get("/ns/matches/log", e.grant(timed, "user:li", []string{"matches"}, []string{"read"}, at("cat-season", head))), 302)
 	shape := map[string]*resp{
