@@ -35,7 +35,7 @@ type streamsCmd struct {
 	Upstream       []string      `arg:"--upstream,separate" placeholder:"PREFIX" help:"allowed upstream: a URL prefix (scheme, host and path prefix) an Upstream-URL must fall under (repeatable; none refuses every request)"`
 	Flush          time.Duration `arg:"--flush" default:"200ms" placeholder:"DURATION" help:"least time between two appends to a stream (§J.2)"`
 	TTL            time.Duration `arg:"--ttl" default:"24h" placeholder:"DURATION" help:"how long a stream's read grants live from its creation; closed streams that old are purged (§J.4)"`
-	IdleTimeout    time.Duration `arg:"--idle-timeout" default:"2m" placeholder:"DURATION" help:"a stream with no append for this long is closed with \"timeout\" (§J.2)"`
+	IdleTimeout    time.Duration `arg:"--idle-timeout" default:"2m" placeholder:"DURATION" help:"a stream with no append for this long is closed with \"timeout\", by any proxy: the deployment's one time, so give every proxy of --ns the same (§J.2 Restarts)"`
 	State          string        `arg:"--state" placeholder:"FILE" help:"file keeping the names of the open streams, so a proxy started again closes them with \"error\" (§J.2)"`
 	MaxRequestBody byteSize      `arg:"--max-request-body" default:"1 MiB" placeholder:"SIZE" help:"largest request body forwarded upstream"`
 	MaxSegments    int           `arg:"--max-segments" default:"8" placeholder:"N" help:"most resources one upstream response may fill, each up to the namespace's documentSize, or --segment-size (§J.1)"`
