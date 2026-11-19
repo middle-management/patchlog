@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // Purge purges a resource (§8.3). It returns the purge entry's ns_id.
@@ -143,16 +145,17 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids
 // it has something to do in by name, locks those, and decides what to do
 // in each before it writes anything.
 //
-//   - One statement finds the candidates (purgePlan): it follows the
-//     branches down from the purged namespace inside the database and
-//     returns the ones that hold a resources row for the name (by the
-//     table's key, so none is missed, whatever its depth and whatever
-//     lies between), the ones with sealed copies or blob sealings stored
-//     under the name, and the ones that may read the name through: those
-//     created at or after the first entry of the name in their base, or
-//     below a base that may itself read it through. That last set is
-//     wider than what resolve would answer, never narrower, since the
-//     statement only picks who is looked at.
+//   - A statement per level of branches below the purged namespace finds
+//     the candidates (purgePlan): asked for the branches of the level
+//     above, by its ids, it tells of each whether it holds a resources row
+//     for the name (by the table's key, so none is missed, whatever its
+//     depth and whatever lies between), has sealed copies or blob
+//     sealings stored under it, and when its own row's first entry was.
+//     From that the purge keeps the holders and the ones that may read
+//     the name through: those created at or after the first entry of the
+//     name in their base, or below a base that may itself read it
+//     through. That last set is wider than what resolve would answer,
+//     never narrower, since it only picks who is looked at.
 //   - The candidates are locked exclusively, and the bases their names
 //     resolve through shared, in one statement (lockAll); then their rows
 //     are read, as of the locks, and resolve decides for each what it
@@ -161,10 +164,11 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids
 //   - Only then does the purge write: the content of the own copies in a
 //     statement per table, an entry per namespace that saw the name, in
 //     the order they were always appended in (branches first, siblings by
-//     name), under their log locks, taken in one statement (lockLogs). On
-//     Postgres the logs' heads are read in one statement once their locks
-//     are held, and the rows of the branches that read the name through
-//     inserted in one, which leaves one statement per branch: its entry.
+//     name). On Postgres the logs' heads are read in one statement, the
+//     rows of the branches that read the name through inserted in one,
+//     and the branches' entries appended in one (appendPurges): the
+//     purge's statements don't grow with its branches. The namespaces'
+//     exclusive locks stand for their log locks (lockLog).
 //
 // Why a branch that neither holds nor sees the name may stay unlocked on
 // Postgres (D.8). The purge holds its own namespace's lock exclusively from
@@ -263,57 +267,81 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 	if n.purged {
 		return p
 	}
-	// Whether n may read the name through its base, which every branch of
-	// n then may too, whenever it was made.
-	through := 0
-	if n.isBranch() {
-		base, at := t.base(n), n.baseAt.Int64
-		t.seedResources(base, name)
-		if t.resolve(base, name, &at).state != NotFound {
-			through = 1
-		}
-	}
-	// The candidates: sub follows the branches down from n. lo is the
-	// namespace log position from which a branch made of the namespace may
-	// see the name: 0 if the namespace may read it through its own base,
-	// else the first entry of its own row, else none (NULL).
+	// The candidates, level by level below n, one statement per level. lo
+	// is the namespace log position from which a branch made of a
+	// namespace may see the name: 0 if the namespace may read it through
+	// its own base, else the first entry of its own row, else never.
 	//
-	// What is asked of each namespace of sub is a scalar subquery, not
-	// EXISTS: Postgres answers EXISTS from a hash of the whole table's rows
-	// of that name when it expects many namespaces (a hashed subplan over a
-	// sequential scan of resources and of sealed, for every purge, with or
-	// without branches), and a scalar subquery by the index on (ns, name),
-	// once per namespace of sub.
+	// The statement names the level above by its ids, and asks of each
+	// branch by scalar subqueries, which Postgres answers by the indexes
+	// on (ns, name), once per branch. Written as one recursive statement
+	// joining namespaces to the level above, the search was at the
+	// planner's mercy: where the statistics say one base holds most
+	// namespaces it ran the join as a nested loop over all of namespaces
+	// for every namespace found (3.5 s with 10,000 branches of one base),
+	// and it answered EXISTS from a hash of a sequential scan of resources
+	// and of sealed by name.
+	const never = math.MaxInt64
 	type cand struct {
 		id   int64
 		base sql.NullInt64
 	}
-	var cands []cand
-	isCand := map[int64]bool{}
+	cands := []cand{{n.id, n.base}}
+	isCand := map[int64]bool{n.id: true}
 	restore := t.planByIndex()
-	rows, err := t.Query(`WITH RECURSIVE sub(ns, base, lo) AS (
-			SELECT n.ns, n.base, CASE WHEN ? = 1 THEN 0 ELSE
-					(SELECT MIN(h.ns_seq) FROM resources r JOIN head_history h ON h.res = r.res WHERE r.ns = n.ns AND r.name = ?) END
-				FROM namespaces n WHERE n.ns = ?
-			UNION ALL
-			SELECT c.ns, c.base, CASE WHEN COALESCE(c.base_at, 0) >= sub.lo THEN 0 ELSE
-					(SELECT MIN(h.ns_seq) FROM resources r JOIN head_history h ON h.res = r.res WHERE r.ns = c.ns AND r.name = ?) END
-				FROM namespaces c JOIN sub ON c.base = sub.ns WHERE c.purged = 0)
-		SELECT s.ns, s.base FROM sub s
-		WHERE s.ns = ? OR s.lo = 0
-			OR (SELECT 1 FROM resources r WHERE r.ns = s.ns AND r.name = ? LIMIT 1) IS NOT NULL
-			OR (SELECT 1 FROM sealed x WHERE x.ns = s.ns AND x.name = ? LIMIT 1) IS NOT NULL
-			OR (SELECT 1 FROM blob_epochs x WHERE x.ns = s.ns AND x.name = ? LIMIT 1) IS NOT NULL`,
-		through, name, n.id, name, n.id, name, name, name)
-	t.must(err)
-	for rows.Next() {
-		var c cand
-		t.must(rows.Scan(&c.id, &c.base))
-		cands = append(cands, c)
-		isCand[c.id] = true
+	const firstEntry = `(SELECT MIN(h.ns_seq) FROM resources r JOIN head_history h ON h.res = r.res WHERE r.ns = c.ns AND r.name = ?)`
+	rootLo := sql.NullInt64{}
+	if n.isBranch() {
+		// Whether n may read the name through its base, which every
+		// branch of n then may too, whenever it was made.
+		base, at := t.base(n), n.baseAt.Int64
+		t.seedResources(base, name)
+		if t.resolve(base, name, &at).state != NotFound {
+			rootLo.Valid = true
+		}
 	}
-	t.must(rows.Err())
-	rows.Close()
+	if !rootLo.Valid {
+		t.must(t.QueryRow(`SELECT `+firstEntry+` FROM namespaces c WHERE c.ns = ?`, name, n.id).Scan(&rootLo))
+	}
+	lo := map[int64]int64{n.id: never}
+	if rootLo.Valid {
+		lo[n.id] = rootLo.Int64
+	}
+	for level := []int64{n.id}; len(level) > 0; {
+		rows, err := t.Query(`SELECT c.ns, c.base, c.base_at, `+firstEntry+`,
+				(SELECT 1 FROM resources r WHERE r.ns = c.ns AND r.name = ? LIMIT 1),
+				(SELECT 1 FROM sealed x WHERE x.ns = c.ns AND x.name = ? LIMIT 1),
+				(SELECT 1 FROM blob_epochs x WHERE x.ns = c.ns AND x.name = ? LIMIT 1)
+			FROM namespaces c WHERE c.purged = 0 AND `+t.e.inArray("c.base", "bigint"),
+			name, name, name, name, t.e.arrayArg(level))
+		t.must(err)
+		var next []int64
+		for rows.Next() {
+			var c cand
+			var at, first, row, sealed, epochs sql.NullInt64
+			t.must(rows.Scan(&c.id, &c.base, &at, &first, &row, &sealed, &epochs))
+			next = append(next, c.id)
+			// Made at or after the position its base's branches may see
+			// the name from (at 0 without one, as resolve reads it): it
+			// may read the name through, and so may its own branches.
+			sees := at.Int64 >= lo[c.base.Int64]
+			switch {
+			case sees:
+				lo[c.id] = 0
+			case first.Valid:
+				lo[c.id] = first.Int64
+			default:
+				lo[c.id] = never
+			}
+			if sees || row.Valid || sealed.Valid || epochs.Valid {
+				cands = append(cands, c)
+				isCand[c.id] = true
+			}
+		}
+		t.must(rows.Err())
+		rows.Close()
+		level = next
+	}
 	restore()
 	// The bases the candidates' names resolve through that aren't
 	// candidates themselves: skipped branches between a candidate and n,
@@ -359,7 +387,7 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 	// (branchesOf), and kept for resolve (chain.go).
 	arg := t.e.arrayArg(all)
 	row, rank := map[int64]*nsRow{}, map[int64]int{}
-	rows, err = t.Query(`SELECT `+nsCols+` FROM namespaces WHERE `+t.e.inArray("ns", "bigint")+` ORDER BY name`, arg)
+	rows, err := t.Query(`SELECT `+nsCols+` FROM namespaces WHERE `+t.e.inArray("ns", "bigint")+` ORDER BY name`, arg)
 	t.must(err)
 	for rows.Next() {
 		x, err := scanNS(rows)
@@ -495,19 +523,17 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 }
 
 // planByIndex makes Postgres plan the statements that follow, until the
-// function it returns is called, as nested loops over index scans, and
-// without compiling them: for the statement that finds a purge's
+// function it returns is called, by index scans and nested loops, and
+// without compiling them: for the statements that find a purge's
 // candidates, whose work must stay in proportion to the branches below the
-// purged namespace whatever the tables' sizes and statistics are.
-//
-// Left to its costs, the planner joined each level of branches by a hash
-// of a sequential scan of namespaces where the statistics say a base has
-// thousands of branches (measured: every purge then read the whole table
-// once per level, with or without branches of its own), and past
-// jit_above_cost it compiled the statement's expressions first, which took
-// 0.3 to 1.1 s for a statement that then ran in 10 to 40 ms. The settings
-// are the transaction's own (SET LOCAL), and are put back for the
-// statements after it, whose plans are not this function's business.
+// purged namespace whatever the tables' sizes and statistics are. Left to
+// its costs, the planner reads a small table sequentially for each
+// namespace asked about, however large that table has grown since it was
+// planned, and past jit_above_cost it compiles a statement's expressions
+// first, which took 0.3 to 1.1 s for a statement that then ran in 10 to
+// 40 ms. The settings are the transaction's own (SET LOCAL), and are put
+// back for the statements after it, whose plans are not this function's
+// business.
 func (t *tx) planByIndex() (restore func()) {
 	if !t.e.pg {
 		return func() {}
@@ -617,9 +643,42 @@ func (t *tx) purgeApply(p *purgePlan, author int64, forced bool) ids.ID {
 			t.must(err)
 		}
 	}
+	entryOf := func(v *view) map[string]any {
+		entry := map[string]any{"resource": p.name, "kind": "purge", "target": v.head.id.String()}
+		if forced {
+			entry["forced"] = true
+		}
+		return entry
+	}
+	// On Postgres the propagated entries, which are the server's own and
+	// come before the purged namespace's, go in one statement
+	// (appendPurges) where the logs' heads are known.
+	var batch []purgeAppend
+	for _, s := range p.steps {
+		if _, known := t.logHeads[s.n.id]; !s.acts() || s.n.id == p.root.id {
+			continue
+		} else if !known || !t.locking() {
+			batch = nil
+			break
+		}
+		a := purgeAppend{n: s.n, res: inserted[s.n.id], target: s.v.head.seq, body: jsonv.Canonical(entryOf(s.v))}
+		if s.v.own != nil {
+			a.res = s.v.own.id
+		}
+		batch = append(batch, a)
+	}
+	appended := map[int64]bool{}
+	if len(batch) > 1 {
+		t.appendPurges(batch, author)
+		for _, a := range batch {
+			appended[a.n.id] = true
+			t.tags = append(t.tags, "r:"+a.n.name+"/"+p.name, "heads:"+a.n.name)
+		}
+		t.flushDocs = true
+	}
 	var out ids.ID
 	for _, s := range p.steps {
-		if !s.acts() {
+		if !s.acts() || appended[s.n.id] {
 			continue
 		}
 		n, v := s.n, s.v
@@ -634,11 +693,7 @@ func (t *tx) purgeApply(p *purgePlan, author int64, forced bool) ids.ID {
 				res = t.mustInsert(`INSERT INTO resources (ns, name, head_seq, state) VALUES (?,?,?,?) RETURNING res`, n.id, p.name, v.head.seq, statePurged)
 			}
 			target := v.head.seq
-			entry := map[string]any{"resource": p.name, "kind": "purge", "target": v.head.id.String()}
-			if forced {
-				entry["forced"] = true
-			}
-			_, id := t.appendNS(n, entry, &res, &target, n.configSeq, author)
+			_, id := t.appendNS(n, entryOf(v), &res, &target, n.configSeq, author)
 			if n.id == p.root.id {
 				out = id
 			}
@@ -673,6 +728,70 @@ func (t *tx) purgeApply(p *purgePlan, author int64, forced bool) ids.ID {
 		t.purgeCheck(p, true)
 	}
 	return out
+}
+
+// purgeAppend is a propagated purge entry to append to n's log: the row
+// it purges, the head it targets and its canonical body.
+type purgeAppend struct {
+	n           *nsRow
+	res, target int64
+	body        []byte
+}
+
+// appendPurges appends a purge's propagated entries, one to the log of
+// each of several namespaces, in one statement (Postgres): what appendNS
+// does for each as the server's own entry, without a grant. Each
+// namespace is locked exclusively and its log's head known (logHeads), so
+// each entry is chained on its own log's head; their seqs are drawn
+// together and given out in the entries' order, as appendNSMany's.
+//
+// One statement per entry made a purge's cost per branch grow with its
+// branches on Postgres: a backend that holds thousands of advisory locks,
+// as a purge does, one per namespace it reaches, takes longer to finish
+// every statement, since releasing a statement's own locks then walks the
+// table of all the locks the backend holds.
+func (t *tx) appendPurges(as []purgeAppend, author int64) {
+	k := len(as)
+	nss, res, targets, prevs, cfgs := make([]int64, k), make([]int64, k), make([]int64, k), make([]int64, k), make([]int64, k)
+	idBytes, bodies := make([][]byte, k), make([]string, k)
+	entryIDs := make([]ids.ID, k)
+	for i, a := range as {
+		t.lockNS(a.n.id, lockExclusive)
+		t.reserveEntries(a.n, a.n.configSeq, 1)
+		prev, prevSeq := t.logHeadOf(a.n)
+		entryIDs[i] = ids.Hash(prev, a.body)
+		nss[i], res[i], targets[i], prevs[i], cfgs[i] = a.n.id, a.res, a.target, prevSeq.(int64), a.n.configSeq
+		idBytes[i], bodies[i] = entryIDs[i][:], string(a.body)
+	}
+	t.wrote()
+	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bigint[], ?::bytea[], ?::bigint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[])
+				WITH ORDINALITY AS v(ns, id, prev_seq, res, target_seq, body, config_seq, ord)),
+			r AS MATERIALIZED (SELECT nextval(pg_get_serial_sequence('ns_log', 'seq')) AS seq FROM generate_series(1, ?::int)),
+			s AS (SELECT seq, row_number() OVER (ORDER BY seq) AS ord FROM r),
+			c AS MATERIALIZED (SELECT v.*, s.seq FROM v JOIN s USING (ord)),
+			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created)
+				SELECT seq, ns, id, prev_seq, ?, res, target_seq, body, config_seq, ?, ? FROM c ORDER BY ord RETURNING seq),
+			u AS (UPDATE namespaces n SET head_seq = c.seq, head_id = c.id, config_seq = c.config_seq FROM c WHERE n.ns = c.ns)
+			SELECT ord, seq FROM c ORDER BY ord`,
+		nss, idBytes, prevs, res, targets, bodies, cfgs, k, nsKindCode("purge"), author, t.now.UnixMilli())
+	t.must(err)
+	seqs := make([]int64, 0, k)
+	for rows.Next() {
+		var ord, seq int64
+		t.must(rows.Scan(&ord, &seq))
+		seqs = append(seqs, seq)
+	}
+	t.must(rows.Err())
+	rows.Close()
+	if len(seqs) != k {
+		panic(fmt.Errorf("appended %d purge entries, want %d", len(seqs), k))
+	}
+	for i, a := range as {
+		a.n.headSeq = sql.NullInt64{Int64: seqs[i], Valid: true}
+		t.logHeads[a.n.id] = logHead{seqs[i], entryIDs[i]}
+		t.lastNS = seqs[i]
+		t.notify[a.n.name] = true
+	}
 }
 
 // purgeCheck is the PATCHLOG_TEST_VALIDATE_BOTH oracle of a purge: the walk
