@@ -368,8 +368,12 @@ func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxL
 			target = t.nsByName(s)
 			// A purged namespace as one that doesn't exist (§C.4,
 			// v0.85): its log is kept, and its purge-ns entry stays
-			// its head for good, but the grant fails the scope.
-			if target == nil || target.purged {
+			// its head for good, but the grant fails the scope. Not
+			// the one the grant is checked in (v0.86): named by its
+			// own name it is as with requireAt: true, so the grant
+			// verifies against its kept chain and the purged
+			// namespace's own 410 answers, never the scope's 403.
+			if target == nil || target.purged && (n == nil || target.id != n.id) {
 				return errAtRejected
 			}
 		}

@@ -664,10 +664,15 @@ func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at an
 			return fmt.Errorf("malformed at")
 		}
 		begun := time.Now()
-		_, named := requireAt.(string)
 		// A purged namespace requireAt names fails the scope, as one
 		// that doesn't exist does at the origin (§C.4, v0.85): never a
-		// chain the checker can't read.
+		// chain the checker can't read. Not the one the grant is
+		// checked in (v0.86): named by its own name it is as with
+		// requireAt: true, and its own 410 answers.
+		named := false
+		if s, ok := requireAt.(string); ok {
+			named = s != ns
+		}
 		gone := func(err error) bool { return named && purgedNS(err, target) }
 		tst, checked, err := ch.stateWithin(ctx, target, ch.ttl)
 		if err != nil {
