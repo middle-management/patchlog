@@ -310,8 +310,12 @@ type Engine struct {
 	comp       storeCodec // compressed patch sets (compress.go)
 	ekeys      epochKeyCache
 	// refsCache is the $refs of schema revisions by path (schemaRefsOf).
-	refsMu      sync.Mutex
-	refsCache   lru.Cache[string, []string]
+	refsMu    sync.Mutex
+	refsCache lru.Cache[string, []string]
+	// gsHeld is whether a gs cookie's record held under every document
+	// between its exchange's and a later one (gsHeldSince, gsHeldKey).
+	gsHeldMu    sync.Mutex
+	gsHeld      lru.Cache[[32]byte, bool]
 	schemaScans atomic.Int64
 	cfgMu       sync.Mutex
 	cfgCache    map[int64]*Config
@@ -502,6 +506,7 @@ func Open(opt Options) (*Engine, error) {
 		started:    opt.Now().UTC(),
 	}
 	e.refsCache.MaxEntries = 65536
+	e.gsHeld.MaxEntries = 65536
 	e.rc.maxBytes = opt.ReadCacheBytes
 	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
 	if err := e.checkKeyStore(); err != nil {

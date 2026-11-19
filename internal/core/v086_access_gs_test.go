@@ -2,6 +2,9 @@ package core
 
 import (
 	"context"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -331,4 +334,121 @@ func TestV086AccessGSStaleExchangeAfterNewer(t *testing.T) {
 	}
 	v86gsReads(t, w, "the newer cookie after the stale exchange's record", newer.gs, cookieOf(newer), 0)
 	v86gsReads(t, w, "the stale exchange's cookie", stale.gs, cookieOf(stale), 403)
+}
+
+// v86gsRows are the seconds matches has a cookie record at for gs.
+func v86gsRows(w *v75World, gs string) (exps []int64) {
+	w.inTx(func(t2 *tx) {
+		rows, err := t2.Query(`SELECT exp FROM filtered_gs_exps WHERE ns = ? AND gs = ? ORDER BY exp`, "matches", gs)
+		t2.must(err)
+		defer rows.Close()
+		for rows.Next() {
+			var exp int64
+			t2.must(rows.Scan(&exp))
+			exps = append(exps, exp)
+		}
+	})
+	return exps
+}
+
+// §C.5.2: a prefix several grants of one exchange give gets one cookie,
+// which lasts as long as the longest of them allows. Two grants of li's
+// that give the same subject set of matches, one ending in two minutes
+// and one in ten, in either order: one record, at the later grant's
+// second, which both edge grants carry and whose cookie reads. (Each
+// grant used to take a second of its own, and the cookie ended with the
+// one recorded last.)
+func TestV086AccessGSTwoGrantsOneCookie(t *testing.T) {
+	t.Parallel()
+	for _, order := range []string{"the shorter first", "the longer first"} {
+		w := newV75World(t, v75Opts{})
+		w.seed()
+		long := w.now().Truncate(time.Second).Add(10 * time.Minute)
+		grantUntil := func(exp time.Time) Credentials {
+			return w.li(map[string]any{"exp": exp.UTC().Format(time.RFC3339)})
+		}
+		bearers := []string{grantUntil(long.Add(-8 * time.Minute)).Bearer, grantUntil(long).Bearer}
+		if order == "the longer first" {
+			bearers[0], bearers[1] = bearers[1], bearers[0]
+		}
+		res, err := w.e.IssueEdgeGrants(context.Background(), bearers)
+		if err != nil || len(res.Grants) != 2 {
+			t.Fatalf("%s: %+v %v", order, res, err)
+		}
+		gs := res.Grants[0].GS
+		for _, g := range res.Grants {
+			if g.GS != gs || !g.Exp.Equal(long) {
+				t.Errorf("%s: edge grant %+v, want gs %s until %v, the longer grant's exp", order, g, gs, long)
+			}
+		}
+		if rows := v86gsRows(w, gs); len(rows) != 1 || rows[0] != long.Unix() {
+			t.Errorf("%s: cookie records at %v, want one, at %d", order, rows, long.Unix())
+		}
+		cookie := Credentials{Edge: &EdgeGrant{NS: "matches", GS: gs, Prefix: "/ns/matches/g/" + gs, Exp: long}}
+		v86gsReads(t, w, order+": the cookie", gs, cookie, 0)
+	}
+}
+
+// Cookie records are swept a minute after their exp, not at it: an
+// instance whose clock is ahead doesn't free a second that an exchange
+// at one behind could take while an ended cookie of that exp lives.
+func TestV086AccessGSSweepMargin(t *testing.T) {
+	t.Parallel()
+	w := newV75World(t, v75Opts{})
+	w.seed()
+	short := w.now().Truncate(time.Second).Add(2 * time.Second)
+	c, gs := v82accessCookie(t, w, w.li(map[string]any{"exp": short.UTC().Format(time.RFC3339)}))
+	has := func() bool { return slices.Contains(v86gsRows(w, gs), c.Edge.Exp.Unix()) }
+	v82accessLater(w, 30*time.Second)
+	v82accessCookie(t, w, w.li()) // an exchange sweeps
+	if !has() {
+		t.Fatal("the record was swept within a minute of its exp")
+	}
+	v82accessLater(w, gsSweepMargin)
+	v82accessCookie(t, w, w.li())
+	if has() {
+		t.Fatal("the record was kept past the margin")
+	}
+}
+
+// A read under a cookie past its exchange's document judges the
+// documents between once: the verdict is kept (gsHeldSince), and later
+// reads at that document read none of them again.
+func TestV086AccessGSVerdictKept(t *testing.T) {
+	t.Parallel()
+	w := newV75World(t, v75Opts{})
+	w.seed()
+	cookie, gs := v82accessCookie(t, w, w.li())
+	for i := 0; i < 20; i++ {
+		w.patchConfig("matches", v82accessOp("add", "/x-n", float64(i)))
+	}
+	red, _ := v76fRedirect(t, w, "matches", gs, cookie)
+	if red == nil {
+		t.Fatal("the cookie doesn't read")
+	}
+	var mu sync.Mutex
+	walked := 0
+	w.e.onStatement = func(q string, _ []any) {
+		if strings.Contains(q, "SELECT parent_seq FROM ns_config") {
+			mu.Lock()
+			walked++
+			mu.Unlock()
+		}
+	}
+	defer func() { w.e.onStatement = nil }()
+	for i := 0; i < 3; i++ {
+		if _, st := v76fHeads(t, w, "matches", gs, red.At, cookie); st != 0 {
+			t.Fatalf("read %d: status %d", i, st)
+		}
+	}
+	if walked != 0 {
+		t.Errorf("reads after the first walked %d documents again", walked)
+	}
+	// The kept verdict is the record's: another cookie's is its own.
+	w.patchConfig("matches", v82accessOp("add", "/keys/1/groups", map[string]any{"deny": []any{"banned"}}))
+	v86gsReads(t, w, "the cookie after a change", gs, cookie, 403)
+	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/1/groups"})
+	v86gsReads(t, w, "the cookie after the undo", gs, cookie, 403)
+	fresh, _ := v82accessCookie(t, w, w.li())
+	v86gsReads(t, w, "a cookie from after the undo", gs, fresh, 0)
 }
