@@ -1,0 +1,23 @@
+-- Migration: namespaces base
+-- Created: 2026-11-19T08:55:06Z
+-- Checksum: 461ef064c0b407bb7a9e2f50aef518bcd8fa4db8fcbca8cf82a28d06fa96ee43
+-- Chain: ea4c32ff4535b5cb87eb7c4f29baf119bf8e8c176c1b88eb6d615961d6b99f89
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- A namespace's branches, in name order (nsconfig.go, branchesOf): asked
+-- of every namespace a purge reaches (§8.3), of a base at every branch
+-- made in it and by /branches. Without it each of those read the whole
+-- table.
+CREATE INDEX IF NOT EXISTS namespaces_base ON namespaces (base, name);

@@ -16,6 +16,10 @@
   schema or by one that reaches it, in the namespaces that hold them or read them through: its
   cost follows what references the schema, not the deployment. `PATCHLOG_TEST_VALIDATE_BOTH=1`
   also makes the old pass on every such change and panics if the two answers differ.
+- **A namespace's branches are found by an index** (`namespaces_base`). A purge asks for the
+  branches of every namespace it reaches, and each time the whole table of namespaces was
+  read, so a purge reaching 10,000 branches took about twice what its branches alone cost.
+  Creating a branch and `/branches` asked the same way.
 - **`serve --max-branch-depth` and `--max-branches-per-namespace`** set the deployment's
   `branchDepth` and the maximum a namespace document's `limits.branchesPerNamespace` may ask
   for (§6.6). The defaults stay 8 and 100.
