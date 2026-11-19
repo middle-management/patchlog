@@ -2,7 +2,7 @@
 
 Measured 2026-11-19 on the Go reference implementation at spec 0.85. This report is for the
 spec writer: it takes §6.6's reasons for the two limits one by one and says what each cost
-when measured, and it ends with three questions for the spec.
+when measured, and it ends with four questions for the spec.
 
 ## Summary
 
@@ -144,6 +144,36 @@ plain namespace's, depth 32 nine times.
    reaches, not the direct branches of each.
 3. **Should `/branches` have pages?** Every other listing does. It is 0.67 s at 10,000
    branches on Postgres, and the limit is the only thing keeping it short.
+
+4. **Could a propagated purge be satisfied by the base's cache tag?** Today a purge sends
+   two tags for every branch that sees the document, `r:{branch}/{name}` and
+   `heads:{branch}`: 212 tags at 100 branches, about 24,000 at 10,000. §9 requires this:
+   branches are cached "under their own URLs and tags, which purges propagated to them
+   (§8.3) purge too", and §8.3 purges by tag, `heads:{ns}` included, in each branch reached.
+
+   One tag could clear them all if a branch's response for a document it reads through also
+   carried the base's tag. That is safe against over-purging: a branch sees its base as of
+   `at`, so ordinary writes in the base never change a read-through response, and ordinary
+   writes purge no tags. Only purges, restores and E3 prunes in the base would clear the
+   branches' copies, which is what should happen.
+
+   The smallest change that would allow it:
+
+   - **§9 "Branches" and §12.8:** a branch's response for a resource it reads through also
+     carries `r:{base}/{name}` for each base in its chain, and its `/heads` pages carry
+     `heads:{base}`. A purge propagated to such a branch MAY then be satisfied by the base's
+     tags.
+   - **Still per branch:** branches with their own chain for the name, and remote branches,
+     keep their own tags.
+   - **SERVICES:** a service whose cache the origin's purges reach either carries the same
+     base tags or always purges its branch tags itself. Today it may rely on the origin
+     purging `r:{branch}/{name}`.
+   - **Switching over:** responses cached before the change lack the base tag, and immutable
+     ones live for a year. A deployment keeps sending the per-branch tags until those expire,
+     or clears each branch's `ns:` tag once.
+
+   This reduces only the tag count. The `purge` entry in each branch's log (§8.3) stays, so
+   a purge still writes once per branch it reaches.
 
 Two smaller points, for the wording of §6.6:
 
