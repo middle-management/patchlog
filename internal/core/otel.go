@@ -25,6 +25,7 @@ type coreInst struct {
 	tracer    trace.Tracer
 	groupSize metric.Int64Histogram
 	lockWait  metric.Float64Histogram
+	liveReads metric.Int64Counter
 }
 
 var inst = telemetry.NewInstruments("internal/core", func(t trace.Tracer, m metric.Meter) *coreInst {
@@ -38,12 +39,16 @@ var inst = telemetry.NewInstruments("internal/core", func(t trace.Tracer, m metr
 			metric.WithDescription("Time spent waiting for a Postgres advisory lock (namespace or log lock)"),
 			metric.WithUnit("s"),
 			metric.WithExplicitBucketBoundaries(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5))),
+		liveReads: telemetry.Must(m.Int64Counter("patchlog.longpoll.resource.reads",
+			metric.WithDescription("Reads of resource long-polls (§7.7) by answer: memory (a quiet resource, no transaction), read, or stale (read, the tailer being behind)"),
+			metric.WithUnit("{read}"))),
 	}
 })
 
 var (
 	attrDBSystem = attribute.Key("db.system.name")
 	attrLock     = attribute.Key("patchlog.lock")
+	attrAnswer   = attribute.Key("patchlog.answer")
 
 	attrSchema      = attribute.Key("patchlog.schema")
 	attrSchemaValid = attribute.Key("patchlog.schema.valid")

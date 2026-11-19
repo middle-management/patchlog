@@ -220,6 +220,9 @@ cd /opt/bench
 install -m 755 /tmp/patchlog patchlog
 ulimit -n 1048576 || ulimit -n "\$(ulimit -Hn)"
 $dbenv
+# Metrics to server.log every 10 s: devices-summary.py reads how resource
+# long-polls were answered (patchlog.longpoll.resource.reads).
+export OTEL_METRICS_EXPORTER=console OTEL_METRIC_EXPORT_INTERVAL=10000
 setsid nohup ./patchlog serve --dev --addr :8080 --playground=false \\
   --max-rate-per-namespace 1e9,1e9 --max-rate-per-resource 1e9,1e9 --max-rate-per-principal 1e9,1e9 \\
   >server.log 2>&1 </dev/null &

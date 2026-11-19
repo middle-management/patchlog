@@ -213,3 +213,26 @@ func TestPGQuietResourceOtherInstance(t *testing.T) {
 		t.Fatalf("head %s after the other instance's write, want %s", next, r)
 	}
 }
+
+// Quiet answers need the tailer to have polled within a quarter of the
+// long-poll interval, more loosely than the read cache (freshFor): a
+// slow poll doesn't turn them off, a stopped tailer does.
+func TestQuietFreshFor(t *testing.T) {
+	e := &Engine{epoch: time.Now().Add(-time.Minute), opt: Options{TailInterval: 100 * time.Millisecond, LongPollInterval: 20 * time.Second}}
+	if e.freshFor() != 300*time.Millisecond || e.quietFreshFor() != 5*time.Second {
+		t.Fatalf("freshFor %s, quietFreshFor %s", e.freshFor(), e.quietFreshFor())
+	}
+	polled := func(ago time.Duration) { e.lastPoll.Store(int64(time.Since(e.epoch)-ago) + 1) }
+	polled(time.Second)
+	if e.fresh() || !e.tailedWithin(e.quietFreshFor()) {
+		t.Fatal("a poll a second ago: the read cache stops, quiet answers go on")
+	}
+	polled(10 * time.Second)
+	if e.tailedWithin(e.quietFreshFor()) {
+		t.Fatal("a poll ten seconds ago still allows quiet answers")
+	}
+	e.opt.LongPollInterval = time.Second
+	if e.quietFreshFor() != e.freshFor() {
+		t.Fatalf("a short interval: quietFreshFor %s, want freshFor", e.quietFreshFor())
+	}
+}

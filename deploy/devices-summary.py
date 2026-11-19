@@ -7,6 +7,9 @@ DIR holds what the run collected:
   loadgen-*.jsonl   cmd/devicebench's steps, one file per load generator
   server-*.samples  "unix-seconds cpu-ticks rss-kB open-fds" every few seconds
                     from each server (the first line is "# clk_tck N")
+  server-*.log      each server's log, with its OpenTelemetry metrics as JSON
+                    lines: how its resource long-polls were answered
+                    (patchlog.longpoll.resource.reads: memory, read, stale)
   rds-cpu.json      CloudWatch's CPUUtilization datapoints, if Postgres was RDS
 
 A step's devices, completions and requests add up across load generators;
@@ -70,6 +73,44 @@ def server_window(clk, rows, start, end):
     return cores, max(r[2] for r in inside) / 1024, max(r[3] for r in inside)
 
 
+def load_answers(path):
+    """The cumulative counts of patchlog.longpoll.resource.reads by answer,
+    as (unix-seconds, {answer: count}) per export."""
+    out = []
+    with open(path, errors="replace") as f:
+        for line in f:
+            if '"patchlog.longpoll.resource.reads"' not in line:
+                continue
+            try:
+                doc = json.loads(line[line.index("{"):])
+            except ValueError:
+                continue
+            for sm in doc.get("ScopeMetrics") or []:
+                for m in sm.get("Metrics") or []:
+                    if m.get("Name") != "patchlog.longpoll.resource.reads":
+                        continue
+                    counts, t = {}, None
+                    for dp in m["Data"]["DataPoints"]:
+                        a = {x["Key"]: x["Value"]["Value"] for x in dp.get("Attributes", [])}.get("patchlog.answer", "?")
+                        counts[a] = dp["Value"]
+                        t = dp["Time"]
+                    if t:
+                        from datetime import datetime
+                        ts = datetime.fromisoformat(t[:26].rstrip("Z") + "+00:00").timestamp()
+                        out.append((ts, counts))
+    return out
+
+
+def answers_window(series, start, end):
+    """Answers a second by kind between the exports nearest start and end."""
+    before = [s for s in series if s[0] <= start]
+    after = [s for s in series if s[0] <= end]
+    if not before or not after or after[-1][0] <= before[-1][0]:
+        return None
+    (t0, c0), (t1, c1) = before[-1], after[-1]
+    return {k: (c1.get(k, 0) - c0.get(k, 0)) / (t1 - t0) for k in set(c0) | set(c1)}
+
+
 def rds_window(points, start, end):
     # Datapoints are one-minute averages stamped with their minute's start.
     inside = [p["Average"] for p in points if start - 30 <= p["t"] and p["t"] + 60 <= end + 30]
@@ -88,6 +129,8 @@ def main():
     if not steps:
         sys.exit(f"devices-summary: no loadgen-*.jsonl in {d}")
     servers = [(os.path.basename(p), *load_samples(p)) for p in sorted(glob.glob(os.path.join(d, "server-*.samples")))]
+    answers = [load_answers(p) for p in sorted(glob.glob(os.path.join(d, "server-*.log")))]
+    answers = [a for a in answers if a]
     rds = None
     rp = os.path.join(d, "rds-cpu.json")
     if os.path.exists(rp):
@@ -98,6 +141,8 @@ def main():
 
     head = ["step", "devices", "target", "completions/s", "delivered", "delivery p50/p99/max ms",
             "polls/s", "errors conn/status/write", "loadgen cores (max)", "server cores", "server RSS MB", "server fds"]
+    if answers:
+        head.append("long-polls/s memory / read / stale")
     if rds is not None:
         head.append("RDS CPU %")
     rows, broken, notes = [], None, []
@@ -121,6 +166,14 @@ def main():
                " ".join(f"{v[0]:.2f}" if v else "-" for v in sv),
                " ".join(f"{v[1]:.0f}" if v else "-" for v in sv),
                " ".join(str(v[2]) if v else "-" for v in sv)]
+        if answers:
+            ws = [answers_window(a, start, end) for a in answers]
+            ws = [w for w in ws if w]
+            if ws:
+                tot = {k: sum(w.get(k, 0) for w in ws) for k in ("memory", "read", "stale")}
+                row.append(f"{tot['memory']:.0f} / {tot['read']:.0f} / {tot['stale']:.0f}")
+            else:
+                row.append("-")
         if rds is not None:
             c = rds_window(rds, start, end)
             row.append(f"{c:.0f}" if c is not None else "-")

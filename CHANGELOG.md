@@ -201,10 +201,14 @@ Other work since v0.31.0:
   the resource's head is remembered, by resource and credentials, and a later long-poll from that
   head is answered from memory while nothing that could change its answer has happened: the
   resource's waiter channel is open, the meta counter (configuration, purges, prunes, restores,
-  key destruction) hasn't moved, on Postgres the tailer is fresh, and the grant hasn't expired.
-  A public namespace's answer holds for every request, another's for the same bearer grant only,
-  never for an edge grant (`Engine.ResourceLiveLog`). docs/CAPACITY.md, "Resource followers",
-  has the measurements.
+  key destruction) hasn't moved, the grant hasn't expired, and on Postgres the tailer has polled
+  within a quarter of the long-poll interval. That bound is looser than the read cache's
+  (`freshFor`), as the answer carries no content: with the read cache's, one slow poll on a busy
+  database sent every follower to read, which slowed the next. A public namespace's answer holds
+  for every request, another's for the same bearer grant only, never for an edge grant
+  (`Engine.ResourceLiveLog`). The metric `patchlog.longpoll.resource.reads` counts resource
+  long-poll reads by answer (`memory`, `read`, `stale`), and `deploy/devices-summary.py` shows
+  them per step. docs/CAPACITY.md, "Resource followers", has the measurements.
 - **A resource's long-polls and event streams are woken by its own commits only** (§7.7,
   §7.3). They waited on the namespace's channel, so every write to the namespace made each of
   them read its log again: with clients each following their own document while a coordinator

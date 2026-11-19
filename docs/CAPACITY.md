@@ -410,9 +410,30 @@ fourth.
 
 - **A waiting device now costs the database nothing.** Before, the 750 re-polls a second took
   0.26 cores of Postgres, about 0.35 ms each; after, none. What remains is the writes' own cost.
-- **On AWS that cost was the limit** (above): RDS ran out at about 3,600 re-polls a second. Now
-  waiting devices are bounded by the cores' memory and connections (about 58 KB a device), which
-  more cores add to.
+- **On AWS that cost was the limit** (above): RDS ran out at about 3,600 re-polls a second.
+
+**On AWS again, the limit didn't move at first.** The same `deploy/ec2-devices.sh` run with
+quiet resources (commit 59127e4, on the database of the first run; files in
+`docs/capacity/devices-aws-2026-11-19-quiet/`) kept writes healthier for longer, but still
+broke at 75,000 devices:
+
+| Devices | Before: writes/s, write p50 / p99 | After: writes/s, write p50 / p99 | RDS CPU before → after |
+|---|---|---|---|
+| 15,000 | 428, 25 / 75 ms | 439, 22 / 51 ms | 64% → 50% |
+| 30,000 | 391, 30 / 110 ms | 410, 25 / 75 ms | 89% → 81% |
+| 45,000 | 263, 44 / 238 ms | 399, 25 / 81 ms | 97% → 82% |
+| 60,000 | 91, 87 / 646 ms | 217, 30 / 94 ms | 99% → 97% |
+| 75,000 | 0, then nothing | 0, then nothing | 100% → 91–100% |
+
+Quiet answers then also required the tailer to be fresh: its last successful poll started
+within `freshFor` (300 ms). Reproduced with three cores on one Postgres vCPU, a busy database
+made polls slow enough to fail that check now and then, and every re-poll in such a window was
+read: 96–430 times a server in 40 s at 18,000 devices, none with a 5 s bound. On RDS, with
+40,000 devices a core, each such window sends thousands of reads to the database, which slows
+the next poll: a loop that grows with the devices. Quiet answers now need the tailer to have
+polled within a quarter of the long-poll interval, and `patchlog.longpoll.resource.reads`
+counts each read by answer, which the summary shows per step, so the next run shows whether
+anything else still reads.
 
 ## Large documents, by shape and schema
 

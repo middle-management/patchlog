@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/metric"
 )
 
 // Long-poll reads of a namespace log shared by their waiters (§7.7).
@@ -209,15 +211,24 @@ func (e *Engine) NamespaceLiveLog(ctx context.Context, ns, since string, limit i
 //     since;
 //   - the read check's decision still stands, as for a LivePass: the
 //     meta counter holds the even value loaded before that transaction,
-//     on Postgres the tailer is fresh, and the grant hasn't expired. A
-//     public namespace's, or any while authentication is disabled, holds
-//     for every request; another's only for the same bearer grant, never
-//     for an edge grant.
+//     and the grant hasn't expired. A public namespace's, or any while
+//     authentication is disabled, holds for every request; another's only
+//     for the same bearer grant, never for an edge grant;
+//   - on Postgres, the tailer's last successful poll started within
+//     quietFreshFor.
 //
-// On Postgres a commit on another instance closes the channel when the
+// On Postgres a commit on another instance closes the channel, and a
+// change to what reads may return moves the meta counter, when the
 // tailer sees it, as it wakes this instance's waiters: until then a
 // request answered here waits, as one that read would have, and the
-// tailer's wake sends it to read.
+// tailer's wake sends it to read. A quiet answer carries no content, only
+// "nothing after since", so the tailer's lag delays a follower as it
+// delays the waiters already waiting, and exposes nothing a purge or
+// revocation withdrew. So it is bounded more loosely than the read
+// cache's answers (freshFor), which carry content: a few seconds. A bound
+// as tight as freshFor turned quiet answers off whenever the database was
+// busy enough to slow one poll, and sent every follower to read, which
+// made the database busier still (docs/CAPACITY.md, Resource followers).
 
 // quietCache holds quiet resources by resource and credentials.
 type quietCache struct {
@@ -268,8 +279,21 @@ func quietKeys(ns, name string, cred Credentials) (anyone, own string) {
 	return anyone, own
 }
 
-// quietLog answers a long-poll from since without a transaction, or nil.
-func (e *Engine) quietLog(ns, name, since string, cred Credentials) *Log {
+// quietFreshFor is how recently the tailer must have polled for quiet
+// answers on Postgres (see above): a quarter of the long-poll interval,
+// and never less than freshFor.
+func (e *Engine) quietFreshFor() time.Duration {
+	return max(e.freshFor(), e.LongPollInterval()/4)
+}
+
+// quietServing reports whether quiet answers may be given now.
+func (e *Engine) quietServing() bool {
+	return e.rc.fresh == nil || e.tailedWithin(e.quietFreshFor())
+}
+
+// quietLog answers a long-poll from since without a transaction, or nil;
+// stale reports an answer withheld because the tailer is behind.
+func (e *Engine) quietLog(ns, name, since string, cred Credentials) (lg *Log, stale bool) {
 	anyone, own := quietKeys(ns, name, cred)
 	for _, k := range []string{anyone, own} {
 		if k == "" {
@@ -283,18 +307,18 @@ func (e *Engine) quietLog(ns, name, since string, cred Credentials) *Log {
 			e.quiet.drop(k)
 			continue
 		}
-		if !e.rc.serving() {
-			return nil
+		if !e.quietServing() {
+			return nil, true
 		}
-		return &Log{Status: 200, Public: q.public, Until: q.until, Last: since}
+		return &Log{Status: 200, Public: q.public, Until: q.until, Last: since}, false
 	}
-	return nil
+	return nil, false
 }
 
 // rememberQuiet records a live read that ended at its resource's head.
 func (e *Engine) rememberQuiet(ns, name string, cred Credentials, lg *Log, q *quietRead) {
 	if !q.ok || lg.Status != 200 || lg.More || lg.Last == "" || q.meta%2 != 0 ||
-		e.rc.meta.Load() != q.meta || !e.rc.serving() || closed(q.woken) {
+		e.rc.meta.Load() != q.meta || !e.quietServing() || closed(q.woken) {
 		return
 	}
 	anyone, own := quietKeys(ns, name, cred)
@@ -344,12 +368,19 @@ func (c *quietCache) put(k string, q quietEntry) {
 // (§7.7): from a quiet resource's head it answers without a transaction
 // (see above), and a read that ends at the head is recorded for the next.
 func (e *Engine) ResourceLiveLog(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
+	answer := "read"
 	if since != "" {
-		if lg := e.quietLog(ns, name, since, cred); lg != nil {
+		lg, stale := e.quietLog(ns, name, since, cred)
+		if lg != nil {
 			e.liveQuiet.Add(1)
+			e.countLiveRead("memory")
 			return lg, nil
 		}
+		if stale {
+			answer = "stale"
+		}
 	}
+	e.countLiveRead(answer)
 	// The channel before the counter, both before the transaction: a
 	// commit the snapshot misses has yet to bump the counter, or close
 	// the channel, or both.
@@ -360,4 +391,10 @@ func (e *Engine) ResourceLiveLog(ctx context.Context, ns, name, since string, li
 		e.rememberQuiet(ns, name, cred, lg, q)
 	}
 	return lg, err
+}
+
+func (e *Engine) countLiveRead(answer string) {
+	if in := inst.Get(); in != nil {
+		in.liveReads.Add(context.Background(), 1, metric.WithAttributes(attrAnswer.String(answer)))
+	}
 }

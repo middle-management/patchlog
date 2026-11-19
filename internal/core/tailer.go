@@ -226,9 +226,13 @@ func (e *Engine) tailLoop(s tailState) {
 
 // fresh reports whether the tailer's last successful poll started within
 // freshFor (readcache.go).
-func (e *Engine) fresh() bool {
+func (e *Engine) fresh() bool { return e.tailedWithin(e.freshFor()) }
+
+// tailedWithin reports whether the tailer's last successful poll started
+// within d.
+func (e *Engine) tailedWithin(d time.Duration) bool {
 	last := e.lastPoll.Load()
-	return last != 0 && time.Since(e.epoch)-time.Duration(last-1) < e.freshFor()
+	return last != 0 && time.Since(e.epoch)-time.Duration(last-1) < d
 }
 
 // freshFor is how long after a poll started the read cache keeps serving
