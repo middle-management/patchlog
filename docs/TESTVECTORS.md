@@ -117,6 +117,20 @@ go test ./internal/vectors/ -run 'TestI2[234]'
 | §I.23 View keys and per-entry sealing (§E.2.6) | `TestI23ViewKey` | the view from I.8's `gs` (`grantcheck.SubjectSetID`; an input only), `ns_id₂` and `derived.CanonicalQuery` without `min`; `seal.ViewKey` over `K_r`; the hit's JWE through `seal.SealWithIV` with the pl of `derived.View`, padded through `seal.Pad`; `derived.SealItem` (own IV) for the same header and plaintext; `derived.OpenItem` opening the JWE and rejecting the four altered views |
 | §I.24 Bundles refused (§G.4.1) | `TestI24BundlesRefused` | each bundle built from §I.20's and matched to its sha-256, then read by the bundle Reader: row 1's id is `grant.Decode` of §I.21's `ops-2027` token, `ID()`, the id §I.21 now states; row 2's `stored` is the authority block cut out of §I.21's token whose root block string has `sub` first; each rejected whole, rows 1 and 2 at the grant line (line 2), row 3 at the header. The Writer refuses rows 1 and 2 too |
 
+## §I.25 (v0.86)
+
+Long-poll phases (§7.7) joined the byte-exact definitions in v0.86. §I.25's four rows are in
+`testdata/addendum_i.json` as SPEC.md prints them and checked in
+[`internal/vectors/addendum_i25_test.go`](../internal/vectors/addendum_i25_test.go):
+
+```
+go test ./internal/vectors/ -run 'TestI25'
+```
+
+| | Test | What the reference computes it with |
+|---|---|---|
+| §I.25 Long-poll phases (§7.7) | `TestI25LongPollPhases`, `TestI25LongPollPhasesServed` | `server.LongPollPhase`, which every log's long-poll clock takes its phase from, for the four paths at 20 s: the four phases (and the first 8 bytes of each path's SHA-256); `server.LongPollCursor` changing at epoch + phase + n × interval; the last path's `gs` is I.8's (`grantcheck.SubjectSetID`); a deployment at the 20 s interval answering a long-poll of each of the first three paths with the `X-Cursor` of the interval the answer falls in, counted from the spec's phase |
+
 ## Candidate vectors (VECTORS-PROPOSED.md, v0.85)
 
 [VECTORS-PROPOSED.md](VECTORS-PROPOSED.md) holds candidates for §I.25's list, computed

@@ -15,7 +15,9 @@ through production code and
 candidates P.1–P.7 of v0.81, which v0.82 took into the Addendum; §I.17 as v0.85 recomputed it,
 which the reference confirms),
 [internal/vectors/addendum_i22_test.go](internal/vectors/addendum_i22_test.go) §I.22–§I.24 (the
-candidates C.1–C.3 of v0.82, in the Addendum since v0.85), and
+candidates C.1–C.3 of v0.82, in the Addendum since v0.85),
+[internal/vectors/addendum_i25_test.go](internal/vectors/addendum_i25_test.go) §I.25 (long-poll
+phases, v0.86), and
 [docs/TESTVECTORS.md](docs/TESTVECTORS.md) points there and records which candidate vectors of
 [docs/VECTORS-PROPOSED.md](docs/VECTORS-PROPOSED.md) the reference confirms (C.4 and C.5,
 v0.85). The
@@ -4967,12 +4969,14 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
 - **Live reads** (§7.3, §7.7, v0.73). A long-poll without a cursor, or with one behind by an
   hour's worth of intervals or less, is answered at once (`200`, or `204` with the current
   `X-Cursor`); one further behind is `400 bad_input`, which followers and `cmd/capacity` answer
-  by dropping the cursor and polling again. Each log's intervals are shifted by a phase drawn from
-  its path (the first 8 bytes of the SHA-256 of `/r/{ns}/{name}/log`, `/ns/{ns}/log` or
-  `/ns/{ns}/g/{gs}/log`, modulo the interval in milliseconds), so the waits of a deployment's
-  logs don't all end at one instant. §7.7 counts every log's from one epoch: `serve
-  --long-poll-fixed-epoch` does that (docs/SPEC-FEEDBACK.md, v0.85 Open 61). Followers of one URL
-  share its boundaries and cursors either way. A long-poll or stream of a resource with no entries
+  by dropping the cursor and polling again. Each log's intervals are counted from the epoch plus
+  the log's phase (§7.7 as of v0.86, vectors §I.25): the first 8 bytes of the SHA-256 of
+  `/r/{ns}/{name}/log`, `/ns/{ns}/log` or `/ns/{ns}/g/{gs}/log`, modulo the interval in
+  milliseconds, so the waits of a deployment's logs don't all end at one instant. Every
+  deployment counts them so: `serve --long-poll-fixed-epoch`, which kept v0.85's one epoch for
+  all logs, is gone. Followers of one URL share its boundaries and cursors; a cursor carried from
+  one log to another (a partial reader's long-poll, redirected to its filtered log) is at most one
+  off there, and answered as any cursor behind or ahead is. A long-poll or stream of a resource with no entries
   waits for its first. A stream judges its read check again before each page and keep-alive,
   ends at the latest when the grant or cookie it was admitted under expires, and a namespace
   stream ends after its `purge-ns` event.

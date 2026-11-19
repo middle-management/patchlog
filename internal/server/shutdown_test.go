@@ -227,7 +227,7 @@ func TestShutdownEndsLongPoll(t *testing.T) {
 	since := s.nsHead("docs")
 	// With the current cursor, so it waits: one without a cursor is
 	// answered at once (§7.7).
-	cur := strconv.FormatInt(time.Now().UnixNano()/int64(s.opt.LongPollInterval), 10)
+	cur := strconv.FormatInt(newLiveClock(s.opt.LongPollInterval, "/ns/docs/log").cursor(time.Now()), 10)
 	res := make(chan result, 1)
 	go func() {
 		res <- send("GET", s.srv.URL+"/ns/docs/log?live=long-poll&since="+since+"&cursor="+cur, "", "", nil)

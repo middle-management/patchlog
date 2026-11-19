@@ -230,7 +230,7 @@ func (s *Server) gLive(w http.ResponseWriter, r *http.Request) {
 func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, gs string, reqCursor int64) {
 	since := r.URL.Query().Get("since")
 	tags := []string{"ns:" + ns}
-	clock := s.clockOf("/ns/" + ns + "/g/" + gs + "/log")
+	clock := s.clockOf(filteredLogPath(ns, gs))
 	interval := clock.interval
 	current, err := judgeCursor(time.Now(), clock, reqCursor)
 	if err != nil {

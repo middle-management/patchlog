@@ -419,5 +419,30 @@
     "rule": "a member §G.4.1 doesn't define"
    }
   ]
+ },
+ "I.25": {
+  "intervalMs": 20000,
+  "rows": [
+   {
+    "path": "/r/docs/a/log",
+    "first8": "c6b6521efdba5aa1",
+    "phaseMs": 15777
+   },
+   {
+    "path": "/r/docs/b/log",
+    "first8": "d88ca141ae2485cf",
+    "phaseMs": 1327
+   },
+   {
+    "path": "/ns/docs/log",
+    "first8": "7a75dc61743845ce",
+    "phaseMs": 18318
+   },
+   {
+    "path": "/ns/matches/g/17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm/log",
+    "first8": "557cd01ce3897ae3",
+    "phaseMs": 15523
+   }
+  ]
  }
 }

@@ -85,12 +85,6 @@ type Options struct {
 	ReadCacheBytes    int
 	// LongPollInterval is the interval of §7.7 (default 20s).
 	LongPollInterval time.Duration
-	// LongPollFixedEpoch counts every log's long-poll intervals from the
-	// epoch itself, as §7.7 says to as of v0.85. By default each log's are
-	// shifted by a phase drawn from its path (server.logPhase;
-	// docs/SPEC-FEEDBACK.md, v0.85 Open 61), so the waits of a
-	// deployment's many logs don't all end at one instant.
-	LongPollFixedEpoch bool
 	// Now overrides the clock (tests).
 	Now func() time.Time
 	// Purger receives cache-tag purges (§9). Nil logs them.
@@ -650,10 +644,6 @@ func (e *Engine) Origin() string { return e.opt.Origin }
 
 // LongPollInterval is the §7.7 interval.
 func (e *Engine) LongPollInterval() time.Duration { return e.opt.LongPollInterval }
-
-// LongPollFixedEpoch reports whether every log's long-poll intervals start
-// at the epoch itself (Options.LongPollFixedEpoch).
-func (e *Engine) LongPollFixedEpoch() bool { return e.opt.LongPollFixedEpoch }
 
 // Limits are the deployment maximums, which bound request bodies.
 func (e *Engine) Limits() Limits { return e.opt.Maximums }
