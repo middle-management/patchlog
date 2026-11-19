@@ -925,6 +925,22 @@ func (t *tx) admit(draws []draw) *Error {
 	return nil
 }
 
+// admitOnce is admit, once for a request: a write that runs again, as one
+// that reads a remote branch's base does (withRemoteSource), keeps its
+// draw (rateDrawn).
+func (t *tx) admitOnce(draws []draw) *Error {
+	if t.rateDrawn != nil && *t.rateDrawn {
+		return nil
+	}
+	if err := t.admit(draws); err != nil {
+		return err
+	}
+	if t.rateDrawn != nil {
+		*t.rateDrawn = true
+	}
+	return nil
+}
+
 // charge deducts more from a bucket an admitted request drew on: an
 // upload's bytes beyond what it declared (§7.8).
 func (rl *rateLimiter) charge(now time.Time, d draw) {

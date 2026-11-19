@@ -13,6 +13,13 @@ import (
 // authorizeTaken authorises a create of an existing namespace, before its
 // 412: an operator grant may create namespaces with config (§C.2 item 2,
 // §C.4), and otherwise the caller needs config on the namespace itself.
+//
+// Under an operator grant the creation draws no token, its 412 included.
+// Under any other grant the 412 costs one token from that grant's
+// principal bucket, its allowance's if it has one, and none from the
+// namespace's (§6.6 Cost and Exempt): a * key's grant too, since the
+// request is no config write of the namespace. With authentication
+// disabled there is no grant, and nothing is drawn.
 func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
 	// The write's rules draw on one validation meter (§6.6, writeMeter).
 	defer t.metered(nil)()
@@ -21,11 +28,18 @@ func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
 			return t.authorize(a, "config", "")
 		}
 	}
-	a, err := t.authenticate(n.name, n, t.config(n.configSeq), req.Cred, nil)
+	cfg := t.config(n.configSeq)
+	a, err := t.authenticate(n.name, n, cfg, req.Cred, nil)
 	if err != nil {
 		return err
 	}
-	return t.authorize(a, "config", "")
+	if err := t.authorize(a, "config", ""); err != nil {
+		return err
+	}
+	if a.verified == nil {
+		return nil
+	}
+	return t.admitOnce([]draw{t.principalDraw(n, cfg, a, 1)})
 }
 
 // createNamespace bootstraps a namespace with an operator grant (§C.4),
