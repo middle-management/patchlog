@@ -1,5 +1,5 @@
 {
- "source": "docs/SPEC.md Addendum I, §I.15–§I.24 (v0.86; §I.17 as v0.85 recomputed it, its last row as v0.86 changed it, §I.22–§I.24 the candidates C.1–C.3 of v0.82); the expected values are copied from it, never computed",
+ "source": "docs/SPEC.md Addendum I, §I.15–§I.25 (v0.86; §I.17 as v0.85 recomputed it, its last row as v0.86 changed it, §I.22–§I.24 the candidates C.1–C.3 of v0.82, §I.25 the long-poll phases of v0.86); the expected values are copied from it, never computed",
  "I.15": {
   "releaseDoc": "{\"branches\":{\"matches\":{\"at\":\"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm\",\"ns\":\"matches-r7\"}},\"name\":\"release-7\"}",
   "releaseGenesis": "1bx3m7usot3btfia44al7op7h4tbzwprh",
