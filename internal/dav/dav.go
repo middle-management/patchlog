@@ -366,6 +366,16 @@ func (st *reqState) upstreamFailed(key string, e *davError) {
 	}
 }
 
+// upstreamOK clears what upstreamFailed kept under key: the read was made
+// again, and answered.
+func (st *reqState) upstreamOK(key string) {
+	st.upMu.Lock()
+	defer st.upMu.Unlock()
+	if i := slices.IndexFunc(st.upFail, func(f upFailure) bool { return f.key == key }); i >= 0 {
+		st.upFail = slices.Delete(st.upFail, i, i+1)
+	}
+}
+
 // upFailure is the first failure for now among the upstream requests made
 // for st's request and not answered since, nil if none: the request's
 // answer (errWriter).
@@ -2547,6 +2557,9 @@ type reqState struct {
 	// failed for now (sawUpstream), the first of which is its answer
 	upMu   sync.Mutex
 	upFail []upFailure
+	// newLock: the token of the lock the request's LOCK created
+	// (boundedLS.Create), released if it is answered a failure
+	newLock string
 
 	hdr       http.Header // the request's
 	resp      http.Header // the answer's

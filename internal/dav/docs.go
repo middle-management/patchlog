@@ -63,12 +63,16 @@ func (s *Server) doc(ctx context.Context, tk *token, ns, name, rev string) (*doc
 	s.docMu.Lock()
 	e, ok := s.docs.Get(k)
 	s.docMu.Unlock()
+	st := state(ctx)
 	if ok {
+		if st != nil {
+			st.upstreamOK("GET " + k)
+		}
 		return e, nil
 	}
 	// One read per token and revision at a time; another token's read
 	// could fail where this one's wouldn't.
-	v, err, _ := s.group.Do(tk.id+"|"+k, func() (any, error) {
+	v, err, shared := s.group.Do(tk.id+"|"+k, func() (any, error) {
 		select {
 		case s.sem <- struct{}{}:
 		case <-ctx.Done():
@@ -89,15 +93,20 @@ func (s *Server) doc(ctx context.Context, tk *token, ns, name, rev string) (*doc
 		return e, nil
 	})
 	if err != nil {
-		if st := state(ctx); st != nil && failedRead(err) && !errors.Is(err, context.Canceled) {
+		if st != nil && shared && failedRead(err) && !errors.Is(err, context.Canceled) {
 			// The read may have been another request's, shared with this
-			// one: its failure for now is this request's too (§H.4
-			// "Answers", v0.86).
+			// one, which then made none of its own to see fail
+			// (sawUpstream): its failure for now is this request's too
+			// (§H.4 "Answers", v0.86), until the read is made again and
+			// answered.
 			if de, ok := upstream(err).(*davError); ok {
 				st.upstreamFailed("GET "+k, de)
 			}
 		}
 		return nil, err
+	}
+	if st != nil {
+		st.upstreamOK("GET " + k)
 	}
 	return v.(*docEntry), nil
 }

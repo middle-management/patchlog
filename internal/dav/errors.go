@@ -309,10 +309,13 @@ func (w *errWriter) writeHeader(code int) {
 	if up := w.st.upFailure(); up != nil && (code < 400 || e == nil || e.status != http.StatusBadGateway && e.status != http.StatusServiceUnavailable) {
 		w.st.s.opt.Logf("dav: %s %s: answered %d, not %d: %v", w.st.method, w.st.path, up.status, code, up)
 		if code < 400 {
-			// What the request did, it did: a DELETE's or MOVE's locks
-			// and properties follow the file (answered), though the
-			// client is told to try again.
+			// What the request did at the core, it did: a DELETE's or
+			// MOVE's locks and properties follow the file (answered),
+			// though the client is told to try again. A lock its LOCK
+			// made is this server's own to take back: the client gets
+			// no token for it.
 			w.st.answered(code)
+			w.st.dropNewLock()
 		} else {
 			w.st.answered(up.status)
 		}

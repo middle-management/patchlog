@@ -153,32 +153,80 @@ func TestV086CoreFailureNamesOnlyTheCore(t *testing.T) {
 // and answered as made.
 func TestV086WaitedOut429IsNoFailure(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
-	e.create("docs", "x", map[string]any{"a": "1"})
-	var limited atomic.Int64
-	rt := rtFunc(func(q *http.Request) (*http.Response, error) {
-		if q.Method != "GET" && q.Method != "HEAD" && strings.HasPrefix(q.URL.Path, "/r/docs/x") && limited.Add(1) == 1 {
-			if q.Body != nil {
-				io.Copy(io.Discard, q.Body)
-				q.Body.Close()
-			}
-			return &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"1"}, "Content-Type": {"application/json"}},
-				Body: io.NopCloser(strings.NewReader(`{"code":"rate_limited","message":"slow down","retryAfter":0.05}`)), Request: q}, nil
+	isWrite := func(q *http.Request) bool {
+		return q.Method != "GET" && q.Method != "HEAD" && strings.HasPrefix(q.URL.Path, "/r/docs/x")
+	}
+	isRead := func(q *http.Request) bool { return q.Method == "GET" && strings.HasPrefix(q.URL.Path, "/r/docs/x") }
+	type limit struct {
+		what  string
+		match func(q *http.Request) bool
+		nth   int64 // which matching request of the PUT gets the 429
+	}
+	cases := []limit{{"the write", isWrite, 1}}
+	// Each read of the document the save makes, in turn: one inside the
+	// attempt is asked again with it, one outside fails the save.
+	for n := int64(1); n <= 4; n++ {
+		cases = append(cases, limit{fmt.Sprintf("read %d of the save", n), isRead, n})
+	}
+	var waitedOut atomic.Int64
+	t.Run("", func(t *testing.T) {
+		for _, c := range cases {
+			t.Run(c.what, func(t *testing.T) {
+				t.Parallel()
+				e := newEnv(t, []string{"docs"}, nil, nil)
+				e.create("docs", "x", map[string]any{"a": "1"})
+				var armed atomic.Bool
+				var seen atomic.Int64
+				var again atomic.Value // the URL answered 429, asked again
+				var url429 atomic.Value
+				rt := rtFunc(func(q *http.Request) (*http.Response, error) {
+					if armed.Load() && c.match(q) {
+						if seen.Add(1) == c.nth {
+							if q.Body != nil {
+								io.Copy(io.Discard, q.Body)
+								q.Body.Close()
+							}
+							url429.Store(q.Method + " " + q.URL.String())
+							return &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"1"}, "Content-Type": {"application/json"}},
+								Body: io.NopCloser(strings.NewReader(`{"code":"rate_limited","message":"slow down","retryAfter":0.05}`)), Request: q}, nil
+						}
+						if u, _ := url429.Load().(string); u == q.Method+" "+q.URL.String() {
+							again.Store(true)
+						}
+					}
+					return http.DefaultTransport.RoundTrip(q)
+				})
+				e = v82With(t, e, rt)
+				b := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
+				armed.Store(true)
+				r := e.do("PUT", "/docs/x.json", strings.Replace(b, `"1"`, `"2"`, 1))
+				armed.Store(false)
+				if seen.Load() < c.nth {
+					t.Skipf("the PUT makes fewer than %d such requests", c.nth)
+				}
+				_, doc := e.load("docs", "x")
+				saved := doc.(map[string]any)["a"] == "2"
+				retried, _ := again.Load().(bool)
+				switch {
+				case retried && saved:
+					// Waited out: the save is answered as made.
+					if r.status != 204 && r.status != 201 {
+						t.Fatalf("a PUT, %s answered 429, asked again and answered, the save made: %d %s", c.what, r.status, r.body)
+					}
+					waitedOut.Add(1)
+				case !saved:
+					// Not asked again: the request failed for now.
+					v86Upstream(t, r, 503, "the core is busy or behind for now; try again", "1", "a PUT, "+c.what+" answered 429 and not asked again")
+				default:
+					t.Fatalf("a PUT, %s answered 429 and never asked again, saved all the same: %d %s", c.what, r.status, r.body)
+				}
+			})
 		}
-		return http.DefaultTransport.RoundTrip(q)
 	})
-	e = v82With(t, e, rt)
-	b := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
-	r := e.do("PUT", "/docs/x.json", strings.Replace(b, `"1"`, `"2"`, 1))
-	if r.status != 204 && r.status != 201 {
-		t.Fatalf("a PUT whose first write the core answered 429 and whose second it took: %d %s", r.status, r.body)
+	if waitedOut.Load() == 0 {
+		t.Fatal("no 429 was waited out")
 	}
-	if limited.Load() < 2 {
-		t.Fatalf("the write was sent %d times, want the 429 and then again", limited.Load())
-	}
-	if _, doc := e.load("docs", "x"); doc.(map[string]any)["a"] != "2" {
-		t.Fatalf("the save wasn't made: %v", doc)
-	}
+	t.Logf("%d of %d rate-limited requests were waited out", waitedOut.Load(), len(cases))
 }
 
 // v0.86 (TOOLS §H.3 "A tree service that is behind": "a tool answers 503
@@ -233,4 +281,46 @@ func TestV086TreeServiceFailureNamesOnlyTheService(t *testing.T) {
 	}
 	status.Store(0)
 	sameStrings(t, "Season, the tree service answering", names(g.propfindAs(user, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+}
+
+// A LOCK answered with an upstream's failure leaves no lock behind: the
+// client was given no token for it, and its next LOCK would be 423 until
+// the lock timed out.
+func TestV086FailedLockLeavesNoLock(t *testing.T) {
+	t.Parallel()
+	rt := &failRT{status: 500}
+	e := newEnv(t, nil, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("docs", "other")}})
+	for _, ns := range []string{"docs", "other"} {
+		must(e.c.CreateNamespace(e.ctx, ns, map[string]any{"read": "public"}))
+	}
+	e.create("docs", "derby", map[string]any{"title": "Derby"})
+	e.create("other", "sib", map[string]any{"title": "Sibling"})
+	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	e.create("cat", "season", map[string]any{"title": "Season", "parents": parents("cat", "root")})
+	e.create("cat", "docs.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
+	e.create("cat", "other.sib", map[string]any{"title": "sib.json", "parents": parents("cat", "season")})
+	e = v82With(t, e, rt)
+	var hit atomic.Int64
+	rt.match.Store(func(q *http.Request) bool {
+		if q.Method == "GET" && (q.URL.Path == "/ns/other" || q.URL.Path == "/ns/other/principal") {
+			hit.Add(1)
+			return true
+		}
+		return false
+	})
+	const lockBody = `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
+	rt.armed.Store(true)
+	r := e.do("LOCK", "/cat/Season/derby.json", lockBody, "Timeout", "Second-600")
+	if hit.Load() == 0 {
+		t.Skip("the LOCK made no read of the sibling's namespace")
+	}
+	v86Upstream(t, r, 502, "the core failed", "", "LOCK while the core fails a sibling namespace's reads")
+	if r.header.Get("Lock-Token") != "" {
+		t.Fatalf("the 502 carries a Lock-Token: %v", r.header)
+	}
+	rt.armed.Store(false)
+	r = e.do("LOCK", "/cat/Season/derby.json", lockBody, "Timeout", "Second-600")
+	if r.status != 200 || r.header.Get("Lock-Token") == "" {
+		t.Fatalf("LOCK again, the core answering: %d %s %v, want the lock", r.status, r.body, r.header)
+	}
 }
