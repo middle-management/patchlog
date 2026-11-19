@@ -621,8 +621,37 @@ func (t *tx) touchedPaths(ch refChange) []string {
 // through, resolved as schemaUses resolves every resource.
 func (t *tx) schemaUsesOf(targets []string, exclude func(ns *nsRow, res string) bool) map[string]map[int64]*nsRow {
 	uses := map[string]map[int64]*nsRow{}
+	w := t.usesWalkOf(targets, exclude)
+	for _, n := range w.all {
+		for _, p := range w.of(n) {
+			if uses[p] == nil {
+				uses[p] = map[int64]*nsRow{}
+			}
+			uses[p][n.id] = n
+		}
+	}
+	return uses
+}
+
+// usesWalk is schemaUsesOf a namespace at a time: all the deployment's
+// namespaces in byte order of name, and of(n) the paths n uses. A caller
+// that needs only the first few referencing namespaces by name stops
+// there, at the cost of those it looked at (brokenEach).
+type usesWalk struct {
+	t       *tx
+	exclude func(ns *nsRow, res string) bool
+	reach   map[string]bool           // the paths that reach a target
+	holds   map[int64]map[string]bool // by namespace, the resources with a revision whose $schema is one
+	all     []*nsRow                  // by name; none if nothing holds one
+	byID    map[int64]*nsRow
+	copies  map[string][]copyRow
+	docs    map[string]any
+}
+
+func (t *tx) usesWalkOf(targets []string, exclude func(ns *nsRow, res string) bool) *usesWalk {
+	w := &usesWalk{t: t, exclude: exclude, byID: map[int64]*nsRow{}, copies: map[string][]copyRow{}, docs: map[string]any{}}
 	if len(targets) == 0 {
-		return uses
+		return w
 	}
 	t.noLock++ // as schemaUses
 	defer func() { t.noLock-- }()
@@ -667,118 +696,125 @@ func (t *tx) schemaUsesOf(targets []string, exclude func(ns *nsRow, res string) 
 		rows.Close()
 	}
 	if len(holds) == 0 {
-		return uses
+		return w
 	}
+	w.reach, w.holds = reach, holds
 	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces`)
 	t.must(err)
-	var all []*nsRow
-	byID := map[int64]*nsRow{}
 	for rows.Next() {
 		n, err := scanNS(rows)
 		t.must(err)
-		all = append(all, n)
-		byID[n.id] = n
+		w.all = append(w.all, n)
+		w.byID[n.id] = n
 	}
+	t.must(rows.Err())
 	rows.Close()
-	copies := map[string][]copyRow{}
-	docs := map[string]any{}
-	for _, n := range all {
-		if n.purged || strings.HasPrefix(n.name, "~") {
+	sort.Slice(w.all, func(i, j int) bool { return w.all[i].name < w.all[j].name })
+	return w
+}
+
+// of is the paths that reach a target which n references (schemaUses'
+// rule for one namespace), in no order; none for a purged namespace or a
+// shadow.
+func (w *usesWalk) of(n *nsRow) []string {
+	t, exclude, reach, holds, byID, copies, docs := w.t, w.exclude, w.reach, w.holds, w.byID, w.copies, w.docs
+	t.noLock++ // as schemaUses
+	defer func() { t.noLock-- }()
+	var out []string
+	used := map[string]bool{}
+	if n.purged || strings.HasPrefix(n.name, "~") {
+		return nil
+	}
+	// What n holds or reads through of those resources.
+	names := map[string]bool{}
+	for m := n; m != nil; m = byID[m.base.Int64] {
+		for name := range holds[m.id] {
+			names[name] = true
+		}
+		if !m.isBranch() {
+			break
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	var queue []string
+	add := func(p string) {
+		if !reach[p] {
+			return
+		}
+		if !used[p] {
+			used[p] = true
+			out = append(out, p)
+			queue = append(queue, p)
+		}
+	}
+	for _, name := range sortedKeys(names) {
+		if exclude(n, name) {
 			continue
 		}
-		// What n holds or reads through of those resources.
-		names := map[string]bool{}
-		for m := n; m != nil; m = byID[m.base.Int64] {
-			for name := range holds[m.id] {
-				names[name] = true
-			}
-			if !m.isBranch() {
-				break
-			}
-		}
-		if len(names) == 0 {
+		v := t.resolve(n, name, nil)
+		if v.state == NotFound || v.state == Purged || v.head == nil {
 			continue
 		}
-		var queue []string
-		add := func(p string) {
-			if !reach[p] {
-				return
-			}
-			if uses[p] == nil {
-				uses[p] = map[int64]*nsRow{}
-			}
-			if uses[p][n.id] == nil {
-				uses[p][n.id] = n
-				queue = append(queue, p)
-			}
+		var ref sql.NullString
+		ll := t.lastLive(v.head)
+		t.must(t.QueryRow(`SELECT schema_ref FROM revisions WHERE seq = ?`, ll.seq).Scan(&ref))
+		if ref.Valid {
+			add(ref.String)
 		}
-		for _, name := range sortedKeys(names) {
-			if exclude(n, name) {
-				continue
-			}
-			v := t.resolve(n, name, nil)
-			if v.state == NotFound || v.state == Purged || v.head == nil {
-				continue
-			}
-			var ref sql.NullString
-			ll := t.lastLive(v.head)
-			t.must(t.QueryRow(`SELECT schema_ref FROM revisions WHERE seq = ?`, ll.seq).Scan(&ref))
-			if ref.Valid {
-				add(ref.String)
-			}
+	}
+	if n.isBranch() && holds[n.id] != nil {
+		// Every revision a branch wrote (schemaUses).
+		rr, err := t.Query(`SELECT DISTINCT s.name, r.schema_ref FROM revisions r JOIN resources s ON s.res = r.res
+			WHERE s.ns = ? AND s.state <> ? AND r.schema_ref IS NOT NULL`, n.id, statePurged)
+		t.must(err)
+		type use struct{ name, ref string }
+		var us []use
+		for rr.Next() {
+			var u use
+			t.must(rr.Scan(&u.name, &u.ref))
+			us = append(us, u)
 		}
-		if n.isBranch() && holds[n.id] != nil {
-			// Every revision a branch wrote (schemaUses).
-			rr, err := t.Query(`SELECT DISTINCT s.name, r.schema_ref FROM revisions r JOIN resources s ON s.res = r.res
-				WHERE s.ns = ? AND s.state <> ? AND r.schema_ref IS NOT NULL`, n.id, statePurged)
-			t.must(err)
-			type use struct{ name, ref string }
-			var us []use
-			for rr.Next() {
-				var u use
-				t.must(rr.Scan(&u.name, &u.ref))
-				us = append(us, u)
-			}
-			t.must(rr.Err())
-			rr.Close()
-			for _, u := range us {
-				if !exclude(n, u.name) {
-					add(u.ref)
-				}
-			}
-		}
-		for len(queue) > 0 {
-			p := queue[0]
-			queue = queue[1:]
-			ref, ok := schema.ParseRef(p)
-			if !ok {
-				continue
-			}
-			d, ok := docs[p]
-			if !ok {
-				cr, ok := copies[p]
-				if !ok {
-					if id, err := ids.Parse(ref.Rev); err == nil {
-						cr = t.copyRows(id, ref.Name)
-					}
-					copies[p] = cr
-				}
-				cs := t.satisfyingCopies(ref, n, nil, cr)
-				if len(cs) == 0 {
-					continue
-				}
-				var err error
-				if d, err = t.docAt(t.rev(cs[0].seq)); err != nil {
-					continue
-				}
-				docs[p] = d
-			}
-			for _, x := range schema.Refs(d) {
-				add(x.Path())
+		t.must(rr.Err())
+		rr.Close()
+		for _, u := range us {
+			if !exclude(n, u.name) {
+				add(u.ref)
 			}
 		}
 	}
-	return uses
+	for len(queue) > 0 {
+		p := queue[0]
+		queue = queue[1:]
+		ref, ok := schema.ParseRef(p)
+		if !ok {
+			continue
+		}
+		d, ok := docs[p]
+		if !ok {
+			cr, ok := copies[p]
+			if !ok {
+				if id, err := ids.Parse(ref.Rev); err == nil {
+					cr = t.copyRows(id, ref.Name)
+				}
+				copies[p] = cr
+			}
+			cs := t.satisfyingCopies(ref, n, nil, cr)
+			if len(cs) == 0 {
+				continue
+			}
+			var err error
+			if d, err = t.docAt(t.rev(cs[0].seq)); err != nil {
+				continue
+			}
+			docs[p] = d
+		}
+		for _, x := range schema.Refs(d) {
+			add(x.Path())
+		}
+	}
+	return out
 }
 
 // SchemaScans is the number of passes over every document of the
@@ -839,31 +875,18 @@ type refChange struct {
 }
 
 // brokenReferences returns the namespaces holding a reference that a copy
-// satisfies now and none would after the change (§6.1). Every other
-// namespace holding a copy of a revision the change touches is locked
-// shared before its copy is relied on (D.8), so two purges can't each
-// remove one of the last two copies.
+// satisfies now and none would after the change (§6.1), in byte order of
+// name. Every other namespace holding a copy of a revision the change
+// touches is locked shared before its copy is relied on (D.8), so two
+// purges can't each remove one of the last two copies.
 func (t *tx) brokenReferences(ch refChange) []*nsRow {
-	none := func(*nsRow, string) bool { return false }
-	if ch.exclude == nil {
-		ch.exclude = none
-	}
-	if ch.removed == nil {
-		ch.removed = none
-	}
-	// Most changes touch no schema revision anything references, and one
-	// that does is judged by what references those revisions: neither
-	// reads every document of the deployment (touchedPaths, schemaUsesOf).
-	var out []*nsRow
-	if touched := t.touchedPaths(ch); len(touched) > 0 {
-		out = t.brokenAmong(ch, t.schemaUsesOf(touched, ch.exclude))
-	}
+	out := []*nsRow{}
+	t.brokenEach(&ch, func(m *nsRow) bool {
+		out = append(out, m)
+		return true
+	})
 	if validateBoth {
-		// The oracle's statements aren't a purge's: tests that count
-		// statements don't see them (asOracle).
-		t.oracle++
-		full := t.brokenAmong(ch, t.schemaUses(ch.exclude))
-		t.oracle--
+		full := t.brokenByEveryDocument(ch)
 		same := len(full) == len(out)
 		for i := 0; same && i < len(full); i++ {
 			same = full[i].id == out[i].id
@@ -873,6 +896,112 @@ func (t *tx) brokenReferences(ch refChange) []*nsRow {
 		}
 	}
 	return out
+}
+
+// brokenByEveryDocument is brokenReferences from a pass over every
+// document of the deployment, the PATCHLOG_TEST_VALIDATE_BOTH oracle of
+// brokenEach. Its statements aren't a purge's: tests that count
+// statements don't see them (asOracle).
+func (t *tx) brokenByEveryDocument(ch refChange) []*nsRow {
+	none := func(*nsRow, string) bool { return false }
+	if ch.exclude == nil {
+		ch.exclude = none
+	}
+	if ch.removed == nil {
+		ch.removed = none
+	}
+	t.oracle++
+	defer func() { t.oracle-- }()
+	return t.brokenAmong(ch, t.schemaUses(ch.exclude))
+}
+
+// brokenEach calls visit with each namespace of brokenReferences, in byte
+// order of name, until visit answers false. Namespaces are judged one at
+// a time in that order, each by what it references (usesWalk), so a
+// caller that stops after the first few pays for the namespaces up to
+// there and not for every reference in the deployment: a refusal lists a
+// page of them (refsInUse). A walk that isn't stopped locks the copies it
+// relies on as brokenReferences says.
+//
+// Most changes touch no schema revision anything references, and one
+// that does is judged by what references those revisions: neither reads
+// every document of the deployment (touchedPaths, usesWalkOf).
+func (t *tx) brokenEach(ch *refChange, visit func(m *nsRow) bool) {
+	none := func(*nsRow, string) bool { return false }
+	if ch.exclude == nil {
+		ch.exclude = none
+	}
+	if ch.removed == nil {
+		ch.removed = none
+	}
+	touched := t.touchedPaths(*ch)
+	if len(touched) == 0 {
+		return
+	}
+	// A path's copies, and whether the change touches one, found once.
+	type judged struct {
+		ref     schema.Ref
+		rows    []copyRow
+		touched bool
+	}
+	paths := map[string]*judged{}
+	path := func(p string) *judged {
+		if j, ok := paths[p]; ok {
+			return j
+		}
+		j := &judged{}
+		paths[p] = j
+		ref, ok := schema.ParseRef(p)
+		if !ok {
+			return j
+		}
+		id, err := ids.Parse(ref.Rev)
+		if err != nil {
+			return j
+		}
+		j.ref, j.rows = ref, t.copyRows(id, ref.Name)
+		for _, cr := range j.rows {
+			if _, ok := ch.cfg[cr.ns]; ok || ch.removed(t.nsRowUnlocked(cr.ns), ref.Name) {
+				j.touched = true
+				break
+			}
+		}
+		if j.touched {
+			for _, cr := range j.rows {
+				if !ch.removed(t.nsRowUnlocked(cr.ns), ref.Name) {
+					t.lockNS(cr.ns, lockShared)
+				}
+			}
+		}
+		return j
+	}
+	w := t.usesWalkOf(touched, ch.exclude)
+	for _, m := range w.all {
+		ps := w.of(m)
+		sort.Strings(ps)
+		broken := false
+		for _, p := range ps {
+			// Every touched path is looked up, and its copies locked,
+			// whether or not an earlier one already breaks m.
+			j := path(p)
+			if !j.touched || broken {
+				continue
+			}
+			if len(t.satisfyingCopies(j.ref, m, nil, j.rows)) == 0 {
+				continue // not satisfied now: nothing to break
+			}
+			left := 0
+			for _, c := range t.satisfyingCopies(j.ref, m, ch.cfg, j.rows) {
+				if !ch.removed(c.ns, j.ref.Name) {
+					left++
+				}
+			}
+			broken = left == 0
+		}
+		if broken && !visit(m) {
+			return
+		}
+	}
 }
 
 // brokenAmong is brokenReferences given the uses of the schema revisions
@@ -935,16 +1064,71 @@ func (t *tx) brokenAmong(ch refChange, uses map[string]map[int64]*nsRow) []*nsRo
 	return out
 }
 
-// inUse is the 409 of §6.1 for a change that would leave references
-// without a copy: it lists, as referencing, the referencing namespaces in
-// which the caller may read anything, by the rule for other namespaces
-// (§7.5): with the request's grant or any in Source-Authorization.
-func (t *tx) inUse(broken []*nsRow, msg string) *Error {
+// refsInUse is the 409 in_use of §6.1 for a change that would leave
+// references without a copy, nil if it leaves none. It lists, as
+// referencing, the referencing namespaces in which the caller may read
+// anything, by the rule for other namespaces (§7.5), with the request's
+// grant or any in Source-Authorization: the first logPageSize in byte
+// order of name, with "more": true where the caller may read others
+// (v0.86). So more never tells a caller that namespaces it can't read
+// exist, and a caller who may read none gets [] without it.
+//
+// The search stops at the first readable namespace past the page: a
+// refusal over a schema that thousands of namespaces reference costs a
+// page of them. (A caller who may read few of them still has the search
+// go on to the end.)
+func (t *tx) refsInUse(ch refChange, msg string) *Error {
+	limit := t.e.opt.Maximums.LogPageSize
 	names := []string{}
-	for _, m := range broken {
-		if t.credsReadAny(m, t.reqCreds) {
-			names = append(names, m.name)
+	found, more := false, false
+	readable := map[int64]bool{}
+	reads := func(m *nsRow) bool {
+		r, ok := readable[m.id]
+		if !ok {
+			r = t.credsReadAny(m, t.reqCreds)
+			readable[m.id] = r
+		}
+		return r
+	}
+	t.brokenEach(&ch, func(m *nsRow) bool {
+		found = true
+		if !reads(m) {
+			return true
+		}
+		if len(names) == limit {
+			more = true
+			return false
+		}
+		names = append(names, m.name)
+		return true
+	})
+	if validateBoth {
+		// The capped answer is a prefix of the whole one: the first page
+		// of the namespaces every document gives that the caller may
+		// read, and more exactly where there is another.
+		full := t.brokenByEveryDocument(ch)
+		want := []string{}
+		wantMore := false
+		for _, m := range full {
+			if !reads(m) {
+				continue
+			}
+			if len(want) == limit {
+				wantMore = true
+				break
+			}
+			want = append(want, m.name)
+		}
+		if found != (len(full) > 0) || !sameStrings(names, want) || more != wantMore {
+			panic(fmt.Sprintf("refsInUse: referencing %v (more %v, any %v), by every document %v (more %v) of %d", names, more, found, want, wantMore, len(full)))
 		}
 	}
-	return apiErr(409, "in_use", "message", msg, "referencing", anyStrings(names))
+	if !found {
+		return nil
+	}
+	e := apiErr(409, "in_use", "message", msg, "referencing", anyStrings(names))
+	if more {
+		e.Body["more"] = true
+	}
+	return e
 }

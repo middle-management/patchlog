@@ -99,7 +99,7 @@ func TestV086BranchesPaged(t *testing.T) {
 		"https://r.example/x":    {{"zz"}},
 		"zz":                     {{}},
 		"zzz":                    {{}},
-		"bé":                {{"https://r.example.org/x", "https://r.example/a", "https://r.example/x"}, {"zz"}},
+		"bé":                     {{"https://r.example.org/x", "https://r.example/a", "https://r.example/x"}, {"zz"}},
 		"a_\x00z":                {{"a_b", "ab", "b"}, {"https://r.example.org/x", "https://r.example/a", "https://r.example/x"}, {"zz"}},
 	} {
 		if got := v086BranchKeys(t, e, "main", after, 3); !reflect.DeepEqual(got, want) {

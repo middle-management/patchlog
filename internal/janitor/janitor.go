@@ -541,6 +541,10 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 			d.Action, d.Reason = ActionRetry, d.Claim+", verified and expired, but the purge is refused with in_use"
 			if ae != nil && len(ae.Referencing()) > 0 {
 				d.Reason += ": still referenced from " + strings.Join(ae.Referencing(), ", ")
+				if ae.More() {
+					// The first page of them (§6.1, v0.86).
+					d.Reason += " and others"
+				}
 			}
 			d.Reason += "; retried later"
 			return d, nil

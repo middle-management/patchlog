@@ -532,8 +532,8 @@ func (t *tx) configInUse(n *nsRow, cur, cfg *Config) *Error {
 	if n.isBranch() && !sameStrings(cur.DraftsFor, cfg.DraftsFor) {
 		// Narrowing drafts.for may leave a reference to its drafts
 		// without a copy (§6.1, §7.4).
-		if broken := t.brokenReferences(refChange{cfg: map[int64]*Config{n.id: cfg}}); len(broken) > 0 {
-			return t.inUse(broken, "the change would leave references to this branch's draft schema revisions without a copy (§6.1)")
+		if err := t.refsInUse(refChange{cfg: map[int64]*Config{n.id: cfg}}, "the change would leave references to this branch's draft schema revisions without a copy (§6.1)"); err != nil {
+			return err
 		}
 	}
 	return nil

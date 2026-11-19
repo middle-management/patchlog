@@ -64,12 +64,13 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		plan := t.purgePlan(n, name)
 		gone := func(ns *nsRow, res string) bool { return res == name && plan.covers(t, ns) }
 		forced := false
-		if broken := t.brokenReferences(refChange{exclude: gone, removed: gone, name: name}); len(broken) > 0 {
-			if !force {
-				return t.inUse(broken, "the purge would remove the last available copy of a referenced schema revision (§6.1)")
+		if ch := (refChange{exclude: gone, removed: gone, name: name}); !force {
+			if err := t.refsInUse(ch, "the purge would remove the last available copy of a referenced schema revision (§6.1)"); err != nil {
+				return err
 			}
+		} else {
 			// The grant may force: mayForce passed at step 1.
-			forced = true
+			forced = len(t.brokenReferences(ch)) > 0
 		}
 		env := t.basicEnvelope("purge", name, a)
 		env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
@@ -900,23 +901,31 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		if ifMatch != head.String() {
 			return apiErr(412, "stale", "head", head.String())
 		}
+		// The dependents (§8.5 item 4, v0.86): the first logPageSize by
+		// name, in byte order, with "more": true if there are others.
+		// Only that page is read, and one row more.
+		limit := t.e.opt.Maximums.LogPageSize
 		var deps []string
-		for _, b := range t.branchesOf(n) {
-			if !b.purged {
-				deps = append(deps, b.name)
-			}
+		for _, b := range t.branchesAfter(n, "", true, limit+1) {
+			deps = append(deps, b.name)
+		}
+		if len(deps) > limit {
+			e := apiErr(409, "in_use", "dependents", anyStrings(deps[:limit]))
+			e.Body["more"] = true
+			return e
 		}
 		if len(deps) > 0 {
 			return apiErr(409, "in_use", "dependents", anyStrings(deps))
 		}
 		gone := func(ns *nsRow, _ string) bool { return ns.id == n.id }
 		forced := false
-		if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
-			if !force {
-				return t.inUse(broken, "the namespace holds the last available copy of a schema revision referenced from another namespace (§6.1)")
+		if ch := (refChange{exclude: gone, removed: gone}); !force {
+			if err := t.refsInUse(ch, "the namespace holds the last available copy of a schema revision referenced from another namespace (§6.1)"); err != nil {
+				return err
 			}
+		} else {
 			// The grant may force: mayForce passed at step 1.
-			forced = true
+			forced = len(t.brokenReferences(ch)) > 0
 		}
 		env := t.basicEnvelope("purge-ns", "", a)
 		env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}

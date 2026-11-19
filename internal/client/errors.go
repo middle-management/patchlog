@@ -97,11 +97,18 @@ func (e *APIError) Successor() string { return str(e.Body, "successor") }
 
 // Referencing lists, for a 409 in_use refusing a purge or config write that
 // would leave schema references without a copy (§6.1), the referencing
-// namespaces the caller can read.
+// namespaces the caller can read: the first logPageSize in byte order of
+// name, and More reports whether the caller can read others (v0.86).
 func (e *APIError) Referencing() []string { return strList(e.Body["referencing"]) }
 
-// Dependents lists the dependents of a 409 in_use (§7.4, §8.5).
+// Dependents lists the dependents of a 409 in_use (§7.4, §8.5). A
+// namespace purge's are the first logPageSize by name, and More reports
+// whether there are others (§8.5, v0.86).
 func (e *APIError) Dependents() []string { return strList(e.Body["dependents"]) }
+
+// More reports whether a 409 in_use lists only the first page of its
+// referencing namespaces or dependents: "more": true (§6.1, §8.5, §12.1).
+func (e *APIError) More() bool { return e.Body["more"] == true }
 
 // Limit is what a limit refusal (413 or 422 limit, §6.6, §12) says: the
 // limit's key, and for sizes and counts the measured value and the limit in
