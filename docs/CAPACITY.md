@@ -371,21 +371,26 @@ and p99 are unchanged (6.6–7.0 ms, 24–26 ms). The runs are in
   step ran 90 s. It had 150 writes a second to random devices' resources, and 300 others to the
   same namespace.
 
-| Devices | Writes to devices/s | Delivered | Delivery p50 / p99 | That write's p50 / p99 | Re-polls/s | Cores' CPU | RDS CPU |
-|---|---|---|---|---|---|---|---|
-| 15,000 | 145 | 100% | 64 / 162 ms | 25 / 75 ms | 751 | 0.45 + 0.14 + 0.14 | 64% |
-| 30,000 | 140 | 99.9% | 69 / 204 ms | 30 / 110 ms | 1,499 | 0.51 + 0.24 + 0.24 | 89% |
-| 45,000 | 112 | 99.9% | 87 / 323 ms | 44 / 238 ms | 2,252 | 0.52 + 0.34 + 0.32 | 97% |
-| 60,000 | 39 | 100% | 139 / 949 ms | 87 / 646 ms | 3,003 | 0.51 + 0.43 + 0.41 | 99% |
-| 75,000 | 0.1 | — | 35 / 65 s | 38 / 61 s | 3,660 | 0.46 + 0.49 + 0.50 | 100% |
-| 120,000 | 0 | — | — | 45 / 61 s | 3,547 | 0.46 + 0.50 + 0.48 | 98–100% |
+The table is the run's `summary.txt` (`deploy/devices-summary.py`), as are the others below.
 
-- **Re-polls** are the 204s at each device's interval boundary (§7.7) and the requests that
-  follow them: devices ÷ 20 a second. Every long-poll request reads its resource's log in a
-  transaction (`Engine.ResourceLog`) before it waits, even when nothing has changed.
-- **RDS ran out first.** Its CPU went from 64% to 89% as 750 more re-polls a second arrived, about
-  0.65 ms of a vCPU each. Re-polls stopped growing at about 3,600 a second, and writes then
-  queued behind them for a minute or more.
+| Devices | Completions/s | Delivery p50 / p99 | Long-polls/s | Cores' CPU | RDS CPU |
+|---|---|---|---|---|---|
+| 15,000 | 145.2 | 64 / 162 ms | 896 | 0.45 + 0.14 + 0.14 | 64% |
+| 30,000 | 140.4 | 69 / 204 ms | 1,639 | 0.51 + 0.24 + 0.24 | 89% |
+| 45,000 | 111.7 | 87 / 323 ms | 2,364 | 0.52 + 0.34 + 0.32 | 97% |
+| 60,000 | 38.6 | 139 / 949 ms | 3,044 | 0.51 + 0.43 + 0.41 | 99% |
+| 75,000 | 0.1 | 35 / 65 s | 3,668 | 0.46 + 0.49 + 0.50 | 100% |
+| 120,000 | 0.0 | 82 / 165 s | 3,677 | 0.46 + 0.50 + 0.48 | 98% |
+
+- **Completions** are the writes to devices' resources (150 a second asked); the 300 background
+  writes a second aren't in the summary.
+- **Long-polls** are mostly re-polls: the 204s at each device's interval boundary (§7.7) and the
+  requests that follow them, devices ÷ 20 a second, plus the completions' wake-ups. Every
+  long-poll request read its resource's log in a transaction (`Engine.ResourceLog`) before it
+  waited, even when nothing had changed.
+- **RDS ran out first.** Its CPU went from 64% to 89% as about 740 more long-polls a second
+  arrived, about 0.65 ms of a vCPU each. Long-polls stopped growing at about 3,670 a second, and
+  completions then queued behind them for a minute or more.
 - **The cores had room.** They used 0.5 of 4 cores each, about 58 KB of memory per device
   (2.3 GB at 40,000), and held 40,000 connections each without errors. At 90,000 devices and
   more, some devices' requests timed out on the client (two minutes), behind the database.
@@ -417,16 +422,19 @@ fourth.
 
 **On AWS again, the limit didn't move at first.** The same `deploy/ec2-devices.sh` run with
 quiet resources (commit 59127e4, on the database of the first run; files in
-`docs/capacity/devices-aws-2026-11-19-quiet/`) kept writes healthier for longer, but still
-broke at 75,000 devices:
+`docs/capacity/devices-aws-2026-11-19-quiet/`) kept completions up for longer, but still broke
+at 75,000 devices. The three runs side by side, each cell completions/s, delivery p99 and RDS
+CPU from its `summary.txt`:
 
-| Devices | Before: writes/s, write p50 / p99 | After: writes/s, write p50 / p99 | RDS CPU before → after |
+| Devices | Before (7379385) | Quiet, 300 ms bound (59127e4) | Quiet, 5 s bound (11a9207) |
 |---|---|---|---|
-| 15,000 | 428, 25 / 75 ms | 439, 22 / 51 ms | 64% → 50% |
-| 30,000 | 391, 30 / 110 ms | 410, 25 / 75 ms | 89% → 81% |
-| 45,000 | 263, 44 / 238 ms | 399, 25 / 81 ms | 97% → 82% |
-| 60,000 | 91, 87 / 646 ms | 217, 30 / 94 ms | 99% → 97% |
-| 75,000 | 0, then nothing | 0, then nothing | 100% → 91–100% |
+| 15,000 | 145.2, 162 ms, 64% | 148.5, 150 ms, 50% | 145.7, 189 ms, 68% |
+| 30,000 | 140.4, 204 ms, 89% | 144.7, 204 ms, 81% | 145.8, 189 ms, 70% |
+| 45,000 | 111.7, 323 ms, 97% | 142.4, 204 ms, 82% | 147.0, 189 ms, 68% |
+| 60,000 | 38.6, 949 ms, 99% | 79.8, 257 ms, 97% | 147.2, 189 ms, 68% |
+| 75,000 | 0.1, 65 s, 100% | 0.1, 76 s, 91% | 146.6, 189 ms, 68% |
+| 90,000 | 0.1, 71 s, 100% | 0.0, —, 100% | 145.5, 204 ms, 70% |
+| 120,000 | 0.0, 165 s, 98% | 0.0, 76 s, 100% | 146.9, 189 ms, 68% |
 
 Quiet answers then also required the tailer to be fresh: its last successful poll started
 within `freshFor` (300 ms). Reproduced with three cores on one Postgres vCPU, a busy database
@@ -440,16 +448,16 @@ counts each read by answer, which the summary shows per step.
 **With that, 120,000 waiting devices cost the database nothing** (commit 11a9207, the same setup
 and database; files in `docs/capacity/devices-aws-2026-11-19-fresh/`):
 
-| Devices | Writes to devices/s, delivered | Delivery p50 / p99 | Long-polls/s: memory / read / stale | Cores' CPU | Cores' memory | RDS CPU |
+| Devices | Completions/s, delivered | Delivery p50 / p99 | Long-polls/s: memory / read / stale | Cores' CPU | Cores' memory | RDS CPU |
 |---|---|---|---|---|---|---|
-| 15,000 | 146, 99.9% | 81 / 189 ms | 887 / 202 / 0 | 0.36 + 0.07 + 0.07 | 351–366 MB | 68% |
-| 60,000 | 147, 100% | 81 / 189 ms | 3,145 / 196 / 0 | 0.47 + 0.16 + 0.16 | 1.2–1.3 GB | 68% |
-| 120,000 | 147, 100% | 81 / 189 ms | 6,144 / 196 / 0 | 0.60 + 0.28 + 0.28 | 2.3–2.6 GB | 68% |
+| 15,000 | 145.7, 99.9% | 81 / 189 ms | 887 / 202 / 0 | 0.36 + 0.07 + 0.07 | 351–366 MB | 68% |
+| 60,000 | 147.2, 100% | 81 / 189 ms | 3,145 / 196 / 0 | 0.47 + 0.16 + 0.16 | 1.2–1.3 GB | 68% |
+| 120,000 | 146.9, 100% | 81 / 189 ms | 6,144 / 196 / 0 | 0.60 + 0.28 + 0.28 | 2.3–2.6 GB | 68% |
 
 - **No step broke.** Every completion reached its device at the same latency from 15,000 devices
   to 120,000, without an error. The run ended at its last step, not at a limit.
-- **The database's load is the writes'.** RDS stayed at 68–70% (the 450 writes a second) at
-  every step. Re-polls were answered from memory, 6,144 a second at 120,000 devices; reads stayed
+- **The database's load is the writes'.** RDS stayed at 68–70% (the completions and the
+  background writes) at every step. Re-polls were answered from memory, 6,144 a second at 120,000 devices; reads stayed
   at about 196 a second, the completions' wake-ups (twice on the writing core, whose tailer wakes
   its own commits' followers again). None was stale.
 - **A waiting device costs a core about 60 KB and little CPU.** The cores that took no writes
