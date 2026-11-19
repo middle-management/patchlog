@@ -212,3 +212,34 @@ func TestV086SnapshotUnplaceableForeignParent(t *testing.T) {
 		t.Fatalf("the base's snapshot, the fork placed by eb's own /heads: %+v", d)
 	}
 }
+
+// v0.86 §E.2.2, §B.11.9: a partial reader's /heads is a redirect to its
+// filtered listing, which doesn't place a fork. It counts as a /heads the
+// reader can't read: the fork is placed from the branch's own, and where
+// that redirects too, nothing sealed under the base is accepted. Until
+// v0.86 the redirect ended the fold with an error.
+func TestV086FilteredHeadsDoNotPlaceAFork(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	v, fork, _, _ := v85Branch(t)
+	redirect := func(deny *regexp.Regexp) http.RoundTripper {
+		next := http.DefaultTransport.(*http.Transport).Clone()
+		return roundTrip(func(req *http.Request) (*http.Response, error) {
+			if req.Method == "GET" && strings.HasSuffix(req.URL.Path, "/heads") && deny.MatchString(req.URL.Path) {
+				h := http.Header{}
+				h.Set("Location", strings.Replace(req.URL.Path, "/rev/", "/g/1"+strings.Repeat("a", 32)+"/rev/", 1))
+				return &http.Response{StatusCode: 302, Header: h, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
+			}
+			return next.RoundTrip(req)
+		})
+	}
+	x := v.s.Client(t, client.WithBearer(v.grant), client.WithHTTPClient(&http.Client{Transport: redirect(v86HeadsOfE)})).E2E(v.priv)
+	if d := must(x.DocE2E(ctx, "eb", "d", fork)); len(d.Flagged) != 0 || d.Value.(map[string]any)["n"] != 2.0 {
+		t.Fatalf("the base's /heads filtered, the fork placed by eb's own: %+v", d)
+	}
+	x = v.s.Client(t, client.WithBearer(v.grant), client.WithHTTPClient(&http.Client{Transport: redirect(v86HeadsOfBoth)})).E2E(v.priv)
+	_, flags := must2(x.OpenLog(ctx, "eb", "d", must(v.c.Log(ctx, "eb", "d", fork, ""))))
+	if !strings.Contains(flags[0], "foreign parent") || !strings.Contains(flags[1], "foreign parent") {
+		t.Fatalf("both /heads filtered: flags %q", flags)
+	}
+}

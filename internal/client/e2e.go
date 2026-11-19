@@ -1476,8 +1476,13 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) (forkList, error) {
 	if ok {
 		return f, nil
 	}
+	// A listing this reader may not read, or that isn't there for it: a
+	// refusal, or the redirect a partial reader gets to its filtered
+	// listing (§B.11.9), which isn't the one a fork is placed by.
 	cant := func(err error) bool {
-		return IsAuth(err) || IsNotFound(err) || IsGone(err) || errors.Is(err, errNoGenesis)
+		var ae *APIError
+		return IsAuth(err) || IsNotFound(err) || IsGone(err) || errors.Is(err, errNoGenesis) ||
+			errors.As(err, &ae) && ae.Status >= 300 && ae.Status < 400
 	}
 	var forks forkList
 	for cur, seen := ns, map[string]bool{}; !seen[cur]; {
@@ -1497,7 +1502,7 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) (forkList, error) {
 			// reads through as of at (§G.3, §7.6). Every namespace of
 			// the remote chain lies behind this one fork.
 			fork, err = x.ownFork(ctx, cur, name)
-		} else if fork, err = x.headAt(ctx, cfg.Base, cfg.At, name); IsAuth(err) || IsNotFound(err) || IsGone(err) {
+		} else if fork, err = x.headAt(ctx, cfg.Base, cfg.At, name); cant(err) {
 			fork, err = x.ownFork(ctx, cur, name)
 		}
 		if cant(err) {

@@ -2103,8 +2103,9 @@ async function revPrecedes(ns, name, a, b) {
 
 /* nsChainOK: a branch reads its bases' ciphertext, sealed under their keys (§F.8), up to the resource's foreign parent
  * (§E.2.2, §E.3.1, v0.85). Without at it says only whether kns is ns or a base in its chain. With at = { name, seen,
- * since, ids }, the resource whose log is folded, the ids the fold has moved past, the revision the range starts
- * after ('' from the genesis) and the ids of the range, a base's namespace is refused once the fold is past the fork
+ * since, ids, missed }, the resource whose log is folded, the ids the fold has moved past, the revision the range
+ * starts after ('' from the genesis), the ids of the range and a Set for the forks this fold found no place for, a
+ * base's namespace is refused once the fold is past the fork
  * from that base: the base's head of the resource as of the branch's at, or none where the base had no such
  * resource. The fork is what the base's /heads lists at at, or else what the branch's own /heads lists at its first
  * namespace entry (§G.4.1), which is all there is for a remote base (§G.3), whose chain, base.chain, lies behind
@@ -2141,11 +2142,14 @@ async function nsChainOK(ns, kns, at) {
     if (at) {
       const k = cur + ' ' + at.name;
       let fork = forks.get(k);
+      if (fork === undefined && at.missed && at.missed.has(k)) return false;
       if (fork === undefined) {
         fork = remote ? null : await headAt(b.ns, b.at, at.name);
         if (fork === null) fork = await ownFork(cur, at.name);
-        // A fork that isn't placed is asked for again: the /heads may be readable later.
+        // A fork that isn't placed is asked for again by a later fold, as the /heads may be readable then, but
+        // once in a fold (at.missed).
         if (fork !== null) forks.set(k, fork);
+        else if (at.missed) at.missed.add(k);
       }
       // Unplaced, or the base had none, or the fold is past it.
       if (fork === null || fork === '' || at.seen.has(fork)) return false;
@@ -2215,7 +2219,7 @@ async function foldLog(ns, name, id, since, arr) {
   const bad = (msg) => { throw new Error(`e2e log of ${ns}/${name}: ${msg}`); };
   let doc, exists = false, prev = '';
   const passed = new Set(); // the ids the fold has moved past: a base's key seals nothing after the fork (nsChainOK)
-  const rangeIDs = new Set(arr.map((e) => e && e.id));
+  const forkAt = { name, seen: passed, since, ids: new Set(arr.map((e) => e && e.id)), missed: new Set() };
   const cfg = ((await nsInfo(ns)).doc || {}).encryption || {};
   if (since) {
     // A namespace is end-to-end from its creation or never (Addendum E Levels): the start is always a snapshot.
@@ -2247,7 +2251,7 @@ async function foldLog(ns, name, id, since, arr) {
     let hdr, kns;
     try { hdr = Z.parseJWE(jwe).header; kns = Z.parseKid(hdr.kid).ns; } catch (err) { flag('sealed patch set: ' + err.message); continue; }
     if (!(await nsChainOK(ns, kns))) { flag('sealed under another namespace\'s key ' + hdr.kid); continue; }
-    if (kns !== ns && !(await nsChainOK(ns, kns, { name, seen: passed, since, ids: rangeIDs }))) { flag('sealed under a base\'s key ' + hdr.kid + ' past the resource\'s foreign parent, or where this reader can\'t place it (\u00a7E.2.2)'); continue; }
+    if (kns !== ns && !(await nsChainOK(ns, kns, forkAt))) { flag('sealed under a base\'s key ' + hdr.kid + ' past the resource\'s foreign parent, or where this reader can\'t place it (\u00a7E.2.2)'); continue; }
     e._sealed = hdr.kid;
     // Under the resource's K_r only (§E.3.1): one sealed otherwise, as under K_e before v0.65, is flagged (v0.78).
     let o;
