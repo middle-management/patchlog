@@ -15,7 +15,9 @@ through production code and
 candidates P.1–P.7 of v0.81, which v0.82 took into the Addendum; §I.17 as v0.85 recomputed it,
 which the reference confirms),
 [internal/vectors/addendum_i22_test.go](internal/vectors/addendum_i22_test.go) §I.22–§I.24 (the
-candidates C.1–C.3 of v0.82, in the Addendum since v0.85), and
+candidates C.1–C.3 of v0.82, in the Addendum since v0.85),
+[internal/vectors/addendum_i25_test.go](internal/vectors/addendum_i25_test.go) §I.25 (long-poll
+phases, v0.86), and
 [docs/TESTVECTORS.md](docs/TESTVECTORS.md) points there and records which candidate vectors of
 [docs/VECTORS-PROPOSED.md](docs/VECTORS-PROPOSED.md) the reference confirms (C.4 and C.5,
 v0.85). The
@@ -722,9 +724,11 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   the loser re-check and answer `412` with the new head (or the idempotent retry), as on
   SQLite. The namespace entry is appended last, under a separate advisory **log lock**,
   `pg_advisory_xact_lock(0x504e, ns)`, taken after every other lock, in ascending order when a
-  write appends to several logs (purge propagation, which takes them in one statement, and
-  branch creation), and held through commit,
-  so entries commit, and their sequence numbers grow, in chain order. A transaction holding a
+  write appends to several logs, and held through commit,
+  so entries commit, and their sequence numbers grow, in chain order. A write that holds a
+  namespace's lock exclusively takes no log lock for it: every appender holds the namespace's
+  lock first, so none is there (a purge that reaches thousands of branches holds one lock for
+  each, and appends their entries in one statement). A transaction holding a
   log lock never waits for a namespace lock (it tries, and restarts with the lock taken up
   front if that fails). An uploader's pending blob total (§7.8) is ordered by a row of its
   own (`blob_uploaders`), so concurrent uploads can't together exceed `blobPending`. Details in
@@ -3417,7 +3421,18 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   MOVE, COPY or MKCOL like a save (TOOLS §H.4 "Answers"): a core or tree service request the
   answer depends on that fails for now fails the request, and never counts as a refusal. So a
   DELETE made while `GET /ns/{ns}/principal` answers `408` is `502`, where it was `403`, and
-  no write goes ahead on settings a failed read left unknown.
+  no write goes ahead on settings a failed read left unknown. Since v0.86 every core or service
+  request the gateway makes for a user's request counts, whether or not the answer needs it
+  (TOOLS §H.4 "Answers"; CONFORMANCE "Grant scope" 86, 87): a GET of a file while the core
+  answers `500` to a read of a sibling item's namespace document is `502`, where it was `200`
+  from the rest; a write that was made before such a read failed stays made, and the answer is
+  still the failure. A request counts by how it ends: a `429` waited out and sent again has not
+  failed. Requests the server makes outside a user's request (verifying a token again, its own
+  start-up reads) don't count. These `502` and `503` name only the upstream that failed
+  ("the core failed", "catalog cat's tree service is busy or behind for now; try again") and
+  carry nothing of its answer: no code, message or status of the upstream's, and the `503`'s
+  `Retry-After` is the gateway's own (1 s for a busy or behind upstream, 5 s where no answer
+  came in time), never the upstream's. What the upstream said is in the server's log.
   A raw file over a JSON document's, or the
   other way round, replaces its root. A purged one is `410`, as is any name of a purged
   namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
@@ -3727,8 +3742,9 @@ only.
   file or folder, a move or a delete, which
   the node documents decide, is `403`, saying so, a move before anything is written (onto another
   file, or to another tree or namespace, the copy is the first write). The tree service unreachable is
-  `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with its
-  `Retry-After`: never an empty folder. Its `401` and `403` are the user's grant refused, answered
+  `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with the
+  gateway's own `Retry-After` that names the tree service and nothing of its answer (v0.86; the
+  namespace a `503 behind` names stays in the log): never an empty folder. Its `401` and `403` are the user's grant refused, answered
   as the core's are (in local mode a `401` refuses `--bearer`: `502`, naming the tree service). A
   tree service answers `503` behind until it has caught up with every namespace the catalog
   trusts and can follow, not only with the catalog (started with a fresh database, rebuilt, or
@@ -3757,15 +3773,19 @@ only.
   `X-Namespace-Revision`, seen as the core answers it), which the tree service waits for (§B.5),
   until a listing that carried them came back, for at most 10 minutes (at most the last 4 entries
   of 64 namespaces a user); other users' listings don't wait. If it hasn't caught up within
-  `--tree-wait` (3 s; the tree service's own `--min-wait`, 2 s, answers sooner), the folder is
-  listed from the node documents instead, as without a tree service, and so are the user's
-  listings of that tree for 5 seconds, however long the tree service lags within those 10
+  `--tree-wait` (3 s; the tree service's own `--min-wait`, 2 s, answers sooner), the request
+  is answered `503` with `Retry-After: 1` (v0.86, §H.3 "A tree service that is behind": "a tool
+  answers `503`"; before, the folder was listed from the node documents in that same request),
+  and the user's requests of that tree for the next 5 seconds don't ask the tree service: their
+  folders are listed from the node documents, as without a tree service, however long the tree
+  service lags within those 10
   minutes: their new file stays listed, and a file they renamed doesn't come back by its old name;
   a grant that can't read the node documents gets `503` with `Retry-After` for 30 s after the
   write, then the tree service's listing without waiting. A `min` the tree service refuses
   (`400`: a namespace it doesn't follow, or the reader can't see) is found per namespace, each
   one's asked for alone: those refused, and those reached, aren't asked for again, the rest
-  are, and that listing is from the node documents.
+  are; that listing is from the node documents, unless the tree service is still behind one of
+  them, which is the `503` above.
 - **New files** (§H.4). A PUT of a new name creates an item in `files.ns` with an opaque name (13
   random base32 characters), and its placement titled with the name, under its folder: one
   `parents` entry, ordered after the folder's last ordered child, so new files list last, and
@@ -4973,12 +4993,14 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
 - **Live reads** (§7.3, §7.7, v0.73). A long-poll without a cursor, or with one behind by an
   hour's worth of intervals or less, is answered at once (`200`, or `204` with the current
   `X-Cursor`); one further behind is `400 bad_input`, which followers and `cmd/capacity` answer
-  by dropping the cursor and polling again. Each log's intervals are shifted by a phase drawn from
-  its path (the first 8 bytes of the SHA-256 of `/r/{ns}/{name}/log`, `/ns/{ns}/log` or
-  `/ns/{ns}/g/{gs}/log`, modulo the interval in milliseconds), so the waits of a deployment's
-  logs don't all end at one instant. §7.7 counts every log's from one epoch: `serve
-  --long-poll-fixed-epoch` does that (docs/SPEC-FEEDBACK.md, v0.85 Open 61). Followers of one URL
-  share its boundaries and cursors either way. A long-poll or stream of a resource with no entries
+  by dropping the cursor and polling again. Each log's intervals are counted from the epoch plus
+  the log's phase (§7.7 as of v0.86, vectors §I.25): the first 8 bytes of the SHA-256 of
+  `/r/{ns}/{name}/log`, `/ns/{ns}/log` or `/ns/{ns}/g/{gs}/log`, modulo the interval in
+  milliseconds, so the waits of a deployment's logs don't all end at one instant. Every
+  deployment counts them so; there is no option to count them from the epoch alone. Followers of
+  one URL share its boundaries and cursors; a cursor carried from
+  one log to another (a partial reader's long-poll, redirected to its filtered log) is at most one
+  off there, and answered as any cursor behind or ahead is. A long-poll or stream of a resource with no entries
   waits for its first. A stream judges its read check again before each page and keep-alive,
   ends at the latest when the grant or cookie it was admitted under expires, and a namespace
   stream ends after its `purge-ns` event.

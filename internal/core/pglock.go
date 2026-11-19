@@ -62,6 +62,8 @@ import (
 //     see a gap) and ns_log.seq grows along the chain. (A row lock on the
 //     namespace would conflict with the key-share locks that inserting a
 //     resource row takes on it, and deadlock concurrent creates, D.8.)
+//     Under the namespace's lock held exclusively the log lock is not
+//     taken: no other appender can be there (lockLog).
 //     Log locks come after every other lock: a transaction holding one
 //     never waits for a namespace lock (it only tries, and restarts if
 //     that fails), takes several in ascending key order (purge
@@ -268,11 +270,25 @@ func (t *tx) lockLog(ns int64) {
 	if t.logLocks[k] {
 		return
 	}
-	keys := []int32{k}
+	// Under the namespace's lock held exclusively its log needs no lock:
+	// every appender holds the namespace's lock, shared or exclusive,
+	// before it takes the log's (appendNS), so none is there, and none
+	// comes before this transaction's commit is visible. A purge that
+	// reaches thousands of branches so holds one lock for each, not two:
+	// the server's lock table has room for max_locks_per_transaction ×
+	// max_connections of them (19,200 by default with 300 connections).
+	var keys []int32
+	if t.locks[k] != lockExclusive {
+		keys = append(keys, k)
+	}
 	for k2 := range t.logPlan {
-		if !t.logLocks[k2] && k2 != k {
+		if !t.logLocks[k2] && k2 != k && t.locks[k2] != lockExclusive {
 			keys = append(keys, k2)
 		}
+	}
+	if len(keys) == 0 {
+		t.logPlan = nil
+		return
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 	if t.logLocks == nil {
@@ -363,11 +379,12 @@ func (t *tx) lockLogs(nss ...int64) {
 	// not held yet, or it would take none (a second purge of a
 	// transaction that follows a remote base, whose first log is held).
 	for _, ns := range nss {
-		if !t.logLocks[lockKey(ns)] {
+		if !t.logLocks[lockKey(ns)] && t.locks[lockKey(ns)] != lockExclusive {
 			t.lockLog(ns)
-			break
+			return
 		}
 	}
+	t.logPlan = nil
 }
 
 // lockAll takes several locks in ascending order: all waited for at the

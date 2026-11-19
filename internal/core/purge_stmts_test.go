@@ -1,13 +1,16 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
@@ -112,18 +115,20 @@ func countPurge(t *testing.T, kind string, branches int) purgeCounts {
 // A purge of a document costs no more statements with many branches that
 // neither hold nor see it than with few (§8.3: such a branch is skipped,
 // and purgePlan finds the others by name), and a few for each branch it
-// does reach. On Postgres, where a statement is a round trip, that is the
-// one that appends the branch's entry; in SQLite also the branch's log
-// head and its update, and the purged row of a branch that read the name
-// through. Before the purge found its branches by name it spent, per
-// branch of each kind, 8, 17 and 25 statements in SQLite and 11, 19 and 27
-// on Postgres, log locks included.
+// does reach: none on Postgres, where a statement is a round trip and the
+// branches' rows and entries go in a statement each; in SQLite the
+// branch's log head, its entry and its head's update, and the purged row
+// of a branch that read the name through. The purge asks for the branches
+// level by level, so its statements grow with the depth of the tree below
+// it, not with its width. Before the purge found its branches by name it
+// spent, per branch of each kind, 8, 17 and 25 statements in SQLite and
+// 11, 19 and 27 on Postgres, log locks included.
 func TestPurgeStatements(t *testing.T) {
 	t.Parallel()
 	few, many := 3, 23
 	limit := map[string]int{branchUnseeing: 0, branchThrough: 4, branchOwn: 3}
 	if pgtest.Enabled() {
-		limit = map[string]int{branchUnseeing: 0, branchThrough: 1, branchOwn: 1}
+		limit = map[string]int{branchUnseeing: 0, branchThrough: 0, branchOwn: 0}
 	}
 	for _, kind := range []string{branchUnseeing, branchThrough, branchOwn} {
 		a, b := countPurge(t, kind, few), countPurge(t, kind, many)
@@ -204,5 +209,43 @@ func TestPurgeOrder(t *testing.T) {
 	}
 	if want := "ba bb1 bb2 bb olda oldz n"; strings.Join(got, " ") != want {
 		t.Fatalf("purge entries in the order %v, want %s", got, want)
+	}
+	// Every log is still a chain, however its purge entry was appended
+	// (on Postgres, with the other branches' in one statement): each
+	// entry's id covers the one before it (§3.5), and the namespace's head
+	// is its last.
+	if err := e.read(ctx, func(t *tx) error {
+		rows, err := t.Query(`SELECT l.ns, l.seq, l.id, l.prev_seq, l.body, n.head_seq, n.head_id FROM ns_log l JOIN namespaces n ON n.ns = l.ns ORDER BY l.ns, l.seq`)
+		t.must(err)
+		defer rows.Close()
+		var ns, lastSeq int64
+		var last *ids.ID
+		var headOK bool
+		check := func() {
+			if ns != 0 && !headOK {
+				panic(fmt.Sprintf("namespace %d: its head isn't its log's last entry %d", ns, lastSeq))
+			}
+		}
+		for rows.Next() {
+			var n, seq int64
+			var prev, headSeq sql.NullInt64
+			var id, headID []byte
+			var body string
+			t.must(rows.Scan(&n, &seq, &id, &prev, &body, &headSeq, &headID))
+			if n != ns {
+				check()
+				ns, last, lastSeq = n, nil, 0
+			}
+			if prev.Int64 != lastSeq || ids.Hash(last, []byte(body)) != ids.FromBytes(id) {
+				panic(fmt.Sprintf("namespace %d: entry %d doesn't chain on %d", n, seq, lastSeq))
+			}
+			cur := ids.FromBytes(id)
+			last, lastSeq = &cur, seq
+			headOK = headSeq.Int64 == seq && bytes.Equal(headID, id)
+		}
+		check()
+		return rows.Err()
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
