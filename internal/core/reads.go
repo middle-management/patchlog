@@ -1089,31 +1089,42 @@ func (t *tx) headRows(n *nsRow, page []headItem) []map[string]any {
 	return out
 }
 
-// Branches lists a namespace's direct branches (§7.4): once the namespace
-// is purged, 410 purged, after the unrestricted-read check (§8.5). public
-// is the namespace's cache visibility (BranchList).
+// Branches is the first page of a namespace's branches (BranchList).
+// public is the namespace's cache visibility.
 func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]map[string]any, bool, error) {
-	bl, err := e.BranchList(ctx, ns, cred)
+	bl, err := e.BranchList(ctx, ns, "", cred)
 	if err != nil {
 		return nil, false, err
 	}
 	return bl.List, bl.Public, nil
 }
 
-// Branches is the answer of GET /ns/{ns}/branches (§7.4): Public its cache
-// visibility. Private is never set since v0.78: a partial reader's
-// /branches is 403 (§B.11.9 Answers); it stays for callers of v0.77.
+// Branches is the answer of GET /ns/{ns}/branches (§7.4): a page of rows
+// in List, Next the after of the following page ("" on the last), Public
+// its cache visibility. Private is never set since v0.78: a partial
+// reader's /branches is 403 (§B.11.9 Answers); it stays for callers of
+// v0.77.
 type Branches struct {
 	List    []map[string]any
+	Next    string
 	Public  bool
 	Private bool
 }
 
-// BranchList is Branches with the answer's caching. A partial reader of a
-// namespace §B.11.9 covers is refused, 403 as for any reader without an
-// unrestricted read, before a purged namespace's 410: filtered reads
-// cover no branch (§B.11.9 Answers; v0.78).
-func (e *Engine) BranchList(ctx context.Context, ns string, cred Credentials) (*Branches, error) {
+// BranchList is a page of GET /ns/{ns}/branches?after={key} (§7.4): the
+// namespace's direct branches and the remote branches whose registration
+// hasn't expired (§G.3), in ascending byte order of key, strictly after
+// after, at most logPageSize of them. A row's key is a local branch's
+// name, or a remote one's {origin}/{ns}; after is a plain bound, any
+// string. Once the namespace is purged it is 410 purged, after the
+// unrestricted-read check (§8.5). A partial reader of a namespace §B.11.9
+// covers is refused, 403 as for any reader without an unrestricted read,
+// before a purged namespace's 410: filtered reads cover no branch
+// (§B.11.9 Answers; v0.78).
+//
+// Only the page is read: one row more than it of each kind, by the
+// indexes on a base's branch names and a namespace's registration keys.
+func (e *Engine) BranchList(ctx context.Context, ns, after string, cred Credentials) (*Branches, error) {
 	var out *Branches
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
@@ -1131,19 +1142,40 @@ func (e *Engine) BranchList(ctx context.Context, ns string, cred Credentials) (*
 			return t.purgedRead(n)
 		}
 		out = &Branches{List: []map[string]any{}, Public: t.cachePublic(n)}
-		for _, b := range t.branchesOf(n) {
-			cfg := t.config(b.configSeq)
-			m := map[string]any{"name": b.name, "at": t.nsLogID(b.baseAt.Int64).String(), "frozen": cfg.Frozen, "purged": b.purged}
-			if cfg.Successor != "" {
-				m["successor"] = cfg.Successor
+		limit, bound := e.opt.Maximums.LogPageSize, plainBound(after)
+		local := t.branchesAfter(n, bound, false, limit+1)
+		remote := t.registrationsAfter(n, bound, limit+1)
+		// The two kinds merged by key. No key is of both: a namespace
+		// name holds no "/" (§3.6).
+		for len(out.List) < limit && (len(local) > 0 || len(remote) > 0) {
+			if len(remote) == 0 || len(local) > 0 && local[0].name < remote[0].key {
+				b := local[0]
+				local = local[1:]
+				cfg := t.config(b.configSeq)
+				m := map[string]any{"name": b.name, "at": t.nsLogID(b.baseAt.Int64).String(), "frozen": cfg.Frozen, "purged": b.purged}
+				if cfg.Successor != "" {
+					m["successor"] = cfg.Successor
+				}
+				if d, ok := cfg.Doc["drafts"]; ok && cfg.DraftsFor != nil {
+					m["drafts"] = d // §7.4: clients apply drafts.for (§6.1)
+				}
+				out.List = append(out.List, m)
+				out.Next = b.name
+				continue
 			}
-			if d, ok := cfg.Doc["drafts"]; ok && cfg.DraftsFor != nil {
-				m["drafts"] = d // §7.4: clients apply drafts.for (§6.1)
-			}
-			out.List = append(out.List, m)
+			r := remote[0]
+			remote = remote[1:]
+			out.List = append(out.List, map[string]any{
+				"remote":  map[string]any{"origin": r.origin, "ns": r.name},
+				"at":      t.nsLogID(r.at).String(),
+				"ns_id":   t.nsLogID(r.seq).String(),
+				"expires": formatTime(r.exp),
+			})
+			out.Next = r.key
 		}
-		// Remote branches whose registration hasn't expired (§G.3).
-		out.List = append(out.List, t.liveRegistrations(n)...)
+		if len(local) == 0 && len(remote) == 0 {
+			out.Next = "" // the last page
+		}
 		return nil
 	})
 	return out, err

@@ -996,7 +996,13 @@ func (im *importer) check(ctx context.Context) error {
 		ext, _ := ParseExternal(e)
 		tns := im.mapNS(ext.NS)
 		if ext.Rev != "" {
-			if _, err := im.c.Doc(ctx, tns, ext.Name, ext.Rev); err != nil {
+			// Whether the target serves the revision, not what it holds:
+			// asked without opening it (RevServed), so an importer that holds
+			// no key of a sealed or e2e target, where a revision below a
+			// horizon is the prune's stored snapshot (§8.6), still finds
+			// it there. A revision pruned without a kept document is 410
+			// pruned, and not in the target (§G.4.2, v0.86).
+			if err := im.c.RevServed(ctx, tns, ext.Name, ext.Rev); err != nil {
 				var held bool
 				var herr error
 				switch {

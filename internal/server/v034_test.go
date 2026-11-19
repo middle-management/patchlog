@@ -22,7 +22,7 @@ func (e *tenv) branchEntry(ns, name string, bearer ...string) map[string]any {
 	e.t.Helper()
 	r := e.get("/ns/"+ns+"/branches", bearer...)
 	expect(e.t, r, 200)
-	for _, x := range r.Arr() {
+	for _, x := range r.Branches() {
 		if m := x.(map[string]any); m["name"] == name {
 			return m
 		}

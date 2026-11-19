@@ -36,7 +36,7 @@ and `K_r` with code of its own instead of calling the reference's.
 
 ## Proposed additions (the reference's own)
 
-Vectors for what "Still to come" (§I.25; §I.22 before v0.85, §I.11 and §I.15 before v0.82) has listed, and those the
+Vectors for what "Still to come" (§I.26; §I.25 before v0.86, §I.22 before v0.85, §I.11 and §I.15 before v0.82) has listed, and those the
 spec writer asked for, are computed through
 production code too and kept in [`internal/vectors/testdata`](../internal/vectors/testdata) as
 JSON, each naming the production function that produced it: RE2 `\u` (`re2.json`), key wraps in
@@ -96,9 +96,11 @@ adds it.
 confirm it. It does: every value reproduces through the production code above (the 1580-byte
 file and its sha-256, both digests, `K_b`, the three lines, the padded tags, length and sha-256,
 and the twelve rejection files, each refused). Until v0.85 it sealed I.9's two lines, which
-§G.4.1 rejects once decrypted (907 bytes, `30bf22f8…`). One row is refused earlier than its rule
-says: "line 2's last character `Q` made `B`" leaves a tag that isn't canonical base64url, which
-the reference refuses as a malformed JWE before it decrypts anything.
+§G.4.1 rejects once decrypted (907 bytes, `30bf22f8…`). In v0.85 the last row
+("line 2's last character `Q` made `B`") left a tag that isn't canonical base64url, which the
+reference refuses as a malformed JWE before it decrypts anything. v0.86 makes it `A`
+(`f69e76d7…`), which keeps the tag canonical and changes it: the test checks that the row is
+refused by decryption, as its rule says.
 
 ## §I.22–§I.24 (v0.85)
 
@@ -117,9 +119,23 @@ go test ./internal/vectors/ -run 'TestI2[234]'
 | §I.23 View keys and per-entry sealing (§E.2.6) | `TestI23ViewKey` | the view from I.8's `gs` (`grantcheck.SubjectSetID`; an input only), `ns_id₂` and `derived.CanonicalQuery` without `min`; `seal.ViewKey` over `K_r`; the hit's JWE through `seal.SealWithIV` with the pl of `derived.View`, padded through `seal.Pad`; `derived.SealItem` (own IV) for the same header and plaintext; `derived.OpenItem` opening the JWE and rejecting the four altered views |
 | §I.24 Bundles refused (§G.4.1) | `TestI24BundlesRefused` | each bundle built from §I.20's and matched to its sha-256, then read by the bundle Reader: row 1's id is `grant.Decode` of §I.21's `ops-2027` token, `ID()`, the id §I.21 now states; row 2's `stored` is the authority block cut out of §I.21's token whose root block string has `sub` first; each rejected whole, rows 1 and 2 at the grant line (line 2), row 3 at the header. The Writer refuses rows 1 and 2 too |
 
+## §I.25 (v0.86)
+
+Long-poll phases (§7.7) joined the byte-exact definitions in v0.86. §I.25's four rows are in
+`testdata/addendum_i.json` as SPEC.md prints them and checked in
+[`internal/vectors/addendum_i25_test.go`](../internal/vectors/addendum_i25_test.go):
+
+```
+go test ./internal/vectors/ -run 'TestI25'
+```
+
+| | Test | What the reference computes it with |
+|---|---|---|
+| §I.25 Long-poll phases (§7.7) | `TestI25LongPollPhases`, `TestI25LongPollPhasesServed` | `server.LongPollPhase`, which every log's long-poll clock takes its phase from, for the four paths at 20 s: the four phases (and the first 8 bytes of each path's SHA-256); `server.LongPollCursor` changing at epoch + phase + n × interval; the last path's `gs` is I.8's (`grantcheck.SubjectSetID`); a deployment at the 20 s interval answering a long-poll of each of the first three paths with the `X-Cursor` of the interval the answer falls in, counted from the spec's phase |
+
 ## Candidate vectors (VECTORS-PROPOSED.md, v0.85)
 
-[VECTORS-PROPOSED.md](VECTORS-PROPOSED.md) holds candidates for §I.25's list, computed
+[VECTORS-PROPOSED.md](VECTORS-PROPOSED.md) holds candidates for "Still to come" (§I.26's list since v0.86; the document itself still says §I.25), computed
 independently from the v0.85 text. They are kept as the document gives them in
 [`testdata/candidates.json`](../internal/vectors/testdata/candidates.json) (extracted, never
 computed) and checked through production code in

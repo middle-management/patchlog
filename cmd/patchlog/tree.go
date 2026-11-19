@@ -77,27 +77,28 @@ import (
 // sealed or e2e catalog are served sealed, and /_status reports what is
 // skipped.
 type treeCmd struct {
-	API          string        `arg:"--api,env:PATCHLOG_API" default:"http://localhost:8080" placeholder:"URL" help:"base URL of the patch-log API"`
-	Catalog      []string      `arg:"--catalog,required,separate" placeholder:"NS[,NS]" help:"catalog namespace to follow (repeatable or comma-separated)"`
-	DB           string        `arg:"--db" default:"tree.db" placeholder:"PATH" help:"SQLite database path; with several catalogs, may contain {catalog}"`
-	Addr         string        `arg:"--addr" default:":8082" help:"listen address of the tree API"`
-	Bearer       string        `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"grant for reading the catalog and its trusted namespaces (Authorization: Bearer)"`
-	BearerFile   string        `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"file holding --bearer (exclusive with it)"`
-	Author       string        `arg:"--author,env:PATCHLOG_AUTHOR" placeholder:"NAME" help:"X-Author for a --dev server"`
-	SelfPlacing  bool          `arg:"--self-placing" help:"accept $parents in trusted content documents as implicit placements (§B.9)"`
-	Access       bool          `arg:"--access" help:"catalog mode: derive access from $access and issue grants (§B.11); needs --key and --kid"`
-	Key          string        `arg:"--key" placeholder:"SEED" help:"catalog signing key (b64url Ed25519 seed), for --access"`
-	Kid          string        `arg:"--kid" help:"kid of the catalog key in the catalog and content namespaces, for --access"`
-	TTL          time.Duration `arg:"--ttl" default:"15m" placeholder:"DURATION" help:"lifetime of issued grants (capped by the key's maxTtl)"`
-	AdminGroup   string        `arg:"--admin-group" default:"catalog-admins" placeholder:"GROUP" help:"group whose moves skip the no-widening check"`
-	MergeKey     string        `arg:"--merge-key" placeholder:"SEED" help:"merge grant signing key (b64url Ed25519 seed), a key of its own used for nothing else (§F.8); without it POST /merge-grants is refused"`
-	MergeKid     string        `arg:"--merge-kid" placeholder:"KID" help:"the merge key's kid in the catalog namespace"`
-	MergeService string        `arg:"--merge-service" placeholder:"SUB" help:"the merge service's sub: merge grants are issued only to it, and name it as their root (§F.8)"`
-	MergeTTL     time.Duration `arg:"--merge-ttl" default:"5m" placeholder:"DURATION" help:"lifetime of merge grants (capped by the merge key's maxTtl)"`
-	Release      string        `arg:"--release" placeholder:"/r/{ns}/{release}" help:"preview a release (§B.5, §F.9): follow the branches the release document lists in place of their bases; previews only, no grants (not with --access), one catalog; the document's log is followed, so a new revision (a rebase's successors) takes effect without a restart"`
-	Rebuild      bool          `arg:"--rebuild" help:"drop the database and replay from the beginning"`
-	MinWait      time.Duration `arg:"--min-wait" default:"2s" placeholder:"DURATION" help:"how long ?min= waits for the service to catch up"`
-	SSE          bool          `arg:"--sse" help:"follow by server-sent events instead of long-poll"`
+	API                string        `arg:"--api,env:PATCHLOG_API" default:"http://localhost:8080" placeholder:"URL" help:"base URL of the patch-log API"`
+	Catalog            []string      `arg:"--catalog,required,separate" placeholder:"NS[,NS]" help:"catalog namespace to follow (repeatable or comma-separated)"`
+	DB                 string        `arg:"--db" default:"tree.db" placeholder:"PATH" help:"SQLite database path; with several catalogs, may contain {catalog}"`
+	Addr               string        `arg:"--addr" default:":8082" help:"listen address of the tree API"`
+	Bearer             string        `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"grant for reading the catalog and its trusted namespaces (Authorization: Bearer)"`
+	BearerFile         string        `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"file holding --bearer (exclusive with it)"`
+	Author             string        `arg:"--author,env:PATCHLOG_AUTHOR" placeholder:"NAME" help:"X-Author for a --dev server"`
+	SelfPlacing        bool          `arg:"--self-placing" help:"accept $parents in trusted content documents as implicit placements (§B.9)"`
+	Access             bool          `arg:"--access" help:"catalog mode: derive access from $access and issue grants (§B.11); needs --key and --kid"`
+	Key                string        `arg:"--key" placeholder:"SEED" help:"catalog signing key (b64url Ed25519 seed), for --access"`
+	Kid                string        `arg:"--kid" help:"kid of the catalog key in the catalog and content namespaces, for --access"`
+	TTL                time.Duration `arg:"--ttl" default:"15m" placeholder:"DURATION" help:"lifetime of issued grants (capped by the key's maxTtl)"`
+	AdminGroup         string        `arg:"--admin-group" default:"catalog-admins" placeholder:"GROUP" help:"group whose moves skip the no-widening check"`
+	MergeKey           string        `arg:"--merge-key" placeholder:"SEED" help:"merge grant signing key (b64url Ed25519 seed), a key of its own used for nothing else (§F.8); without it POST /merge-grants is refused"`
+	MergeKid           string        `arg:"--merge-kid" placeholder:"KID" help:"the merge key's kid in the catalog namespace"`
+	MergeService       string        `arg:"--merge-service" placeholder:"SUB" help:"the merge service's sub: merge grants are issued only to it, and name it as their root (§F.8)"`
+	MergeTTL           time.Duration `arg:"--merge-ttl" default:"5m" placeholder:"DURATION" help:"lifetime of merge grants (capped by the merge key's maxTtl)"`
+	Release            string        `arg:"--release" placeholder:"/r/{ns}/{release}" help:"preview a release (§B.5, §F.9): follow the branches the release document lists in place of their bases; previews only, no grants (not with --access), one catalog; the document's log is followed, so a new revision (a rebase's successors) takes effect without a restart"`
+	Rebuild            bool          `arg:"--rebuild" help:"drop the database and replay from the beginning"`
+	MaxValidationSteps int           `arg:"--max-validation-steps" default:"5000000" placeholder:"N" help:"validationSteps (§6.6, §12.2) as the origin's deployment sets it (serve --max-validation-steps), which no namespace document carries: the steps each read check and each item filtered by a grant may take in its rules' schema tests; one that needs more fails, or the item is left out; at least 1"`
+	MinWait            time.Duration `arg:"--min-wait" default:"2s" placeholder:"DURATION" help:"how long ?min= waits for the service to catch up"`
+	SSE                bool          `arg:"--sse" help:"follow by server-sent events instead of long-poll"`
 	encKeyArgs
 	keyringArgs
 	purgeArgs
@@ -139,7 +140,11 @@ func (a *treeCmd) run(string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	topt := tree.Options{Client: c, Catalog: catalogs[0], DB: treeDB(a.DB, catalogs[0], len(catalogs)), Rebuild: a.Rebuild, SelfPlacing: a.SelfPlacing, MinWait: a.MinWait, Recipient: recipient}
+	steps, err := validationSteps(a.MaxValidationSteps)
+	if err != nil {
+		log.Fatal(err)
+	}
+	topt := tree.Options{ValidationSteps: steps, Client: c, Catalog: catalogs[0], DB: treeDB(a.DB, catalogs[0], len(catalogs)), Rebuild: a.Rebuild, SelfPlacing: a.SelfPlacing, MinWait: a.MinWait, Recipient: recipient}
 	if a.SSE {
 		topt.FollowOptions = append(topt.FollowOptions, follow.WithSSE())
 	}

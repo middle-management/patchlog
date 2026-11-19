@@ -23,7 +23,26 @@
 //
 // is read by the core itself, once: every write step that is validated by
 // its patch's changes is also validated in full, and the process panics if
-// the two disagree (core, validateBoth).
+// the two disagree (core, validateBoth). Likewise every purge, prune and
+// drafts.for change also looks for schema references in every document of
+// the deployment, as well as in what references the revisions it touches
+// (core, brokenReferences and referencedOf). And every use of a namespace
+// row a transaction keeps of a branch's chain of bases reads the row from
+// the database again, and panics if it differs in anything the lock the
+// transaction holds on it covers; a row kept under a shared lock on
+// Postgres, whose head other writers may move, is handed out with a head
+// that is no entry's, so that whatever read it would fail (core, chain.go).
+// A purge of a resource, which finds the branches it has something to do in
+// by name, also walks every branch below the purged namespace as it used
+// to, read-only, twice: before its first write, panicking unless every
+// branch where the walk would purge the name, append an entry or delete
+// stored sealings is one the purge planned to, seeing the same head there;
+// and after its last, panicking if the walk would still do anything
+// anywhere (core, purgeCheck). The count of a base's live branches by the
+// frozen and purged columns is compared with the count by the branches'
+// namespace documents (core, liveBranches), and a log head a transaction
+// keeps in memory with the row it stands for (core, logHeadOf). None of
+// these checks' statements are reported to tests that count statements.
 package testenv
 
 import (

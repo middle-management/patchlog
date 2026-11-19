@@ -48,6 +48,7 @@ func (t *tx) bulkExec(s bulkStmt, rows [][]any) int64 {
 	}
 	t.wrote()
 	if t.e.pg {
+		t.counted(s.pg)
 		r, err := t.Tx.Exec(s.pg, s.arrays(rows)...)
 		t.must(err)
 		n, err := r.RowsAffected()
@@ -81,6 +82,7 @@ func (t *tx) bulkQuery(s bulkStmt, rows [][]any, scan func(*sql.Rows)) {
 		rs.Close()
 	}
 	if t.e.pg {
+		t.counted(s.pg)
 		each(t.Tx.Query(s.pg, s.arrays(rows)...))
 		return
 	}

@@ -98,7 +98,7 @@ func (t *tx) remoteShadow(n *nsRow) *nsRow {
 	if !n.isBranch() {
 		return nil
 	}
-	if b := t.nsByID(n.base.Int64); b.isShadow() {
+	if b := t.base(n); b.isShadow() {
 		return b
 	}
 	return nil

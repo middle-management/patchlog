@@ -181,6 +181,11 @@ func (c *Client) DocKid(ctx context.Context, ns, name, id string) (string, error
 	if r.status != 200 {
 		return "", r.apiError()
 	}
+	// "Not sealed" is an answer its caller acts on: refused, as Doc
+	// refuses the document itself, where sealed or e2e is held (levels.go).
+	if err := c.refusePlain(ctx, ns, name, r); err != nil {
+		return "", err
+	}
 	if !isJOSE(r) {
 		return "", nil
 	}
@@ -193,6 +198,28 @@ func (c *Client) DocKid(ctx context.Context, ns, name, id string) (string, error
 		return "", fmt.Errorf("client: document %s/%s@%s is sealed under %s with pl %v: %w", ns, name, id, h.Kid, h.PL, seal.ErrMismatch)
 	}
 	return h.Kid, nil
+}
+
+// RevServed asks whether the server serves the document at revision id,
+// without opening it: nil for a 200, whatever its form (in the clear,
+// sealed, or an e2e resource's stored snapshot, §8.6), and the *APIError
+// otherwise, as Doc gives it. For a caller that needs to know a revision
+// is there and holds no key to read it with.
+func (c *Client) RevServed(ctx context.Context, ns, name, id string) error {
+	if err := checkRes(ns, name); err != nil {
+		return err
+	}
+	if err := checkID("revision", id); err != nil {
+		return err
+	}
+	r, err := c.do(ctx, "GET", "/r/"+ns+"/"+name+"/rev/"+id, nil, nil)
+	if err != nil {
+		return err
+	}
+	if r.status != 200 {
+		return r.apiError()
+	}
+	return nil
 }
 
 // Doc fetches the document at revision id (immutable). A tombstone id, a
@@ -211,9 +238,9 @@ func (c *Client) Doc(ctx context.Context, ns, name, id string) (*Doc, error) {
 	if r.status != 200 {
 		return nil, r.apiError()
 	}
-	// A namespace held as e2e serves no document but its keyring in the
-	// clear (§7.1, levels.go).
-	if err := c.refusePlain(ns, name, r); err != nil {
+	// A namespace held as sealed serves no document in the clear, and one
+	// held as e2e none but its keyring (§7.1, levels.go).
+	if err := c.refusePlain(ctx, ns, name, r); err != nil {
 		return nil, err
 	}
 	body := r.body

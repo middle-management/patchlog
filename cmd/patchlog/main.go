@@ -249,11 +249,13 @@ type serveCmd struct {
 	IndexURL            string        `arg:"--index-url" placeholder:"URL" help:"search index (Addendum A) the playground reads through a read-only proxy at /playground/index/, e.g. http://index:8081; one index serves several namespaces"`
 	SchemaFetch         bool          `arg:"--schema-fetch" help:"let the playground's schema import fetch http(s) URLs (off: it takes uploaded files only); private, loopback and link-local addresses are refused unless the host is in --schema-fetch-hosts"`
 	SchemaFetchHosts    string        `arg:"--schema-fetch-hosts" placeholder:"H,H" help:"comma-separated hosts --schema-fetch is limited to, e.g. www.schemastore.org,raw.githubusercontent.com (also trusted with private addresses)"`
+	MaxBranchDepth      int           `arg:"--max-branch-depth" placeholder:"N" help:"branchDepth (§6.6): how deep local branches of branches may stack (default 8); deployment-wide"`
+	MaxBranchesPerNS    int           `arg:"--max-branches-per-namespace" placeholder:"N" help:"deployment maximum of branchesPerNamespace (§6.6; default: the namespace default, 100); a namespace document's limits may go up to it"`
 	MaxItemsPerBatch    int           `arg:"--max-items-per-batch" placeholder:"N" help:"deployment maximum items per batch (default: the namespace default, 1000); allowances may go up to it, so an atomic import of more items needs it raised (§6.6)"`
 	MaxBatchSize        *byteSize     `arg:"--max-batch-size" placeholder:"SIZE" help:"deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB); allowances may go up to it (§6.6)"`
 	DocumentSize        *byteSize     `arg:"--document-size" placeholder:"SIZE" help:"default documentSize of namespaces that don't set one, e.g. \"4 MiB\" (default 1 MiB, where §6.6 says 4 MiB; see docs/CAPACITY.md), at most --max-document-size"`
 	MaxDocumentSize     *byteSize     `arg:"--max-document-size" placeholder:"SIZE" help:"deployment maximum documentSize, which namespaces may set in their limits, e.g. \"8 MiB\" (default 4 MiB, §6.6's default)"`
-	MaxValidationSteps  int           `arg:"--max-validation-steps" default:"5000000" placeholder:"N" help:"validationSteps (§6.6, §12.2): steps a write's validation against its schema and its rules' schema tests may take together, a step being one schema or subschema applied to one value; a write that needs more is refused (422 limit, validationSteps); 0 for no limit, which the spec doesn't provide for (it requires a bound) and which leaves the limit out of /principal"`
+	MaxValidationSteps  int           `arg:"--max-validation-steps" default:"5000000" placeholder:"N" help:"validationSteps (§6.6, §12.2): steps a write's validation against its schema and its rules' schema tests may take together, a step being one schema or subschema applied to one value; a write that needs more is refused (422 limit, validationSteps), and each read check, exchange, key request and item filtered by a grant has as many for its rules' schema tests, failing if it needs more; at least 1: no deployment leaves it unbounded"`
 	FullValidation      bool          `arg:"--full-validation" help:"validate the whole document on every write; by default a patch to a document this instance has validated against the same schema revision is validated only where it can have changed the verdict"`
 	GrantCache          int           `arg:"--grant-cache" placeholder:"N" help:"verified bearer grants kept per instance, the least recently used evicted (default 65536; every request whose grant isn't kept verifies it, docs/CAPACITY.md)"`
 	DocCacheSize        *byteSize     `arg:"--doc-cache-size" placeholder:"SIZE" help:"documents kept in memory by revision id, e.g. \"1 GiB\" (default 256 MiB)"`
@@ -286,7 +288,6 @@ type serveCmd struct {
 	PurgeRaisedE2E      bool          `arg:"--purge-raised-e2e" help:"purge at start, destroying their keys, the namespaces an earlier version raised to e2e by a config write and the remote branches of sources raised so, which this version refuses to start with (Addendum E Levels; to keep a copy, export them with the v0.26.1 tools first)"`
 	GroupCommit         int           `arg:"--group-commit" default:"32" placeholder:"N" help:"Postgres: at most this many concurrent resource writes and batches of one namespace committed in one transaction (group commit, D.8); 1 or less commits every write on its own"`
 	GroupCommitWait     time.Duration `arg:"--group-commit-wait" default:"200us" placeholder:"DURATION" help:"Postgres: at most how long a group waits for writes of its namespace still being checked (0: no wait)"`
-	LongPollFixedEpoch  bool          `arg:"--long-poll-fixed-epoch" help:"count every log's long-poll intervals (§7.7) from the epoch itself, as spec v0.85 says, so every wait of the deployment ends at one instant; by default each log's are shifted by a phase drawn from its path (docs/SPEC-FEEDBACK.md, v0.85 Open 61)"`
 	LocalRateBuckets    bool          `arg:"--local-rate-buckets" help:"Postgres: keep the rate-limit buckets (§6.6) in this instance's memory rather than in the database, saving a round trip per write; only for a deployment of one instance, since instances sharing a database must share their buckets"`
 	StoreCompression    string        `arg:"--store-compression" default:"off" placeholder:"off|zstd" help:"zstd: store the patch sets of namespaces without encryption, from 1 KiB, compressed (SQLite only). A format change: earlier versions can't read a database once it holds compressed patch sets, and turning it off again doesn't decompress them"`
 	EdgeGrantKey        []string      `arg:"--edge-grant-key,separate" placeholder:"[KID=]FILE" help:"a file holding a key edge-grant cookies of POST /edge-grants are signed with, named KID (a plain FILE takes --edge-grant-kid) (§C.5); a FILE with '=' before any '/' is given as KID=FILE or ./FILE; repeatable, to rotate keys: cookies under any are accepted, and the last given signs new ones. Without it, a random key per process, so cookies don't survive a restart, reach another instance or verify at an edge: an edge verifying cookies needs key files. FILE edge-secret is the key derived from --edge-secret, for migrating to key files only: every holder of the edge secret, services included, can derive it and mint cookies with it"`
@@ -295,6 +296,17 @@ type serveCmd struct {
 	edgeArgs
 	corsArgs
 	shutdownArgs
+}
+
+// validationSteps checks --max-validation-steps, of serve and of the
+// services: no deployment leaves validationSteps unbounded (§6.6
+// Validation work), so 0 no longer lifts it and is refused, as a negative
+// count is.
+func validationSteps(n int) (int, error) {
+	if n <= 0 {
+		return 0, fmt.Errorf("--max-validation-steps %d: validationSteps is at least 1; no deployment leaves it unbounded (§6.6, §12.2)", n)
+	}
+	return n, nil
 }
 
 func (a *serveCmd) run(string) {
@@ -343,6 +355,15 @@ func (a *serveCmd) run(string) {
 	max := core.DefaultMaximums()
 	if a.MaxItemsPerBatch > 0 {
 		max.ItemsPerBatch = a.MaxItemsPerBatch
+	}
+	if a.MaxBranchDepth < 0 || a.MaxBranchesPerNS < 0 {
+		log.Fatal("--max-branch-depth and --max-branches-per-namespace must be positive")
+	}
+	if a.MaxBranchDepth > 0 {
+		max.BranchDepth = a.MaxBranchDepth
+	}
+	if a.MaxBranchesPerNS > 0 {
+		max.BranchesPerNamespace = a.MaxBranchesPerNS
 	}
 	if a.LogPageSize < 0 {
 		log.Fatal("--log-page-size must be positive")
@@ -424,13 +445,13 @@ func (a *serveCmd) run(string) {
 	}
 	opt := core.Options{Path: a.DB, BlobDir: a.BlobDir, Origin: a.Origin, AuthDisabled: a.Dev, OperatorKeys: keys, OperatorKeyHistory: history, JWKSURI: a.JWKSURI,
 		Limits: limits, Maximums: max, GrantCacheEntries: a.GrantCache, DocCacheBytes: sizeOr(a.DocCacheSize, 0), ReadCacheBytes: sizeOr(a.ReadCacheSize, 0), Archiver: arch, RetentionInterval: retention, Remote: remote, KeyStore: ks,
-		RotateEpochs: a.RotateEpochs, RotateOnRevoke: a.RotateOnRevoke, PurgeRaisedE2E: a.PurgeRaisedE2E, GroupCommit: a.GroupCommit, GroupCommitWait: a.GroupCommitWait, LocalRateBuckets: a.LocalRateBuckets, LongPollFixedEpoch: a.LongPollFixedEpoch, StoreCompression: a.StoreCompression}
+		RotateEpochs: a.RotateEpochs, RotateOnRevoke: a.RotateOnRevoke, PurgeRaisedE2E: a.PurgeRaisedE2E, GroupCommit: a.GroupCommit, GroupCommitWait: a.GroupCommitWait, LocalRateBuckets: a.LocalRateBuckets, StoreCompression: a.StoreCompression}
 	if opt.GroupCommit < 1 {
 		opt.GroupCommit = 1 // off
 	}
 	opt.FullValidation = a.FullValidation
-	if opt.MaxValidationSteps = a.MaxValidationSteps; a.MaxValidationSteps <= 0 {
-		opt.MaxValidationSteps = -1 // no limit
+	if opt.MaxValidationSteps, err = validationSteps(a.MaxValidationSteps); err != nil {
+		log.Fatal(err)
 	}
 	if opt.GroupCommitWait <= 0 {
 		opt.GroupCommitWait = -1 // none

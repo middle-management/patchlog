@@ -164,7 +164,7 @@ func TestBranches(t *testing.T) {
 	// Listing of branches.
 	bl := e.get("/ns/main/branches")
 	expect(t, bl, 200)
-	list := bl.Arr()
+	list := bl.Branches()
 	if len(list) != 2 {
 		t.Fatalf("branches %s", bl.Body)
 	}
@@ -179,7 +179,7 @@ func TestBranches(t *testing.T) {
 	expect(t, e.patchNS("rel", ops(op("add", "/successor", "main")), ""), 422)
 	expect(t, e.patchNS("rel", ops(op("add", "/frozen", true), op("add", "/successor", "rel2")), ""), 201)
 	bl = e.get("/ns/main/branches")
-	if m := bl.Arr()[0].(map[string]any); m["frozen"] != true || m["successor"] != "rel2" {
+	if m := bl.Branches()[0].(map[string]any); m["frozen"] != true || m["successor"] != "rel2" {
 		t.Fatalf("frozen branch listing %v", m)
 	}
 	r = e.write("PATCH", "rel", "a", fw, ops(op("replace", "/v", 11.0)))

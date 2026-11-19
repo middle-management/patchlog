@@ -57,8 +57,10 @@ import (
 // listing that asked for them came back, for at most maxWroteAge:
 // however long the tree service lags within that, a user's own new file
 // stays listed and a file they renamed doesn't come back by its old name.
-// Past TreeWait the folder is listed from the node documents instead, as
-// without a tree service, for slowFor; a token whose grant can't read
+// Past TreeWait the request is answered 503 (§H.3 "A tree service that is
+// behind", v0.86), and the user's requests that follow, for slowFor, list
+// the folder from the node documents, as without a tree service, without
+// asking the tree service; a token whose grant can't read
 // them either gets a 503 for limitedWait after the user's write, then the
 // tree service's listing without waiting. Entries the tree service
 // refuses to wait for (400: a namespace it doesn't follow, or the reader
@@ -90,7 +92,8 @@ const (
 	// service's most, and maxTreePages the pages one folder lists.
 	treePage, maxTreePages = 1000, 10
 	// slowFor is how long a catalog whose tree service didn't reach the
-	// user's writes in time is listed from its node documents.
+	// user's writes in time (a 503 for the request that asked) is listed
+	// from its node documents, without asking it.
 	slowFor = 5 * time.Second
 	// maxWroteNS bounds the namespaces a user's writes are kept for, and
 	// maxWroteIDs the entries of one; maxWroteAge how long an entry the
@@ -436,9 +439,14 @@ func (st *reqState) serviceDir(ctx context.Context, cat, folder string, c catCon
 	ents, err := st.svcList(ctx, cat, folder, mins)
 	switch {
 	case errors.Is(err, errBehind):
-		st.s.opt.Logf("dav: %s: the tree service hasn't reached %s within %v; folder %s is listed from the catalog's node documents", cat, strings.Join(mins, " "), st.s.opt.TreeWait, folder)
+		// A tree service that is behind: 503 (§H.3, §H.4 "Answers",
+		// v0.86), naming the service alone. Before v0.86 the folder was
+		// listed from the node documents in the same request; it is for
+		// the requests that follow, for slowFor, without asking the
+		// tree service (isSlow above).
+		st.s.opt.Logf("dav: %s: the tree service hasn't reached %s within %v; folder %s is answered 503, and listed from the catalog's node documents for %v", cat, strings.Join(mins, " "), st.s.opt.TreeWait, folder, slowFor)
 		st.p.ts.setSlow(cat, now.Add(slowFor))
-		return st.behindDir(ctx, cat, folder, oldest)
+		return nil, behind(cat)
 	case errors.Is(err, errMinsRefused):
 		drop := st.splitRefused(ctx, cat, folder, mins)
 		st.s.opt.Logf("dav: %s: the tree service refuses to wait for %s (of %s); folder %s is listed from the catalog's node documents", cat, strings.Join(drop, " "), strings.Join(mins, " "), folder)
@@ -586,7 +594,7 @@ func (st *reqState) lookupEntry(ctx context.Context, cat string, segs []string) 
 	var a *svcAnswer
 	for hops := 0; ; hops++ {
 		if hops > 4 {
-			return nil, false, false, fail(http.StatusBadGateway, "catalog %s's tree service redirected the lookup of %s more than 4 times", cat, path)
+			return nil, false, false, upFailed(fmt.Sprintf("catalog %s's tree service", cat), fmt.Errorf("redirected the lookup of %s more than 4 times", path))
 		}
 		var loc *url.URL
 		a, loc, err = st.svcGet(ctx, cat, u, false)
@@ -671,11 +679,22 @@ func (st *reqState) behindDir(ctx context.Context, cat, folder string, oldest ti
 			}
 			return d, err
 		}
-		e := fail(http.StatusServiceUnavailable, "catalog %s's tree service hasn't caught up with your latest writes yet, and your grant doesn't read the catalog's nodes otherwise (%s); try again in a moment", cat, de.msg)
-		e.header = http.Header{"Retry-After": {"1"}}
+		// Why the grant doesn't read them is the core's text, which a
+		// 503 doesn't carry (§H.4 "Answers", v0.86).
+		e := fail(http.StatusServiceUnavailable, "catalog %s's tree service hasn't caught up with your latest writes yet, and your grant doesn't read the catalog's nodes otherwise; try again in a moment", cat)
+		e.header = http.Header{"Retry-After": {retryBusy}}
 		return nil, e
 	}
 	return d, err
+}
+
+// behind is the 503 for catalog cat's tree service being behind the
+// user's writes (§H.3 "A tree service that is behind", §B.5): it names
+// the service, and neither the namespaces it is behind on nor anything
+// else of its answer (§H.4 "Answers", v0.86), with this server's
+// Retry-After.
+func behind(cat string) *davError {
+	return upBusy(fmt.Sprintf("catalog %s's tree service", cat), errBehind)
 }
 
 // splitRefused returns the mins to drop of mins, a set the tree service
@@ -933,7 +952,7 @@ func (st *reqState) svcListing(ctx context.Context, cat, op string, q url.Values
 			return nil, err
 		case loc != nil:
 			if hops++; hops > 4 {
-				return nil, fail(http.StatusBadGateway, "catalog %s's tree service redirected the listing of %s more than 4 times", cat, folder)
+				return nil, upFailed(fmt.Sprintf("catalog %s's tree service", cat), fmt.Errorf("redirected the listing of %s more than 4 times", folder))
 			}
 			u = loc
 			continue
@@ -947,7 +966,7 @@ func (st *reqState) svcListing(ctx context.Context, cat, op string, q url.Values
 		// folder's limit.
 		if cursorAt != "" && a.At != cursorAt {
 			if restarts++; restarts > 4 {
-				return nil, fail(http.StatusBadGateway, "catalog %s's tree service started the listing of %s again more than 4 times", cat, folder)
+				return nil, upFailed(fmt.Sprintf("catalog %s's tree service", cat), fmt.Errorf("started the listing of %s again more than 4 times", folder))
 			}
 			out, pages = nil, 0
 		}
@@ -1005,29 +1024,37 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 	if b := st.tk.c.Bearer(); b != "" {
 		req.Header.Set("Authorization", "Bearer "+b)
 	}
-	res, err := st.s.ts.hc.Do(req)
+	what := fmt.Sprintf("catalog %s's tree service", cat)
+	res, err := st.svcDo(what, req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		return nil, nil, unreached(fmt.Sprintf("catalog %s's tree service", cat), err)
+		return nil, nil, unreached(what, err)
 	}
 	defer res.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(res.Body, 64<<20))
 	if err != nil {
+		if ctx.Err() != nil && !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, nil, ctx.Err()
+		}
+		de := unreached(what, err)
+		if de.status != http.StatusServiceUnavailable {
+			de = &davError{status: http.StatusBadGateway, msg: what + "'s answer was cut short", cause: err}
+		}
+		st.upstreamFailed(st.upKey(req), de)
 		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
 		}
-		if de := unreached(fmt.Sprintf("catalog %s's tree service", cat), err); de.status == http.StatusServiceUnavailable {
-			return nil, nil, de
-		}
-		return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service's answer was cut short", cat), cause: err}
+		return nil, nil, de
 	}
 	switch res.StatusCode {
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
 		loc, err := u.Parse(res.Header.Get("Location"))
 		if err != nil || res.Header.Get("Location") == "" {
-			return nil, nil, fail(http.StatusBadGateway, "catalog %s's tree service redirected to %q", cat, res.Header.Get("Location"))
+			// Where to isn't said: a 502 carries nothing of the answer
+			// (§H.4 "Answers", v0.86).
+			return nil, nil, upFailed(what, fmt.Errorf("redirected to %q", res.Header.Get("Location")))
 		}
 		return nil, loc, nil
 	}
@@ -1043,7 +1070,7 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		// are sealed too, and it isn't offered (§H.3).
 		return nil, nil, notOffered(cat)
 	case res.StatusCode == http.StatusOK && jsonErr != nil:
-		return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service answered with a listing that isn't JSON", cat), cause: jsonErr}
+		return nil, nil, upFailed(what, fmt.Errorf("a listing that isn't JSON: %w", jsonErr))
 	case res.StatusCode == http.StatusOK:
 		return &a, nil, nil
 	case withMins && res.StatusCode == http.StatusServiceUnavailable && a.Code == "behind":
@@ -1058,7 +1085,7 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		// Local mode's grant is the server's own (-bearer): a 502, named
 		// as the tree service's refusal, where record would name a 401
 		// the core's.
-		return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service refused this server's grant (-bearer) with 401", cat), cause: errors.New(msg)}
+		return nil, nil, &davError{status: http.StatusBadGateway, msg: what + " refused this server's grant (-bearer)", cause: errors.New(msg)}
 	case res.StatusCode == http.StatusUnauthorized:
 		// A gateway's 401 is the user's grant refused: the challenge
 		// again, and the token verified again at its next request
@@ -1069,15 +1096,20 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		e.svcRefused = true
 		return nil, nil, e
 	case res.StatusCode == http.StatusServiceUnavailable, res.StatusCode == http.StatusTooManyRequests:
-		e := fail(http.StatusServiceUnavailable, "catalog %s's tree service answered %d: %s", cat, res.StatusCode, msg)
-		ra := res.Header.Get("Retry-After")
-		if ra == "" {
-			ra = "1"
-		}
-		e.header = http.Header{"Retry-After": {ra}}
-		return nil, nil, e
+		// Its text, behind's ns among it, and its Retry-After stay here
+		// (§H.4 "Answers", v0.86; CONFORMANCE Grant scope 86).
+		return nil, nil, upBusy(what, fmt.Errorf("%d %s", res.StatusCode, msg))
 	}
-	// A 502 names the service and its status, nothing of its answer
-	// (§C.6 Upstream failures), which is logged (record).
-	return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service answered %d", cat, res.StatusCode), cause: errors.New(msg)}
+	// A 502 names the service, nothing of its answer (§H.4 "Answers",
+	// §C.6 Upstream failures), which is logged (record).
+	return nil, nil, upFailed(what, fmt.Errorf("%d %s", res.StatusCode, msg))
+}
+
+// svcDo sends req, a request made for st's request, to a catalog's tree or
+// catalog service (what names it), and keeps how it ended for the
+// request's answer (sawUpstream, §H.4 "Answers").
+func (st *reqState) svcDo(what string, req *http.Request) (*http.Response, error) {
+	res, err := st.s.ts.hc.Do(req)
+	st.sawUpstream(what, req, res, err)
+	return res, err
 }

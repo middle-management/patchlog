@@ -346,7 +346,16 @@ type itemErr struct {
 
 // batchError builds the §7.5 failure body.
 func batchError(fails []itemErr) *Error {
+	// An item whose step 1 ran out of validationSteps answers only if no
+	// check there fails outright (§6.6): the status is that of the first
+	// item that failed outright, if one did.
 	status := fails[0].err.Status
+	for _, f := range fails {
+		if !f.err.ranOut {
+			status = f.err.Status
+			break
+		}
+	}
 	var items []any
 	for _, f := range fails {
 		m := map[string]any{}
@@ -566,7 +575,8 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// Each step of each item has its own validation meter, which the
 	// step's rules draw on from here on (itemState.meters): a run of step
 	// 1 starts them afresh, and every candidate verb tried counts. A step
-	// whose steps run out is 422 here already, before the rate limits.
+	// whose steps run out fails the item with a 422 that answers after
+	// the rate limits, unless a check of step 1 fails outright (ranOut).
 	cfg := cur
 	authorizeItems := func(a *actor) []itemErr {
 		var fs []itemErr
@@ -576,6 +586,9 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			s.cands = nil
 			s.meters = make([]*writeMeter, len(s.Steps))
 			readable := func() bool { return t.canRead(n, cfg, a, s.Resource) }
+			// A step whose rules ran out of validationSteps fails the
+			// item only if no step of it fails outright (§6.6).
+			var out *Error
 			for j := range s.Steps {
 				s.meters[j] = t.newMeter(readable)
 				t.meter = s.meters[j]
@@ -584,25 +597,32 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 					// tried, and the item passes if any does (§C.2 item 2).
 					// Under If-Match step 2 settles it; without a
 					// precondition step 2.5 answers 428.
-					var first *Error
+					var first, ran *Error
 					var passed []string
 					for _, verb := range verbs {
-						if err := t.authorize(a, verb, s.Resource); err != nil {
-							if first == nil || t.meter.Over {
-								first = err
-							}
-							if t.meter.Over {
-								// Out of steps, whatever another verb
-								// would say.
-								passed = nil
-								break
-							}
-							continue
+						err := t.authorize(a, verb, s.Resource)
+						switch {
+						case err == nil:
+							passed = append(passed, verb)
+						case err.ranOut:
+							// Out of steps, whatever another verb would
+							// say: they share the step's budget.
+							ran = err
+						case first == nil:
+							first = err
 						}
-						passed = append(passed, verb)
+						if ran != nil {
+							break
+						}
+					}
+					if ran != nil {
+						if out == nil {
+							out = ran
+						}
+						continue
 					}
 					if len(passed) == 0 {
-						fs = append(fs, itemErr{s.index, first})
+						fs, out = append(fs, itemErr{s.index, first}), nil
 						break
 					}
 					if hasCandidates(s.Item) {
@@ -611,9 +631,18 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 					continue
 				}
 				if err := t.authorize(a, staticVerb(s.Item, j), s.Resource); err != nil {
-					fs = append(fs, itemErr{s.index, err})
+					if err.ranOut {
+						if out == nil {
+							out = err
+						}
+						continue
+					}
+					fs, out = append(fs, itemErr{s.index, err}), nil
 					break
 				}
+			}
+			if out != nil {
+				fs = append(fs, itemErr{s.index, out})
 			}
 		}
 		return fs
@@ -631,11 +660,12 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		// included, as that config write would (§7.5), drawing nothing.
 		// The change is a write of its own, with its own meter.
 		unmeter := t.metered(func() bool { return t.readsNS(n, cur, a, false) })
-		if err := t.authorize(a, "config", ""); err != nil {
-			return nil, nil, err
+		aerr := t.authorize(a, "config", "")
+		unmeter()
+		if aerr != nil {
+			return nil, nil, t.configRanOut(n, cur, a, cc, aerr)
 		}
 		p, err := t.planConfig(n, cur, a, cc, true)
-		unmeter()
 		if err != nil {
 			var ae *Error
 			if !errors.As(err, &ae) {
@@ -717,6 +747,30 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// Step 1: authorisation.
 	fs := authorizeItems(a)
 	if len(fs) > 0 {
+		// Items whose rules ran out of validationSteps count as failing
+		// authorisation (§7.5), and are listed with those that fail
+		// outright. Only if none does do the rate limits come first,
+		// drawing what the batch costs from the caller's own buckets and
+		// nothing from the namespace's (§6.6 Validation work). A batch
+		// whose config change failed after its step 1 draws nothing once
+		// an item fails step 1, however it fails.
+		outright := false
+		for _, f := range fs {
+			outright = outright || !f.err.ranOut
+		}
+		if !outright && !cfgFailed && !drawn {
+			cost := len(items)
+			if cplan != nil && !cplan.exempt {
+				cost++
+			}
+			names := make([]string, len(items))
+			for i, it := range items {
+				names[i] = it.Resource
+			}
+			if err := t.admitOnce(t.ownDraws(n, cfg, a, names, cost)); err != nil {
+				return nil, nil, err
+			}
+		}
 		return nil, nil, fail(fs)
 	}
 	// A batch costs a token per item, and one for its config change unless

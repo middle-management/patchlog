@@ -32,14 +32,23 @@ func (t *tx) filteredEdgeGrant(n *nsRow, fs *fscope, a *actor, exp time.Time) (*
 			if refersToNow(r) {
 				return nil, forbidden("the grant's rules refuse reading " + n.name + ": a rule that refers to /now passes no read (§C.2 item 5)")
 			}
-			if !r.Refs()["resource"] && !r.Eval(env) {
+			if !r.Refs()["resource"] && !t.readRule(r, env) {
 				return nil, forbidden("the grant's rules refuse reading " + n.name)
 			}
 		}
 	}
+	// An exchange whose budget of validationSteps is spent, by the check
+	// of unrestricted read that brought it here or by a rule above, fails
+	// as a whole: no cookie for the subject set either (§6.6).
+	if t.readSpent() {
+		return nil, forbidden("the grant's rules take more than validationSteps steps for this exchange, which fails it (§6.6): " + n.name)
+	}
 	fv, err := t.grantView(fs, t.filteredCurrent(fs), a)
 	if err != nil {
 		return nil, err
+	}
+	if t.readSpent() {
+		return nil, forbidden("the grant's rules take more than validationSteps steps for this exchange, which fails it (§6.6): " + n.name)
 	}
 	if n.purged {
 		pe := t.purgedNS(n)
@@ -53,7 +62,12 @@ func (t *tx) filteredEdgeGrant(n *nsRow, fs *fscope, a *actor, exp time.Time) (*
 	// The record keeps the digest of the key's entry and the read roles'
 	// definitions as of the checkpoint the view is at, which every read
 	// under the cookie compares (§B.11.9 gs, gsDigestHolds).
+	// It keeps that document's ns_config seq too: the cookie is held to
+	// every document of {ns} after it (gsHeldSince, v0.86). Both are of
+	// this read snapshot, so a change that commits before the record is
+	// written is one after the exchange.
 	rec := gsRecordOf(fv, until.Unix())
-	rec.entry = t.gsEntryDigest(n, t.fconfigAt(fv.cp.seqs[n.name]), rec.kid, rec.roles)
+	rec.conf = t.fconfigSeqAt(fv.cp.seqs[n.name])
+	rec.entry = t.gsEntryDigest(n, t.config(rec.conf), rec.kid, rec.roles)
 	return &edgeIssue{gs: fv.gs, rec: rec, bucket: a.bucketKey}, nil
 }

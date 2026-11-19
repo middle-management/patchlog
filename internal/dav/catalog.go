@@ -46,7 +46,11 @@ const kindFolder = tree.KindFolder
 // them, with the heads of their items, and the nodes' creation
 // times, as read since.
 type catGraph struct {
-	cat   string
+	cat string
+	// bases is the catalog's local base chain where it is a branch
+	// (baseChain): a link into one of them is one to the catalog's own
+	// node of that name (SERVICES §B.5 Previews, v0.86).
+	bases []string
 	g     *tree.Graph
 	heads map[string]string
 	at    time.Time
@@ -130,7 +134,11 @@ func (st *reqState) readGraph(ctx context.Context, cat string) (*catGraph, error
 	if err != nil {
 		return nil, err
 	}
-	cg := &catGraph{cat: cat, heads: map[string]string{}, items: map[string]*client.Head{}, births: map[string]time.Time{}}
+	bases, err := st.baseChain(ctx, cat)
+	if err != nil {
+		return nil, err
+	}
+	cg := &catGraph{cat: cat, bases: bases, heads: map[string]string{}, items: map[string]*client.Head{}, births: map[string]time.Time{}}
 	nodes := map[string]any{}
 	for _, hd := range docs {
 		if hd.e.sealed {
@@ -139,8 +147,66 @@ func (st *reqState) readGraph(ctx context.Context, cat string) (*catGraph, error
 		cg.heads[hd.name] = hd.rev
 		nodes[hd.name] = hd.e.value
 	}
-	cg.g = tree.BuildGraph(cat, nil, nodes)
+	cg.g = tree.BuildBranchGraph(cat, bases, nil, nodes)
 	return cg, nil
+}
+
+// baseChain is the local base chain of catalog cat where it is a branch,
+// nearest first, nil where it is none: "A catalog branch, previewed or
+// served directly, lists the nodes it reads through from its base as of
+// the branch's at. There a link into a namespace of its local base chain
+// counts as a link to the branch's node of that name" (SERVICES §B.5
+// Previews, v0.86; scenario 150), as its tree service reads them
+// (tree.Graph.Bases). A branch's /heads lists what it reads through, with
+// the parents the base's documents name, so without the chain a branch's
+// file tree would be the nodes it wrote itself. A remote base (§G.3) ends
+// the chain, and so does a document the token can't read (401, 403, 404,
+// 410): the bases known so far count, which shows less. A read that
+// failed for now is an error.
+func (st *reqState) baseChain(ctx context.Context, cat string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{cat: true}
+	for ns := cat; len(seen) <= tree.MaxDepth; {
+		var d *client.NSDoc
+		h, err := st.tk.c.NSHead(ctx, ns)
+		if err == nil {
+			d, err = st.tk.c.NSDoc(ctx, ns, h.ID)
+		}
+		if transient(err) {
+			return nil, err
+		}
+		if err != nil {
+			break
+		}
+		b, _ := d.Value["base"].(map[string]any)
+		name, _ := b["ns"].(string)
+		if _, remote := b["origin"]; b == nil || remote || name == "" || seen[name] {
+			break
+		}
+		seen[name] = true
+		out = append(out, name)
+		ns = name
+	}
+	return out, nil
+}
+
+// own reports whether a link into namespace ns is one to catalog cat's
+// own node: cat itself, or a namespace of its base chain (baseChain) as
+// the request read it with the catalog's graph, or as the token's kept
+// graph has it (a chain never changes). A request that has neither reads
+// such a link as one to another namespace, as before v0.86: a node named
+// through the base then counts as renamed or moved (stillNamed), and
+// nothing is written.
+func (st *reqState) own(cat, ns string) bool {
+	if ns == cat {
+		return true
+	}
+	cg := st.graphs[cat]
+	if cg == nil {
+		v, _ := st.s.view(st.tk, cat)
+		cg = v.cg
+	}
+	return cg != nil && slices.Contains(cg.bases, ns)
 }
 
 // tree returns catalog cat's graph and its file tree's settings, or why
@@ -1543,7 +1609,7 @@ func (st *reqState) stillNamed(src target, doc any) bool {
 	for _, x := range ps {
 		p, _ := x.(map[string]any)
 		href, _ := p["href"].(string)
-		if ns, name, ok := tree.ParseHref(href); ok && ns == src.ns && name == src.parent {
+		if ns, name, ok := tree.ParseHref(href); ok && st.own(src.ns, ns) && name == src.parent {
 			return true
 		}
 	}
@@ -1664,7 +1730,7 @@ func (st *reqState) moveNode(ctx context.Context, src, dst target) error {
 			ps = append(ps, map[string]any{"op": "add", "path": "/title", "value": title})
 		}
 		if moved {
-			ps = append(ps, parentsEdit(src.ns, m["parents"], src.parent, dst.parent, order)...)
+			ps = append(ps, parentsEdit(src.ns, st.own, m["parents"], src.parent, dst.parent, order)...)
 		}
 		if len(ps) == 0 {
 			return false, nil
@@ -1738,7 +1804,7 @@ func (st *reqState) notInto(ctx context.Context, f *treeFiles, src, dst target) 
 		for _, href := range parentHrefs(m["parents"]) {
 			ns, name, ok := tree.ParseHref(href)
 			switch {
-			case !ok || ns != src.ns || seen[name]:
+			case !ok || !st.own(src.ns, ns) || seen[name]:
 			case name == src.node:
 				return intoItself(src)
 			default:
@@ -1897,7 +1963,7 @@ func (st *reqState) notCopiedInto(ctx context.Context, f *treeFiles, src, dst ta
 	now := st.s.opt.Now()
 	behind := func() error {
 		e := fail(http.StatusServiceUnavailable, "folder %s isn't copied yet: catalog %s's tree service hasn't caught up with your latest writes, so that %s isn't in it can't be checked, and your grant doesn't read the catalog's nodes otherwise; try again in a moment (§H.5, §H.7 \"Limited grants\")", src.path, src.ns, dst.dir)
-		e.header = http.Header{"Retry-After": {"1"}}
+		e.header = http.Header{"Retry-After": {retryBusy}}
 		return e
 	}
 	// Folders' parents are the catalog's alone.
@@ -1920,7 +1986,7 @@ func (st *reqState) notCopiedInto(ctx context.Context, f *treeFiles, src, dst ta
 	var a *svcAnswer
 	for hops := 0; a == nil; hops++ {
 		if hops > 4 {
-			return fail(http.StatusBadGateway, "catalog %s's tree service redirected the ancestors of %s more than 4 times", src.ns, dst.dir)
+			return upFailed(fmt.Sprintf("catalog %s's tree service", src.ns), fmt.Errorf("redirected the ancestors of %s more than 4 times", dst.dir))
 		}
 		var loc *url.URL
 		a, loc, err = st.svcGet(ctx, src.ns, u, len(mins) > 0)
@@ -2298,7 +2364,7 @@ func (st *reqState) unlink(ctx context.Context, t target) error {
 			return false, fail(http.StatusNotFound, "%s was renamed or moved by someone else just now; reload its folder", t.path)
 		}
 		m, _ := e.value.(map[string]any)
-		ps := parentsEdit(t.ns, m["parents"], t.parent, "", "")
+		ps := parentsEdit(t.ns, st.own, m["parents"], t.parent, "", "")
 		if len(ps) == 0 {
 			return false, nil
 		}
@@ -2315,14 +2381,14 @@ func (st *reqState) unlink(ctx context.Context, t target) error {
 // in a parents value v with one for to, ordered order ("" for none): ""
 // for to removes the entry, as does a to the node is already in; a from
 // it isn't in adds one.
-func parentsEdit(cat string, v any, from, to, order string) []any {
+func parentsEdit(cat string, own func(cat, ns string) bool, v any, from, to, order string) []any {
 	arr, isArr := v.([]any)
 	at, has := -1, false
 	for i, x := range arr {
 		m, _ := x.(map[string]any)
 		href, _ := m["href"].(string)
 		ns, name, ok := tree.ParseHref(href)
-		if !ok || ns != cat {
+		if !ok || !own(cat, ns) {
 			continue
 		}
 		if from != "" && name == from && at < 0 {

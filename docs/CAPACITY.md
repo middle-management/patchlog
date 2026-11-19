@@ -343,11 +343,12 @@ The raw results are `docs/capacity/resource-live-*.json`.
 
 The sweep is `docs/capacity/resource-live-sqlite-after-sweep.json`.
 
-**Per-log phases.** The core now shifts each log's interval boundaries by a phase drawn from
-the log's path (docs/SPEC-FEEDBACK.md, v0.85 Open 61). Followers of one URL still share their
-boundaries, so a CDN still collapses them, but different resources' boundaries spread over the
-interval. `serve --long-poll-fixed-epoch` keeps the spec's single epoch. The same run, with
-each setting:
+**Per-log phases.** The core shifts each log's interval boundaries by a phase drawn from the
+log's path (§7.7 as of spec v0.86). Followers of one URL still share their boundaries, so a CDN
+still collapses them, but different resources' boundaries spread over the interval. The same
+run, with every log's intervals counted from one epoch, as spec v0.85 had it (measured with
+`serve --long-poll-fixed-epoch`, an option that existed until v0.86 made the phase the rule), and
+with phases:
 
 | Followers | Fixed epoch: writes/s, worst write | Per-log phase: writes/s, worst write |
 |---|---|---|
@@ -824,8 +825,8 @@ These were limits and are not any more:
 - **Every long-poll of a deployment ended its wait at the same instant**, so at each interval
   boundary the writes queued behind one request per follower: 1.5 s for the worst write at
   12,288 resource followers. Now each log's boundaries are shifted by a phase drawn from its
-  path: 51 ms ([Resource followers](#resource-followers)). `serve --long-poll-fixed-epoch` keeps
-  the spec's single epoch.
+  path: 51 ms ([Resource followers](#resource-followers)), which spec v0.86 made the rule
+  (§7.7).
 - **Long-polls of a namespace** each read the log on their own when woken. Now the read is
   shared ([Origin-side collapse](#origin-side-collapse);
   [Earlier measurements](#earlier-measurements) has the before and after).

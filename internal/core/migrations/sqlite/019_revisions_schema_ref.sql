@@ -1,0 +1,22 @@
+-- Migration: revisions schema ref
+-- Created: 2026-11-19T08:12:26Z
+-- Checksum: 743f729d7994dd927a1db182776ba3f07721af34046cc373dce3661595fa24d0
+-- Chain: 1e584207785584739dbc375da99aa6f1e250c2674dc4c1d2fac26723861c4e3a
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- The distinct $schema values of the deployment, one index probe each
+-- (drafts.go, possiblyReferenced): what a purge asks before it would read
+-- every document for references to what it removes (§6.1).
+CREATE INDEX IF NOT EXISTS revisions_schema_ref ON revisions (schema_ref) WHERE schema_ref IS NOT NULL;

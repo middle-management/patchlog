@@ -247,7 +247,7 @@ func (s *Server) nsBranches(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	bl, err := s.e.BranchList(r.Context(), ns, creds(r))
+	bl, err := s.e.BranchList(r.Context(), ns, r.URL.Query().Get("after"), creds(r))
 	if err != nil {
 		// Once the namespace is purged, 410 purged, long (§7.4, §8.5).
 		if s.writeErrShort(w, r, err, "ns:"+ns) {
@@ -257,7 +257,11 @@ func (s *Server) nsBranches(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cache(w, r, ccHead, bl.Public, "ns:"+ns)
-	writeJSON(w, 200, bl.List)
+	body := map[string]any{"branches": bl.List}
+	if bl.Next != "" {
+		body["next"] = bl.Next
+	}
+	writeJSON(w, 200, body)
 }
 
 // nsKeys answers POST /ns/{ns}/keys (§E.2.3): { "epochs"?: [e…],

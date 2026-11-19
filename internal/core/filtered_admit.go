@@ -1,6 +1,8 @@
 package core
 
 import (
+	"crypto/sha256"
+	"database/sql"
 	"slices"
 
 	"github.com/middle-management/patchlog/internal/catvis"
@@ -130,9 +132,10 @@ func gsRecordOf(fv *fview, exp int64) *gsRecord {
 //     than the stored one, counts as differing), or where that key's
 //     entry or one of those roles' definitions differs there in any
 //     member from the one recorded at the exchange (gsEntryDigest,
-//     v0.82), or where the cookie expires no later than those issued
-//     before an exchange replaced that record (entryAfter), so that
-//     another reader's exchange revives none; 403 where it holds
+//     v0.82), or did under any document of {ns} between the exchange's
+//     and cp's, whatever a later one undoes (gsHeldSince, v0.86), the
+//     entry and the exchange's document being those of the cookie's own
+//     exp (filtered_gs_exps), so that another exchange revives none; 403 where it holds
 //     "partial", a set stored before v0.78 that leaves groups out, which
 //     no gs does now (§B.11.5, §B.11.9 gs), whatever the catalogs decide;
 //     otherwise item 1 from the stored subjects and item 2 from the
@@ -177,14 +180,18 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 	if rec == nil {
 		return nil, apiErr(401, "unauthenticated", "message", "unknown subject set: exchange the grant again (§B.11.9)")
 	}
-	if !t.gsDigestHolds(n, cp, rec) {
-		return nil, forbidden("the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)")
+	// The cookie is judged from the row of its own exp, the entry digest
+	// and document its exchanges recorded (recordFilteredGS): one whose
+	// row a change ended stays ended whoever exchanged since. A cookie
+	// with no row, one from before rows were kept or without an expiry,
+	// which the server never mints, is refused. A cookie for /ns/{ns} is
+	// held to it as a cookie for urlGS would be.
+	slot, ok := gsSlot{}, false
+	if !eg.Exp.IsZero() {
+		slot, ok = t.loadGSSlot(n.name, urlGS, eg.Exp.Unix())
 	}
-	// A cookie from before an exchange replaced the row's entry digest,
-	// or one that can't be told from such a one, stays ended whoever
-	// exchanged since (recordFilteredGS). A cookie for /ns/{ns} is held
-	// to it as a cookie for urlGS would be.
-	if rec.entryAfter > 0 && (eg.Exp.IsZero() || eg.Exp.Unix() <= rec.entryAfter) {
+	rec.entry, rec.conf = slot.entry, slot.conf
+	if !ok || !t.gsDigestHolds(n, cp, rec) || !t.gsHeldSince(n, cp, rec) {
 		return nil, forbidden("the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)")
 	}
 	if rec.partial || slices.Contains(rec.subjects, catvis.Partial) {
@@ -230,7 +237,11 @@ func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	if !ok {
 		return false
 	}
-	cfg := t.fconfigAt(seq)
+	return t.gsHoldsUnder(n, t.fconfigAt(seq), rec)
+}
+
+// gsHoldsUnder is gsDigestHolds for n's document cfg.
+func (t *tx) gsHoldsUnder(n *nsRow, cfg *Config, rec *gsRecord) bool {
 	key, ok := findKey(t.effectiveKeys(n, cfg), rec.kid)
 	if !ok || !key.Lists("read") || rec.pub == "" || keyPub(key) != rec.pub ||
 		!slices.Contains(rec.subjects, catvis.KeySubject(rec.kid, rec.pub)) {
@@ -252,6 +263,119 @@ func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	}
 	d, ok := grantcheck.ScopeDigest(in)
 	return ok && d == rec.digest
+}
+
+// gsWalk is how many namespace documents back a gs cookie's record is
+// judged (gsHeldSince, gsShares): a cookie lives 15 minutes at the
+// longest (§C.5.2), and a namespace that wrote more documents than this
+// since an exchange ends its cookies, whose readers exchange again.
+const gsWalk = 64
+
+// gsHeldSince reports whether rec has held under every document of n
+// after the one its exchange recorded it under (rec.conf), up to the one
+// at cp (§B.11.9 gs, v0.86: "Once an entry after its exchange changes
+// one of them, the cookie is 403 from that entry on, even where a later
+// entry undoes the change"; CONFORMANCE Access 145). gsDigestHolds judges
+// the document at cp alone, which a change made and undone gives back.
+// Each config entry is judged as a whole, so two changes in one batch,
+// which leave the key's entry as it was, end nothing. A checkpoint at or
+// before the exchange's document has none to judge. It fails closed for
+// a row from before conf was kept, and where more than gsWalk documents
+// lie between.
+//
+// A read at the exchange's own document, the usual one, costs the lookup
+// of the checkpoint's ns_config seq and no more.
+func (t *tx) gsHeldSince(n *nsRow, cp *fcp, rec *gsRecord) bool {
+	seq, ok := cp.seqs[n.name]
+	if !ok || rec.conf == 0 {
+		return false
+	}
+	c := t.fconfigSeqAt(seq)
+	if c <= rec.conf {
+		return true
+	}
+	// Past the exchange's document the walk judges up to gsWalk
+	// documents, the same ones at every read under the cookie there. Its
+	// verdict depends on the record and on documents that never change
+	// (ns_config rows, by seq), so it is kept for the engine's life.
+	key := gsHeldKey(rec, c)
+	t.e.gsHeldMu.Lock()
+	held, ok := t.e.gsHeld.Get(key)
+	t.e.gsHeldMu.Unlock()
+	if ok {
+		return held
+	}
+	held = true
+	for i, d := 0, c; d > rec.conf; i++ {
+		if i == gsWalk || !t.gsHoldsUnder(n, t.config(d), rec) {
+			held = false
+			break
+		}
+		d = t.configParent(d)
+	}
+	t.e.gsHeldMu.Lock()
+	t.e.gsHeld.Put(key, held, 0)
+	t.e.gsHeldMu.Unlock()
+	return held
+}
+
+// gsHeldKey is the key of gsHeldSince's verdict for rec at the document
+// with ns_config seq c: a digest of everything of rec that gsHoldsUnder
+// reads, the record of the cookie's own second (entry, conf) and what
+// the filtered_gs row holds, which a later exchange may write again.
+func gsHeldKey(rec *gsRecord, c int64) [32]byte {
+	strs := func(xs []string) []any {
+		out := make([]any, len(xs))
+		for i, x := range xs {
+			out[i] = x
+		}
+		return out
+	}
+	return sha256.Sum256(jsonv.Canonical([]any{rec.ns, rec.gs, rec.kid, rec.pub, rec.digest, rec.entry, float64(rec.conf), float64(c),
+		strs(rec.subjects), strs(rec.roles), nonNilRules(rec.blockRules), rec.principal, rec.readScope}))
+}
+
+// gsShares returns the test of whether r's exchange may share the row s
+// of the cookies expiring at one second (recordFilteredGS): the same
+// entry digest, and r holding under every document of n after the
+// earlier of the two documents up to the later, so that neither cookie's
+// verdict at any checkpoint depends on which of the two the row keeps.
+// It fails closed where more than gsWalk documents lie between, for a
+// row or record without a document, and for a namespace that is gone.
+func (t *tx) gsShares(n *nsRow, r *gsRecord) func(s gsSlot) bool {
+	holds := map[int64]bool{}
+	held := func(from, to int64) bool {
+		c := to
+		for i := 0; c > from; i++ {
+			if i == gsWalk {
+				return false
+			}
+			h, ok := holds[c]
+			if !ok {
+				h = t.gsHoldsUnder(n, t.config(c), r)
+				holds[c] = h
+			}
+			if !h {
+				return false
+			}
+			c = t.configParent(c)
+		}
+		return true
+	}
+	return func(s gsSlot) bool {
+		if n == nil || s.entry != r.entry || s.entry == "" || s.conf == 0 || r.conf == 0 {
+			return false
+		}
+		return held(min(s.conf, r.conf), max(s.conf, r.conf))
+	}
+}
+
+// configParent is the ns_config seq of the document before the one at
+// seq in its namespace's chain, 0 for the first.
+func (t *tx) configParent(seq int64) int64 {
+	var p sql.NullInt64
+	t.must(t.QueryRow(`SELECT parent_seq FROM ns_config WHERE seq = ?`, seq).Scan(&p))
+	return p.Int64
 }
 
 // gsEntryDigest is §B.11.9 gs's EntryDigest of the key named kid and of

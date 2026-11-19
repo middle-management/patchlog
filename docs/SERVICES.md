@@ -1,6 +1,6 @@
 # Patch Log — Services
 
-Status: draft v0.85 · 2026-11-17. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.86 · 2026-11-19. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Services that follow namespaces through the protocol's public API and answer queries over them:
 
@@ -86,7 +86,7 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
   **Across namespaces.** `GET /_refs?to=<reference>`, `to` in any form above, asks every followed namespace the reader may see.
 
   - It redirects to `/_refs/g/{gs}/at/{at}?to=…`. `at` is the combined checkpoint (§B.5) over only those namespaces and, for those §B.11.9 covers, every namespace it reads there (§B.11.9 URLs).
-  - **`gs`** is computed, and its URLs served, as in §B.11.5, but over these markers. There is at most one marker for each followed non-public namespace, and the service's exchange refuses only as **Coverage**, §B.11.9 Where and the `503` below say. The marker for `{ns}` is:
+  - **`gs`** is computed, and its URLs served, as in §B.11.5, but over these markers. There is at most one marker for each followed non-public namespace, and the service's exchange refuses only as **Coverage**, §B.11.9 Where, §C.4's `502` and `503` for a `requireAt` chain it can't read, and the `503` below say. The marker for `{ns}` is:
     - `reads:{ns}:{k}`, `k` the `key:` string (§B.11.9 `gs`) of the key that verified the grant in `{ns}`, where the reader's grant would be issued a namespace-wide edge grant (§C.5.2);
     - `reads:{ns}:g:{gs}`, with its `gs` there, for a partial reader where §B.11.9 covers `{ns}`;
     - none for a partial reader where it doesn't but `{ns}` is neither sealed nor end-to-end and is a catalog (§B.6) or its `catalogs`, or that of any local base in its chain at the base's head or as of the `at` it is read through at, names one;
@@ -96,7 +96,7 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
     - once a namespace's coverage changes and its marker for it has the old form;
     - or where a marker's key, rules or roles would end a `gs` cookie (§B.11.9 `gs`), its key being the one that verified the grant in `{ns}`, `reads:{ns}:{k}` markers included; as there, another reader's exchange revives no such cookie.
 
-    An exchange whose cookie would be `403` at once, as a key or role its marker draws on has changed since the checkpoint the marker is judged at, answers `503` (`behind`) with `Retry-After`, ranked as §C.5.2 ranks an unreadable `requireAt` chain.
+    An exchange whose cookie would be `403` at once, as a key or role its marker draws on has changed since the checkpoint the marker is judged at, answers `503` (`behind`) with `Retry-After`, ranked as §C.5.2 ranks an unreadable `requireAt` chain. So does one where every `exp` it may give is that of a cookie for the same prefix that is `403` (§C.5.2).
 
     Readers with no marker, and requests with neither a grant nor a cookie, share the empty set's `gs`. They get `401` only as **Coverage** says. The path always has `/g/{gs}`.
   - It takes `?min={ns}:{ns_id}`, repeatable, as any `at` URL does (§A.5). A `min` is `400` for a namespace the reader can't see, that the service doesn't follow, or that **Coverage** leaves out, purged ones excepted (§A.5). A namespace that `at` covers only because §B.11.9 reads it is none of these.
@@ -112,7 +112,7 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
     - Only a reader who may see none of the namespaces gets `401` or `403`, or, where every namespace its grant names is purged and the grant verifies in each, `410` as §C.5.2 gives it.
     - If the service can't read the namespace document of one the grant names, the answer is `502`.
     - Any other whose document it can't read is left out, as one the reader can't see.
-  - It is tagged `idx:{ns}` for every namespace in `at`, and `r:{ns}/{name}` per hit.
+  - It is tagged `idx:{ns}` for every namespace in `at`, and `r:{ns}/{name}` per hit, with base tags as §9 and §B.5 allow.
 
   Hits of a `ref` query, and only those, carry `refs: [{ "path", "ref" }]`, the matching locations and strings, as written.
 
@@ -257,7 +257,7 @@ CREATE INDEX edges_by_parent ON edges (parent, ord, child);
 
 - Listings redirect (`302`, head-pointer caching) to `/{catalog}/at/{at}/…` or `/{catalog}/g/{gs}/at/{at}/…`, as §B.11.5 says.
 - `at` is the service's **combined checkpoint**, `text(trunc160(sha256(canonical({ ns: ns_id, … }))))` over the catalog and the content namespaces it follows, purged ones left out.
-- A listing at a given `at` never changes and uses the immutable class (§9), except one that §E.2.6 serves `no-store`. It is tagged with every item it shows (`r:{ns}/{name}`) and every namespace in the checkpoint (`ns:{ns}`). A service whose cache the origin's purges don't reach purges these tags itself. No service serves or keeps a listing computed before a purge it has applied (§A.1).
+- A listing at a given `at` never changes and uses the immutable class (§9), except one that §E.2.6 serves `no-store`. It is tagged with every item it shows (`r:{ns}/{name}`) and every namespace in the checkpoint (`ns:{ns}`). A service whose cache the origin's purges don't reach purges these tags itself. One whose cache they reach counts as carrying §9's base tags only if it tags each item a branch reads through with them too, under §9's condition on stripping caches. No service serves or keeps a listing computed before a purge it has applied (§A.1).
 - The service answers `200` at an `at` only if it is current or that exact result was stored, else `302` to the current one. It SHOULD store the result at an `at` it redirects to for a while (§A.4).
 - `?min={ns}:{ns_id}`, repeatable, gives read-your-writes (§A.5). A service following several catalogs keeps a combined checkpoint per catalog. It judges `?min` against that of the catalog in the URL, even for a content namespace other catalogs follow too.
 
@@ -312,8 +312,8 @@ CREATE INDEX edges_by_parent ON edges (parent, ord, child);
 - **Shared nodes in DAGs.** `subtree`, `ancestors` and `where` show a node with several parents under each of them. Services MUST bound a response by the depth limit and a per-response node limit, and report when one was cut, with the top-level member `"tooDeep": true` (depth 64, Cycles above) or `"truncated": true` (the node limit), absent otherwise. They SHOULD expand a shared node only at its first occurrence in a `subtree` response and mark later occurrences `"repeat": true`, without children.
 
 - **Previews of a release** (§F.9). A tree service previewing a release follows the branches its release document lists in place of their bases: `checkpoints` holds those branches, and a placement resolves to the release's branch of its item's namespace, if it lists one, whose resource its entry's content URL then names. It answers `403`, minting no edge grant (§B.11.5), to a viewer without unrestricted `read` (§2.1) on every listed non-public branch, serves previews only, and issues no grants (§F.8). A long-running preview service follows the release document's own log (§10), so its new revisions take effect without a restart.
-  - A catalog branch, previewed or served directly, lists the nodes it reads through from its base as of the branch's `at` (§7.6).
-  - A reader accepts an entry sealed under a namespace other than the catalog's, or a value sealed under one other than its item's (§E.2.6), only where that namespace's own document (§7.4) names the catalog's or item's namespace as its local `base`, or names a local `base` whose document does so in turn.
+  - A catalog branch, previewed or served directly, lists the nodes it reads through from its base as of the branch's `at` (§7.6). There a link into a namespace of its local `base` chain counts as a link to the branch's node of that name (§B.3).
+  - A reader accepts an entry sealed under a namespace other than the catalog's, or a value sealed under one other than its item's (§E.2.6), only where the namespace documents it reads (§7.4) put the catalog's or item's namespace in the local `base` chain of the one the seal's `pl.ns` names. Otherwise it shows the entry by name only.
 
 - **`mode` is enforced by the catalog's rules** (§B.6), not by consumers: a `tree` catalog whose rules allow several parents is served as a DAG. A service MAY report nodes with several parents in a `tree` catalog under `/problems`.
 
@@ -520,7 +520,7 @@ Authorization: Bearer <base grant from the identity provider>
 
 The catalog grants role names without evaluating their rules, which the gate applies (§C.1.1), so it may still refuse a write under them.
 
-**The caller's grant.** Even where reads are public, `POST /grants` and `POST /read-grants` answer `403` (`no-store`), after a malformed request's `400` and `401` and before any other answer, to a caller whose grant has a block or key-scope rule that refers to `/now` (§C.2 item 5). They answer so to `/read-grants`, and to a `want` that lists `read`, where the grant allows `read` (§C.2 item 2, counting only roles item 5 lets count) in no namespace the service follows that it verifies in. A merge grant (§F.8) is refused so where its approver's grant has such a `/now` rule.
+**The caller's grant.** Even where reads are public, `POST /grants` and `POST /read-grants` answer `403` (`no-store`), after a malformed request's `400` and `401` and before any other answer, to a caller whose grant has a block or key-scope rule that refers to `/now` (§C.2 item 5). They answer so to `/read-grants`, and to a `want` that lists `read`, where the grant allows `read` (§C.2 item 2, counting only roles item 5 lets count) in no namespace the service follows that it verifies in; where that turns on a `requireAt` chain the service can't read, they answer `502` or `503` as §C.4 gives them. A merge grant (§F.8) is refused so where its approver's grant has such a `/now` rule.
 
 Item requests other than Place answer, in order:
 
@@ -610,7 +610,7 @@ A caller in `catalog-admins` needs no tree power, though a Place still needs the
   - A listing URL without `at` is under the prefix too, with the `gs` the exchange's `prefixes` gives.
   - A listing URL without `/g/{gs}` is redirected to its `…/g/{gs}/at/{at}/…` URL by the grant in `Authorization`, `private, no-store`.
   - A grant in `Authorization` reads only at its own `gs`, as of the URL's `at` or, as the service chooses, of the current checkpoint, or at `all` where it qualifies (below). Elsewhere it is `403`. At every `/g/{gs}` URL and at the exchange, so is a grant `POST /read-grants` refuses as the caller's grant (§B.11.4).
-  - A request that needs `/g/{gs}` and carries neither a grant that verifies in a namespace the service follows nor a cookie it verifies is `401`.
+  - A request that needs `/g/{gs}` and carries neither a grant that verifies in a namespace the service follows nor a cookie it verifies is `401`. A `gs` other than `all` takes its subjects as §B.11.6 Whose claims says.
   - A tree service without §B.11 serves only `all` (`403` otherwise).
   - The edge admits a request only if the caller's edge grant is bound to that exact `gs`. That edge grant is a cookie the service mints with a key of its own (§C.5) for the prefix `/{catalog}/g/{gs}`. The service mints it after resolving the caller's subjects, at an exchange endpoint of its own that follows §C.5.2's issuance rules, except as §A.4 says for the index.
   - Services apply §9 to their own origin.
@@ -654,6 +654,7 @@ A caller in `catalog-admins` needs no tree power, though a Place still needs the
 - **Default:** group claims come in the base grant from the identity provider.
 - **Alternative:** a `groups` namespace of documents (`{ "members": [...] }`) that the catalog service follows.
 - **Either way,** key scopes limit which groups and roles the catalog may assert, and the base grant allows `read` in a namespace the service follows (§B.11.4). In a covered one (§B.11.9), its holder then sees the accepted leaks there.
+- **Whose claims.** A catalog service takes the caller's `sub` and groups from the base grant as the catalog namespace's keys verify it, so no content namespace's key asserts them for the catalog. A base grant that doesn't verify there is answered as the catalog namespace would answer it (§C.2 item 1, §C.4), at the place §B.11.4 gives `401`.
 
 ### B.11.7 Catalog storage
 
@@ -735,7 +736,7 @@ Optional. An origin that implements it gives **partial readers** a namespace's o
 
       The origin keeps, per namespace and `gs`, its subjects and the rules and `/principal` values its marker digests. It judges item 2 under a cookie, a miss included, from those, never from a grant the request doesn't carry. A cookie whose `gs` it keeps nothing for is `401`.
 
-      A `gs` cookie is `403` at an `at` where those rules differ, or the key its `key:` string names, or a key or role they came from, is gone or changes in any member, until the reader exchanges again. No exchange revives a cookie minted before the change, and one the origin can't tell from such a cookie is `403` too. Long-poll and event streams judge this at the current checkpoint, and a stream ends when the check fails (§7.3).
+      A `gs` cookie is `403` at an `at` where those rules differ, or the key its `key:` string names, or a key or role they came from, is gone or changes in any member, until the reader exchanges again. Once an entry after its exchange changes one of them, the cookie is `403` from that entry on, even where a later entry undoes the change. No exchange revives a cookie minted before the change, and one the origin can't tell from such a cookie is `403` too. Long-poll and event streams judge this at the current checkpoint, and a stream ends when the check fails (§7.3).
     - **Edge grants.** The origin's exchange (§C.5.2) gives a partial reader whose grant doesn't fix `/resource` the prefix `/ns/{ns}/g/{gs}`, after resolving its subjects. Its cookie never outlasts that grant. For that prefix, §C.5.2's checks change:
       - its refusals concerning `/resource` rules and qualifying roles don't apply;
       - its check that rules pass now covers only block and key-scope rules that don't refer to `/resource`, which item 2 judges per resource;
@@ -771,7 +772,7 @@ For services serving views derived from sealed and end-to-end namespaces, such a
   The JWE is sealed under that epoch's `K_n` (§E.2.1), with `kid` naming that epoch, `Content-Type: application/jose` and `pl: { "ns", "view" }`. Its plaintext is the response body.
 - **Per-entry sealing.** Otherwise, including a single-source view for a reader whose grant gives only per-resource keys, the response stays JSON. Each entry (a hit, a child, a node) that carries sealed values replaces them with `"sealed": "<JWE compact>"`, whose plaintext is the object of the members it replaces:
   - under the `K_r` of the entry's own resource (§E.2.1), in a branch the branch's, read-through entries included (§E.2.5);
-  - with `kid` naming the epoch the revision it derives from is served under (§E.2.2), at E3 the one a prune's `snapshot` of that revision would carry (§E.3.1). The epoch is judged once, when the service first seals a value derived from that revision. Until it can judge it, the service seals nothing derived from that revision: it serves the entry by name only and leaves such values out of other entries, in a response that is `no-store` and isn't stored, or, while it may yet judge it, answers `503` (`behind`, §B.5) instead;
+  - with `kid` naming the epoch the revision it derives from is served under (§E.2.2), at E3 the one a prune's `snapshot` of that revision would carry (§E.3.1). The epoch is judged once, when the service first seals a value derived from that revision; at E2 the service takes it from the `kid` of that revision's JWE as the origin serves it (§E.2.2). Until it can judge it, the service seals nothing derived from that revision: it serves the entry by name only and leaves such values out of other entries, in a response that is `no-store` and isn't stored, or, while it may yet judge it, answers `503` (`behind`, §B.5) instead;
   - with `pl: { "ns", "name", "view" }`.
 
   A value it derives from a revision of another epoch, or that an entry with no revision of its own carries, such as an implicit placement (§B.9), is sealed in place as a value of another resource is (below). An entry whose epoch the service's grant gets no key for (§E.2.3) is served by name only, or left out where the service never opened that revision. A reader decrypts the entries it holds keys for and shows the rest by name only. Of an entry that carries `sealed`, it takes from outside it only what this section leaves in the clear (above). Folders and placements from a sealed or end-to-end catalog namespace are entries of that namespace.
@@ -784,7 +785,7 @@ For services serving views derived from sealed and end-to-end namespaces, such a
   - has `pl: { "ns", "name", "view" }`, where `ns` and `name` name the other resource, in the clear in the protected header, and `view` is the response's. A reader compares `ns` and `name` with the resource the entry draws the value from, where the entry names it, as an item's content URL does (§B.5), in a preview the release branch's;
   - has its namespace's padding.
 
-  It nests inside a whole-response JWE where the rest of the response is sealed whole. While a fetch of that namespace's keys fails transiently (transport error, `5xx`, `408`, `429`), the service answers `503` rather than a view without the value. A value whose epoch the service's grant gets no key for, or whose namespace's keys it lacks (§A.4: `/keys` answers it another `4xx`, or gives none it can unwrap), is left out.
+  It nests inside a whole-response JWE where the rest of the response is sealed whole. A value drawn from a namespace that is neither sealed nor end-to-end has no `K_r`: it goes inside the entry's own `sealed`, or, in an entry without one, such as an implicit placement (§B.9) of such an item, stays in the clear. While a fetch of that namespace's keys fails transiently (transport error, `5xx`, `408`, `429`), the service answers `503` rather than a view without the value. A value whose epoch the service's grant gets no key for, or whose namespace's keys it lacks (§A.4: `/keys` answers it another `4xx`, or gives none it can unwrap), is left out.
 - **Stored once, served forever.** A view at a given `at`, other than a `no-store` one (Per-entry sealing), is sealed once, under the epochs above, and then served unchanged, like revisions (§E.2.2), until a config entry on which §9 purges a source's `ns:{ns}` drops it (§A.1). A stored view is keyed by its URL and the shape of the reader's keys, as kept results are (§A.4). Padding (`pad`) follows the source namespace. Whole-response sealing pads only when every source is padded.
 - **Caching** is public only for a view whose sources are all public (§9); other views are private results (§C.6). Tags are those of §A.4 and §B.5.
 - **Local storage.** A service keeps what it derives from a sealed or end-to-end namespace in storage encrypted as at E1 (§E.1), such as an encrypted volume or database, with keys held outside it. Views it has sealed (above) may be stored as they are. A purge of the source, or the destruction of its keys, MUST remove the derived data: rows are deleted and freed pages overwritten, stored sealed views are deleted, and cached keys are forgotten.

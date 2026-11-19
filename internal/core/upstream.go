@@ -42,7 +42,7 @@ import (
 // that is for a level this server lacks. ok is false if there is none, as
 // for every namespace that doesn't read through a remote branch.
 func (t *tx) lostRemote(n *nsRow) (branch *nsRow, origin string, lacks, ok bool) {
-	for b := n; b.isBranch() && !b.isShadow(); b = t.nsByID(b.base.Int64) {
+	for b := n; b.isBranch() && !b.isShadow(); b = t.base(b) {
 		if t.remoteShadow(b) == nil {
 			continue
 		}

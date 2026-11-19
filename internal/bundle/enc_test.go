@@ -35,13 +35,16 @@ const marker = "zqx-bundle-secret"
 // newEncDeployment is a deployment with a key store (sealed and e2e
 // namespaces need one), whose client decrypts sealed namespaces with keys
 // fetched from the server (development mode: raw keys).
-func newEncDeployment(t *testing.T, origin string) *deployment {
+func newEncDeployment(t *testing.T, origin string, opts ...func(*core.Options)) *deployment {
 	t.Helper()
 	ks, err := keystore.New(keystore.Generate())
 	if err != nil {
 		t.Fatal(err)
 	}
 	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: origin, AuthDisabled: true, Purger: nopPurger{}, KeyStore: ks}
+	for _, f := range opts {
+		f(&o)
+	}
 	testenv.Apply(&o)
 	e, err := core.Open(o)
 	if err != nil {

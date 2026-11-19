@@ -34,7 +34,8 @@ long-polls stopped waking on the namespace's other writes. They started from a n
 database, and Postgres 16 shared the host (`fsync=off`). See "Resource followers" in
 CAPACITY.md. `resource-live-sqlite-after-sweep.json` sweeps the follower count up to 12,288, and
 `resource-live-sqlite-phase.json` compares 8,192 and 12,288 followers with one epoch for every
-log (`--long-poll-fixed-epoch`) and with per-log phases.
+log (`--long-poll-fixed-epoch`, an option the core had until spec v0.86 made the phase the rule)
+and with per-log phases.
 
 [`2026-10-15/`](2026-10-15/) holds the first measurements (spec 0.52, another host). CAPACITY.md
 uses them only under "Earlier measurements".

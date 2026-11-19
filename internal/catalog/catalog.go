@@ -1137,6 +1137,7 @@ func (v *visibility) viewOf(g *tree.Graph) *catvis.View {
 			subjects = append(subjects, v.who.sub)
 		}
 		v.cat, v.view = c, c.ViewWith(subjects, func(name string) map[string][]string { return v.s.eff[name] })
+		v.view.Steps = v.s.opt.Tree.ValidationSteps
 	}
 	return v.view
 }
@@ -1169,17 +1170,21 @@ func (v *visibility) Node(g *tree.Graph, n *tree.Node) bool { return v.viewOf(g)
 func (v *visibility) Organising(g *tree.Graph, n *tree.Node) bool { return v.viewOf(g).AsIfLive(n) }
 
 // passes evaluates role r's rules and the key's scope rules against the
-// read envelope (counts), with /resource resource unless it is "".
-func passes(rr *readRoles, def *readRole, r, resource string, groups []any) bool {
+// read envelope (counts), with /resource resource unless it is "", within
+// what m has left of the item's validation steps (§6.6 Validation work).
+func passes(rr *readRoles, def *readRole, r, resource string, groups []any, m *rules.Meter) bool {
 	env := map[string]any{"action": "read", "principal": map[string]any{"groups": nonNilAny(groups), "roles": []any{r}}}
 	if resource != "" {
 		env["resource"] = resource
 	}
-	if _, _, ok := rules.EvalList(rr.keyRules, env); !ok {
-		return false
+	for _, rs := range [][]*rules.Rule{rr.keyRules, def.rules} {
+		for _, rule := range rs {
+			if !rule.Passes(env, m) {
+				return false
+			}
+		}
 	}
-	_, _, ok := rules.EvalList(def.rules, env)
-	return ok
+	return true
 }
 
 // Item: a visible placement's item is visible too, since visibility is

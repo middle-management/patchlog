@@ -63,7 +63,7 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		// The write's rules draw on one validation meter (§6.6, writeMeter).
 		defer t.metered(func() bool { return t.canRead(n, cfg, a, name) })()
 		if err := t.authorize(a, "prune", name); err != nil {
-			return err
+			return t.stepOneRanOut(err, t.ownDraws(n, cfg, a, []string{name}, 1))
 		}
 		// A prune isn't exempt: a token from the principal, namespace and
 		// per-resource buckets, checked last in step 1 (§6.6).
@@ -354,7 +354,7 @@ func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 // revisions already below an earlier horizon, which keep the snapshot they
 // have.
 func (t *tx) keptBelow(n *nsRow, name string, own *resRow, h *revRow, keep []*revRow) (keepSeqs map[int64]*revRow, preserve map[int64]bool) {
-	refs := t.referencedPaths()
+	refs := t.referencedOf(n.name, name)
 	keepSeqs = map[int64]*revRow{}
 	keepSeqs[t.lastLive(h).seq] = t.lastLive(h)
 	for _, k := range keep {

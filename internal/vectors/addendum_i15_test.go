@@ -451,7 +451,10 @@ func TestI17SealedBundle(t *testing.T) {
 		{oneLF, []byte(front + strings.TrimSuffix(lines[3], "\n") + "\r\n")},
 		{oneLF, []byte(front + strings.TrimSuffix(lines[3], "\n"))},
 		{"a blank one included", file(lines[3] + "\n")},
-		{"any line fails to decrypt", file(strings.TrimSuffix(lines[3], "Q\n") + "B\n")},
+		// v0.86: `Q` made `A`, which keeps the tag canonical base64url (a
+		// 16-byte tag's last character carries 4 bits: A, Q, g or w), so
+		// the line is refused by decryption, not as a malformed JWE.
+		{"any line fails to decrypt", file(strings.TrimSuffix(lines[3], "Q\n") + "A\n")},
 	}
 	if len(cases) != len(p.Rejected) {
 		t.Fatalf("%d rejection rows in addendum_i.json, %d built", len(p.Rejected), len(cases))
@@ -464,8 +467,12 @@ func TestI17SealedBundle(t *testing.T) {
 		if got := sha256Hex(c.b); got != row.SHA256 {
 			t.Errorf("%s: the file is sha-256 %s, want %s", row.Change, got, row.SHA256)
 		}
-		if pt, err := open(c.b); err == nil {
+		pt, err := open(c.b)
+		if err == nil {
 			t.Errorf("%s: opened to %q, want refused (%s)", row.Change, pt, row.Rule)
+		}
+		if i == len(cases)-1 && err != nil && !strings.Contains(err.Error(), "the line fails to decrypt") {
+			t.Errorf("%s: refused with %q, want by decryption: the altered tag is still canonical base64url", row.Change, err)
 		}
 	}
 }

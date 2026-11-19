@@ -226,16 +226,12 @@ func principalCatalog(doc map[string]any, whole bool) map[string]any {
 // namespace whose configuration is cfg: the document's, over the
 // deployment's defaults and within its maximums, which hold alone for the
 // deployment-only limits, grantSize, rulesPerGrant and validationSteps
-// among them (§12.2). A deployment run without a bound on validation
-// (Options.MaxValidationSteps negative), which §6.6 doesn't provide for,
-// has no value to give: validationSteps is then left out.
+// among them (§12.2).
 func (t *tx) limitsInForce(cfg *Config) map[string]any {
 	l, max := cfg.Limits, t.e.opt.Maximums
 	l.LogPageSize, l.LogPageBytes, l.BranchDepth, l.ExchangeRate = max.LogPageSize, max.LogPageBytes, max.BranchDepth, max.ExchangeRate
 	l.RulesPerGrant, l.GrantSize = max.RulesPerGrant, max.GrantSize
 	out := l.Doc()
-	if n := t.e.opt.MaxValidationSteps; n > 0 {
-		out["validationSteps"] = int64(n)
-	}
+	out["validationSteps"] = int64(t.e.opt.MaxValidationSteps)
 	return out
 }

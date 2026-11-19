@@ -114,18 +114,46 @@ func (t *tx) recheck(p *writePlan, d *writeDeps) (*nsRow, bool) {
 // read again where it matters (appendNS).
 func (t *tx) recheckIn(p *writePlan, d *writeDeps, nss map[int64]*nsRow) (*nsRow, bool) {
 	var target *nsRow
+	// The rows the check read, in one statement however many they are: a
+	// write to a deeply stacked branch read every base (chain.go).
+	if nss == nil {
+		nss = map[int64]*nsRow{}
+	}
+	var want []int64
+	for _, id := range d.order {
+		if nss[id] == nil {
+			want = append(want, id)
+		}
+	}
+	if len(want) == 1 {
+		cur, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE ns = ?`, want[0]))
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false
+		}
+		t.must(err)
+		nss[cur.id] = cur
+	} else if len(want) > 1 {
+		rows, err := t.Query(`SELECT `+nsCols+` FROM namespaces WHERE `+t.e.inArray("ns", "bigint"), t.e.arrayArg(want))
+		t.must(err)
+		for rows.Next() {
+			cur, err := scanNS(rows)
+			t.must(err)
+			nss[cur.id] = cur
+		}
+		t.must(rows.Err())
+		rows.Close()
+	}
+	for _, id := range want {
+		// Read after their locks (lockDeps): the bases among them are the
+		// rows resolve reads the items' resources through below.
+		if cur := nss[id]; cur != nil {
+			t.keepLocked(cur)
+		}
+	}
 	for _, id := range d.order {
 		cur := nss[id]
 		if cur == nil {
-			var err error
-			cur, err = scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE ns = ?`, id))
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, false
-			}
-			t.must(err)
-			if nss != nil {
-				nss[id] = cur
-			}
+			return nil, false
 		}
 		if !sameNS(d.ns[id], cur) {
 			return nil, false

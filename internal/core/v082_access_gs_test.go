@@ -164,8 +164,11 @@ func TestV082AccessGSEntryEarlierEndings(t *testing.T) {
 // §B.11.9 gs: the answers at an at from before the change are the ones
 // its document gave, so the old cookie still reads there, as a changed
 // rule leaves it (immutable answers, §B.5); once the reader has exchanged
-// again, her record is the new document's and the earlier at is 403 for
-// it, as every at is from then on for the cookie from before.
+// again, her new cookie's record is the new document's and the earlier
+// at is 403 for it. The cookie from before keeps its own record (v0.86,
+// filtered_gs_exps): it is 403 "from that entry on" and reads on at the
+// earlier at, whoever exchanged since. (Before v0.86 the exchange
+// replaced the one record, and every at was 403 for it from then on.)
 func TestV082AccessGSEntryPerAt(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -187,15 +190,19 @@ func TestV082AccessGSEntryPerAt(t *testing.T) {
 	if _, st := v76fHeads(t, w, "matches", gs, old.At, cookie2); st != 403 {
 		t.Fatalf("the earlier at under the new record: %d, want 403", st)
 	}
-	if _, st := v76fHeads(t, w, "matches", gs, old.At, cookie); st != 403 {
-		t.Fatalf("the earlier at under the earlier cookie, after the new exchange: %d, want 403", st)
+	if _, st := v76fHeads(t, w, "matches", gs, old.At, cookie); st != 0 {
+		t.Fatalf("the earlier at under the earlier cookie, after the new exchange: %d, want it served", st)
+	}
+	if st := v82accessCookieReads(t, w, gs, cookie); st != 403 {
+		t.Fatalf("the current at under the earlier cookie: %d, want 403", st)
 	}
 }
 
-// Stored data (stored.md, core migration 017): a filtered_gs row from
-// before the upgrade has entry ”, which never holds. Its cookie is 403
-// until the reader exchanges again; a gs the origin keeps nothing for
-// stays 401 (§B.11.9 gs).
+// Stored data (stored.md, core migration 017): a record from before the
+// upgrade has entry ”, which never holds. Its cookie is 403 until the
+// reader exchanges again; a gs the origin keeps nothing for stays 401
+// (§B.11.9 gs). Since v0.86 the entry is in the cookie's own record
+// (filtered_gs_exps).
 func TestV082AccessGSStoredWithoutEntry(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -203,7 +210,7 @@ func TestV082AccessGSStoredWithoutEntry(t *testing.T) {
 	ctx := context.Background()
 	cookie, gs := v82accessCookie(t, w, w.li())
 	if err := w.e.update(ctx, func(t2 *tx) error {
-		_, err := t2.Exec(`UPDATE filtered_gs SET entry = '' WHERE ns = ? AND gs = ?`, "matches", gs)
+		_, err := t2.Exec(`UPDATE filtered_gs_exps SET entry = '' WHERE ns = ? AND gs = ?`, "matches", gs)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -223,8 +230,8 @@ func TestV082AccessGSStoredWithoutEntry(t *testing.T) {
 	if st := v82accessCookieReads(t, w, gs, cookie2); st != 0 {
 		t.Fatalf("after exchanging again: %d", st)
 	}
-	// A row without an entry digest counts as replaced: the cookie from
-	// before stays 403.
+	// A record without an entry digest is shared by no exchange: the
+	// cookie from before stays 403.
 	if st := v82accessCookieReads(t, w, gs, cookie); st != 403 {
 		t.Fatalf("the cookie of the row without an entry digest, after another exchange: %d, want 403", st)
 	}
@@ -253,10 +260,13 @@ func TestV082AccessGSStoredWithoutEntry(t *testing.T) {
 //     stays 403 until it expires, /heads and long-poll alike: bo hasn't
 //     exchanged again ("until the reader exchanges again"), and a cookie
 //     never reads where its grant couldn't. The origin tells the cookies
-//     apart by their expiry: one that expires no later than the last
-//     issued under the replaced record is refused (recordFilteredGS);
-//   - which fails closed for a cookie that can't be told from those: cy's
-//     from the same second, or from a grant that ends no later;
+//     apart by their expiry: each second's cookies have their own record
+//     (filtered_gs_exps), and an exchange whose cookie must differ from
+//     the one a second holds takes an earlier second (recordFilteredGS;
+//     §C.5.2, v0.86);
+//   - so cy's cookie from the same second as the last one before the
+//     change, or from the grant she held before, reads (before v0.86,
+//     told apart by "expires no later", those were refused with bo's);
 //   - a change made and undone revives nothing either.
 func TestV082AccessGSEntrySharedRow(t *testing.T) {
 	t.Parallel()
@@ -295,14 +305,19 @@ func TestV082AccessGSEntrySharedRow(t *testing.T) {
 	reads("bo's cookie after bo's refused exchange", boCookie, 403)
 
 	// cy exchanges within the second of the last exchange before the
-	// change, or a grant that ends no later than the cookies from before:
-	// her cookie can't be told from bo's, and is refused with it.
+	// change, and then the grant she held before, which ends with the
+	// cookies from before: her cookies expire a second before those they
+	// must be told apart from, and read; bo's stays ended.
 	sameSecond, _ := v82accessCookie(t, w, reader("user:cy"))
-	reads("cy's cookie from the same second", sameSecond, 403)
+	if !sameSecond.Edge.Exp.Before(boCookie.Edge.Exp) {
+		t.Errorf("cy's cookie from the same second expires %v, bo's ended one %v: want it earlier", sameSecond.Edge.Exp, boCookie.Edge.Exp)
+	}
+	reads("cy's cookie from the same second", sameSecond, 0)
 	reads("bo's cookie after cy's same-second exchange", boCookie, 403)
 	v82accessLater(w, time.Second)
 	sameGrant, _ := v82accessCookie(t, w, cyGrant)
-	reads("cy's cookie from the grant she held before", sameGrant, 403)
+	reads("cy's cookie from the grant she held before", sameGrant, 0)
+	reads("bo's cookie after cy's exchange of her earlier grant", boCookie, 403)
 
 	// cy, not bo, exchanges a grant from after the change.
 	cyCookie, cyGS := v82accessCookie(t, w, reader("user:cy"))
@@ -321,14 +336,22 @@ func TestV082AccessGSEntrySharedRow(t *testing.T) {
 	reads("cy's cookie after the change was undone", cyCookie, 403)
 	v82accessLater(w, time.Second)
 	cyCookie2, _ := v82accessCookie(t, w, reader("user:cy"))
-	var first string
-	w.inTx(func(t2 *tx) {
-		rec := t2.loadGS("matches", gs)
-		first = rec.entry
-		if rec.entryAfter != cyCookie.Edge.Exp.Unix() {
-			t.Errorf("entryAfter %d, want the replaced record's exp %d", rec.entryAfter, cyCookie.Edge.Exp.Unix())
-		}
-	})
+	// The cookies' own records: bo's from before the change and cy's
+	// from after the undo carry the same entry digest, under different
+	// documents, and cy's from the narrowed document another.
+	slotOf := func(c Credentials) (s gsSlot) {
+		w.inTx(func(t2 *tx) {
+			var ok bool
+			if s, ok = t2.loadGSSlot("matches", gs, c.Edge.Exp.Unix()); !ok {
+				t.Errorf("no record for the cookie expiring %v", c.Edge.Exp)
+			}
+		})
+		return s
+	}
+	first := slotOf(boCookie)
+	if now := slotOf(cyCookie2); now.entry != first.entry || now.conf <= first.conf || slotOf(cyCookie).entry == first.entry {
+		t.Errorf("records: before the change %+v, under the narrowed document %+v, after the undo %+v", first, slotOf(cyCookie), now)
+	}
 	reads("cy's cookie after the undoing and her exchange", cyCookie2, 0)
 	reads("bo's old cookie after the undoing and cy's exchange", boCookie, 403)
 	reads("cy's cookie from the narrowed document", cyCookie, 403)
@@ -339,19 +362,19 @@ func TestV082AccessGSEntrySharedRow(t *testing.T) {
 	boCookie2, _ := v82accessCookie(t, w, reader("user:bo"))
 	reads("bo's cookie after bo exchanged again", boCookie2, 0)
 	reads("cy's cookie after bo's exchange under the same entry", cyCookie2, 0)
-	w.inTx(func(t2 *tx) {
-		if rec := t2.loadGS("matches", gs); rec.entry != first || rec.entryAfter != cyCookie.Edge.Exp.Unix() {
-			t.Errorf("after an exchange under the same entry: entry %s (was %s), entryAfter %d", rec.entry, first, rec.entryAfter)
-		}
-	})
+	if got := slotOf(boCookie); got != first {
+		t.Errorf("the record of bo's ended cookie after later exchanges: %+v, was %+v", got, first)
+	}
 	// bo's old cookie is 403 to its last second.
 	w.clock.Store(boCookie.Edge.Exp.Add(-time.Second).UnixMilli())
 	reads("bo's old cookie in its last second", boCookie, 403)
 }
 
 // A cookie without an expiry, which the server never mints, is refused
-// once a record was replaced, and a cookie for /ns/{ns}, which covers a
-// gs's URLs too, is held to the same expiry as one for the gs would be.
+// (v0.86: a cookie is judged from the record of its own expiry, and it
+// has none; before, it read until a record was replaced), and a cookie
+// for /ns/{ns}, which covers a gs's URLs too, is held to the same expiry
+// as one for the gs would be.
 func TestV082AccessGSEntryAfterOtherCookies(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -362,10 +385,11 @@ func TestV082AccessGSEntryAfterOtherCookies(t *testing.T) {
 	}
 	noExp := Credentials{Edge: &EdgeGrant{NS: "matches", GS: gs, Prefix: "/ns/matches/g/" + gs}}
 	wideOld := wide(cookie.Edge.Exp)
-	for what, c := range map[string]Credentials{"without an expiry": noExp, "for /ns/matches": wideOld} {
-		if st := v82accessCookieReads(t, w, gs, c); st != 0 {
-			t.Fatalf("a cookie %s, before any change: %d", what, st)
-		}
+	if st := v82accessCookieReads(t, w, gs, wideOld); st != 0 {
+		t.Fatalf("a cookie for /ns/matches, before any change: %d", st)
+	}
+	if st := v82accessCookieReads(t, w, gs, noExp); st != 403 {
+		t.Fatalf("a cookie without an expiry, before any change: %d, want 403", st)
 	}
 	w.patchConfig("matches", v82accessOp("add", "/keys/1/maxLag", "PT50S"))
 	v82accessLater(w, time.Second)

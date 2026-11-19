@@ -1,6 +1,185 @@
 # Changelog
 
-## Unreleased
+## v0.32.0
+
+Implements spec **v0.86** (previously **v0.85**). v0.86 is the spec's answer to the reference's
+61 open notes on v0.85 and to its measurements of the branch limits (docs/SPEC-FEEDBACK.md,
+"Settled in v0.86"): by its own count 22 already matched the text or are the implementation's
+business, and the rest got a clause each. What the reference changed for them is below,
+breaking changes first; the 68 notes this work leaves are the new list, "v0.86 Open n".
+
+- **`GET /` answers `"spec": "0.86"`**, and the docs mirror v0.86 (SPEC, SERVICES, TOOLS,
+  CONFORMANCE, the spec's change log). The proposed-vectors file that came with it is still
+  v0.85's (v0.86 Open 43).
+
+Breaking:
+
+- **Breaking: `GET /ns/{ns}/branches` is paged** (§7.4, HTTP-31). The answer was a bare JSON
+  array of every branch and remote registration. It is now `{ "branches": [...], "next"? }`:
+  at most `logPageSize` rows (1,000 by default) in byte order of key, a local branch's name or
+  a remote one's `{origin}/{ns}`, local and remote rows together; `?after={next}` gives the
+  following page, and `next` is absent on the last. A client from before this version can't
+  read the new body, and this version's client can't read an older server's: upgrade both
+  together. `client.Branches` follows `next` and still returns the whole list, as do
+  `patchlog branch list`, the janitor and the playground; `client.BranchesPage` reads one page
+  and `Branch.Key()` gives a row's key. The migration (`023_branches_paging_gs_conf` on
+  Postgres, `022_…` on SQLite) adds the two indexes the pages are read by. `capacity`'s
+  `branch_list` now times the whole paged listing, and `branch_list_first_page` one page.
+- **Breaking: `serve --long-poll-fixed-epoch` is removed; each log's long-poll intervals have
+  a phase of their own** (§7.7, §I.25; docs/SPEC-FEEDBACK.md, Settled in v0.86, 61). Every
+  wait of a deployment ended at the one interval boundary, so at each boundary every follower
+  was answered and polled again together, and writes queued behind them: the worst write of a
+  20 s window took 1.5 s with 12,288 resource followers on SQLite. Now a log's intervals start
+  at the epoch plus a phase, the first 8 bytes of the SHA-256 of the log's path
+  (`/r/{ns}/{name}/log`, `/ns/{ns}/log` or `/ns/{ns}/g/{gs}/log`) modulo the interval in
+  milliseconds, and that worst write took 51 ms. All followers of one URL share its boundaries
+  and cursors, so CDN collapsing is unchanged. This is the spec's rule since v0.86, so the
+  option that kept the single epoch (and Options `LongPollFixedEpoch`) is gone: a deployment
+  started with the flag no longer starts, and drops it. Its logs' boundaries and cursors then
+  shift by less than one interval; followers need no change. The reference reproduces
+  §I.25's four phases (`TestI25LongPollPhases`).
+- **Breaking: `serve --max-validation-steps 0` is refused** (§6.6 "No deployment leaves
+  `validationSteps` unbounded"). `0` lifted the limit, as the v0.31.0 notes below still
+  describe; now `0` or less stops the server at start, and `GET /ns/{ns}/principal` always
+  lists `validationSteps`. Give the flag a number, or leave it out for the default of
+  5,000,000.
+- **Breaking: reads have a validation budget too** (§6.6 Validation work, LIM-7; Grant scope
+  scenarios 89, 90, 92). Only writes were bounded, as the v0.31.0 notes below still say. Now
+  every read check, every exchange (`POST /edge-grants`), every key request, every read check a
+  write makes, and every item a filtered read or a service listing judges has `validationSteps`
+  steps for its rules' `schema` tests. One that needs more fails as that check usually does:
+  `404` for a private resource, `403` for a namespace log, an exchange, a key request or a
+  branch's creation; a filtered item is left out and the rest listed. A test cut short never
+  passes, under `not` either. An exchange whose budget is spent issues no cookie, and where one
+  of a grant's roles ran out a service doesn't go on to a later role. A grant whose rules were
+  this expensive read slowly before and is refused now. `patchlog index` and `patchlog tree`
+  (and the catalog service with it) take `--max-validation-steps` (default 5,000,000): give them
+  the origin's value, since a service set lower hides items the origin would show.
+- **Breaking: a write that runs out of `validationSteps` in its grant's rules costs a token**
+  (§6.2 step 1, §6.6; Grant scope scenario 88). When the grant, key-scope or role rules checked
+  before anything is read ran out of steps, the `422` (`limit`) came at once, before the rate
+  limits, and cost nothing. Now another check of that step that fails outright answers first
+  (`403` or `401`, no token). Otherwise the rate limits come next: `429` when the caller's
+  bucket is empty, else one token from the principal's bucket (its allowance's if it has one)
+  and from each per-resource bucket, never the namespace's, and then the `422`. A blob upload
+  is treated the same and draws none of its bytes. In a batch such an item counts as failing
+  authorisation. Writes that are exempt from rate limits still draw nothing. Running out
+  later, while the document is validated, is `422` at once as before.
+- **Breaking: the WebDAV gateway fails a request when anything it asked upstream failed**
+  (TOOLS §H.4 Answers, §H.3; Grant scope scenarios 86, 87). A `GET` or `PROPFIND` used to
+  answer from the rest when a read it could do without failed. Now any request the gateway
+  makes to the core or to a tree or catalog service for your request that fails for now
+  (`408`, `429`, `5xx`, unreachable, no answer in time) fails your request: `503` after a
+  `429`, a `503` or a timeout, else `502`, never `200`, `207`, `404` or `403` from the rest.
+  A failure is cleared only by the same request made again and answered (for one with a
+  body, the same body), so a request the gateway waited out and got answered is no failure.
+  Once a read made for your request has failed, its first write isn't sent, so nothing is
+  written and then answered "try again"; a write already made stays made.
+  - The `502` and `503` name only what failed, "the core" or a catalog's tree or catalog
+    service, and carry none of its code, text or status number. `Retry-After` is the
+    gateway's own, 1 s for busy or behind and 5 s for no answer in time. The upstream's
+    answer is in the gateway's log.
+  - When the tree service is behind your own writes for longer than `--tree-wait`, the
+    request answers `503` with `Retry-After: 1`, where it listed from the node documents.
+    Requests in the next 5 s are listed from node documents as before.
+  - A `LOCK` answered with such a failure leaves no lock, so the retry isn't `423`.
+- **Breaking: a filtered-read or index cookie stays ended once a key or role it drew on
+  changes** (SERVICES §B.11.9 `gs`, scenario 145). When a later config entry undid the change
+  and nobody had exchanged in between, the old cookie read again at the origin; at the index
+  it held when both entries arrived in one batch. Now it is `403` on `/heads`, log ranges,
+  long-poll and events from the change on, until the reader exchanges again; at an `at`
+  before the change it still reads. A change made and undone within one config entry ends
+  nothing.
+  - At the origin: the exchange after a change gives a cookie that reads, with any grant.
+    Where it must be told apart from an earlier cookie it expires whole seconds earlier
+    (§C.5.2), and `POST /edge-grants` answers `503` (`behind`, with `Retry-After`) where no
+    second is left before the grant's `exp`. Several grants in one exchange that give the
+    same subject set give one cookie, lasting as long as the longest of them allows. Cookies
+    issued before the upgrade are `403` once, and their readers exchange again (migrations
+    `023_filtered_gs_exps` on SQLite, `024_…` on Postgres). A cookie is judged over at most
+    64 namespace documents after the one its exchange read: at a checkpoint further on it is
+    `403`, while it still reads at an earlier `at`, so a namespace that writes more than 64
+    config entries within a cookie's life, 15 minutes at most, ends it there.
+  - At the index: only the config entries after a cookie's exchange are judged, so an index
+    catching up on a backlog doesn't end cookies minted meanwhile. This also covers a branch
+    whose keys come from a base the index follows. An index that starts a namespace from a
+    snapshot ends that namespace's cookies. Index migrations 012 and 013 add two columns to
+    its cookie rows (position and base chain); cookies recorded before them may be ended
+    once by the next config entry applied.
+- **Breaking: clients refuse content of a base they can't place** (§E.2.2, ENC-14; Encryption
+  scenario 87). A reader of an end-to-end branch accepts content sealed under a base's keys only
+  up to the point where the branch forked. The Go client and the playground take that point from
+  the base's `/heads`, or else from the branch's own `/heads` at its first entry. Where they
+  could read neither, they opened such entries unchecked, anywhere in the branch's log. Now
+  those entries are flagged and folded as `[]`, and a base's snapshot is refused. A reader with
+  a narrow grant (one fixed to a resource, or a partial reader) may lose content the branch
+  reads through. A fork that couldn't be placed is asked for again at the next read, and a
+  branch whose document names a base without `at` gets no read-through content. The playground
+  now also checks remote bases and prune snapshots.
+- **Breaking: clients hold a branch at its base's encryption level, and refuse plaintext
+  under `sealed`** (§7.1, HTTP-68; Encryption scenario 94). The Go client and the playground
+  kept a level for each namespace alone, and only a holder of `e2e` refused a document served
+  as a plaintext `200`. Now a branch is held at least at the level held for any base in its
+  local `base` chain, so `--expect-level N=sealed` (`client.WithExpectedLevel`) also refuses
+  a branch of `N` that claims less; and a holder of `sealed` refuses a plaintext document too
+  (`client.ErrLevelLowered`), from `Client.DocKid` as from `Client.Doc`. To know the chain,
+  a client that holds `sealed` or `e2e` for some namespace reads a namespace's current
+  document once before it trusts a first document served in the clear from it, so such a
+  branch is refused without having been looked at first. That is one more namespace-document
+  read per namespace and client; a client that holds only `at-rest`, or nothing, makes none.
+  A refusal of the namespace document is remembered per grant, so a client copy with a wider
+  grant still reads it. `Client.HeldLevel` may report a level inherited from a base. A remote
+  base isn't followed, and the check rests on the document the server serves: against a
+  hostile server, configure the level for the branch itself (v0.86 Open 2, 5).
+- **Breaking: `409 in_use` lists a page** (§6.1 Refusals, §8.5; SCH-6, Grant scope scenario
+  94). `referencing` named every namespace you may read that still references the schema. It
+  now holds the first `logPageSize` of them by name, with `"more": true` where you may read
+  others; a namespace purge's `dependents` likewise. A refused purge of a widely referenced
+  schema no longer searches every referencing namespace before it answers.
+  `client.APIError.More()` reports the member, and the janitor's message says "and others". A
+  config write's `dependents` are listed whole as before.
+- **Breaking: a catalog branch shows its base's tree, and gives out no content grants**
+  (SERVICES §B.5 Previews, scenario 150).
+  - A tree service serving a catalog branch treats links into the branch's base chain
+    (`parents` and `$parents` naming `/r/{base}/…`) as links to the branch's own nodes, so the
+    base's tree appears in the branch as it stood. Before, everything read through showed as
+    roots and orphans. The WebDAV gateway shows and moves a branch catalog's files the same
+    way. A tree database written before this is read again at start; rebuild it if the
+    catalog uses implicit placements.
+  - A catalog service whose catalog is a branch, or a release preview, answers a request for
+    a content grant or a read grant `404 not_offered`. Organising grants for the branch's
+    own nodes are unchanged.
+
+Other changes for v0.86:
+
+- **A `PATCH /ns/{ns}` creation that is `412` for a taken name costs a token** (§6.6 Cost;
+  Grant scope scenario 93): one from the grant's principal bucket, `429` when it is empty.
+  Under an operator grant it stays free, as the creation itself is.
+- **A `requireAt` key that names its own namespace** behaves like `requireAt: true` once that
+  namespace is purged (§C.4; Grant scope scenario 83): the log is still served and resources
+  answer `410 purged`, where they answered the scope's `403`. At the origin and at services.
+- **Bundles: a branch's export needs no access to its base** (§G.4.1, FED-3).
+  `export --foreign-parents`, and every export of an end-to-end branch, take each document's
+  foreign parent from the branch's own `/heads` at its first entry, where they read the
+  base's. Branches of a remote base now export in full: an end-to-end one exported only the
+  documents that were its own from the start, and a plain one failed with `404`. Such an
+  export fails, writing nothing, if the branch's namespace log doesn't start with its config
+  entry.
+- **Bundles: import accepts a pinned revision it can't decrypt** (TOOLS §G.4.2, FED-15). A pin
+  to a revision that an end-to-end or sealed target serves but the importer has no key for,
+  such as an end-to-end target's horizon snapshot, failed the import. It now counts as in the
+  target. A pin pruned without a kept document is reported as not in the target.
+- **Streams: the proxy answers `401` to an operator grant** presented as the caller's (§C.4),
+  where it created the stream. `--idle-timeout` must be the same on every proxy of a
+  deployment (TOOLS §J.2 Restarts); the help text and the README now say so.
+- **Playground: a stacked preview opens** (SERVICES §B.5 Previews; Encryption scenarios 92,
+  93). A catalog entry sealed under a branch of a release branch was shown by name only; the
+  playground now follows the chain of branches, up to 8 levels.
+- **Test vectors** (§I.17, §I.25). §I.17's last row follows v0.86 and is checked as a
+  decryption failure, not a malformed token. §I.25's long-poll phases are new
+  (`server.LongPollPhase`, `server.LongPollCursor`). docs/TESTVECTORS.md has both.
+
+Other work since v0.31.0:
 
 - **The playground is published on GitHub Pages** (`.github/workflows/pages.yml`, at
   https://middle-management.github.io/patchlog/). Away from `/playground/` the page is
@@ -21,15 +200,56 @@
   resource as well, from the `ns_log` entries it reads (a batch's items from its body).
   docs/CAPACITY.md, "Resource followers", has the before and after; `cmd/capacity -only
   resource-live` measures it.
-- **Each log's long-poll intervals have a phase of their own** (§7.7; docs/SPEC-FEEDBACK.md,
-  v0.85 Open 61). Every wait of a deployment ended at the one interval boundary, so at each
-  boundary every follower was answered and polled again together, and writes queued behind
-  them: the worst write of a 20 s window took 1.5 s with 12,288 resource followers on SQLite.
-  Now a log's intervals start at the epoch plus a phase, the first 8 bytes of the SHA-256 of
-  the log's path modulo the interval in milliseconds, and that worst write took 51 ms. All
-  followers of one URL share its boundaries and cursors, so CDN collapsing is unchanged, and
-  cursors stay within one of the old ones. `serve --long-poll-fixed-epoch` (Options
-  `LongPollFixedEpoch`) keeps the spec's single epoch.
+- **A purge no longer reads every document of the deployment, and neither does a prune.**
+  Before it removes anything, a purge of a document or a namespace (and a narrowing of
+  `drafts.for`) checks that it leaves no schema reference without a copy (§6.1). That check
+  listed the `$schema` of every document every namespace sees, read-through ones included, so
+  one purge cost a second with ten branches and a few thousand documents on Postgres, and 40
+  seconds with a thousand branches, whatever was purged. A prune made the same pass once for
+  every document it pruned, to keep referenced schema revisions. Now the server first asks
+  which schema revisions anything references at all (the distinct `$schema` values stored, by a
+  new index `revisions_schema_ref`, and the schemas those reach by `$ref`). A purge that
+  touches no copy of one of them is done with the check there, at what it cost with an empty
+  database. One that does, a referenced schema's, reads only the documents typed by that
+  schema or by one that reaches it, in the namespaces that hold them or read them through: its
+  cost follows what references the schema, not the deployment. `PATCHLOG_TEST_VALIDATE_BOTH=1`
+  also makes the old pass on every such change and panics if the two answers differ.
+- **A purge reaches only the branches it has work in.** A purge in a base visited every
+  branch below it, locked it and read its row, whether or not the branch saw the purged
+  document: about 1 ms a branch on Postgres, so 9.6 s with 10,000 branches that didn't see
+  it, and 27 s where they read it through. Now the server finds, by name, the branches that
+  hold the document or may read it through, and neither reads nor locks the others; on
+  Postgres the branches it does reach get their `purge` entries in one statement. With
+  10,000 branches a purge takes 52 ms where they don't see the document and 0.9 s where they
+  do (0.1 ms a branch), and frozen branches cost the same as live ones. The entries written,
+  their order and the cache tags purged are unchanged. `PATCHLOG_TEST_VALIDATE_BOTH=1` also
+  makes the old walk over every branch and panics if the two disagree. A refused purge of a
+  schema that many branches reference is still slow (40 s with 10,000 branches).
+- **A branch's chain of bases is read once per transaction.** Every read and write in a
+  branch read, locked and checked each base on its own, so each level added about 0.07 ms to
+  a read and 0.7 ms to a write on Postgres: a create took 9.3 ms at depth 8 against 2.9 ms in
+  a plain namespace, and 16 callers wrote 420 documents a second against 1,197. Now the chain
+  comes in one statement and its rows are kept for the transaction. A create takes 3.3 ms at
+  depth 8 and at depth 32, and 16 callers write 937 a second at depth 8. On Postgres the
+  first use of a base in a transaction now takes a shared lock on the whole local chain.
+- **A namespace locked for itself alone takes no separate log lock** (Postgres). Every
+  appender takes the namespace's lock before its log's, so the second lock added nothing
+  there; a purge reaching 10,000 branches held 20,000 advisory locks and now holds half. That is
+  still one lock per branch reached: Postgres's lock table holds `max_locks_per_transaction`
+  × `max_connections` locks, 6,400 as installed, so a purge reaching more branches than that
+  needs one of the two raised (the measurements ran with `max_connections=300`, 19,200).
+- **`namespaces.frozen` is set for branches created frozen**, with a migration that corrects
+  existing rows. The count of a namespace's live branches (§6.6) now reads that column.
+- **A namespace's branches are found by an index** (`namespaces_base`). A purge asks for the
+  branches of every namespace it reaches, and each time the whole table of namespaces was
+  read, so a purge reaching 10,000 branches took about twice what its branches alone cost.
+  Creating a branch and `/branches` asked the same way.
+- **`serve --max-branch-depth` and `--max-branches-per-namespace`** set the deployment's
+  `branchDepth` and the maximum a namespace document's `limits.branchesPerNamespace` may ask
+  for (§6.6). The defaults stay 8 and 100.
+- **`capacity --only branches`** measures what those two limits bound: one base with many live
+  or frozen branches (`--branch-count`, `--branch-frozen`, `--branch-children`), or a chain of
+  branches of branches (`--branch-depth`).
 
 ## v0.31.0
 

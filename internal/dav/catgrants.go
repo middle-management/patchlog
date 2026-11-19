@@ -85,9 +85,10 @@ func (st *reqState) derived(ctx context.Context, cat string) (bool, error) {
 		return false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	res, err := st.s.ts.hc.Do(req)
+	what := fmt.Sprintf("catalog %s's tree service", cat)
+	res, err := st.svcDo(what, req)
 	if err != nil {
-		return false, unreached(fmt.Sprintf("catalog %s's tree service", cat), err)
+		return false, unreached(what, err)
 	}
 	io.Copy(io.Discard, io.LimitReader(res.Body, 1<<16))
 	res.Body.Close()
@@ -95,8 +96,10 @@ func (st *reqState) derived(ctx context.Context, cat string) (bool, error) {
 	case http.StatusMethodNotAllowed, http.StatusNotFound:
 	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusUnsupportedMediaType:
 		k.catalog = true
+	case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+		return false, upBusy(what, fmt.Errorf("POST /grants: %d", res.StatusCode))
 	default:
-		return false, fail(http.StatusBadGateway, "catalog %s's tree service answered POST /grants %d", cat, res.StatusCode)
+		return false, upFailed(what, fmt.Errorf("POST /grants: %d", res.StatusCode))
 	}
 	k.at = now
 	st.s.ts.mu.Lock()
@@ -133,7 +136,7 @@ func (st *reqState) issue(ctx context.Context, cat string, req map[string]any) (
 		return nil, err
 	}
 	if a.Grant == "" {
-		return nil, fail(http.StatusBadGateway, "catalog %s's catalog service answered POST /grants without a grant", cat)
+		return nil, upFailed(fmt.Sprintf("catalog %s's catalog service", cat), errors.New("POST /grants answered without a grant"))
 	}
 	return &a, nil
 }
@@ -151,7 +154,10 @@ func (st *reqState) catalogPost(ctx context.Context, cat, path string, body []by
 	if len(mins) > 0 {
 		q = "?" + url.Values{"min": mins}.Encode()
 	}
-	// Waited out in real time, as a listing's TreeWait is (svcListing).
+	what := fmt.Sprintf("catalog %s's catalog service", cat)
+	// Waited out in real time, as a listing's TreeWait is (svcListing):
+	// a 503 or 429 asked again and answered within it hasn't failed
+	// (sawUpstream).
 	deadline := time.Now().Add(st.s.opt.TreeWait)
 	for wait := 50 * time.Millisecond; ; wait = min(2*wait, time.Second) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, st.s.treeURL(cat)+path+q, bytes.NewReader(body))
@@ -162,24 +168,26 @@ func (st *reqState) catalogPost(ctx context.Context, cat, path string, body []by
 		if b := st.tk.c.Bearer(); b != "" {
 			req.Header.Set("Authorization", "Bearer "+b)
 		}
-		res, err := st.s.ts.hc.Do(req)
+		res, err := st.svcDo(what, req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			return unreached(fmt.Sprintf("catalog %s's catalog service", cat), err)
+			return unreached(what, err)
 		}
 		b, err := io.ReadAll(io.LimitReader(res.Body, 16<<20))
 		res.Body.Close()
 		if err != nil {
-			if de := unreached(fmt.Sprintf("catalog %s's catalog service", cat), err); de.status == http.StatusServiceUnavailable {
-				return de
+			de := unreached(what, err)
+			if de.status != http.StatusServiceUnavailable {
+				de = &davError{status: http.StatusBadGateway, msg: what + "'s answer was cut short", cause: err}
 			}
-			return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's catalog service's answer was cut short", cat), cause: err}
+			st.upstreamFailed(st.upKey(req), de)
+			return de
 		}
 		if res.StatusCode == http.StatusOK {
 			if err := json.Unmarshal(b, out); err != nil {
-				return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's catalog service answered %s with what isn't JSON", cat, path), cause: err}
+				return upFailed(what, fmt.Errorf("%s answered with what isn't JSON: %w", path, err))
 			}
 			return nil
 		}
@@ -199,24 +207,20 @@ func (st *reqState) catalogPost(ctx context.Context, cat, path string, body []by
 					return ctx.Err()
 				}
 			}
-			de := fail(http.StatusServiceUnavailable, "catalog %s's catalog service answered %d: %s", cat, res.StatusCode, msg)
-			ra := res.Header.Get("Retry-After")
-			if ra == "" {
-				ra = "1"
-			}
-			de.header = http.Header{"Retry-After": {ra}}
-			return de
+			// Named alone, with this server's Retry-After (§H.4
+			// "Answers", v0.86).
+			return upBusy(what, fmt.Errorf("%s: %d %s", path, res.StatusCode, msg))
 		case http.StatusUnauthorized:
 			if !st.s.opt.Gateway {
-				return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's catalog service refused this server's grant (-bearer) with 401", cat), cause: errors.New(msg)}
+				return &davError{status: http.StatusBadGateway, msg: what + " refused this server's grant (-bearer)", cause: errors.New(msg)}
 			}
 			return fail(http.StatusUnauthorized, "catalog %s's catalog service refused your grant: %s", cat, msg)
 		case http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusGone:
 			return fail(res.StatusCode, "catalog %s's catalog service: %s (§B.11.4)", cat, msg)
 		}
-		// A 502 names the service and its status, nothing of its answer
-		// (§C.6 Upstream failures), which is logged (record).
-		return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's catalog service answered %s %d", cat, path, res.StatusCode), cause: errors.New(msg)}
+		// A 502 names the service, nothing of its answer (§H.4
+		// "Answers", §C.6 Upstream failures), which is logged (record).
+		return upFailed(what, fmt.Errorf("%s: %d %s", path, res.StatusCode, msg))
 	}
 }
 
@@ -247,7 +251,7 @@ const maxIssued = 1 << 10
 func (st *reqState) install(ns, name, g string, writes bool) error {
 	dg, err := grant.Decode(g, 64<<10)
 	if err != nil || len(dg.Blocks) == 0 {
-		return fail(http.StatusBadGateway, "the catalog service issued a grant that doesn't decode: %v", err)
+		return upFailed("the catalog service", fmt.Errorf("it issued a grant that doesn't decode: %w", err))
 	}
 	root := dg.Blocks[0]
 	ig := issuedGrant{grant: g, can: append([]string(nil), root.Can...), writes: writes}

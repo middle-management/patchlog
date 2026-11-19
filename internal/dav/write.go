@@ -1186,13 +1186,17 @@ func rendersAs(v any) func(doc any) bool {
 func (st *reqState) retrying(ctx context.Context, attempt func() (retry bool, err error)) error {
 	waits := 0
 	for moved := 0; ; {
+		mark := st.upMark()
 		retry, err := attempt()
 		if client.IsRateLimited(err) {
 			ae := errAPI(err)
 			if waits >= 2 || ae.RetryAfter > st.s.opt.MaxRetryWait {
-				return busy(ae)
+				return upBusy(theCore, err)
 			}
 			waits++
+			// Waited out and made again whole: the attempt's 429 isn't
+			// the request's failure (§H.4 "Answers"; upForgive).
+			st.upForgive(mark)
 			t := time.NewTimer(ae.RetryAfter)
 			select {
 			case <-ctx.Done():

@@ -62,10 +62,13 @@ func not3(t Tri) Tri {
 // jsv.ValidateOptions.Budget counts them. Steps already holds what else
 // drew on the same budget, a write's own validation.
 //
-// Once the steps run out Over is set, and every schema test from then on
-// is False without being run. Tri has no value for that, so the outcome of
-// an evaluation that left Over set means nothing: a test cut short under a
-// not would pass. Callers check Over before they read the outcome.
+// Once the steps run out Over is set, and the test cut short, like every
+// schema test from then on, which isn't run, is Unknown: so a rule that
+// is False with Over set fails whatever those tests would have said, and
+// one that is Unknown or True was not decided within the budget. Callers
+// check Over before they take a value other than False for an answer: a
+// test cut short under an any that another member satisfies leaves the
+// rule True.
 type Meter struct {
 	Max   int // 0: no limit
 	Steps int // taken so far; where they ran out, a lower bound of what was needed
@@ -198,10 +201,33 @@ func (r *Rule) EvalTri(env map[string]any, unknown ...string) Tri {
 }
 
 // EvalMetered is EvalTri with the rule's schema tests drawing on m (nil:
-// no bound). If it leaves m.Over set, the steps ran out and the value
-// returned means nothing (Meter).
+// no bound). If it leaves m.Over set, the steps ran out: False is then
+// still a rule that fails, and any other value is not an answer (Meter).
 func (r *Rule) EvalMetered(env map[string]any, m *Meter, unknown ...string) Tri {
 	return r.n.eval(env, blindOf(unknown, m))
+}
+
+// DefaultValidationSteps is §12.2's default of validationSteps.
+const DefaultValidationSteps = 5_000_000
+
+// Budget is a meter of steps for one check, DefaultValidationSteps for a
+// steps that isn't positive: no check is left unbounded (§6.6 Validation
+// work).
+func Budget(steps int) *Meter {
+	if steps <= 0 {
+		steps = DefaultValidationSteps
+	}
+	return &Meter{Max: steps}
+}
+
+// Passes reports whether r is True against env within what m has left, as
+// a read check or an item filtered by a grant needs it (§6.6 Validation
+// work): a rule that isn't True fails the check, and so does one whose
+// schema tests ran out of steps, whatever it evaluated to, so a test cut
+// short under a not, or beside a member of an any that holds, never
+// passes. Once m is over, no rule passes it.
+func (r *Rule) Passes(env map[string]any, m *Meter) bool {
+	return r.EvalMetered(env, m) == True && !m.Over
 }
 
 func blindOf(unknown []string, m *Meter) blind {
@@ -562,14 +588,14 @@ func (n *testNode) eval(env map[string]any, unk blind) Tri {
 		// refuses the test here.
 		left, ok := m.Left()
 		if !ok {
-			return False
+			return Unknown
 		}
 		var st jsv.Stats
 		err := n.schema.Validate(v, jsv.ValidateOptions{Budget: left, Stats: &st})
 		m.Steps += st.Steps
 		if errors.Is(err, jsv.ErrBudget) {
 			m.Over = true
-			return False
+			return Unknown
 		}
 		return tri(err == nil)
 	}

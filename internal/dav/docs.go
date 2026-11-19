@@ -63,12 +63,17 @@ func (s *Server) doc(ctx context.Context, tk *token, ns, name, rev string) (*doc
 	s.docMu.Lock()
 	e, ok := s.docs.Get(k)
 	s.docMu.Unlock()
+	st := state(ctx)
 	if ok {
+		// A read of the request's that failed stays its failure though
+		// the document has come into the cache since, by another
+		// request: every request it makes counts (§H.4 "Answers",
+		// v0.86), and only its own, made again and answered, clears one.
 		return e, nil
 	}
 	// One read per token and revision at a time; another token's read
 	// could fail where this one's wouldn't.
-	v, err, _ := s.group.Do(tk.id+"|"+k, func() (any, error) {
+	v, err, shared := s.group.Do(tk.id+"|"+k, func() (any, error) {
 		select {
 		case s.sem <- struct{}{}:
 		case <-ctx.Done():
@@ -89,7 +94,21 @@ func (s *Server) doc(ctx context.Context, tk *token, ns, name, rev string) (*doc
 		return e, nil
 	})
 	if err != nil {
+		if st != nil && shared && failedRead(err) && !errors.Is(err, context.Canceled) {
+			// The read may have been another request's, shared with this
+			// one, which then made none of its own to see fail
+			// (sawUpstream): its failure for now is this request's too
+			// (§H.4 "Answers", v0.86), until the read is made again and
+			// answered.
+			if de, ok := upstream(err).(*davError); ok {
+				st.upstreamFailed("GET "+k, de)
+			}
+		}
 		return nil, err
+	}
+	if st != nil && !shared {
+		// Its own read, answered: a failure it shared before is past.
+		st.upstreamOK("GET " + k)
 	}
 	return v.(*docEntry), nil
 }
@@ -222,7 +241,9 @@ func (s *Server) nsInfo(ctx context.Context, tk *token, ns string) nsInfo {
 	if st := state(ctx); err != nil && st != nil && st.writes() && failedRead(err) {
 		// What a request's writes need is among what its answer depends
 		// on (§H.4 "Answers", v0.85): it fails before it writes
-		// (saveInfo), a save as any other writing request.
+		// (saveInfo), a save as any other writing request. A request that
+		// only reads fails too, since v0.86, when it answers: the read
+		// that failed here is one it made (writeGuard, sawUpstream).
 		st.unread.CompareAndSwap(nil, &err)
 	}
 	return in
@@ -235,8 +256,9 @@ func (s *Server) nsInfo(ctx context.Context, tk *token, ns string) nsInfo {
 // the error, and the request fails before the write: a failed read of
 // what the answer depends on fails it, and never counts as a refusal or
 // as settings to go by (§H.4 "Answers", v0.85; before, a save's alone).
-// A request that only reads goes by the settings a fresh $nonce on every
-// write stands for, as nsInfo does.
+// A request that only reads goes on by the settings a fresh $nonce on
+// every write stands for, as nsInfo does, and is answered with the
+// failure all the same (errWriter; §H.4 "Answers", v0.86).
 func (st *reqState) saveInfo(ctx context.Context, ns string) (nsInfo, error) {
 	in, err := st.s.nsInfoErr(ctx, st.tk, ns)
 	if !st.writes() {

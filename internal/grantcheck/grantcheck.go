@@ -55,6 +55,7 @@ type Checker struct {
 	now      func() time.Time
 	maxGrant int
 	maxRules int
+	steps    int // validationSteps for each check; 0: the default
 
 	mu     sync.Mutex
 	states map[string]*nsState
@@ -109,6 +110,19 @@ func WithMaxGrantSize(n int) Option { return func(ch *Checker) { ch.maxGrant = n
 // rule forms, nested ones included (default 32, the §12.2 default of
 // rulesPerGrant).
 func WithMaxGrantRules(n int) Option { return func(ch *Checker) { ch.maxRules = n } }
+
+// WithValidationSteps sets the validation steps each read check, each
+// attrs check and each item filtered by a grant may take in its rules'
+// schema tests (§6.6 Validation work): one that needs more fails, or the
+// item is left out. validationSteps is a limit of the origin's deployment
+// that no namespace document carries, so a service is told it here; the
+// default, and what a value that isn't positive means, is §12.2's
+// 5,000,000 (rules.DefaultValidationSteps). No check is unbounded.
+func WithValidationSteps(n int) Option { return func(ch *Checker) { ch.steps = n } }
+
+// ValidationSteps is the budget WithValidationSteps set, 0 for the
+// default: what a ReadFilter of this checker's service takes as Steps.
+func (ch *Checker) ValidationSteps() int { return ch.steps }
 
 // New returns a Checker that reads namespace documents with c.
 func New(c *client.Client, opts ...Option) *Checker {
@@ -507,7 +521,7 @@ func (ch *Checker) Verify(ctx context.Context, ns, token string) (*grant.Verifie
 		Keys:          st.keys,
 		Revoked:       st.revoked,
 		Roles:         st.cfg.Roles,
-		ValidateAttrs: ValidateAttrs,
+		ValidateAttrs: func(schema any, attrs map[string]any) error { return validateAttrs(schema, attrs, ch.steps) },
 		CheckAt:       ch.checkAt(ctx, ns),
 	}
 	return grant.Verify(g, env)
@@ -590,6 +604,12 @@ func unreadable(err error) bool { return client.IsNotFound(err) || client.IsAuth
 // ValidateAttrs checks asserted attrs against a key scope's attrs schema,
 // as the core does: by evaluating a rule { op: test, path: /attrs, schema }.
 func ValidateAttrs(schema any, attrs map[string]any) error {
+	return validateAttrs(schema, attrs, 0)
+}
+
+// validateAttrs is ValidateAttrs within a budget of steps validation
+// steps (0: the default): attrs whose check takes more don't match.
+func validateAttrs(schema any, attrs map[string]any, steps int) error {
 	r, err := rules.Compile(map[string]any{"op": "test", "path": "/attrs", "schema": schema})
 	if err != nil {
 		return fmt.Errorf("invalid attrs schema: %v", err)
@@ -598,7 +618,7 @@ func ValidateAttrs(schema any, attrs map[string]any) error {
 	if attrs != nil {
 		a = attrs
 	}
-	if !r.Eval(map[string]any{"attrs": a}) {
+	if !r.Passes(map[string]any{"attrs": a}, rules.Budget(steps)) {
 		return fmt.Errorf("attrs do not match the key scope")
 	}
 	return nil
@@ -664,10 +684,15 @@ func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at an
 			return fmt.Errorf("malformed at")
 		}
 		begun := time.Now()
-		_, named := requireAt.(string)
 		// A purged namespace requireAt names fails the scope, as one
 		// that doesn't exist does at the origin (§C.4, v0.85): never a
-		// chain the checker can't read.
+		// chain the checker can't read. Not the one the grant is
+		// checked in (v0.86): named by its own name it is as with
+		// requireAt: true, and its own 410 answers.
+		named := false
+		if s, ok := requireAt.(string); ok {
+			named = s != ns
+		}
 		gone := func(err error) bool { return named && purgedNS(err, target) }
 		tst, checked, err := ch.stateWithin(ctx, target, ch.ttl)
 		if err != nil {
@@ -903,6 +928,9 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 		return false, "the grant does not allow read"
 	}
 	env := ReadEnvelope(v, resource, ch.now())
+	// The check's budget of validationSteps: a rule whose schema test
+	// runs out fails it, whatever role might have passed (§6.6).
+	m := rules.Budget(ch.steps)
 	for _, src := range [][]any{v.KeyRules, v.BlockRules} {
 		for _, rv := range src {
 			r, err := ch.compile(rv)
@@ -912,7 +940,7 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 			if FailsRead(r) {
 				return false, "a grant or key rule refers to /now, which no read passes (§C.2 item 5)"
 			}
-			if !r.Eval(env) {
+			if !r.Passes(env, m) {
 				return false, "a grant or key rule refuses the read"
 			}
 		}
@@ -922,10 +950,15 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 			pass := true
 			for _, rv := range v.RoleRules(role) {
 				r, err := ch.compile(rv)
-				if err != nil || FailsRead(r) || !r.Eval(env) {
+				if err != nil || FailsRead(r) || !r.Passes(env, m) {
 					pass = false
 					break
 				}
+			}
+			if m.Over {
+				// Not a role that doesn't pass: the check's steps ran
+				// out, which no other role makes up for (§6.6).
+				return false, "the grant's rules take more than validationSteps steps for this read"
 			}
 			if pass {
 				return true, ""
@@ -978,14 +1011,21 @@ func (ch *Checker) ReadsUnrestricted(v *grant.Verified) bool {
 		return false
 	}
 	env := ReadEnvelope(v, "", ch.now())
-	if !ch.passWhole(v.KeyRules, env) || !ch.passWhole(v.BlockRules, env) {
+	m := rules.Budget(ch.steps) // the check's validationSteps (§6.6)
+	if !ch.passWhole(v.KeyRules, env, m) || !ch.passWhole(v.BlockRules, env, m) {
 		return false
 	}
 	if !v.HasRoles() {
 		return true
 	}
 	for _, role := range roles {
-		if ch.passWhole(v.RoleRules(role), env) {
+		pass := ch.passWhole(v.RoleRules(role), env, m)
+		if m.Over {
+			// The check's steps ran out, which no other role makes up
+			// for: the whole check fails, as at the origin (§6.6).
+			return false
+		}
+		if pass {
 			return true
 		}
 	}
@@ -994,16 +1034,17 @@ func (ch *Checker) ReadsUnrestricted(v *grant.Verified) bool {
 
 // passWhole reports whether rules rs pass against env without referring to
 // /resource, or to /now (or the whole envelope), which fails any read.
-func (ch *Checker) passWhole(rs []any, env map[string]any) bool {
-	return ch.passWholeRefs(rs, env, "resource", "now")
+func (ch *Checker) passWhole(rs []any, env map[string]any, m *rules.Meter) bool {
+	return ch.passWholeRefs(rs, env, m, "resource", "now")
 }
 
-// passWholeRefs reports whether rules rs pass against env without
-// referring to any of refs or to the whole envelope.
-func (ch *Checker) passWholeRefs(rs []any, env map[string]any, refs ...string) bool {
+// passWholeRefs reports whether rules rs pass against env, within what m
+// has left of the check's validation steps, without referring to any of
+// refs or to the whole envelope.
+func (ch *Checker) passWholeRefs(rs []any, env map[string]any, m *rules.Meter, refs ...string) bool {
 	for _, rv := range rs {
 		r, err := ch.compile(rv)
-		if err != nil || r.Refs()["*"] || !r.Eval(env) {
+		if err != nil || r.Refs()["*"] || !r.Passes(env, m) {
 			return false
 		}
 		for _, ref := range refs {
@@ -1031,14 +1072,20 @@ func (ch *Checker) NamespaceWide(v *grant.Verified) bool {
 		return false
 	}
 	env := ReadEnvelope(v, "", ch.now())
-	if !ch.passWholeRefs(v.KeyRules, env, "resource", "now") || !ch.passWholeRefs(v.BlockRules, env, "resource", "now") {
+	m := rules.Budget(ch.steps) // the check's validationSteps (§6.6)
+	if !ch.passWholeRefs(v.KeyRules, env, m, "resource", "now") || !ch.passWholeRefs(v.BlockRules, env, m, "resource", "now") {
 		return false
 	}
 	if !v.HasRoles() {
 		return true
 	}
 	for _, role := range roles {
-		if ch.passWholeRefs(v.RoleRules(role), env, "resource", "now") {
+		pass := ch.passWholeRefs(v.RoleRules(role), env, m, "resource", "now")
+		if m.Over {
+			// As ReadsUnrestricted: a spent budget fails the whole check.
+			return false
+		}
+		if pass {
 			return true
 		}
 	}

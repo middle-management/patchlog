@@ -68,6 +68,9 @@ func (c *Client) NSDoc(ctx context.Context, ns, nsID string) (*NSDoc, error) {
 	if !ok {
 		return nil, fmt.Errorf("client: namespace document %s@%s is not an object", ns, nsID)
 	}
+	// A base never changes, so any revision of the document names it: the
+	// branch is held at least at its bases' level from here on (levels.go).
+	c.levels.learnBase(ns, m)
 	return &NSDoc{ID: nsID, Config: r.header.Get("X-Config-Revision"), Raw: body, Value: m}, nil
 }
 
@@ -501,20 +504,58 @@ type Branch struct {
 	Raw    map[string]any
 }
 
-// Branches lists a namespace's direct branches (§7.4).
-func (c *Client) Branches(ctx context.Context, ns string) ([]Branch, error) {
-	if err := checkNS(ns); err != nil {
-		return nil, err
+// Key is the row's key in /branches (§7.4): a local branch's name, or a
+// remote one's {origin}/{ns}.
+func (b Branch) Key() string {
+	if b.Remote != nil {
+		return str(b.Remote, "origin") + "/" + str(b.Remote, "ns")
 	}
-	r, err := c.do(ctx, "GET", "/ns/"+ns+"/branches", nil, nil)
+	return b.Name
+}
+
+// Branches lists a namespace's direct branches and unexpired remote
+// branch registrations (§7.4), iterating all pages of BranchesPage.
+func (c *Client) Branches(ctx context.Context, ns string) ([]Branch, error) {
+	var all []Branch
+	after := ""
+	for {
+		page, next, err := c.BranchesPage(ctx, ns, after)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if next == "" {
+			return all, nil
+		}
+		if next <= after {
+			return nil, fmt.Errorf("client: /ns/%s/branches: next %q doesn't follow %q (§7.4)", ns, next, after)
+		}
+		after = next
+	}
+}
+
+// BranchesPage is one page of GET /ns/{ns}/branches?after={key} (§7.4):
+// rows in ascending byte order of key (Branch.Key), strictly after after,
+// and next, the after of the following page, "" on the last. A server
+// before v0.86 answers a bare array, which is an error here.
+func (c *Client) BranchesPage(ctx context.Context, ns, after string) (page []Branch, next string, err error) {
+	if err := checkNS(ns); err != nil {
+		return nil, "", err
+	}
+	r, err := c.do(ctx, "GET", "/ns/"+ns+"/branches", headsQuery("", after), nil)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if r.status != 200 {
-		return nil, r.apiError()
+		return nil, "", r.apiError()
 	}
-	arr, _ := r.value().([]any)
-	out := make([]Branch, 0, len(arr))
+	body := r.obj()
+	arr, ok := body["branches"].([]any)
+	if !ok {
+		return nil, "", fmt.Errorf("client: %s: no branches in the answer (§7.4)", r.path)
+	}
+	page = make([]Branch, 0, len(arr))
+	last := after
 	for _, x := range arr {
 		m, _ := x.(map[string]any)
 		b := Branch{Name: str(m, "name"), At: str(m, "at"), Successor: str(m, "successor"), Raw: m}
@@ -522,9 +563,14 @@ func (c *Client) Branches(ctx context.Context, ns string) ([]Branch, error) {
 		b.Purged, _ = m["purged"].(bool)
 		b.Remote, _ = m["remote"].(map[string]any)
 		b.Drafts = draftsFor(m["drafts"])
-		out = append(out, b)
+		k := b.Key()
+		if k <= last {
+			return nil, "", fmt.Errorf("client: %s: row %q outside the page asked for (§7.4)", r.path, k)
+		}
+		last = k
+		page = append(page, b)
 	}
-	return out, nil
+	return page, str(body, "next"), nil
 }
 
 // ConfigResult is the outcome of a namespace-document write.

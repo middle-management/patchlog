@@ -15,11 +15,13 @@ through production code and
 candidates P.1–P.7 of v0.81, which v0.82 took into the Addendum; §I.17 as v0.85 recomputed it,
 which the reference confirms),
 [internal/vectors/addendum_i22_test.go](internal/vectors/addendum_i22_test.go) §I.22–§I.24 (the
-candidates C.1–C.3 of v0.82, in the Addendum since v0.85), and
+candidates C.1–C.3 of v0.82, in the Addendum since v0.85),
+[internal/vectors/addendum_i25_test.go](internal/vectors/addendum_i25_test.go) §I.25 (long-poll
+phases, v0.86), and
 [docs/TESTVECTORS.md](docs/TESTVECTORS.md) points there and records which candidate vectors of
 [docs/VECTORS-PROPOSED.md](docs/VECTORS-PROPOSED.md) the reference confirms (C.4 and C.5,
 v0.85). The
-additions the reference proposes to the spec writer (for §I.25's list, "Still to come", and the
+additions the reference proposes to the spec writer (for §I.26's list, "Still to come", and the
 writer's own: RE2 `\u`, key
 wraps, sealed payloads, blobs and bundles, the plan digest, Biscuit tokens, file renderings and
 more) live in [internal/vectors/testdata](internal/vectors/testdata), each naming the production
@@ -51,7 +53,7 @@ and serves immutable, CDN-cacheable revisions.
 | Streams and shared agent sessions: a proxy that keeps an upstream's streamed response as a resource, sessions of people and agents in one namespace, agents through MCP, recorded model calls | TOOLS Addendum J (suggested, non-normative; v0.83) | Partly: J.1–J.4, the stream proxy, are implemented by `patchlog streams` (see [Stream proxy](#stream-proxy-addendum-j1j4)): the stream document, writing, the narrowed read grant, resuming, abort and expiry, in plain and at-rest namespaces; sealed and end-to-end namespaces are refused at start, as the pattern is for neither (J.4 Encryption, v0.85). J.5–J.7 (shared sessions, agents through MCP, recording model calls) are not implemented: they are patterns built from core requests by tools outside this repository |
 | Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`, bounded by entries and by `logPageBytes`) | §6.2, §7.1–§7.2 | ✅ (`serve --log-page-size`, `--log-page-bytes`; see [Design notes](#design-notes)) |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
-| Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name, `?prefix=`), `/branches` | §7.4 | ✅ |
+| Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name, `?prefix=`), `/branches` (paged: `?after={key}`, `{ branches, next? }`, byte order of key, local and remote rows together) | §7.4 | ✅ |
 | `GET /ns?after={name}`: the deployment's namespaces for operators, branches, remote branches and purged namespaces included, as `{ name, created, base?, frozen, purged }` in byte order of name, paged by `logPageSize`, with `?prefix=`; answered only to an operator grant whose blocks name `"*"`, that carries no roles, and whose blocks list `config` where they carry `can` and carry no rule (`403`, `401`, `403` in that order, a key-scope failure being `403`), or to anyone under `serve --dev` | §7.4, §C.4 (v0.84, v0.85) | ✅ (`client.Namespaces`, `patchlog ns ls`; see [Grants](#grants)) |
 | Files and sync clients: `Last-Modified`, `Repr-Digest` and `If-Modified-Since` on `…/rev/{id}`, and `created`, `size` and `digest` on `/heads` entries, outside E2 and E3; raw documents at `…/raw`; moves recorded as `$successor`, named by the head's `410`; whole-document appends up to `documentSize` | §6.2, §6.6, §7.1, §7.4, §7.8, §8.1 | ✅ (see [Files and sync clients](#files-and-sync-clients-71-74-78-81)) |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
@@ -709,7 +711,10 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   in ascending order. Writes that change a namespace's configuration or state (config writes,
   purges, prunes, branch operations, freezing, the pending-blob sweep) take them exclusive on
   every namespace they change (the written one; a branch's base, which receives the `branch`
-  entry; every branch and remote shadow a purge reaches). Resource writes, batches and blob
+  entry; every branch and remote shadow a purge reaches: the branches that hold the purged
+  name or see it, found by name and locked in one statement, while a branch that does neither
+  is skipped and stays unlocked, since nothing can give it the name without the purged
+  namespace's lock; `internal/core/nspurge.go`). Resource writes, batches and blob
   uploads take their own namespace's lock **shared**, like every namespace a decision read
   (bases whose keys and revocations a branch write re-checks, the namespaces `$schema` and
   `$ref` resolve into, a batch source), so writers of different resources of one namespace
@@ -719,8 +724,11 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   the loser re-check and answer `412` with the new head (or the idempotent retry), as on
   SQLite. The namespace entry is appended last, under a separate advisory **log lock**,
   `pg_advisory_xact_lock(0x504e, ns)`, taken after every other lock, in ascending order when a
-  write appends to several logs (purge propagation, branch creation), and held through commit,
-  so entries commit, and their sequence numbers grow, in chain order. A transaction holding a
+  write appends to several logs, and held through commit,
+  so entries commit, and their sequence numbers grow, in chain order. A write that holds a
+  namespace's lock exclusively takes no log lock for it: every appender holds the namespace's
+  lock first, so none is there (a purge that reaches thousands of branches holds one lock for
+  each, and appends their entries in one statement). A transaction holding a
   log lock never waits for a namespace lock (it tries, and restarts with the lock taken up
   front if that fails). An uploader's pending blob total (§7.8) is ordered by a row of its
   own (`blob_uploaders`), so concurrent uploads can't together exceed `blobPending`. Details in
@@ -2467,7 +2475,17 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   `sealed` or `e2e`, repeatable; `client.WithExpectedLevel`, v0.82, §7.1): the client keeps the
   highest level it has learnt for a namespace, in memory, and refuses a server or cache that
   claims a lower one (`client.ErrLevelLowered`), and a document served in the clear in a
-  namespace held as e2e; with the flag it holds that level from its first request. Keyring writes (`InitKeyring`, `AddReader`, `RotateEpoch`, and the playground's) carry a
+  namespace held as sealed or e2e (only e2e before v0.86); with the flag it holds that level
+  from its first request. Since v0.86 the level also binds the namespace's branches: a branch is
+  held at least at the level held for any base in its local `base` chain, so
+  `--expect-level N=sealed` refuses a branch of `N` that claims less or serves a document in
+  the clear. To know the chain, a client that holds `sealed` or `e2e` for some namespace reads
+  a namespace's current document, and its local bases', once before it trusts a first document
+  served in the clear from it; a document its grant may not read teaches nothing, which is
+  remembered for that grant alone. A remote base isn't followed. The chain is what the server
+  serves as the branch's document, so this guards a first contact with an honest or
+  misconfigured server or cache; against a hostile one, give `--expect-level` for the branch
+  itself. Keyring writes (`InitKeyring`, `AddReader`, `RotateEpoch`, and the playground's) carry a
   fresh `$nonce` where the keyring read has one, so the next one mends a keyring whose `$nonce`
   predates v0.76, which `/keys` doesn't relay meanwhile (v0.81). A keyring in the format before
   v0.63 is no longer relayed or read, and keys wrapped
@@ -3413,7 +3431,20 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   MOVE, COPY or MKCOL like a save (TOOLS §H.4 "Answers"): a core or tree service request the
   answer depends on that fails for now fails the request, and never counts as a refusal. So a
   DELETE made while `GET /ns/{ns}/principal` answers `408` is `502`, where it was `403`, and
-  no write goes ahead on settings a failed read left unknown.
+  no write goes ahead on settings a failed read left unknown. Since v0.86 every core or service
+  request the gateway makes for a user's request counts, whether or not the answer needs it
+  (TOOLS §H.4 "Answers"; CONFORMANCE "Grant scope" 86, 87): a GET of a file while the core
+  answers `500` to a read of a sibling item's namespace document is `502`, where it was `200`
+  from the rest. Once a read has failed, the request's first write to the core isn't sent, so
+  nothing is written and then answered "try again"; a write that was made before such a read
+  failed stays made, what follows it is still sent, and the answer is the failure. A request
+  counts by how it ends: a `429` waited out and sent again has not failed, where "again" is the
+  same request (for a POST, the same body), not another to the same URL. Requests the server makes outside a user's request (verifying a token again, its own
+  start-up reads) don't count. These `502` and `503` name only the upstream that failed
+  ("the core failed", "catalog cat's tree service is busy or behind for now; try again") and
+  carry nothing of its answer: no code, message or status of the upstream's, and the `503`'s
+  `Retry-After` is the gateway's own (1 s for a busy or behind upstream, 5 s where no answer
+  came in time), never the upstream's. What the upstream said is in the server's log.
   A raw file over a JSON document's, or the
   other way round, replaces its root. A purged one is `410`, as is any name of a purged
   namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
@@ -3723,8 +3754,9 @@ only.
   file or folder, a move or a delete, which
   the node documents decide, is `403`, saying so, a move before anything is written (onto another
   file, or to another tree or namespace, the copy is the first write). The tree service unreachable is
-  `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with its
-  `Retry-After`: never an empty folder. Its `401` and `403` are the user's grant refused, answered
+  `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with the
+  gateway's own `Retry-After` that names the tree service and nothing of its answer (v0.86; the
+  namespace a `503 behind` names stays in the log): never an empty folder. Its `401` and `403` are the user's grant refused, answered
   as the core's are (in local mode a `401` refuses `--bearer`: `502`, naming the tree service). A
   tree service answers `503` behind until it has caught up with every namespace the catalog
   trusts and can follow, not only with the catalog (started with a fresh database, rebuilt, or
@@ -3753,15 +3785,19 @@ only.
   `X-Namespace-Revision`, seen as the core answers it), which the tree service waits for (§B.5),
   until a listing that carried them came back, for at most 10 minutes (at most the last 4 entries
   of 64 namespaces a user); other users' listings don't wait. If it hasn't caught up within
-  `--tree-wait` (3 s; the tree service's own `--min-wait`, 2 s, answers sooner), the folder is
-  listed from the node documents instead, as without a tree service, and so are the user's
-  listings of that tree for 5 seconds, however long the tree service lags within those 10
+  `--tree-wait` (3 s; the tree service's own `--min-wait`, 2 s, answers sooner), the request
+  is answered `503` with `Retry-After: 1` (v0.86, §H.3 "A tree service that is behind": "a tool
+  answers `503`"; before, the folder was listed from the node documents in that same request),
+  and the user's requests of that tree for the next 5 seconds don't ask the tree service: their
+  folders are listed from the node documents, as without a tree service, however long the tree
+  service lags within those 10
   minutes: their new file stays listed, and a file they renamed doesn't come back by its old name;
   a grant that can't read the node documents gets `503` with `Retry-After` for 30 s after the
   write, then the tree service's listing without waiting. A `min` the tree service refuses
   (`400`: a namespace it doesn't follow, or the reader can't see) is found per namespace, each
   one's asked for alone: those refused, and those reached, aren't asked for again, the rest
-  are, and that listing is from the node documents.
+  are; that listing is from the node documents, unless the tree service is still behind one of
+  them, which is the `503` above.
 - **New files** (§H.4). A PUT of a new name creates an item in `files.ns` with an opaque name (13
   random base32 characters), and its placement titled with the name, under its folder: one
   `parents` entry, ordered after the folder's last ordered child, so new files list last, and
@@ -3874,7 +3910,7 @@ sessions, agents through MCP and recording model calls (J.5–J.7) are not imple
 | `--upstream` | An allowed upstream: a URL prefix (repeatable). An `Upstream-URL` must have the same scheme and host and a path under the prefix's, at a segment boundary; anything else is `403`. No `--upstream` refuses every request. Redirects are not followed: a `3xx` is kept as the stream. |
 | `--flush` | Least time between two appends to one stream (default 200 ms, §J.2 Pace). |
 | `--ttl` | How long read grants live from a stream's creation (default 24 h); a closed stream that old is purged with its continuations (§J.4 Expiry). |
-| `--idle-timeout` | A stream with no append for this long is closed with `"timeout"` (default 2 m). |
+| `--idle-timeout` | A stream with no append for this long is closed with `"timeout"`, by any proxy (default 2 m). The time is the deployment's, one for all its proxies (§J.2 Restarts): give every proxy of `--ns` the same value. Nothing checks that they agree, and with different values the shortest closes every proxy's streams. |
 | `--state` | A file with the names of the streams being written; a proxy started again closes those still open with `"error"` (§J.2 Restarts). Without it they are closed by the idle sweep, with `"timeout"`. |
 | `--segment-size` | The size at which a stream continues in its next resource, where that is below the namespace's `documentSize` (default: `documentSize`). Each append costs the stream's size so far, so where latency matters §J.1 suggests well below it, `--segment-size "256 KiB"` say. |
 | `--max-request-body`, `--max-segments`, `--max-streams` | Largest body forwarded upstream (1 MiB); most resources one response may fill (8); most streams carried at once (64, then `503` with `Retry-After`; requests that arrive together share the count, and a `Request-Key` request for a stream that exists needs no slot). |
@@ -4153,6 +4189,9 @@ patchlog import -i all.jsonl --atomic --ns demo-schemas=demo2-schemas,demo=demo2
   missing ones first, listing the importer's key and allowance; a `401` or `403` on the first
   read of a target namespace says so.
 - **Branches** export with the base's history included, or with `--foreign-parents` naming the base revisions in `requires`.
+  The foreign parent is the resource's head as the branch's own `/heads` lists it at the
+  branch's first `ns_id` (§G.4.1, v0.86): the exporter reads nothing in the base, needs no
+  grant there, and a branch of a remote base (§G.3) exports the same way.
   An e2e branch's documents always export the second way, its keyring aside (v0.82, §G.5.1; see
   E3 under Encryption below).
 - **Blobs** (§G.4.1) travel as blob lines (unpadded base64url; padded is accepted), each
@@ -4214,13 +4253,16 @@ patchlog import --ns secret -i s.plb --identity me.jwk --atomic
   target's keyring must share the bundle's history, else the import is refused at step 1. An
   e2e branch's export writes no line the branch reads through from its base, whose sealed ops
   name the base (v0.82, §G.5.1 Importing): a document continued in the branch starts after its
-  foreign parent, the base's head at `base.at`, named in `requires` (a `requires` before it, or
+  foreign parent, its head as the branch's `/heads` lists it at the branch's first `ns_id`,
+  named in `requires` (a `requires` before it, or
   a foreign parent that isn't in the chain, refuses the document); one the branch never wrote
   is `external`, pinned to its revision; the keyring comes whole, unless the export asks for
   `--foreign-parents`; and a branch of a remote base
-  exports only documents that start with a line of its own. The importer looks a pinned
-  `external` up in the target's chain where an e2e target serves no document by revision, and
-  for a tombstone at any level. Lines
+  exports the same way (v0.86; before, only documents that start with a line of its own). The
+  importer asks the target for a pinned `external` without opening it, so it needs no key of a
+  sealed or e2e target; it looks the pin up in the target's chain where an e2e target serves
+  no document by revision, and for a tombstone at any level; a pin pruned without a kept
+  document is not in the target (§G.4.2, v0.86). Lines
   go in batches per epoch, in epoch order, each epoch's raise of `encryption.epoch` in the batch
   with the keyring line that brings its key (so atomic mode is atomic per epoch); an existing
   target is refused only below the bundle's lowest epoch, or past the epoch of a sealed line it
@@ -4963,12 +5005,14 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
 - **Live reads** (§7.3, §7.7, v0.73). A long-poll without a cursor, or with one behind by an
   hour's worth of intervals or less, is answered at once (`200`, or `204` with the current
   `X-Cursor`); one further behind is `400 bad_input`, which followers and `cmd/capacity` answer
-  by dropping the cursor and polling again. Each log's intervals are shifted by a phase drawn from
-  its path (the first 8 bytes of the SHA-256 of `/r/{ns}/{name}/log`, `/ns/{ns}/log` or
-  `/ns/{ns}/g/{gs}/log`, modulo the interval in milliseconds), so the waits of a deployment's
-  logs don't all end at one instant. §7.7 counts every log's from one epoch: `serve
-  --long-poll-fixed-epoch` does that (docs/SPEC-FEEDBACK.md, v0.85 Open 61). Followers of one URL
-  share its boundaries and cursors either way. A long-poll or stream of a resource with no entries
+  by dropping the cursor and polling again. Each log's intervals are counted from the epoch plus
+  the log's phase (§7.7 as of v0.86, vectors §I.25): the first 8 bytes of the SHA-256 of
+  `/r/{ns}/{name}/log`, `/ns/{ns}/log` or `/ns/{ns}/g/{gs}/log`, modulo the interval in
+  milliseconds, so the waits of a deployment's logs don't all end at one instant. Every
+  deployment counts them so; there is no option to count them from the epoch alone. Followers of
+  one URL share its boundaries and cursors; a cursor carried from
+  one log to another (a partial reader's long-poll, redirected to its filtered log) is at most one
+  off there, and answered as any cursor behind or ahead is. A long-poll or stream of a resource with no entries
   waits for its first. A stream judges its read check again before each page and keep-alive,
   ends at the latest when the grant or cookie it was admitted under expires, and a namespace
   stream ends after its `purge-ns` event.
@@ -5056,15 +5100,29 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   refused `422` with `code: "limit"`, `limit: "validationSteps"`, `max`, and `measured`, the
   steps taken where it stopped, which is left out for a writer who can't read the resource.
   It is `422` at whatever stage the steps run out, also inside a grant rule whose own failure
-  would be `403`, and at step 1 it comes before the rate limits and draws no token. Listing an
+  would be `403`. At step 1 it answers only if no check there fails outright (a verb, or a
+  rule that is false whatever the tests cut short would have said, is `403` and draws
+  nothing), and after the rate limits: `429` if a bucket is empty, else a token from the
+  principal's bucket (or its allowance's) and from each per-resource bucket the write would
+  draw on, never from the namespace's; an exempt write still draws nothing, and an upload
+  none of its bytes. In a batch such an item counts as failing authorisation. Listing an
   invalid document's failures takes what finding the first left of the limit; if that runs
   out, the `422 invalid` names the first failure alone. The limit is the deployment's
-  (`serve --max-validation-steps`): a namespace document that sets `limits.validationSteps` is
-  `422 invalid`, and `GET /ns/{ns}/principal` lists it among `writer.limits`.
-  `--max-validation-steps 0` lifts it, which the spec doesn't provide for (it requires a
-  bound); `/principal` then leaves the limit out. Reads aren't bounded: the spec bounds writes,
-  and a rule's `schema` test evaluated for a read, an exchange or a key request is not
-  counted. Annotation walks are not counted either.
+  (`serve --max-validation-steps`, at least 1: no deployment is unbounded, and `0` is
+  refused): a namespace document that sets `limits.validationSteps` is `422 invalid`, and
+  `GET /ns/{ns}/principal` lists it among `writer.limits`.
+- **Read checks have the same budget each.** Every read check under a grant, every exchange
+  (`POST /edge-grants`, one budget for all the namespaces and names of the grant), every key
+  request, every read check a write makes (schema reads, `referencing`, branching's
+  unrestricted read, whether a refusal may carry `measured`) and every item a filtered read
+  judges has `validationSteps` steps for its rules' `schema` tests. Running out fails the
+  check with its usual refusal (`404` for a resource of a private namespace, `403` for the
+  namespace's log, an exchange, a key request and branching) or leaves the item out; a test
+  cut short never passes, under a `not` either. A key scope's `attrs` schema is held to the
+  same count. The index and tree services (the catalog with the tree) apply it per read check
+  and per item too; the limit is in no namespace document, so they take
+  `--max-validation-steps` themselves (default 5,000,000) and should be given the origin's.
+  Annotation walks are not counted.
 - **A patch to a typed document is validated where it changes it**, when this instance has
   validated the document it applies to against the same schema revision: the changed values,
   and each schema's own keywords on the way to them. The verdict and the `422` are those of

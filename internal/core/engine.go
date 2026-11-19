@@ -21,6 +21,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdh"
 	"database/sql"
@@ -84,12 +85,6 @@ type Options struct {
 	ReadCacheBytes    int
 	// LongPollInterval is the interval of §7.7 (default 20s).
 	LongPollInterval time.Duration
-	// LongPollFixedEpoch counts every log's long-poll intervals from the
-	// epoch itself, as §7.7 says to as of v0.85. By default each log's are
-	// shifted by a phase drawn from its path (server.logPhase;
-	// docs/SPEC-FEEDBACK.md, v0.85 Open 61), so the waits of a
-	// deployment's many logs don't all end at one instant.
-	LongPollFixedEpoch bool
 	// Now overrides the clock (tests).
 	Now func() time.Time
 	// Purger receives cache-tag purges (§9). Nil logs them.
@@ -152,9 +147,11 @@ type Options struct {
 	// resulting document against its schema (§6.2 step 5) and of the
 	// schema tests of the rules evaluated for that write, together. A step
 	// is one schema or subschema applied to one value, and a write that
-	// takes more is refused 422 with the limit validationSteps. Zero means
-	// DefaultMaxValidationSteps; negative, no limit, which §6.6 doesn't
-	// provide for: the limit is then left out of what /principal reports.
+	// takes more is refused 422 with the limit validationSteps. Each read
+	// check, exchange, key request and item filtered by a grant has such a
+	// budget of its own for its rules' schema tests, and one that runs out
+	// fails. Zero, or less, means DefaultMaxValidationSteps: no
+	// deployment leaves it unbounded.
 	MaxValidationSteps int
 	// GroupCommitWait is at most how long a group waits for writes of its
 	// namespace still in their check phase (zero means 200µs; negative,
@@ -312,11 +309,19 @@ type Engine struct {
 	deks       *dekCache
 	comp       storeCodec // compressed patch sets (compress.go)
 	ekeys      epochKeyCache
-	cfgMu      sync.Mutex
-	cfgCache   map[int64]*Config
-	stmts      stmtCache
-	rc         readCache
-	bearers    grantCache
+	// refsCache is the $refs of schema revisions by path (schemaRefsOf).
+	refsMu    sync.Mutex
+	refsCache lru.Cache[string, []string]
+	// gsHeld is whether a gs cookie's record held under every document
+	// between its exchange's and a later one (gsHeldSince, gsHeldKey).
+	gsHeldMu    sync.Mutex
+	gsHeld      lru.Cache[[32]byte, bool]
+	schemaScans atomic.Int64
+	cfgMu       sync.Mutex
+	cfgCache    map[int64]*Config
+	stmts       stmtCache
+	rc          readCache
+	bearers     grantCache
 	// liveReads shares long-poll reads of a namespace log among their
 	// waiters (live.go), and liveDone keeps their recent answers;
 	// liveJoins counts the reads asked of them, and liveShared those made.
@@ -445,7 +450,7 @@ func Open(opt Options) (*Engine, error) {
 	if opt.GroupCommit == 0 {
 		opt.GroupCommit = defaultGroupCommit
 	}
-	if opt.MaxValidationSteps == 0 {
+	if opt.MaxValidationSteps <= 0 {
 		opt.MaxValidationSteps = DefaultMaxValidationSteps
 	}
 	if opt.GroupCommitWait == 0 {
@@ -500,6 +505,8 @@ func Open(opt Options) (*Engine, error) {
 		stop:       make(chan struct{}),
 		started:    opt.Now().UTC(),
 	}
+	e.refsCache.MaxEntries = 65536
+	e.gsHeld.MaxEntries = 65536
 	e.rc.maxBytes = opt.ReadCacheBytes
 	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
 	if err := e.checkKeyStore(); err != nil {
@@ -626,7 +633,7 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.85"
+const SpecVersion = "0.86"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a
@@ -644,10 +651,6 @@ func (e *Engine) Origin() string { return e.opt.Origin }
 
 // LongPollInterval is the §7.7 interval.
 func (e *Engine) LongPollInterval() time.Duration { return e.opt.LongPollInterval }
-
-// LongPollFixedEpoch reports whether every log's long-poll intervals start
-// at the epoch itself (Options.LongPollFixedEpoch).
-func (e *Engine) LongPollFixedEpoch() bool { return e.opt.LongPollFixedEpoch }
 
 // Limits are the deployment maximums, which bound request bodies.
 func (e *Engine) Limits() Limits { return e.opt.Maximums }
@@ -679,6 +682,12 @@ type Error struct {
 	// §9's short class and purges with its long one, which the server
 	// derives from it. Write responses leave it unset (no-store).
 	Public *bool
+	// ranOut marks the 422 of a write whose step-1 rules ran out of
+	// validationSteps while none of them failed outright (authorize): it
+	// answers only after the step's other checks and the rate limits,
+	// which draw on the caller's own buckets alone (§6.2 step 1, §6.6
+	// Validation work; stepOneRanOut).
+	ranOut bool
 }
 
 func (e *Error) Error() string {
@@ -754,17 +763,21 @@ type tx struct {
 	// checked, which its rules' schema tests draw on (writeMeter); nil
 	// for reads, which nothing bounds.
 	meter *writeMeter
-	// readMeter, set only while a write's refusal for validationSteps
-	// checks whether the writer may read the resource, bounds that
-	// check's rules (writeMeter.readsWithin).
+	// readMeter is the budget of validationSteps of the read checks made
+	// while it is set (readScope), nil outside one: every read check then
+	// gets a fresh budget.
 	readMeter *writeMeter
 	// rateDrawn, when set, records that a write drew its rate-limit tokens,
 	// so a transaction run again doesn't draw them twice.
 	rateDrawn *bool
 	// memo and dirty: rows read in this transaction, and whether it has
 	// written (memo.go).
-	memo    memo
-	dirty   bool
+	memo  memo
+	dirty bool
+	// links and kept: the chains of bases read in this transaction, as
+	// what never changes of a namespace and as whole rows (chain.go).
+	links   map[int64]nsLink
+	kept    map[int64]nsRow
 	ownRevs map[int64]revRow
 	revIDs  map[int64]ids.ID
 	// grants maps an author authenticated in this transaction under a
@@ -804,9 +817,10 @@ type tx struct {
 	logLocks  map[int32]bool
 	maxLogKey int32
 	logPlan   map[int32]bool
-	// logHeads, when set (a group commit's transaction), are the heads of
-	// the chains it appended to, which it knows while it holds their log
-	// locks.
+	// logHeads, when set (a group commit's transaction, or a purge's on
+	// Postgres, which reads them in one statement, purgeApply), are the
+	// heads of the chains it appended to or read under their log locks,
+	// which it knows while it holds those.
 	logHeads map[int64]logHead
 	// cancelDue, when set (a group commit's transaction), cancels its ctx
 	// right before the commit if every request of the group is cancelled:
@@ -814,6 +828,9 @@ type tx struct {
 	// functions run in goroutines that may not have run yet.
 	cancelDue func()
 	noLock    int
+	// oracle > 0 while a check of PATCHLOG_TEST_VALIDATE_BOTH runs
+	// (asOracle): its statements aren't reported to onStatement.
+	oracle int
 	// sharedNS is the namespace a resource write or batch appends to
 	// holding its lock only shared (pglock.go); 0 if none.
 	sharedNS int64
@@ -1204,7 +1221,9 @@ func (t *tx) nsByNameLocked(name string, mode lockMode) *nsRow {
 }
 
 // nsByID returns a namespace, taking its lock shared on Postgres. A read
-// transaction reads each namespace once (memo.ns).
+// transaction reads each namespace once (memo.ns); a write transaction
+// reads it again each time, head included. For a branch's base, read again
+// and again along its chain, see base (chain.go).
 func (t *tx) nsByID(id int64) *nsRow {
 	return t.nsByIDLocked(id, lockShared)
 }
@@ -1214,6 +1233,13 @@ func (t *tx) nsByIDLocked(id int64, mode lockMode) *nsRow {
 	if n, ok := t.memo.ns[id]; ok {
 		t.deps.addNS(&n)
 		return &n
+	}
+	if !t.write {
+		// Read with its branch's chain (chain.go).
+		if n, ok := t.keptRow(id); ok {
+			t.deps.addNS(n)
+			return n
+		}
 	}
 	n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE ns = ?`, id))
 	t.must(err)
@@ -1404,10 +1430,20 @@ func entryResources(entry map[string]any) (names []string, ok bool) {
 // n.headSeq, and returns its id and seq (nil for an empty chain).
 func (t *tx) logHeadOf(n *nsRow) (*ids.ID, any) {
 	var headID []byte
-	if h, ok := t.logHeads[n.id]; ok && t.logLocks[lockKey(n.id)] {
-		// The head this transaction appended last, under the log lock it
-		// still holds (group commit).
+	if h, ok := t.logHeads[n.id]; ok && (t.logLocks[lockKey(n.id)] || t.locks[lockKey(n.id)] == lockExclusive) {
+		// The head this transaction appended or read last, under the log
+		// lock it still holds (group commit), or under the namespace's
+		// lock held exclusively, which stands for it (lockLog).
 		n.headSeq, headID = sql.NullInt64{Int64: h.seq, Valid: true}, h.id[:]
+		if validateBoth {
+			// The oracle: the head as the database has it now.
+			var seq sql.NullInt64
+			var id []byte
+			t.must(t.uncounted(`SELECT head_seq, head_id FROM namespaces WHERE ns = ?`, n.id).Scan(&seq, &id))
+			if seq != n.headSeq || !bytes.Equal(id, headID) {
+				panic(fmt.Errorf("the log head known of namespace %d is %d, the database has %v", n.id, h.seq, seq))
+			}
+		}
 	} else {
 		t.must(t.QueryRow(`SELECT head_seq, head_id FROM namespaces WHERE ns = ?`, n.id).Scan(&n.headSeq, &headID))
 		t.forget() // read after the log lock

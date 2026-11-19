@@ -94,10 +94,17 @@ func (c *stmtCache) close() {
 //
 // On Postgres they rewrite the query for the dialect (dialect.go) and leave
 // statement caching to pgx, which prepares each query once per connection.
+//
+// A statement that inserts or updates namespaces rows drops the rows the
+// transaction keeps of its branches' chains (chain.go): all of them go
+// through here.
 
 func (t *tx) QueryRow(q string, args ...any) *sql.Row {
-	if h := t.e.onStatement; h != nil {
+	if h := t.e.onStatement; h != nil && t.oracle == 0 {
 		h(q, args)
+	}
+	if t.kept != nil && writesNS(q) {
+		t.changedNS()
 	}
 	if t.e.pg {
 		return t.Tx.QueryRow(rebind(q), pgArgs(args)...)
@@ -109,8 +116,11 @@ func (t *tx) QueryRow(q string, args ...any) *sql.Row {
 }
 
 func (t *tx) Query(q string, args ...any) (*sql.Rows, error) {
-	if h := t.e.onStatement; h != nil {
+	if h := t.e.onStatement; h != nil && t.oracle == 0 {
 		h(q, args)
+	}
+	if t.kept != nil && writesNS(q) {
+		t.changedNS()
 	}
 	if t.e.pg {
 		return t.Tx.Query(rebind(q), pgArgs(args)...)
@@ -122,8 +132,11 @@ func (t *tx) Query(q string, args ...any) (*sql.Rows, error) {
 }
 
 func (t *tx) Exec(q string, args ...any) (sql.Result, error) {
-	if h := t.e.onStatement; h != nil {
+	if h := t.e.onStatement; h != nil && t.oracle == 0 {
 		h(q, args)
+	}
+	if t.kept != nil && writesNS(q) {
+		t.changedNS()
 	}
 	t.wrote()
 	if t.e.pg {

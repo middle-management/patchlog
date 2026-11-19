@@ -206,6 +206,12 @@ type View struct {
 	groups []string // the groups among the subjects, as the grant has them (for /principal/groups)
 	eff    func(name string) map[string][]string
 
+	// Steps is the validation steps the rules' schema tests may take for
+	// each item, and each folder, through each role the view judges it by
+	// (§6.6 Validation work): one that needs more isn't visible through
+	// that role. 0 is §12.2's default. Set before the view is used.
+	Steps int
+
 	// folder caches, per readRoles, whether a role counts for folders:
 	// that depends on the subject set and the role alone.
 	mu     sync.Mutex
@@ -612,7 +618,11 @@ func (v *View) counts(rr *readRoles, eff map[string][]string, resource string, i
 			case len(def.rules) == 0 && len(rr.keyRules) == 0:
 				return true
 			case item:
-				if passes(rr, def, r, resource, groups) {
+				// Each role is judged as the grant carrying it would be,
+				// a check of its own with its own budget of validation
+				// steps (§6.6): one that runs out doesn't count, whatever
+				// order the roles come in.
+				if passes(rr, def, r, resource, groups, rules.Budget(v.Steps)) {
 					return true
 				}
 			case v.folderRole(rr, def, r, groups):
@@ -637,24 +647,28 @@ func (v *View) folderRole(rr *readRoles, def *readRole, r string, groups []any) 
 	}
 	ok, done := m[r]
 	if !done {
-		ok = passes(rr, def, r, "", groups)
+		ok = passes(rr, def, r, "", groups, rules.Budget(v.Steps))
 		m[r] = ok
 	}
 	return ok
 }
 
 // passes evaluates role r's rules and the key's scope rules against the
-// read envelope (counts), with /resource resource unless it is "".
-func passes(rr *readRoles, def *readRole, r, resource string, groups []any) bool {
+// read envelope (counts), with /resource resource unless it is "", within
+// what m has left of the item's validation steps (§6.6 Validation work).
+func passes(rr *readRoles, def *readRole, r, resource string, groups []any, m *rules.Meter) bool {
 	env := map[string]any{"action": "read", "principal": map[string]any{"groups": nonNilAny(groups), "roles": []any{r}}}
 	if resource != "" {
 		env["resource"] = resource
 	}
-	if _, _, ok := rules.EvalList(rr.keyRules, env); !ok {
-		return false
+	for _, rs := range [][]*rules.Rule{rr.keyRules, def.rules} {
+		for _, rule := range rs {
+			if !rule.Passes(env, m) {
+				return false
+			}
+		}
 	}
-	_, _, ok := rules.EvalList(def.rules, env)
-	return ok
+	return true
 }
 
 func nonNilAny(xs []any) []any {

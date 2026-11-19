@@ -1,6 +1,8 @@
 package client
 
 import (
+	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -18,6 +20,15 @@ import (
 // With copies and their E2E views: a client's first contact can't tell a
 // server that claims a lower level, so a namespace known to be end-to-end
 // is configured with WithExpectedLevel.
+//
+// A branch is held at least at the level held for any base in its base
+// chain (§7.1, v0.86): a branch's level is never below its base's. The
+// chain is what the namespace documents the client has read name as each
+// namespace's local base (link), which never changes; the level held for
+// a namespace is the highest over it and those bases. A client that has
+// read no document of a branch doesn't know its bases, and a remote base
+// (base.origin) is another deployment's namespace, for which this table,
+// kept per deployment, holds nothing.
 
 // ErrLevelLowered reports a namespace document or /keys answer naming a
 // lower encryption level than the client has learnt for the namespace
@@ -40,17 +51,162 @@ func levelRank(level string) (int, bool) {
 	return 0, false
 }
 
-// levelTable holds the highest level learnt per namespace.
+// levelTable holds the highest level learnt per namespace, and the local
+// bases its documents named.
 type levelTable struct {
 	mu sync.Mutex
 	m  map[string]string
+	// base[ns] lists the namespaces a document of ns named as its local
+	// base: one, as a base never changes, unless a server lied, and then
+	// each counts, since a link only ever raises what is held.
+	base map[string][]string
+	// read marks the namespaces whose current document was read: a 200.
+	read map[string]bool
+	// refused marks, per namespace and caller (probeKey), a current
+	// document the server refused that caller: not asked for again by it,
+	// while another caller, with another grant, still asks.
+	refused map[string]bool
+	// probing holds the chain reads under way (learnChain), by the same
+	// key, so that concurrent first reads make one.
+	probing map[string]chan struct{}
 }
 
-// held is the level held for ns, "" for none.
+// canRefusePlain reports whether the client holds, for any namespace, a
+// level under which a document in the clear is refused: sealed or e2e. A
+// caller that holds mu.
+func (t *levelTable) canRefusePlain() bool {
+	for _, lv := range t.m {
+		if r, _ := levelRank(lv); r >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
+// unread reports whether the chain of ns is still to be asked about by
+// the caller key names: the client holds sealed or e2e for some
+// namespace, which ns may be a branch of, and ns's current document was
+// neither read nor refused to this caller. At-rest refuses no plaintext,
+// so holding nothing above it asks for nothing.
+func (t *levelTable) unread(ns, key string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return !t.read[ns] && !t.refused[key] && t.canRefusePlain()
+}
+
+// markRead records that ns's current namespace document was read.
+func (t *levelTable) markRead(ns string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.read == nil {
+		t.read = map[string]bool{}
+	}
+	t.read[ns] = true
+}
+
+// markRefused records that the server refused the caller of key a
+// namespace's current document.
+func (t *levelTable) markRefused(key string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.refused == nil {
+		t.refused = map[string]bool{}
+	}
+	t.refused[key] = true
+}
+
+// begin claims the read of key: mine is true for the caller that is to
+// make it and then call end; another gets the channel closed when that
+// read is over.
+func (t *levelTable) begin(key string) (wait chan struct{}, mine bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if ch, ok := t.probing[key]; ok {
+		return ch, false
+	}
+	if t.probing == nil {
+		t.probing = map[string]chan struct{}{}
+	}
+	ch := make(chan struct{})
+	t.probing[key] = ch
+	return ch, true
+}
+
+func (t *levelTable) end(key string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	close(t.probing[key])
+	delete(t.probing, key)
+}
+
+// bases lists the local bases the documents of ns named.
+func (t *levelTable) bases(ns string) []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]string(nil), t.base[ns]...)
+}
+
+// held is the level held for ns, "" for none: the highest of its own and
+// those of the bases in its chain.
 func (t *levelTable) held(ns string) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.m[ns]
+	return t.floor(ns)
+}
+
+// floor is held, for a caller that holds mu.
+func (t *levelTable) floor(ns string) string {
+	best := t.m[ns]
+	if len(t.base[ns]) == 0 {
+		return best
+	}
+	br, _ := levelRank(best)
+	seen := map[string]bool{ns: true}
+	for todo := []string{ns}; len(todo) > 0; {
+		cur := todo[0]
+		todo = todo[1:]
+		for _, b := range t.base[cur] {
+			if seen[b] {
+				continue
+			}
+			seen[b] = true
+			if r, _ := levelRank(t.m[b]); r > br {
+				best, br = t.m[b], r
+			}
+			todo = append(todo, b)
+		}
+	}
+	return best
+}
+
+// link records that a document of ns names base as its local base.
+func (t *levelTable) link(ns, base string) {
+	if base == ns || !ValidNSName(base) {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, b := range t.base[ns] {
+		if b == base {
+			return
+		}
+	}
+	if t.base == nil {
+		t.base = map[string][]string{}
+	}
+	t.base[ns] = append(t.base[ns], base)
+}
+
+// learnBase records the local base that doc, a namespace document of ns,
+// names (link). A remote base, one with an origin, is none.
+func (t *levelTable) learnBase(ns string, doc map[string]any) {
+	b, _ := doc["base"].(map[string]any)
+	if _, remote := b["origin"]; b == nil || remote {
+		return
+	}
+	if base, _ := b["ns"].(string); base != "" {
+		t.link(ns, base)
+	}
 }
 
 // expect records level for ns as configuration gives it, keeping the
@@ -73,18 +229,20 @@ func (t *levelTable) expect(ns, level string) {
 
 // learn takes level, which ns's current document or /keys names, and
 // returns the level held after it: level itself, recorded, unless a
-// higher one is held, which is ErrLevelLowered, as is a level this client
-// doesn't know while any is held.
+// higher one is held, for ns or for a base in its chain, which is
+// ErrLevelLowered, as is a level this client doesn't know while any is
+// held.
 func (t *levelTable) learn(ns, level string) (string, error) {
 	r, ok := levelRank(level)
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	held := t.m[ns]
+	held := t.floor(ns)
 	h, _ := levelRank(held)
 	if r < h || !ok && h > 0 {
 		return held, fmt.Errorf("client: namespace %s: level %q where %q is held: %w", ns, level, held, ErrLevelLowered)
 	}
-	if ok && r > h {
+	if own, _ := levelRank(t.m[ns]); ok && r > own {
+		// Kept as the namespace's own, though a base's already holds it.
 		if t.m == nil {
 			t.m = map[string]string{}
 		}
@@ -93,13 +251,81 @@ func (t *levelTable) learn(ns, level string) (string, error) {
 	return level, nil
 }
 
+// maxChain bounds the namespaces learnChain walks for one read. A
+// deployment sets its own branch depth (§12.4), which a client doesn't
+// know; a chain longer than this is refused, never cut short.
+const maxChain = 1024
+
+// probeKey names ns as this client asks for it: by its credentials, since
+// With copies share the table and a refusal to one grant says nothing of
+// another.
+func (c *Client) probeKey(ns string) string {
+	sum := sha256.Sum256([]byte(c.bearer))
+	return fmt.Sprintf("%s %x %p", ns, sum[:8], c.signer)
+}
+
+// learnChain reads the current namespace document of ns, and of every
+// local base those documents name, to the end of the chain as known,
+// where the client holds sealed or e2e for some namespace and hasn't read
+// them yet (unread), learning their levels and bases. A document that
+// names a lower level than held is ErrLevelLowered. One the server
+// refuses this caller (401, 403, 404, 410) teaches nothing and isn't
+// asked for again with the same credentials; a failure of the moment
+// (transport, 429, 5xx) is returned, naming the document that wasn't
+// read, and asked for again next time: without it the level of what was
+// served can't be confirmed. Concurrent callers share one read.
+func (c *Client) learnChain(ctx context.Context, ns string) error {
+	seen := map[string]bool{ns: true}
+	for todo := []string{ns}; len(todo) > 0; {
+		cur := todo[0]
+		todo = todo[1:]
+		for key := c.probeKey(cur); c.levels.unread(cur, key); {
+			wait, mine := c.levels.begin(key)
+			if !mine {
+				select {
+				case <-wait:
+					continue
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			_, _, _, err := c.currentLevel(ctx, cur)
+			var ae *APIError
+			if errors.As(err, &ae) && !Retryable(err) && !errors.Is(err, ErrLevelLowered) {
+				c.levels.markRefused(key)
+				err = nil
+			}
+			c.levels.end(key)
+			switch {
+			case errors.Is(err, ErrLevelLowered):
+				return err
+			case err != nil:
+				return fmt.Errorf("reading the current namespace document of %s, to learn its level and base: %w", cur, err)
+			}
+			break
+		}
+		for _, b := range c.levels.bases(cur) {
+			if !seen[b] {
+				if len(seen) >= maxChain {
+					return fmt.Errorf("the chain of bases of %s is longer than %d namespaces: %w", ns, maxChain, ErrLevelLowered)
+				}
+				seen[b] = true
+				todo = append(todo, b)
+			}
+		}
+	}
+	return nil
+}
+
 // WithExpectedLevel configures the encryption level namespace ns is known
 // to have: "at-rest", "sealed" or "e2e" (§7.1, Levels). The client holds
 // it from its first request on, so a server that claims a lower one is
-// ErrLevelLowered, and with "e2e" a 200 of a resource other than the
-// keyring that isn't application/jose is refused. The highest of several
-// counts, and it is shared with the client's With copies. A level this
-// client doesn't know is held as "e2e".
+// ErrLevelLowered, and a document's 200 that isn't application/jose is
+// refused with "sealed" or "e2e" (at "e2e" but the keyring's). It holds
+// for the branches of ns too, once the client has read a document of
+// theirs that names ns in its base chain. The highest of several counts,
+// and it is shared with the client's With copies. A level this client
+// doesn't know is held as "e2e".
 func WithExpectedLevel(ns, level string) Option {
 	return func(c *Client) {
 		if c.levels == nil {
@@ -117,7 +343,9 @@ func ValidLevel(level string) bool {
 }
 
 // HeldLevel is the encryption level the client holds for ns: the highest
-// it was configured with or has learnt, "" for none.
+// it was configured with or has learnt for ns or for a base in its chain
+// of local bases, as far as the documents it has read name them, "" for
+// none.
 func (c *Client) HeldLevel(ns string) string { return c.levels.held(ns) }
 
 // heldOver is level, which something that teaches nothing suggests (a
@@ -135,22 +363,44 @@ func (c *Client) heldOver(ns, level string) string {
 
 // learnDocLevel learns ns's level from r, a 200 for its current namespace
 // document: "sealed" for one served as a JWE (E2), else its
-// encryption.level.
+// encryption.level. A document in the clear names its base too, which is
+// taken first, and from a document that is then refused as well: the
+// level it claims is judged against what is held for that base, and a
+// link only raises what is held. A sealed document's base is learnt where
+// it is opened (NSDoc).
 func (c *Client) learnDocLevel(ns string, r *response) (string, error) {
+	c.levels.markRead(ns)
 	lv := "sealed"
 	if !isJOSE(r) {
-		enc, _ := r.obj()["encryption"].(map[string]any)
+		doc := r.obj()
+		c.levels.learnBase(ns, doc)
+		enc, _ := doc["encryption"].(map[string]any)
 		lv, _ = enc["level"].(string)
 	}
 	return c.levels.learn(ns, lv)
 }
 
 // refusePlain is the error for r, a 200 for a document of ns/name, where
-// the client holds e2e for ns and r isn't a JWE: an end-to-end namespace
-// serves no document but its keyring in the clear (§7.1).
-func (c *Client) refusePlain(ns, name string, r *response) error {
-	if name == KeyringName || isJOSE(r) || c.levels.held(ns) != "e2e" {
+// the client holds sealed or e2e for ns, as its own level or a base's, and
+// r isn't a JWE: a sealed namespace serves every document as one, and an
+// end-to-end one every document but its keyring (§7.1; v0.86 scenario 94
+// for sealed).
+//
+// A client that holds sealed or e2e for some namespace and has read no
+// namespace document of ns doesn't know whether ns is a branch of it. So before the first such 200 is trusted it reads ns's current
+// document, and those of the local bases it names, once each per client
+// (learnChain): scenario 94's client "has learnt no level for Z". A
+// client that holds no level asks for nothing.
+func (c *Client) refusePlain(ctx context.Context, ns, name string, r *response) error {
+	if isJOSE(r) {
 		return nil
 	}
-	return fmt.Errorf("client: %s/%s: the server answered 200 %s in a namespace this client holds as e2e, not application/jose (§7.1): %w", ns, name, r.header.Get("Content-Type"), ErrLevelLowered)
+	if err := c.learnChain(ctx, ns); err != nil {
+		return fmt.Errorf("client: %s/%s: the document arrived in the clear (200 %s), but this client holds sealed or e2e for a namespace and could not confirm that %s is no branch of it: %w", ns, name, r.header.Get("Content-Type"), ns, err)
+	}
+	held := c.levels.held(ns)
+	if hr, _ := levelRank(held); hr < 2 || held == "e2e" && name == KeyringName {
+		return nil
+	}
+	return fmt.Errorf("client: %s/%s: the server answered 200 %s in a namespace this client holds as %s, not application/jose (§7.1): %w", ns, name, r.header.Get("Content-Type"), held, ErrLevelLowered)
 }

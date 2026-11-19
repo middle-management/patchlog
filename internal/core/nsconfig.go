@@ -27,13 +27,43 @@ type configPlan struct {
 	exempt bool
 }
 
+// configExempt reports whether a config write draws no rate tokens, being
+// by a * key or only a freeze (§6.6 Exempt), which a speculative apply of
+// its patches decides.
+func configExempt(cur *Config, a *actor, cc *ConfigChange) bool {
+	if a.star {
+		return true
+	}
+	ops, err := patch.Parse(cc.Patches)
+	if err != nil {
+		return false
+	}
+	d, w, err := patch.Apply(cur.Doc, true, ops, patch.Options{})
+	return err == nil && freezeOnly(patch.WritesStrings(w), d)
+}
+
+// configRanOut is stepOneRanOut for a config write whose authorize
+// refused it with err: one whose rules ran out of validationSteps draws a
+// token from its principal's bucket before its 422, unless it is exempt,
+// and then draws nothing as ever.
+func (t *tx) configRanOut(n *nsRow, cur *Config, a *actor, cc *ConfigChange, err *Error) *Error {
+	if !err.ranOut || configExempt(cur, a, cc) {
+		return err
+	}
+	return t.stepOneRanOut(err, t.ownDraws(n, cur, a, nil, 1))
+}
+
 // planConfig runs steps 1–6 of a config write on an existing namespace.
 func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBatch bool) (*configPlan, error) {
 	// Step 1.
 	// The write's rules draw on one validation meter (§6.6, writeMeter).
 	defer t.metered(func() bool { return t.readsNS(n, cur, a, false) })()
 	if err := t.authorize(a, "config", ""); err != nil {
-		return nil, err
+		if inBatch {
+			// The batch answered the change's step 1 itself (checkItems).
+			return nil, err
+		}
+		return nil, t.configRanOut(n, cur, a, cc, err)
 	}
 	p := &configPlan{}
 	curID := t.configID(n.configSeq)
@@ -532,8 +562,8 @@ func (t *tx) configInUse(n *nsRow, cur, cfg *Config) *Error {
 	if n.isBranch() && !sameStrings(cur.DraftsFor, cfg.DraftsFor) {
 		// Narrowing drafts.for may leave a reference to its drafts
 		// without a copy (§6.1, §7.4).
-		if broken := t.brokenReferences(refChange{cfg: map[int64]*Config{n.id: cfg}}); len(broken) > 0 {
-			return t.inUse(broken, "the change would leave references to this branch's draft schema revisions without a copy (§6.1)")
+		if err := t.refsInUse(refChange{cfg: map[int64]*Config{n.id: cfg}}, "the change would leave references to this branch's draft schema revisions without a copy (§6.1)"); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -562,14 +592,30 @@ func (t *tx) publicDependents(n *nsRow) []string {
 
 // liveBranches counts n's direct branches that are live (§6.6): neither
 // frozen nor purged, leaving out except.
+//
+// It counts by the frozen and purged columns, through the index on base,
+// without loading the rows of every branch n ever had: frozen mirrors the
+// branch's namespace document, written with it at creation and by every
+// config write (insertConfig).
 func (t *tx) liveBranches(n, except *nsRow) int {
-	live := 0
-	for _, b := range t.branchesOf(n) {
-		if except != nil && b.id == except.id {
-			continue
-		}
-		if !b.purged && !t.config(b.configSeq).Frozen {
-			live++
+	var skip int64 // no namespace's id
+	if except != nil {
+		skip = except.id
+	}
+	var live int
+	t.must(t.QueryRow(`SELECT COUNT(*) FROM namespaces WHERE base = ? AND purged = 0 AND frozen = 0 AND ns <> ?`, n.id, skip).Scan(&live))
+	if validateBoth {
+		// The oracle: the branches' documents, one by one.
+		byDoc := 0
+		t.asOracle(func() {
+			for _, b := range t.branchesOf(n) {
+				if (except == nil || b.id != except.id) && !b.purged && !t.config(b.configSeq).Frozen {
+					byDoc++
+				}
+			}
+		})
+		if byDoc != live {
+			panic(fmt.Sprintf("liveBranches of %s: %d by the frozen column, %d by the branches' documents", n.name, live, byDoc))
 		}
 	}
 	return live
@@ -585,6 +631,33 @@ func (t *tx) branchesOf(n *nsRow) []*nsRow {
 		t.must(err)
 		out = append(out, b)
 	}
+	return out
+}
+
+// branchesAfter lists at most limit direct branches of n in byte order of
+// name, those whose name is strictly after the plain bound after, only
+// the unpurged ones if unpurged: a page of /branches (§7.4) or of a
+// namespace purge's dependents (§8.5). It reads the page alone, by the
+// index on a base's branch names in byte order (the "C" collation on
+// Postgres, index namespaces_base_c; SQLite's namespaces_base is BINARY).
+func (t *tx) branchesAfter(n *nsRow, after string, unpurged bool, limit int) []*nsRow {
+	col, cond := "name", ""
+	if t.e.pg {
+		col = `name COLLATE "C"`
+	}
+	if unpurged {
+		cond = ` AND purged = 0`
+	}
+	rows, err := t.Query(`SELECT `+nsCols+` FROM namespaces WHERE base = ? AND `+col+` > ?`+cond+` ORDER BY `+col+` LIMIT ?`, n.id, after, limit)
+	t.must(err)
+	defer rows.Close()
+	var out []*nsRow
+	for rows.Next() {
+		b, err := scanNS(rows)
+		t.must(err)
+		out = append(out, b)
+	}
+	t.must(rows.Err())
 	return out
 }
 

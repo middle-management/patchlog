@@ -746,6 +746,10 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 	var out []map[string]any
 	var ans *KeysAnswer
 	err := e.read(ctx, func(t *tx) error {
+		// A key request has one budget of validationSteps for its rules'
+		// schema tests, however many resources it names (§6.6 Validation
+		// work).
+		defer t.readScope()()
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)

@@ -13,6 +13,13 @@ import (
 // authorizeTaken authorises a create of an existing namespace, before its
 // 412: an operator grant may create namespaces with config (§C.2 item 2,
 // §C.4), and otherwise the caller needs config on the namespace itself.
+//
+// Under an operator grant the creation draws no token, its 412 included.
+// Under any other grant the 412 costs one token from that grant's
+// principal bucket, its allowance's if it has one, and none from the
+// namespace's (§6.6 Cost and Exempt): a * key's grant too, since the
+// request is no config write of the namespace. With authentication
+// disabled there is no grant, and nothing is drawn.
 func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
 	// The write's rules draw on one validation meter (§6.6, writeMeter).
 	defer t.metered(nil)()
@@ -21,11 +28,20 @@ func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
 			return t.authorize(a, "config", "")
 		}
 	}
-	a, err := t.authenticate(n.name, n, t.config(n.configSeq), req.Cred, nil)
+	cfg := t.config(n.configSeq)
+	a, err := t.authenticate(n.name, n, cfg, req.Cred, nil)
 	if err != nil {
 		return err
 	}
-	return t.authorize(a, "config", "")
+	if err := t.authorize(a, "config", ""); err != nil {
+		// A run-out of validationSteps answers instead of the 412, after
+		// the same draw (§6.6 Validation work).
+		return t.stepOneRanOut(err, []draw{t.principalDraw(n, cfg, a, 1)})
+	}
+	if a.verified == nil {
+		return nil
+	}
+	return t.admitOnce([]draw{t.principalDraw(n, cfg, a, 1)})
 }
 
 // createNamespace bootstraps a namespace with an operator grant (§C.4),
@@ -136,11 +152,18 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	}
 	// The write's rules draw on one validation meter (§6.6, writeMeter).
 	defer t.metered(func() bool { return t.readsNS(base, bcfg, a, true) })()
-	if err := t.authorize(a, "branch", br.Name); err != nil {
-		return nil, err
+	ran := t.authorize(a, "branch", br.Name)
+	if ran != nil && !ran.ranOut {
+		return nil, ran
 	}
 	if !t.readsNS(base, bcfg, a, true) {
 		return nil, forbidden("branching needs unrestricted read on the base (§2.1)")
+	}
+	if ran != nil {
+		// Its rules ran out of validationSteps and no check of step 1
+		// failed outright: the rate limits, on its own buckets, then the
+		// 422 (§6.6 Validation work).
+		return nil, t.stepOneRanOut(ran, t.ownDraws(base, bcfg, a, nil, 1))
 	}
 	if err := t.rateLimit(base, bcfg, a, nil, 1); err != nil {
 		return nil, err
@@ -266,7 +289,11 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	}
 	// Step 7.
 	author := t.actorID(a)
-	bid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?) RETURNING ns`, br.Name, base.id, atSeq, base.configSeq)
+	// frozen mirrors the document, as after every config write
+	// (insertConfig): a branch may be created frozen, and liveBranches
+	// counts by the column.
+	bid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq, frozen) VALUES (?,?,?,?,?) RETURNING ns`,
+		br.Name, base.id, atSeq, base.configSeq, cfg.Frozen)
 	cseq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?) RETURNING seq`,
 		bid, cfgID[:], string(gcanon), string(jsonv.Canonical(nd)), author, t.now.UnixMilli())
 	bn := t.nsByIDLocked(bid, lockExclusive)

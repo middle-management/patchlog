@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
@@ -108,6 +109,18 @@ func (e *Engine) EdgeGrantsOffered() error {
 // exchanged, as they would follow "Bearer " (§C.5.2). None is 401; the
 // server keeps their number within MaxEdgeGrants.
 func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGrants, error) {
+	return e.IssueEdgeGrantsWithin(ctx, bearers, maxEdgeTTL)
+}
+
+// IssueEdgeGrantsWithin is IssueEdgeGrants for a server whose edge grants
+// live ttl at the longest, at most a quarter of an hour (§C.5.2). The
+// cookie of a partial reader's subject set expires at the second its
+// edge grant's Exp names, which a read under it is judged by (§B.11.9
+// gs, recordFilteredGS), so that second is within ttl.
+func (e *Engine) IssueEdgeGrantsWithin(ctx context.Context, bearers []string, ttl time.Duration) (*EdgeGrants, error) {
+	if ttl <= 0 || ttl > maxEdgeTTL {
+		ttl = maxEdgeTTL
+	}
 	if err := e.EdgeGrantsOffered(); err != nil {
 		return nil, err
 	}
@@ -187,9 +200,35 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 	}
 	// A partial reader's subject sets are recorded before their cookies
 	// are set, so every instance judges them (§B.11.9 gs).
+	// Each takes the second its cookie expires at, at or before the one
+	// the exchange would give it, which its edge grant then carries
+	// (§C.5.2: whole seconds off, so that cookies that must be told
+	// apart differ in exp; 503 behind where none is left).
+	// Grants that give the same subject set of a namespace give one
+	// prefix and one cookie, which lasts as long as the longest of them
+	// allows (§C.5.2): one record, with the latest exp. They are of one
+	// read snapshot, so their records differ in nothing else that a
+	// cookie is judged by.
+	latest := out.Now.Add(ttl).Unix()
+	var recs []*gsRecord
 	for _, rec := range col.recs {
+		rec.exp = min(rec.exp, latest)
+		i := slices.IndexFunc(recs, func(o *gsRecord) bool { return o.ns == rec.ns && o.gs == rec.gs })
+		switch {
+		case i < 0:
+			recs = append(recs, rec)
+		case rec.exp > recs[i].exp:
+			recs[i] = rec
+		}
+	}
+	for _, rec := range recs {
 		if err := e.recordFilteredGS(ctx, rec); err != nil {
 			return nil, err
+		}
+		for i, g := range out.Grants {
+			if g.NS == rec.ns && g.GS == rec.gs {
+				out.Grants[i].Exp = time.Unix(rec.exp, 0)
+			}
 		}
 	}
 	return out, nil
@@ -232,6 +271,10 @@ func (c *edgeCollect) add(eg EdgeGrant) bool {
 // each with g's exp. It returns the key of g's principal's buckets, as a
 // write's are keyed (§6.6), and the first refusal of the lowest rank.
 func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) (string, *Error) {
+	// The exchange of g has one budget of validationSteps for the rules
+	// it evaluates, whatever namespaces and names they are for (§6.6
+	// Validation work).
+	defer t.readScope()()
 	exp := grantExp(g)
 	var bucket string
 	var refused *Error
@@ -373,11 +416,16 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 		for _, name := range names[1:] {
 			env := t.basicEnvelope("read", name, a)
 			for _, r := range each {
-				if !r.Eval(env) {
+				if !t.readRule(r, env) {
 					return nil, forbidden("the grant's rules refuse reading " + name + " in " + ns + ", a name they fix (§C.5.2)")
 				}
 			}
 		}
+	}
+	if t.readSpent() {
+		// The exchange's budget of validationSteps ran out along the
+		// way: it fails as a whole (§6.6).
+		return nil, forbidden("the grant's rules take more than validationSteps steps for this exchange, which fails it (§6.6): " + ns)
 	}
 	// A purged namespace is decided last, once the grant verifies and may
 	// read there, as its URLs answer 410 after the read check (§8.5). Its
@@ -425,7 +473,7 @@ func (t *tx) qualifies(a *actor, rs []any, names []string) bool {
 			list = once
 		}
 		for _, r := range list {
-			if !r.Eval(env) {
+			if !t.readRule(r, env) {
 				return false
 			}
 		}

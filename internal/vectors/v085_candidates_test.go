@@ -1,6 +1,7 @@
 package vectors_test
 
-// The candidate vectors of docs/VECTORS-PROPOSED.md for §I.25's list
+// The candidate vectors of docs/VECTORS-PROPOSED.md for "Still to come"
+// (§I.26's list since v0.86; §I.25's in the document, as v0.85 numbered it)
 // (C.4 and C.5, computed independently from the v0.85 text), each computed
 // here through the reference's production code and compared with the
 // candidate. testdata/candidates.json holds the candidates as the document
