@@ -207,9 +207,9 @@ type View struct {
 	eff    func(name string) map[string][]string
 
 	// Steps is the validation steps the rules' schema tests may take for
-	// each item, and each folder role, the view judges (§6.6 Validation
-	// work): one that needs more isn't visible through that role. 0 is
-	// §12.2's default. Set before the view is used.
+	// each item, and each folder, through each role the view judges it by
+	// (§6.6 Validation work): one that needs more isn't visible through
+	// that role. 0 is §12.2's default. Set before the view is used.
 	Steps int
 
 	// folder caches, per readRoles, whether a role counts for folders:
@@ -607,8 +607,6 @@ func (v *View) counts(rr *readRoles, eff map[string][]string, resource string, i
 			groups = append(groups, gr)
 		}
 	}
-	// One budget for the item, whatever roles are tried for it.
-	budget := rules.Budget(v.Steps)
 	for subj, roles := range eff {
 		if !subs[subj] {
 			continue
@@ -620,7 +618,11 @@ func (v *View) counts(rr *readRoles, eff map[string][]string, resource string, i
 			case len(def.rules) == 0 && len(rr.keyRules) == 0:
 				return true
 			case item:
-				if passes(rr, def, r, resource, groups, budget) {
+				// Each role is judged as the grant carrying it would be,
+				// a check of its own with its own budget of validation
+				// steps (§6.6): one that runs out doesn't count, whatever
+				// order the roles come in.
+				if passes(rr, def, r, resource, groups, rules.Budget(v.Steps)) {
 					return true
 				}
 			case v.folderRole(rr, def, r, groups):

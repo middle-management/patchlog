@@ -335,7 +335,9 @@ func (f *ReadFilter) allows(resource string, item bool) bool {
 				return false
 			}
 		}
-		return true
+		// A role without rules doesn't make up for one before it that
+		// ran out of steps: that fails the whole check (§6.6).
+		return !m.Over
 	}
 	if !pass(f.compiled[0]) || !pass(f.compiled[1]) {
 		return false

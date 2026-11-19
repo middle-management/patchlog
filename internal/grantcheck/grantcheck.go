@@ -950,6 +950,11 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 					break
 				}
 			}
+			if m.Over {
+				// Not a role that doesn't pass: the check's steps ran
+				// out, which no other role makes up for (§6.6).
+				return false, "the grant's rules take more than validationSteps steps for this read"
+			}
 			if pass {
 				return true, ""
 			}

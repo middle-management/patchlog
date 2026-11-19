@@ -5072,15 +5072,29 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   refused `422` with `code: "limit"`, `limit: "validationSteps"`, `max`, and `measured`, the
   steps taken where it stopped, which is left out for a writer who can't read the resource.
   It is `422` at whatever stage the steps run out, also inside a grant rule whose own failure
-  would be `403`, and at step 1 it comes before the rate limits and draws no token. Listing an
+  would be `403`. At step 1 it answers only if no check there fails outright (a verb, or a
+  rule that is false whatever the tests cut short would have said, is `403` and draws
+  nothing), and after the rate limits: `429` if a bucket is empty, else a token from the
+  principal's bucket (or its allowance's) and from each per-resource bucket the write would
+  draw on, never from the namespace's; an exempt write still draws nothing, and an upload
+  none of its bytes. In a batch such an item counts as failing authorisation. Listing an
   invalid document's failures takes what finding the first left of the limit; if that runs
   out, the `422 invalid` names the first failure alone. The limit is the deployment's
-  (`serve --max-validation-steps`): a namespace document that sets `limits.validationSteps` is
-  `422 invalid`, and `GET /ns/{ns}/principal` lists it among `writer.limits`.
-  `--max-validation-steps 0` lifts it, which the spec doesn't provide for (it requires a
-  bound); `/principal` then leaves the limit out. Reads aren't bounded: the spec bounds writes,
-  and a rule's `schema` test evaluated for a read, an exchange or a key request is not
-  counted. Annotation walks are not counted either.
+  (`serve --max-validation-steps`, at least 1: no deployment is unbounded, and `0` is
+  refused): a namespace document that sets `limits.validationSteps` is `422 invalid`, and
+  `GET /ns/{ns}/principal` lists it among `writer.limits`.
+- **Read checks have the same budget each.** Every read check under a grant, every exchange
+  (`POST /edge-grants`, one budget for all the namespaces and names of the grant), every key
+  request, every read check a write makes (schema reads, `referencing`, branching's
+  unrestricted read, whether a refusal may carry `measured`) and every item a filtered read
+  judges has `validationSteps` steps for its rules' `schema` tests. Running out fails the
+  check with its usual refusal (`404` for a resource of a private namespace, `403` for the
+  namespace's log, an exchange, a key request and branching) or leaves the item out; a test
+  cut short never passes, under a `not` either. A key scope's `attrs` schema is held to the
+  same count. The index and tree services (the catalog with the tree) apply it per read check
+  and per item too; the limit is in no namespace document, so they take
+  `--max-validation-steps` themselves (default 5,000,000) and should be given the origin's.
+  Annotation walks are not counted.
 - **A patch to a typed document is validated where it changes it**, when this instance has
   validated the document it applies to against the same schema revision: the changed values,
   and each schema's own keywords on the way to them. The verdict and the `422` are those of

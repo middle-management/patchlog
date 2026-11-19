@@ -1584,8 +1584,9 @@ func (v *visibility) itemRoles(rr *readRoles, eff map[string][]string, resource 
 	}
 	tried := map[string]bool{}
 	var out []string
-	// One budget of validation steps for the item (§6.6 Validation work).
-	budget := rules.Budget(v.s.opt.Tree.ValidationSteps)
+	// Each role is a check of its own, with its own budget of validation
+	// steps (§6.6 Validation work, catvis.View.counts).
+	steps := v.s.opt.Tree.ValidationSteps
 	for subj, roles := range eff {
 		if !subs[subj] {
 			continue
@@ -1596,7 +1597,7 @@ func (v *visibility) itemRoles(rr *readRoles, eff map[string][]string, resource 
 				continue
 			}
 			tried[r] = true
-			if len(def.rules) == 0 && len(rr.keyRules) == 0 || passes(rr, def, r, resource, groups, budget) {
+			if len(def.rules) == 0 && len(rr.keyRules) == 0 || passes(rr, def, r, resource, groups, rules.Budget(steps)) {
 				out = append(out, r)
 			}
 		}
