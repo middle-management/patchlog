@@ -19,7 +19,7 @@ candidates C.1–C.3 of v0.82, in the Addendum since v0.85), and
 [docs/TESTVECTORS.md](docs/TESTVECTORS.md) points there and records which candidate vectors of
 [docs/VECTORS-PROPOSED.md](docs/VECTORS-PROPOSED.md) the reference confirms (C.4 and C.5,
 v0.85). The
-additions the reference proposes to the spec writer (for §I.25's list, "Still to come", and the
+additions the reference proposes to the spec writer (for §I.26's list, "Still to come", and the
 writer's own: RE2 `\u`, key
 wraps, sealed payloads, blobs and bundles, the plan digest, Biscuit tokens, file renderings and
 more) live in [internal/vectors/testdata](internal/vectors/testdata), each naming the production
