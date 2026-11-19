@@ -1152,30 +1152,93 @@ func (e *Engine) BranchList(ctx context.Context, ns string, cred Credentials) (*
 // Wait returns a channel closed on the next change to a namespace's log.
 func (e *Engine) Wait(ns string) <-chan struct{} { return e.hub.wait(ns) }
 
-// hub wakes waiters when a namespace log changes.
+// WaitResource returns a channel closed on the next commit that may change
+// what a read of one resource's log returns: an entry of the namespace
+// naming the resource (a write, a batch item, a purge or a prune), or one
+// whose effect isn't confined to named resources (a configuration change,
+// a namespace purge, a branch), which wakes every waiter of the namespace.
+// Writes to the namespace's other resources leave it open, so a resource
+// long-poll or event stream costs nothing while its resource is quiet.
+func (e *Engine) WaitResource(ns, name string) <-chan struct{} { return e.hub.waitResource(ns, name) }
+
+// hub wakes waiters when a namespace log changes: the namespace's own
+// waiters on every change, a resource's on the changes that name it or
+// concern the whole namespace.
 type hub struct {
 	mu sync.Mutex
-	m  map[string]chan struct{}
+	m  map[string]*nsWaiters
 }
 
-func newHub() *hub { return &hub{m: map[string]chan struct{}{}} }
+// nsWaiters are the channels of a namespace's waiters, made on the first
+// wait and closed (and dropped) by the publish that wakes them.
+type nsWaiters struct {
+	log chan struct{}            // the namespace log's waiters, or nil
+	res map[string]chan struct{} // resource waiters by resource name
+}
+
+func newHub() *hub { return &hub{m: map[string]*nsWaiters{}} }
+
+func (h *hub) waiters(ns string) *nsWaiters {
+	w, ok := h.m[ns]
+	if !ok {
+		w = &nsWaiters{}
+		h.m[ns] = w
+	}
+	return w
+}
 
 func (h *hub) wait(ns string) <-chan struct{} {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	c, ok := h.m[ns]
+	w := h.waiters(ns)
+	if w.log == nil {
+		w.log = make(chan struct{})
+	}
+	return w.log
+}
+
+func (h *hub) waitResource(ns, name string) <-chan struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	w := h.waiters(ns)
+	if w.res == nil {
+		w.res = map[string]chan struct{}{}
+	}
+	c, ok := w.res[name]
 	if !ok {
 		c = make(chan struct{})
-		h.m[ns] = c
+		w.res[name] = c
 	}
 	return c
 }
 
-func (h *hub) publish(ns string) {
+// publish wakes ns's namespace waiters and the waiters of the resources
+// named, or, when all, every resource waiter of ns.
+func (h *hub) publish(ns string, names []string, all bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if c, ok := h.m[ns]; ok {
-		close(c)
+	w, ok := h.m[ns]
+	if !ok {
+		return
+	}
+	if w.log != nil {
+		close(w.log)
+		w.log = nil
+	}
+	if all {
+		for _, c := range w.res {
+			close(c)
+		}
+		w.res = nil
+	} else {
+		for _, name := range names {
+			if c, ok := w.res[name]; ok {
+				close(c)
+				delete(w.res, name)
+			}
+		}
+	}
+	if w.log == nil && len(w.res) == 0 {
 		delete(h.m, ns)
 	}
 }

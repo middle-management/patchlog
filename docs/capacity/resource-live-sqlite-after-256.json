@@ -1,0 +1,26 @@
+{
+  "origin_vmhwm_mb": 71.25,
+  "origin_vmrss_mb": 70.52734375,
+  "profile": "public",
+  "resource_long_poll_writes": {
+    "256": {
+      "long_poll_answers": 256,
+      "long_poll_errors": 0,
+      "origin_cores": 1.4292473168637765,
+      "origin_cpu_seconds": 28.59,
+      "own_write_delivered_ms": 1.227,
+      "write_errors": 0,
+      "writes": {
+        "max_ms": 60.083,
+        "n": 35964,
+        "p50_ms": 6.425,
+        "p95_ms": 19.353,
+        "p99_ms": 22.491,
+        "per_second": 1797.882144235357
+      }
+    },
+    "seconds": 20,
+    "writers": 16
+  },
+  "total_seconds": 22.737608682
+}

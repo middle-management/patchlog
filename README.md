@@ -19,7 +19,7 @@ candidates C.1–C.3 of v0.82, in the Addendum since v0.85), and
 [docs/TESTVECTORS.md](docs/TESTVECTORS.md) points there and records which candidate vectors of
 [docs/VECTORS-PROPOSED.md](docs/VECTORS-PROPOSED.md) the reference confirms (C.4 and C.5,
 v0.85). The
-additions the reference proposes to the spec writer (for §I.25's list, "Still to come", and the
+additions the reference proposes to the spec writer (for §I.26's list, "Still to come", and the
 writer's own: RE2 `\u`, key
 wraps, sealed payloads, blobs and bundles, the plan digest, Biscuit tokens, file renderings and
 more) live in [internal/vectors/testdata](internal/vectors/testdata), each naming the production
@@ -1263,6 +1263,35 @@ body is capped at 16 MiB and 50 files. The demo composes pass
 
 Run it with `./patchlog serve --dev` and open `http://localhost:8080/playground/`. Sealed and e2e
 namespaces need `--master-key FILE --master-key-create`.
+
+#### Playground on GitHub Pages
+
+The same page is published at **https://middle-management.github.io/patchlog/** by
+`.github/workflows/pages.yml` on every push to `main` that touches `internal/playground/static`.
+There it is standalone: it calls the server in the **Server** box of its top bar
+(`http://localhost:8080` until changed; `?server=URL` sets it too and makes a link to share), and
+that server has to allow the page's origin:
+
+```bash
+./patchlog serve --dev --cors-origin https://middle-management.github.io
+```
+
+or, for the compose stack, `PATCHLOG_CORS_ORIGINS=https://middle-management.github.io make up`.
+Until `GET /` answers, the page says so and shows the command for its own origin. Only the
+server's origin counts (the API is at its root), and a server on another port of `localhost` gets
+`--addr` in the suggested command. An HTTPS page can call plain `http://` on `localhost` only;
+any other server needs `https://`. Chrome may ask once whether the page may reach the local
+network.
+
+The page tells the two apart by its path: under `/playground/` it is the server's own and calls
+its origin, with the CSP header above; anywhere else it is standalone. The Pages copy carries the
+CSP as a meta tag, with `connect-src` open to `http:` and `https:` for the server it is pointed at.
+The tree and index proxies, the merge and schema-import planners and `selftest.json`'s vectors
+work as on the server (the vectors are the page's own file), and the namespaces, keys and boxes
+kept in localStorage belong to the Pages origin, shared by every server it is pointed at.
+
+To serve the copy yourself, any static file server will do, e.g. `python3 -m http.server -d
+internal/playground/static 8000` with `--cors-origin http://localhost:8000`.
 
 ### Undo and redo (§11.2)
 
@@ -3849,7 +3878,7 @@ sessions, agents through MCP and recording model calls (J.5–J.7) are not imple
 | `--upstream` | An allowed upstream: a URL prefix (repeatable). An `Upstream-URL` must have the same scheme and host and a path under the prefix's, at a segment boundary; anything else is `403`. No `--upstream` refuses every request. Redirects are not followed: a `3xx` is kept as the stream. |
 | `--flush` | Least time between two appends to one stream (default 200 ms, §J.2 Pace). |
 | `--ttl` | How long read grants live from a stream's creation (default 24 h); a closed stream that old is purged with its continuations (§J.4 Expiry). |
-| `--idle-timeout` | A stream with no append for this long is closed with `"timeout"` (default 2 m). |
+| `--idle-timeout` | A stream with no append for this long is closed with `"timeout"`, by any proxy (default 2 m). The time is the deployment's, one for all its proxies (§J.2 Restarts): give every proxy of `--ns` the same value. Nothing checks that they agree, and with different values the shortest closes every proxy's streams. |
 | `--state` | A file with the names of the streams being written; a proxy started again closes those still open with `"error"` (§J.2 Restarts). Without it they are closed by the idle sweep, with `"timeout"`. |
 | `--segment-size` | The size at which a stream continues in its next resource, where that is below the namespace's `documentSize` (default: `documentSize`). Each append costs the stream's size so far, so where latency matters §J.1 suggests well below it, `--segment-size "256 KiB"` say. |
 | `--max-request-body`, `--max-segments`, `--max-streams` | Largest body forwarded upstream (1 MiB); most resources one response may fill (8); most streams carried at once (64, then `503` with `Retry-After`; requests that arrive together share the count, and a `Request-Key` request for a stream that exists needs no slot). |
@@ -4128,6 +4157,9 @@ patchlog import -i all.jsonl --atomic --ns demo-schemas=demo2-schemas,demo=demo2
   missing ones first, listing the importer's key and allowance; a `401` or `403` on the first
   read of a target namespace says so.
 - **Branches** export with the base's history included, or with `--foreign-parents` naming the base revisions in `requires`.
+  The foreign parent is the resource's head as the branch's own `/heads` lists it at the
+  branch's first `ns_id` (§G.4.1, v0.86): the exporter reads nothing in the base, needs no
+  grant there, and a branch of a remote base (§G.3) exports the same way.
   An e2e branch's documents always export the second way, its keyring aside (v0.82, §G.5.1; see
   E3 under Encryption below).
 - **Blobs** (§G.4.1) travel as blob lines (unpadded base64url; padded is accepted), each
@@ -4189,13 +4221,16 @@ patchlog import --ns secret -i s.plb --identity me.jwk --atomic
   target's keyring must share the bundle's history, else the import is refused at step 1. An
   e2e branch's export writes no line the branch reads through from its base, whose sealed ops
   name the base (v0.82, §G.5.1 Importing): a document continued in the branch starts after its
-  foreign parent, the base's head at `base.at`, named in `requires` (a `requires` before it, or
+  foreign parent, its head as the branch's `/heads` lists it at the branch's first `ns_id`,
+  named in `requires` (a `requires` before it, or
   a foreign parent that isn't in the chain, refuses the document); one the branch never wrote
   is `external`, pinned to its revision; the keyring comes whole, unless the export asks for
   `--foreign-parents`; and a branch of a remote base
-  exports only documents that start with a line of its own. The importer looks a pinned
-  `external` up in the target's chain where an e2e target serves no document by revision, and
-  for a tombstone at any level. Lines
+  exports the same way (v0.86; before, only documents that start with a line of its own). The
+  importer asks the target for a pinned `external` without opening it, so it needs no key of a
+  sealed or e2e target; it looks the pin up in the target's chain where an e2e target serves
+  no document by revision, and for a tombstone at any level; a pin pruned without a kept
+  document is not in the target (§G.4.2, v0.86). Lines
   go in batches per epoch, in epoch order, each epoch's raise of `encryption.epoch` in the batch
   with the keyring line that brings its key (so atomic mode is atomic per epoch); an existing
   target is refused only below the bundle's lowest epoch, or past the epoch of a sealed line it
@@ -4285,6 +4320,13 @@ The last row is the root: paste its path into a document's `$schema` (or another
   `--schema-fetch-hosts`.
 
 ### A short tour (dev mode)
+
+For how a client should cut its writes (small patch sets, gestures, retries, splitting large
+changes), when to work in a branch, and how to merge, squash and rebase, see the client guide
+[.claude/skills/patchlog-client/SKILL.md](.claude/skills/patchlog-client/SKILL.md), with branches and
+merging in [merging.md](.claude/skills/patchlog-client/merging.md) and each command mapped to its HTTP
+requests in [http.md](.claude/skills/patchlog-client/http.md). It is also a
+Claude Code skill: copy the folder into another project's `.claude/skills/` to use it there.
 
 The client commands call the public API (§7) through `internal/client`. Every write is
 conditional (§7.2), and they supply the precondition: `put` and `ns create` send
@@ -4917,7 +4959,13 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   while the read cache's meta counter (configuration, purges, prunes, restores, key destruction;
   on Postgres while the tailer is fresh) hasn't moved, and before the grant's earliest `exp`
   (since v0.78 a rule on `/now` never passes for a read, so it no longer matters here); edge
-  grants and resource long-polls are read on their own, as before. When it was first measured
+  grants and resource long-polls are read on their own, as before. A resource's long-polls and
+  event streams wait on the resource, not the namespace (`Engine.WaitResource`): they are woken
+  by commits naming it (a write, a batch item, a purge or a prune) and by entries that name no
+  resource (configuration changes, branches, namespace purges), not by writes to its other
+  resources. So a client following its own document doesn't read it again on every write to the
+  namespace; on Postgres the tailer wakes by resource too, from the `ns_log` entries it reads
+  ([docs/CAPACITY.md](docs/CAPACITY.md), "Resource followers"). When it was first measured
   ([docs/CAPACITY.md](docs/CAPACITY.md), "Earlier measurements") one write to 5,000 private followers went from 3.7–4.1 s
   of core CPU to 0.3–1 s. The local CDN's VCL lets a long-poll with credentials skip Varnish's
   waiting list (`hash_ignore_busy`), so a private one isn't held behind an identical request in
@@ -4925,7 +4973,12 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
 - **Live reads** (§7.3, §7.7, v0.73). A long-poll without a cursor, or with one behind by an
   hour's worth of intervals or less, is answered at once (`200`, or `204` with the current
   `X-Cursor`); one further behind is `400 bad_input`, which followers and `cmd/capacity` answer
-  by dropping the cursor and polling again. A long-poll or stream of a resource with no entries
+  by dropping the cursor and polling again. Each log's intervals are shifted by a phase drawn from
+  its path (the first 8 bytes of the SHA-256 of `/r/{ns}/{name}/log`, `/ns/{ns}/log` or
+  `/ns/{ns}/g/{gs}/log`, modulo the interval in milliseconds), so the waits of a deployment's
+  logs don't all end at one instant. §7.7 counts every log's from one epoch: `serve
+  --long-poll-fixed-epoch` does that (docs/SPEC-FEEDBACK.md, v0.85 Open 61). Followers of one URL
+  share its boundaries and cursors either way. A long-poll or stream of a resource with no entries
   waits for its first. A stream judges its read check again before each page and keep-alive,
   ends at the latest when the grant or cookie it was admitted under expires, and a namespace
   stream ends after its `purge-ns` event.

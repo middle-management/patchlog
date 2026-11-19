@@ -51,7 +51,9 @@ type Options struct {
 	// 24h).
 	TTL time.Duration
 	// IdleTimeout closes a stream with no append for that long with
-	// "timeout" (J.2; default 2m).
+	// "timeout" (J.2; default 2m). It is the deployment's set time, one
+	// for all the proxies of NS (J.2 Restarts, v0.86): any of them closes
+	// a stream that idle, so each is to be given the same.
 	IdleTimeout time.Duration
 	// SweepInterval is how often Run sweeps the namespace (default a
 	// quarter of the lesser of IdleTimeout and TTL, between 1s and 1m).
@@ -423,6 +425,11 @@ func (p *Proxy) whois(r *http.Request) (caller, int, string) {
 		return caller{}, 401, "the caller's grant can't be verified in namespace " + p.opt.CallerNS
 	case err != nil:
 		return caller{}, 502, "the core could not be asked about the caller's grant"
+	case pi.Operator:
+		// An operator grant authorises creating namespaces and forced
+		// purges, nothing a service does (§C.4 Operator grants, §C.6):
+		// 401, as the core answers one anywhere else.
+		return caller{}, 401, "the caller's grant is an operator grant, which no service accepts (§C.4)"
 	case pi.Sub == "":
 		return caller{}, 401, "the caller's grant names no principal"
 	}

@@ -85,6 +85,12 @@ type Options struct {
 	ReadCacheBytes    int
 	// LongPollInterval is the interval of §7.7 (default 20s).
 	LongPollInterval time.Duration
+	// LongPollFixedEpoch counts every log's long-poll intervals from the
+	// epoch itself, as §7.7 says to as of v0.85. By default each log's are
+	// shifted by a phase drawn from its path (server.logPhase;
+	// docs/SPEC-FEEDBACK.md, v0.85 Open 61), so the waits of a
+	// deployment's many logs don't all end at one instant.
+	LongPollFixedEpoch bool
 	// Now overrides the clock (tests).
 	Now func() time.Time
 	// Purger receives cache-tag purges (§9). Nil logs them.
@@ -336,6 +342,7 @@ type Engine struct {
 	// background loops (pglock.go).
 	epoch      time.Time
 	lastPoll   atomic.Int64
+	tailFrom   atomic.Uint64 // the tailer's position: every xid below it is read (SyncTail)
 	leaderMu   sync.Mutex
 	leaderConn *sql.Conn
 	// afterWriteLock, if set, is called by resource writes and batches
@@ -644,6 +651,10 @@ func (e *Engine) Origin() string { return e.opt.Origin }
 // LongPollInterval is the §7.7 interval.
 func (e *Engine) LongPollInterval() time.Duration { return e.opt.LongPollInterval }
 
+// LongPollFixedEpoch reports whether every log's long-poll intervals start
+// at the epoch itself (Options.LongPollFixedEpoch).
+func (e *Engine) LongPollFixedEpoch() bool { return e.opt.LongPollFixedEpoch }
+
 // Limits are the deployment maximums, which bound request bodies.
 func (e *Engine) Limits() Limits { return e.opt.Maximums }
 
@@ -718,7 +729,11 @@ type tx struct {
 	now    time.Time
 	write  bool
 	notify map[string]bool // namespaces whose logs changed
-	tags   []string        // cache tags to purge after commit
+	// wake are, per namespace in notify, the resources its new entries
+	// name (wakeFor), or nil when one of them concerns the whole
+	// namespace: the live readers to wake after commit.
+	wake map[string]map[string]bool
+	tags []string // cache tags to purge after commit
 	// lastNS is the seq of the last namespace entry this transaction
 	// appended: what a CDN purge it sends is keyed on (repurge.go).
 	lastNS    int64
@@ -925,7 +940,7 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 	if err != nil {
 		return nil, err
 	}
-	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}}
+	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}, wake: map[string]map[string]bool{}}
 	committing := false
 	defer func() {
 		if p := recover(); p != nil {
@@ -1014,7 +1029,12 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 // learn of: the namespaces whose logs moved, and whether what reads may
 // return changed beyond them (readcache.go), with the caches to flush.
 type invalidation struct {
-	nss                                  []string
+	nss []string
+	// res are, per namespace of nss, the resources whose logs moved: their
+	// live readers are woken (hub.publish). A namespace without a key here
+	// wakes every resource reader it has: its change wasn't confined to
+	// named resources, or which ones wasn't learnt.
+	res                                  map[string][]string
 	meta                                 bool
 	flushDocs, flushDEKs, flushEpochKeys bool
 }
@@ -1024,6 +1044,14 @@ func (t *tx) invalidation() invalidation {
 	inv.meta = t.metaChanged || t.flushDocs || t.flushDEKs || t.flushEpochKeys
 	for ns := range t.notify {
 		inv.nss = append(inv.nss, ns)
+		if names, ok := t.wake[ns]; ok && names != nil {
+			if inv.res == nil {
+				inv.res = map[string][]string{}
+			}
+			for name := range names {
+				inv.res[ns] = append(inv.res[ns], name)
+			}
+		}
 	}
 	return inv
 }
@@ -1050,7 +1078,8 @@ func (e *Engine) invalidate(inv invalidation, seen bool) {
 		e.schemaDocs.flush()
 	}
 	for _, ns := range inv.nss {
-		e.hub.publish(ns)
+		names, ok := inv.res[ns]
+		e.hub.publish(ns, names, !ok)
 	}
 }
 
@@ -1344,7 +1373,54 @@ func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targ
 	}
 	n.configSeq = configSeq
 	t.notify[n.name] = true
+	t.wakeFor(n.name, entry)
 	return seq, id
+}
+
+// wakeFor records the resource live readers an entry appended to ns's log
+// wakes after commit (invalidation): those it names, or all of the
+// namespace's for an entry that names none.
+func (t *tx) wakeFor(ns string, entry map[string]any) {
+	names, ok := entryResources(entry)
+	cur, seen := t.wake[ns]
+	switch {
+	case !ok:
+		t.wake[ns] = nil
+		return
+	case seen && cur == nil:
+		return // already the whole namespace
+	case cur == nil:
+		cur = map[string]bool{}
+		t.wake[ns] = cur
+	}
+	for _, name := range names {
+		cur[name] = true
+	}
+}
+
+// entryResources returns the resources whose reads a namespace entry may
+// change: the one a head, tombstone, purge or prune names, or a batch's
+// items'. ok is false for any other entry (config, purge-ns, branch, a
+// batch with a config change): it may change what a read of any of the
+// namespace's resources returns.
+func entryResources(entry map[string]any) (names []string, ok bool) {
+	switch entry["kind"] {
+	case "head", "tombstone", "purge", "prune":
+		name, ok := entry["resource"].(string)
+		return []string{name}, ok
+	case "batch":
+		items, _ := entry["entries"].([]any)
+		for _, it := range items {
+			m, _ := it.(map[string]any)
+			name, ok := m["resource"].(string)
+			if !ok || (m["kind"] != "head" && m["kind"] != "tombstone") {
+				return nil, false
+			}
+			names = append(names, name)
+		}
+		return names, true
+	}
+	return nil, false
 }
 
 // logHeadOf reads n's chain head once its log lock is held, into
@@ -1478,6 +1554,9 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	}
 	n.configSeq = configSeq
 	t.notify[n.name] = true
+	for _, a := range as {
+		t.wakeFor(n.name, a.entry)
+	}
 	return out
 }
 
