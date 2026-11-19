@@ -1,6 +1,7 @@
 package core
 
 import (
+	"database/sql"
 	"slices"
 
 	"github.com/middle-management/patchlog/internal/catvis"
@@ -130,7 +131,9 @@ func gsRecordOf(fv *fview, exp int64) *gsRecord {
 //     than the stored one, counts as differing), or where that key's
 //     entry or one of those roles' definitions differs there in any
 //     member from the one recorded at the exchange (gsEntryDigest,
-//     v0.82), or where the cookie expires no later than those issued
+//     v0.82), or did under any document of {ns} between the exchange's
+//     and cp's, whatever a later one undoes (gsHeldSince, v0.86), or
+//     where the cookie expires no later than those issued
 //     before an exchange replaced that record (entryAfter), so that
 //     another reader's exchange revives none; 403 where it holds
 //     "partial", a set stored before v0.78 that leaves groups out, which
@@ -177,7 +180,7 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 	if rec == nil {
 		return nil, apiErr(401, "unauthenticated", "message", "unknown subject set: exchange the grant again (§B.11.9)")
 	}
-	if !t.gsDigestHolds(n, cp, rec) {
+	if !t.gsDigestHolds(n, cp, rec) || !t.gsHeldSince(n, cp, rec) {
 		return nil, forbidden("the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)")
 	}
 	// A cookie from before an exchange replaced the row's entry digest,
@@ -230,7 +233,11 @@ func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	if !ok {
 		return false
 	}
-	cfg := t.fconfigAt(seq)
+	return t.gsHoldsUnder(n, t.fconfigAt(seq), rec)
+}
+
+// gsHoldsUnder is gsDigestHolds for n's document cfg.
+func (t *tx) gsHoldsUnder(n *nsRow, cfg *Config, rec *gsRecord) bool {
 	key, ok := findKey(t.effectiveKeys(n, cfg), rec.kid)
 	if !ok || !key.Lists("read") || rec.pub == "" || keyPub(key) != rec.pub ||
 		!slices.Contains(rec.subjects, catvis.KeySubject(rec.kid, rec.pub)) {
@@ -252,6 +259,66 @@ func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	}
 	d, ok := grantcheck.ScopeDigest(in)
 	return ok && d == rec.digest
+}
+
+// gsWalk is how many namespace documents back a gs cookie's record is
+// judged (gsHeldSince, gsChangedBefore): a cookie lives 15 minutes at the
+// longest (§C.5.2), and a namespace that wrote more documents than this
+// since an exchange ends its cookies, whose readers exchange again.
+const gsWalk = 64
+
+// gsHeldSince reports whether rec has held under every document of n
+// after the one its exchange recorded it under (rec.conf), up to the one
+// at cp (§B.11.9 gs, v0.86: "Once an entry after its exchange changes
+// one of them, the cookie is 403 from that entry on, even where a later
+// entry undoes the change"; CONFORMANCE Access 145). gsDigestHolds judges
+// the document at cp alone, which a change made and undone gives back.
+// Each config entry is judged as a whole, so two changes in one batch,
+// which leave the key's entry as it was, end nothing. A checkpoint at or
+// before the exchange's document has none to judge. It fails closed for
+// a row from before conf was kept, and where more than gsWalk documents
+// lie between.
+//
+// A read at the exchange's own document, the usual one, costs the lookup
+// of the checkpoint's ns_config seq and no more.
+func (t *tx) gsHeldSince(n *nsRow, cp *fcp, rec *gsRecord) bool {
+	seq, ok := cp.seqs[n.name]
+	if !ok || rec.conf == 0 {
+		return false
+	}
+	c := t.fconfigSeqAt(seq)
+	for i := 0; c > rec.conf; i++ {
+		if i == gsWalk || !t.gsHoldsUnder(n, t.config(c), rec) {
+			return false
+		}
+		c = t.configParent(c)
+	}
+	return true
+}
+
+// gsChangedBefore is the ns_config seq of the latest document of n, at or
+// before r.conf, under which r doesn't hold: a cookie whose row was
+// recorded under an earlier document is one a change has ended, whatever
+// later documents undo (recordFilteredGS). 0 if r held under every
+// document of n. Past gsWalk documents back it is the last one looked
+// at, which ends the cookies from before it, as gsHeldSince does.
+func (t *tx) gsChangedBefore(n *nsRow, r *gsRecord) int64 {
+	c := r.conf
+	for i := 0; c > 0; i++ {
+		if i == gsWalk || !t.gsHoldsUnder(n, t.config(c), r) {
+			return c
+		}
+		c = t.configParent(c)
+	}
+	return 0
+}
+
+// configParent is the ns_config seq of the document before the one at
+// seq in its namespace's chain, 0 for the first.
+func (t *tx) configParent(seq int64) int64 {
+	var p sql.NullInt64
+	t.must(t.QueryRow(`SELECT parent_seq FROM ns_config WHERE seq = ?`, seq).Scan(&p))
+	return p.Int64
 }
 
 // gsEntryDigest is §B.11.9 gs's EntryDigest of the key named kid and of

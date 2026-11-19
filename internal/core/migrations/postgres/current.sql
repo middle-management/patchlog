@@ -15,3 +15,12 @@
 -- order ("https://a/x" is after "https://a.b/x").
 CREATE INDEX IF NOT EXISTS namespaces_base_c ON namespaces (base, name COLLATE "C");
 CREATE INDEX IF NOT EXISTS remote_branches_key ON remote_branches (ns, ((origin || '/' || name) COLLATE "C"));
+
+-- Filtered namespace reads (§B.11.9 gs, filtered_admit.go; v0.86): "Once
+-- an entry after its exchange changes one of them, the cookie is 403 from
+-- that entry on, even where a later entry undoes the change." conf is the
+-- ns_config row of {ns} under which the exchange recorded the row's entry
+-- digest: a cookie is judged at every namespace document between it and
+-- the one at the answer's checkpoint, not at the checkpoint's alone. 0, a
+-- row from before it was kept, never holds.
+ALTER TABLE filtered_gs ADD COLUMN conf bigint NOT NULL DEFAULT 0;

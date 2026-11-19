@@ -162,8 +162,12 @@ func (t *tx) fsTrust(root *nsRow, doc map[string]any) []fsCat {
 }
 
 // fconfigAt is the namespace document in force after the ns_log entry seq.
-func (t *tx) fconfigAt(seq int64) *Config {
+func (t *tx) fconfigAt(seq int64) *Config { return t.config(t.fconfigSeqAt(seq)) }
+
+// fconfigSeqAt is the ns_config seq of the namespace document in force
+// after the ns_log entry seq.
+func (t *tx) fconfigSeqAt(seq int64) int64 {
 	var cseq int64
 	t.must(t.QueryRow(`SELECT config_seq FROM ns_log WHERE seq = ?`, seq).Scan(&cseq))
-	return t.config(cseq)
+	return cseq
 }

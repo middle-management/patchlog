@@ -217,8 +217,16 @@ type gsRecord struct {
 	// told from one, and is 403 (§B.11.9 gs, "until the reader exchanges
 	// again"; recordFilteredGS). Only the upsert writes it.
 	entryAfter int64
-	filter     string // grantcheck.ReadFilter.Encode
-	exp        int64  // Unix seconds: the latest expiry of its cookies
+	// conf is the ns_config seq of {ns}'s document the exchange computed
+	// entry under, in its read snapshot: a cookie is held to every
+	// document of {ns} after it up to the one at the answer's checkpoint
+	// (§B.11.9 gs, v0.86: "Once an entry after its exchange changes one
+	// of them, the cookie is 403 from that entry on, even where a later
+	// entry undoes the change"; gsHeldSince). 0 (a row from before it
+	// was kept) never holds.
+	conf   int64
+	filter string // grantcheck.ReadFilter.Encode
+	exp    int64  // Unix seconds: the latest expiry of its cookies
 }
 
 // recordFilteredGS records r in filtered_gs, in a short write transaction
@@ -243,6 +251,20 @@ type gsRecord struct {
 // digests their kid, pub and read roles by name (grantcheck.ScopeDigest),
 // which are what the entry digest is over, so only a changed document
 // replaces it.
+//
+// A change made and undone gives the entry digest it had (v0.86): a row
+// recorded before the change and one recorded after the undo carry the
+// same entry, and the cookies from before stay ended all the same. Each
+// is refused by itself while the row stands, judged at every document
+// since the row's conf (gsHeldSince). When a later exchange moves conf
+// past a document under which the record doesn't hold, the row's exp
+// goes to entry_after exactly as when the entry is replaced: the row's
+// conf is then below changedAt, the latest such document at or before
+// r.conf (gsChangedBefore), which is a fact of {ns}'s history alone, so
+// the upsert stays one statement and needs no lock. conf always becomes
+// the exchange's own: an exchange that read {ns} before a change and
+// records after it leaves a row that the change, at a later document,
+// ends for every cookie under it.
 func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 	subjects := make([]any, len(r.subjects))
 	for i, s := range r.subjects {
@@ -253,12 +275,12 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 		roles[i] = s
 	}
 	enc := func(v any) string { return string(jsonv.Canonical(jsonv.FromGo(v))) }
-	q := `INSERT INTO filtered_gs (gs, ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, entry, filter, exp)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	q := `INSERT INTO filtered_gs (gs, ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, entry, conf, filter, exp)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (ns, gs) DO UPDATE SET subjects = excluded.subjects, partial = excluded.partial,
 			kid = excluded.kid, pub = excluded.pub, roles = excluded.roles, block_rules = excluded.block_rules, read_scope = excluded.read_scope,
-			principal = excluded.principal, digest = excluded.digest, entry = excluded.entry, filter = excluded.filter,
-			entry_after = CASE WHEN filtered_gs.entry <> excluded.entry THEN GRT(filtered_gs.entry_after, filtered_gs.exp) ELSE filtered_gs.entry_after END,
+			principal = excluded.principal, digest = excluded.digest, entry = excluded.entry, conf = excluded.conf, filter = excluded.filter,
+			entry_after = CASE WHEN filtered_gs.entry <> excluded.entry OR filtered_gs.conf < ? THEN GRT(filtered_gs.entry_after, filtered_gs.exp) ELSE filtered_gs.entry_after END,
 			exp = GRT(filtered_gs.exp, excluded.exp)`
 	if e.pg {
 		q = strings.ReplaceAll(q, "GRT(", "GREATEST(")
@@ -269,8 +291,15 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 		if _, err := t.Exec(`DELETE FROM filtered_gs WHERE exp <= ? OR ns IN (SELECT name FROM namespaces WHERE purged <> 0)`, t.now.Unix()); err != nil {
 			return err
 		}
+		// {ns}'s documents are read without its lock: they only append.
+		t.noLock++
+		changedAt := r.conf // no namespace: every earlier row counts as changed
+		if n := t.nsByName(r.ns); n != nil {
+			changedAt = t.gsChangedBefore(n, r)
+		}
+		t.noLock--
 		_, err := t.Exec(q, r.gs, r.ns, enc(subjects), boolInt(r.partial), r.kid, r.pub, enc(roles), enc(nonNilRules(r.blockRules)),
-			boolInt(r.readScope), enc(r.principal), r.digest, r.entry, r.filter, r.exp)
+			boolInt(r.readScope), enc(r.principal), r.digest, r.entry, r.conf, r.filter, r.exp, changedAt)
 		return err
 	})
 }
@@ -297,8 +326,8 @@ func (t *tx) loadGS(ns, gs string) *gsRecord {
 	r := &gsRecord{gs: gs}
 	var subjects, roles, blockRules, principal string
 	var partial, readScope int64
-	err := t.QueryRow(`SELECT ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, entry, entry_after, filter, exp FROM filtered_gs WHERE ns = ? AND gs = ?`, ns, gs).
-		Scan(&r.ns, &subjects, &partial, &r.kid, &r.pub, &roles, &blockRules, &readScope, &principal, &r.digest, &r.entry, &r.entryAfter, &r.filter, &r.exp)
+	err := t.QueryRow(`SELECT ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, entry, entry_after, conf, filter, exp FROM filtered_gs WHERE ns = ? AND gs = ?`, ns, gs).
+		Scan(&r.ns, &subjects, &partial, &r.kid, &r.pub, &roles, &blockRules, &readScope, &principal, &r.digest, &r.entry, &r.entryAfter, &r.conf, &r.filter, &r.exp)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}

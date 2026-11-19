@@ -53,7 +53,12 @@ func (t *tx) filteredEdgeGrant(n *nsRow, fs *fscope, a *actor, exp time.Time) (*
 	// The record keeps the digest of the key's entry and the read roles'
 	// definitions as of the checkpoint the view is at, which every read
 	// under the cookie compares (§B.11.9 gs, gsDigestHolds).
+	// It keeps that document's ns_config seq too: the cookie is held to
+	// every document of {ns} after it (gsHeldSince, v0.86). Both are of
+	// this read snapshot, so a change that commits before the record is
+	// written is one after the exchange.
 	rec := gsRecordOf(fv, until.Unix())
-	rec.entry = t.gsEntryDigest(n, t.fconfigAt(fv.cp.seqs[n.name]), rec.kid, rec.roles)
+	rec.conf = t.fconfigSeqAt(fv.cp.seqs[n.name])
+	rec.entry = t.gsEntryDigest(n, t.config(rec.conf), rec.kid, rec.roles)
 	return &edgeIssue{gs: fv.gs, rec: rec, bucket: a.bucketKey}, nil
 }
