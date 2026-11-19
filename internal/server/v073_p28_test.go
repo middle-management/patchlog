@@ -26,7 +26,7 @@ func p28AfterBoundary(interval time.Duration) {
 func p28Cursor(interval time.Duration) int64 { return time.Now().UnixNano() / int64(interval) }
 
 // p28LongPollEnv is a namespace with one resource, for the long-poll
-// cursor tests, with helpers that check an answer came at once and what
+// cursor tests, its intervals counted from the epoch itself (withFixedEpoch), with helpers that check an answer came at once and what
 // its cursor is.
 //
 // atOnce builds its request's path from the cursor of the instant it is
@@ -36,7 +36,7 @@ func p28Cursor(interval time.Duration) int64 { return time.Now().UnixNano() / in
 // interval left when it is sent and the answer due within half of it, the
 // server judges the request in the interval its path was built in.
 func p28LongPollEnv(t *testing.T, interval time.Duration) (e *tenv, r1, head string, atOnce func(what string, path func(cur int64) string) (*resp, int64), cursorIs func(what string, r *resp, want int64)) {
-	e = newEnv(t, withLongPoll(interval))
+	e = newEnv(t, withLongPoll(interval), withFixedEpoch)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	r1 = e.create("docs", "a", map[string]any{"n": 1.0})
 	head = e.nsHead("docs")
@@ -156,7 +156,7 @@ func TestV073P28JudgeCursor(t *testing.T) {
 		{"ahead by more", last, k + hour + 1, true},
 		{"zero", start, 0, true},
 	} {
-		cur, err := judgeCursor(c.now, interval, c.cursor)
+		cur, err := judgeCursor(c.now, liveClock{interval: interval}, c.cursor)
 		if want := c.now.UnixNano() / int64(interval); cur != want {
 			t.Errorf("%s: current %d, want %d", c.what, cur, want)
 		}
@@ -172,7 +172,7 @@ func TestV073P28JudgeCursor(t *testing.T) {
 // 404 (short) stays, and a grant that may not read the resource gets 404.
 func TestV073P28LongPollNoEntries(t *testing.T) {
 	const interval = 20 * time.Second
-	e := newEnv(t, withLongPoll(interval), withFileDB(t))
+	e := newEnv(t, withLongPoll(interval), withFileDB(t), withFixedEpoch)
 	e.mkNS("docs", map[string]any{"read": "public"})
 
 	// No cursor: 204 at once, without X-Revision.
@@ -219,7 +219,7 @@ func TestV073P28LongPollNoEntries(t *testing.T) {
 	expect(t, e.get("/r/docs/none/log?since="+g+"&live=long-poll"), 404)
 
 	// A grant that may not read the resource: 404, not a wait.
-	a := newAuthEnv(t, withLongPoll(interval))
+	a := newAuthEnv(t, withLongPoll(interval), withFixedEpoch)
 	k := newKey("k")
 	a.mkNS("p", map[string]any{"keys": []any{k.entry("*")}})
 	other := a.grant(k, "bob", []string{"p"}, []string{"read"}, map[string]any{

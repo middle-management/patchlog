@@ -18,7 +18,10 @@ import (
 //     from = that xmin. Every transaction below xmin has committed or
 //     aborted, so none is skipped however long it ran (ids are assigned
 //     before commit, so sequence numbers would be). For each namespace in
-//     them it wakes the live readers (long-polls and SSE, §7.7) and moves
+//     them it wakes the live readers (long-polls and SSE, §7.7): those of
+//     the namespace, and those of the resources its entries name, or all
+//     of its resource readers for an entry that names none (as a local
+//     commit does, entryResources); and it moves
 //     the read cache's counter of that namespace; entries that change what
 //     reads may return (config, purge, purge-ns, prune, branch) also count
 //     as below;
@@ -52,6 +55,9 @@ func (e *Engine) tailStart(ctx context.Context) (tailState, error) {
 		return s, err
 	}
 	s.from, err = strconv.ParseUint(xmin, 10, 64)
+	if err == nil {
+		e.tailFrom.Store(s.from)
+	}
 	return s, err
 }
 
@@ -59,6 +65,13 @@ func (e *Engine) tailStart(ctx context.Context) (tailState, error) {
 // the namespace's log (nsKindNames: purge, config, purge-ns, branch, prune).
 // A batch with a config change is caught by cache_gen.
 const metaKinds = `2, 3, 5, 6, 7`
+
+// resourceKinds are the ns_log kinds that name one resource, by res (head,
+// tombstone, purge, prune); batchKind names its items in its body.
+const (
+	resourceKinds = `0, 1, 2, 7`
+	batchKind     = `4`
+)
 
 // tailPoll reads what committed since s and applies it.
 func (e *Engine) tailPoll(ctx context.Context, s *tailState) error {
@@ -78,26 +91,61 @@ func (e *Engine) tailPoll(ctx context.Context, s *tailState) error {
 	}
 	inv := invalidation{}
 	if to > s.from {
-		rows, err := tx.Query(`SELECT n.name, bool_or(l.kind IN (`+metaKinds+`))
+		// One row per entry, or per item of a batch: its namespace, whether
+		// it changes what reads return beyond the log, and the resource it
+		// names, or NULL for an entry that concerns the whole namespace
+		// (entryResources): a write, purge or prune names its resource by
+		// res; a batch's items by name in its body, its only entries whose
+		// body is read here.
+		rows, err := tx.Query(`SELECT n.name, l.kind IN (`+metaKinds+`),
+				CASE WHEN l.kind IN (`+resourceKinds+`) THEN r.name
+					WHEN l.kind = `+batchKind+` AND e->>'kind' IN ('head', 'tombstone') THEN e->>'resource' END
 			FROM ns_log l JOIN namespaces n ON n.ns = l.ns
-			WHERE l.xid >= $1::text::xid8 AND l.xid < $2::text::xid8 GROUP BY n.name`,
+			LEFT JOIN resources r ON r.res = l.res
+			LEFT JOIN LATERAL jsonb_array_elements(CASE WHEN l.kind = `+batchKind+` THEN l.body::jsonb->'entries' END) e ON true
+			WHERE l.xid >= $1::text::xid8 AND l.xid < $2::text::xid8`,
 			strconv.FormatUint(s.from, 10), xmin)
 		if err != nil {
 			return err
 		}
+		wake := map[string]map[string]bool{} // as tx.wake
 		for rows.Next() {
 			var name string
 			var meta bool
-			if err := rows.Scan(&name, &meta); err != nil {
+			var res sql.NullString
+			if err := rows.Scan(&name, &meta, &res); err != nil {
 				rows.Close()
 				return err
 			}
-			inv.nss = append(inv.nss, name)
 			inv.meta = inv.meta || meta
+			cur, seen := wake[name]
+			if !seen {
+				inv.nss = append(inv.nss, name)
+			}
+			switch {
+			case !res.Valid:
+				wake[name] = nil
+			case seen && cur == nil:
+			case cur == nil:
+				wake[name] = map[string]bool{res.String: true}
+			default:
+				cur[res.String] = true
+			}
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return err
+		}
+		for ns, names := range wake {
+			if names == nil {
+				continue
+			}
+			if inv.res == nil {
+				inv.res = map[string][]string{}
+			}
+			for name := range names {
+				inv.res[ns] = append(inv.res[ns], name)
+			}
 		}
 	}
 	if gen != s.gen {
@@ -110,6 +158,34 @@ func (e *Engine) tailPoll(ctx context.Context, s *tailState) error {
 		e.invalidate(inv, true)
 	}
 	s.from, s.gen = max(s.from, to), gen
+	e.tailFrom.Store(s.from)
+	return nil
+}
+
+// SyncTail waits until the tailer has read every transaction committed
+// before the call, so the wake-ups and cache invalidations for them have
+// been applied, or ctx ends. The tailer reads up to the oldest transaction
+// still running anywhere in the cluster (tailPoll), so a long one, in any
+// database, delays it. Without a tailer (SQLite) it returns at once.
+func (e *Engine) SyncTail(ctx context.Context) error {
+	if !e.pg {
+		return nil
+	}
+	var xmax string
+	if err := e.db.QueryRowContext(ctx, `SELECT pg_snapshot_xmax(pg_current_snapshot())::text`).Scan(&xmax); err != nil {
+		return err
+	}
+	want, err := strconv.ParseUint(xmax, 10, 64)
+	if err != nil {
+		return err
+	}
+	for e.tailFrom.Load() < want {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(e.opt.TailInterval / 4):
+		}
+	}
 	return nil
 }
 

@@ -4949,7 +4949,13 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   while the read cache's meta counter (configuration, purges, prunes, restores, key destruction;
   on Postgres while the tailer is fresh) hasn't moved, and before the grant's earliest `exp`
   (since v0.78 a rule on `/now` never passes for a read, so it no longer matters here); edge
-  grants and resource long-polls are read on their own, as before. When it was first measured
+  grants and resource long-polls are read on their own, as before. A resource's long-polls and
+  event streams wait on the resource, not the namespace (`Engine.WaitResource`): they are woken
+  by commits naming it (a write, a batch item, a purge or a prune) and by entries that name no
+  resource (configuration changes, branches, namespace purges), not by writes to its other
+  resources. So a client following its own document doesn't read it again on every write to the
+  namespace; on Postgres the tailer wakes by resource too, from the `ns_log` entries it reads
+  ([docs/CAPACITY.md](docs/CAPACITY.md), "Resource followers"). When it was first measured
   ([docs/CAPACITY.md](docs/CAPACITY.md), "Earlier measurements") one write to 5,000 private followers went from 3.7–4.1 s
   of core CPU to 0.3–1 s. The local CDN's VCL lets a long-poll with credentials skip Varnish's
   waiting list (`hash_ignore_busy`), so a private one isn't held behind an identical request in
@@ -4957,7 +4963,12 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
 - **Live reads** (§7.3, §7.7, v0.73). A long-poll without a cursor, or with one behind by an
   hour's worth of intervals or less, is answered at once (`200`, or `204` with the current
   `X-Cursor`); one further behind is `400 bad_input`, which followers and `cmd/capacity` answer
-  by dropping the cursor and polling again. A long-poll or stream of a resource with no entries
+  by dropping the cursor and polling again. Each log's intervals are shifted by a phase drawn from
+  its path (the first 8 bytes of the SHA-256 of `/r/{ns}/{name}/log`, `/ns/{ns}/log` or
+  `/ns/{ns}/g/{gs}/log`, modulo the interval in milliseconds), so the waits of a deployment's
+  logs don't all end at one instant. §7.7 counts every log's from one epoch: `serve
+  --long-poll-fixed-epoch` does that (docs/SPEC-FEEDBACK.md, v0.85 Open 61). Followers of one URL
+  share its boundaries and cursors either way. A long-poll or stream of a resource with no entries
   waits for its first. A stream judges its read check again before each page and keep-alive,
   ends at the latest when the grant or cookie it was admitted under expires, and a namespace
   stream ends after its `purge-ns` event.
