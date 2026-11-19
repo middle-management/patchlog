@@ -249,3 +249,59 @@ func TestV086StepOneRunOutOtherWrites(t *testing.T) {
 	expectSteps(t, prune("user:pr"))
 	expectCode(t, prune("user:pr"), 429, "rate")
 }
+
+// Step-1 run-outs of writes that are exempt from the rate limits (§6.6
+// Exempt), which the text doesn't single out: exempt stays exempt, so a
+// purge and a config write under a * key that run out are 422 however
+// often, never 429; and ?force=1 under a grant that can't force, another
+// check of step 1, is 403 ahead of the 422.
+func TestV086StepOneRunOutExempt(t *testing.T) {
+	t.Parallel()
+	f, mint := stepOneFixture(t)
+	e := f.tenv
+	head := e.create("sec", "doc", map[string]any{}, f.adminG)
+	slow := map[string]any{"rules": []any{slowName()}}
+	purger := narrowed(t, mint("user:pg", "read", "purge"), slow)
+	for i := 0; i < 4; i++ {
+		expectSteps(t, e.purge("sec", "doc", head, purger))
+		expectCode(t, e.do(req{method: "POST", path: "/r/sec/doc/purge?force=1", ifMatch: head, bearer: purger}), 403, "forbidden")
+	}
+
+	star, err := grant.Decode(e.grant(f.admin, "user:star", []string{"sec"}, allVerbs), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slowStar := narrowed(t, star, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/principal", "schema": doubling(30)}}})
+	for i := 0; i < 4; i++ {
+		expectSteps(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: e.configID("sec", f.adminG), body: ops(op("add", "/x-note", "n")), bearer: slowStar}))
+	}
+}
+
+// §6.6 Validation work, §C.2 Unrestricted read, conformance scenario 92:
+// POST /ns/{ns}/branches with an unrestricted-read check whose role rule
+// runs out of validationSteps is 403, as for a role that can't read,
+// drawing nothing: never the write's 422 and never 429.
+func TestV086BranchReadCheckRunsOut(t *testing.T) {
+	t.Parallel()
+	f, _ := stepOneFixture(t)
+	e := f.tenv
+	rule := map[string]any{"op": "test", "path": "/principal", "schema": doubling(30)}
+	expect(t, e.patchNS("sec", ops(op("add", "/roles/brancher", map[string]any{"can": []any{"read", "branch"}, "rules": []any{rule}}),
+		op("add", "/roles/quick", map[string]any{"can": []any{"read", "branch"}, "rules": []any{map[string]any{"op": "test", "path": "/principal", "schema": doubling(4)}}})), f.adminG), 201)
+	with := func(role string) string {
+		g, err := grant.Mint(map[string]any{"kid": "issuer", "sub": "user:br", "ns": []any{"sec", "sec-b"}, "roles": []any{role},
+			"exp": e.clock.Now().Add(time.Hour).Format(time.RFC3339)}, f.issuer.priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return g.Encode()
+	}
+	branch := func(g string) *resp {
+		return e.do(req{method: "POST", path: "/ns/sec/branches", ifNoneMatch: "*", bearer: g, body: map[string]any{"name": "sec-b", "patches": []any{}}})
+	}
+	for i := 0; i < 4; i++ {
+		expectCode(t, branch(with("brancher")), 403, "forbidden")
+	}
+	// The same shape within the budget branches.
+	expect(t, branch(with("quick")), 201)
+}

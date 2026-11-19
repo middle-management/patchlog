@@ -353,6 +353,8 @@ func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any
 // §C.2 item 4). A batch runs each half for every item before the next
 // (checkItems).
 func (t *tx) checkRules(cfg *Config, a *actor, env map[string]any, isConfig bool) *Error {
+	// Never without a meter: no rule's schema test is unbounded (§6.6).
+	defer t.metered(nil)()
 	if err := t.checkGrantRules(a, env, nil); err != nil {
 		return err
 	}
@@ -364,6 +366,7 @@ func (t *tx) checkRules(cfg *Config, a *actor, env map[string]any, isConfig bool
 // envelope members unknown names are hidden (grantRulesMode). Their schema
 // tests draw on the write's meter (t.meter).
 func (t *tx) checkGrantRules(a *actor, env map[string]any, unknown []string) *Error {
+	defer t.metered(nil)()
 	verb := env["action"].(string)
 	if a.verified != nil {
 		if ok, _ := a.verified.Allows(verb); !ok {
