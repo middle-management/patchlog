@@ -132,10 +132,9 @@ func gsRecordOf(fv *fview, exp int64) *gsRecord {
 //     entry or one of those roles' definitions differs there in any
 //     member from the one recorded at the exchange (gsEntryDigest,
 //     v0.82), or did under any document of {ns} between the exchange's
-//     and cp's, whatever a later one undoes (gsHeldSince, v0.86), or
-//     where the cookie expires no later than those issued
-//     before an exchange replaced that record (entryAfter), so that
-//     another reader's exchange revives none; 403 where it holds
+//     and cp's, whatever a later one undoes (gsHeldSince, v0.86), the
+//     entry and the exchange's document being those of the cookie's own
+//     exp (filtered_gs_exps), so that another exchange revives none; 403 where it holds
 //     "partial", a set stored before v0.78 that leaves groups out, which
 //     no gs does now (§B.11.5, §B.11.9 gs), whatever the catalogs decide;
 //     otherwise item 1 from the stored subjects and item 2 from the
@@ -180,14 +179,18 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 	if rec == nil {
 		return nil, apiErr(401, "unauthenticated", "message", "unknown subject set: exchange the grant again (§B.11.9)")
 	}
-	if !t.gsDigestHolds(n, cp, rec) || !t.gsHeldSince(n, cp, rec) {
-		return nil, forbidden("the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)")
+	// The cookie is judged from the row of its own exp, the entry digest
+	// and document its exchanges recorded (recordFilteredGS): one whose
+	// row a change ended stays ended whoever exchanged since. A cookie
+	// with no row, one from before rows were kept or without an expiry,
+	// which the server never mints, is refused. A cookie for /ns/{ns} is
+	// held to it as a cookie for urlGS would be.
+	slot, ok := gsSlot{}, false
+	if !eg.Exp.IsZero() {
+		slot, ok = t.loadGSSlot(n.name, urlGS, eg.Exp.Unix())
 	}
-	// A cookie from before an exchange replaced the row's entry digest,
-	// or one that can't be told from such a one, stays ended whoever
-	// exchanged since (recordFilteredGS). A cookie for /ns/{ns} is held
-	// to it as a cookie for urlGS would be.
-	if rec.entryAfter > 0 && (eg.Exp.IsZero() || eg.Exp.Unix() <= rec.entryAfter) {
+	rec.entry, rec.conf = slot.entry, slot.conf
+	if !ok || !t.gsDigestHolds(n, cp, rec) || !t.gsHeldSince(n, cp, rec) {
 		return nil, forbidden("the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)")
 	}
 	if rec.partial || slices.Contains(rec.subjects, catvis.Partial) {
@@ -262,7 +265,7 @@ func (t *tx) gsHoldsUnder(n *nsRow, cfg *Config, rec *gsRecord) bool {
 }
 
 // gsWalk is how many namespace documents back a gs cookie's record is
-// judged (gsHeldSince, gsChangedBefore): a cookie lives 15 minutes at the
+// judged (gsHeldSince, gsShares): a cookie lives 15 minutes at the
 // longest (§C.5.2), and a namespace that wrote more documents than this
 // since an exchange ends its cookies, whose readers exchange again.
 const gsWalk = 64
@@ -296,21 +299,39 @@ func (t *tx) gsHeldSince(n *nsRow, cp *fcp, rec *gsRecord) bool {
 	return true
 }
 
-// gsChangedBefore is the ns_config seq of the latest document of n, at or
-// before r.conf, under which r doesn't hold: a cookie whose row was
-// recorded under an earlier document is one a change has ended, whatever
-// later documents undo (recordFilteredGS). 0 if r held under every
-// document of n. Past gsWalk documents back it is the last one looked
-// at, which ends the cookies from before it, as gsHeldSince does.
-func (t *tx) gsChangedBefore(n *nsRow, r *gsRecord) int64 {
-	c := r.conf
-	for i := 0; c > 0; i++ {
-		if i == gsWalk || !t.gsHoldsUnder(n, t.config(c), r) {
-			return c
+// gsShares returns the test of whether r's exchange may share the row s
+// of the cookies expiring at one second (recordFilteredGS): the same
+// entry digest, and r holding under every document of n after the
+// earlier of the two documents up to the later, so that neither cookie's
+// verdict at any checkpoint depends on which of the two the row keeps.
+// It fails closed where more than gsWalk documents lie between, for a
+// row or record without a document, and for a namespace that is gone.
+func (t *tx) gsShares(n *nsRow, r *gsRecord) func(s gsSlot) bool {
+	holds := map[int64]bool{}
+	held := func(from, to int64) bool {
+		c := to
+		for i := 0; c > from; i++ {
+			if i == gsWalk {
+				return false
+			}
+			h, ok := holds[c]
+			if !ok {
+				h = t.gsHoldsUnder(n, t.config(c), r)
+				holds[c] = h
+			}
+			if !h {
+				return false
+			}
+			c = t.configParent(c)
 		}
-		c = t.configParent(c)
+		return true
 	}
-	return 0
+	return func(s gsSlot) bool {
+		if n == nil || s.entry != r.entry || s.entry == "" || s.conf == 0 || r.conf == 0 {
+			return false
+		}
+		return held(min(s.conf, r.conf), max(s.conf, r.conf))
+	}
 }
 
 // configParent is the ns_config seq of the document before the one at

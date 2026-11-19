@@ -76,7 +76,7 @@ func (s *Server) edgeGrants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	res, err := s.e.IssueEdgeGrants(r.Context(), bearers)
+	res, err := s.e.IssueEdgeGrantsWithin(r.Context(), bearers, s.cookies.MaxTTL())
 	if err != nil {
 		writeErr(w, err)
 		return

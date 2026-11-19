@@ -108,6 +108,18 @@ func (e *Engine) EdgeGrantsOffered() error {
 // exchanged, as they would follow "Bearer " (§C.5.2). None is 401; the
 // server keeps their number within MaxEdgeGrants.
 func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGrants, error) {
+	return e.IssueEdgeGrantsWithin(ctx, bearers, maxEdgeTTL)
+}
+
+// IssueEdgeGrantsWithin is IssueEdgeGrants for a server whose edge grants
+// live ttl at the longest, at most a quarter of an hour (§C.5.2). The
+// cookie of a partial reader's subject set expires at the second its
+// edge grant's Exp names, which a read under it is judged by (§B.11.9
+// gs, recordFilteredGS), so that second is within ttl.
+func (e *Engine) IssueEdgeGrantsWithin(ctx context.Context, bearers []string, ttl time.Duration) (*EdgeGrants, error) {
+	if ttl <= 0 || ttl > maxEdgeTTL {
+		ttl = maxEdgeTTL
+	}
 	if err := e.EdgeGrantsOffered(); err != nil {
 		return nil, err
 	}
@@ -187,9 +199,20 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 	}
 	// A partial reader's subject sets are recorded before their cookies
 	// are set, so every instance judges them (§B.11.9 gs).
+	// Each takes the second its cookie expires at, at or before the one
+	// the exchange would give it, which its edge grant then carries
+	// (§C.5.2: whole seconds off, so that cookies that must be told
+	// apart differ in exp; 503 behind where none is left).
+	latest := out.Now.Add(ttl).Unix()
 	for _, rec := range col.recs {
+		rec.exp = min(rec.exp, latest)
 		if err := e.recordFilteredGS(ctx, rec); err != nil {
 			return nil, err
+		}
+		for i, g := range out.Grants {
+			if g.NS == rec.ns && g.GS == rec.gs {
+				out.Grants[i].Exp = time.Unix(rec.exp, 0)
+			}
 		}
 	}
 	return out, nil

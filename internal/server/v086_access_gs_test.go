@@ -15,7 +15,8 @@ func TestV086FilteredCookieStaysEnded(t *testing.T) {
 	t.Parallel()
 	w := newV75s(t, v75sOpts{})
 	w.seed([]string{"derby"}, nil, []string{"derby"})
-	c, gs := w.cookie(w.li())
+	g := w.li()
+	c, gs := w.cookie(g)
 	base := "/ns/matches/g/" + gs
 	// paths are the reads at the current at, which li's grant names.
 	paths := func() []string {
@@ -55,12 +56,16 @@ func TestV086FilteredCookieStaysEnded(t *testing.T) {
 	expect(t, w.patchNS("matches", ops(op("remove", "/keys/1/groups")), w.admin), 201)
 	refused("after the change was undone", old)
 
-	// She exchanges again: the new cookie reads at the later at, and the
-	// old one stays ended.
-	w.clock.Advance(time.Second)
-	c2, gs2 := w.cookie(w.li())
+	// She exchanges again, the same grant in the same second: the new
+	// cookie expires a second before the ended one, to be told apart
+	// from it (§C.5.2), and reads at the later at; the old one stays
+	// ended.
+	c2, gs2 := w.cookie(g)
 	if gs2 != gs {
 		t.Fatalf("gs after the undo %s, was %s", gs2, gs)
+	}
+	if !c2.Expires.Equal(c.Expires.Add(-time.Second)) {
+		t.Fatalf("the new cookie expires %v, the ended one %v: want a second earlier", c2.Expires, c.Expires)
 	}
 	fresh := cookieHdr(c2)
 	_, at = w.filtered(w.li())

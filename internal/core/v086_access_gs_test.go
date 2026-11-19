@@ -79,9 +79,9 @@ func TestV086AccessGSChangeUndone(t *testing.T) {
 
 // The same where another reader of the same gs, not li, exchanges after
 // the undo: the row's entry digest is the one li's exchange recorded, so
-// nothing replaces it, and li's cookie from before the change stays
-// ended all the same (recordFilteredGS: the row's conf is below a
-// document the record doesn't hold under).
+// its exchange can't share the record of li's cookie's second, a
+// document between the two not holding, and li's cookie from before the
+// change stays ended all the same (recordFilteredGS, gsShares).
 func TestV086AccessGSChangeUndoneOtherExchanges(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -134,25 +134,9 @@ func TestV086AccessGSExchangeAcrossChange(t *testing.T) {
 	w := newV75World(t, v75Opts{})
 	w.seed()
 	ctx := context.Background()
-	// What an exchange reads, without recording it.
-	var rec *gsRecord
-	li := w.li()
-	if err := w.e.read(ctx, func(t2 *tx) error {
-		n := t2.nsByName("matches")
-		a, _, _, err := t2.nsAccess(n, li)
-		if err != nil {
-			return err
-		}
-		// Its cookie ends before one from a later exchange does.
-		iss, err := t2.filteredEdgeGrant(n, t2.filteredScope(n), a, w.now().Add(5*time.Minute))
-		if err != nil {
-			return err
-		}
-		rec = iss.rec
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
+	// What an exchange reads, without recording it. Its cookie ends
+	// before one from a later exchange does.
+	rec := v86gsRead(t, w, w.li(), w.now().Add(5*time.Minute))
 	if rec.conf == 0 || rec.entry == "" {
 		t.Fatalf("the exchange's record: conf %d, entry %q", rec.conf, rec.entry)
 	}
@@ -170,9 +154,9 @@ func TestV086AccessGSExchangeAcrossChange(t *testing.T) {
 	v86gsReads(t, w, "the earlier cookie after that exchange", rec.gs, cookie, 403)
 }
 
-// A row from before conf was kept never holds (migration: conf 0), and a
-// cookie is refused where more namespace documents than gsWalk lie
-// between its exchange and the checkpoint, whatever they changed.
+// A cookie with no record of its own, one from before they were kept,
+// is refused, and so is one where more namespace documents than gsWalk
+// lie between its exchange and the checkpoint, whatever they changed.
 func TestV086AccessGSFailsClosed(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -188,10 +172,163 @@ func TestV086AccessGSFailsClosed(t *testing.T) {
 	again, _ := v82accessCookie(t, w, w.li())
 	v86gsReads(t, w, "li's cookie after exchanging again", gs, again, 0)
 	if err := w.e.update(context.Background(), func(t2 *tx) error {
-		_, err := t2.Exec(`UPDATE filtered_gs SET conf = 0`)
+		_, err := t2.Exec(`DELETE FROM filtered_gs_exps`)
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	v86gsReads(t, w, "a cookie whose row has no conf", gs, again, 403)
+	v86gsReads(t, w, "a cookie with no record of its own", gs, again, 403)
+	// Its reader exchanges again, the grant she held included.
+	li := w.li()
+	c1, _ := v82accessCookie(t, w, li)
+	v86gsReads(t, w, "the cookie of an exchange after that", gs, c1, 0)
+}
+
+// The sequence a grant that ends within the quarter of an hour used to
+// fail (§C.5.2, SERVICES §A.4 gs, CONFORMANCE Access 144; v0.86: "less
+// any whole seconds a minter MAY take off so that cookies for one prefix
+// that it must tell apart differ in exp"): li's grant G ends in ten
+// minutes, so her cookie expires with G. A key change is made and undone,
+// and she exchanges G again: the cookie expires a second earlier and
+// reads, where one told apart by "expires no later than the ended ones"
+// was 403 at every exchange until G expired. Each further change and
+// exchange takes another second.
+func TestV086AccessGSExchangeAgainSameGrant(t *testing.T) {
+	t.Parallel()
+	w := newV75World(t, v75Opts{})
+	w.seed()
+	g := w.li()
+	first, gs := v82accessCookie(t, w, g)
+	prev := first
+	ended := []Credentials{}
+	for i := 1; i <= 3; i++ {
+		w.patchConfig("matches", v82accessOp("add", "/keys/1/groups", map[string]any{"deny": []any{"banned"}}))
+		w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/1/groups"})
+		ended = append(ended, prev)
+		next, _ := v82accessCookie(t, w, g)
+		if want := first.Edge.Exp.Add(-time.Duration(i) * time.Second); !next.Edge.Exp.Equal(want) {
+			t.Fatalf("exchange %d of the same grant: the cookie expires %v, want %v, a second before the last", i, next.Edge.Exp, want)
+		}
+		v86gsReads(t, w, "the cookie of the exchange after a change and its undo", gs, next, 0)
+		for _, c := range ended {
+			v86gsReads(t, w, "a cookie from before a change, after the re-exchange", gs, c, 403)
+		}
+		prev = next
+	}
+	// With nothing changed, an exchange shares the second it would get.
+	same, _ := v82accessCookie(t, w, g)
+	if !same.Edge.Exp.Equal(first.Edge.Exp.Add(-3 * time.Second)) {
+		t.Errorf("an exchange with nothing changed expires %v, want the last cookie's second %v", same.Edge.Exp, prev.Edge.Exp)
+	}
+	v86gsReads(t, w, "the cookie of an exchange with nothing changed", gs, same, 0)
+}
+
+// Where no whole second is left before the grant's exp, the exchange is
+// 503 behind with Retry-After and records nothing (Access 144, §C.5.2
+// Answer, §12.1): a grant with two seconds left gives two cookies that
+// must be told apart, and no third.
+func TestV086AccessGSNoSecondLeft(t *testing.T) {
+	t.Parallel()
+	w := newV75World(t, v75Opts{})
+	w.seed()
+	ctx := context.Background()
+	g := w.li(map[string]any{"exp": w.now().Truncate(time.Second).Add(2 * time.Second).UTC().Format(time.RFC3339)})
+	change := func() {
+		w.patchConfig("matches", v82accessOp("add", "/keys/1/groups", map[string]any{"deny": []any{"banned"}}))
+		w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/1/groups"})
+	}
+	c1, gs := v82accessCookie(t, w, g)
+	change()
+	c2, _ := v82accessCookie(t, w, g)
+	v86gsReads(t, w, "the second cookie", gs, c2, 0)
+	v86gsReads(t, w, "the first cookie", gs, c1, 403)
+	change()
+	res, err := w.e.IssueEdgeGrants(ctx, []string{g.Bearer})
+	ae, _ := err.(*Error)
+	if ae == nil || ae.Status != 503 || ae.Body["code"] != "behind" || ae.Header.Get("Retry-After") == "" {
+		t.Fatalf("the third exchange: %+v %v, want 503 behind with Retry-After", res, err)
+	}
+	v86gsReads(t, w, "the second cookie after the change", gs, c2, 403)
+	// A grant that lasts longer exchanges.
+	c3, _ := v82accessCookie(t, w, w.li())
+	v86gsReads(t, w, "the cookie of a grant that lasts longer", gs, c3, 0)
+}
+
+// v86gsRead is what an exchange of cred reads of matches, without
+// recording it: the record recordFilteredGS is then given.
+func v86gsRead(t *testing.T, w *v75World, cred Credentials, exp time.Time) *gsRecord {
+	t.Helper()
+	var rec *gsRecord
+	if err := w.e.read(context.Background(), func(t2 *tx) error {
+		n := t2.nsByName("matches")
+		a, _, _, err := t2.nsAccess(n, cred)
+		if err != nil {
+			return err
+		}
+		iss, err := t2.filteredEdgeGrant(n, t2.filteredScope(n), a, exp)
+		if err != nil {
+			return err
+		}
+		rec = iss.rec
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return rec
+}
+
+// An exchange whose read predates a change and whose record lands after
+// a newer exchange's moves nothing back: it can't share the newer
+// cookie's record, a document between the two not holding, so it takes
+// its own second and is the one that is 403, and the newer cookie reads
+// on. Where every document between the two holds, they share a record,
+// which keeps the later document.
+func TestV086AccessGSStaleExchangeAfterNewer(t *testing.T) {
+	t.Parallel()
+	w := newV75World(t, v75Opts{})
+	w.seed()
+	ctx := context.Background()
+	li := w.li()
+	exp := w.now().Truncate(time.Second).Add(10 * time.Minute)
+	cookieOf := func(rec *gsRecord) Credentials {
+		return Credentials{Edge: &EdgeGrant{NS: "matches", GS: rec.gs, Prefix: "/ns/matches/g/" + rec.gs, Exp: time.Unix(rec.exp, 0)}}
+	}
+	slot := func(rec *gsRecord) (s gsSlot) {
+		w.inTx(func(t2 *tx) { s, _ = t2.loadGSSlot("matches", rec.gs, rec.exp) })
+		return s
+	}
+	// Every document between holds: one record, at the later document.
+	stale := v86gsRead(t, w, li, exp)
+	w.patchConfig("matches", v82accessOp("add", "/x-note", "unrelated"))
+	newer := v86gsRead(t, w, li, exp)
+	if newer.conf <= stale.conf {
+		t.Fatalf("documents: %d then %d", stale.conf, newer.conf)
+	}
+	for _, rec := range []*gsRecord{newer, stale} {
+		if err := w.e.recordFilteredGS(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if stale.exp != newer.exp || slot(newer).conf != newer.conf {
+		t.Fatalf("the stale exchange's cookie expires %d with record %+v, the newer one's %d at document %d: want one record, at the later document", stale.exp, slot(stale), newer.exp, newer.conf)
+	}
+	v86gsReads(t, w, "the newer cookie after the stale exchange's record", newer.gs, cookieOf(newer), 0)
+
+	// A change between them: the stale exchange takes its own second.
+	// (Cookies of another minute, clear of the record above.)
+	exp = exp.Add(-time.Minute)
+	stale = v86gsRead(t, w, li, exp)
+	w.patchConfig("matches", v82accessOp("add", "/keys/1/groups", map[string]any{"deny": []any{"banned"}}))
+	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/1/groups"})
+	newer = v86gsRead(t, w, li, exp)
+	for _, rec := range []*gsRecord{newer, stale} {
+		if err := w.e.recordFilteredGS(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if stale.exp >= newer.exp || slot(newer).conf != newer.conf || slot(stale).conf != stale.conf {
+		t.Fatalf("the stale exchange's cookie expires %d (record %+v), the newer one's %d (record %+v): want a second of its own, each with its document", stale.exp, slot(stale), newer.exp, slot(newer))
+	}
+	v86gsReads(t, w, "the newer cookie after the stale exchange's record", newer.gs, cookieOf(newer), 0)
+	v86gsReads(t, w, "the stale exchange's cookie", stale.gs, cookieOf(stale), 403)
 }

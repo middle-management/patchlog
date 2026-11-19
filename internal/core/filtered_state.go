@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -208,63 +209,76 @@ type gsRecord struct {
 	// entry is EntryDigest (gsEntryDigest) over kid's whole key entry and
 	// the whole definition of each of roles, as {ns}'s document had them
 	// at the exchange: a cookie is accepted only while it is the same
-	// (§B.11.9 gs, "gone or changes in any member"). "" (a row from
-	// before it was kept) never holds.
-	entry string
-	// entryAfter is the latest expiry (Unix seconds) of the cookies issued
-	// under an entry digest an exchange has since replaced, 0 if none
-	// was: a cookie that expires no later is one of those, or can't be
-	// told from one, and is 403 (§B.11.9 gs, "until the reader exchanges
-	// again"; recordFilteredGS). Only the upsert writes it.
-	entryAfter int64
-	// conf is the ns_config seq of {ns}'s document the exchange computed
-	// entry under, in its read snapshot: a cookie is held to every
-	// document of {ns} after it up to the one at the answer's checkpoint
-	// (§B.11.9 gs, v0.86: "Once an entry after its exchange changes one
-	// of them, the cookie is 403 from that entry on, even where a later
-	// entry undoes the change"; gsHeldSince). 0 (a row from before it
-	// was kept) never holds.
+	// (§B.11.9 gs, "gone or changes in any member"). "" never holds.
+	// conf is the ns_config seq of that document, of the exchange's read
+	// snapshot: a cookie is held to every document of {ns} after it up to
+	// the one at the answer's checkpoint (§B.11.9 gs, v0.86: "Once an
+	// entry after its exchange changes one of them, the cookie is 403
+	// from that entry on, even where a later entry undoes the change";
+	// gsHeldSince). 0 never holds.
+	//
+	// Both are a cookie's own: filteredAdmit reads them from the
+	// filtered_gs_exps row of the cookie's exp (loadGSSlot). The
+	// filtered_gs row keeps those of its latest exchange.
+	entry  string
 	conf   int64
 	filter string // grantcheck.ReadFilter.Encode
-	exp    int64  // Unix seconds: the latest expiry of its cookies
+	// exp, Unix seconds: for an exchange, the latest its cookie may
+	// expire, which recordFilteredGS sets to the second it took; in a
+	// filtered_gs row, the latest expiry of its cookies.
+	exp int64
 }
 
-// recordFilteredGS records r in filtered_gs, in a short write transaction
-// of its own, keeping the later exp of a row already there; it sweeps rows
-// past their exp and those of purged namespaces (§B.11.9 gs). Rows are per
-// (ns, gs): a gs names no namespace, so one grant's gs can be the same in
-// two covered namespaces, and each keeps its own kid and rules.
+// errNoSecond is the 503 of an exchange whose cookie must differ in exp
+// from those minted for its prefix and has no whole second left to do so
+// before it would expire (§C.5.2 Answer, SERVICES §A.4 gs, §12.1 behind).
+func errNoSecond() *Error {
+	err := apiErr(503, "behind", "message", "no second is left before this edge grant would expire to tell it from those already minted: exchange a grant that lasts longer (§C.5.2)")
+	err.Header = http.Header{"Retry-After": []string{"1"}}
+	return err
+}
+
+// recordFilteredGS records r in filtered_gs and takes the second its
+// cookie expires at, which it sets r.exp to, in a short write transaction
+// of its own; it sweeps rows past their exp and those of purged
+// namespaces (§B.11.9 gs). Rows are per (ns, gs): a gs names no
+// namespace, so one grant's gs can be the same in two covered
+// namespaces, and each keeps its own kid and rules.
 //
 // Readers who share a gs share its row, and a cookie carries its prefix
-// and expiry alone (§C.5.3), so a row replaced under another entry digest
-// would serve the cookies the change ended again, those of a reader the
-// changed key now refuses among them, where §B.11.9 gs has each 403
-// "until the reader exchanges again". So the replaced row's exp, which no
-// cookie issued under it outlasts, is kept in entry_after, which only
-// grows (a change made and undone revives nothing), and filteredAdmit
-// refuses a cookie that expires no later. That fails closed for a cookie
-// from the same second as the last one before the change, and for one
-// whose grant ends by then: its reader reads with the grant itself, and
-// with a cookie from a later exchange or a grant that lasts longer. A row
-// from before entries were kept, whose entry is empty, counts as replaced.
+// and expiry alone (§C.5.3): the cookies of a gs that expire at the same
+// second are one cookie. Each has a filtered_gs_exps row, with the entry
+// digest and the document (conf) its exchanges recorded, from which a
+// read under it is judged (filteredAdmit). An exchange shares the row of
+// the second its cookie would expire at only where that changes no
+// verdict: the same entry digest, and the record holding under every
+// document of {ns} between the row's and its own (gsShares). Otherwise
+// its cookie must be told apart from that one, and it takes whole seconds
+// off, down to the first second that is free or that it can share
+// (§C.5.2: "less any whole seconds a minter MAY take off so that cookies
+// for one prefix that it must tell apart differ in exp"). errNoSecond
+// where none is left after now: nothing is recorded.
+//
+// So a cookie a change ended stays ended whoever exchanges since, the
+// same reader or another, with whatever grant: no exchange writes to its
+// row. A change made and undone gives the entry digest it had, and the
+// exchange after the undo still takes another second, since a document
+// between the two doesn't hold. And a reader who exchanges again always
+// gets a cookie that reads, while a second is left, also under a grant
+// that ends within the quarter of an hour and with the grant she held
+// before. (Before, cookies were told apart by "expires no later than the
+// replaced row's", which such a grant's cookie never passed.)
+//
+// A shared row keeps the greater conf: every document between the two
+// holds, so each cookie's verdict at any checkpoint is the same from
+// either, and an exchange that read {ns} earlier and records later moves
+// nothing back. An exchange that read before a change and records after
+// it can't share the row of one made after the change: it takes its own
+// second, with the document it read, and is ended by the change.
+//
 // Readers of one gs record one entry at one document: its scope: subject
 // digests their kid, pub and read roles by name (grantcheck.ScopeDigest),
-// which are what the entry digest is over, so only a changed document
-// replaces it.
-//
-// A change made and undone gives the entry digest it had (v0.86): a row
-// recorded before the change and one recorded after the undo carry the
-// same entry, and the cookies from before stay ended all the same. Each
-// is refused by itself while the row stands, judged at every document
-// since the row's conf (gsHeldSince). When a later exchange moves conf
-// past a document under which the record doesn't hold, the row's exp
-// goes to entry_after exactly as when the entry is replaced: the row's
-// conf is then below changedAt, the latest such document at or before
-// r.conf (gsChangedBefore), which is a fact of {ns}'s history alone, so
-// the upsert stays one statement and needs no lock. conf always becomes
-// the exchange's own: an exchange that read {ns} before a change and
-// records after it leaves a row that the change, at a later document,
-// ends for every cookie under it.
+// which are what the entry digest is over.
 func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 	subjects := make([]any, len(r.subjects))
 	for i, s := range r.subjects {
@@ -280,28 +294,104 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 		ON CONFLICT (ns, gs) DO UPDATE SET subjects = excluded.subjects, partial = excluded.partial,
 			kid = excluded.kid, pub = excluded.pub, roles = excluded.roles, block_rules = excluded.block_rules, read_scope = excluded.read_scope,
 			principal = excluded.principal, digest = excluded.digest, entry = excluded.entry, conf = excluded.conf, filter = excluded.filter,
-			entry_after = CASE WHEN filtered_gs.entry <> excluded.entry OR filtered_gs.conf < ? THEN GRT(filtered_gs.entry_after, filtered_gs.exp) ELSE filtered_gs.entry_after END,
 			exp = GRT(filtered_gs.exp, excluded.exp)`
+	raise := `UPDATE filtered_gs_exps SET conf = GRT(conf, ?) WHERE ns = ? AND gs = ? AND exp = ?`
+	grt := "max("
 	if e.pg {
-		q = strings.ReplaceAll(q, "GRT(", "GREATEST(")
-	} else {
-		q = strings.ReplaceAll(q, "GRT(", "max(")
+		grt = "GREATEST("
 	}
-	return e.update(ctx, func(t *tx) error {
-		if _, err := t.Exec(`DELETE FROM filtered_gs WHERE exp <= ? OR ns IN (SELECT name FROM namespaces WHERE purged <> 0)`, t.now.Unix()); err != nil {
-			return err
+	q, raise = strings.ReplaceAll(q, "GRT(", grt), strings.ReplaceAll(raise, "GRT(", grt)
+	taken := r.exp
+	err := e.update(ctx, func(t *tx) error {
+		now := t.now.Unix()
+		for _, sweep := range []string{
+			`DELETE FROM filtered_gs WHERE exp <= ? OR ns IN (SELECT name FROM namespaces WHERE purged <> 0)`,
+			`DELETE FROM filtered_gs_exps WHERE exp <= ? OR ns IN (SELECT name FROM namespaces WHERE purged <> 0)`,
+		} {
+			if _, err := t.Exec(sweep, now); err != nil {
+				return err
+			}
 		}
 		// {ns}'s documents are read without its lock: they only append.
 		t.noLock++
-		changedAt := r.conf // no namespace: every earlier row counts as changed
-		if n := t.nsByName(r.ns); n != nil {
-			changedAt = t.gsChangedBefore(n, r)
-		}
+		n := t.nsByName(r.ns)
 		t.noLock--
+		shares := t.gsShares(n, r)
+		// The latest second at or before r.exp that is free, or whose
+		// row this exchange can share. Another instance may take a free
+		// one first: then the seconds are read again.
+		for taken = 0; taken == 0; {
+			slots := map[int64]gsSlot{}
+			rows, err := t.Query(`SELECT exp, entry, conf FROM filtered_gs_exps WHERE ns = ? AND gs = ? AND exp > ? AND exp <= ?`, r.ns, r.gs, now, r.exp)
+			if err != nil {
+				return err
+			}
+			for rows.Next() {
+				var exp int64
+				var s gsSlot
+				if err := rows.Scan(&exp, &s.entry, &s.conf); err != nil {
+					rows.Close()
+					return err
+				}
+				slots[exp] = s
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			rows.Close()
+			lost := false
+			for exp := r.exp; exp > now && taken == 0 && !lost; exp-- {
+				s, held := slots[exp]
+				switch {
+				case !held:
+					res, err := t.Exec(`INSERT INTO filtered_gs_exps (ns, gs, exp, entry, conf) VALUES (?, ?, ?, ?, ?) ON CONFLICT (ns, gs, exp) DO NOTHING`, r.ns, r.gs, exp, r.entry, r.conf)
+					if err != nil {
+						return err
+					}
+					if c, err := res.RowsAffected(); err != nil {
+						return err
+					} else if c == 0 {
+						lost = true
+						continue
+					}
+					taken = exp
+				case shares(s):
+					if _, err := t.Exec(raise, r.conf, r.ns, r.gs, exp); err != nil {
+						return err
+					}
+					taken = exp
+				}
+			}
+			if taken == 0 && !lost {
+				return errNoSecond()
+			}
+		}
 		_, err := t.Exec(q, r.gs, r.ns, enc(subjects), boolInt(r.partial), r.kid, r.pub, enc(roles), enc(nonNilRules(r.blockRules)),
-			boolInt(r.readScope), enc(r.principal), r.digest, r.entry, r.conf, r.filter, r.exp, changedAt)
+			boolInt(r.readScope), enc(r.principal), r.digest, r.entry, r.conf, r.filter, taken)
 		return err
 	})
+	if err == nil {
+		r.exp = taken
+	}
+	return err
+}
+
+// gsSlot is a filtered_gs_exps row: the entry digest and document the
+// exchanges of the cookies of one gs expiring at one second recorded.
+type gsSlot struct {
+	entry string
+	conf  int64
+}
+
+// loadGSSlot is the filtered_gs_exps row of the cookies of gs in ns that
+// expire at exp, as the read snapshot has it; ok is false for none.
+func (t *tx) loadGSSlot(ns, gs string, exp int64) (s gsSlot, ok bool) {
+	err := t.QueryRow(`SELECT entry, conf FROM filtered_gs_exps WHERE ns = ? AND gs = ? AND exp = ?`, ns, gs, exp).Scan(&s.entry, &s.conf)
+	if errors.Is(err, sql.ErrNoRows) {
+		return s, false
+	}
+	t.must(err)
+	return s, true
 }
 
 func boolInt(b bool) int {
@@ -326,8 +416,8 @@ func (t *tx) loadGS(ns, gs string) *gsRecord {
 	r := &gsRecord{gs: gs}
 	var subjects, roles, blockRules, principal string
 	var partial, readScope int64
-	err := t.QueryRow(`SELECT ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, entry, entry_after, conf, filter, exp FROM filtered_gs WHERE ns = ? AND gs = ?`, ns, gs).
-		Scan(&r.ns, &subjects, &partial, &r.kid, &r.pub, &roles, &blockRules, &readScope, &principal, &r.digest, &r.entry, &r.entryAfter, &r.conf, &r.filter, &r.exp)
+	err := t.QueryRow(`SELECT ns, subjects, partial, kid, pub, roles, block_rules, read_scope, principal, digest, entry, conf, filter, exp FROM filtered_gs WHERE ns = ? AND gs = ?`, ns, gs).
+		Scan(&r.ns, &subjects, &partial, &r.kid, &r.pub, &roles, &blockRules, &readScope, &principal, &r.digest, &r.entry, &r.conf, &r.filter, &r.exp)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
