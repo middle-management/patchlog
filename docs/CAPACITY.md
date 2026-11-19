@@ -40,6 +40,9 @@ under [Earlier measurements](#earlier-measurements) and
   on SQLite and 150–220 ms on server X. See [Batches](#batches).
 - **A long history doesn't slow a document down**, measured up to 100,000 revisions. See
   [Long histories](#long-histories).
+- **Waiting devices cost the database nothing.** Each long-polling its own resource, 120,000
+  devices on three `c7g.xlarge` cores and a 2-vCPU RDS were answered from memory, with no change
+  in delivery or database CPU from 15,000 up. See [Resource followers](#resource-followers).
 
 ## Contents
 
@@ -432,8 +435,27 @@ read: 96–430 times a server in 40 s at 18,000 devices, none with a 5 s bound. 
 40,000 devices a core, each such window sends thousands of reads to the database, which slows
 the next poll: a loop that grows with the devices. Quiet answers now need the tailer to have
 polled within a quarter of the long-poll interval, and `patchlog.longpoll.resource.reads`
-counts each read by answer, which the summary shows per step, so the next run shows whether
-anything else still reads.
+counts each read by answer, which the summary shows per step.
+
+**With that, 120,000 waiting devices cost the database nothing** (commit 11a9207, the same setup
+and database; files in `docs/capacity/devices-aws-2026-11-19-fresh/`):
+
+| Devices | Writes to devices/s, delivered | Delivery p50 / p99 | Long-polls/s: memory / read / stale | Cores' CPU | Cores' memory | RDS CPU |
+|---|---|---|---|---|---|---|
+| 15,000 | 146, 99.9% | 81 / 189 ms | 887 / 202 / 0 | 0.36 + 0.07 + 0.07 | 351–366 MB | 68% |
+| 60,000 | 147, 100% | 81 / 189 ms | 3,145 / 196 / 0 | 0.47 + 0.16 + 0.16 | 1.2–1.3 GB | 68% |
+| 120,000 | 147, 100% | 81 / 189 ms | 6,144 / 196 / 0 | 0.60 + 0.28 + 0.28 | 2.3–2.6 GB | 68% |
+
+- **No step broke.** Every completion reached its device at the same latency from 15,000 devices
+  to 120,000, without an error. The run ended at its last step, not at a limit.
+- **The database's load is the writes'.** RDS stayed at 68–70% (the 450 writes a second) at
+  every step. Re-polls were answered from memory, 6,144 a second at 120,000 devices; reads stayed
+  at about 196 a second, the completions' wake-ups (twice on the writing core, whose tailer wakes
+  its own commits' followers again). None was stale.
+- **A waiting device costs a core about 60 KB and little CPU.** The cores that took no writes
+  used 0.28 of 4 vCPUs at 40,000 devices each. By memory, a `c7g.xlarge` (8 GB) would hold
+  about 100,000; more devices need more cores, not a larger database.
+- **Not reached:** a core's own limit, and connections past 40,000 a core.
 
 ## Large documents, by shape and schema
 
