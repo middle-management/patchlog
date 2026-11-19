@@ -215,30 +215,38 @@ func (t *tx) samePrincipal(seq int64, a *actor, author int64) bool {
 	return t.sameRoot(gid, a)
 }
 
-// liveRegistrations lists the unexpired remote branch registrations of n.
-func (t *tx) liveRegistrations(n *nsRow) []map[string]any {
-	rows, err := t.Query(`SELECT origin, name, at_seq, ns_seq, expires FROM remote_branches WHERE ns = ? AND expires > ? ORDER BY origin, name`, n.id, t.now.UnixMilli())
+// regKey is the key of a remote branch's row in /branches (§7.4):
+// {origin}/{ns}, in SQL, as the index remote_branches_key has it.
+const regKey = `(origin || '/' || name)`
+
+// liveReg is an unexpired remote branch registration, key its /branches
+// key.
+type liveReg struct {
+	key, origin, name string
+	at, seq, exp      int64
+}
+
+// registrationsAfter lists at most limit unexpired remote branch
+// registrations of n (§G.3) in byte order of key, those whose key is
+// strictly after the plain bound after (index remote_branches_key: the
+// "C" collation on Postgres, SQLite's BINARY).
+func (t *tx) registrationsAfter(n *nsRow, after string, limit int) []liveReg {
+	key := regKey
+	if t.e.pg {
+		key += ` COLLATE "C"`
+	}
+	rows, err := t.Query(`SELECT origin, name, at_seq, ns_seq, expires FROM remote_branches
+		WHERE ns = ? AND `+key+` > ? AND expires > ? ORDER BY `+key+` LIMIT ?`, n.id, after, t.now.UnixMilli(), limit)
 	t.must(err)
-	type raw struct {
-		origin, name string
-		at, seq, exp int64
-	}
-	var rs []raw
+	defer rows.Close()
+	var out []liveReg
 	for rows.Next() {
-		var r raw
+		var r liveReg
 		t.must(rows.Scan(&r.origin, &r.name, &r.at, &r.seq, &r.exp))
-		rs = append(rs, r)
+		r.key = r.origin + "/" + r.name
+		out = append(out, r)
 	}
-	rows.Close()
-	out := make([]map[string]any, 0, len(rs))
-	for _, r := range rs {
-		out = append(out, map[string]any{
-			"remote":  map[string]any{"origin": r.origin, "ns": r.name},
-			"at":      t.nsLogID(r.at).String(),
-			"ns_id":   t.nsLogID(r.seq).String(),
-			"expires": formatTime(r.exp),
-		})
-	}
+	t.must(rows.Err())
 	return out
 }
 

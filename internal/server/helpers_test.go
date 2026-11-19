@@ -215,6 +215,13 @@ func (r *resp) Arr() []any {
 	return a
 }
 
+// Branches are the rows of a GET /ns/{ns}/branches page (§7.4:
+// { "branches": [ … ], "next"? }).
+func (r *resp) Branches() []any {
+	a, _ := r.Obj()["branches"].([]any)
+	return a
+}
+
 func (r *resp) Str(k string) string { s, _ := r.Obj()[k].(string); return s }
 
 func (r *resp) String() string { return string(r.Body) }

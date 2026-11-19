@@ -532,9 +532,27 @@ async function refreshNS() {
   if (ns !== S.ns) return;
   if (lg.status === 200) { const v = await nsLogRead(ns, lg); if (ns !== S.ns) return; S.nsLog = v; }
   if (hd.status === 200 && hd.json) { S.heads = headsOf(hd.json); S.headsNext = hd.json.next || ''; }
-  if (br.status === 200 && Array.isArray(br.json)) S.branches = br.json; else S.branches = [];
+  S.branches = await branchesAll(ns, br);
+  if (ns !== S.ns) return;
   renderNsAll();
   updateLiveUrls();
+}
+
+// branchesAll is every row of GET /ns/{ns}/branches (§7.4), given the
+// first page's answer: { branches: [ … ], next? }, a page of at most
+// logPageSize rows in byte order of key, the following one at
+// ?after={next}. A next that doesn't move on ends the listing.
+async function branchesAll(ns, first) {
+  const rows = [];
+  let r = first, after = '';
+  for (;;) {
+    if (r.status !== 200 || !r.json || !Array.isArray(r.json.branches)) return rows;
+    rows.push(...r.json.branches);
+    const next = r.json.next;
+    if (typeof next !== 'string' || next <= after) return rows;
+    after = next;
+    r = await api('GET', `/ns/${ns}/branches?after=${encodeURIComponent(after)}`, { auto: true });
+  }
 }
 
 function renderNsAll() {

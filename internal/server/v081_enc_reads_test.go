@@ -23,7 +23,7 @@ func TestV081BranchesPartial403(t *testing.T) {
 	expect(t, w.get("/ns/matches/branches", w.li()), 403)
 	r := w.get("/ns/matches/branches", w.admin)
 	expect(t, r, 200)
-	if len(r.Arr()) != 1 {
+	if len(r.Branches()) != 1 {
 		t.Fatalf("admin %s", r.Body)
 	}
 }

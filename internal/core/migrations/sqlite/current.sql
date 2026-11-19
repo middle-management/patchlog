@@ -6,3 +6,9 @@
 --
 -- Example usage:
 -- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- A page of GET /ns/{ns}/branches (§7.4) is in byte order of key
+-- (remote_source.go, registrationsAfter). A remote branch's key is
+-- {origin}/{ns}, which the primary key's (origin, name) doesn't order
+-- ("https://a/x" is after "https://a.b/x"). (A base's branches are in
+-- byte order in namespaces_base already: SQLite's index is BINARY.)
+CREATE INDEX IF NOT EXISTS remote_branches_key ON remote_branches (ns, (origin || '/' || name));

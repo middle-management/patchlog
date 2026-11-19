@@ -604,6 +604,33 @@ func (t *tx) branchesOf(n *nsRow) []*nsRow {
 	return out
 }
 
+// branchesAfter lists at most limit direct branches of n in byte order of
+// name, those whose name is strictly after the plain bound after, only
+// the unpurged ones if unpurged: a page of /branches (§7.4) or of a
+// namespace purge's dependents (§8.5). It reads the page alone, by the
+// index on a base's branch names in byte order (the "C" collation on
+// Postgres, index namespaces_base_c; SQLite's namespaces_base is BINARY).
+func (t *tx) branchesAfter(n *nsRow, after string, unpurged bool, limit int) []*nsRow {
+	col, cond := "name", ""
+	if t.e.pg {
+		col = `name COLLATE "C"`
+	}
+	if unpurged {
+		cond = ` AND purged = 0`
+	}
+	rows, err := t.Query(`SELECT `+nsCols+` FROM namespaces WHERE base = ? AND `+col+` > ?`+cond+` ORDER BY `+col+` LIMIT ?`, n.id, after, limit)
+	t.must(err)
+	defer rows.Close()
+	var out []*nsRow
+	for rows.Next() {
+		b, err := scanNS(rows)
+		t.must(err)
+		out = append(out, b)
+	}
+	t.must(rows.Err())
+	return out
+}
+
 // allBranchesOf lists the direct branches of n that aren't purged.
 func (t *tx) allBranchesOf(n *nsRow) []*nsRow {
 	var out []*nsRow

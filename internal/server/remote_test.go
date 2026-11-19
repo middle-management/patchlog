@@ -181,7 +181,7 @@ func TestRemoteRegistration(t *testing.T) {
 		t.Fatalf("remote branch entry %v", last)
 	}
 	// Listed in /branches as { remote, at, ns_id, expires } only.
-	bl := a.get("/ns/main/branches").Arr()
+	bl := a.get("/ns/main/branches").Branches()
 	if len(bl) != 1 || string(canonical(bl[0])) != string(canonical(map[string]any{
 		"remote": map[string]any{"origin": originB, "ns": "rel"}, "at": at, "ns_id": reg1, "expires": "2026-11-03T12:00:00.000Z"})) {
 		t.Fatalf("branches %v", bl)
@@ -235,7 +235,7 @@ func TestRemoteRegistration(t *testing.T) {
 
 	// After expiry: not listed, not protecting, and registrable again.
 	a.clock.Advance(31 * 24 * time.Hour)
-	if bl := a.get("/ns/main/branches").Arr(); len(bl) != 0 {
+	if bl := a.get("/ns/main/branches").Branches(); len(bl) != 0 {
 		t.Fatalf("expired registrations listed: %v", bl)
 	}
 	r = a.prune("main", "p", map[string]any{"horizon": p3}, "admin")
@@ -280,7 +280,7 @@ func TestRemoteRegistrationAuth(t *testing.T) {
 	expect(t, f.register("sec", "rel2", at, "", both), 201)
 	// /branches needs read.
 	expect(t, f.get("/ns/sec/branches"), 401)
-	if n := len(f.get("/ns/sec/branches", both).Arr()); n != 2 {
+	if n := len(f.get("/ns/sec/branches", both).Branches()); n != 2 {
 		t.Fatalf("%d listed", n)
 	}
 }
@@ -741,7 +741,7 @@ func TestRemoteRegisterAndRenew(t *testing.T) {
 	a, b, _ := pair(t, nil, nil, func(o *core.RemoteOptions) { o.Register = true })
 	f := populateA(t, a)
 	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
-	bl := a.get("/ns/main/branches").Arr()
+	bl := a.get("/ns/main/branches").Branches()
 	if len(bl) != 1 || string(canonical(bl[0].(map[string]any)["remote"])) != string(canonical(map[string]any{"origin": originB, "ns": "rel"})) {
 		t.Fatalf("A's branches %v", bl)
 	}
@@ -760,7 +760,7 @@ func TestRemoteRegisterAndRenew(t *testing.T) {
 	if err := b.e.SyncRemotes(ctx); err != nil {
 		t.Fatal(err)
 	}
-	bl = a.get("/ns/main/branches").Arr()
+	bl = a.get("/ns/main/branches").Branches()
 	if len(bl) != 1 || bl[0].(map[string]any)["ns_id"] == reg1 || bl[0].(map[string]any)["expires"] != "2026-11-27T12:00:00.000Z" {
 		t.Fatalf("after renewal %v", bl)
 	}

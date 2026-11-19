@@ -91,20 +91,20 @@ func TestV075BranchListPartial(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	all, err := w.e.BranchList(ctx, "matches", w.admin)
+	all, err := w.e.BranchList(ctx, "matches", "", w.admin)
 	if err != nil || len(all.List) != 2 {
 		t.Fatalf("admin: %+v %v", all, err)
 	}
-	if bl, err := w.e.BranchList(ctx, "matches", w.li()); v75Status(err) != 403 {
+	if bl, err := w.e.BranchList(ctx, "matches", "", w.li()); v75Status(err) != 403 {
 		t.Fatalf("li: %+v %v, want 403", bl, err)
 	}
 	both := w.li(map[string]any{"ns": []any{"matches", "matches-r7"}})
-	if bl, err := w.e.BranchList(ctx, "matches", both); v75Status(err) != 403 {
+	if bl, err := w.e.BranchList(ctx, "matches", "", both); v75Status(err) != 403 {
 		t.Fatalf("li in both: %+v %v, want 403", bl, err)
 	}
 	// Uncovered: 403, as before v0.75.
 	w2 := newV75World(t, v75Opts{engine: func(o *Options) { o.NoFilteredReads = true }})
-	if _, err := w2.e.BranchList(ctx, "matches", w2.li()); v75Status(err) != 403 {
+	if _, err := w2.e.BranchList(ctx, "matches", "", w2.li()); v75Status(err) != 403 {
 		t.Fatalf("NoFilteredReads: %v", err)
 	}
 }

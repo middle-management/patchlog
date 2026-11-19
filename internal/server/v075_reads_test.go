@@ -757,7 +757,7 @@ func TestV075BranchesPartial(t *testing.T) {
 	// Unrestricted: the head pointer class, as before.
 	r := w.get("/ns/matches/branches", w.admin)
 	expect(t, r, 200)
-	if r.H.Get("Cache-Control") != "private, max-age=0" || len(r.Arr()) != 1 {
+	if r.H.Get("Cache-Control") != "private, max-age=0" || len(r.Branches()) != 1 {
 		t.Fatalf("admin %v %s", r.H, r.Body)
 	}
 }

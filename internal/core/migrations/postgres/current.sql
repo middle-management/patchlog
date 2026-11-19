@@ -6,3 +6,12 @@
 --
 -- Example usage:
 -- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- A page of GET /ns/{ns}/branches (§7.4) and of a namespace purge's
+-- dependents (§8.5) is in byte order of key (nsconfig.go, branchesAfter;
+-- remote_source.go, registrationsAfter). namespaces_base orders a base's
+-- branches by the database's collation, so neither a page's bound nor its
+-- order could use it: as namespaces_name_c for the pages of GET /ns. A
+-- remote branch's key is {origin}/{ns}, which (origin, name) doesn't
+-- order ("https://a/x" is after "https://a.b/x").
+CREATE INDEX IF NOT EXISTS namespaces_base_c ON namespaces (base, name COLLATE "C");
+CREATE INDEX IF NOT EXISTS remote_branches_key ON remote_branches (ns, ((origin || '/' || name) COLLATE "C"));

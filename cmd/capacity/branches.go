@@ -283,10 +283,20 @@ func (r *runner) branchWidth(tag string, stub *purgeStub) {
 	}
 	r.settle()
 
+	// The whole listing, every page of it (§7.4: logPageSize rows a
+	// page, so one request per thousand branches at the default), then
+	// its first page alone.
 	r.record("branch_list", timesOf(10, func(int) error {
 		bs, err := cb.Branches(r.ctx, base)
 		if err == nil && len(bs) != frozen+n {
 			err = fmt.Errorf("listed %d branches", len(bs))
+		}
+		return err
+	}))
+	r.record("branch_list_first_page", timesOf(10, func(int) error {
+		bs, next, err := cb.BranchesPage(r.ctx, base, "")
+		if err == nil && next == "" && len(bs) != frozen+n {
+			err = fmt.Errorf("listed %d branches on the only page", len(bs))
 		}
 		return err
 	}))
