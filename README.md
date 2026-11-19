@@ -4128,6 +4128,9 @@ patchlog import -i all.jsonl --atomic --ns demo-schemas=demo2-schemas,demo=demo2
   missing ones first, listing the importer's key and allowance; a `401` or `403` on the first
   read of a target namespace says so.
 - **Branches** export with the base's history included, or with `--foreign-parents` naming the base revisions in `requires`.
+  The foreign parent is the resource's head as the branch's own `/heads` lists it at the
+  branch's first `ns_id` (§G.4.1, v0.86): the exporter reads nothing in the base, needs no
+  grant there, and a branch of a remote base (§G.3) exports the same way.
   An e2e branch's documents always export the second way, its keyring aside (v0.82, §G.5.1; see
   E3 under Encryption below).
 - **Blobs** (§G.4.1) travel as blob lines (unpadded base64url; padded is accepted), each
@@ -4189,13 +4192,16 @@ patchlog import --ns secret -i s.plb --identity me.jwk --atomic
   target's keyring must share the bundle's history, else the import is refused at step 1. An
   e2e branch's export writes no line the branch reads through from its base, whose sealed ops
   name the base (v0.82, §G.5.1 Importing): a document continued in the branch starts after its
-  foreign parent, the base's head at `base.at`, named in `requires` (a `requires` before it, or
+  foreign parent, its head as the branch's `/heads` lists it at the branch's first `ns_id`,
+  named in `requires` (a `requires` before it, or
   a foreign parent that isn't in the chain, refuses the document); one the branch never wrote
   is `external`, pinned to its revision; the keyring comes whole, unless the export asks for
   `--foreign-parents`; and a branch of a remote base
-  exports only documents that start with a line of its own. The importer looks a pinned
-  `external` up in the target's chain where an e2e target serves no document by revision, and
-  for a tombstone at any level. Lines
+  exports the same way (v0.86; before, only documents that start with a line of its own). The
+  importer asks the target for a pinned `external` without opening it, so it needs no key of a
+  sealed or e2e target; it looks the pin up in the target's chain where an e2e target serves
+  no document by revision, and for a tombstone at any level; a pin pruned without a kept
+  document is not in the target (§G.4.2, v0.86). Lines
   go in batches per epoch, in epoch order, each epoch's raise of `encryption.epoch` in the batch
   with the keyring line that brings its key (so atomic mode is atomic per epoch); an existing
   target is refused only below the bundle's lowest epoch, or past the epoch of a sealed line it

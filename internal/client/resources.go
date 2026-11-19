@@ -195,6 +195,28 @@ func (c *Client) DocKid(ctx context.Context, ns, name, id string) (string, error
 	return h.Kid, nil
 }
 
+// RevServed asks whether the server serves the document at revision id,
+// without opening it: nil for a 200, whatever its form (in the clear,
+// sealed, or an e2e resource's stored snapshot, §8.6), and the *APIError
+// otherwise, as Doc gives it. For a caller that needs to know a revision
+// is there and holds no key to read it with.
+func (c *Client) RevServed(ctx context.Context, ns, name, id string) error {
+	if err := checkRes(ns, name); err != nil {
+		return err
+	}
+	if err := checkID("revision", id); err != nil {
+		return err
+	}
+	r, err := c.do(ctx, "GET", "/r/"+ns+"/"+name+"/rev/"+id, nil, nil)
+	if err != nil {
+		return err
+	}
+	if r.status != 200 {
+		return r.apiError()
+	}
+	return nil
+}
+
 // Doc fetches the document at revision id (immutable). A tombstone id, a
 // purge or a pruned revision is a 410 *APIError (IsGone / IsPruned).
 func (c *Client) Doc(ctx context.Context, ns, name, id string) (*Doc, error) {
