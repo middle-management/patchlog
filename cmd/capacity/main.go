@@ -342,9 +342,11 @@ func (r *runner) run() {
 	if on("live") {
 		r.live()
 	}
+	if on("resource-live") {
+		r.resourceLive()
+	}
 	if r.c.only != "" && on("branches") {
 		r.branches()
-		r.resourceLive()
 	}
 	for k, pid := range r.pids() {
 		b, err := os.ReadFile("/proc/" + pid + "/status")
