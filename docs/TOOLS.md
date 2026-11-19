@@ -1,6 +1,6 @@
 # Patch Log — Tools
 
-Status: draft v0.85 · 2026-11-17. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.86 · 2026-11-19. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Clients and tools that use the protocol's public API. A server needs nothing from this document.
 
@@ -442,7 +442,7 @@ A selection is a list of resources, or anything a resolver turns into one, e.g. 
 2.  **Declared references:** fields marked `x-ref` in the documents' schemas (§6.5). A **pinned** reference needs that exact revision, a **live** one the head as of the export's `at`.
 3.  **Application resolvers:** tool plug-ins for relationships no schema expresses, e.g. "a match brings its team pages".
 
-Untyped documents have no level 2, but an opt-in rule may treat any string in them matching `^/r/` as a reference. Dependencies left out with `external` are checked by the importer to exist in the target: by id for pinned references, in the resource's chain and not purged, and by name for live ones.
+Untyped documents have no level 2, but an opt-in rule may treat any string in them matching `^/r/` as a reference. Dependencies left out with `external` are checked by the importer to exist in the target: by id for pinned references, in the resource's chain and neither purged nor pruned without a kept document (§8.6), and by name for live ones.
 
 ### G.4.3 History or snapshot
 
@@ -601,7 +601,7 @@ A tree of files lives in a catalog namespace (Addendum B), with names as data:
   - In sealed namespaces it seals `file` as a value of another resource (§E.2.6).
   - Where it can't give `file`, it says why: `"file": { "absent": "e2e" }` for an end-to-end item, `{ "absent": "pending" }` for a head it hasn't read yet, which a tool then reads from the core.
 - **A folder too large to list whole** (beyond what a tool pages through) is refused (`403`, saying why), never listed cut short. A path inside it still resolves by `lookup`, or is `403` too in a sealed or end-to-end catalog, which doesn't offer that (§B.5).
-- **A tree service that is behind** answers `503 behind` with `Retry-After` (§B.5); a tool passes it on, and deletes nothing on the strength of a listing meanwhile.
+- **A tree service that is behind** answers `503 behind` with `Retry-After` (§B.5); a tool answers `503` (§H.4 Answers), and deletes nothing on the strength of a listing meanwhile.
 - **Read-your-writes.** A tool sends the `X-Namespace-Revision` of each of its writes, the catalog's and the content namespace's, as `?min` on later listings, kept and dropped as §A.5 says.
 - **In the flat view,** a directory is listed from the `head` rows of `/heads` (§7.4), tombstones and purges left out: `ETag` from `target`, the time from `created`. A JSON file's size is its rendering's, not `/heads`' `size`, and a raw file's the blob reference's `size` (at E3 its `sealed.size`), both read from the head document once per revision, cacheable for good.
 - **Where times are absent,** rows without `created` take `Last-Modified` from the document read for the size (§7.1). In sealed and end-to-end namespaces a gateway with keys takes them from the logs.
@@ -668,10 +668,12 @@ A save follows §11.3, with these specifics:
   | Frozen namespace                                                                                                                                                                                                                                                           | `403`, naming the successor; never `423` (§H.6)                                                                                                                            |
   | Purged                                                                                                                                                                                                                                                                     | `410`                                                                                                                                                                      |
   | Rate limited, or a service behind, for longer than a client waits (§6.6, §B.5)                                                                                                                                                                                             | `503` with `Retry-After`                                                                                                                                                   |
-  | A core or service request the answer depends on fails (`408`, `429`, `5xx`, no connection, or no answer in time), a read of another namespace's documents or a write included; a failed read never counts as a refusal | `503` with `Retry-After` after a `429`, a `503` or no answer in time, else `502` |
+  | A core or service request the gateway makes for the user's request fails (`408`, `429`, `5xx`, no connection, or no answer in time), a read of another namespace's documents or a write included, whether or not the answer needed it; a failed read never counts as a refusal | `503` with `Retry-After` after a `429`, a `503` or no answer in time, else `502` |
   | A limit exceeded (the core's `413` or `422` with `code: "limit"`)                                                                                                                                                                                                          | `413`, in one shape: `too large: {limit} {measured} > {max} (§6.6): {message}`, a limit without sizes named alone, and a `413` that names no limit keeping the core's text |
   | A bound of the gateway's own (an upload buffer, a file-size setting, `blobSize` checked before an upload)                                                                                                                                                                  | `413` in the same shape, naming its setting, `measured` a lower bound where reading stopped                                                                                |
   | The gateway's own memory for scratch files or locks full (§H.6)                                                                                                                                                                                                            | `507`; bounds are generous                                                                                                                                                 |
+
+  A gateway's `502` and `503` name only the upstream that failed, the core or a service, and carry nothing of its answer, as §C.6 says of a service's `502`; the `503`'s `Retry-After` is the gateway's own.
 
 ## H.5 Deleting, renaming, moving and copying
 
@@ -688,9 +690,9 @@ A save follows §11.3, with these specifics:
 - **Across trees or namespaces:** when the item itself goes to another namespace, its last revision before the tombstone carries `$successor` (§8.1); a JSON file whose root isn't an object can't, and moves without one.
 - **Copy:** a new item with the source's current content, and a placement for it. A `COPY` onto an existing file (`Overwrite: T`) is instead a save into it, as for a move onto it.
   - A folder is copied, or moved to another tree, as a new folder node as `MKCOL` makes one, titled with the destination's last segment, without the source's `$access` (§B.11.3). Its visible children are then copied or moved into it one by one (`Depth: 0` copies the folder alone), and a moved folder is deleted once empty.
-  - A copy into the folder itself or a descendant of it is `403`. This is judged by the ancestry the user sees: the node documents, or for a grant that can't read them the tree service's `ancestors` (§B.5), `403` too where that reports a cut (`tooDeep` or `truncated`).
+  - A copy into the folder itself or a descendant of it is `403`, before anything is written. This is judged by the ancestry the user sees: the node documents, or for a grant that can't read them the tree service's `ancestors` (§B.5), `403` too where that reports a cut (`tooDeep` or `truncated`).
   - A gateway MAY refuse (`403`) to copy a folder that carries, sits under or holds `$access`, as a stricter policy (§B.11.4 Copies).
-  - A failure part-way leaves what was done, with no rollback, and is answered as that child's request would be.
+  - A failure part-way, such as a nested copy's `403` where `ancestors` reports a cut, leaves what was done, with no rollback, and is answered as that child's request would be.
   - A raw file's blob is copied with `Blob-From` where §7.8 allows it. Otherwise its bytes are uploaded again: decrypted with the reference's key from an `e2e` source, and encrypted under a fresh key, with a new id, into an `e2e` target (§E.3.1).
 
 ## H.6 Clients as they are
@@ -797,12 +799,12 @@ The proxy keeps each upstream response as one resource, in a namespace of its ow
 
 ## J.2 Writing
 
-1.  **Create** the resource with `If-None-Match: *` (§7.2), holding `upstream.method` and `"chunks": []`, before calling upstream. A `200` (the same create, retried) or a `412` means the stream exists: return it, and don't call upstream again. A `410` means it was removed.
+1.  **Create** the resource with `If-None-Match: *` (§7.2), holding `upstream.method` and `"chunks": []`, before calling upstream. A `200` (the same create, retried) or a `412` means the stream exists: return it, and don't call upstream again. An orphan, whose proxy died before calling upstream, ends `"timeout"` (Restarts). A `410` means it was removed.
 2.  **Call upstream.** Record `status` and `contentType` in the first append. An answer of any status, a `3xx` included and not followed, is kept with its body and closed `"complete"`. A call that gets no answer, is cut short or gets a body that isn't text closes with `"error"`; the proxy still answers its own caller as its protocol says.
 3.  **Append** each flush as one patch set adding to `/chunks/-`, with a fresh `$nonce` (§C.7) and `If-Match` on the proxy's last revision, so no append lands twice (§7.2).
 4.  **Close** with a last append that sets `closed`.
 
-- **Restarts.** Upstream can't be resumed. A proxy that restarts closes its open streams with `"error"`, and a stream with no append for a set time is closed by any proxy with `"timeout"`, the one carrying it included. A proxy that finds its stream closed by another cancels upstream and appends nothing more.
+- **Restarts.** Upstream can't be resumed. A proxy that restarts closes its open streams with `"error"`, and a stream with no append for the deployment's set time, one for all its proxies, is closed by any proxy with `"timeout"`, the one carrying it included. A proxy that finds its stream closed by another cancels upstream and appends nothing more.
 - **Pace.** Rate limits count by the proxy's principal (§6.6). Flush each stream at most every 200 ms, leaving room for aborts. `ratePerPrincipal` bounds how many streams the proxy carries at once; an allowance raises it. Callers' aborts, refused ones included, draw on the same buckets, so a caller can slow every stream; a proxy that can't accept this takes aborts itself and hands out `can: ["read"]`.
 - **The namespace log** records every append (§3.5), so keep `streams` apart from namespaces that consumers follow.
 
@@ -823,7 +825,7 @@ The proxy keeps each upstream response as one resource, in a namespace of its ow
 ## J.4 Abort, expiry and encryption
 
 - **Abort.** The caller appends `{ "op": "add", "path": "/abort", "value": true }`, with a fresh `$nonce` where the namespace requires one (§C.7, as `GET /ns/{ns}/principal` says) and `If-Match` on the head it last saw, and on `412` retries on the head the body gives. The proxy's next append then gets `412`, or the proxy sees the entry while following the log between chunks. It reads the new entries, never resending blindly, cancels upstream and closes with `"aborted"`. An abort after `closed`, or of any value but `true`, is ignored.
-- **Expiry.** The core deletes nothing by age, and retention prunes only history (§8.6). Every read grant of a stream has the same `exp`, counted from the stream's creation (its first log entry's `created`), also when a repeated request hands it out again. After it the proxy answers that request `410` and, once the stream is closed, purges it and its continuations (§8.3).
+- **Expiry.** The core deletes nothing by age, and retention prunes only history (§8.6). A stream's read grants have the `exp` counted from its creation (its first log entry's `created`), also when a repeated request hands one out again, or the proxy grant's own if earlier, which a narrowed grant never outlives (§C.2 item 1). After it the proxy answers that request `410` and, once the stream is closed, purges it and its continuations (§8.3).
 - **Encryption.** This design is for a `streams` namespace that is neither sealed nor end-to-end: keys are wrapped to the root block's `enc` (§E.2.3), so a narrowed grant opens nothing for the reader, and at E3 the abort rule can't be judged (§6.2).
 
 ## J.5 Shared sessions
