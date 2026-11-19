@@ -1264,6 +1264,35 @@ body is capped at 16 MiB and 50 files. The demo composes pass
 Run it with `./patchlog serve --dev` and open `http://localhost:8080/playground/`. Sealed and e2e
 namespaces need `--master-key FILE --master-key-create`.
 
+#### Playground on GitHub Pages
+
+The same page is published at **https://middle-management.github.io/patchlog/** by
+`.github/workflows/pages.yml` on every push to `main` that touches `internal/playground/static`.
+There it is standalone: it calls the server in the **Server** box of its top bar
+(`http://localhost:8080` until changed; `?server=URL` sets it too and makes a link to share), and
+that server has to allow the page's origin:
+
+```bash
+./patchlog serve --dev --cors-origin https://middle-management.github.io
+```
+
+or, for the compose stack, `PATCHLOG_CORS_ORIGINS=https://middle-management.github.io make up`.
+Until `GET /` answers, the page says so and shows the command for its own origin. Only the
+server's origin counts (the API is at its root), and a server on another port of `localhost` gets
+`--addr` in the suggested command. An HTTPS page can call plain `http://` on `localhost` only;
+any other server needs `https://`. Chrome may ask once whether the page may reach the local
+network.
+
+The page tells the two apart by its path: under `/playground/` it is the server's own and calls
+its origin, with the CSP header above; anywhere else it is standalone. The Pages copy carries the
+CSP as a meta tag, with `connect-src` open to `http:` and `https:` for the server it is pointed at.
+The tree and index proxies, the merge and schema-import planners and `selftest.json`'s vectors
+work as on the server (the vectors are the page's own file), and the namespaces, keys and boxes
+kept in localStorage belong to the Pages origin, shared by every server it is pointed at.
+
+To serve the copy yourself, any static file server will do, e.g. `python3 -m http.server -d
+internal/playground/static 8000` with `--cors-origin http://localhost:8000`.
+
 ### Undo and redo (§11.2)
 
 A client sends a `Gesture` with every write a user action produces (`client.NewGesture`,
@@ -4286,6 +4315,13 @@ The last row is the root: paste its path into a document's `$schema` (or another
 
 ### A short tour (dev mode)
 
+For how a client should cut its writes (small patch sets, gestures, retries, splitting large
+changes), when to work in a branch, and how to merge, squash and rebase, see the client guide
+[.claude/skills/patchlog-client/SKILL.md](.claude/skills/patchlog-client/SKILL.md), with branches and
+merging in [merging.md](.claude/skills/patchlog-client/merging.md) and each command mapped to its HTTP
+requests in [http.md](.claude/skills/patchlog-client/http.md). It is also a
+Claude Code skill: copy the folder into another project's `.claude/skills/` to use it there.
+
 The client commands call the public API (§7) through `internal/client`. Every write is
 conditional (§7.2), and they supply the precondition: `put` and `ns create` send
 `If-None-Match: *`, `patch` appends to the head it reads (trying again if another writer got
@@ -4917,7 +4953,13 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   while the read cache's meta counter (configuration, purges, prunes, restores, key destruction;
   on Postgres while the tailer is fresh) hasn't moved, and before the grant's earliest `exp`
   (since v0.78 a rule on `/now` never passes for a read, so it no longer matters here); edge
-  grants and resource long-polls are read on their own, as before. When it was first measured
+  grants and resource long-polls are read on their own, as before. A resource's long-polls and
+  event streams wait on the resource, not the namespace (`Engine.WaitResource`): they are woken
+  by commits naming it (a write, a batch item, a purge or a prune) and by entries that name no
+  resource (configuration changes, branches, namespace purges), not by writes to its other
+  resources. So a client following its own document doesn't read it again on every write to the
+  namespace; on Postgres the tailer wakes by resource too, from the `ns_log` entries it reads
+  ([docs/CAPACITY.md](docs/CAPACITY.md), "Resource followers"). When it was first measured
   ([docs/CAPACITY.md](docs/CAPACITY.md), "Earlier measurements") one write to 5,000 private followers went from 3.7–4.1 s
   of core CPU to 0.3–1 s. The local CDN's VCL lets a long-poll with credentials skip Varnish's
   waiting list (`hash_ignore_busy`), so a private one isn't held behind an identical request in
@@ -4925,7 +4967,12 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
 - **Live reads** (§7.3, §7.7, v0.73). A long-poll without a cursor, or with one behind by an
   hour's worth of intervals or less, is answered at once (`200`, or `204` with the current
   `X-Cursor`); one further behind is `400 bad_input`, which followers and `cmd/capacity` answer
-  by dropping the cursor and polling again. A long-poll or stream of a resource with no entries
+  by dropping the cursor and polling again. Each log's intervals are shifted by a phase drawn from
+  its path (the first 8 bytes of the SHA-256 of `/r/{ns}/{name}/log`, `/ns/{ns}/log` or
+  `/ns/{ns}/g/{gs}/log`, modulo the interval in milliseconds), so the waits of a deployment's
+  logs don't all end at one instant. §7.7 counts every log's from one epoch: `serve
+  --long-poll-fixed-epoch` does that (docs/SPEC-FEEDBACK.md, v0.85 Open 61). Followers of one URL
+  share its boundaries and cursors either way. A long-poll or stream of a resource with no entries
   waits for its first. A stream judges its read check again before each page and keep-alive,
   ends at the latest when the grant or cookie it was admitted under expires, and a namespace
   stream ends after its `purge-ns` event.

@@ -1,0 +1,71 @@
+{
+  "note": "cmd/capacity -only resource-live, 16 writers, 20 s, SQLite serve --dev on the 4-vCPU host: the same follower counts with every log's intervals from the epoch (--long-poll-fixed-epoch) and with per-log phases (the default)",
+  "8192": {
+    "fixed_epoch": {
+      "long_poll_answers": 8192,
+      "long_poll_errors": 0,
+      "origin_cores": 1.5081069804590057,
+      "origin_cpu_seconds": 30.17,
+      "own_write_delivered_ms": 1.502,
+      "write_errors": 0,
+      "writes": {
+        "max_ms": 1098.91,
+        "n": 32210,
+        "p50_ms": 6.806,
+        "p95_ms": 19.869,
+        "p99_ms": 24.066,
+        "per_second": 1610.0804057204034
+      }
+    },
+    "phase": {
+      "long_poll_answers": 8195,
+      "long_poll_errors": 0,
+      "origin_cores": 1.5271961488251504,
+      "origin_cpu_seconds": 30.550000000000004,
+      "own_write_delivered_ms": 1.286,
+      "write_errors": 0,
+      "writes": {
+        "max_ms": 99.837,
+        "n": 33086,
+        "p50_ms": 6.881,
+        "p95_ms": 20.634,
+        "p99_ms": 24.351,
+        "per_second": 1653.9709256965277
+      }
+    }
+  },
+  "12288": {
+    "fixed_epoch": {
+      "long_poll_answers": 12288,
+      "long_poll_errors": 0,
+      "origin_cores": 1.5542193557765918,
+      "origin_cpu_seconds": 31.089999999999996,
+      "own_write_delivered_ms": 1.237,
+      "write_errors": 0,
+      "writes": {
+        "max_ms": 1523.082,
+        "n": 31292,
+        "p50_ms": 6.619,
+        "p95_ms": 20.276,
+        "p99_ms": 25.667,
+        "per_second": 1564.3175323564205
+      }
+    },
+    "phase": {
+      "long_poll_answers": 12292,
+      "long_poll_errors": 0,
+      "origin_cores": 1.593491617294568,
+      "origin_cpu_seconds": 31.880000000000003,
+      "own_write_delivered_ms": 1.044,
+      "write_errors": 0,
+      "writes": {
+        "max_ms": 50.661,
+        "n": 33383,
+        "p50_ms": 6.953,
+        "p95_ms": 20.28,
+        "p99_ms": 24.57,
+        "per_second": 1668.6176493144465
+      }
+    }
+  }
+}

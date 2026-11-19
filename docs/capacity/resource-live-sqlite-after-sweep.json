@@ -1,0 +1,89 @@
+{
+  "origin_vmhwm_mb": 1182.80078125,
+  "origin_vmrss_mb": 1136.3046875,
+  "profile": "public",
+  "resource_long_poll_writes": {
+    "0": {
+      "long_poll_answers": 0,
+      "long_poll_errors": 0,
+      "origin_cores": 1.448273701745455,
+      "origin_cpu_seconds": 28.98,
+      "write_errors": 0,
+      "writes": {
+        "max_ms": 44.048,
+        "n": 38444,
+        "p50_ms": 6.192,
+        "p95_ms": 17.214,
+        "p99_ms": 20.065,
+        "per_second": 1921.2365144893813
+      }
+    },
+    "2048": {
+      "long_poll_answers": 2048,
+      "long_poll_errors": 0,
+      "origin_cores": 1.4402209065035891,
+      "origin_cpu_seconds": 28.810000000000002,
+      "own_write_delivered_ms": 1.355,
+      "write_errors": 0,
+      "writes": {
+        "max_ms": 280.861,
+        "n": 36152,
+        "p50_ms": 6.228,
+        "p95_ms": 18.574,
+        "p99_ms": 21.849,
+        "per_second": 1807.2497817395958
+      }
+    },
+    "4096": {
+      "long_poll_answers": 4096,
+      "long_poll_errors": 0,
+      "origin_cores": 1.4387523043826378,
+      "origin_cpu_seconds": 28.789999999999992,
+      "own_write_delivered_ms": 1.276,
+      "write_errors": 0,
+      "writes": {
+        "max_ms": 527.089,
+        "n": 33378,
+        "p50_ms": 6.615,
+        "p95_ms": 19.883,
+        "p99_ms": 25.274,
+        "per_second": 1668.0331509442065
+      }
+    },
+    "8192": {
+      "long_poll_answers": 8192,
+      "long_poll_errors": 0,
+      "origin_cores": 1.5100280341692989,
+      "origin_cpu_seconds": 30.210000000000008,
+      "own_write_delivered_ms": 1.285,
+      "write_errors": 0,
+      "writes": {
+        "max_ms": 1087.238,
+        "n": 33357,
+        "p50_ms": 6.462,
+        "p95_ms": 19.415,
+        "p99_ms": 23.144,
+        "per_second": 1667.3288691090795
+      }
+    },
+    "seconds": 20,
+    "writers": 16,
+    "12288": {
+      "long_poll_answers": 12288,
+      "long_poll_errors": 0,
+      "origin_cores": 1.5895285628362181,
+      "origin_cpu_seconds": 31.799999999999997,
+      "own_write_delivered_ms": 1.359,
+      "write_errors": 0,
+      "writes": {
+        "max_ms": 1683.088,
+        "n": 34178,
+        "p50_ms": 6.238,
+        "p95_ms": 18.14,
+        "p99_ms": 22.266,
+        "per_second": 1708.393308824411
+      }
+    }
+  },
+  "note": "0-8192 from one server (its 16384 round dropped: the harness held the earlier rounds idle connections and hit the host 20,000 open-file cap); 12288 from a fresh server"
+}

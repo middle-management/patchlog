@@ -13,6 +13,7 @@
 <header class="top">
   <div class="brand">Patch Log <span>playground</span></div>
   <div class="conn">
+    <label id="serverBox" hidden title="The patchlog server this page calls. It must allow this page's origin: serve --cors-origin">Server <input id="server" class="mono" placeholder="http://localhost:8080" autocomplete="off" spellcheck="false"></label>
     <label>Author <input id="author" class="mono" placeholder="alice  (X-Author, serve --dev)" autocomplete="off" spellcheck="false"></label>
     <label>Bearer grant <input id="bearer" class="mono" type="password" placeholder="optional token" autocomplete="off" spellcheck="false"></label>
     <span id="origin" title="GET / response"></span>
@@ -23,6 +24,8 @@
   </div>
   <button id="inspToggle" aria-expanded="false" aria-controls="inspector" title="Show or hide the request inspector">Inspector <span id="inspCount" class="badge">0</span></button>
 </header>
+
+<div id="connHelp" class="warn-box conn-help" hidden></div>
 
 <div class="ctx">
   <div class="grp">
