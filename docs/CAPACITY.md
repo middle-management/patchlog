@@ -41,8 +41,8 @@ under [Earlier measurements](#earlier-measurements) and
 - **A long history doesn't slow a document down**, measured up to 100,000 revisions. See
   [Long histories](#long-histories).
 - **Waiting devices cost the database nothing.** Each long-polling its own resource, 120,000
-  devices on three `c7g.xlarge` cores and a 2-vCPU RDS were answered from memory, with no change
-  in delivery or database CPU from 15,000 up. See [Resource followers](#resource-followers).
+  devices on three `c7g.xlarge` cores and a 2-vCPU RDS were answered from memory, with
+  delivery and database CPU the same as at 15,000. See [Resource followers](#resource-followers).
 
 ## Contents
 
@@ -266,204 +266,83 @@ For followers that reach the origin:
 
 ### Resource followers
 
-**A follower of one resource costs nothing while its resource is quiet**, however busy the
-rest of its namespace is.
+**A device that long-polls its own resource (§7.7), as one waits for the result of a workflow
+run it started, costs the database nothing while the resource is quiet, and about 60 KB of a
+core's memory.** As of 2026-11-19, three cores sharing a 2-vCPU Postgres held 120,000 such
+devices with delivery and database CPU the same as at 15,000. That was the largest load
+measured, not a limit.
 
-Until 2026-11-19 a resource long-poll (`GET /r/{ns}/{name}/log?live=long-poll`) or event stream
-waited on its namespace's channel. Every write to the namespace woke it, and it read its
-resource's log again, found nothing and waited on. Resource long-polls aren't shared like the
-namespace's ([Origin-side collapse](#origin-side-collapse)), and a CDN can't collapse them,
-since each follower's URL is its own. The cost was **followers × namespace writes a second**.
+What a follower costs:
 
-A workflow-runner prototype hit this. Each client long-polled its own run document while a
-coordinator wrote 500–1,400 times a second to the same namespace (SQLite `serve --dev`,
-4 vCPU):
+- **Writes to other resources don't touch it.** A resource long-poll or event stream is woken
+  only by commits naming its resource (a write, a batch item, a purge, a prune) and by those
+  that concern the whole namespace (a configuration change, a branch, a namespace purge)
+  (`Engine.WaitResource`; on Postgres the tailer wakes by resource too).
+- **Its re-polls are answered from memory.** A follower asks again at each interval boundary,
+  devices ÷ 20 requests a second. A long-poll from its resource's head is answered without a
+  transaction while nothing that could change the answer has happened
+  (`Engine.ResourceLiveLog`; README, "Long-poll reads are shared"). Only its first request,
+  and a write to its resource, read the database.
+- **Boundaries are spread out.** Each log's long-poll intervals have a phase of their own
+  (§7.7), so followers of different resources don't all ask at once.
 
-- at 256 clients, throughput fell from 61 to 4.8 runs a second, write p50 rose to about 10 s,
-  and the core used 3.2 cores;
-- at 1,024 clients the run didn't finish in 150 s.
+**On AWS** (`deploy/ec2-devices.sh`, eu-west-1):
 
-Now each resource has its own waiters (`Engine.WaitResource`):
-
-- **What wakes them:** a commit whose namespace entry names the resource (a write, a batch
-  item, a purge, a prune), or an entry that names no resource (a configuration change, a
-  branch, a namespace purge). The second kind wakes every waiter of the namespace.
-- **On Postgres**, the tailer wakes by resource as well, from the `ns_log` rows it reads. It
-  takes a batch's items from the batch's body.
-
-**Measured** with `cmd/capacity -only resource-live`. N followers each long-poll a resource of
-their own, while 16 writers append to 16 other resources of the same namespace, as fast as
-they can, for 20 s. The setup was the 4-vCPU host, no containers, the harness on the same host,
-and `serve --dev` with the namespace's rates raised. SQLite was a file. Postgres 16 shared the
-host (`fsync=off`).
-
-| Followers | Before: writes/s | Before: write p50 / p99 | Before: core CPU | After: writes/s | After: write p50 / p99 | After: core CPU |
-|---|---|---|---|---|---|---|
-| SQLite, 256 | 45 | 338 ms / 1.6 s | 3.1 cores | **1,798** | 6.4 / 22 ms | 1.4 cores |
-| SQLite, 1,024 | 12 | 1.25 s / 2.2 s | 3.3 cores | **1,746** | 6.5 / 24 ms | 1.4 cores |
-| Postgres, 256 | 269 | 57 / 131 ms | 1.7 cores | **1,660** | 9.2 / 16 ms | 1.0 cores |
-| Postgres, 1,024 | 70 | 199 / 663 ms | 1.7 cores | **1,277** | 11.8 / 22 ms | 0.8 cores |
-
-How to read the table:
-
-- **Core CPU** is the core process alone. On Postgres the database took the rest of the host,
-  which is why the "before" core stops at 1.7 cores.
-- **Before**, the core spent its CPU re-reading logs that hadn't changed, and writes queued
-  behind it. Throughput fell with every follower added.
-- **After**, throughput and latency are the same at 256 and at 1,024 followers. The CPU is the
-  writes' own.
-- **A write to a follower's own resource** reached it in 1–15 ms on both databases, against
-  37–252 ms before.
-- **Each follower got one answer** in every run: the 204 at the long-poll interval's boundary
-  (§7.7), which every 20 s window crosses. Unrelated writes caused no answers before or after;
-  they caused reads.
-
-The raw results are `docs/capacity/resource-live-*.json`.
-
-**How far it goes.** The same run on SQLite, with the follower count swept on one server and
-12,288 on a fresh one:
-
-| Followers | Writes/s | Write p50 / p99 | Write max | Core CPU |
-|---|---|---|---|---|
-| 0 | 1,921 | 6.2 / 20 ms | 44 ms | 1.45 cores |
-| 2,048 | 1,807 | 6.2 / 22 ms | 0.28 s | 1.44 cores |
-| 4,096 | 1,668 | 6.6 / 25 ms | 0.53 s | 1.44 cores |
-| 8,192 | 1,667 | 6.5 / 23 ms | 1.09 s | 1.51 cores |
-| 12,288 | 1,708 | 6.2 / 22 ms | 1.68 s | 1.59 cores |
-
-- **No cliff up to 12,288 followers.** Throughput stays within 1,650–1,810 writes/s (1,746 at
-  1,024 in the table above). The 16 writers alone reach 1,921, which is the ceiling here: the
-  harness shares the core's 4 vCPU. Quiet followers cost the core almost no CPU.
-- **What grew was the worst write, about 0.13 ms per follower.** This sweep counted every log's
-  intervals from one epoch, as §7.7 says. At each boundary every follower was answered 204 at
-  once and polled again at once: a burst of one request per follower, which the writes queued
-  behind. p99 didn't move, because this happened once per 20 s window. Per-log phases, below,
-  remove it.
-- **Past ~12k the host is the limit, not patchlog.** The core and the harness each hold one
-  socket per follower, and the host caps a process at 20,000 open files. At 16,384 both ran out:
-  the core couldn't accept connections or open the SQLite file. A larger fleet needs a raised
-  `nofile` limit on the core, and followers on more than one client host.
-
-The sweep is `docs/capacity/resource-live-sqlite-after-sweep.json`.
-
-**Per-log phases.** The core shifts each log's interval boundaries by a phase drawn from the
-log's path (§7.7 as of spec v0.86). Followers of one URL still share their boundaries, so a CDN
-still collapses them, but different resources' boundaries spread over the interval. The same
-run, with every log's intervals counted from one epoch, as spec v0.85 had it (measured with
-`serve --long-poll-fixed-epoch`, an option that existed until v0.86 made the phase the rule), and
-with phases:
-
-| Followers | Fixed epoch: writes/s, worst write | Per-log phase: writes/s, worst write |
-|---|---|---|
-| 8,192 | 1,610, 1.10 s | 1,654, **100 ms** |
-| 12,288 | 1,564, 1.52 s | 1,669, **51 ms** |
-
-With phases, the worst write at 12,288 followers is that of no followers at all (44 ms), and p50
-and p99 are unchanged (6.6–7.0 ms, 24–26 ms). The runs are in
-`docs/capacity/resource-live-sqlite-phase.json`.
-
-**Across machines, on AWS: Postgres's CPU is the limit, at 45,000–60,000 waiting devices.**
-`deploy/ec2-devices.sh`, run once on 2026-11-19 in eu-west-1 (commit 7379385):
-
-- **Setup:** three cores (`c7g.xlarge`) sharing an RDS `db.m7g.large` (2 vCPU), and three load
-  generators of their own.
+- **Setup:** three `c7g.xlarge` cores (4 vCPU, 8 GB) sharing an RDS `db.m7g.large` (2 vCPU),
+  and three load generators of their own.
 - **Load:** devices were added 15,000 a step, each long-polling a resource of its own. Each
-  step ran 90 s. It had 150 writes a second to random devices' resources, and 300 others to the
-  same namespace.
-
-The table is the run's `summary.txt` (`deploy/devices-summary.py`), as are the others below.
-
-| Devices | Completions/s | Delivery p50 / p99 | Long-polls/s | Cores' CPU | RDS CPU |
-|---|---|---|---|---|---|
-| 15,000 | 145.2 | 64 / 162 ms | 896 | 0.45 + 0.14 + 0.14 | 64% |
-| 30,000 | 140.4 | 69 / 204 ms | 1,639 | 0.51 + 0.24 + 0.24 | 89% |
-| 45,000 | 111.7 | 87 / 323 ms | 2,364 | 0.52 + 0.34 + 0.32 | 97% |
-| 60,000 | 38.6 | 139 / 949 ms | 3,044 | 0.51 + 0.43 + 0.41 | 99% |
-| 75,000 | 0.1 | 35 / 65 s | 3,668 | 0.46 + 0.49 + 0.50 | 100% |
-| 120,000 | 0.0 | 82 / 165 s | 3,677 | 0.46 + 0.50 + 0.48 | 98% |
-
-- **Completions** are the writes to devices' resources (150 a second asked); the 300 background
-  writes a second aren't in the summary.
-- **Long-polls** are mostly re-polls: the 204s at each device's interval boundary (§7.7) and the
-  requests that follow them, devices ÷ 20 a second, plus the completions' wake-ups. Every
-  long-poll request read its resource's log in a transaction (`Engine.ResourceLog`) before it
-  waited, even when nothing had changed.
-- **RDS ran out first.** Its CPU went from 64% to 89% as about 740 more long-polls a second
-  arrived, about 0.65 ms of a vCPU each. Long-polls stopped growing at about 3,670 a second, and
-  completions then queued behind them for a minute or more.
-- **The cores had room.** They used 0.5 of 4 cores each, about 58 KB of memory per device
-  (2.3 GB at 40,000), and held 40,000 connections each without errors. At 90,000 devices and
-  more, some devices' requests timed out on the client (two minutes), behind the database.
-- **What would move the limit:**
-  - a larger database, in proportion to its CPU;
-  - answering a re-poll without a transaction when the resource hasn't changed since `since`
-    (done since: below);
-  - a longer long-poll interval: each doubling halves the re-polls, but the interval isn't
-    configurable.
-
-The run's files are in `docs/capacity/devices-aws-2026-11-19/`.
-
-**Quiet resources: a re-poll from the head costs no transaction.** A long-poll read that ends
-at its resource's head is now remembered, and a later long-poll from that head is answered from
-memory while nothing that could change its answer has happened (`Engine.ResourceLiveLog`; README,
-"Long-poll reads are shared"). Measured with `cmd/devicebench` on the 4-vCPU host: 15,000
-devices each long-polling their own resource of a public namespace for 60 s, one core
-(`serve --dev`, pinned to one vCPU) on Postgres 16 (two vCPUs), the load generator on the
-fourth.
-
-| Load | Before: core / Postgres CPU | After: core / Postgres CPU | Delivery p50 / p99, before → after |
-|---|---|---|---|
-| Waiting only (750 re-polls/s) | 0.42 / **0.26** cores | 0.16 / **0** cores | — |
-| With 50 writes/s to devices and 200 others | 0.66 / 0.72 cores | 0.46 / 0.48 cores | 8.7 / 51 → 7.4 / 24 ms |
-
-- **A waiting device now costs the database nothing.** Before, the 750 re-polls a second took
-  0.26 cores of Postgres, about 0.35 ms each; after, none. What remains is the writes' own cost.
-- **On AWS that cost was the limit** (above): RDS ran out at about 3,600 re-polls a second.
-
-**On AWS again, the limit didn't move at first.** The same `deploy/ec2-devices.sh` run with
-quiet resources (commit 59127e4, on the database of the first run; files in
-`docs/capacity/devices-aws-2026-11-19-quiet/`) kept completions up for longer, but still broke
-at 75,000 devices. The three runs side by side, each cell completions/s, delivery p99 and RDS
-CPU from its `summary.txt`:
-
-| Devices | Before (7379385) | Quiet, 300 ms bound (59127e4) | Quiet, 5 s bound (11a9207) |
-|---|---|---|---|
-| 15,000 | 145.2, 162 ms, 64% | 148.5, 150 ms, 50% | 145.7, 189 ms, 68% |
-| 30,000 | 140.4, 204 ms, 89% | 144.7, 204 ms, 81% | 145.8, 189 ms, 70% |
-| 45,000 | 111.7, 323 ms, 97% | 142.4, 204 ms, 82% | 147.0, 189 ms, 68% |
-| 60,000 | 38.6, 949 ms, 99% | 79.8, 257 ms, 97% | 147.2, 189 ms, 68% |
-| 75,000 | 0.1, 65 s, 100% | 0.1, 76 s, 91% | 146.6, 189 ms, 68% |
-| 90,000 | 0.1, 71 s, 100% | 0.0, —, 100% | 145.5, 204 ms, 70% |
-| 120,000 | 0.0, 165 s, 98% | 0.0, 76 s, 100% | 146.9, 189 ms, 68% |
-
-Quiet answers then also required the tailer to be fresh: its last successful poll started
-within `freshFor` (300 ms). Reproduced with three cores on one Postgres vCPU, a busy database
-made polls slow enough to fail that check now and then, and every re-poll in such a window was
-read: 96–430 times a server in 40 s at 18,000 devices, none with a 5 s bound. On RDS, with
-40,000 devices a core, each such window sends thousands of reads to the database, which slows
-the next poll: a loop that grows with the devices. Quiet answers now need the tailer to have
-polled within a quarter of the long-poll interval, and `patchlog.longpoll.resource.reads`
-counts each read by answer, which the summary shows per step.
-
-**With that, 120,000 waiting devices cost the database nothing** (commit 11a9207, the same setup
-and database; files in `docs/capacity/devices-aws-2026-11-19-fresh/`):
+  step had 90 s of 150 completions a second (writes to random devices' resources) and a
+  background writer of up to 300 writes a second to the same namespace.
 
 | Devices | Completions/s, delivered | Delivery p50 / p99 | Long-polls/s: memory / read / stale | Cores' CPU | Cores' memory | RDS CPU |
 |---|---|---|---|---|---|---|
 | 15,000 | 145.7, 99.9% | 81 / 189 ms | 887 / 202 / 0 | 0.36 + 0.07 + 0.07 | 351–366 MB | 68% |
+| 30,000 | 145.8, 99.9% | 87 / 189 ms | 1,644 / 194 / 0 | 0.40 + 0.11 + 0.11 | 662–710 MB | 70% |
 | 60,000 | 147.2, 100% | 81 / 189 ms | 3,145 / 196 / 0 | 0.47 + 0.16 + 0.16 | 1.2–1.3 GB | 68% |
+| 90,000 | 145.5, 100% | 87 / 204 ms | 4,643 / 194 / 0 | 0.53 + 0.22 + 0.22 | 1.8–2.1 GB | 70% |
 | 120,000 | 146.9, 100% | 81 / 189 ms | 6,144 / 196 / 0 | 0.60 + 0.28 + 0.28 | 2.3–2.6 GB | 68% |
 
-- **No step broke.** Every completion reached its device at the same latency from 15,000 devices
-  to 120,000, without an error. The run ended at its last step, not at a limit.
-- **The database's load is the writes'.** RDS stayed at 68–70% (the completions and the
-  background writes) at every step. Re-polls were answered from memory, 6,144 a second at 120,000 devices; reads stayed
-  at about 196 a second, the completions' wake-ups (twice on the writing core, whose tailer wakes
-  its own commits' followers again). None was stale.
-- **A waiting device costs a core about 60 KB and little CPU.** The cores that took no writes
-  used 0.28 of 4 vCPUs at 40,000 devices each. By memory, a `c7g.xlarge` (8 GB) would hold
-  about 100,000; more devices need more cores, not a larger database.
-- **Not reached:** a core's own limit, and connections past 40,000 a core.
+- **The figures are the run's `summary.txt`** (`deploy/devices-summary.py`).
+- **The database's load is the writes'.** RDS stayed at 68–70% at every step.
+  - Long-polls were answered from memory: 6,144 a second at 120,000 devices.
+  - Reads stayed at about 196 a second, the completions' wake-ups. A completion is read twice
+    on the core that wrote it, whose tailer wakes its own commits' followers again.
+  - None was stale (read because the tailer was behind).
+- **A waiting device costs a core about 60 KB and little CPU.** The first core also took every
+  write. The other two used 0.28 of 4 vCPUs at 40,000 devices each.
+- **Delivery** from a completion's write to its device took 81 ms at p50 and 189 ms at p99,
+  including the hop from the writing core to the others through the tailer.
+
+**On one host** (`cmd/capacity -only resource-live`, 4 vCPU, the harness on the same host,
+`serve --dev`): N followers each long-poll a resource of their own while 16 writers append to
+16 other resources of the namespace as fast as they can, for 20 s. SQLite was a file; Postgres
+16 shared the host (`fsync=off`).
+
+| Followers | Writes/s | Write p50 / p99 | Worst write | Core CPU |
+|---|---|---|---|---|
+| SQLite, 0 | 1,921 | 6.2 / 20 ms | 44 ms | 1.45 cores |
+| SQLite, 1,024 | 1,746 | 6.5 / 24 ms | — | 1.4 cores |
+| SQLite, 12,288 | 1,669 | 6.6–7.0 / 24–26 ms | 51 ms | — |
+| Postgres, 1,024 | 1,277 | 11.8 / 22 ms | — | 0.8 cores |
+
+- **Followers don't slow writes.** The 16 writers alone reach 1,921 a second, the ceiling of
+  a host they share with the core.
+- **A write to a follower's own resource** reaches it in 1–15 ms.
+- **15,000 waiting devices with no writes** (`cmd/devicebench`, one core on Postgres) cost
+  Postgres no CPU and the core 0.16 cores.
+
+**Limits:**
+
+- **Memory.** About 60 KB a waiting device, so a core with 8 GB holds about 100,000 (estimated,
+  not measured). More devices need more cores, not a larger database.
+- **Open files.** A core holds one socket a follower: give it a `nofile` limit above its
+  followers. `deploy/ec2-devices.sh` raises it to 1,048,576.
+- **Not reached:** a core's own limit, connections past 40,000 a core, and the database's
+  share of more than three cores' wake-ups.
+
+The files are in `docs/capacity/devices-aws-2026-11-19-fresh/` (AWS) and
+`docs/capacity/resource-live-sqlite-after-*.json`, `resource-live-pg-after-1024.json` and
+`resource-live-sqlite-phase.json` (one host).
 
 ## Large documents, by shape and schema
 

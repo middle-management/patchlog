@@ -1,6 +1,0 @@
-i-06118696137775c3a  bw_in_allowance_exceeded: 0  bw_out_allowance_exceeded: 0  pps_allowance_exceeded: 0  conntrack_allowance_exceeded: 0  linklocal_allowance_exceeded: 0
-i-0f7faeda09aa20830  bw_in_allowance_exceeded: 0  bw_out_allowance_exceeded: 0  pps_allowance_exceeded: 0  conntrack_allowance_exceeded: 0  linklocal_allowance_exceeded: 0
-i-02e3268a425763270  bw_in_allowance_exceeded: 0  bw_out_allowance_exceeded: 0  pps_allowance_exceeded: 0  conntrack_allowance_exceeded: 0  linklocal_allowance_exceeded: 0
-i-075951d72a3eb7c73  bw_in_allowance_exceeded: 0  bw_out_allowance_exceeded: 0  pps_allowance_exceeded: 0  conntrack_allowance_exceeded: 0  linklocal_allowance_exceeded: 0
-i-0782db17b6458d1ce  bw_in_allowance_exceeded: 0  bw_out_allowance_exceeded: 0  pps_allowance_exceeded: 0  conntrack_allowance_exceeded: 0  linklocal_allowance_exceeded: 0
-i-0bfb5a47a608cd10b  bw_in_allowance_exceeded: 0  bw_out_allowance_exceeded: 0  pps_allowance_exceeded: 0  conntrack_allowance_exceeded: 0  linklocal_allowance_exceeded: 0
