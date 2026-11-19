@@ -2,10 +2,7 @@ package index_test
 
 import (
 	"context"
-	"io"
 	"net/http"
-	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,18 +28,25 @@ import (
 // with the cookies' keys it had, and mods.
 func v86Restart(d *v77docs, ns []string, rebuild bool, mods ...func(*indexOpts)) {
 	d.t.Helper()
-	db := d.x.dbPath
-	d.x.stop()
-	ev := must(edge.New([]byte("s3cret"), "", ""))
-	d.x = startSvcWith(d.t, d.s.Client(d.t, client.WithBearer(d.admin.Grant(d.t, d.s.Now(), "svc:indexer", ns, []string{"read"}))),
-		svcOpts{db: db, ns: ns, untyped: true, rebuild: rebuild, now: d.s.Now},
-		append([]func(*indexOpts){func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
-		}}, mods...)...)
+	v86Start(d, ns, svcOpts{rebuild: rebuild}, mods...)
 	for _, n := range ns {
 		d.x.caughtUp(n)
 	}
 	d.x.ix.ExpireGrantChecks()
+}
+
+// v86Start is v86Restart without the wait, with o's rebuild and noRun: an
+// index that isn't run serves, and exchanges, where its database stands.
+func v86Start(d *v77docs, ns []string, o svcOpts, mods ...func(*indexOpts)) {
+	d.t.Helper()
+	db := d.x.dbPath
+	d.x.stop()
+	ev := must(edge.New([]byte("s3cret"), "", ""))
+	d.x = startSvcWith(d.t, d.s.Client(d.t, client.WithBearer(d.admin.Grant(d.t, d.s.Now(), "svc:indexer", ns, []string{"read"}))),
+		svcOpts{db: db, ns: ns, untyped: true, rebuild: o.rebuild, noRun: o.noRun, now: d.s.Now},
+		append([]func(*indexOpts){func(o *indexOpts) {
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+		}}, mods...)...)
 }
 
 // v86Config appends one config entry of ops to ns's document, the index
@@ -242,25 +246,12 @@ func v86Exchange(d *v77docs, tok string) (string, []*http.Cookie) {
 	return r.body["prefixes"].([]any)[0].(string), r.cookies
 }
 
-// v86Stall answers the index's reads of namespace logs 503 while on, so
-// that its followers stay where they are, and passes the rest on: the
-// grant checker still reads the documents at the heads.
-type v86Stall struct{ on atomic.Bool }
-
-func (f *v86Stall) RoundTrip(r *http.Request) (*http.Response, error) {
-	if f.on.Load() && strings.HasPrefix(r.URL.Path, "/ns/") && (strings.HasSuffix(r.URL.Path, "/log") || strings.HasSuffix(r.URL.Path, "/events")) {
-		return &http.Response{StatusCode: 503, Header: http.Header{"Content-Type": {"application/json"}, "Retry-After": {"0"}}, Request: r,
-			Body: io.NopCloser(strings.NewReader(`{"code":"unavailable","message":"stalled"}`))}, nil
-	}
-	return transport.RoundTrip(r)
-}
-
 // TestV086CookieMintedBehindOutlivesBacklog (SERVICES §B.11.9 gs, v0.86:
 // "Once an entry after its exchange changes one of them, the cookie is
 // 403 from that entry on"): only entries after the exchange count. The
 // index is behind by three config entries, each of which changes k1; li
 // exchanges, her grant verified against the document at the head; the
-// index then applies the backlog, a batch at a time or all in one. Her
+// index then applies the backlog. Her
 // cookie holds: those entries are from before her exchange. The next
 // change to k1 ends it, and its undo doesn't bring it back. Without the
 // position kept with the cookie's row, the first document of the backlog
@@ -288,26 +279,25 @@ func TestV086CookieMintedBehindOutlivesBacklog(t *testing.T) {
 			} else {
 				d = newV82Whole(t)
 			}
-			stall := &v86Stall{}
-			v86Restart(d, nss, false, func(o *indexOpts) { o.Client = o.Client.With(client.WithHTTPClient(&http.Client{Transport: stall})) })
-			was := d.x.ix.Checkpoint("docs")
-			stall.on.Store(true)
+			// The index is stopped, docs moves on, and the index serves
+			// again without following: behind by the backlog.
+			d.x.stop()
 			for _, op := range backlog {
 				v86Config(d, "docs", op)
 			}
-			d.x.ix.ExpireGrantChecks()
-			prefix, c := v86Exchange(d, v86GrantFor(d, ns))
-			if got := d.x.ix.Checkpoint("docs"); got != was {
-				t.Fatalf("the index moved to %s while stalled at %s: the test shows nothing", got, was)
+			v86Start(d, nss, svcOpts{noRun: true})
+			was := d.x.ix.Checkpoint("docs")
+			if head := must(d.w.NSHead(context.Background(), "docs")).ID; was == head || was == "" {
+				t.Fatalf("the index, not run, is at %q and docs at %s: the test shows nothing", was, head)
 			}
+			prefix, c := v86Exchange(d, v86GrantFor(d, ns))
 			status := func() int {
 				t.Helper()
 				r, _ := p37Follow(t, d.x, prefix+"?q=word", c, "")
 				return r.status
 			}
-			stall.on.Store(false)
-			d.x.caughtUp("docs")
-			d.x.ix.ExpireGrantChecks()
+			// It follows again, and applies the backlog.
+			v86Restart(d, nss, false)
 			if got := status(); got != 200 {
 				t.Fatalf("li under the cookie minted against the head, once the index applied the %d config entries before it: %d, want 200", len(backlog), got)
 			}
