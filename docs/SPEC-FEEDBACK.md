@@ -21,9 +21,9 @@ documents, bundles and the gateway (29–39), vectors (40), playground (41), ind
 and validation (43–54), listings, refusals and the branch limits (55–60) and long-poll
 intervals (61–64).
 Sections are SPEC.md's unless TOOLS.md is named; Addenda A and B and §E.2.6 are in SERVICES.md.
-CONFORMANCE numbers its scenarios 83–96 in two groups: "Encryption scenario n" is one under
-"Encryption levels and epochs", "Grant scope scenario n" one under "Grant scope"; a bare
-scenario number above 100 is under "Tree-derived access".
+Scenario numbers repeat across CONFORMANCE's groups; here "Encryption scenario n" is one under
+"Encryption levels and epochs", "Grant scope scenario n" one under "Grant scope", and a bare
+scenario number, all above 100, one under "Tree-derived access".
 
 64 are open: 48 from this version's work and 16 carried.
 
@@ -98,9 +98,9 @@ scenario number above 100 is under "Tree-derived access".
     "`403` from that entry on": readers of one `gs` share a record, and a cookie carries only
     its prefix and expiry. While the record stands the origin is exact, `403` from the changing
     entry on and served at an `at` before it. Once any reader exchanges after the change,
-    earlier cookies are `403` at every `at`, as is one from the same second as the last before
-    the change, the new cookie is `403` at an `at` from before the change, and paging in flight
-    there is stranded. The index ends a cookie at every `at` at once. For a branch the
+    earlier cookies are `403` at every `at`, those before the change included, as is one from
+    the same second as the last before the change, and paging in flight at an earlier `at` is
+    stranded. The index ends a cookie at every `at` at once. For a branch the
     reference takes the effective key's source entry, the base's current entry where the base
     has that `kid`. *Question:* must a cookie stay readable at an earlier `at`, or is a `302`
     to the current one meant; which document's entry counts for a branch, and is a `kid` the
@@ -365,7 +365,7 @@ the area named:
   Changed, for the clause that came with 2's answer: a client holds a branch at least at the
   level it holds for any base in its local chain, and a holder of `sealed` refuses a plaintext
   `200` (`TestV086BranchHeldAtBasesLevel`, `TestV086SealedHolderRefusesPlaintext`; the
-  playground alike). Left: v0.86 Open 1–4, 8.
+  playground alike). New: v0.86 Open 1–4, 8.
 - **The foreign parent** (4, 39): a reader that can't place it accepts no base's `ns` (4), and
   §G.4.1 defines it as the resource's head as the branch's own `/heads` lists it at the
   branch's first `ns_id` (39). Changed, both. The Go client and the playground place the fork
@@ -374,7 +374,7 @@ the area named:
   (`TestV086UnplaceableForeignParentFailsClosed`, `TestV086ForkUnplacedWithNode`). The
   exporter reads the branch's own `/heads` and nothing in the base, so a branch of a remote
   base exports like a local one (`TestV086ForeignParentFromBranchHeads`,
-  `TestV086ForeignParentRemoteBase`). Left: v0.86 Open 5–7.
+  `TestV086ForeignParentRemoteBase`). New: v0.86 Open 5–7.
 - **Derived views and previews** (8, 9, 10, 11, 47): at E2 a service takes a pending head's
   epoch from the `kid` of the revision as the origin serves it, the sentence proposed (8;
   `TestV085E2EpochFromOriginSealing`). A value from a namespace that is neither sealed nor
@@ -386,7 +386,7 @@ the area named:
   item's namespace in that one's local `base` chain, and shows the entry by name only
   otherwise (47). 8 to 11 as the reference had them. Changed for 47: the playground follows
   the chain for an entry's own seal too, where it looked one level up
-  (`TestV086PlaygroundPreviewChainWithNode`). Left: v0.86 Open 41.
+  (`TestV086PlaygroundPreviewChainWithNode`). New: v0.86 Open 41.
 - **No clause in federation and stored data** (12, 13): a cross-draft remote branch's `502` is
   §12.1's, and re-sealed rows with their old `ETag` are data of an earlier draft; both are the
   implementation's. Left open: 14 (v0.86 Open 9).
@@ -417,16 +417,17 @@ the area named:
   Grant scope scenario 85). A catalog service takes the caller's `sub` and groups from the
   base grant as the catalog namespace's keys verify it (27, §B.11.6 Whose claims;
   `TestV086ClaimsFromTheCatalogsKeysAlone`), and where "reads nowhere" turns on a chain it
-  can't read it answers `502` or `503` (28; `TestV086CallersGrantChainUnread`). The index, the
-  tree service and the catalog service had all three (`TestV086OperatorGrantAtTheIndex`,
-  `…AtTheTreeService`, `…AtTheCatalogService`). Changed: the stream proxy answers `401` to an
+  can't read it answers `502` or `503` (28; `TestV086CallersGrantChainUnread`). The catalog
+  service had 27 and 28, and the index, the tree service and the catalog service answered an
+  operator grant `401` already (`TestV086OperatorGrantAtTheIndex`, `…AtTheTreeService`,
+  `…AtTheCatalogService`). Changed: the stream proxy answers `401` to an
   operator grant presented as a caller's, where it created the stream
   (`TestV086OperatorGrantIsNoCaller`). Left open: 26 (v0.86 Open 19); new: v0.86 Open 17, 18,
   20, 21.
 - **No clause in access and tree answers** (32, 33): unchanged §B.11.9 gives the
   `/ns/{ns}/g/{gs}` prefix only to a grant that doesn't fix `/resource` (32), and puts `next`
   on every full page of a filtered `/heads` (33), both as the reference does. Carried: 29, 30,
-  31, 34 (v0.86 Open 22–25).
+  31, 34 (v0.86 Open 22–25), and the index's range filters, 48 (v0.86 Open 42).
 - **Branch catalogs** (35): in a catalog branch a link into a namespace of its local `base`
   chain counts as a link to the branch's node of that name, and no content grant is issued
   from the branch (scenario 150). Changed: the tree service and the gateway resolve such

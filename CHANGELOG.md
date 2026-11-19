@@ -125,7 +125,7 @@ Breaking:
     catalog uses implicit placements.
   - A catalog service whose catalog is a branch, or a release preview, answers a request for
     a content grant or a read grant `404 not_offered`. Organising grants for the branch's
-    own nodes are unchanged. Ask the service on the base for content grants.
+    own nodes are unchanged.
 
 Other changes for v0.86:
 
