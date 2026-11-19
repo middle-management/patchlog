@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
@@ -203,9 +204,24 @@ func (e *Engine) IssueEdgeGrantsWithin(ctx context.Context, bearers []string, tt
 	// the exchange would give it, which its edge grant then carries
 	// (§C.5.2: whole seconds off, so that cookies that must be told
 	// apart differ in exp; 503 behind where none is left).
+	// Grants that give the same subject set of a namespace give one
+	// prefix and one cookie, which lasts as long as the longest of them
+	// allows (§C.5.2): one record, with the latest exp. They are of one
+	// read snapshot, so their records differ in nothing else that a
+	// cookie is judged by.
 	latest := out.Now.Add(ttl).Unix()
+	var recs []*gsRecord
 	for _, rec := range col.recs {
 		rec.exp = min(rec.exp, latest)
+		i := slices.IndexFunc(recs, func(o *gsRecord) bool { return o.ns == rec.ns && o.gs == rec.gs })
+		switch {
+		case i < 0:
+			recs = append(recs, rec)
+		case rec.exp > recs[i].exp:
+			recs[i] = rec
+		}
+	}
+	for _, rec := range recs {
 		if err := e.recordFilteredGS(ctx, rec); err != nil {
 			return nil, err
 		}

@@ -304,11 +304,16 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 	taken := r.exp
 	err := e.update(ctx, func(t *tx) error {
 		now := t.now.Unix()
+		// Rows are swept a while after their exp: instances sharing the
+		// database each go by their own clock, and a row swept at its
+		// second by one that is ahead would leave that second free for
+		// an exchange at one that is behind, whose row an ended cookie
+		// of the same exp would then read under until it expires.
 		for _, sweep := range []string{
 			`DELETE FROM filtered_gs WHERE exp <= ? OR ns IN (SELECT name FROM namespaces WHERE purged <> 0)`,
 			`DELETE FROM filtered_gs_exps WHERE exp <= ? OR ns IN (SELECT name FROM namespaces WHERE purged <> 0)`,
 		} {
-			if _, err := t.Exec(sweep, now); err != nil {
+			if _, err := t.Exec(sweep, now-int64(gsSweepMargin/time.Second)); err != nil {
 				return err
 			}
 		}
@@ -356,8 +361,17 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 					}
 					taken = exp
 				case shares(s):
-					if _, err := t.Exec(raise, r.conf, r.ns, r.gs, exp); err != nil {
+					res, err := t.Exec(raise, r.conf, r.ns, r.gs, exp)
+					if err != nil {
 						return err
+					}
+					if c, err := res.RowsAffected(); err != nil {
+						return err
+					} else if c == 0 {
+						// Swept since it was read: without its row the
+						// cookie would be 403. The seconds are read again.
+						lost = true
+						continue
 					}
 					taken = exp
 				}
@@ -375,6 +389,11 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 	}
 	return err
 }
+
+// gsSweepMargin is how long past their exp filtered_gs and
+// filtered_gs_exps rows are kept (recordFilteredGS): more than the
+// clocks of instances sharing a database differ by.
+const gsSweepMargin = time.Minute
 
 // gsSlot is a filtered_gs_exps row: the entry digest and document the
 // exchanges of the cookies of one gs expiring at one second recorded.

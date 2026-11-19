@@ -1,6 +1,7 @@
 package core
 
 import (
+	"crypto/sha256"
 	"database/sql"
 	"slices"
 
@@ -290,13 +291,48 @@ func (t *tx) gsHeldSince(n *nsRow, cp *fcp, rec *gsRecord) bool {
 		return false
 	}
 	c := t.fconfigSeqAt(seq)
-	for i := 0; c > rec.conf; i++ {
-		if i == gsWalk || !t.gsHoldsUnder(n, t.config(c), rec) {
-			return false
-		}
-		c = t.configParent(c)
+	if c <= rec.conf {
+		return true
 	}
-	return true
+	// Past the exchange's document the walk judges up to gsWalk
+	// documents, the same ones at every read under the cookie there. Its
+	// verdict depends on the record and on documents that never change
+	// (ns_config rows, by seq), so it is kept for the engine's life.
+	key := gsHeldKey(rec, c)
+	t.e.gsHeldMu.Lock()
+	held, ok := t.e.gsHeld.Get(key)
+	t.e.gsHeldMu.Unlock()
+	if ok {
+		return held
+	}
+	held = true
+	for i, d := 0, c; d > rec.conf; i++ {
+		if i == gsWalk || !t.gsHoldsUnder(n, t.config(d), rec) {
+			held = false
+			break
+		}
+		d = t.configParent(d)
+	}
+	t.e.gsHeldMu.Lock()
+	t.e.gsHeld.Put(key, held, 0)
+	t.e.gsHeldMu.Unlock()
+	return held
+}
+
+// gsHeldKey is the key of gsHeldSince's verdict for rec at the document
+// with ns_config seq c: a digest of everything of rec that gsHoldsUnder
+// reads, the record of the cookie's own second (entry, conf) and what
+// the filtered_gs row holds, which a later exchange may write again.
+func gsHeldKey(rec *gsRecord, c int64) [32]byte {
+	strs := func(xs []string) []any {
+		out := make([]any, len(xs))
+		for i, x := range xs {
+			out[i] = x
+		}
+		return out
+	}
+	return sha256.Sum256(jsonv.Canonical([]any{rec.ns, rec.gs, rec.kid, rec.pub, rec.digest, rec.entry, float64(rec.conf), float64(c),
+		strs(rec.subjects), strs(rec.roles), nonNilRules(rec.blockRules), rec.principal, rec.readScope}))
 }
 
 // gsShares returns the test of whether r's exchange may share the row s
