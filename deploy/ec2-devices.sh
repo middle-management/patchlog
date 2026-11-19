@@ -211,14 +211,14 @@ net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.tcp_tw_reuse = 1
 SYSCTL
-sysctl --system
+sysctl -p /etc/sysctl.d/90-devices.conf
 mkdir -p /opt/bench && cd /opt/bench
 cat >server.sh <<'SH'
 #!/bin/bash
 set -eu
 cd /opt/bench
 install -m 755 /tmp/patchlog patchlog
-ulimit -n 1048576
+ulimit -n 1048576 || ulimit -n "\$(ulimit -Hn)"
 $dbenv
 setsid nohup ./patchlog serve --dev --addr :8080 --playground=false \\
   --max-rate-per-namespace 1e9,1e9 --max-rate-per-resource 1e9,1e9 --max-rate-per-principal 1e9,1e9 \\
@@ -237,7 +237,7 @@ cat >loadgen.sh <<'SH'
 set -eu
 cd /opt/bench
 install -m 755 /tmp/devicebench devicebench
-ulimit -n 1048576
+ulimit -n 1048576 || ulimit -n "\$(ulimit -Hn)"
 if [ "\$1" = setup ]; then shift; exec ./devicebench --setup "\$@"; fi
 setsid nohup ./devicebench "\$@" >loadgen.log 2>&1 </dev/null &
 echo "devicebench \$! started"
@@ -294,9 +294,8 @@ done
 scp_to() {
   local id=$1 i; shift
   for i in $(seq 1 6); do
-    aws ec2-instance-connect send-ssh-public-key --instance-id "$id" --instance-os-user ec2-user \
-      --ssh-public-key "file://$work/key.pub" >/dev/null
-    if scp -q -i "$work/key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    if aws ec2-instance-connect send-ssh-public-key --instance-id "$id" --instance-os-user ec2-user \
+        --ssh-public-key "file://$work/key.pub" >/dev/null && scp -q -i "$work/key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         -o LogLevel=ERROR -o ConnectTimeout=20 \
         -o ProxyCommand="aws ssm start-session --target %h --document-name AWS-StartSSHSession --parameters portNumber=%p" \
         "$@"; then
@@ -306,15 +305,19 @@ scp_to() {
     sleep 10
   done
 }
-# waitall: waits for the background jobs, and fails if one did.
+# spawn …: runs a command in the background, remembered for waitall, which
+# waits for them all and fails if one did (jobs -p forgets finished ones).
+pids=()
+spawn() { "$@" & pids+=($!); }
 waitall() {
   local pid ok=0
-  for pid in $(jobs -p); do wait "$pid" || ok=1; done
+  for pid in ${pids[@]+"${pids[@]}"}; do wait "$pid" || ok=1; done
+  pids=()
   return $ok
 }
 echo "copying the binaries"
-for id in "${server_ids[@]}"; do scp_to "$id" "$work/patchlog" "ec2-user@$id:/tmp/patchlog" & done
-for id in "${loadgen_ids[@]}"; do scp_to "$id" "$work/devicebench" "ec2-user@$id:/tmp/devicebench" & done
+for id in "${server_ids[@]}"; do spawn scp_to "$id" "$work/patchlog" "ec2-user@$id:/tmp/patchlog"; done
+for id in "${loadgen_ids[@]}"; do spawn scp_to "$id" "$work/devicebench" "ec2-user@$id:/tmp/devicebench"; done
 waitall
 
 # ssm ID TIMEOUT COMMAND: runs COMMAND (no double quotes or backslashes) as
@@ -341,7 +344,7 @@ ssm() {
 echo "starting the core"
 ssm "${server_ids[0]}" 300 /opt/bench/server.sh
 # Not seq: on macOS, seq 1 0 counts down.
-i=1; while [ "$i" -lt "$SERVERS" ]; do ssm "${server_ids[$i]}" 300 /opt/bench/server.sh & i=$(( i + 1 )); done
+i=1; while [ "$i" -lt "$SERVERS" ]; do spawn ssm "${server_ids[$i]}" 300 /opt/bench/server.sh; i=$(( i + 1 )); done
 waitall
 urls=$(printf 'http://%s:8080,' "${server_ips[@]}"); urls=${urls%,}
 write_url=http://${server_ips[0]}:8080
@@ -349,11 +352,14 @@ write_url=http://${server_ips[0]}:8080
 echo "making $(( LOADGENS * DEVICES )) devices' resources"
 ssm "${loadgen_ids[0]}" 1800 "/opt/bench/loadgen.sh setup --write-url $write_url --devices $(( LOADGENS * DEVICES ))"
 
-# The start, a minute away by the load generators' clock, not this machine's.
-start=$(( $(ssm "${loadgen_ids[0]}" 60 "date +%s") + 60 ))
+# The start, two minutes away by the load generators' clock, not this
+# machine's: SSM can take a while to deliver the commands that start them.
+now=$(ssm "${loadgen_ids[0]}" 60 "date +%s")
+case $now in ''|*[!0-9]*) echo "ec2-devices: no time from ${loadgen_ids[0]}: $now" >&2; exit 1 ;; esac
+start=$(( now + 120 ))
 for i in "${!loadgen_ids[@]}"; do
   bg=0; [ "$i" -gt 0 ] || bg=$BG
-  ssm "${loadgen_ids[$i]}" 120 "/opt/bench/loadgen.sh --url $urls --write-url $write_url --first $(( i * DEVICES )) --devices $DEVICES --step $STEP --step-time ${STEP_SECS}s --settle ${SETTLE}s --start-at $start --completions $COMPLETIONS --bg $bg --out /opt/bench/steps.jsonl --label loadgen-$i" &
+  spawn ssm "${loadgen_ids[$i]}" 120 "/opt/bench/loadgen.sh --url $urls --write-url $write_url --first $(( i * DEVICES )) --devices $DEVICES --step $STEP --step-time ${STEP_SECS}s --settle ${SETTLE}s --start-at $start --completions $COMPLETIONS --bg $bg --out /opt/bench/steps.jsonl --label loadgen-$i"
 done
 waitall
 echo "run starts at $(date -d @$start +%T 2>/dev/null || date -r $start +%T), $steps steps; progress from the first load generator:"
@@ -365,15 +371,23 @@ done
 
 mkdir -p "$OUT"
 echo "collecting results into $OUT"
-for i in "${!loadgen_ids[@]}"; do
-  scp_to "${loadgen_ids[$i]}" "ec2-user@${loadgen_ids[$i]}:/opt/bench/steps.jsonl" "$OUT/loadgen-$i.jsonl" &
-  scp_to "${loadgen_ids[$i]}" "ec2-user@${loadgen_ids[$i]}:/opt/bench/loadgen.log" "$OUT/loadgen-$i.log" &
-done
-for i in "${!server_ids[@]}"; do
-  scp_to "${server_ids[$i]}" "ec2-user@${server_ids[$i]}:/opt/bench/server.samples" "$OUT/server-$i.samples" &
-  scp_to "${server_ids[$i]}" "ec2-user@${server_ids[$i]}:/opt/bench/server.log" "$OUT/server-$i.log" &
-done
+# collect ROLE INDEX ID FILE…: one scp an instance (each pushes a key).
+collect() {
+  local role=$1 i=$2 id=$3 f srcs=(); shift 3
+  mkdir -p "$OUT/$role-$i.d"
+  for f in "$@"; do srcs+=("ec2-user@$id:/opt/bench/$f"); done
+  scp_to "$id" "${srcs[@]}" "$OUT/$role-$i.d/" || return 1
+  for f in "$@"; do mv "$OUT/$role-$i.d/$f" "$OUT/$role-$i.${f#*.}"; done
+  rmdir "$OUT/$role-$i.d"
+}
+for i in "${!loadgen_ids[@]}"; do spawn collect loadgen "$i" "${loadgen_ids[$i]}" steps.jsonl loadgen.log; done
+for i in "${!server_ids[@]}"; do spawn collect server "$i" "${server_ids[$i]}" server.samples server.log; done
 waitall || echo "ec2-devices: some results weren't collected" >&2
+# Packets the instance's network allowances dropped: connections past the
+# tracked-connection allowance show here, not as a limit of the core.
+for id in "${server_ids[@]}" "${loadgen_ids[@]}"; do
+  echo "$id $(ssm "$id" 60 "ethtool -S \$(ip route show default | awk '{print \$5; exit}') | grep allowance_exceeded | tr -s ' ' | paste -sd' ' -" || echo unknown)"
+done >"$OUT/allowances.txt"
 if [ "$BACKEND" = postgres ]; then
   echo "waiting 2 minutes for RDS's CloudWatch metrics"
   sleep 120

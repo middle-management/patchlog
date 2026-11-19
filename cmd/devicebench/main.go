@@ -70,7 +70,9 @@ func main() {
 	run()
 }
 
-var plain = &http.Client{Timeout: 60 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+// plain is the writers' and -setup's: a pool big enough for the writers
+// to keep their connections.
+var plain = &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: 64, IdleConnTimeout: 2 * time.Minute}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 func do(c *http.Client, method, url string, hdr map[string]string, body any) (int, http.Header, []byte, error) {
 	var rd io.Reader
@@ -375,6 +377,9 @@ func run() {
 	start := time.Now()
 	if a.StartAt > 0 {
 		start = time.Unix(a.StartAt, 0)
+		if late := time.Since(start); late > 5*time.Second {
+			fmt.Fprintf(os.Stderr, "devicebench: started %s after --start-at: its steps are out of line with other processes'\n", late.Round(time.Second))
+		}
 		time.Sleep(time.Until(start))
 	}
 	if a.Completions > 0 {
@@ -418,6 +423,7 @@ func run() {
 		c0, we0, b0, be0 := completions.Load(), writeErrs.Load(), bgWrites.Load(), bgErrs.Load()
 		cpu0, _ := selfStat()
 		m0 := time.Now()
+		late := m0.Sub(begin.Add(a.Settle))
 		time.Sleep(time.Until(begin.Add(period)))
 		el := time.Since(m0).Seconds()
 		cpu1, rss := selfStat()
@@ -427,7 +433,7 @@ func run() {
 			delivered += v
 		}
 		res := map[string]any{
-			"label": a.Label, "step": step, "start": m0.Unix(), "end": time.Now().Unix(), "seconds": round(el),
+			"label": a.Label, "step": step, "start": m0.Unix(), "end": time.Now().Unix(), "seconds": round(el), "late_s": round(late.Seconds()),
 			"devices_target": target - a.First, "devices": connected.Load(), "waiting": waiting.Load(),
 			"polls": polls.Load() - p0, "wakes": wakes.Load() - w0, "timeouts_204": timeouts.Load() - t0,
 			"conn_errors": connErrs.Load() - ce0, "status_errors": statusErrs.Load() - se0,

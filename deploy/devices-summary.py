@@ -100,7 +100,7 @@ def main():
             "polls/s", "errors conn/status/write", "loadgen cores (max)", "server cores", "server RSS MB", "server fds"]
     if rds is not None:
         head.append("RDS CPU %")
-    rows, broken = [], None
+    rows, broken, notes = [], None, []
     for n in sorted(steps):
         ss = steps[n]
         start, end = min(s["start"] for s in ss), max(s["end"] for s in ss)
@@ -134,6 +134,9 @@ def main():
             why.append(f"{devices} of {target} devices connected")
         if conn + status > 0.001 * max(devices, 1):
             why.append(f"{conn + status} device errors")
+        late = max(s.get("late_s", 0) for s in ss)
+        if late > 5:
+            notes.append(f"step {n}: a load generator began measuring {late:.0f} s late (it connected its devices slowly, or started after --start-at)")
         if why and broken is None:
             broken = (n, devices, why)
     widths = [max(len(head[i]), *(len(r[i]) for r in rows)) for i in range(len(head))]
@@ -142,6 +145,16 @@ def main():
         print("  ".join(r[i].ljust(widths[i]) for i in range(len(head))))
     if servers:
         print("\nservers, in order:", ", ".join(name for name, _, _ in servers))
+    for note in notes:
+        print("note:", note)
+    ap = os.path.join(d, "allowances.txt")
+    if os.path.exists(ap):
+        with open(ap) as f:
+            hits = [l.strip() for l in f if any(t.isdigit() and t != "0" for t in l.replace(":", " ").split()[1:])]
+        if hits:
+            print("network allowances exceeded (packets dropped by EC2, not by the core):")
+            for h in hits:
+                print("  " + h)
     if broken:
         print(f"\nfirst step that looks broken: step {broken[0]} at {broken[1]} devices: {'; '.join(broken[2])}")
     else:
