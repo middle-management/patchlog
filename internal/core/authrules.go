@@ -39,6 +39,11 @@ func (t *tx) readScope() func() {
 	return func() { t.readMeter = nil }
 }
 
+// readSpent reports whether the budget the read checks in progress share
+// (readScope) has run out: whatever is decided after that for the same
+// exchange or key request fails with it (§6.6 Validation work).
+func (t *tx) readSpent() bool { return t.readMeter != nil && t.readMeter.Over }
+
 // readRule reports whether r passes against the read envelope env within
 // the read check's budget (readScope): a rule whose schema tests run out
 // of validationSteps doesn't, under a not either (§6.6 Validation work).

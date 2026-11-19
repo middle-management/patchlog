@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/grant"
 )
 
@@ -68,4 +69,52 @@ func TestV086ReadCheckBudget(t *testing.T) {
 		expectCode(t, e.get("/r/sec/x", onX), 404, "not_found")
 		expect(t, e.get("/r/sec/y", onX), 302)
 	}
+}
+
+// §6.6 Validation work: "each … key request" has one budget, however
+// many resources it names. A grant whose rule takes more than half the
+// budget for a name gets past the read check for either name alone (the
+// namespace isn't sealed: 404 not_offered), and is 403 for both at once.
+func TestV086KeyRequestOneBudget(t *testing.T) {
+	t.Parallel()
+	f, mint := stepOneFixture(t)
+	e := f.tenv
+	who := narrowed(t, mint("user:k", "read"), map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"x", "y"}}},
+		map[string]any{"op": "test", "path": "/principal", "schema": doubling(9)}}})
+	for _, name := range []string{"x", "y"} {
+		_, r := e.keysOf("sec", map[string]any{"resources": []any{name}}, who)
+		expectCode(t, r, 404, "not_offered")
+	}
+	_, r := e.keysOf("sec", map[string]any{"resources": []any{"x", "y"}}, who)
+	expectCode(t, r, 403, "forbidden")
+}
+
+// §6.6 Validation work, §B.11.9 Edge grants: an exchange whose budget is
+// spent fails as a whole. A grant of a covered namespace whose only role
+// runs out on the check of unrestricted read gets no cookie for its
+// subject set either: 403, nothing set.
+func TestV086FilteredExchangeSpent(t *testing.T) {
+	t.Parallel()
+	plain := newKey("plain")
+	role := func(levels int) map[string]any {
+		return map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"op": "test", "path": "/principal", "schema": doubling(levels)}}}
+	}
+	w := newV75s(t, v75sOpts{env: []envOpt{func(o *core.Options) { o.MaxValidationSteps = 3000 }}, matches: func(doc map[string]any) {
+		doc["keys"] = append(doc["keys"].([]any), plain.entry("read"))
+		doc["roles"].(map[string]any)["slow"] = role(30)
+		doc["roles"].(map[string]any)["quick"] = role(4)
+	}})
+	w.seed([]string{"derby"}, nil, []string{"derby"})
+	with := func(r string) string {
+		return w.grant(plain, "user:li", []string{"matches"}, nil, map[string]any{"roles": []any{r}, "groups": []any{"editors"},
+			"exp": w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)})
+	}
+	r := w.do(req{method: "POST", path: "/edge-grants", bearer: with("slow")})
+	expectCode(t, r, 403, "forbidden")
+	if r.H.Get("Set-Cookie") != "" {
+		t.Fatalf("the exchange set %q", r.H.Get("Set-Cookie"))
+	}
+	// Within the budget the same shape is exchanged.
+	expect(t, w.do(req{method: "POST", path: "/edge-grants", bearer: with("quick")}), 200)
 }
