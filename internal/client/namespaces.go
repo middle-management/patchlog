@@ -68,6 +68,9 @@ func (c *Client) NSDoc(ctx context.Context, ns, nsID string) (*NSDoc, error) {
 	if !ok {
 		return nil, fmt.Errorf("client: namespace document %s@%s is not an object", ns, nsID)
 	}
+	// A base never changes, so any revision of the document names it: the
+	// branch is held at least at its bases' level from here on (levels.go).
+	c.levels.learnBase(ns, m)
 	return &NSDoc{ID: nsID, Config: r.header.Get("X-Config-Revision"), Raw: body, Value: m}, nil
 }
 

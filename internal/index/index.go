@@ -925,6 +925,17 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		}
 	}
 
+	// The cookies the batch's documents end, each judged in order, and
+	// all of them at a snapshot's start (cookieEnds; §B.11.9 gs, v0.86).
+	cdocs := configDocs(b)
+	if snapDoc != nil {
+		cdocs = append(cdocs, snapDoc)
+	}
+	ends, err := ix.cookieEnds(ctx, b.NS, cdocs, b.Replaces())
+	if err != nil {
+		return err
+	}
+
 	ix.wmu.Lock()
 	defer ix.wmu.Unlock()
 	tx, err := ix.db.BeginTx(ctx, nil)
@@ -932,6 +943,9 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := ends.apply(ctx, tx); err != nil {
+		return err
+	}
 	if b.Replaces() || co.PurgedNS {
 		// A snapshot is the complete state (its later pages add to the
 		// first); a purge-ns drops everything (Coalesce keeps only the
@@ -1259,11 +1273,6 @@ func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, table, ns string, doc
 	}
 	if err := recordTrust(ctx, tx, ns, docs[len(docs)-1].Value); err != nil {
 		return false, err
-	}
-	if table == "ns_conf" {
-		if err := endCookies(ctx, tx, ns, docs[len(docs)-1].Value); err != nil {
-			return false, err
-		}
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO `+table+` (ns, public, level) VALUES (?, ?, ?) ON CONFLICT (ns) DO UPDATE SET public = excluded.public, level = excluded.level`, ns, public, level)
 	return narrowed, err

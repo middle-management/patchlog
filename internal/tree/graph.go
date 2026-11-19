@@ -2,6 +2,7 @@ package tree
 
 import (
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 
@@ -212,6 +213,20 @@ type Graph struct {
 	// Aliases maps a namespace to the branch followed in its place in a
 	// release preview (§B.5, §F.9); nil otherwise.
 	Aliases map[string]string
+	// Bases are the namespaces of the catalog's local base chain, nearest
+	// first, where the catalog served is a branch (served directly, or a
+	// release preview's branch of a branch), without the catalog's own
+	// name; nil otherwise. "A catalog branch, previewed or served
+	// directly, lists the nodes it reads through from its base as of the
+	// branch's at. There a link into a namespace of its local base chain
+	// counts as a link to the branch's node of that name" (SERVICES §B.5
+	// Previews, v0.86; scenario 150): a node read through keeps the
+	// parents its document names, /r/{base}/…, and so may one the branch
+	// writes, or a content document's $parents (§B.9). Set by the tree
+	// service alone (catalogOpts, meta "bases"); a graph built for
+	// §B.11.9 visibility or for a merge into the base has none, and
+	// reads such a link as one to another namespace.
+	Bases []string
 	// Purged, while a Hook's Update runs, reports whether the apply purged
 	// a name of the catalog (every name once the catalog itself is purged),
 	// so the hook drops what it keeps of it (§8.3); nil otherwise.
@@ -560,8 +575,19 @@ func ParseHref(h string) (ns, name string, ok bool) {
 
 // parseParents parses a parents (or $parents) value. With onlyCatalog,
 // entries linking elsewhere are dropped instead of being marked invalid
-// (for $parents, which may link to folders of other catalogs, §B.9).
-func parseParents(catalog string, v any, onlyCatalog bool) []Parent {
+// (for $parents, which may link to folders of other catalogs, §B.9). A
+// link into one of bases, the catalog's local base chain where it is
+// served as a branch (Graph.Bases), counts as one to the catalog's own
+// node of that name (§B.5 Previews, v0.86).
+func parseParents(catalog string, bases []string, v any, onlyCatalog bool) []Parent {
+	own := func(ns string) bool { return ns == catalog || slices.Contains(bases, ns) }
+	pinned := func(href string) bool {
+		if !strings.HasPrefix(href, "/r/") {
+			return false
+		}
+		ns, _, _ := strings.Cut(href[len("/r/"):], "/")
+		return strings.HasPrefix(href, "/r/"+ns+"/") && own(ns)
+	}
 	arr, _ := v.([]any)
 	var out []Parent
 	for _, e := range arr {
@@ -581,14 +607,14 @@ func parseParents(catalog string, v any, onlyCatalog bool) []Parent {
 		}
 		ns, name, ok := ParseHref(p.Href)
 		switch {
-		case !ok && strings.HasPrefix(p.Href, "/r/"+catalog+"/"):
+		case !ok && pinned(p.Href):
 			p.Invalid = "not a live link (pinned or malformed)"
 		case !ok:
 			if onlyCatalog {
 				continue
 			}
 			p.Invalid = "not a live link"
-		case ns != catalog:
+		case !own(ns):
 			if onlyCatalog {
 				continue
 			}
@@ -637,8 +663,29 @@ func parseAccess(v any) (acc map[string][]string, inherit, powers, has bool) {
 	return acc, inherit, powers, true
 }
 
-// ParseNode builds an explicit node from a catalog document.
+// ParseNode builds an explicit node from a catalog document, a link into
+// any other namespace being one to another namespace: the reading of
+// §B.11.9 visibility and of a merge into the base, which no branch's
+// base chain changes (TOOLS §F.8). The tree service parses through its
+// graph (Graph.parseNode).
 func ParseNode(catalog, name, head string, doc any) *Node {
+	return parseNodeIn(catalog, nil, name, head, doc)
+}
+
+// parseNode is ParseNode for g's catalog, with links into its base chain
+// counting as its own (Graph.Bases).
+func (g *Graph) parseNode(name, head string, doc any) *Node {
+	return parseNodeIn(g.Catalog, g.Bases, name, head, doc)
+}
+
+// parseSelf is the implicit placement a content document makes in g's
+// catalog, nil if none, with $parents naming a folder through the base
+// chain counting as naming the catalog's own (Graph.Bases).
+func (g *Graph) parseSelf(ns, name string, doc any) *Node {
+	return parseSelf(g.Catalog, g.Bases, ns, name, doc)
+}
+
+func parseNodeIn(catalog string, bases []string, name, head string, doc any) *Node {
 	n := &Node{Name: name, Head: head, Inherit: true}
 	if strings.Contains(name, ".") {
 		n.Kind = KindPlacement
@@ -648,7 +695,7 @@ func ParseNode(catalog, name, head string, doc any) *Node {
 	}
 	m, _ := doc.(map[string]any)
 	n.Title, _ = m["title"].(string)
-	n.Parents = parseParents(catalog, m["parents"], false)
+	n.Parents = parseParents(catalog, bases, m["parents"], false)
 	n.Access, n.Inherit, n.InheritPowers, n.HasAccess = parseAccess(m["$access"])
 	n.rawParents, n.rawAccess = m["parents"], m["$access"]
 	return n
@@ -656,12 +703,12 @@ func ParseNode(catalog, name, head string, doc any) *Node {
 
 // parseSelf builds an implicit placement from a content document's
 // $parents, nil if it names no folder of this catalog.
-func parseSelf(catalog, ns, name string, doc any) *Node {
+func parseSelf(catalog string, bases []string, ns, name string, doc any) *Node {
 	m, _ := doc.(map[string]any)
 	if m == nil {
 		return nil
 	}
-	ps := parseParents(catalog, m["$parents"], true)
+	ps := parseParents(catalog, bases, m["$parents"], true)
 	if len(ps) == 0 {
 		return nil
 	}

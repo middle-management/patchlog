@@ -102,7 +102,7 @@ func runXrevHarness(t *testing.T, node string, input map[string]any, out any) {
 		t.Fatal(err)
 	}
 	var fns []string
-	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "revTarget", "notOffered", "readDoc", "nsChainOK",
+	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "revTarget", "notOffered", "readDoc", "nsFirstEntry", "revPrecedes", "nsChainOK",
 		"epochKey", "contentKey", "openSealed", "decrypted", "openSnapshot", "foldLog", "nsDocPL", "nsHeadDoc", "openSealedEntries", "loadHistory", "openEntries"} {
 		fns = append(fns, jsFunction(t, js, f))
 	}

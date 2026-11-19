@@ -1140,6 +1140,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	// aren't sealed or end-to-end, when the catalog names a pointer.
 	s.mu.RLock()
 	tptr, hasTitle, fileTree := s.g.TitlePtr, s.g.HasTitle, s.g.Files
+	bases := s.g.Bases
 	s.mu.RUnlock()
 	var retitle map[[2]string]string
 	if isCat && cfg != nil {
@@ -1202,7 +1203,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 				}
 				// A node's born (§B.5): a catalog node's, or that of the
 				// implicit placement a content document makes (§B.9).
-				self := !isCat && s.opt.SelfPlacing && parseSelf(s.opt.Catalog, b.NS, ch.Resource, doc.Value) != nil
+				self := !isCat && s.opt.SelfPlacing && parseSelf(s.opt.Catalog, bases, b.NS, ch.Resource, doc.Value) != nil
 				switch {
 				case isCat || self && bornable:
 					if p.born, p.bornUnknown, p.bornEpoch, err = s.nodeBorn(ctx, fb.NS, ch.Resource, p.head, self, ch.Purged); err != nil {
@@ -1444,7 +1445,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 		for _, p := range preps {
 			changed[p.name] = true
 			if p.kind == "head" && p.doc != nil {
-				n := ParseNode(cat, p.name, p.head, p.doc)
+				n := g.parseNode(p.name, p.head, p.doc)
 				n.Born, n.BornUnknown, n.Epoch, n.BornEpoch = p.born, p.bornUnknown, p.epoch, carryBornEpoch(g.explicit[p.name], p)
 				if g.explicitGone[p.name] {
 					if err := saveGone(ctx, tx, p.name, false); err != nil {
@@ -1562,7 +1563,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			}
 			var sn *Node
 			if st == ItemLive && p.doc != nil {
-				sn = parseSelf(cat, ns, p.name, p.doc)
+				sn = g.parseSelf(ns, p.name, p.doc)
 			}
 			if sn != nil {
 				m, _ := p.doc.(map[string]any)

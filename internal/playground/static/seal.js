@@ -778,7 +778,11 @@ async function selfTest(fx) {
  * refused (learnLevel's lowered), never believed, while a refusal, a 404 and an answer naming no level teach
  * nothing. The table is kept in localStorage under pl.levels, by the page's origin and the namespace, so it outlives
  * the page; without localStorage (Node, private mode) it lasts as long as the script. A first contact can't tell a
- * server that claims a lower level: for that there is the setting. */
+ * server that claims a lower level: for that there is the setting.
+ *
+ * A branch is held at least at the level held for any base in its base chain (§7.1, v0.86): the chain is what the
+ * namespace documents this page has read name as each namespace's local base (learnBase), kept beside the levels
+ * under pl.bases. A remote base (base.origin) is another deployment's namespace, and is not followed. */
 const LEVEL_RANK = Object.freeze(Object.assign(Object.create(null), { '': 0, 'at-rest': 1, sealed: 2, e2e: 3 }));
 /* levelRank is level's place in the order, undefined for anything that is no level this page knows: a string it
  * doesn't list, such as the name of a member of Object.prototype, and whatever isn't a string (["e2e"] is no level,
@@ -803,33 +807,96 @@ function levelSet(ns, level) {
   if (level) t[levelID(ns)] = level; else delete t[levelID(ns)];
   try { ls.setItem(LEVELS_KEY, JSON.stringify(t)); } catch (_) { /* private mode: held for this page */ }
 }
-/* heldLevel is the level held for ns, '' for none. A stored value that is no level is held as e2e. */
-function heldLevel(ns) {
+/* ownLevel is the level held for ns itself, '' for none. A stored value that is no level is held as e2e. */
+function ownLevel(ns) {
   const norm = (v) => (v === undefined || v === '' ? '' : levelRank(v) > 0 ? v : 'e2e');
   // What this page learnt stands where the store lost or refused it.
   const lv = norm(levelTable()[levelID(ns)]), mem = norm(levelMem.get(levelID(ns)));
   return levelRank(mem) > levelRank(lv) ? mem : lv;
 }
+const BASES_KEY = 'pl.bases';
+const baseMem = new Map();
+function baseTable() {
+  const ls = levelStorage();
+  if (!ls) return {};
+  try { const t = JSON.parse(ls.getItem(BASES_KEY) || '{}'); return t && typeof t === 'object' && !Array.isArray(t) ? t : {}; } catch (_) { return {}; }
+}
+/* basesOf lists the namespaces a document of ns named as its local base: one, as a base never changes, unless a
+ * server lied, and then each counts, since a link only ever raises what is held. */
+function basesOf(ns) {
+  const stored = baseTable()[levelID(ns)];
+  const all = new Set(baseMem.get(levelID(ns)) || []);
+  if (Array.isArray(stored)) for (const b of stored) if (isNamespaceName(b)) all.add(b);
+  return all;
+}
+/* learnBase takes doc, a namespace document of ns as read (in the clear, or a sealed one opened), and keeps the
+ * local base it names. A remote base, one with an origin, is none. */
+function learnBase(ns, doc) {
+  const b = doc && typeof doc === 'object' && !Array.isArray(doc) ? doc.base : null;
+  if (!b || typeof b !== 'object' || Array.isArray(b) || b.origin !== undefined || !isNamespaceName(b.ns) || b.ns === ns) return;
+  const all = basesOf(ns);
+  if (all.has(b.ns)) return;
+  all.add(b.ns);
+  baseMem.set(levelID(ns), all);
+  const ls = levelStorage();
+  if (!ls) return;
+  const t = baseTable();
+  t[levelID(ns)] = Array.from(all);
+  try { ls.setItem(BASES_KEY, JSON.stringify(t)); } catch (_) { /* private mode: held for this page */ }
+}
+/* heldLevel is the level held for ns, '' for none: the highest of its own and those of the bases in its chain. */
+function heldLevel(ns) {
+  let best = ownLevel(ns);
+  const seen = new Set([ns]);
+  for (const todo = [ns]; todo.length;) {
+    for (const b of basesOf(todo.shift())) {
+      if (seen.has(b)) continue;
+      seen.add(b); todo.push(b);
+      const lv = ownLevel(b);
+      if (levelRank(lv) > levelRank(best)) best = lv;
+    }
+  }
+  return best;
+}
 /* learnLevel takes level, which ns's current document or /keys names, and returns { level, lowered }: the level
- * held after it, and, where level is lower than the one held (or no level this page knows while one is held), why
- * it is refused. */
+ * held after it, and, where level is lower than the one held for ns or for a base in its chain (or no level this
+ * page knows while one is held), why it is refused. */
 function learnLevel(ns, level) {
   const held = heldLevel(ns), r = levelRank(level);
   if (r === undefined ? held !== '' : r < levelRank(held)) {
-    return { level: held, lowered: `the server names encryption level ${JSON.stringify(level || 'none')} for ${ns}, lower than ${held}, which this browser has learnt for it: a level is never lowered, so this is refused (§7.1, Levels)` };
+    const whose = levelRank(ownLevel(ns)) === levelRank(held) ? 'it' : 'a base it is a branch of';
+    return { level: held, lowered: `the server names encryption level ${JSON.stringify(level || 'none')} for ${ns}, lower than ${held}, which this browser has learnt for ${whose}: a level is never lowered, and a branch's is never below its base's, so this is refused (§7.1, Levels)` };
   }
-  if (r !== undefined && r > levelRank(held)) levelSet(ns, level);
+  if (r !== undefined && r > levelRank(ownLevel(ns))) levelSet(ns, level);
   return { level: r === undefined ? '' : level, lowered: '' };
+}
+/* learnDoc is what a 200 for ns's current namespace document teaches: its local base, from doc, the document in the
+ * clear or a sealed one once opened (null where it wasn't), and its level, sealed for one served as a JWE (jose),
+ * else doc's encryption.level. The base is taken first, and from a document that is then refused as well: the level
+ * it claims is judged against what is held for that base. It returns learnLevel's { level, lowered }. */
+function learnDoc(ns, jose, doc) {
+  learnBase(ns, doc);
+  const enc = doc && typeof doc === 'object' && !Array.isArray(doc) ? doc.encryption : null;
+  return learnLevel(ns, jose ? 'sealed' : ((enc && enc.level) || ''));
 }
 /* expectLevel is the setting: ns is known to have level (at-rest, sealed or e2e). The higher of it and what is held
  * stays; a level this page doesn't know is held as e2e. */
 function expectLevel(ns, level) {
   const want = levelRank(level) > 0 ? level : 'e2e';
-  if (levelRank(want) > levelRank(heldLevel(ns))) levelSet(ns, want);
+  if (levelRank(want) > levelRank(ownLevel(ns))) levelSet(ns, want);
   return heldLevel(ns);
 }
-/* forgetLevel drops what is held for ns: the user's own act, for a development database created afresh. */
-function forgetLevel(ns) { levelSet(ns, ''); levelMem.delete(levelID(ns)); }
+/* forgetLevel drops what is held for ns, and the bases its documents named, so what was held for those no longer
+ * holds for it: the user's own act, for a development database created afresh. */
+function forgetLevel(ns) {
+  levelSet(ns, ''); levelMem.delete(levelID(ns));
+  baseMem.delete(levelID(ns));
+  const ls = levelStorage();
+  if (!ls) return;
+  const t = baseTable();
+  delete t[levelID(ns)];
+  try { ls.setItem(BASES_KEY, JSON.stringify(t)); } catch (_) { /* private mode */ }
+}
 /* levelOver is level, which something that teaches nothing suggests (a 404, a log's delivery, a cached answer),
  * unless a higher one is held for ns: then the level held. */
 function levelOver(ns, level) {
@@ -917,7 +984,7 @@ root.PLSeal = {
   parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,
   applyPatch, validate, selfTest,
   isNamespaceName, isResourceName,
-  LEVEL_RANK, levelRank, heldLevel, learnLevel, expectLevel, forgetLevel, levelOver, keysLevel,
+  LEVEL_RANK, levelRank, heldLevel, learnLevel, learnBase, learnDoc, expectLevel, forgetLevel, levelOver, keysLevel,
   SEAL_BOUND, SealCounter,
 };
 })(typeof window !== 'undefined' ? window : globalThis);

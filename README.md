@@ -3421,7 +3421,18 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   MOVE, COPY or MKCOL like a save (TOOLS §H.4 "Answers"): a core or tree service request the
   answer depends on that fails for now fails the request, and never counts as a refusal. So a
   DELETE made while `GET /ns/{ns}/principal` answers `408` is `502`, where it was `403`, and
-  no write goes ahead on settings a failed read left unknown.
+  no write goes ahead on settings a failed read left unknown. Since v0.86 every core or service
+  request the gateway makes for a user's request counts, whether or not the answer needs it
+  (TOOLS §H.4 "Answers"; CONFORMANCE "Grant scope" 86, 87): a GET of a file while the core
+  answers `500` to a read of a sibling item's namespace document is `502`, where it was `200`
+  from the rest; a write that was made before such a read failed stays made, and the answer is
+  still the failure. A request counts by how it ends: a `429` waited out and sent again has not
+  failed. Requests the server makes outside a user's request (verifying a token again, its own
+  start-up reads) don't count. These `502` and `503` name only the upstream that failed
+  ("the core failed", "catalog cat's tree service is busy or behind for now; try again") and
+  carry nothing of its answer: no code, message or status of the upstream's, and the `503`'s
+  `Retry-After` is the gateway's own (1 s for a busy or behind upstream, 5 s where no answer
+  came in time), never the upstream's. What the upstream said is in the server's log.
   A raw file over a JSON document's, or the
   other way round, replaces its root. A purged one is `410`, as is any name of a purged
   namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
@@ -3731,8 +3742,9 @@ only.
   file or folder, a move or a delete, which
   the node documents decide, is `403`, saying so, a move before anything is written (onto another
   file, or to another tree or namespace, the copy is the first write). The tree service unreachable is
-  `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with its
-  `Retry-After`: never an empty folder. Its `401` and `403` are the user's grant refused, answered
+  `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with the
+  gateway's own `Retry-After` that names the tree service and nothing of its answer (v0.86; the
+  namespace a `503 behind` names stays in the log): never an empty folder. Its `401` and `403` are the user's grant refused, answered
   as the core's are (in local mode a `401` refuses `--bearer`: `502`, naming the tree service). A
   tree service answers `503` behind until it has caught up with every namespace the catalog
   trusts and can follow, not only with the catalog (started with a fresh database, rebuilt, or
@@ -3761,15 +3773,19 @@ only.
   `X-Namespace-Revision`, seen as the core answers it), which the tree service waits for (§B.5),
   until a listing that carried them came back, for at most 10 minutes (at most the last 4 entries
   of 64 namespaces a user); other users' listings don't wait. If it hasn't caught up within
-  `--tree-wait` (3 s; the tree service's own `--min-wait`, 2 s, answers sooner), the folder is
-  listed from the node documents instead, as without a tree service, and so are the user's
-  listings of that tree for 5 seconds, however long the tree service lags within those 10
+  `--tree-wait` (3 s; the tree service's own `--min-wait`, 2 s, answers sooner), the request
+  is answered `503` with `Retry-After: 1` (v0.86, §H.3 "A tree service that is behind": "a tool
+  answers `503`"; before, the folder was listed from the node documents in that same request),
+  and the user's requests of that tree for the next 5 seconds don't ask the tree service: their
+  folders are listed from the node documents, as without a tree service, however long the tree
+  service lags within those 10
   minutes: their new file stays listed, and a file they renamed doesn't come back by its old name;
   a grant that can't read the node documents gets `503` with `Retry-After` for 30 s after the
   write, then the tree service's listing without waiting. A `min` the tree service refuses
   (`400`: a namespace it doesn't follow, or the reader can't see) is found per namespace, each
   one's asked for alone: those refused, and those reached, aren't asked for again, the rest
-  are, and that listing is from the node documents.
+  are; that listing is from the node documents, unless the tree service is still behind one of
+  them, which is the `503` above.
 - **New files** (§H.4). A PUT of a new name creates an item in `files.ns` with an opaque name (13
   random base32 characters), and its placement titled with the name, under its folder: one
   `parents` entry, ordered after the folder's last ordered child, so new files list last, and

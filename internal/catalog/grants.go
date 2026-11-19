@@ -652,6 +652,9 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 func (s *Service) decideRead(ctx context.Context, v *grant.Verified, vis *visibility, e map[string]any, ns, name, item string, lagOK map[string]bool) ([]keyOf, error) {
 	var err error
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
+		if err = branchRefusal(g); err != nil {
+			return
+		}
 		if err = s.untrustedIn(g, cur, ns); err != nil {
 			return
 		}
@@ -1207,10 +1210,14 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 	if create && len(want) != 1 {
 		return nil, badInput("create can't be combined with other verbs")
 	}
+	if contains(want, "restore") && len(want) != 1 {
+		return nil, badInput("restore can't be combined with other verbs")
+	}
+	s.t.View(func(g *tree.Graph, _ map[string]string) { err = branchRefusal(g) })
+	if err != nil {
+		return nil, err
+	}
 	if contains(want, "restore") {
-		if len(want) != 1 {
-			return nil, badInput("restore can't be combined with other verbs")
-		}
 		return s.planRestore(ctx, v, ns, name, item)
 	}
 	latest, err := s.contentConfig(ctx, ns)
@@ -1841,6 +1848,26 @@ func (o *organising) readTrusted() {
 func (o *organising) offered() error {
 	if derived.InfoOf(o.g.Config).Level == derived.LevelE2E {
 		return notOffered(o.g.Catalog)
+	}
+	return nil
+}
+
+// branchRefusal refuses a content grant, and a content item's read grant
+// and keys, where the catalog the service follows is a branch, or stands
+// for one in a release preview: "No content grant is issued from cat-b"
+// (CONFORMANCE Tree 150; TOOLS §F.8: a catalog service "MUST issue
+// content grants only from the catalog it follows as the base"). A
+// branch catalog's tree is its base's as of the branch's at, its links
+// into the base chain counting as its own (SERVICES §B.5 Previews,
+// v0.86), with whatever the branch wrote on top, unmerged: its $access
+// decides nothing about content. Organising grants, which write the
+// branch's own nodes, and the keys of its own nodes are given as before.
+// The spec names no status: 404 not_offered, as §F.8 answers a merge
+// grant the service doesn't issue. As of the checkpoint; call it under
+// View.
+func branchRefusal(g *tree.Graph) error {
+	if _, branch := g.Config["base"].(map[string]any); branch || g.Aliases[g.Catalog] != "" {
+		return errf(404, "not_offered", "%s is served from a branch: the catalog service issues content grants only from the catalog it follows as the base (§F.8)", g.Catalog)
 	}
 	return nil
 }

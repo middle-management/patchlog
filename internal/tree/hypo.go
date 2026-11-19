@@ -16,7 +16,17 @@ import (
 // judged structurally: as if every item existed (a release creates its
 // items in another namespace, in another step).
 func BuildGraph(catalog string, config map[string]any, docs map[string]any) *Graph {
+	return BuildBranchGraph(catalog, nil, config, docs)
+}
+
+// BuildBranchGraph is BuildGraph for a catalog that is a branch, read
+// directly as the tree service serves it: a link into one of bases, its
+// local base chain, counts as one to its own node of that name (§B.5
+// Previews, v0.86; Graph.Bases). Not for §B.11.9 visibility or a merge,
+// which judge a link into the base as one to another namespace.
+func BuildBranchGraph(catalog string, bases []string, config map[string]any, docs map[string]any) *Graph {
 	g := newGraph(catalog)
+	g.Bases = bases
 	if config != nil {
 		g.setConfig(config)
 	}
@@ -29,7 +39,7 @@ func BuildGraph(catalog string, config map[string]any, docs map[string]any) *Gra
 		if docs[name] == nil {
 			continue
 		}
-		n := ParseNode(catalog, name, "", docs[name])
+		n := g.parseNode(name, "", docs[name])
 		if n.ItemNS != "" {
 			n.ItemState = ItemLive
 		}
@@ -53,7 +63,7 @@ func (g *Graph) With(changes map[string]any) *Graph {
 	for ns := range g.Trust {
 		h.Trust[ns] = true
 	}
-	h.Aliases = g.Aliases
+	h.Aliases, h.Bases = g.Aliases, g.Bases
 	for ns, c := range g.Content {
 		h.Content[ns] = c
 	}
@@ -94,7 +104,7 @@ func (g *Graph) With(changes map[string]any) *Graph {
 		if doc == nil {
 			continue
 		}
-		n := ParseNode(g.Catalog, name, "", doc)
+		n := g.parseNode(name, "", doc)
 		if old := g.explicit[name]; old != nil {
 			n.copyItem(old)
 		} else if s := g.self[name]; s != nil {

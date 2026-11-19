@@ -229,7 +229,8 @@ func newTestKeyStore(t *testing.T) *keystore.Local {
 
 // Every log range app.js fetches is read through the paged readers: each
 // api('GET', …/log…) call sits in a function that hands its answer to
-// nsLogRead or readLogRange (the range readDoc folds at E3 too).
+// nsLogRead or readLogRange (the range readDoc folds at E3 too), but the
+// two that place a fork and read no range: nsFirstEntry and revPrecedes.
 func TestLogReadersUsed(t *testing.T) {
 	t.Parallel()
 	js, err := assets.ReadFile("static/app.js")
@@ -244,6 +245,12 @@ func TestLogReadersUsed(t *testing.T) {
 			t.Fatalf("a log fetch outside any function at %d", m[0])
 		}
 		name := string(fs[len(fs)-1][1])
+		if name == "nsFirstEntry" || name == "revPrecedes" {
+			// Not reads of a range: the first entry of a first page, and
+			// whether a range exists at all (nsChainOK, v0.86).
+			n++
+			continue
+		}
 		body := jsFunction(t, js, name)
 		if !strings.Contains(body, "nsLogRead(") && !strings.Contains(body, "readLogRange(") {
 			t.Errorf("%s fetches a log range without following its pages", name)

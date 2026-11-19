@@ -1015,6 +1015,9 @@ func TestTreeServiceBehindRootsV073(t *testing.T) {
 	clk.add(10 * time.Second)
 	g.expect(g.doAs(narrow, "PROPFIND", "/cat/", "", "Depth", "1"), 503, "the limited token's top level 10 s after ann's write")
 	clk.add(time.Minute)
+	// The tree service is asked again, and its 503 answered (§H.3,
+	// v0.86); the listing that follows doesn't wait.
+	g.wantBehind(g.doAs(narrow, "PROPFIND", "/cat/", "", "Depth", "1"), "the limited token's first listing a minute after ann's write")
 	sameStrings(t, "the limited token's top level a minute after ann's write", names(g.propfindAs(narrow, "/cat/"), "/cat/"), []string{"Season/"})
 	g.expect(g.doAs(narrow, "PUT", "/cat/new.json", `{"n": 1}`), 404, "the limited token's new file at the top level")
 }
