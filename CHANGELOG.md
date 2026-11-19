@@ -207,6 +207,30 @@ Other work since v0.31.0:
   schema or by one that reaches it, in the namespaces that hold them or read them through: its
   cost follows what references the schema, not the deployment. `PATCHLOG_TEST_VALIDATE_BOTH=1`
   also makes the old pass on every such change and panics if the two answers differ.
+- **A purge reaches only the branches it has work in.** A purge in a base visited every
+  branch below it, locked it and read its row, whether or not the branch saw the purged
+  document: about 1 ms a branch on Postgres, so 9.6 s with 10,000 branches that didn't see
+  it, and 27 s where they read it through. Now the server finds, by name, the branches that
+  hold the document or may read it through, and neither reads nor locks the others; on
+  Postgres the branches it does reach get their `purge` entries in one statement. With
+  10,000 branches a purge takes 52 ms where they don't see the document and 0.9 s where they
+  do (0.1 ms a branch), and frozen branches cost the same as live ones. The entries written,
+  their order and the cache tags purged are unchanged. `PATCHLOG_TEST_VALIDATE_BOTH=1` also
+  makes the old walk over every branch and panics if the two disagree. A refused purge of a
+  schema that many branches reference is still slow (40 s with 10,000 branches).
+- **A branch's chain of bases is read once per transaction.** Every read and write in a
+  branch read, locked and checked each base on its own, so each level added about 0.07 ms to
+  a read and 0.7 ms to a write on Postgres: a create took 9.3 ms at depth 8 against 2.9 ms in
+  a plain namespace, and 16 callers wrote 420 documents a second against 1,197. Now the chain
+  comes in one statement and its rows are kept for the transaction. A create takes 3.3 ms at
+  depth 8 and at depth 32, and 16 callers write 937 a second at depth 8. On Postgres the
+  first use of a base in a transaction now takes a shared lock on the whole local chain.
+- **A namespace locked for itself alone takes no separate log lock** (Postgres). Every
+  appender takes the namespace's lock before its log's, so the second lock added nothing
+  there; a purge reaching 10,000 branches held 20,000 advisory locks, the size of Postgres's
+  default lock table, and now holds half.
+- **`namespaces.frozen` is set for branches created frozen**, with a migration that corrects
+  existing rows. The count of a namespace's live branches (§6.6) now reads that column.
 - **A namespace's branches are found by an index** (`namespaces_base`). A purge asks for the
   branches of every namespace it reaches, and each time the whole table of namespaces was
   read, so a purge reaching 10,000 branches took about twice what its branches alone cost.

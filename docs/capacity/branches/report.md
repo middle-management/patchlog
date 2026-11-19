@@ -4,6 +4,10 @@ Measured 2026-11-19 on the Go reference implementation at spec 0.85. This report
 spec writer: it takes §6.6's reasons for the two limits one by one and says what each cost
 when measured, and it ends with four questions for the spec.
 
+Spec 0.86 answered the questions, and the implementation has changed since: the last
+section, [Afterwards](#afterwards-spec-086-and-the-same-measurements-again), has both. The
+sections before it stand as they were sent.
+
 ## Summary
 
 - **`branchesPerNamespace` bounds one thing that matters: purges.** A purge in a base costs
@@ -202,3 +206,90 @@ are fixed; the tables above are from the fixed code.
 | After | 0.16 s | 1.7 s |
 
 The raw results are next to this file; `README.md` there names the runs.
+
+## Afterwards: spec 0.86, and the same measurements again
+
+### What spec 0.86 answered
+
+| Question | Answer in 0.86 | The reference |
+|---|---|---|
+| 1. Should frozen branches count? | No: `branchesPerNamespace` stays as it was, and frozen branches are free. | Unchanged. A purge now costs a frozen branch that doesn't see the document nothing (below), which is most of what the question was about. |
+| 2. Is the per-level product intended? | Not answered. | Carried as an open note (docs/SPEC-FEEDBACK.md). |
+| 3. Should `/branches` have pages? | Yes: `?after=`, `{ "branches": [ … ], "next"? }`. An `in_use` refusal's `referencing` and a namespace purge's `dependents` list a page too, with `"more": true`. | Done. |
+| 4. Could a propagated purge be satisfied by the base's cache tag? | Allowed, as an option: a branch's read-through responses MAY carry its local bases' tags, and once no cache holds a branch response without them a propagated purge MAY be satisfied by the base's tags (§9). | Not used: the reference still purges each branch's own tags, which conforms. |
+
+### What changed in the implementation
+
+- **A branch's chain of bases is read once per transaction**, in one statement, where each
+  level was read, locked and checked on its own. Depth no longer adds statements to a read or
+  a write.
+- **A purge finds the branches it has work in by name**: those that hold a row for the
+  document or may read it through. A branch that neither holds nor sees it is not read,
+  locked or written. The branches a purge does reach get their `purge` entries in one
+  statement on Postgres.
+- **The cause of "Postgres is not quite linear at the top" was found.** A lookup the purge
+  made per branch was planned as a scan of a table the purge itself was filling. That lookup
+  is gone.
+
+### Purges, Postgres, median ms
+
+| Live branches | 1 | 10 | 100 | 1,000 | 10,000 | 100 × 100 | 100 + 10,000 frozen |
+|---|---|---|---|---|---|---|---|
+| Branches don't see the document: then | 14 | 22 | 95 | 952 | 9,555 | 9,918 | 9,048 |
+| now | 7.3 | 7.8 | 9.0 | 13 | 52 | 56 | 54 |
+| Branches read it through: then | 12 | 30 | 158 | 1,685 | 26,753 | 24,980 | 25,407 |
+| now | 7.5 | 7.7 | 16 | 104 | 873 | 894 | 939 |
+| Each branch has its own revision: then | 14 | 34 | 201 | 2,268 | 29,134 | 25,250 | 25,217 |
+| now | 9.7 | 7.8 | 20 | 102 | 1,058 | 1,041 | 1,028 |
+| Refused purge of the schema: then | 139 | 196 | 690 | 5,747 | 53,562 | 81,183 | 56,745 |
+| now | 176 | 200 | 535 | 4,065 | 39,995 | 49,357 | 40,354 |
+| `GET /branches`, every page: now | 0.8 | 1.9 | 9.1 | 72 | 662 | 7.4 | 646 |
+| `GET /branches`, one page: now | 0.7 | 1.4 | 8.0 | 70 | 61 | 7.9 | 66 |
+| Create one more branch: now | 3.5 | 3.3 | 3.8 | 4.7 | 5.0 | 3.7 | 5.1 |
+
+- A purge now costs about 0.1 ms per branch that sees the document, at 1,000 and at 10,000,
+  and about 0.005 ms per branch that doesn't (the search still looks each one up by key).
+- The cache tags per purge are what they were: two per branch that sees the document.
+- The slowest write to another namespace during a purge was 37 ms.
+- **The refused purge of a referenced schema is not fixed.** The cap on `referencing` lets
+  the search stop at a page only where the caller may read more than a page of referencing
+  namespaces, and the purge is still planned over every branch before it is refused. Here it
+  is 40 s at 10,000 branches.
+- On SQLite at 10,000 branches: 39 ms where the branches don't see the document, 0.77 s
+  where they read it through, 1.0 s where each has its own revision, and other namespaces'
+  writes still wait for the purge (0.75 s at most).
+
+### Depth, Postgres, median ms
+
+| Depth | 0 | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---|---|---|---|---|---|---|
+| Read one that falls through to the root: then | 0.5 | 0.6 | 0.7 | 0.8 | 1.1 | 1.7 | 2.6 |
+| now | 0.5 | 0.7 | 0.6 | 0.6 | 0.7 | 0.9 | 0.8 |
+| Create a document: then | 2.9 | 3.8 | 5.2 | 5.6 | 9.3 | 14.3 | 25.6 |
+| now | 2.7 | 3.2 | 3.3 | 3.3 | 3.3 | 4.1 | 3.3 |
+| Create one typed by a draft: then | n/a | 5.7 | 7.5 | 9.1 | 13.9 | 28.7 | 42.0 |
+| now | n/a | 4.7 | 4.4 | 4.4 | 4.4 | 4.7 | 5.0 |
+| Append to a document read through: then | n/a | 4.9 | 5.3 | 7.0 | 10.0 | 16.0 | 27.9 |
+| now | n/a | 4.3 | 4.2 | 4.5 | 4.2 | 4.2 | 4.6 |
+| Purge in the root: then | 5.7 | 15 | 16 | 24 | 40 | 56 | 134 |
+| now | 5.9 | 6.7 | 7.8 | 9.8 | 9.1 | 12 | 14 |
+| Reads per second, 16 callers: then | 7,282 | 5,679 | 5,113 | 4,742 | 3,677 | 1,977 | 1,324 |
+| now | 8,556 | 5,999 | 5,781 | 5,499 | 4,873 | 4,706 | 3,578 |
+| Creates per second, 16 callers: then | 1,197 | 990 | 772 | 633 | 420 | 258 | 159 |
+| now | 1,331 | 1,092 | 922 | 996 | 937 | 827 | 993 |
+
+- One caller's read or write now costs about the same at any depth. The summary's "each
+  level adds about 0.07 ms to a read and 0.7 ms to a write" no longer holds here.
+- Depth still costs under load: 16 callers read 3,578 documents a second at depth 32 against
+  8,556 in a plain namespace, and a branch still costs more than a plain namespace (depth 0
+  to 1). The first use of a base in a transaction locks the whole local chain.
+- Creating a branch at depth 32 takes 8 ms against 4 ms at depth 1.
+
+### What this says about §6.6's reasons
+
+For this implementation, `branchDepth` no longer bounds a per-request cost that grows by
+level, and `branchesPerNamespace` bounds a purge at about 0.1 ms per branch that sees the
+purged document instead of 1.5 to 2.3 ms. Neither changes what the spec should say: another
+implementation may pay per level, and the limits are the only bound the text gives. The
+`-v086` result files are next to this one.
+

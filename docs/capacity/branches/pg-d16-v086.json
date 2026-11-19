@@ -1,0 +1,164 @@
+{
+  "branch_depth": 16,
+  "chain_append_through_c1": {
+    "max_ms": 7.174,
+    "n": 500,
+    "p50_ms": 4.23
+  },
+  "chain_create_deepest_ms": 8.042,
+  "chain_create_doc_c1": {
+    "concurrency": 1,
+    "errors": 0,
+    "max_ms": 13.499,
+    "n": 500,
+    "p50_ms": 4.145,
+    "p95_ms": 5.724,
+    "p99_ms": 7.16,
+    "per_second": 234.77226717734982
+  },
+  "chain_create_doc_c16": {
+    "concurrency": 16,
+    "errors": 0,
+    "max_ms": 33.301,
+    "n": 500,
+    "p50_ms": 18.31,
+    "p95_ms": 31.132,
+    "p99_ms": 32.508,
+    "per_second": 826.8581451840362
+  },
+  "chain_create_draft_typed_c1": {
+    "concurrency": 1,
+    "errors": 0,
+    "max_ms": 10.208,
+    "n": 500,
+    "p50_ms": 4.721,
+    "p95_ms": 6.311,
+    "p99_ms": 7.463,
+    "per_second": 204.842031523994
+  },
+  "chain_create_draft_typed_c16": {
+    "concurrency": 16,
+    "errors": 0,
+    "max_ms": 57.792,
+    "n": 500,
+    "p50_ms": 22.551,
+    "p95_ms": 41.717,
+    "p99_ms": 44.775,
+    "per_second": 655.048556037558
+  },
+  "chain_create_sibling": {
+    "max_ms": 5.768,
+    "n": 5,
+    "p50_ms": 5.57
+  },
+  "chain_create_typed_c1": {
+    "concurrency": 1,
+    "errors": 0,
+    "max_ms": 29.498,
+    "n": 500,
+    "p50_ms": 4.489,
+    "p95_ms": 6.364,
+    "p99_ms": 6.754,
+    "per_second": 213.27767147826683
+  },
+  "chain_create_typed_c16": {
+    "concurrency": 16,
+    "errors": 0,
+    "max_ms": 37.4,
+    "n": 500,
+    "p50_ms": 20.846,
+    "p95_ms": 27.895,
+    "p99_ms": 30.169,
+    "per_second": 738.3502176036966
+  },
+  "chain_purge_root": {
+    "max_ms": 15.649,
+    "n": 5,
+    "p50_ms": 11.501,
+    "purge_tags_each": 44
+  },
+  "chain_read_miss_c1": {
+    "concurrency": 1,
+    "errors": 0,
+    "max_ms": 1.864,
+    "n": 500,
+    "p50_ms": 0.876,
+    "p95_ms": 1.333,
+    "p99_ms": 1.653,
+    "per_second": 1075.3327844734438
+  },
+  "chain_read_miss_c16": {
+    "concurrency": 16,
+    "errors": 0,
+    "max_ms": 13.02,
+    "n": 500,
+    "p50_ms": 2.911,
+    "p95_ms": 6.299,
+    "p99_ms": 8.755,
+    "per_second": 4788.609147706871
+  },
+  "chain_read_own_c1": {
+    "concurrency": 1,
+    "errors": 0,
+    "max_ms": 4.311,
+    "n": 500,
+    "p50_ms": 0.981,
+    "p95_ms": 1.38,
+    "p99_ms": 1.998,
+    "per_second": 983.6061690944827
+  },
+  "chain_read_own_c16": {
+    "concurrency": 16,
+    "errors": 0,
+    "max_ms": 18.375,
+    "n": 500,
+    "p50_ms": 3.313,
+    "p95_ms": 8.512,
+    "p99_ms": 13.599,
+    "per_second": 4067.5441411517213
+  },
+  "chain_read_root_c1": {
+    "concurrency": 1,
+    "errors": 0,
+    "max_ms": 2.376,
+    "n": 500,
+    "p50_ms": 0.933,
+    "p95_ms": 1.282,
+    "p99_ms": 1.619,
+    "per_second": 1036.0013300848116
+  },
+  "chain_read_root_c16": {
+    "concurrency": 16,
+    "errors": 0,
+    "max_ms": 12.402,
+    "n": 500,
+    "p50_ms": 2.891,
+    "p95_ms": 6.892,
+    "p99_ms": 8.553,
+    "per_second": 4705.907155840068
+  },
+  "chain_read_root_new_grant_c1": {
+    "concurrency": 1,
+    "errors": 0,
+    "max_ms": 2.651,
+    "n": 500,
+    "p50_ms": 0.845,
+    "p95_ms": 1.432,
+    "p99_ms": 1.754,
+    "per_second": 1081.0373370513234
+  },
+  "chain_read_root_new_grant_c16": {
+    "concurrency": 16,
+    "errors": 0,
+    "max_ms": 18.74,
+    "n": 500,
+    "p50_ms": 3.875,
+    "p95_ms": 8.531,
+    "p99_ms": 11.532,
+    "per_second": 3654.6788400900173
+  },
+  "origin_vmhwm_mb": 43.17578125,
+  "origin_vmrss_mb": 42.66015625,
+  "profile": "grants",
+  "total_seconds": 18.480276988
+}

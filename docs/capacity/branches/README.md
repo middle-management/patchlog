@@ -20,6 +20,8 @@ grants profile, with `--samples 500`, the core's `--max-branch-depth 64` and
 |---|---|
 | `-before` | v0.31.0: every purge read every document of the deployment for schema references |
 | none | with that fixed, without the index on a namespace's base |
-| `-idx` | with the index `namespaces_base` too: the current code |
+| `-idx` | with the index `namespaces_base` too: what `report.md`'s tables show |
+| `-v086` | spec 0.86, after the work `report.md`'s last section describes: a branch's chain of bases read once per transaction, a purge finding the branches it has work in by name, `/branches` paged |
 
-The `-before` runs had no typed documents in the base and no `purge_schema_refused`.
+The `-before` runs had no typed documents in the base and no `purge_schema_refused`. The `-v086`
+runs have `branch_list` over every page of `/branches` and `branch_list_first_page` for one.
