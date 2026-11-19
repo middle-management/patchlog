@@ -724,9 +724,11 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   the loser re-check and answer `412` with the new head (or the idempotent retry), as on
   SQLite. The namespace entry is appended last, under a separate advisory **log lock**,
   `pg_advisory_xact_lock(0x504e, ns)`, taken after every other lock, in ascending order when a
-  write appends to several logs (purge propagation, which takes them in one statement, and
-  branch creation), and held through commit,
-  so entries commit, and their sequence numbers grow, in chain order. A transaction holding a
+  write appends to several logs, and held through commit,
+  so entries commit, and their sequence numbers grow, in chain order. A write that holds a
+  namespace's lock exclusively takes no log lock for it: every appender holds the namespace's
+  lock first, so none is there (a purge that reaches thousands of branches holds one lock for
+  each, and appends their entries in one statement). A transaction holding a
   log lock never waits for a namespace lock (it tries, and restarts with the lock taken up
   front if that fails). An uploader's pending blob total (§7.8) is ordered by a row of its
   own (`blob_uploaders`), so concurrent uploads can't together exceed `blobPending`. Details in

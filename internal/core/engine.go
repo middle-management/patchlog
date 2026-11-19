@@ -1417,9 +1417,10 @@ func entryResources(entry map[string]any) (names []string, ok bool) {
 // n.headSeq, and returns its id and seq (nil for an empty chain).
 func (t *tx) logHeadOf(n *nsRow) (*ids.ID, any) {
 	var headID []byte
-	if h, ok := t.logHeads[n.id]; ok && t.logLocks[lockKey(n.id)] {
-		// The head this transaction appended last, under the log lock it
-		// still holds (group commit).
+	if h, ok := t.logHeads[n.id]; ok && (t.logLocks[lockKey(n.id)] || t.locks[lockKey(n.id)] == lockExclusive) {
+		// The head this transaction appended or read last, under the log
+		// lock it still holds (group commit), or under the namespace's
+		// lock held exclusively, which stands for it (lockLog).
 		n.headSeq, headID = sql.NullInt64{Int64: h.seq, Valid: true}, h.id[:]
 		if validateBoth {
 			// The oracle: the head as the database has it now.
