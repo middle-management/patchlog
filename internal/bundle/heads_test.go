@@ -85,7 +85,7 @@ func headsScenario(t *testing.T, mode string, sealed, branch bool) ([]byte, *dep
 	newD := func(t *testing.T, origin string) *deployment { return newDeployment(t, origin) }
 	doc := map[string]any{"read": "public"}
 	if sealed {
-		newD, doc = newEncDeployment, map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}}
+		newD, doc = func(t *testing.T, origin string) *deployment { return newEncDeployment(t, origin) }, map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}}
 	}
 	src, dst := newD(t, stagingOrigin), newD(t, cmsOrigin)
 	src.ns("m", doc)

@@ -36,7 +36,7 @@ and `K_r` with code of its own instead of calling the reference's.
 
 ## Proposed additions (the reference's own)
 
-Vectors for what "Still to come" (§I.25; §I.22 before v0.85, §I.11 and §I.15 before v0.82) has listed, and those the
+Vectors for what "Still to come" (§I.26; §I.25 before v0.86, §I.22 before v0.85, §I.11 and §I.15 before v0.82) has listed, and those the
 spec writer asked for, are computed through
 production code too and kept in [`internal/vectors/testdata`](../internal/vectors/testdata) as
 JSON, each naming the production function that produced it: RE2 `\u` (`re2.json`), key wraps in
@@ -96,9 +96,11 @@ adds it.
 confirm it. It does: every value reproduces through the production code above (the 1580-byte
 file and its sha-256, both digests, `K_b`, the three lines, the padded tags, length and sha-256,
 and the twelve rejection files, each refused). Until v0.85 it sealed I.9's two lines, which
-§G.4.1 rejects once decrypted (907 bytes, `30bf22f8…`). One row is refused earlier than its rule
-says: "line 2's last character `Q` made `B`" leaves a tag that isn't canonical base64url, which
-the reference refuses as a malformed JWE before it decrypts anything.
+§G.4.1 rejects once decrypted (907 bytes, `30bf22f8…`). In v0.85 the last row
+("line 2's last character `Q` made `B`") left a tag that isn't canonical base64url, which the
+reference refuses as a malformed JWE before it decrypts anything. v0.86 makes it `A`
+(`f69e76d7…`), which keeps the tag canonical and changes it: the test checks that the row is
+refused by decryption, as its rule says.
 
 ## §I.22–§I.24 (v0.85)
 
@@ -133,7 +135,7 @@ go test ./internal/vectors/ -run 'TestI25'
 
 ## Candidate vectors (VECTORS-PROPOSED.md, v0.85)
 
-[VECTORS-PROPOSED.md](VECTORS-PROPOSED.md) holds candidates for §I.25's list, computed
+[VECTORS-PROPOSED.md](VECTORS-PROPOSED.md) holds candidates for "Still to come" (§I.26's list since v0.86; the document itself still says §I.25), computed
 independently from the v0.85 text. They are kept as the document gives them in
 [`testdata/candidates.json`](../internal/vectors/testdata/candidates.json) (extracted, never
 computed) and checked through production code in

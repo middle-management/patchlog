@@ -21,7 +21,7 @@ phases, v0.86), and
 [docs/TESTVECTORS.md](docs/TESTVECTORS.md) points there and records which candidate vectors of
 [docs/VECTORS-PROPOSED.md](docs/VECTORS-PROPOSED.md) the reference confirms (C.4 and C.5,
 v0.85). The
-additions the reference proposes to the spec writer (for §I.25's list, "Still to come", and the
+additions the reference proposes to the spec writer (for §I.26's list, "Still to come", and the
 writer's own: RE2 `\u`, key
 wraps, sealed payloads, blobs and bundles, the plan digest, Biscuit tokens, file renderings and
 more) live in [internal/vectors/testdata](internal/vectors/testdata), each naming the production
@@ -3880,7 +3880,7 @@ sessions, agents through MCP and recording model calls (J.5–J.7) are not imple
 | `--upstream` | An allowed upstream: a URL prefix (repeatable). An `Upstream-URL` must have the same scheme and host and a path under the prefix's, at a segment boundary; anything else is `403`. No `--upstream` refuses every request. Redirects are not followed: a `3xx` is kept as the stream. |
 | `--flush` | Least time between two appends to one stream (default 200 ms, §J.2 Pace). |
 | `--ttl` | How long read grants live from a stream's creation (default 24 h); a closed stream that old is purged with its continuations (§J.4 Expiry). |
-| `--idle-timeout` | A stream with no append for this long is closed with `"timeout"` (default 2 m). |
+| `--idle-timeout` | A stream with no append for this long is closed with `"timeout"`, by any proxy (default 2 m). The time is the deployment's, one for all its proxies (§J.2 Restarts): give every proxy of `--ns` the same value. Nothing checks that they agree, and with different values the shortest closes every proxy's streams. |
 | `--state` | A file with the names of the streams being written; a proxy started again closes those still open with `"error"` (§J.2 Restarts). Without it they are closed by the idle sweep, with `"timeout"`. |
 | `--segment-size` | The size at which a stream continues in its next resource, where that is below the namespace's `documentSize` (default: `documentSize`). Each append costs the stream's size so far, so where latency matters §J.1 suggests well below it, `--segment-size "256 KiB"` say. |
 | `--max-request-body`, `--max-segments`, `--max-streams` | Largest body forwarded upstream (1 MiB); most resources one response may fill (8); most streams carried at once (64, then `503` with `Retry-After`; requests that arrive together share the count, and a `Request-Key` request for a stream that exists needs no slot). |
@@ -4159,6 +4159,9 @@ patchlog import -i all.jsonl --atomic --ns demo-schemas=demo2-schemas,demo=demo2
   missing ones first, listing the importer's key and allowance; a `401` or `403` on the first
   read of a target namespace says so.
 - **Branches** export with the base's history included, or with `--foreign-parents` naming the base revisions in `requires`.
+  The foreign parent is the resource's head as the branch's own `/heads` lists it at the
+  branch's first `ns_id` (§G.4.1, v0.86): the exporter reads nothing in the base, needs no
+  grant there, and a branch of a remote base (§G.3) exports the same way.
   An e2e branch's documents always export the second way, its keyring aside (v0.82, §G.5.1; see
   E3 under Encryption below).
 - **Blobs** (§G.4.1) travel as blob lines (unpadded base64url; padded is accepted), each
@@ -4220,13 +4223,16 @@ patchlog import --ns secret -i s.plb --identity me.jwk --atomic
   target's keyring must share the bundle's history, else the import is refused at step 1. An
   e2e branch's export writes no line the branch reads through from its base, whose sealed ops
   name the base (v0.82, §G.5.1 Importing): a document continued in the branch starts after its
-  foreign parent, the base's head at `base.at`, named in `requires` (a `requires` before it, or
+  foreign parent, its head as the branch's `/heads` lists it at the branch's first `ns_id`,
+  named in `requires` (a `requires` before it, or
   a foreign parent that isn't in the chain, refuses the document); one the branch never wrote
   is `external`, pinned to its revision; the keyring comes whole, unless the export asks for
   `--foreign-parents`; and a branch of a remote base
-  exports only documents that start with a line of its own. The importer looks a pinned
-  `external` up in the target's chain where an e2e target serves no document by revision, and
-  for a tombstone at any level. Lines
+  exports the same way (v0.86; before, only documents that start with a line of its own). The
+  importer asks the target for a pinned `external` without opening it, so it needs no key of a
+  sealed or e2e target; it looks the pin up in the target's chain where an e2e target serves
+  no document by revision, and for a tombstone at any level; a pin pruned without a kept
+  document is not in the target (§G.4.2, v0.86). Lines
   go in batches per epoch, in epoch order, each epoch's raise of `encryption.epoch` in the batch
   with the keyring line that brings its key (so atomic mode is atomic per epoch); an existing
   target is refused only below the bundle's lowest epoch, or past the epoch of a sealed line it
