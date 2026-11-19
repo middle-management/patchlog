@@ -92,7 +92,7 @@ func TestV086CookieEndedStaysEnded(t *testing.T) {
 			v86Config(d, "docs", v86Undo)
 			v86Restart(d, []string{"docs"}, false)
 			var both bool
-			for _, b := range d.x.batches() {
+			for _, b := range d.x.appliedUpTo(must(d.w.NSHead(context.Background(), "docs")).ID) {
 				n := 0
 				for _, u := range b.Units {
 					if u.Config != nil {

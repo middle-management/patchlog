@@ -18,6 +18,7 @@ import (
 func TestV086BranchCatalogTree(t *testing.T) {
 	t.Parallel()
 	e := treeEnv(t)
+	e.create("cat", "inner", map[string]any{"title": "Inner", "parents": parents("cat", "season")})
 	must(e.c.CreateBranch(e.ctx, "cat", client.BranchRequest{Name: "cat-b"}))
 	opt := e.opt
 	opt.Catalogs = []string{"cat-b"}
@@ -30,13 +31,19 @@ func TestV086BranchCatalogTree(t *testing.T) {
 	b.opt, b.dav = opt, newTestServer(t, srv)
 
 	sameStrings(t, "cat-b", names(b.propfind("/cat-b/"), "/cat-b/"), []string{"Empty/", "Season/"})
-	sameStrings(t, "Season", names(b.propfind("/cat-b/Season/"), "/cat-b/Season/"), []string{"derby.json"})
+	sameStrings(t, "Season", names(b.propfind("/cat-b/Season/"), "/cat-b/Season/"), []string{"Inner/", "derby.json"})
 	b.expect(b.do("MOVE", "/cat-b/Season/derby.json", "", "Destination", "/cat-b/Empty/derby.json"), 201, "a move in the branch")
 	sameJSON(t, b.lastEntry("cat-b", "matches.derby").Patches, []any{map[string]any{"op": "replace", "path": "/parents/0",
 		"value": map[string]any{"href": "/r/cat-b/empty", "order": "a0"}}})
 	sameStrings(t, "Empty", names(b.propfind("/cat-b/Empty/"), "/cat-b/Empty/"), []string{"derby.json"})
-	sameStrings(t, "Season after the move", names(b.propfind("/cat-b/Season/"), "/cat-b/Season/"), nil)
+	sameStrings(t, "Season after the move", names(b.propfind("/cat-b/Season/"), "/cat-b/Season/"), []string{"Inner/"})
+	// A folder moves the same way, and not into itself through the base's
+	// name.
+	b.expect(b.do("MOVE", "/cat-b/Season/Inner", "", "Destination", "/cat-b/Empty/Inner"), 201, "a folder named through the base, moved in the branch")
+	sameJSON(t, b.lastEntry("cat-b", "inner").Patches, []any{map[string]any{"op": "replace", "path": "/parents/0",
+		"value": map[string]any{"href": "/r/cat-b/empty", "order": "a1"}}})
+	b.expect(b.do("MOVE", "/cat-b/Empty", "", "Destination", "/cat-b/Empty/Inner/Empty"), 403, "a folder into a folder in it")
 	// The base is as it was.
 	sameJSON(t, e.parentsOf("matches.derby"), parents("cat", "season"))
-	sameStrings(t, "the base's Season", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+	sameStrings(t, "the base's Season", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"Inner/", "derby.json"})
 }

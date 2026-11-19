@@ -191,13 +191,21 @@ func (st *reqState) baseChain(ctx context.Context, cat string) ([]string, error)
 }
 
 // own reports whether a link into namespace ns is one to catalog cat's
-// own node: cat itself, or a namespace of its base chain as the request
-// read it (baseChain).
+// own node: cat itself, or a namespace of its base chain (baseChain) as
+// the request read it with the catalog's graph, or as the token's kept
+// graph has it (a chain never changes). A request that has neither reads
+// such a link as one to another namespace, as before v0.86: a node named
+// through the base then counts as renamed or moved (stillNamed), and
+// nothing is written.
 func (st *reqState) own(cat, ns string) bool {
 	if ns == cat {
 		return true
 	}
 	cg := st.graphs[cat]
+	if cg == nil {
+		v, _ := st.s.view(st.tk, cat)
+		cg = v.cg
+	}
 	return cg != nil && slices.Contains(cg.bases, ns)
 }
 
