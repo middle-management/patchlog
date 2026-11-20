@@ -650,10 +650,7 @@ func TestTreeFolderAccess(t *testing.T) {
 		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": "^(ta|ax|as|az)$"}}}})
 	partial := s.Client(t, client.WithBearer(byName))
 	if _, err := partial.Doc(ctx, "files", "ax", must(admin.Head(ctx, "files", "ax")).ID); err != nil {
-		// From v0.87 a partial reader's document reads are redirected
-		// under /ns/{ns}/view/{view} (§7.9), which internal/client's Doc
-		// and blob reads don't follow yet.
-		t.Skipf("a partial reader's document read isn't served through the client: %v", err)
+		t.Fatalf("a partial reader's document read: %v", err)
 	}
 	e.pw = byName
 	if r := e.do("PROPFIND", "/files/", "", "Depth", "1"); r.status != http.StatusMultiStatus {
@@ -671,7 +668,7 @@ func TestTreeFolderAccess(t *testing.T) {
 	teamA := k.Grant(t, s.Now(), "user:a", []string{"files", "schemas"}, []string{"read"}, map[string]any{"rules": []any{rule}})
 	ta := s.Client(t, client.WithBearer(teamA))
 	if h, err := ta.Head(ctx, "files", "ax"); err != nil || h.State != client.Live {
-		t.Skipf("the core doesn't serve a /doc/folder read rule's subtree yet (§7.9 filtered reads by document): head of /team-a/x.txt: %+v %v", h, err)
+		t.Fatalf("head of /team-a/x.txt under a /doc/folder rule: %+v %v", h, err)
 	}
 	e.pw = teamA
 	if top = e.ls("/files/"); strings.Join(top, ",") != "team-a/" {
