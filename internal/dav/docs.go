@@ -28,6 +28,14 @@ type docEntry struct {
 	// sealed: the core served it sealed (application/jose, Addendum E),
 	// which this server, holding no keys, doesn't offer (§H.7).
 	sealed bool
+	// tree: a document of a file tree (§H.2), whose file is its content:
+	// value, rendered, raw and file are content's (contentEntry), and whole
+	// is the document; folder and name are its place, and isFolder says it
+	// has no content. A document without a string folder and name has no
+	// place (placed false), and is in no folder.
+	tree, placed, isFolder bool
+	whole                  any
+	folder, name           string
 }
 
 // newEntry is the entry of document v, read or written at modified.
@@ -35,6 +43,57 @@ func newEntry(v any, modified time.Time) *docEntry {
 	e := &docEntry{value: v, modified: modified, raw: rawRefOf(v, client.RawBlobOf(v))}
 	e.file, e.rendered = files.Show(v)
 	return e
+}
+
+// treeEntry is the entry of document v of a file tree (§H.2), read or
+// written at modified: its file is content, of which "everything this
+// addendum says of a file's document" holds, paths included; $nonce and
+// $successor stay at the document's top level.
+func treeEntry(v any, modified time.Time) *docEntry {
+	m, _ := v.(map[string]any)
+	content, has := m["content"]
+	e := contentEntry(content, modified)
+	e.tree, e.whole, e.isFolder = true, v, !has
+	e.folder, _ = m["folder"].(string)
+	e.name, _ = m["name"].(string)
+	_, fok := m["folder"].(string)
+	_, nok := m["name"].(string)
+	e.placed = fok && nok
+	if e.isFolder {
+		e.value, e.raw, e.rendered = nil, nil, nil
+	}
+	return e
+}
+
+// contentEntry is the entry of a tree file's content: a raw file where it
+// is a blob reference, else a JSON file whose rendering is content's own
+// (§H.1, §H.2: the document's top-level $nonce and $successor aren't in
+// it, as they aren't in content).
+func contentEntry(content any, modified time.Time) *docEntry {
+	e := &docEntry{value: content, modified: modified, tree: true, placed: true}
+	if bid := client.RawBlobOf(content); bid != "" {
+		e.raw = rawRefOf(content, bid)
+	}
+	e.file, e.rendered = files.Show(content)
+	return e
+}
+
+// entryOf is the entry of document v of namespace ns as this server shows
+// it: a tree's (treeEntry) or a flat namespace's (newEntry).
+func (s *Server) entryOf(ns string, v any, modified time.Time) *docEntry {
+	if s.trees[ns] {
+		return treeEntry(v, modified)
+	}
+	return newEntry(v, modified)
+}
+
+// root is e's document as the core holds it: its whole document in a
+// tree, else its value.
+func (e *docEntry) root() any {
+	if e.tree {
+		return e.whole
+	}
+	return e.value
 }
 
 // fileMeta is what a listing shows of a revision's file (§H.3), read from
@@ -86,7 +145,7 @@ func (s *Server) doc(ctx context.Context, tk *token, ns, name, rev string) (*doc
 		case err != nil:
 			return nil, err
 		default:
-			e = newEntry(d.Value, d.Modified)
+			e = s.entryOf(ns, d.Value, d.Modified)
 		}
 		s.keep(k, e)
 		return e, nil
@@ -152,6 +211,10 @@ type nsInfo struct {
 	nonceRequired         bool
 	patchSetSize, docSize int
 	opsPerSet, blobSize   int
+	// tree: a file tree's (§H.2), whose files' patch sets are content's,
+	// sent under /content, and whose documents are objects, which carry a
+	// $nonce whatever their content (withNonce)
+	tree bool
 }
 
 // writerAt is §7.4's writer block of a namespace as a token was given it,
@@ -262,7 +325,7 @@ func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, e
 		pi, err := tk.c.NSPrincipal(ctx, ns)
 		switch {
 		case transient(err):
-			return nsInfo{nonce: true}, err
+			return nsInfo{nonce: true, tree: s.trees[ns]}, err
 		case err != nil:
 			wa = writerAt{err: err, at: now}
 		default:
@@ -273,7 +336,7 @@ func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, e
 		tk.writers[ns] = wa
 		tk.mu.Unlock()
 	}
-	in := nsInfo{nonce: true}
+	in := nsInfo{nonce: true, tree: s.trees[ns]}
 	if wa.err == nil {
 		w := wa.w
 		in.sealed = w.Level == "sealed" || w.Level == "e2e"

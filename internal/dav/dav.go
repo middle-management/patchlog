@@ -62,6 +62,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/files"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
@@ -76,6 +77,26 @@ type Options struct {
 	// Namespaces are the flat namespaces served, each a directory of its
 	// files (§H.2 "Flat view").
 	Namespaces []string
+	// Trees are the namespaces served as file trees (§H.2): documents of
+	// the file schema, { $schema, folder, name, content? }, placed by their
+	// folder and name, listed through the index (Index, §H.3).
+	Trees []string
+	// Index is the base URL of the index service (Addendum A, patchlog
+	// index) that lists the trees' folders (§H.3); it follows the trees.
+	// IndexClient sends its requests (default: one of its own).
+	Index       string
+	IndexClient *http.Client
+	// FileSchema is the file schema's resource, /r/{ns}/{name} (default
+	// files.SchemaResource): listings ask for its documents, and new files
+	// and folders are pinned to its head revision.
+	FileSchema string
+	// CaseSensitive compares names in a tree's folder as they are, NFC
+	// aside; by default after Unicode simple case folding too (§H.2
+	// "Siblings").
+	CaseSensitive bool
+	// MaxListing bounds the entries of a tree's folder listed (default
+	// 10000): a larger one is refused (403), never listed cut short (§H.3).
+	MaxListing int
 	// InlinePDF serves a PDF (a raw file stored as application/pdf) for
 	// display in the browser; by default it is sent as an attachment
 	// (Content-Disposition: attachment). Either way its 200 and 206 go
@@ -180,8 +201,18 @@ const maxMetas = 1 << 18
 type Server struct {
 	opt   Options
 	flat  map[string]bool
-	start time.Time
-	fs    *davFS
+	trees map[string]bool
+	// schemaNS and schemaName are the file schema's resource (FileSchema)
+	schemaNS, schemaName string
+	// nsWrites keeps, by namespace, the ns_ids of the last writes this
+	// server made there (X-Namespace-Revision, writeGuard), sent as ?min
+	// on the trees' listings (§H.3 "Read-your-writes", §H.4 "Names
+	// before writes")
+	nsWriteMu sync.Mutex
+	nsWrites  map[string][]string
+	ixc       *http.Client
+	start     time.Time
+	fs        *davFS
 
 	local *token // local mode: the one bearer, the one user
 
@@ -283,6 +314,7 @@ func (g writeGuard) RoundTrip(r *http.Request) (*http.Response, error) {
 		st.sawUpstream(theCore, r, res, err)
 		if write && err == nil && res.StatusCode < 300 {
 			st.sent.Store(true)
+			st.s.noteWrite(r.URL.Path, res.Header.Get("X-Namespace-Revision"))
 		}
 	}
 	return res, err
@@ -435,8 +467,11 @@ func New(opt Options) (*Server, error) {
 	if !opt.Gateway && opt.Password == "" {
 		return nil, errors.New("dav: local mode needs a password")
 	}
-	if len(opt.Namespaces) == 0 {
+	if len(opt.Namespaces) == 0 && len(opt.Trees) == 0 {
 		return nil, errors.New("dav: no namespace to serve")
+	}
+	if len(opt.Trees) > 0 && opt.Index == "" {
+		return nil, errors.New("dav: file trees are listed through an index service (§H.3): no Index given")
 	}
 	def := func(v *int, d int) {
 		if *v <= 0 {
@@ -461,6 +496,10 @@ func New(opt Options) (*Server, error) {
 	def(&opt.MaxTokensPerPrincipal, 8)
 	def(&opt.MaxLocks, 256)
 	def(&opt.Retries, 5)
+	def(&opt.MaxListing, 10000)
+	if opt.FileSchema == "" {
+		opt.FileSchema = files.SchemaResource
+	}
 	defDur(&opt.ScratchIdle, time.Hour)
 	defDur(&opt.RecordIdle, 24*time.Hour)
 	defDur(&opt.VerifyEvery, maxVerifyEvery)
@@ -477,7 +516,7 @@ func New(opt Options) (*Server, error) {
 	if opt.Logf == nil {
 		opt.Logf = func(string, ...any) {}
 	}
-	s := &Server{opt: opt, flat: map[string]bool{}, tokens: map[string]*token{},
+	s := &Server{opt: opt, flat: map[string]bool{}, trees: map[string]bool{}, nsWrites: map[string][]string{}, tokens: map[string]*token{},
 		principals: map[string]*principal{}, recRoots: map[string]*recStore{},
 		sem: make(chan struct{}, opt.FetchConcurrency), inflight: semaphore.NewWeighted(int64(opt.InflightBytes)),
 		heavy: make(chan struct{}, maxHeavy)}
@@ -490,6 +529,30 @@ func New(opt Options) (*Server, error) {
 			return nil, fmt.Errorf("dav: invalid namespace name %q", ns)
 		}
 		s.flat[ns] = true
+	}
+	for _, ns := range opt.Trees {
+		if !client.ValidNSName(ns) {
+			return nil, fmt.Errorf("dav: invalid namespace name %q", ns)
+		}
+		if s.flat[ns] {
+			return nil, fmt.Errorf("dav: namespace %s is served both flat and as a tree", ns)
+		}
+		s.trees[ns] = true
+	}
+	if len(s.trees) > 0 {
+		rest, ok := strings.CutPrefix(opt.FileSchema, "/r/")
+		ns, name, ok2 := strings.Cut(rest, "/")
+		if !ok || !ok2 || !client.ValidNSName(ns) || !client.ValidResourceName(name) {
+			return nil, fmt.Errorf("dav: FileSchema %q isn't a resource /r/{ns}/{name}", opt.FileSchema)
+		}
+		s.schemaNS, s.schemaName = ns, name
+		if _, err := url.Parse(opt.Index); err != nil {
+			return nil, fmt.Errorf("dav: Index: %w", err)
+		}
+		s.ixc = opt.IndexClient
+		if s.ixc == nil {
+			s.ixc = &http.Client{Timeout: time.Minute}
+		}
 	}
 	s.fs = &davFS{s: s}
 	opt.Client = s.opt.Client
@@ -512,8 +575,11 @@ func (s *Server) realm() string { return fmt.Sprintf("Basic realm=%q, charset=\"
 
 // namespaces lists the served namespaces, sorted.
 func (s *Server) namespaces() []string {
-	out := make([]string, 0, len(s.flat))
+	out := make([]string, 0, len(s.flat)+len(s.trees))
 	for ns := range s.flat {
+		out = append(out, ns)
+	}
+	for ns := range s.trees {
 		out = append(out, ns)
 	}
 	sort.Strings(out)
@@ -2459,6 +2525,12 @@ type reqState struct {
 
 	lists map[string]*listing     // by directory path
 	heads map[string]*client.Head // by ns/name
+	// caught: by tree namespace, the head its listings wait for (catchUp);
+	// schemaRef: the file schema's revision new documents pin
+	// (fileSchemaRef); blobAt: the name a new tree file's blob went to
+	// (treeCreate)
+	caught            map[string]string
+	schemaRef, blobAt string
 }
 
 type stateKey struct{}
