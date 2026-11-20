@@ -609,8 +609,12 @@ func TestV075FilteredLongPollPerGS(t *testing.T) {
 		newLiveClock(interval, filteredLogPath("matches", lgs)), newLiveClock(interval, filteredLogPath("matches", bgs)))
 	lcur, bcur := strconv.FormatInt(curs[0], 10), strconv.FormatInt(curs[1], 10)
 	lc, bc := make(chan longPollRes, 1), make(chan longPollRes, 1)
-	go func() { lc <- w.longPoll("/ns/matches/view/"+lgs+"/log?live=long-poll&cursor="+lcur+"&since="+since, li) }()
-	go func() { bc <- w.longPoll("/ns/matches/view/"+bgs+"/log?live=long-poll&cursor="+bcur+"&since="+since, bo) }()
+	go func() {
+		lc <- w.longPoll("/ns/matches/view/"+lgs+"/log?live=long-poll&cursor="+lcur+"&since="+since, li)
+	}()
+	go func() {
+		bc <- w.longPoll("/ns/matches/view/"+bgs+"/log?live=long-poll&cursor="+bcur+"&since="+since, bo)
+	}()
 	time.Sleep(200 * time.Millisecond)
 	w.put("matches", "derby", map[string]any{})
 	l, b := <-lc, <-bc

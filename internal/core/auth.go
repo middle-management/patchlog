@@ -479,7 +479,16 @@ func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 	if !a.verified.Can["read"] {
 		return false
 	}
-	return t.grantRules(a, "read", nil, t.basicEnvelope("read", resource, a), false) == nil
+	if t.grantRules(a, "read", nil, t.basicEnvelope("read", resource, a), false) != nil {
+		return false
+	}
+	// Rules on /doc are left to the revision the read concerns
+	// (mayReadRow); the parts of them that don't refer to /doc, alls
+	// flattened, hold for every revision it may read.
+	if j := t.grantJudge(a); resource != "" && j != nil && j.doc && !j.byNameOnly(resource) {
+		return false
+	}
+	return true
 }
 
 // reader authenticates a read of a resource URL (/r/{ns}/{name} and the

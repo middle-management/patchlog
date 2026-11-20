@@ -36,6 +36,21 @@ type judge struct {
 
 	mu    sync.Mutex
 	names map[string]bool
+
+	once   sync.Once
+	nondoc *grantcheck.ReadFilter
+}
+
+// byNameOnly reports whether the rules of j that don't refer to /doc,
+// alls flattened (grantcheck.ReadFilter.WithoutDoc), allow reading name:
+// what holds for every revision j may read, and all a purge entry is
+// judged by (§7.9 Log entries).
+func (j *judge) byNameOnly(name string) bool {
+	j.once.Do(func() {
+		j.nondoc = j.filter.WithoutDoc()
+		j.nondoc.Steps = j.filter.Steps
+	})
+	return j.nondoc.Allows(name)
 }
 
 // newJudge is the judge of filter, whose digest is key.
@@ -316,9 +331,6 @@ type fview struct {
 	// unrestricted: an unrestricted reader's /ns/{ns} cookie, which
 	// reads at the view's URLs as at its own (filteredAdmit).
 	unrestricted bool
-
-	once   sync.Once
-	nondoc *grantcheck.ReadFilter
 }
 
 // View is the view's id (§7.9 view).
@@ -348,11 +360,7 @@ func (fv *fview) purgeShown(name string) bool {
 	if fv.unrestricted {
 		return true
 	}
-	fv.once.Do(func() {
-		fv.nondoc = fv.j.filter.WithoutDoc()
-		fv.nondoc.Steps = fv.j.filter.Steps
-	})
-	return fv.nondoc.Allows(name)
+	return fv.j.byNameOnly(name)
 }
 
 // candidates calls fn, in ascending byte order, with every name the
