@@ -55,7 +55,7 @@ func TestV085C5GrantLineKeyRejected(t *testing.T) {
 	}
 }
 
-// C.4, served (SERVICES §A.4 gs, §E.2.6 Whole-response sealing): an index
+// C.4, served (SERVICES §A.4 view, §E.2.6 Whole-response sealing): an index
 // of private, sealed demo at epoch 3, whose key ops-2026 has I.14's pub,
 // answers bob, whom that key's grant lets read demo whole, at the
 // candidate's view, the one over its key: string alone, and

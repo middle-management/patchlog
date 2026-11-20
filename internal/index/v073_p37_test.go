@@ -167,15 +167,15 @@ func p37Hits(body map[string]any) []string {
 }
 
 // TestV073P37IndexEdgeGrants (IX-18, §A.4, §B.11.5, §C.5.2–§C.5.4): the
-// index serves its gs URLs as §B.11.5 says. Its own POST /edge-grants
-// exchanges a grant for cookies, minted with its key, for /{ns}/view/{gs} of
+// index serves its view URLs as §B.11.5 says. Its own POST /edge-grants
+// exchanges a grant for cookies, minted with its key, for /{ns}/view/{view} of
 // each private namespace it follows that the grant names and
-// /_refs/view/{gs} of the reader's subject set; a GET with only the cookie
+// /_refs/view/{view} of the reader's view; a GET with only the cookie
 // is authorised from it at the origin (the head pointer under the prefix
 // and the at URLs), and behind a verifying edge gets edge lifetimes. A
 // reader whose grant reads only some resources gets them filtered as
 // under the grant. Neither grant nor cookie is 401, and so is the cookie
-// at another gs, which it doesn't cover. DELETE /edge-grants withdraws.
+// at another view, which it doesn't cover. DELETE /edge-grants withdraws.
 func TestV073P37IndexEdgeGrants(t *testing.T) {
 	t.Parallel()
 	w := p37Setup(t, index.DefaultExchangeRate)
@@ -188,8 +188,8 @@ func TestV073P37IndexEdgeGrants(t *testing.T) {
 	if len(prefixes) != 3 || prefixes["pa"] == "" || prefixes["pb"] == "" || prefixes["_refs"] == "" {
 		t.Fatalf("amy's prefixes: %v", prefixes)
 	}
-	// The grant's own subject set is the cookie's.
-	_, gs := path(prefixes["pa"])
+	// The grant's own view is the cookie's.
+	_, vid := path(prefixes["pa"])
 	if r := x.raw("/pa?limit=5", amy); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), prefixes["pa"]+"/at/") {
 		t.Fatalf("amy's pointer: %d %s (want under %s)", r.status, r.header.Get("Location"), prefixes["pa"])
 	}
@@ -206,10 +206,10 @@ func TestV073P37IndexEdgeGrants(t *testing.T) {
 	}
 	// Neither grant nor cookie, or a cookie that doesn't cover the URL.
 	_, refsGS := path(prefixes["_refs"])
-	other := strings.Replace(at, gs, refsGS, 1)
+	other := strings.Replace(at, vid, refsGS, 1)
 	for _, c := range [][]*http.Cookie{nil, cookies} {
 		if r := p37Do(t, x, "GET", other, "", "", c, ""); r.status != 401 {
-			t.Errorf("another gs's at URL with %d cookies: %d %v", len(c), r.status, r.body)
+			t.Errorf("another vid's at URL with %d cookies: %d %v", len(c), r.status, r.body)
 		}
 	}
 	if r := p37Do(t, x, "GET", at, "", "", nil, ""); r.status != 401 {
@@ -227,7 +227,7 @@ func TestV073P37IndexEdgeGrants(t *testing.T) {
 	if r, _ := p37Follow(t, x, cp["_refs"]+"?to="+url.QueryEscape("/r/target/x"), cc, ""); r.status != 200 || strings.Join(p37Hits(r.body), ",") != "pa/a,pub/p" {
 		t.Errorf("/_refs under carl's cookie: %d %v", r.status, r.body)
 	}
-	// A restarted instance on the same database knows the subject sets.
+	// A restarted instance on the same database knows the views.
 	x.stop()
 	x2 := w.start(t)
 	if r, _ := p37Follow(t, x2, cp["pa"]+"?limit=5", cc, ""); r.status != 200 || strings.Join(p37Hits(r.body), ",") != "a" {
@@ -263,8 +263,8 @@ func TestV073P37IndexEdgeGrants(t *testing.T) {
 	}
 }
 
-// path splits an index prefix /{ns}/view/{gs}.
-func path(p string) (ns, gs string) {
+// path splits an index prefix /{ns}/view/{view}.
+func path(p string) (ns, vid string) {
 	segs := strings.Split(p, "/")
 	return segs[1], segs[3]
 }
@@ -616,7 +616,7 @@ func TestV073P37ExchangePurged(t *testing.T) {
 // for its principal, with /resource set to each name it fixes" is 403. A
 // grant whose rules fix /resource to no name at all, or to names none of
 // its rules pass for, reads nothing: 403 at the core and at the index,
-// with no cookie and no subject set recorded. One that passes for a name
+// with no cookie and no view recorded. One that passes for a name
 // it fixes gets its scope marker's cookies.
 func TestV073P37ExchangeFixedNames(t *testing.T) {
 	t.Parallel()

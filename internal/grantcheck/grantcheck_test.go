@@ -306,9 +306,9 @@ func TestPublicAndSubjectSets(t *testing.T) {
 		t.Fatalf("group subjects %v", g)
 	}
 	sum := sha256.Sum256([]byte(`["group:desk","group:ops","user:bob"]`))
-	gs := ids.FromBytes(sum[:20]).String()
-	if got := grantcheck.ViewID([]string{"user:bob", "group:ops", "group:desk"}); got != gs {
-		t.Fatalf("gs %s want %s", got, gs)
+	vid := ids.FromBytes(sum[:20]).String()
+	if got := grantcheck.ViewID([]string{"user:bob", "group:ops", "group:desk"}); got != vid {
+		t.Fatalf("vid %s want %s", got, vid)
 	}
 	if string(jsonv.Canonical([]any{"b", "a"})) != `["b","a"]` {
 		t.Fatal("canonical arrays keep order")

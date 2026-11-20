@@ -537,14 +537,14 @@ func TestI7ResourceKey(t *testing.T) {
 // over two namespaces' ns_ids.
 func TestI8SubjectSetAndCheckpoint(t *testing.T) {
 	t.Parallel()
-	const gs = "17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm"
+	const vid = "17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm"
 	for _, subjects := range [][]string{
 		{"group:match-desk", "user:anna"},
 		{"user:anna", "group:match-desk"}, // sorted first
 		{"user:anna", "group:match-desk", "user:anna"},
 	} {
-		if got := grantcheck.ViewID(subjects); got != gs {
-			t.Errorf("ViewID(%q) = %s, want %s", subjects, got, gs)
+		if got := grantcheck.ViewID(subjects); got != vid {
+			t.Errorf("ViewID(%q) = %s, want %s", subjects, got, vid)
 		}
 	}
 	if at := grantcheck.CombinedAt(map[string]string{"cat": nsID1, "matches": nsID2}); at != "1vwnfnoyshruyx4lul4a25rtctooiph5v" {

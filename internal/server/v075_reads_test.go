@@ -18,7 +18,7 @@ import (
 )
 
 // V75-03 (v0.75): filtered namespace reads at the origin (§7.9): the
-// redirects of partial readers, the /ns/{ns}/view/{gs} routes, filtered
+// redirects of partial readers, the /ns/{ns}/view/{view} routes, filtered
 // /heads, ranges, long-poll and events, /branches, the gestures listing,
 // and ?prefix= on /heads for every reader (§7.4).
 
@@ -133,8 +133,8 @@ func (w *v75s) catGrant(sub string, groups []any, extra ...map[string]any) strin
 }
 
 // filtered follows a partial reader's redirect from /rev/{head}/heads
-// and returns the gs and at it names.
-func (w *v75s) filtered(bearer string) (gs, at string) {
+// and returns the view and at it names.
+func (w *v75s) filtered(bearer string) (vid, at string) {
 	w.t.Helper()
 	r := w.get("/ns/matches/rev/"+w.nsHead("matches", w.admin)+"/heads", bearer)
 	expect(w.t, r, 302)
@@ -146,7 +146,7 @@ func (w *v75s) filtered(bearer string) (gs, at string) {
 	return parts[4], parts[6]
 }
 
-// cookie exchanges bearer for its /ns/matches/view/{gs} cookie.
+// cookie exchanges bearer for its /ns/matches/view/{view} cookie.
 func (w *v75s) cookie(bearer string) (*http.Cookie, string) {
 	w.t.Helper()
 	r := w.do(req{method: "POST", path: "/edge-grants", bearer: bearer})
@@ -244,8 +244,8 @@ func TestV075PartialRedirects(t *testing.T) {
 	w.seed([]string{"derby"}, nil, []string{"derby"})
 	li := w.li()
 	head := w.nsHead("matches", w.admin)
-	gs, at := w.filtered(li)
-	base := "/ns/matches/view/" + gs
+	vid, at := w.filtered(li)
+	base := "/ns/matches/view/" + vid
 	cases := []struct{ path, loc string }{
 		{"/ns/matches/rev/" + head + "/heads?after=a&prefix=d", base + "/at/" + at + "/heads?after=a&prefix=d"},
 		{"/ns/matches/rev/" + head + "/heads", base + "/at/" + at + "/heads"},
@@ -294,20 +294,20 @@ func TestV075PartialRedirects(t *testing.T) {
 	}
 }
 
-// §7.9 URLs (scenario 89): a URL under /ns/{ns}/view/{gs} without at is
+// §7.9 URLs (scenario 89): a URL under /ns/{ns}/view/{view} without at is
 // 302 to its form at the current at, private, no-store, under the cookie;
-// an at the origin can't answer is too; gs and at are ids (400).
+// an at the origin can't answer is too; view and at are ids (400).
 func TestV075FilteredRoutes(t *testing.T) {
 	t.Parallel()
 	w := newV75s(t, v75sOpts{})
 	w.seed([]string{"derby"}, nil, []string{"derby"})
-	c, gs := w.cookie(w.li())
-	gsBearer, at := w.filtered(w.li())
-	if gs != gsBearer {
-		t.Fatalf("cookie gs %s, grant gs %s", gs, gsBearer)
+	c, vid := w.cookie(w.li())
+	viewBearer, at := w.filtered(w.li())
+	if vid != viewBearer {
+		t.Fatalf("cookie vid %s, grant vid %s", vid, viewBearer)
 	}
 	ck := cookieHdr(c)
-	base := "/ns/matches/view/" + gs
+	base := "/ns/matches/view/" + vid
 	head := w.nsHead("matches", w.admin)
 	otherAt := w.nsHead("cat-season", w.admin) // no entry of matches
 	for path, loc := range map[string]string{
@@ -333,11 +333,11 @@ func TestV075FilteredRoutes(t *testing.T) {
 		base + "/heads?prefix=.x", base + "/log?live=x", base + "/events?since=bad", base + "/heads?since=" + head} {
 		expectCode(t, w.do(req{method: "GET", path: p, hdr: ck}), 400, "bad_input")
 	}
-	// The cookie covers its own gs alone; no credentials are 401.
+	// The cookie covers its own view alone; no credentials are 401.
 	other := "/ns/matches/view/" + ids.Of([]byte("other")).String()
 	expect(t, w.do(req{method: "GET", path: other + "/heads", hdr: ck}), 401)
 	expect(t, w.get(base+"/at/"+at+"/heads"), 401)
-	// A grant reads at its own gs alone.
+	// A grant reads at its own view alone.
 	expect(t, w.get(other+"/heads", w.li()), 403)
 	// An unrestricted reader's grant is 403 there.
 	expect(t, w.get(base+"/at/"+at+"/heads", w.admin), 403)
@@ -352,9 +352,9 @@ func TestV075FilteredHeads(t *testing.T) {
 	w := newV75s(t, v75sOpts{env: []envOpt{withLogPageSize(1)}})
 	w.seed([]string{"a", "c"}, []string{"b"}, []string{"a", "b", "c", "d"})
 	li := w.li()
-	gs, at := w.filtered(li)
+	vid, at := w.filtered(li)
 	head := w.nsHead("matches", w.admin)
-	base := "/ns/matches/view/" + gs + "/at/" + at + "/heads"
+	base := "/ns/matches/view/" + vid + "/at/" + at + "/heads"
 	var pages [][]string
 	var nexts []string
 	for after := ""; ; {
@@ -390,11 +390,11 @@ func TestV075FilteredHeads(t *testing.T) {
 	}
 	// bo, in chiefs, sees b alone.
 	bo := w.bo()
-	bgs, bat := w.filtered(bo)
-	if bgs == gs {
-		t.Fatal("bo shares li's gs")
+	bvid, bat := w.filtered(bo)
+	if bvid == vid {
+		t.Fatal("bo shares li's vid")
 	}
-	r = w.get("/ns/matches/view/"+bgs+"/at/"+bat+"/heads", bo)
+	r = w.get("/ns/matches/view/"+bvid+"/at/"+bat+"/heads", bo)
 	if !reflect.DeepEqual(headNames(t, r), []string{"b"}) {
 		t.Fatalf("bo %s", r.Body)
 	}
@@ -414,11 +414,11 @@ func v75Item(name string, doc map[string]any) map[string]any {
 
 // readRange reads a filtered range page by page from since, returning the
 // entries and checking X-Log-Next and X-Namespace-Revision.
-func (w *v75s) readRange(gs, at, since, bearer string) (entries []map[string]any, pages int) {
+func (w *v75s) readRange(vid, at, since, bearer string) (entries []map[string]any, pages int) {
 	w.t.Helper()
 	end := ""
 	for {
-		r := w.get("/ns/matches/view/"+gs+"/at/"+at+"/log?since="+since, bearer)
+		r := w.get("/ns/matches/view/"+vid+"/at/"+at+"/log?since="+since, bearer)
 		expect(w.t, r, 200)
 		pages++
 		if end == "" {
@@ -468,8 +468,8 @@ func TestV075FilteredLog(t *testing.T) {
 	expect(t, w.do(req{method: "POST", path: "/ns/matches/branches", ifNoneMatch: "*", bearer: w.admin,
 		body: map[string]any{"name": "matches-r7", "at": w.nsHead("matches", w.admin), "patches": []any{}}}), 201)
 
-	gs, at := w.filtered(li)
-	entries, pages := w.readRange(gs, at, from, li)
+	vid, at := w.filtered(li)
+	entries, pages := w.readRange(vid, at, from, li)
 	var kinds []string
 	for _, e := range entries {
 		kinds = append(kinds, e["kind"].(string))
@@ -519,7 +519,7 @@ func TestV075FilteredLog(t *testing.T) {
 		t.Fatalf("batch 1's prev %v, want the hidden %s", b1["prev"], srcNS)
 	}
 	// A since not in the chain is 404, short, tagged.
-	r := w.get("/ns/matches/view/"+gs+"/at/"+at+"/log?since="+ids.Of([]byte("nope")).String(), li)
+	r := w.get("/ns/matches/view/"+vid+"/at/"+at+"/log?since="+ids.Of([]byte("nope")).String(), li)
 	expect(t, r, 404)
 	if !strings.Contains(r.H.Get("Cache-Tag"), "ns:matches") || r.H.Get("X-Namespace-Revision") == "" {
 		t.Fatalf("404 headers %v", r.H)
@@ -550,10 +550,10 @@ func TestV075FilteredLongPoll(t *testing.T) {
 	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval), withLogPageSize(5)}})
 	w.seed([]string{"derby"}, nil, nil)
 	li := w.li()
-	gs, _ := w.filtered(li)
-	lp := "/ns/matches/view/" + gs + "/log?live=long-poll&since="
+	vid, _ := w.filtered(li)
+	lp := "/ns/matches/view/" + vid + "/log?live=long-poll&since="
 	// The filtered log's own intervals (§7.7): its path's phase.
-	clock := newLiveClock(interval, filteredLogPath("matches", gs))
+	clock := newLiveClock(interval, filteredLogPath("matches", vid))
 	since := w.nsHead("matches", w.admin)
 	// Answered at once: twenty hidden entries are scanned past, page by
 	// page, to 204 with the newest.
@@ -593,27 +593,27 @@ func TestV075FilteredLongPoll(t *testing.T) {
 }
 
 // §7.9 Cost: waiters of two subject sets on one since are answered
-// apart: a write visible to one gs alone answers it 200 and the other 204.
-// Each gs's log has its own interval boundaries (§7.7), so each waiter
+// apart: a write visible to one view alone answers it 200 and the other 204.
+// Each view's log has its own interval boundaries (§7.7), so each waiter
 // sends its own log's cursor, at an instant when both have 1.5 s left.
-func TestV075FilteredLongPollPerGS(t *testing.T) {
+func TestV075FilteredLongPollPerView(t *testing.T) {
 	t.Parallel()
 	interval := 4 * time.Second
 	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval)}})
 	w.seed([]string{"derby"}, []string{"secret"}, []string{"secret"})
 	li, bo := w.li(), w.bo()
-	lgs, _ := w.filtered(li)
-	bgs, _ := w.filtered(bo)
+	lvid, _ := w.filtered(li)
+	bvid, _ := w.filtered(bo)
 	since := w.nsHead("matches", w.admin)
 	curs := waitCursors(t, 1500*time.Millisecond,
-		newLiveClock(interval, filteredLogPath("matches", lgs)), newLiveClock(interval, filteredLogPath("matches", bgs)))
+		newLiveClock(interval, filteredLogPath("matches", lvid)), newLiveClock(interval, filteredLogPath("matches", bvid)))
 	lcur, bcur := strconv.FormatInt(curs[0], 10), strconv.FormatInt(curs[1], 10)
 	lc, bc := make(chan longPollRes, 1), make(chan longPollRes, 1)
 	go func() {
-		lc <- w.longPoll("/ns/matches/view/"+lgs+"/log?live=long-poll&cursor="+lcur+"&since="+since, li)
+		lc <- w.longPoll("/ns/matches/view/"+lvid+"/log?live=long-poll&cursor="+lcur+"&since="+since, li)
 	}()
 	go func() {
-		bc <- w.longPoll("/ns/matches/view/"+bgs+"/log?live=long-poll&cursor="+bcur+"&since="+since, bo)
+		bc <- w.longPoll("/ns/matches/view/"+bvid+"/log?live=long-poll&cursor="+bcur+"&since="+since, bo)
 	}()
 	time.Sleep(200 * time.Millisecond)
 	w.put("matches", "derby", map[string]any{})
@@ -685,10 +685,10 @@ func TestV075FilteredEvents(t *testing.T) {
 	w := newV75s(t, v75sOpts{env: []envOpt{withLogPageSize(4)}})
 	w.seed([]string{"derby", "shared"}, nil, []string{"derby", "shared"})
 	li := w.li()
-	gs, _ := w.filtered(li)
+	vid, _ := w.filtered(li)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r, ch := w.events(ctx, "/ns/matches/view/"+gs+"/events?since="+w.nsHead("matches", w.admin), li)
+	r, ch := w.events(ctx, "/ns/matches/view/"+vid+"/events?since="+w.nsHead("matches", w.admin), li)
 	if r.StatusCode != 200 || r.Header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("stream %d %v", r.StatusCode, r.Header)
 	}
@@ -710,7 +710,7 @@ func TestV075FilteredEvents(t *testing.T) {
 	if !ok || !strings.Contains(ev.data, `"resource":"shared"`) {
 		t.Fatalf("after the move %+v %v", ev, ok)
 	}
-	// Once the rules its gs digests change, the next read check fails
+	// Once the rules its view digests change, the next read check fails
 	// and the stream ends, sending nothing more.
 	expect(t, w.patchNS("matches", ops(op("add", "/roles/reader/rules", []any{map[string]any{"op": "test", "path": "/action", "value": "read"}})), w.admin), 201)
 	w.put("matches", "shared", map[string]any{"v": 3})
@@ -723,13 +723,13 @@ func TestV075FilteredEvents(t *testing.T) {
 		t.Fatal("the stream outlived its read check")
 	}
 	li = w.li()
-	gs, _ = w.filtered(li)
+	vid, _ = w.filtered(li)
 	// Last-Event-ID may name a hidden entry.
 	w.put("matches", "h99", map[string]any{})
 	hid := w.nsHead("matches", w.admin)
 	ctx2, cancel2 := context.WithCancel(context.Background())
 	defer cancel2()
-	hr, _ := http.NewRequestWithContext(ctx2, "GET", w.srv.URL+"/ns/matches/view/"+gs+"/events", nil)
+	hr, _ := http.NewRequestWithContext(ctx2, "GET", w.srv.URL+"/ns/matches/view/"+vid+"/events", nil)
 	hr.Header.Set("Authorization", "Bearer "+li)
 	hr.Header.Set("Last-Event-ID", hid)
 	r2, err := client.Do(hr)
@@ -778,10 +778,10 @@ func TestV075FilteredPurged(t *testing.T) {
 	expect(t, w.do(req{method: "POST", path: "/ns/matches/purge?force=1", ifMatch: w.nsHead("matches", w.admin), bearer: opg}), 204)
 	purgeNS := w.nsHead("matches", w.admin)
 	// Her unfiltered /heads is 410 directly since v0.82 (ACC-8a); the
-	// unfiltered log still redirects to her gs.
+	// unfiltered log still redirects to her view.
 	expectCode(t, w.get("/ns/matches/rev/"+purgeNS+"/heads", li), 410, "purged")
-	gs, at := v82encFilteredLog(w, li)
-	r := w.get("/ns/matches/view/"+gs+"/at/"+at+"/heads", li)
+	vid, at := v82encFilteredLog(w, li)
+	r := w.get("/ns/matches/view/"+vid+"/at/"+at+"/heads", li)
 	expectCode(t, r, 410, "purged")
 	// As the unfiltered /heads' 410, tagged as filtered answers are.
 	u := w.get("/ns/matches/rev/"+purgeNS+"/heads", w.admin)
@@ -789,12 +789,12 @@ func TestV075FilteredPurged(t *testing.T) {
 	if r.H.Get("Cache-Control") != u.H.Get("Cache-Control") || !strings.Contains(r.H.Get("Cache-Tag"), "ns:matches") {
 		t.Fatalf("410 headers %v, unfiltered %v", r.H, u.H)
 	}
-	entries, _ := w.readRange(gs, at, from, li)
+	entries, _ := w.readRange(vid, at, from, li)
 	if len(entries) == 0 || entries[len(entries)-1]["kind"] != "purge-ns" || entries[len(entries)-1]["id"] != purgeNS {
 		t.Fatalf("range %v", entries)
 	}
-	expectCode(t, w.get("/ns/matches/view/"+gs+"/events?since="+purgeNS, li), 410, "purged")
-	expectCode(t, w.get("/ns/matches/view/"+gs+"/log?live=long-poll&since="+purgeNS, li), 410, "purged")
+	expectCode(t, w.get("/ns/matches/view/"+vid+"/events?since="+purgeNS, li), 410, "purged")
+	expectCode(t, w.get("/ns/matches/view/"+vid+"/log?live=long-poll&since="+purgeNS, li), 410, "purged")
 }
 
 // §7.9 with the client of V75-02: a partial reader's FilteredHeads,

@@ -66,9 +66,9 @@ func TestV086FilteredLongPollPhase(t *testing.T) {
 	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval)}})
 	w.seed([]string{"derby"}, nil, nil)
 	li := w.li()
-	gs, _ := w.filtered(li)
+	vid, _ := w.filtered(li)
 	since := w.nsHead("matches", w.admin)
-	paths := []string{filteredLogPath("matches", gs), nsLogPath("matches")}
+	paths := []string{filteredLogPath("matches", vid), nsLogPath("matches")}
 	bearers := []string{li, w.admin}
 	clocks := []liveClock{newLiveClock(interval, paths[0]), newLiveClock(interval, paths[1])}
 	curs := waitCursors(t, 800*time.Millisecond, clocks...)
@@ -108,9 +108,9 @@ func TestV086FilteredRedirectCarriesCursor(t *testing.T) {
 	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval)}})
 	w.seed([]string{"derby"}, nil, nil)
 	li := w.li()
-	gs, _ := w.filtered(li)
+	vid, _ := w.filtered(li)
 	since := w.nsHead("matches", w.admin)
-	nsClock, gClock := newLiveClock(interval, nsLogPath("matches")), newLiveClock(interval, filteredLogPath("matches", gs))
+	nsClock, gClock := newLiveClock(interval, nsLogPath("matches")), newLiveClock(interval, filteredLogPath("matches", vid))
 	for _, d := range []int64{-1, 0, 1} {
 		// Clear of both logs' boundaries, so the cursors the requests
 		// meet are these.
@@ -123,7 +123,7 @@ func TestV086FilteredRedirectCarriesCursor(t *testing.T) {
 		r := w.get("/ns/matches/log?live=long-poll&since="+since+"&cursor="+strconv.FormatInt(sent, 10), li)
 		expect(t, r, 302)
 		loc := r.H.Get("Location")
-		if !strings.HasPrefix(loc, "/ns/matches/view/"+gs+"/log?") || !strings.Contains(loc, "cursor="+strconv.FormatInt(sent, 10)) ||
+		if !strings.HasPrefix(loc, "/ns/matches/view/"+vid+"/log?") || !strings.Contains(loc, "cursor="+strconv.FormatInt(sent, 10)) ||
 			!strings.Contains(loc, "live=long-poll") || !strings.Contains(loc, "since="+since) {
 			t.Fatalf("Location %q", loc)
 		}

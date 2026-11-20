@@ -20,7 +20,7 @@ import (
 
 // V75-05 (v0.75): the index's answers for namespaces §7.9 covers
 // (§A.4 Private namespaces, Across namespaces): a partial reader's marker
-// is reads:{ns}:g:{gs}, gs the origin's; its hits are filtered by
+// is reads:{ns}:g:{view}, view the origin's; its hits are filtered by
 // visibility; its answers are at the combined checkpoint of every
 // namespace visibility reads, which they list as namespaces and min may
 // name; covered branches judge their bases at baseAt.
@@ -152,8 +152,8 @@ func (w *v75x) readerVia(sub string, groups []any) string {
 }
 
 // pointer asks path with token and returns the at URL it redirects to,
-// its gs and its at.
-func (w *v75x) pointer(path, token string) (loc, gs, at string) {
+// its view and its at.
+func (w *v75x) pointer(path, token string) (loc, vid, at string) {
 	w.t.Helper()
 	r := w.x.raw(path, token)
 	loc = r.header.Get("Location")
@@ -250,9 +250,9 @@ func TestV075IndexPagesFilled(t *testing.T) {
 	}
 }
 
-// TestV075IndexSubjectSets (SVC-5, §A.4, §7.9 gs): two partial readers
+// TestV075IndexSubjectSets (SVC-5, §A.4, §7.9 view): two partial readers
 // with the same rules through the same key, whatever their groups, share
-// a subject set, the gs inside the marker reads:matches:g:{gs} being the
+// a view, the view inside the marker reads:matches:g:{view} being the
 // origin's own, at the index's checkpoint of matches; a reader with other
 // rules gets another.
 func TestV075IndexSubjectSets(t *testing.T) {
@@ -261,23 +261,23 @@ func TestV075IndexSubjectSets(t *testing.T) {
 	w := newV75X(t, false)
 	fan := w.reader("user:fan", []any{"fans"})
 	intern := w.reader("user:intern", []any{"interns"})
-	_, fgs, fat := w.pointer("/matches", fan)
-	_, igs, _ := w.pointer("/matches", intern)
-	if fgs != igs {
-		t.Fatalf("fans and interns: gs %s and %s", fgs, igs)
+	_, fvid, fat := w.pointer("/matches", fan)
+	_, ivid, _ := w.pointer("/matches", intern)
+	if fvid != ivid {
+		t.Fatalf("fans and interns: vid %s and %s", fvid, ivid)
 	}
 	narrow := w.cat.Grant(t, w.s.Now(), "user:fan", []string{"matches"}, []string{"read"}, map[string]any{"roles": []any{"reader"},
 		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": "^d"}}},
 		"exp":   w.s.Now().Add(10 * time.Minute).Format(time.RFC3339)})
-	if _, ngs, _ := w.pointer("/matches", narrow); ngs == fgs {
-		t.Errorf("other rules share gs %s", ngs)
+	if _, nvid, _ := w.pointer("/matches", narrow); nvid == fvid {
+		t.Errorf("other rules share vid %s", nvid)
 	}
 	if got := resources(w.x.search("/matches", narrow)); strings.Join(got, ",") != "derby" {
 		t.Errorf("narrow sees %v", got)
 	}
-	// The origin's own subject set for the same grant, which its exchange
-	// gives a partial reader as the prefix /ns/matches/view/{gs} (§7.9
-	// Edge grants): the gs inside the index's marker is the origin's.
+	// The origin's own view for the same grant, which its exchange
+	// gives a partial reader as the prefix /ns/matches/view/{view} (§7.9
+	// Edge grants): the view inside the index's marker is the origin's.
 	req := must(http.NewRequestWithContext(ctx, "POST", w.s.URL+"/edge-grants", nil))
 	req.Header.Set("Authorization", "Bearer "+fan)
 	res := must(noFollow.Do(req))
@@ -287,18 +287,18 @@ func TestV075IndexSubjectSets(t *testing.T) {
 	if err != nil || res.StatusCode != 200 || len(body.Prefixes) != 1 || !strings.HasPrefix(body.Prefixes[0], "/ns/matches/view/") {
 		t.Fatalf("the origin's exchange: %d %v %v", res.StatusCode, err, body)
 	}
-	ogs := strings.TrimPrefix(body.Prefixes[0], "/ns/matches/view/")
+	ovid := strings.TrimPrefix(body.Prefixes[0], "/ns/matches/view/")
 	// v0.87 (§A.4): the reader's §7.9 view, as the origin computes it.
-	if fgs != ogs {
-		t.Errorf("index view %s, want the origin's %s", fgs, ogs)
+	if fvid != ovid {
+		t.Errorf("index view %s, want the origin's %s", fvid, ovid)
 	}
 	if want := w.x.ix.Checkpoint("matches"); fat != want {
 		t.Errorf("index at %s, want %s", fat, want)
 	}
 }
 
-// TestV075IndexCookies (SVC-5, §7.9 gs, §B.11.5): the index's edge
-// grant for a partial reader stands for its marker reads:matches:g:{gs},
+// TestV075IndexCookies (SVC-5, §7.9 view, §B.11.5): the index's edge
+// grant for a partial reader stands for its marker reads:matches:g:{view},
 // whose subjects and filter it records: a read under the cookie alone is
 // filtered by visibility as under the grant, after a restart too; once
 // the rules the scope digest covers change, the cookie is 403 at the new
@@ -312,15 +312,15 @@ func TestV075IndexCookies(t *testing.T) {
 	if r.status != 200 {
 		t.Fatalf("exchange: %d %v", r.status, r.body)
 	}
-	_, gs, _ := w.pointer("/matches", fan)
+	_, vid, _ := w.pointer("/matches", fan)
 	var prefix string
 	for _, p := range r.body["prefixes"].([]any) {
 		if strings.HasPrefix(p.(string), "/matches/") {
 			prefix = p.(string)
 		}
 	}
-	if prefix != "/matches/view/"+gs {
-		t.Fatalf("prefixes %v, want /matches/view/%s", r.body["prefixes"], gs)
+	if prefix != "/matches/view/"+vid {
+		t.Fatalf("prefixes %v, want /matches/view/%s", r.body["prefixes"], vid)
 	}
 	got, _ := p37Follow(t, w.x, prefix, r.cookies, "")
 	if got.status != 200 || strings.Join(p37Hits(got.body), ",") != "derby,shared" {

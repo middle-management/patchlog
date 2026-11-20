@@ -24,7 +24,7 @@ func v077xCookie(t *testing.T, w *v75World, cred Credentials) (Credentials, stri
 }
 
 // Access 111: li through access-02, bo through reader-01,
-// same deciding subjects and rules -> different gs. access-02's pub then
+// same deciding subjects and rules -> different view. access-02's pub then
 // changes and a third reader exchanges under the new key -> li's old
 // cookie at a later at -> 403; her exchange under the old grant -> 401.
 func TestV077XconfScenario111(t *testing.T) {
@@ -43,17 +43,17 @@ func TestV077XconfScenario111(t *testing.T) {
 	}
 	li := grantBy(a2Priv, "access-02", "user:li")
 	bo := grantBy(w.catPriv, "reader-01", "user:li")
-	liCookie, liGS := v077xCookie(t, w, li)
-	_, boGS := v077xCookie(t, w, bo)
-	if liGS == boGS {
-		t.Fatalf("same gs %s through two keys", liGS)
+	liCookie, liView := v077xCookie(t, w, li)
+	_, boView := v077xCookie(t, w, bo)
+	if liView == boView {
+		t.Fatalf("same vid %s through two keys", liView)
 	}
 	newPub, newPriv := grant.GenerateKey()
 	w.patchConfig("matches", map[string]any{"op": "replace", "path": "/keys/2/pub", "value": newPub})
 	third := grantBy(newPriv, "access-02", "user:zed")
 	v077xCookie(t, w, third)
 	w.put("matches", "later", map[string]any{"title": "x"})
-	if red, st := v76fRedirect(t, w, "matches", liGS, liCookie); st != 403 {
+	if red, st := v76fRedirect(t, w, "matches", liView, liCookie); st != 403 {
 		t.Errorf("li's old cookie after access-02's pub changed: %+v %d, want 403", red, st)
 	}
 	if _, err := w.e.IssueEdgeGrants(context.Background(), []string{li.Bearer}); v75Status(err) != 401 {
@@ -67,19 +67,19 @@ func TestV077XconfScenario112Key(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
 	w.seed()
-	cookie, gs := v077xCookie(t, w, w.li())
-	if red, st := v76fRedirect(t, w, "matches", gs, cookie); red == nil {
+	cookie, vid := v077xCookie(t, w, w.li())
+	if red, st := v76fRedirect(t, w, "matches", vid, cookie); red == nil {
 		t.Fatalf("before: %d", st)
 	}
 	w.patchConfig("matches", map[string]any{"op": "replace", "path": "/keys/1/can", "value": []any{"create"}})
-	if red, st := v76fRedirect(t, w, "matches", gs, cookie); st != 403 {
+	if red, st := v76fRedirect(t, w, "matches", vid, cookie); st != 403 {
 		t.Errorf("after reader-01 lost read: %+v %d, want 403", red, st)
 	}
 }
 
 // Tree-derived access 113 (origin half): after matches-r7 is created,
 // matches edits only reader-01's maxTtl -> a partial reader of the branch
-// -> filtered /heads 403; the exchange gives no /ns/matches-r7/view/{gs}.
+// -> filtered /heads 403; the exchange gives no /ns/matches-r7/view/{view}.
 // Since v0.78 no branch is covered (§7.9 Where), before the edit too.
 func TestV077XconfScenario113(t *testing.T) {
 	t.Parallel()
@@ -93,9 +93,9 @@ func TestV077XconfScenario113(t *testing.T) {
 	if _, st := v76fRedirect(t, w, "matches-r7", "", r7); st != 403 {
 		t.Fatalf("branch before: %d, want 403", st)
 	}
-	gs := v075GS(t, w, w.li())
+	vid := v075ViewID(t, w, w.li())
 	w.patchConfig("matches", map[string]any{"op": "replace", "path": "/keys/1/maxTtl", "value": "PT14M"})
-	if st := v75Status(w.e.FilteredCurrent(ctx, "matches-r7", gs, "/heads", r7)); st != 403 {
+	if st := v75Status(w.e.FilteredCurrent(ctx, "matches-r7", vid, "/heads", r7)); st != 403 {
 		t.Errorf("branch after maxTtl edit: %d, want 403", st)
 	}
 	res, err := w.e.IssueEdgeGrants(ctx, []string{r7.Bearer})
@@ -175,7 +175,7 @@ func TestV077XconfScenario118(t *testing.T) {
 	}
 }
 
-// Cross-review (conformance lens), §7.9 gs: a gs's subjects carry "the
+// Cross-review (conformance lens), §7.9 view: a view's subjects carry "the
 // string scope:{digest} of §A.4's marker for {ns}", whose digest covers
 // the rules and the key's key: string (grantcheck.ScopeKeyDigest), not the
 // rules' digest alone.

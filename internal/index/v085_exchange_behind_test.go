@@ -38,7 +38,7 @@ func (g *v85Gate) RoundTrip(r *http.Request) (*http.Response, error) {
 	return g.base.RoundTrip(r)
 }
 
-// Scenario 134 (SERVICES §A.4 gs, v0.85: "An exchange whose cookie would
+// Scenario 134 (SERVICES §A.4 view, v0.85: "An exchange whose cookie would
 // be 403 at once, as a key or role its marker draws on has changed since
 // the checkpoint the marker is judged at, answers 503 (behind) with
 // Retry-After";

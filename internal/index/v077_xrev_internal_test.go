@@ -9,7 +9,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
-// Cross-review (conformance lens), §7.9 gs: a gs's subjects carry "the
+// Cross-review (conformance lens), §7.9 view: a view's subjects carry "the
 // string scope:{digest} of §A.4's marker for {ns}": the digest of the
 // index's scope marker for the same grant, covering the key's key:
 // string, not the rules' digest alone.

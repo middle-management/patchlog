@@ -23,7 +23,7 @@ import (
 // The service's own edge grants (§A.4, §C.5.3): the request and answer of
 // its exchange endpoint, which follows the origin's issuance (§C.5.2),
 // its withdrawal (§C.5.4), and the state it keeps beside them in its own
-// database (edgeStore): the subjects behind each subject set (gs) it
+// database (edgeStore): the markers behind each prefix it
 // minted a cookie for, and its exchangeRate buckets (§6.6), shared by
 // every instance on that database.
 //
@@ -136,12 +136,12 @@ func svcBearers(r *http.Request, grantSize int) ([]string, *svcError) {
 		return nil, svcRefuse(http.StatusBadRequest, "bad_input", "malformed body: "+err.Error())
 	}
 	m, _ := v.(map[string]any)
-	gs, ok := m["grants"].([]any)
-	if !ok || len(m) != 1 || len(gs) < 1 || len(gs) > svcMaxGrants {
+	grants, ok := m["grants"].([]any)
+	if !ok || len(m) != 1 || len(grants) < 1 || len(grants) > svcMaxGrants {
 		return nil, svcRefuse(http.StatusBadRequest, "bad_input", fmt.Sprintf("body must be { grants: [ … ] }, 1 to %d grants (§C.5.2)", svcMaxGrants))
 	}
-	bearers := make([]string, 0, len(gs))
-	for _, g := range gs {
+	bearers := make([]string, 0, len(grants))
+	for _, g := range grants {
 		t, ok := g.(string)
 		if !ok || strings.TrimSpace(t) == "" {
 			return nil, svcRefuse(http.StatusBadRequest, "bad_input", "each grant is a string: the token as it would follow \"svcBearer \" (§C.5.2)")
@@ -268,14 +268,15 @@ var DefaultExchangeRate = Rate{Rate: 10, Burst: 100}
 // SQLite database (§A.4), shared by every instance of the service that
 // opens that database, and kept across restarts and rebuilds:
 //
-//	edge_subjects(gs, subjects, exp)  the subjects behind each subject set
+//	edge_subjects(prefix, subjects,   the markers behind each prefix
+//	              exp)
 //	                                  the service minted an edge grant for,
 //	                                  until the last of them expires
 //	edge_buckets(k, tokens, last)     the exchangeRate buckets of its
 //	                                  exchange, one per principal (Draw)
 //
-// A gs is the digest of its subjects, so what Subjects answers for one
-// never changes, and the store keeps the answers it read in memory too.
+// What Subjects answers for a prefix never changes while a cookie for it
+// lives, and the store keeps the answers it read in memory too.
 type edgeStore struct {
 	db *sql.DB
 
@@ -283,7 +284,7 @@ type edgeStore struct {
 	subs map[string]edgeSubjectSet
 }
 
-// edgeSubjectSet is the subjects behind a gs, and the expiry of the last edge
+// edgeSubjectSet is the markers behind a prefix, and the expiry of the last edge
 // grant minted for it that the store knows of (Unix seconds).
 type edgeSubjectSet struct {
 	subjects []string
@@ -296,10 +297,10 @@ func newEdgeStore(db *sql.DB) *edgeStore {
 	return &edgeStore{db: db, subs: map[string]edgeSubjectSet{}}
 }
 
-// Record records the subjects behind gs, for an edge grant minted at now
+// Record records the markers behind prefix, for an edge grant minted at now
 // that expires at exp, and drops the records whose last edge grant has
 // expired.
-func (s *edgeStore) Record(ctx context.Context, gs string, subjects []string, exp, now time.Time) error {
+func (s *edgeStore) Record(ctx context.Context, prefix string, subjects []string, exp, now time.Time) error {
 	b, err := json.Marshal(subjects)
 	if err != nil {
 		return err
@@ -309,8 +310,8 @@ func (s *edgeStore) Record(ctx context.Context, gs string, subjects []string, ex
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM edge_subjects WHERE exp <= ?`, now.Unix()); err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO edge_subjects (gs, subjects, exp) VALUES (?, ?, ?)
-		ON CONFLICT (gs) DO UPDATE SET subjects = excluded.subjects, exp = max(exp, excluded.exp)`, gs, string(b), exp.Unix()); err != nil {
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO edge_subjects (prefix, subjects, exp) VALUES (?, ?, ?)
+		ON CONFLICT (prefix) DO UPDATE SET subjects = excluded.subjects, exp = max(exp, excluded.exp)`, prefix, string(b), exp.Unix()); err != nil {
 		return err
 	}
 	for k, e := range s.subs {
@@ -318,29 +319,29 @@ func (s *edgeStore) Record(ctx context.Context, gs string, subjects []string, ex
 			delete(s.subs, k)
 		}
 	}
-	e := s.subs[gs]
-	s.subs[gs] = edgeSubjectSet{subjects: subjects, exp: max(e.exp, exp.Unix())}
+	e := s.subs[prefix]
+	s.subs[prefix] = edgeSubjectSet{subjects: subjects, exp: max(e.exp, exp.Unix())}
 	return nil
 }
 
-// Subjects is the subjects behind gs, recorded when an edge grant for it
+// Subjects is the markers behind prefix, recorded when an edge grant for it
 // was minted, by this instance or another on the same database.
-func (s *edgeStore) Subjects(ctx context.Context, gs string) ([]string, bool) {
+func (s *edgeStore) Subjects(ctx context.Context, prefix string) ([]string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if e, ok := s.subs[gs]; ok {
+	if e, ok := s.subs[prefix]; ok {
 		return e.subjects, true
 	}
 	var text string
 	var exp int64
-	if err := s.db.QueryRowContext(ctx, `SELECT subjects, exp FROM edge_subjects WHERE gs = ?`, gs).Scan(&text, &exp); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT subjects, exp FROM edge_subjects WHERE prefix = ?`, prefix).Scan(&text, &exp); err != nil {
 		return nil, false
 	}
 	var subs []string
 	if json.Unmarshal([]byte(text), &subs) != nil {
 		return nil, false
 	}
-	s.subs[gs] = edgeSubjectSet{subjects: subs, exp: exp}
+	s.subs[prefix] = edgeSubjectSet{subjects: subs, exp: exp}
 	return subs, true
 }
 

@@ -56,20 +56,20 @@ func (w *v76fWorld) fan(ns string, priv ed25519.PrivateKey) Credentials {
 		"exp": w.now().Add(10 * time.Minute).UTC().Format(time.RFC3339)})
 }
 
-// v76fRedirect is FilteredCurrent's redirect for cred on ns at gs ("" for
+// v76fRedirect is FilteredCurrent's redirect for cred on ns at view ("" for
 // its own, found through the unfiltered /heads' redirect).
-func v76fRedirect(t *testing.T, w *v75World, ns, gs string, cred Credentials) (*FilteredRedirect, int) {
+func v76fRedirect(t *testing.T, w *v75World, ns, vid string, cred Credentials) (*FilteredRedirect, int) {
 	t.Helper()
 	ctx := context.Background()
-	if gs == "" {
+	if vid == "" {
 		_, err := v76fUnfiltered(ctx, w.e, ns, cred)
 		if r, ok := err.(*FilteredRedirect); ok {
-			gs = r.View
+			vid = r.View
 		} else {
 			return nil, v75Status(err)
 		}
 	}
-	err := w.e.FilteredCurrent(ctx, ns, gs, "/heads", cred)
+	err := w.e.FilteredCurrent(ctx, ns, vid, "/heads", cred)
 	if r, ok := err.(*FilteredRedirect); ok {
 		return r, 0
 	}
@@ -88,11 +88,11 @@ func v76fUnfiltered(ctx context.Context, e *Engine, ns string, cred Credentials)
 	return a, err
 }
 
-// v76fHeads are the names FilteredHeads lists for cred at ns/view/gs/at/at,
+// v76fHeads are the names FilteredHeads lists for cred at ns/view/view/at/at,
 // and its status (0 for 200; -1 for a redirect).
-func v76fHeads(t *testing.T, w *v75World, ns, gs, at string, cred Credentials) ([]string, int) {
+func v76fHeads(t *testing.T, w *v75World, ns, vid, at string, cred Credentials) ([]string, int) {
 	t.Helper()
-	page, _, err := w.e.FilteredHeads(context.Background(), ns, gs, at, "", "", cred)
+	page, _, err := w.e.FilteredHeads(context.Background(), ns, vid, at, "", "", cred)
 	if _, ok := err.(*FilteredRedirect); ok {
 		return nil, -1
 	}
@@ -128,30 +128,30 @@ func TestV076OriginBranchUncovered(t *testing.T) {
 	ctx := context.Background()
 	fan := w.fan("matches-r7", w.fanPriv)
 	li := w.li(map[string]any{"ns": []any{"matches-r7"}})
-	gs := grantcheck.ViewID([]string{"group:fan-club"})
+	vid := grantcheck.ViewID([]string{"group:fan-club"})
 	at := grantcheck.CombinedAt(map[string]string{"matches-r7": w.head("matches-r7")})
 	for name, cred := range map[string]Credentials{"fan": fan, "li": li} {
 		if _, err := v76fUnfiltered(ctx, w.e, "matches-r7", cred); v75Status(err) != 403 {
 			t.Errorf("%s: unfiltered URL %v, want 403 and no redirect", name, err)
 		}
-		if _, st := v76fRedirect(t, w.v75World, "matches-r7", gs, cred); st != 403 {
+		if _, st := v76fRedirect(t, w.v75World, "matches-r7", vid, cred); st != 403 {
 			t.Errorf("%s: FilteredCurrent %d, want 403", name, st)
 		}
-		if _, st := v76fHeads(t, w.v75World, "matches-r7", gs, at, cred); st != 403 {
+		if _, st := v76fHeads(t, w.v75World, "matches-r7", vid, at, cred); st != 403 {
 			t.Errorf("%s: FilteredHeads %d, want 403", name, st)
 		}
-		if _, _, err := w.e.FilteredLog(ctx, "matches-r7", gs, at, "", 0, cred); v75Status(err) != 403 {
+		if _, _, err := w.e.FilteredLog(ctx, "matches-r7", vid, at, "", 0, cred); v75Status(err) != 403 {
 			t.Errorf("%s: FilteredLog %v, want 403", name, err)
 		}
 		if res, err := w.e.IssueEdgeGrants(ctx, []string{cred.Bearer}); v75Status(err) != 403 {
 			t.Errorf("%s: exchange %+v %v, want 403", name, res, err)
 		}
 	}
-	if _, st := v76fHeads(t, w.v75World, "matches-r7", gs, at, Credentials{}); st != 401 {
+	if _, st := v76fHeads(t, w.v75World, "matches-r7", vid, at, Credentials{}); st != 401 {
 		t.Errorf("no credentials: %d, want 401", st)
 	}
-	cookie := Credentials{Edge: &EdgeGrant{NS: "matches-r7", View: gs, Prefix: "/ns/matches-r7/view/" + gs, Exp: w.now().Add(10 * time.Minute)}}
-	if _, st := v76fRedirect(t, w.v75World, "matches-r7", gs, cookie); st != 403 {
+	cookie := Credentials{Edge: &EdgeGrant{NS: "matches-r7", View: vid, Prefix: "/ns/matches-r7/view/" + vid, Exp: w.now().Add(10 * time.Minute)}}
+	if _, st := v76fRedirect(t, w.v75World, "matches-r7", vid, cookie); st != 403 {
 		t.Errorf("a g cookie: %d, want 403", st)
 	}
 	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/2"})
@@ -160,7 +160,7 @@ func TestV076OriginBranchUncovered(t *testing.T) {
 	}
 }
 
-// §7.9 gs, §C.4 (conformance 106, ported from the branch case before
+// §7.9 view, §C.4 (conformance 106, ported from the branch case before
 // v0.78): a partial reader of matches whose grant is signed by key fan,
 // which matches then removes: her cookie is 403 at a later at, and her
 // exchange then 401.
@@ -173,17 +173,17 @@ func TestV076OriginGSKeyRemoved(t *testing.T) {
 	if err != nil || len(res.Grants) != 1 || res.Grants[0].View == "" {
 		t.Fatalf("exchange: %+v %v", res, err)
 	}
-	gs := res.Grants[0].View
-	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: gs, Prefix: "/ns/matches/view/" + gs, Exp: w.now().Add(10 * time.Minute)}}
-	red, st := v76fRedirect(t, w.v75World, "matches", gs, cookie)
+	vid := res.Grants[0].View
+	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: vid, Prefix: "/ns/matches/view/" + vid, Exp: w.now().Add(10 * time.Minute)}}
+	red, st := v76fRedirect(t, w.v75World, "matches", vid, cookie)
 	if red == nil {
 		t.Fatalf("cookie before: %d", st)
 	}
-	if names, st := v76fHeads(t, w.v75World, "matches", gs, red.At, cookie); st != 0 || !v76fHas(names, "derby") {
+	if names, st := v76fHeads(t, w.v75World, "matches", vid, red.At, cookie); st != 0 || !v76fHas(names, "derby") {
 		t.Fatalf("cookie before: %v %d", names, st)
 	}
 	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/2"})
-	if _, st := v76fRedirect(t, w.v75World, "matches", gs, cookie); st != 403 {
+	if _, st := v76fRedirect(t, w.v75World, "matches", vid, cookie); st != 403 {
 		t.Fatalf("cookie at a later at: %d, want 403", st)
 	}
 	if _, err := w.e.IssueEdgeGrants(ctx, []string{fan.Bearer}); v75Status(err) != 401 {
@@ -191,7 +191,7 @@ func TestV076OriginGSKeyRemoved(t *testing.T) {
 	}
 }
 
-// §7.9 gs, §C.4: a stored subject set is bound to its key's pub: a
+// §7.9 view, §C.4: a stored subject set is bound to its key's pub: a
 // cookie is 403 once matches replaces that kid's pub, keeping its scope
 // and roles, until the reader exchanges again; an empty stored pub is 403
 // too.
@@ -218,38 +218,38 @@ func TestV076OriginGSBoundToPub(t *testing.T) {
 			if err != nil || len(res.Grants) != 1 || res.Grants[0].View == "" {
 				t.Fatalf("exchange: %+v %v", res, err)
 			}
-			gs := res.Grants[0].View
-			cookie := Credentials{Edge: &EdgeGrant{NS: c.ns, View: gs, Prefix: "/ns/" + c.ns + "/view/" + gs, Exp: w.now().Add(10 * time.Minute)}}
+			vid := res.Grants[0].View
+			cookie := Credentials{Edge: &EdgeGrant{NS: c.ns, View: vid, Prefix: "/ns/" + c.ns + "/view/" + vid, Exp: w.now().Add(10 * time.Minute)}}
 			wantPub := w.catPub
 			if c.kid == 2 {
 				wantPub = w.fanPub
 			}
 			w.inTx(func(t2 *tx) {
-				if r := t2.loadView(c.ns, gs); r == nil || r.pub != wantPub {
+				if r := t2.loadView(c.ns, vid); r == nil || r.pub != wantPub {
 					t.Fatalf("stored row %+v, want pub %s", r, wantPub)
 				}
 			})
-			red, st := v76fRedirect(t, w.v75World, c.ns, gs, cookie)
+			red, st := v76fRedirect(t, w.v75World, c.ns, vid, cookie)
 			if red == nil {
 				t.Fatalf("cookie before: %d", st)
 			}
-			if names, st := v76fHeads(t, w.v75World, c.ns, gs, red.At, cookie); st != 0 || !v76fHas(names, "derby") {
+			if names, st := v76fHeads(t, w.v75World, c.ns, vid, red.At, cookie); st != 0 || !v76fHas(names, "derby") {
 				t.Fatalf("cookie before: %v %d", names, st)
 			}
 			// An empty stored pub, as a row from before the migration has.
 			if err := w.e.update(ctx, func(t2 *tx) error {
-				_, err := t2.Exec(`UPDATE filtered_views SET pub = '' WHERE ns = ? AND view = ?`, c.ns, gs)
+				_, err := t2.Exec(`UPDATE filtered_views SET pub = '' WHERE ns = ? AND view = ?`, c.ns, vid)
 				return err
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if _, st := v76fHeads(t, w.v75World, c.ns, gs, red.At, cookie); st != 403 {
+			if _, st := v76fHeads(t, w.v75World, c.ns, vid, red.At, cookie); st != 403 {
 				t.Fatalf("an empty stored pub: %d, want 403", st)
 			}
 			if _, err := w.e.IssueEdgeGrants(ctx, []string{cred.Bearer}); err != nil {
 				t.Fatal(err)
 			}
-			if _, st := v76fHeads(t, w.v75World, c.ns, gs, red.At, cookie); st != 0 {
+			if _, st := v76fHeads(t, w.v75World, c.ns, vid, red.At, cookie); st != 0 {
 				t.Fatalf("exchanged again: %d", st)
 			}
 			// The kid's pub is replaced, its scope and roles kept.
@@ -257,21 +257,21 @@ func TestV076OriginGSBoundToPub(t *testing.T) {
 			if c.kid == 1 {
 				w.catPub, w.catPriv = newPub, newPriv
 			}
-			red2, st := v76fRedirect(t, w.v75World, c.ns, gs, cookie)
+			red2, st := v76fRedirect(t, w.v75World, c.ns, vid, cookie)
 			if st != 403 {
 				t.Fatalf("cookie after the pub changed: %+v %d, want 403", red2, st)
 			}
 			if _, err := w.e.IssueEdgeGrants(ctx, []string{cred.Bearer}); v75Status(err) != 401 {
 				t.Fatalf("the old grant's exchange: %v, want 401", err)
 			}
-			// A grant of the new key exchanges for a gs of its own, bound
-			// to the new pub (grantcheck.KeySubject); the old gs stays 403.
+			// A grant of the new key exchanges for a view of its own, bound
+			// to the new pub (grantcheck.KeySubject); the old view stays 403.
 			fresh := grantOf(newPriv)
 			res, err = w.e.IssueEdgeGrants(ctx, []string{fresh.Bearer})
-			if err != nil || len(res.Grants) != 1 || res.Grants[0].View == "" || res.Grants[0].View == gs {
-				t.Fatalf("exchange with the new key: %+v %v (old gs %s)", res, err, gs)
+			if err != nil || len(res.Grants) != 1 || res.Grants[0].View == "" || res.Grants[0].View == vid {
+				t.Fatalf("exchange with the new key: %+v %v (old vid %s)", res, err, vid)
 			}
-			if _, st := v76fRedirect(t, w.v75World, c.ns, gs, cookie); st != 403 {
+			if _, st := v76fRedirect(t, w.v75World, c.ns, vid, cookie); st != 403 {
 				t.Fatalf("the old cookie after exchanging again: %d, want 403", st)
 			}
 			gs2 := res.Grants[0].View
@@ -296,7 +296,7 @@ func TestV076OriginUncoveredFiltered401(t *testing.T) {
 	w.mkNS("pub", map[string]any{"read": "public", "keys": []any{w.kEntry()}})
 	w.mkNS("priv", map[string]any{"read": "grant", "keys": []any{w.kEntry()}})
 	ctx := context.Background()
-	gs := grantcheck.ViewID([]string{"group:editors"})
+	vid := grantcheck.ViewID([]string{"group:editors"})
 	at := grantcheck.CombinedAt(map[string]string{"pub": w.head("pub")})
 	k := func(ns string, can ...any) Credentials {
 		return w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:r", "ns": []any{ns}, "can": can})
@@ -319,10 +319,10 @@ func TestV076OriginUncoveredFiltered401(t *testing.T) {
 		"private, a grant for another namespace":  {"priv", k("matches", "read"), 403},
 		"private, a grant that doesn't read here": {"priv", k("priv", "create"), 403},
 	} {
-		st := v75Status(w.e.FilteredCurrent(ctx, c.ns, gs, "/heads", c.cred))
-		lst := v75Status(w.e.FilteredCurrent(ctx, c.ns, gs, "/log", c.cred))
-		_, _, herr := w.e.FilteredHeads(ctx, c.ns, gs, at, "", "", c.cred)
-		_, _, lerr := w.e.FilteredLog(ctx, c.ns, gs, at, "", 0, c.cred)
+		st := v75Status(w.e.FilteredCurrent(ctx, c.ns, vid, "/heads", c.cred))
+		lst := v75Status(w.e.FilteredCurrent(ctx, c.ns, vid, "/log", c.cred))
+		_, _, herr := w.e.FilteredHeads(ctx, c.ns, vid, at, "", "", c.cred)
+		_, _, lerr := w.e.FilteredLog(ctx, c.ns, vid, at, "", 0, c.cred)
 		if st != c.want || lst != c.want || v75Status(herr) != c.want || v75Status(lerr) != c.want {
 			t.Errorf("%s: FilteredCurrent %d %d, FilteredHeads %v, FilteredLog %v, want %d", name, st, lst, herr, lerr, c.want)
 		}
@@ -358,7 +358,7 @@ func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	gs := grantcheck.ViewID([]string{"group:editors"})
+	vid := grantcheck.ViewID([]string{"group:editors"})
 	reader := func(ns string) Credentials {
 		return w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:r", "ns": []any{ns}, "can": []any{"read"}})
 	}
@@ -379,26 +379,26 @@ func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
 			t.Fatalf("%s: unfiltered /heads %v, want %d", c.name, uerr, c.heads)
 		}
 		at := grantcheck.CombinedAt(map[string]string{c.ns: purge})
-		_, _, herr := w.e.FilteredHeads(ctx, c.ns, gs, at, "", "", c.cred)
-		hcur := w.e.FilteredCurrent(ctx, c.ns, gs, "/heads", c.cred)
-		_, _, pollPurge := w.e.FilteredLiveLog(ctx, c.ns, gs, purge, 10, c.cred)
+		_, _, herr := w.e.FilteredHeads(ctx, c.ns, vid, at, "", "", c.cred)
+		hcur := w.e.FilteredCurrent(ctx, c.ns, vid, "/heads", c.cred)
+		_, _, pollPurge := w.e.FilteredLiveLog(ctx, c.ns, vid, purge, 10, c.cred)
 		if v75Status(herr) != c.log || v75Status(hcur) != c.log || v75Status(pollPurge) != c.log {
 			t.Errorf("%s: FilteredHeads %v, FilteredCurrent /heads %v, live from the purge-ns entry %v, want %d", c.name, herr, hcur, pollPurge, c.log)
 		}
-		_, _, lerr := w.e.FilteredLog(ctx, c.ns, gs, at, "", 10, c.cred)
-		lcur := w.e.FilteredCurrent(ctx, c.ns, gs, "/log", c.cred)
-		_, _, poll := w.e.FilteredLiveLog(ctx, c.ns, gs, "", 10, c.cred)
+		_, _, lerr := w.e.FilteredLog(ctx, c.ns, vid, at, "", 10, c.cred)
+		lcur := w.e.FilteredCurrent(ctx, c.ns, vid, "/log", c.cred)
+		_, _, poll := w.e.FilteredLiveLog(ctx, c.ns, vid, "", 10, c.cred)
 		if v75Status(lerr) != c.log || v75Status(lcur) != c.log || v75Status(poll) != c.log {
 			t.Errorf("%s: FilteredLog %v, FilteredCurrent /log %v, live %v, want %d", c.name, lerr, lcur, poll, c.log)
 		}
 	}
 }
 
-// §7.9 gs, §C.4: readers whose grants come from two keys with the same
-// scope rules never share a gs, so neither's filtered_views row judges the
+// §7.9 view, §C.4: readers whose grants come from two keys with the same
+// scope rules never share a view, so neither's filtered_views row judges the
 // other's cookies: once fan's pub is replaced, a cookie from fan's grant
 // is 403 whatever is exchanged through fan2, before or after, and fan2's
-// cookie reads on. Before grantcheck.KeySubject both got one gs, whose row
+// cookie reads on. Before grantcheck.KeySubject both got one view, whose row
 // kept the kid and pub of the last exchange.
 func TestV076OriginGSPerKey(t *testing.T) {
 	t.Parallel()
@@ -420,47 +420,47 @@ func TestV076OriginGSPerKey(t *testing.T) {
 				if err != nil || len(res.Grants) != 1 || res.Grants[0].View == "" {
 					t.Fatalf("exchange: %+v %v", res, err)
 				}
-				gs := res.Grants[0].View
-				return gs, Credentials{Edge: &EdgeGrant{NS: "matches", View: gs, Prefix: "/ns/matches/view/" + gs, Exp: w.now().Add(10 * time.Minute)}}
+				vid := res.Grants[0].View
+				return vid, Credentials{Edge: &EdgeGrant{NS: "matches", View: vid, Prefix: "/ns/matches/view/" + vid, Exp: w.now().Add(10 * time.Minute)}}
 			}
 			rotate := func() {
 				np, _ := grant.GenerateKey()
 				w.patchConfig("matches", map[string]any{"op": "replace", "path": "/keys/2/pub", "value": np})
 			}
-			gsA, cookieA := exchange(a)
+			viewA, cookieA := exchange(a)
 			if rotateFirst {
 				rotate()
-				if _, st := v76fRedirect(t, w.v75World, "matches", gsA, cookieA); st != 403 {
+				if _, st := v76fRedirect(t, w.v75World, "matches", viewA, cookieA); st != 403 {
 					t.Fatalf("fan's cookie after the rotation: %d, want 403", st)
 				}
 			}
-			gsB, cookieB := exchange(b)
-			if gsA == gsB {
-				t.Fatalf("grants of fan and fan2 share gs %s", gsA)
+			viewB, cookieB := exchange(b)
+			if viewA == viewB {
+				t.Fatalf("grants of fan and fan2 share vid %s", viewA)
 			}
 			w.inTx(func(t2 *tx) {
-				if r := t2.loadView("matches", gsA); r == nil || r.kid != "fan" || r.pub != w.fanPub {
+				if r := t2.loadView("matches", viewA); r == nil || r.kid != "fan" || r.pub != w.fanPub {
 					t.Fatalf("fan's row %+v", r)
 				}
-				if r := t2.loadView("matches", gsB); r == nil || r.kid != "fan2" || r.pub != pub2 {
+				if r := t2.loadView("matches", viewB); r == nil || r.kid != "fan2" || r.pub != pub2 {
 					t.Fatalf("fan2's row %+v", r)
 				}
 			})
 			if !rotateFirst {
 				rotate()
 			}
-			if red, st := v76fRedirect(t, w.v75World, "matches", gsA, cookieA); red != nil || st != 403 {
+			if red, st := v76fRedirect(t, w.v75World, "matches", viewA, cookieA); red != nil || st != 403 {
 				names := []string(nil)
 				if red != nil {
-					names, _ = v76fHeads(t, w.v75World, "matches", gsA, red.At, cookieA)
+					names, _ = v76fHeads(t, w.v75World, "matches", viewA, red.At, cookieA)
 				}
 				t.Fatalf("fan's cookie after fan's pub was replaced: %d %v, want 403", st, names)
 			}
-			red, st := v76fRedirect(t, w.v75World, "matches", gsB, cookieB)
+			red, st := v76fRedirect(t, w.v75World, "matches", viewB, cookieB)
 			if red == nil {
 				t.Fatalf("fan2's cookie: %d", st)
 			}
-			if names, st := v76fHeads(t, w.v75World, "matches", gsB, red.At, cookieB); st != 0 || !v76fHas(names, "derby") {
+			if names, st := v76fHeads(t, w.v75World, "matches", viewB, red.At, cookieB); st != 0 || !v76fHas(names, "derby") {
 				t.Fatalf("fan2's cookie: %v %d", names, st)
 			}
 		})

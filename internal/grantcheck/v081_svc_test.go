@@ -8,7 +8,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
-// §A.4 gs markers, §C.2 item 5: a role with a rule on /now doesn't count
+// §A.4 view markers, §C.2 item 5: a role with a rule on /now doesn't count
 // for read, so the scope marker and the filter leave it out and judge by
 // the other roles (ScopeInputOf, FilterOf); a grant all of whose roles
 // refer to /now reads nothing and has no marker (ReadsScope false), never

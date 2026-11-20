@@ -9,14 +9,14 @@ import (
 	"time"
 )
 
-// v86gsReads checks cookie's reads of matches' filtered URLs for gs at the
+// v86viewReads checks cookie's reads of matches' filtered URLs for view at the
 // current checkpoint, the later at of CONFORMANCE Access 145: /heads and
 // the log range there, and the long-poll, whose read is the event
 // stream's too (FilteredLiveLog). want is the status, 0 where served.
-func v86gsReads(t *testing.T, w *v75World, what, gs string, cookie Credentials, want int) {
+func v86viewReads(t *testing.T, w *v75World, what, vid string, cookie Credentials, want int) {
 	t.Helper()
 	ctx := context.Background()
-	red, st := v76fRedirect(t, w, "matches", gs, cookie)
+	red, st := v76fRedirect(t, w, "matches", vid, cookie)
 	if st != want {
 		t.Errorf("%s, the redirect to the current at: status %d (0 = served), want %d", what, st, want)
 	}
@@ -28,21 +28,21 @@ func v86gsReads(t *testing.T, w *v75World, what, gs string, cookie Credentials, 
 		// is sent to.
 		w.inTx(func(t2 *tx) { at = t2.filteredCurrent(t2.filteredScope(t2.nsByName("matches"))).at })
 	}
-	if _, st := v76fHeads(t, w, "matches", gs, at, cookie); st != want {
+	if _, st := v76fHeads(t, w, "matches", vid, at, cookie); st != want {
 		t.Errorf("%s, /heads at the current at: status %d (0 = served), want %d", what, st, want)
 	}
-	if _, _, err := w.e.FilteredLog(ctx, "matches", gs, at, "", 10, cookie); v75Status(err) != want {
+	if _, _, err := w.e.FilteredLog(ctx, "matches", vid, at, "", 10, cookie); v75Status(err) != want {
 		t.Errorf("%s, the log range at the current at: %v, want %d (0 = served)", what, err, want)
 	}
-	if _, _, err := w.e.FilteredLiveLog(ctx, "matches", gs, "", 10, cookie); v75Status(err) != want {
+	if _, _, err := w.e.FilteredLiveLog(ctx, "matches", vid, "", 10, cookie); v75Status(err) != want {
 		t.Errorf("%s, long-poll and events: %v, want %d (0 = served)", what, err, want)
 	}
 }
 
-// CONFORMANCE Access 145 at the origin (SERVICES §7.9 gs, v0.86): "Once
+// CONFORMANCE Access 145 at the origin (SERVICES §7.9 view, v0.86): "Once
 // an entry after its exchange changes one of them, the cookie is 403 from
 // that entry on, even where a later entry undoes the change." li holds a
-// filtered gs cookie for matches; matches changes the groups scope of the
+// filtered view cookie for matches; matches changes the groups scope of the
 // key her grant came from, then changes it back in a later config entry,
 // and nobody exchanges in between: at the later at her cookie is 403, on
 // /heads, the log range, long-poll and events, until she exchanges again.
@@ -52,35 +52,35 @@ func TestV086AccessGSChangeUndone(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
 	w.seed()
-	cookie, gs := v82accessCookie(t, w, w.li())
-	v86gsReads(t, w, "li's cookie before the change", gs, cookie, 0)
-	before, _ := v76fRedirect(t, w, "matches", gs, cookie)
+	cookie, vid := v82accessCookie(t, w, w.li())
+	v86viewReads(t, w, "li's cookie before the change", vid, cookie, 0)
+	before, _ := v76fRedirect(t, w, "matches", vid, cookie)
 
 	w.patchConfig("matches", v82accessOp("add", "/keys/1/groups", map[string]any{"deny": []any{"banned"}}))
-	v86gsReads(t, w, "li's cookie after the key's groups scope changed", gs, cookie, 403)
+	v86viewReads(t, w, "li's cookie after the key's groups scope changed", vid, cookie, 403)
 	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/1/groups"})
-	v86gsReads(t, w, "li's cookie after the change was undone", gs, cookie, 403)
+	v86viewReads(t, w, "li's cookie after the change was undone", vid, cookie, 403)
 	// Other entries after the undo change nothing of that.
 	w.patchConfig("matches", v82accessOp("add", "/x-note", "later"))
 	w.put("matches", "later", map[string]any{"n": 1.0})
-	v86gsReads(t, w, "li's cookie, later entries after the undo", gs, cookie, 403)
+	v86viewReads(t, w, "li's cookie, later entries after the undo", vid, cookie, 403)
 	// "From that entry on": at the at from before the change, which is
 	// before that entry, the cookie reads as it did.
-	if _, st := v76fHeads(t, w, "matches", gs, before.At, cookie); st != 0 {
+	if _, st := v76fHeads(t, w, "matches", vid, before.At, cookie); st != 0 {
 		t.Errorf("li's cookie at the at from before the change: status %d, want it served", st)
 	}
 
 	// She exchanges again: the new cookie reads, the old one stays ended.
 	v82accessLater(w, time.Second)
 	again, gs2 := v82accessCookie(t, w, w.li())
-	if gs2 != gs {
-		t.Fatalf("li's gs after the undo %s, was %s", gs2, gs)
+	if gs2 != vid {
+		t.Fatalf("li's vid after the undo %s, was %s", gs2, vid)
 	}
-	v86gsReads(t, w, "li's cookie from the exchange after the undo", gs, again, 0)
-	v86gsReads(t, w, "li's old cookie after she exchanged again", gs, cookie, 403)
+	v86viewReads(t, w, "li's cookie from the exchange after the undo", vid, again, 0)
+	v86viewReads(t, w, "li's old cookie after she exchanged again", vid, cookie, 403)
 }
 
-// The same where another reader of the same gs, not li, exchanges after
+// The same where another reader of the same view, not li, exchanges after
 // the undo: the row's entry digest is the one li's exchange recorded, so
 // its exchange can't share the record of li's cookie's second, a
 // document between the two not holding, and li's cookie from before the
@@ -90,23 +90,23 @@ func TestV086AccessGSChangeUndoneOtherExchanges(t *testing.T) {
 	w := newV75World(t, v75Opts{})
 	w.seed()
 	reader := func(sub string) Credentials { return w.catGrant(sub, []any{"editors"}) }
-	bo, gs := v82accessCookie(t, w, reader("user:bo"))
+	bo, vid := v82accessCookie(t, w, reader("user:bo"))
 	w.patchConfig("matches", v82accessOp("add", "/keys/1/groups", map[string]any{"deny": []any{"banned"}}))
 	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/1/groups"})
 	v82accessLater(w, time.Second)
-	cy, cyGS := v82accessCookie(t, w, reader("user:cy"))
-	if cyGS != gs {
-		t.Fatalf("bo and cy have different gs: %s, %s", gs, cyGS)
+	cy, cyView := v82accessCookie(t, w, reader("user:cy"))
+	if cyView != vid {
+		t.Fatalf("bo and cy have different vid: %s, %s", vid, cyView)
 	}
-	v86gsReads(t, w, "cy's cookie from after the undo", gs, cy, 0)
-	v86gsReads(t, w, "bo's cookie from before the change, after cy's exchange", gs, bo, 403)
+	v86viewReads(t, w, "cy's cookie from after the undo", vid, cy, 0)
+	v86viewReads(t, w, "bo's cookie from before the change, after cy's exchange", vid, bo, 403)
 	// Exchanges under an unchanged document replace nothing: cy's reads
 	// on after bo exchanges again.
 	v82accessLater(w, time.Second)
 	bo2, _ := v82accessCookie(t, w, reader("user:bo"))
-	v86gsReads(t, w, "bo's cookie after bo exchanged again", gs, bo2, 0)
-	v86gsReads(t, w, "cy's cookie after bo's exchange", gs, cy, 0)
-	v86gsReads(t, w, "bo's old cookie", gs, bo, 403)
+	v86viewReads(t, w, "bo's cookie after bo exchanged again", vid, bo2, 0)
+	v86viewReads(t, w, "cy's cookie after bo's exchange", vid, cy, 0)
+	v86viewReads(t, w, "bo's old cookie", vid, bo, 403)
 }
 
 // Access 145, last sentence: "Both changes in one batch → her cookies
@@ -116,14 +116,14 @@ func TestV086AccessGSChangeAndUndoInOneEntry(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
 	w.seed()
-	cookie, gs := v82accessCookie(t, w, w.li())
+	cookie, vid := v82accessCookie(t, w, w.li())
 	w.patchConfig("matches",
 		v82accessOp("add", "/keys/1/groups", map[string]any{"deny": []any{"banned"}}),
 		map[string]any{"op": "remove", "path": "/keys/1/groups"},
 		v82accessOp("add", "/x-note", "one entry"))
-	v86gsReads(t, w, "li's cookie after a change and its undo in one entry", gs, cookie, 0)
+	v86viewReads(t, w, "li's cookie after a change and its undo in one entry", vid, cookie, 0)
 	w.patchConfig("matches", v82accessOp("add", "/x-other", true))
-	v86gsReads(t, w, "li's cookie after an unrelated config entry", gs, cookie, 0)
+	v86viewReads(t, w, "li's cookie after an unrelated config entry", vid, cookie, 0)
 }
 
 // An exchange that read matches before a change and records its row
@@ -149,12 +149,12 @@ func TestV086AccessGSExchangeAcrossChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: rec.view, Prefix: "/ns/matches/view/" + rec.view, Exp: time.Unix(rec.exp, 0)}}
-	v86gsReads(t, w, "the cookie of an exchange that read before the change", rec.view, cookie, 403)
+	v86viewReads(t, w, "the cookie of an exchange that read before the change", rec.view, cookie, 403)
 	// A reader exchanging now gets a cookie that reads.
 	v82accessLater(w, time.Second)
 	fresh, _ := v82accessCookie(t, w, w.li())
-	v86gsReads(t, w, "a cookie from an exchange after the undo", rec.view, fresh, 0)
-	v86gsReads(t, w, "the earlier cookie after that exchange", rec.view, cookie, 403)
+	v86viewReads(t, w, "a cookie from an exchange after the undo", rec.view, fresh, 0)
+	v86viewReads(t, w, "the earlier cookie after that exchange", rec.view, cookie, 403)
 }
 
 // A cookie with no record of its own, one from before they were kept,
@@ -164,31 +164,31 @@ func TestV086AccessGSFailsClosed(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
 	w.seed()
-	cookie, gs := v82accessCookie(t, w, w.li())
+	cookie, vid := v82accessCookie(t, w, w.li())
 	for i := 0; i < viewWalk; i++ {
 		w.patchConfig("matches", v82accessOp("add", "/x-n", float64(i)))
 	}
-	v86gsReads(t, w, "li's cookie, viewWalk documents later", gs, cookie, 0)
+	v86viewReads(t, w, "li's cookie, viewWalk documents later", vid, cookie, 0)
 	w.patchConfig("matches", v82accessOp("add", "/x-n", "one more"))
-	v86gsReads(t, w, "li's cookie, more than viewWalk documents later", gs, cookie, 403)
+	v86viewReads(t, w, "li's cookie, more than viewWalk documents later", vid, cookie, 403)
 	v82accessLater(w, time.Second)
 	again, _ := v82accessCookie(t, w, w.li())
-	v86gsReads(t, w, "li's cookie after exchanging again", gs, again, 0)
+	v86viewReads(t, w, "li's cookie after exchanging again", vid, again, 0)
 	if err := w.e.update(context.Background(), func(t2 *tx) error {
 		_, err := t2.Exec(`DELETE FROM filtered_view_exps`)
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	v86gsReads(t, w, "a cookie with no record of its own", gs, again, 403)
+	v86viewReads(t, w, "a cookie with no record of its own", vid, again, 403)
 	// Its reader exchanges again, the grant she held included.
 	li := w.li()
 	c1, _ := v82accessCookie(t, w, li)
-	v86gsReads(t, w, "the cookie of an exchange after that", gs, c1, 0)
+	v86viewReads(t, w, "the cookie of an exchange after that", vid, c1, 0)
 }
 
 // The sequence a grant that ends within the quarter of an hour used to
-// fail (§C.5.2, SERVICES §A.4 gs, CONFORMANCE Access 144; v0.86: "less
+// fail (§C.5.2, SERVICES §A.4 view, CONFORMANCE Access 144; v0.86: "less
 // any whole seconds a minter MAY take off so that cookies for one prefix
 // that it must tell apart differ in exp"): li's grant G ends in ten
 // minutes, so her cookie expires with G. A key change is made and undone,
@@ -201,7 +201,7 @@ func TestV086AccessGSExchangeAgainSameGrant(t *testing.T) {
 	w := newV75World(t, v75Opts{})
 	w.seed()
 	g := w.li()
-	first, gs := v82accessCookie(t, w, g)
+	first, vid := v82accessCookie(t, w, g)
 	prev := first
 	ended := []Credentials{}
 	for i := 1; i <= 3; i++ {
@@ -212,9 +212,9 @@ func TestV086AccessGSExchangeAgainSameGrant(t *testing.T) {
 		if want := first.Edge.Exp.Add(-time.Duration(i) * time.Second); !next.Edge.Exp.Equal(want) {
 			t.Fatalf("exchange %d of the same grant: the cookie expires %v, want %v, a second before the last", i, next.Edge.Exp, want)
 		}
-		v86gsReads(t, w, "the cookie of the exchange after a change and its undo", gs, next, 0)
+		v86viewReads(t, w, "the cookie of the exchange after a change and its undo", vid, next, 0)
 		for _, c := range ended {
-			v86gsReads(t, w, "a cookie from before a change, after the re-exchange", gs, c, 403)
+			v86viewReads(t, w, "a cookie from before a change, after the re-exchange", vid, c, 403)
 		}
 		prev = next
 	}
@@ -223,7 +223,7 @@ func TestV086AccessGSExchangeAgainSameGrant(t *testing.T) {
 	if !same.Edge.Exp.Equal(first.Edge.Exp.Add(-3 * time.Second)) {
 		t.Errorf("an exchange with nothing changed expires %v, want the last cookie's second %v", same.Edge.Exp, prev.Edge.Exp)
 	}
-	v86gsReads(t, w, "the cookie of an exchange with nothing changed", gs, same, 0)
+	v86viewReads(t, w, "the cookie of an exchange with nothing changed", vid, same, 0)
 }
 
 // Where no whole second is left before the grant's exp, the exchange is
@@ -240,21 +240,21 @@ func TestV086AccessGSNoSecondLeft(t *testing.T) {
 		w.patchConfig("matches", v82accessOp("add", "/keys/1/groups", map[string]any{"deny": []any{"banned"}}))
 		w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/1/groups"})
 	}
-	c1, gs := v82accessCookie(t, w, g)
+	c1, vid := v82accessCookie(t, w, g)
 	change()
 	c2, _ := v82accessCookie(t, w, g)
-	v86gsReads(t, w, "the second cookie", gs, c2, 0)
-	v86gsReads(t, w, "the first cookie", gs, c1, 403)
+	v86viewReads(t, w, "the second cookie", vid, c2, 0)
+	v86viewReads(t, w, "the first cookie", vid, c1, 403)
 	change()
 	res, err := w.e.IssueEdgeGrants(ctx, []string{g.Bearer})
 	ae, _ := err.(*Error)
 	if ae == nil || ae.Status != 503 || ae.Body["code"] != "behind" || ae.Header.Get("Retry-After") == "" {
 		t.Fatalf("the third exchange: %+v %v, want 503 behind with Retry-After", res, err)
 	}
-	v86gsReads(t, w, "the second cookie after the change", gs, c2, 403)
+	v86viewReads(t, w, "the second cookie after the change", vid, c2, 403)
 	// A grant that lasts longer exchanges.
 	c3, _ := v82accessCookie(t, w, w.li())
-	v86gsReads(t, w, "the cookie of a grant that lasts longer", gs, c3, 0)
+	v86viewReads(t, w, "the cookie of a grant that lasts longer", vid, c3, 0)
 }
 
 // v86gsRead is what an exchange of cred reads of matches, without
@@ -315,7 +315,7 @@ func TestV086AccessGSStaleExchangeAfterNewer(t *testing.T) {
 	if stale.exp != newer.exp || slot(newer).conf != newer.conf {
 		t.Fatalf("the stale exchange's cookie expires %d with record %+v, the newer one's %d at document %d: want one record, at the later document", stale.exp, slot(stale), newer.exp, newer.conf)
 	}
-	v86gsReads(t, w, "the newer cookie after the stale exchange's record", newer.view, cookieOf(newer), 0)
+	v86viewReads(t, w, "the newer cookie after the stale exchange's record", newer.view, cookieOf(newer), 0)
 
 	// A change between them: the stale exchange takes its own second.
 	// (Cookies of another minute, clear of the record above.)
@@ -332,14 +332,14 @@ func TestV086AccessGSStaleExchangeAfterNewer(t *testing.T) {
 	if stale.exp >= newer.exp || slot(newer).conf != newer.conf || slot(stale).conf != stale.conf {
 		t.Fatalf("the stale exchange's cookie expires %d (record %+v), the newer one's %d (record %+v): want a second of its own, each with its document", stale.exp, slot(stale), newer.exp, slot(newer))
 	}
-	v86gsReads(t, w, "the newer cookie after the stale exchange's record", newer.view, cookieOf(newer), 0)
-	v86gsReads(t, w, "the stale exchange's cookie", stale.view, cookieOf(stale), 403)
+	v86viewReads(t, w, "the newer cookie after the stale exchange's record", newer.view, cookieOf(newer), 0)
+	v86viewReads(t, w, "the stale exchange's cookie", stale.view, cookieOf(stale), 403)
 }
 
-// v86gsRows are the seconds matches has a cookie record at for gs.
-func v86gsRows(w *v75World, gs string) (exps []int64) {
+// v86gsRows are the seconds matches has a cookie record at for view.
+func v86gsRows(w *v75World, vid string) (exps []int64) {
 	w.inTx(func(t2 *tx) {
-		rows, err := t2.Query(`SELECT exp FROM filtered_view_exps WHERE ns = ? AND view = ? ORDER BY exp`, "matches", gs)
+		rows, err := t2.Query(`SELECT exp FROM filtered_view_exps WHERE ns = ? AND view = ? ORDER BY exp`, "matches", vid)
 		t2.must(err)
 		defer rows.Close()
 		for rows.Next() {
@@ -375,17 +375,17 @@ func TestV086AccessGSTwoGrantsOneCookie(t *testing.T) {
 		if err != nil || len(res.Grants) != 2 {
 			t.Fatalf("%s: %+v %v", order, res, err)
 		}
-		gs := res.Grants[0].View
+		vid := res.Grants[0].View
 		for _, g := range res.Grants {
-			if g.View != gs || !g.Exp.Equal(long) {
-				t.Errorf("%s: edge grant %+v, want gs %s until %v, the longer grant's exp", order, g, gs, long)
+			if g.View != vid || !g.Exp.Equal(long) {
+				t.Errorf("%s: edge grant %+v, want vid %s until %v, the longer grant's exp", order, g, vid, long)
 			}
 		}
-		if rows := v86gsRows(w, gs); len(rows) != 1 || rows[0] != long.Unix() {
+		if rows := v86gsRows(w, vid); len(rows) != 1 || rows[0] != long.Unix() {
 			t.Errorf("%s: cookie records at %v, want one, at %d", order, rows, long.Unix())
 		}
-		cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: gs, Prefix: "/ns/matches/view/" + gs, Exp: long}}
-		v86gsReads(t, w, order+": the cookie", gs, cookie, 0)
+		cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: vid, Prefix: "/ns/matches/view/" + vid, Exp: long}}
+		v86viewReads(t, w, order+": the cookie", vid, cookie, 0)
 	}
 }
 
@@ -397,8 +397,8 @@ func TestV086AccessGSSweepMargin(t *testing.T) {
 	w := newV75World(t, v75Opts{})
 	w.seed()
 	short := w.now().Truncate(time.Second).Add(2 * time.Second)
-	c, gs := v82accessCookie(t, w, w.li(map[string]any{"exp": short.UTC().Format(time.RFC3339)}))
-	has := func() bool { return slices.Contains(v86gsRows(w, gs), c.Edge.Exp.Unix()) }
+	c, vid := v82accessCookie(t, w, w.li(map[string]any{"exp": short.UTC().Format(time.RFC3339)}))
+	has := func() bool { return slices.Contains(v86gsRows(w, vid), c.Edge.Exp.Unix()) }
 	v82accessLater(w, 30*time.Second)
 	v82accessCookie(t, w, w.li()) // an exchange sweeps
 	if !has() {
@@ -418,11 +418,11 @@ func TestV086AccessGSVerdictKept(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
 	w.seed()
-	cookie, gs := v82accessCookie(t, w, w.li())
+	cookie, vid := v82accessCookie(t, w, w.li())
 	for i := 0; i < 20; i++ {
 		w.patchConfig("matches", v82accessOp("add", "/x-n", float64(i)))
 	}
-	red, _ := v76fRedirect(t, w, "matches", gs, cookie)
+	red, _ := v76fRedirect(t, w, "matches", vid, cookie)
 	if red == nil {
 		t.Fatal("the cookie doesn't read")
 	}
@@ -437,7 +437,7 @@ func TestV086AccessGSVerdictKept(t *testing.T) {
 	}
 	defer func() { w.e.onStatement = nil }()
 	for i := 0; i < 3; i++ {
-		if _, st := v76fHeads(t, w, "matches", gs, red.At, cookie); st != 0 {
+		if _, st := v76fHeads(t, w, "matches", vid, red.At, cookie); st != 0 {
 			t.Fatalf("read %d: status %d", i, st)
 		}
 	}
@@ -446,9 +446,9 @@ func TestV086AccessGSVerdictKept(t *testing.T) {
 	}
 	// The kept verdict is the record's: another cookie's is its own.
 	w.patchConfig("matches", v82accessOp("add", "/keys/1/groups", map[string]any{"deny": []any{"banned"}}))
-	v86gsReads(t, w, "the cookie after a change", gs, cookie, 403)
+	v86viewReads(t, w, "the cookie after a change", vid, cookie, 403)
 	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/1/groups"})
-	v86gsReads(t, w, "the cookie after the undo", gs, cookie, 403)
+	v86viewReads(t, w, "the cookie after the undo", vid, cookie, 403)
 	fresh, _ := v82accessCookie(t, w, w.li())
-	v86gsReads(t, w, "a cookie from after the undo", gs, fresh, 0)
+	v86viewReads(t, w, "a cookie from after the undo", vid, fresh, 0)
 }

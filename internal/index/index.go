@@ -21,15 +21,15 @@
 //	                                      path is the full instance pointer, indices included
 //	sealed_views, sealed_view_tags   sealed results of sealed/e2e namespaces (derived.Cache)
 //	cdn_repurge(id, tags, due)       second CDN purges (package repurge), kept by a rebuild
-//	edge_subjects, edge_buckets      the markers of each subject set the service minted edge
+//	edge_subjects, edge_buckets      the markers of each view the service minted edge
 //	                                 grants for, until the last of them expires, and its
 //	                                 exchangeRate buckets (edgeStore, edgegrants.go)
 //	edge_filters(marker, filter, exp) what each scope or g: marker of those stands for (markerRec)
-//	edge_gs(marker, subjects, kid, roles, pub, exp)  and, for a g: marker (§7.9), its subjects;
-//	                                      its kid, roles and pub are no longer read (edge_gs_keys)
-//	edge_gs_keys(marker, exp, kid, roles, pub, entry, pending, chain)  every key the cookie of a marker (reads:{ns}:{k}
+//	edge_views(marker, subjects, kid, roles, pub, exp)  and, for a g: marker (§7.9), its subjects;
+//	                                      its kid, roles and pub are no longer read (edge_view_keys)
+//	edge_view_keys(marker, exp, kid, roles, pub, entry, pending, chain)  every key the cookie of a marker (reads:{ns}:{k}
 //	                                      included) that expires at exp came from, with its read
-//	                                      roles and the digest of its entry and theirs (gsKey),
+//	                                      roles and the digest of its entry and theirs (viewKey),
 //	                                      written once: an exchange with other keys or entries
 //	                                      takes another exp (recordCookies)
 //	ns_stopped(ns, ns_id)                 a namespace the index stopped following, or can't follow
@@ -211,7 +211,7 @@ type Index struct {
 	edge    *edgeStore     // the service's edge grants (EdgeGrants)
 
 	fmu     sync.Mutex
-	filters map[string]keptFilter // scope or g: marker -> what it stands for (edge_filters, edge_gs)
+	filters map[string]keptFilter // scope or g: marker -> what it stands for (edge_filters, edge_views)
 	copied  sync.Map              // a local branch -> the kids it copied from its base (copiedKids)
 
 	fs fstate // the state of namespaces §7.9 covers (filtered.go)
@@ -355,7 +355,7 @@ func (ix *Index) Origin() string { return ix.origin }
 var migrations embed.FS
 
 // resetStmts empty what a rebuild replays (cdn_repurge stays, and so do
-// the edge grants' tables, edge_filters, edge_gs and edgeStore's), in
+// the edge grants' tables, edge_filters, edge_views and edgeStore's), in
 // one transaction. checkpoints_bootstrap too: a snapshot left part-way would
 // otherwise be resumed, not replayed from its first page. text, made by
 // initSchema rather than a migration, is dropped, so a rebuild decides
@@ -852,7 +852,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	}
 
 	// The cookies the batch's documents end, each judged in order, and
-	// all of them at a snapshot's start (cookieEnds; §7.9 gs, v0.86).
+	// all of them at a snapshot's start (cookieEnds; §7.9 view, v0.86).
 	ends, err := ix.cookieEnds(ctx, b.NS, b, snapDoc)
 	if err != nil {
 		return err

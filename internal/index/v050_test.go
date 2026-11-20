@@ -101,7 +101,7 @@ func TestMinAlwaysRedirects(t *testing.T) {
 	}
 }
 
-// TestMinAlwaysRedirectsPrivate (§A.5): the same under a subject set's URL
+// TestMinAlwaysRedirectsPrivate (§A.5): the same under a view's URL
 // space, which the redirect keeps.
 func TestMinAlwaysRedirectsPrivate(t *testing.T) {
 	t.Parallel()
@@ -129,7 +129,7 @@ func TestMinAlwaysRedirectsPrivate(t *testing.T) {
 	// pointer, min goes straight to the reader's own at URL, without min.
 	for _, p := range []string{atLoc + "&min=" + wr.NSID, "/sec?limit=5&min=sec:" + wr.NSID, "/sec/at/" + at + "?limit=5&min=" + wr.NSID, "/sec?limit=5&min=" + wr.NSID} {
 		r := x.raw(p, bob)
-		// A redirect that adds /view/{gs} is private, no-store (§A.4, v0.73).
+		// A redirect that adds /view/{view} is private, no-store (§A.4, v0.73).
 		if r.status != 302 || r.header.Get("Location") != atLoc || r.header.Get("Cache-Control") != "private, no-store" {
 			t.Errorf("%s: %d %s %v", p, r.status, r.header.Get("Location"), r.header)
 		}

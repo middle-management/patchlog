@@ -10,7 +10,7 @@ package vectors_test
 // the writer as contested, never a candidate overwritten with ours.
 //
 // These are the computed values. What a deployment answers with them, the
-// bundle Reader's verdict on C.5's rows and an index serving C.4's gs, is
+// bundle Reader's verdict on C.5's rows and an index serving C.4's view, is
 // in v085_pending_test.go.
 
 import (
@@ -54,9 +54,9 @@ func loadCandidates(t *testing.T) candidatesFile {
 	return f
 }
 
-// C.4 (SERVICES §E.2.6 Whole-response sealing, §A.4, §7.9 gs): the
+// C.4 (SERVICES §E.2.6 Whole-response sealing, §A.4, §7.9 view): the
 // key: string of demo's key ops-2026 with I.14's pub, as the reference
-// binds a gs to a key (grantcheck.KeySubject: canonical([kid, pub]), pub the
+// binds a view to a key (grantcheck.KeySubject: canonical([kid, pub]), pub the
 // key entry's base64url string, the reading the candidates call
 // underdetermined); the view of that one subject (grantcheck.ViewID,
 // v0.87: no scope: subject for unrestricted read); §I.23's query at ns_id₂
@@ -154,7 +154,7 @@ func TestV085C4WholeResponse(t *testing.T) {
 		if got, err := derived.OpenView(c.jwe, keyOf, v); err != nil || !bytes.Equal(got, c.want) {
 			t.Errorf("%s opens to %s %v", what, got, err)
 		}
-		// At I.8's gs, §I.23's view, it is another URL's.
+		// At I.8's view, §I.23's view, it is another URL's.
 		if got, err := derived.OpenView(c.jwe, keyOf, derived.View{NS: "demo", Target: i23.View}); err == nil {
 			t.Errorf("%s opened at §I.23's view: %s", what, got)
 		}

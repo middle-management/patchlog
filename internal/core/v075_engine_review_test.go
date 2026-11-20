@@ -6,9 +6,9 @@ import (
 	"time"
 )
 
-// §7.9 gs: a grant reading two covered namespaces with the same key
-// rules and role definitions gets the same gs in both (a gs names no
-// namespace), so filtered_views keeps a row per (ns, gs): each namespace's
+// §7.9 view: a grant reading two covered namespaces with the same key
+// rules and role definitions gets the same view in both (a view names no
+// namespace), so filtered_views keeps a row per (ns, view): each namespace's
 // cookie is admitted, by its own row.
 func TestV075EngineGSPerNamespace(t *testing.T) {
 	t.Parallel()
@@ -31,7 +31,7 @@ func TestV075EngineGSPerNamespace(t *testing.T) {
 		t.Fatalf("exchange: %+v %v", res, err)
 	}
 	if res.Grants[0].View != res.Grants[1].View {
-		t.Fatalf("gs matches=%s results=%s: the case needs them equal", res.Grants[0].View, res.Grants[1].View)
+		t.Fatalf("vid matches=%s results=%s: the case needs them equal", res.Grants[0].View, res.Grants[1].View)
 	}
 	exp := w.now().Add(10 * time.Minute)
 	for _, g := range res.Grants {

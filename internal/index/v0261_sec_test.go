@@ -204,7 +204,7 @@ func TestV0261NarrowWrittenPrivateServedPublic(t *testing.T) {
 // refsAnswer computes it again (recover) with the reader of before (pr
 // still among its public namespaces), and keeps it. Once the grant checker
 // has observed the change, is that kept answer, showing pr/b, served at
-// its URL to an anonymous reader, whose gs is the empty set's either way?
+// its URL to an anonymous reader, whose view is the empty set's either way?
 func TestV0261RefsNarrowRetry(t *testing.T) {
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})

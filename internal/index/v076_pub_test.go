@@ -14,7 +14,7 @@ import (
 )
 
 // pub76Cookie exchanges a partial reader's grant of matches at w's index
-// and returns its /matches/view/{gs} prefix and cookies, read once under them.
+// and returns its /matches/view/{view} prefix and cookies, read once under them.
 func pub76Cookie(t *testing.T, w *v75x) (string, []*http.Cookie) {
 	t.Helper()
 	fan := w.reader("user:fan", []any{"fans"})
@@ -34,13 +34,13 @@ func pub76Cookie(t *testing.T, w *v75x) (string, []*http.Cookie) {
 	return prefix, r.cookies
 }
 
-// TestV076PubKeyReplaced (FSVC-7; §7.9 gs: a gs cookie is 403 where "a
+// TestV076PubKeyReplaced (FSVC-7; §7.9 view: a view cookie is 403 where "a
 // key or role they came from is gone or, as §C.4 judges a base's keys, no
 // longer accepted"; §C.4: a shared kid is accepted "only while the base
 // has it with the same pub"): a partial reader's cookie for
-// reads:matches:g:{gs}, exchanged through reader-01, is 403 "exchange the
+// reads:matches:g:{view}, exchanged through reader-01, is 403 "exchange the
 // grant again" once matches gives reader-01 another pub, its scope,
-// and roles unchanged. Before v0.76 edge_gs kept only the kid,
+// and roles unchanged. Before v0.76 edge_views kept only the kid,
 // and the cookie was still served.
 func TestV076PubKeyReplaced(t *testing.T) {
 	t.Parallel()
@@ -69,16 +69,16 @@ func TestV076PubKeyReplaced(t *testing.T) {
 	}
 }
 
-// TestV076PubNoneStored (FSVC-7, §7.9 gs): a g: marker whose key was
+// TestV076PubNoneStored (FSVC-7, §7.9 view): a g: marker whose key was
 // recorded without its pub (migration 006 gives such a row an empty pub),
-// or recorded before edge_gs_keys kept every key a marker's cookies came
+// or recorded before edge_view_keys kept every key a marker's cookies came
 // from (migration 007: no row there), is 403 under its cookie, until the
 // reader exchanges again, which records the key and its pub.
 func TestV076PubNoneStored(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct{ name, q string }{
-		{"no pub", `UPDATE edge_gs_keys SET pub = ''`},
-		{"before 007", `DELETE FROM edge_gs_keys`},
+		{"no pub", `UPDATE edge_view_keys SET pub = ''`},
+		{"before 007", `DELETE FROM edge_view_keys`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -96,7 +96,7 @@ func TestV076PubNoneStored(t *testing.T) {
 			res := must(sdb.Exec(c.q))
 			sdb.Close()
 			if n := must(res.RowsAffected()); n != 1 {
-				t.Fatalf("%d edge_gs_keys rows", n)
+				t.Fatalf("%d edge_view_keys rows", n)
 			}
 			restart()
 			if got, _ := p37Follow(t, w.x, prefix, cookies, ""); got.status != 403 {
@@ -112,7 +112,7 @@ func TestV076PubNoneStored(t *testing.T) {
 	}
 }
 
-// TestV076PubSharedMarker (§7.9 gs, §C.4): a g: marker's subjects
+// TestV076PubSharedMarker (§7.9 view, §C.4): a g: marker's subjects
 // include grantcheck.KeySubject(kid, pub), so readers whose grants come from
 // different keys, or from one kid under different pubs, never share a
 // marker. Reader A's cookie came from reader-01's old pub; once matches
@@ -120,7 +120,7 @@ func TestV076PubNoneStored(t *testing.T) {
 // reader B, with the same subjects and rules, exchanges a grant signed under
 // the new pub: B gets a marker of its own, which reads. Before v0.76, B's
 // exchange overwrote the shared marker's pub and A's cookie was served
-// again. edge_gs_keys still keeps every key of a marker, for readers who
+// again. edge_view_keys still keeps every key of a marker, for readers who
 // share one key.
 func TestV076PubSharedMarker(t *testing.T) {
 	t.Parallel()

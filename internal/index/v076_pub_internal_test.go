@@ -9,10 +9,10 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
-// TestV076PubKeysKept (§7.9 gs, §C.4): each exchange for a g: marker
+// TestV076PubKeysKept (§7.9 view, §C.4): each exchange for a g: marker
 // adds the key its grant came from beside those of the marker's other
 // live cookies, never in their place, and one key's record lasts until
-// the last cookie minted under it expires; gsKeys reads them from the
+// the last cookie minted under it expires; viewKeys reads them from the
 // database, as every instance on it shares them, and forgets the expired.
 func TestV076PubKeysKept(t *testing.T) {
 	ctx := context.Background()
@@ -22,7 +22,7 @@ func TestV076PubKeysKept(t *testing.T) {
 	const m = "reads:matches:g:1abc"
 	rec := func(pub string) *markerRec {
 		return &markerRec{f: &grantcheck.ReadFilter{Principal: map[string]any{}}, subjects: []string{"group:fans"},
-			key: gsKey{kid: "reader-01", roles: []string{"reader"}, pub: pub}}
+			key: viewKey{kid: "reader-01", roles: []string{"reader"}, pub: pub}}
 	}
 	must := func(err error) {
 		t.Helper()
@@ -32,7 +32,7 @@ func TestV076PubKeysKept(t *testing.T) {
 	}
 	pubs := func(now time.Time) []string {
 		t.Helper()
-		ks, err := ix.gsKeys(ctx, m, now)
+		ks, err := ix.viewKeys(ctx, m, now)
 		must(err)
 		var out []string
 		for _, k := range ks {

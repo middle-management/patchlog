@@ -613,15 +613,15 @@ func TestV050EdgeGrantsRefusedCheaply(t *testing.T) {
 	for i := range nss {
 		nss[i] = fmt.Sprintf("n%d", i)
 	}
-	gs := make([]string, 50)
-	for i := range gs {
-		gs[i] = e.grant(k, fmt.Sprintf("user:x%d", i), nss, []string{"read"})
+	vid := make([]string, 50)
+	for i := range vid {
+		vid[i] = e.grant(k, fmt.Sprintf("user:x%d", i), nss, []string{"read"})
 	}
-	if len(gs[0]) > 8<<10 {
-		t.Fatalf("grant of %d bytes", len(gs[0]))
+	if len(vid[0]) > 8<<10 {
+		t.Fatalf("grant of %d bytes", len(vid[0]))
 	}
 	start := time.Now()
-	r := e.issueGrants(gs...)
+	r := e.issueGrants(vid...)
 	if took := time.Since(start); r.Code != 401 || took > 5*time.Second {
 		t.Fatalf("%d in %v", r.Code, took)
 	}

@@ -79,7 +79,7 @@ func TestV0261WidenPending503(t *testing.T) {
 	}
 	rg := k.Grant(t, s.Now(), "user:r", []string{"pr"}, []string{"read"})
 	if g := x.raw("/pr?limit=6", rg); g.status != 302 || !strings.HasPrefix(g.header.Get("Location"), "/pr/view/") {
-		t.Errorf("a grant holder's /pr meanwhile: %d %q %v, want a redirect to its gs", g.status, g.header.Get("Location"), g.body)
+		t.Errorf("a grant holder's /pr meanwhile: %d %q %v, want a redirect to its vid", g.status, g.header.Get("Location"), g.body)
 	} else if f := x.raw(g.header.Get("Location"), rg); f.status != 200 {
 		t.Errorf("a grant holder's %s meanwhile: %d %v", g.header.Get("Location"), f.status, f.body)
 	}

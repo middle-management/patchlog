@@ -12,7 +12,7 @@ import (
 // Tests for clauses of v0.86 the index already met: scenarios Tree 144
 // and 148, and Access 85.
 
-// TestV086CookiesToldApartByExp (CONFORMANCE Tree 144; SERVICES §A.4 gs,
+// TestV086CookiesToldApartByExp (CONFORMANCE Tree 144; SERVICES §A.4 view,
 // SPEC §C.5.2 Answer: a cookie lasts until its grant's exp "less any
 // whole seconds a minter MAY take off so that cookies for one prefix that
 // it must tell apart differ in exp"; §12.1 behind: "an exchange has no
@@ -89,7 +89,7 @@ func TestV086CookiesToldApartByExp(t *testing.T) {
 // a service (§C.6), is 401, as for a key the namespace doesn't list. …
 // Requests that ignore any grant, such as public reads, … ignore it
 // too"). An operator grant, naming the namespace or "*", is 401 at the
-// index's exchange, with no cookie and no subject set, at GET /_refs and
+// index's exchange, with no cookie and no view, at GET /_refs and
 // at a query on a private namespace; a public namespace's query ignores
 // it. The index holds no operator key: it verifies a grant against the
 // namespace's own keys alone.

@@ -13,7 +13,7 @@ import (
 	"github.com/middle-management/patchlog/internal/index"
 )
 
-// CONFORMANCE Tree 145 at the index (SERVICES §7.9 gs, §A.4 gs, v0.86):
+// CONFORMANCE Tree 145 at the index (SERVICES §7.9 view, §A.4 view, v0.86):
 // "Once an entry after its exchange changes one of them, the cookie is
 // 403 from that entry on, even where a later entry undoes the change. …
 // Both changes in one batch → her cookies hold." The index judges a
@@ -246,7 +246,7 @@ func v86Exchange(d *v77docs, tok string) (string, []*http.Cookie) {
 	return r.body["prefixes"].([]any)[0].(string), r.cookies
 }
 
-// TestV086CookieMintedBehindOutlivesBacklog (SERVICES §7.9 gs, v0.86:
+// TestV086CookieMintedBehindOutlivesBacklog (SERVICES §7.9 view, v0.86:
 // "Once an entry after its exchange changes one of them, the cookie is
 // 403 from that entry on"): only entries after the exchange count. The
 // index is behind by three config entries, each of which changes k1; li

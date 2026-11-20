@@ -187,7 +187,7 @@ func TestV082AccessNowBeforePurged(t *testing.T) {
 	now := w.li(map[string]any{"rules": []any{v82accessNow}})
 	env := w.li(map[string]any{"rules": []any{v82accessWhole}})
 	nowAdmin := w.grant(w.k, "user:root", []string{"matches"}, []string{"read"}, map[string]any{"rules": []any{v82accessNow}})
-	gs, at := w.filtered(li)
+	vid, at := w.filtered(li)
 	rev := etagOf(w.get("/r/matches/derby", w.admin))
 	head := v82accessPurge(t, w)
 	for _, c := range []struct {
@@ -200,8 +200,8 @@ func TestV082AccessNowBeforePurged(t *testing.T) {
 		{"/r/matches/derby/rev/" + rev, 404, 410, false},
 		{"/ns/matches/rev/" + head + "/heads", 403, 410, true},
 		{"/ns/matches/gestures/" + gA, 403, 410, false},
-		{"/ns/matches/view/" + gs + "/heads", 403, 410, false},
-		{"/ns/matches/view/" + gs + "/at/" + at + "/heads", 403, 410, false},
+		{"/ns/matches/view/" + vid + "/heads", 403, 410, false},
+		{"/ns/matches/view/" + vid + "/at/" + at + "/heads", 403, 410, false},
 	} {
 		good := li
 		if c.admin {
@@ -239,7 +239,7 @@ func v82accessPurge(t *testing.T, w *v75s) string {
 }
 
 // Conformance 124, second half, over HTTP (ACC-8b): covered matches is
-// purged. li's grant at another subject set's /view/{gs}/heads is 403, not
+// purged. li's grant at another subject set's /view/{view}/heads is 403, not
 // 410; at her own, 410. An unrestricted reader's grant is 403 at the
 // filtered URLs, as at a live namespace's, and 410 at the unfiltered
 // /heads. None of the 403s shows the purge.
@@ -248,24 +248,24 @@ func TestV082AccessPurgedFilteredHeads(t *testing.T) {
 	w := newV75s(t, v75sOpts{})
 	w.seed([]string{"derby"}, []string{"secret"}, []string{"derby", "secret"})
 	li, bo := w.li(), w.bo()
-	liGS, at := w.filtered(li)
-	boGS, _ := w.filtered(bo)
-	if liGS == boGS {
-		t.Fatal("li and bo share a gs")
+	liView, at := w.filtered(li)
+	boView, _ := w.filtered(bo)
+	if liView == boView {
+		t.Fatal("li and bo share a vid")
 	}
 	head := v82accessPurge(t, w)
 	for _, c := range []struct {
-		who, bearer, gs string
-		want            int
+		who, bearer, vid string
+		want             int
 	}{
-		{"li at her own gs", li, liGS, 410},
-		{"li at another subject set's", li, boGS, 403},
-		{"bo at li's", bo, liGS, 403},
-		{"an unrestricted reader at li's gs", w.admin, liGS, 403},
-		{"an unrestricted reader at bo's gs", w.admin, boGS, 403},
-		{"no credentials", "", liGS, 401},
+		{"li at her own vid", li, liView, 410},
+		{"li at another subject set's", li, boView, 403},
+		{"bo at li's", bo, liView, 403},
+		{"an unrestricted reader at li's vid", w.admin, liView, 403},
+		{"an unrestricted reader at bo's vid", w.admin, boView, 403},
+		{"no credentials", "", liView, 401},
 	} {
-		for _, path := range []string{"/ns/matches/view/" + c.gs + "/heads", "/ns/matches/view/" + c.gs + "/at/" + at + "/heads"} {
+		for _, path := range []string{"/ns/matches/view/" + c.vid + "/heads", "/ns/matches/view/" + c.vid + "/at/" + at + "/heads"} {
 			r := w.get(path, c.bearer)
 			if r.Code != c.want {
 				t.Errorf("%s, %s: %d %s, want %d", c.who, path, r.Code, r.Body, c.want)
@@ -280,7 +280,7 @@ func TestV082AccessPurgedFilteredHeads(t *testing.T) {
 	expectCode(t, w.get("/ns/matches/rev/"+head+"/heads", w.admin), 410, "purged")
 }
 
-// Conformance 125 (§7.9 URLs, §6.2): /ns/matches/view/all/…, and a gs or
+// Conformance 125 (§7.9 URLs, §6.2): /ns/matches/view/all/…, and a view or
 // at that isn't an id in text form, are 400 bad_input, a request-shape
 // error, before any 401 or 403: without credentials, with a grant the
 // read check refuses, with a partial reader's, and for a namespace that
@@ -290,7 +290,7 @@ func TestV082AccessFilteredShapeFirst(t *testing.T) {
 	w := newV75s(t, v75sOpts{})
 	w.seed([]string{"derby"}, nil, []string{"derby"})
 	li := w.li()
-	gs, at := w.filtered(li)
+	vid, at := w.filtered(li)
 	since := w.nsHead("matches", w.admin)
 	refused := w.grant(w.k, "user:x", []string{"cat-season"}, []string{"read"})
 	now := w.li(map[string]any{"rules": []any{v82accessNow}})
@@ -300,11 +300,11 @@ func TestV082AccessFilteredShapeFirst(t *testing.T) {
 		"/ns/matches/view/all/at/" + at + "/log",
 		"/ns/matches/view/all/log?live=long-poll&since=" + since,
 		"/ns/matches/view/all/events",
-		"/ns/matches/view/" + strings.ToUpper(gs) + "/heads",
-		"/ns/matches/view/" + gs[:len(gs)-1] + "/heads",
-		"/ns/matches/view/" + gs + "/at/all/heads",
-		"/ns/matches/view/" + gs + "/at/" + at[:len(at)-1] + "/log",
-		"/ns/matches/view/" + gs + "/at/" + at + "x/heads",
+		"/ns/matches/view/" + strings.ToUpper(vid) + "/heads",
+		"/ns/matches/view/" + vid[:len(vid)-1] + "/heads",
+		"/ns/matches/view/" + vid + "/at/all/heads",
+		"/ns/matches/view/" + vid + "/at/" + at[:len(at)-1] + "/log",
+		"/ns/matches/view/" + vid + "/at/" + at + "x/heads",
 		"/ns/nowhere/view/all/heads",
 		"/ns/cat-season/view/all/heads",
 	}
@@ -318,8 +318,8 @@ func TestV082AccessFilteredShapeFirst(t *testing.T) {
 		}
 	}
 	// Well-formed, the same requests get the read check's answers.
-	expect(t, w.get("/ns/matches/view/"+gs+"/heads", ""), 401)
-	expect(t, w.get("/ns/matches/view/"+gs+"/heads", now), 403)
-	expect(t, w.get("/ns/matches/view/"+gs+"/heads", w.admin), 403)
-	expect(t, w.get("/ns/matches/view/"+gs+"/heads", li), 302)
+	expect(t, w.get("/ns/matches/view/"+vid+"/heads", ""), 401)
+	expect(t, w.get("/ns/matches/view/"+vid+"/heads", now), 403)
+	expect(t, w.get("/ns/matches/view/"+vid+"/heads", w.admin), 403)
+	expect(t, w.get("/ns/matches/view/"+vid+"/heads", li), 302)
 }

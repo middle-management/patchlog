@@ -235,7 +235,7 @@ func TestReferenceQueries(t *testing.T) {
 }
 
 // Private namespaces: reference queries follow the grant's rules,
-// are routed under the reader's subject set, keep the encoded query, and
+// are routed under the reader's view, keep the encoded query, and
 // show only what the reader may read.
 func TestReferencePrivate(t *testing.T) {
 	t.Parallel()

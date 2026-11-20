@@ -124,19 +124,19 @@ func TestV055LimitGrantFields(t *testing.T) {
 		expectCode(t, r, 422, "invalid")
 	}
 
-	gs := int64(core.DefaultMaximums().GrantSize)
+	vid := int64(core.DefaultMaximums().GrantSize)
 	// Too long to decode: measured is a lower bound, the decoded length.
-	expectLimit(t, e.write("PATCH", "sec", "y", "", addRoot(map[string]any{}), strings.Repeat("A", 12000)), 413, "grantSize", 9000, gs)
+	expectLimit(t, e.write("PATCH", "sec", "y", "", addRoot(map[string]any{}), strings.Repeat("A", 12000)), 413, "grantSize", 9000, vid)
 	// Decoded, one byte over.
-	n := base64.URLEncoding.EncodedLen(int(gs))
-	expectLimit(t, e.write("PATCH", "sec", "y", "", addRoot(map[string]any{}), strings.Repeat("A", n)), 413, "grantSize", gs+1, gs)
+	n := base64.URLEncoding.EncodedLen(int(vid))
+	expectLimit(t, e.write("PATCH", "sec", "y", "", addRoot(map[string]any{}), strings.Repeat("A", n)), 413, "grantSize", vid+1, vid)
 
 	// Edge-grant exchanges (§C.5.2): a grant too large is grantSize; a
 	// body too large to hold the grants it may is over the exchange's
 	// limits, 400 bad_input (§12), with no sizes, since no grant measured
 	// them.
 	reader := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"})
-	expectLimit(t, e.issueGrants(reader, strings.Repeat("A", 12000)), 413, "grantSize", 9000, gs)
+	expectLimit(t, e.issueGrants(reader, strings.Repeat("A", 12000)), 413, "grantSize", 9000, vid)
 	r := e.do(req{method: "POST", path: "/edge-grants", raw: `{"grants": ["` + strings.Repeat("A", 600<<10) + `"]}`})
 	expectCode(t, r, 400, "bad_input")
 	if b := r.Obj(); b["limit"] != nil || b["measured"] != nil {

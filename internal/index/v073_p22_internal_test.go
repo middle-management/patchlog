@@ -31,7 +31,7 @@ func TestV073StrictMins(t *testing.T) {
 
 // TestV073DropWholePublic (ENC-33, §E.2.6): opening the index drops the
 // stored results sealed whole at a public URL, as before v0.73, with their
-// tags, and keeps every other: a whole JWE at a private one (/view/{gs}, a
+// tags, and keeps every other: a whole JWE at a private one (/view/{view}, a
 // namespace named g included), a public URL's JSON, /_refs answers.
 func TestV073DropWholePublic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.db")

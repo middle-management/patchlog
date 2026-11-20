@@ -7,11 +7,11 @@ import (
 	"time"
 )
 
-// V82-02 (v0.82), ACC-14 over HTTP: a gs cookie ends when its key's entry
+// V82-02 (v0.82), ACC-14 over HTTP: a view cookie ends when its key's entry
 // changes in any member, until the reader exchanges again; long-poll
-// judges it at the current checkpoint (SERVICES §7.9 gs).
+// judges it at the current checkpoint (SERVICES §7.9 view).
 
-// §7.9 gs: "A gs cookie is 403 ... [where] the key its key: string
+// §7.9 view: "A view cookie is 403 ... [where] the key its key: string
 // names, or a key or role they came from, is gone or changes in any
 // member, until the reader exchanges again. Long-poll judges this at the
 // current checkpoint." li's cookie reads; her key's entry gains a rate,
@@ -25,16 +25,16 @@ func TestV082AccessGSCookieEndsOnKeyChange(t *testing.T) {
 	w := newV75s(t, v75sOpts{env: []envOpt{withLongPoll(interval)}})
 	w.seed([]string{"derby"}, nil, []string{"derby"})
 	li := w.li()
-	c, gs := w.cookie(li)
+	c, vid := w.cookie(li)
 	ck := cookieHdr(c)
-	base := "/ns/matches/view/" + gs
+	base := "/ns/matches/view/" + vid
 	r := w.do(req{method: "GET", path: base + "/heads", hdr: ck})
 	expect(t, r, 302)
 	at := r.H.Get("Location")
 	expect(t, w.do(req{method: "GET", path: at, hdr: ck}), 200)
 
 	since := w.nsHead("matches", w.admin)
-	cur := waitCursor(t, newLiveClock(interval, filteredLogPath("matches", gs)), 1500*time.Millisecond)
+	cur := waitCursor(t, newLiveClock(interval, filteredLogPath("matches", vid)), 1500*time.Millisecond)
 	done := make(chan *resp, 1)
 	go func() {
 		done <- w.do(req{method: "GET", path: base + "/log?live=long-poll&since=" + since + "&cursor=" + strconv.FormatInt(cur, 10), hdr: ck})
@@ -50,13 +50,13 @@ func TestV082AccessGSCookieEndsOnKeyChange(t *testing.T) {
 			t.Errorf("%s under the old cookie: %d %s, want 403", path, r.Code, r.Body)
 		}
 	}
-	// Her grant still verifies: she exchanges again, for the same gs. The
+	// Her grant still verifies: she exchanges again, for the same view. The
 	// new cookie expires later than the one the change ended, which is
 	// how the origin tells them apart.
 	w.clock.Advance(time.Second)
 	c2, gs2 := w.cookie(w.li())
-	if gs2 != gs {
-		t.Fatalf("gs after the change %s, was %s", gs2, gs)
+	if gs2 != vid {
+		t.Fatalf("vid after the change %s, was %s", gs2, vid)
 	}
 	r = w.do(req{method: "GET", path: base + "/heads", hdr: cookieHdr(c2)})
 	expect(t, r, 302)

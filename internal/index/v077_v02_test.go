@@ -129,8 +129,8 @@ func (d *v77docs) exchange(token string) (map[string]string, []*http.Cookie) {
 // TestV077ScopeMarkerKey (FSVC-1; §A.4 Across namespaces: the scope
 // marker's "digest covering the rules that limit it there ..., the
 // /principal values they refer to and its key's key: string (§7.9
-// gs)"; CONFORMANCE Grant scope 66): grants through k1 and k2, whose
-// rules are the same, are redirected to different /docs/view/{gs}, and the
+// view)"; CONFORMANCE Grant scope 66): grants through k1 and k2, whose
+// rules are the same, are redirected to different /docs/view/{view}, and the
 // exchange gives them different prefixes. Before v0.77 both shared one.
 func TestV077ScopeMarkerKey(t *testing.T) {
 	t.Parallel()
@@ -138,7 +138,7 @@ func TestV077ScopeMarkerKey(t *testing.T) {
 	g1, g2 := d.reader(d.k1), d.reader(d.k2)
 	loc1, loc2 := d.x.raw("/docs?q=word", g1).header.Get("Location"), d.x.raw("/docs?q=word", g2).header.Get("Location")
 	if !strings.HasPrefix(loc1, "/docs/view/") || !strings.HasPrefix(loc2, "/docs/view/") || strings.Split(loc1, "/")[3] == strings.Split(loc2, "/")[3] {
-		t.Errorf("k1's and k2's readers: %s and %s, want different gs", loc1, loc2)
+		t.Errorf("k1's and k2's readers: %s and %s, want different vid", loc1, loc2)
 	}
 	for _, g := range []string{g1, g2} {
 		if got := strings.Join(resources(d.x.search("/docs?q=word", g)), ","); got != "a,b,secret" {
@@ -154,9 +154,9 @@ func TestV077ScopeMarkerKey(t *testing.T) {
 
 // TestV077ScopeCookieEnds (FSVC-2; §A.4: "a cookie is 403 until the
 // reader exchanges again ... where a marker's key, rules or roles would
-// end a gs cookie (§7.9 gs)"; scenarios 66 and 121): li's cookie for
+// end a view cookie (§7.9 view)"; scenarios 66 and 121): li's cookie for
 // its scope marker in docs, through k1 with the role reader, is 403 at
-// /docs/view/{gs} and at /_refs once docs (a) removes k1, (b) changes k1's
+// /docs/view/{view} and at /_refs once docs (a) removes k1, (b) changes k1's
 // pub, (c) narrows reader's rules, or (d) drops read from reader; a
 // change to an unrelated role leaves it read. Before v0.77 it read on
 // under the old rules until it expired.
@@ -208,7 +208,7 @@ func TestV077ScopeCookieEnds(t *testing.T) {
 // TestV077AuthDisabledUncovers (FSVC-5; §7.9 Where: "only while
 // authentication is on (§1)"; §A.4 follows coverage): against a core
 // running with authentication disabled, matches isn't covered: a partial
-// reader gets no g: marker, but a scope marker, and so another gs.
+// reader gets no g: marker, but a scope marker, and so another view.
 func TestV077AuthDisabledUncovers(t *testing.T) {
 	t.Parallel()
 	// The core's root says whether authentication is disabled (§1, §7);
@@ -229,18 +229,18 @@ func TestV077AuthDisabledUncovers(t *testing.T) {
 	if r := w.x.raw("/matches", li); r.status != 302 || !strings.Contains(r.header.Get("Location"), "/view/") {
 		t.Fatalf("li with authentication on: %d %s %v", r.status, r.header.Get("Location"), r.body)
 	}
-	_, gs, _ := w.pointer("/matches", li)
+	_, vid, _ := w.pointer("/matches", li)
 	off.Store(true)
 	time.Sleep(5 * time.Millisecond) // the index's CheckerTTL
 	// The view doesn't depend on coverage (v0.87, §A.4: "at every level
 	// and whether or not the origin serves §7.9").
-	if _, off, _ := w.pointer("/matches", li); off != gs {
-		t.Errorf("li with authentication disabled: view %s, not the covered one %s", off, gs)
+	if _, off, _ := w.pointer("/matches", li); off != vid {
+		t.Errorf("li with authentication disabled: view %s, not the covered one %s", off, vid)
 	}
 	off.Store(false)
 	time.Sleep(5 * time.Millisecond)
-	if _, again, _ := w.pointer("/matches", li); again != gs {
-		t.Errorf("li once authentication is on again: gs %s, want %s", again, gs)
+	if _, again, _ := w.pointer("/matches", li); again != vid {
+		t.Errorf("li once authentication is on again: vid %s, want %s", again, vid)
 	}
 }
 
@@ -305,7 +305,7 @@ func TestV077PurgeBeforeServe(t *testing.T) {
 	ctx := context.Background()
 	w := newV75X(t, false)
 	whole := w.k.Grant(t, w.s.Now(), "user:whole", []string{"matches"}, []string{"read"})
-	_, gs, at := w.pointer("/matches?q=shared", whole)
+	_, vid, at := w.pointer("/matches?q=shared", whole)
 	var once atomic.Bool
 	w.x.ix.OnAnswerRead(func() {
 		if once.CompareAndSwap(false, true) {
@@ -313,7 +313,7 @@ func TestV077PurgeBeforeServe(t *testing.T) {
 			w.x.caughtUp("matches")
 		}
 	})
-	old := "/matches/view/" + gs + "/at/" + at + "?q=derby"
+	old := "/matches/view/" + vid + "/at/" + at + "?q=derby"
 	r := w.x.raw(old, whole)
 	if !once.Load() {
 		t.Fatal("the answer was never computed")

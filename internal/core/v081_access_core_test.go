@@ -8,8 +8,8 @@ import (
 )
 
 // V81-02 (v0.78, v0.81): access in the core. A rule referring to /now
-// never passes for a read (§C.2 item 5); a gs holds all the caller's
-// groups and a stored "partial" set is refused (§B.11.5, §7.9 gs);
+// never passes for a read (§C.2 item 5); a view holds all the caller's
+// groups and a stored "partial" set is refused (§B.11.5, §7.9 view);
 // filtered reads cover no branch (§7.9 Where).
 
 // v081Heads are the names li's filtered /heads lists in matches, after
@@ -84,7 +84,7 @@ func TestV081AccessNowRulesFailReads(t *testing.T) {
 	})
 }
 
-// §7.9 Partial reader, §A.4 gs (ACCESS-4): a role with a rule on /now
+// §7.9 Partial reader, §A.4 view (ACCESS-4): a role with a rule on /now
 // just doesn't count. li, with roles clock (/now) and prefixed (/resource
 // ^pub-), reads matches filtered through prefixed alone; once prefixed
 // gains a /now rule, her cookie is 403 (the stored role's digest no longer

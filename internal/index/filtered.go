@@ -26,7 +26,7 @@ import (
 // A partial reader of a covered namespace (one whose grant allows read
 // there without a namespace-wide edge grant, §C.5.2) reads it filtered by
 // visibility: a resource is visible where its grant's blocks, key scope
-// and roles allow reading it. Its marker is reads:{ns}:g:{gs}, gs being
+// and roles allow reading it. Its marker is reads:{ns}:g:{view}, view being
 // the origin's (grantcheck.FilteredSubjects: scope:{digest} of
 // grantcheck.ReadsScope's digest with its key, and grantcheck.KeySubject
 // of its key), and its answers are at the index's checkpoint of {ns},
@@ -185,8 +185,8 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 }
 
 // keptCP is the checkpoint at of ns computed earlier, nil if none is
-// held: a reader's gs at an older at is computed there (§7.9: a
-// grant reads at its own gs as of the URL's at).
+// held: a reader's view at an older at is computed there (§7.9: a
+// grant reads at its own view as of the URL's at).
 func (ix *Index) keptCP(ns, at string) *fcp {
 	ix.fs.mu.Lock()
 	defer ix.fs.mu.Unlock()
@@ -200,17 +200,17 @@ func (ix *Index) keptCP(ns, at string) *fcp {
 // (§7.9 Visible): its read filter decides, per revision (revAllow).
 type fview struct {
 	cp       *fcp
-	gs       string // the §7.9 view of subjects
+	vid      string // the §7.9 view of subjects
 	subjects []string
 	filter   *grantcheck.ReadFilter
 	visible  allowFunc
 }
 
 func (ix *Index) newFview(cp *fcp, subjects []string, filter *grantcheck.ReadFilter) *fview {
-	return &fview{cp: cp, gs: grantcheck.ViewID(subjects), subjects: subjects, filter: filter, visible: ix.revAllow(cp.ns, filter)}
+	return &fview{cp: cp, vid: grantcheck.ViewID(subjects), subjects: subjects, filter: filter, visible: ix.revAllow(cp.ns, filter)}
 }
 
-// grantFview is a partial reader's view at cp (§7.9 gs): its subjects
+// grantFview is a partial reader's view at cp (§7.9 view): its subjects
 // are grantcheck.FilteredSubjects of its ReadsScope digest and key, as
 // the origin's; its filter the grant's (grantcheck.FilterOf). A grant
 // whose key-scope or block rules refer to /now, or whose roles all do,
@@ -226,27 +226,27 @@ func (ix *Index) grantFview(cp *fcp, v *grant.Verified, steps int) (*fview, erro
 	return ix.newFview(cp, grantcheck.ViewSubjects(digest, v.Key.Kid, pub, true), f), nil
 }
 
-// errRulesChanged refuses a cookie for a marker reads:{ns}:g:{gs} at a
-// checkpoint it doesn't stand for (§7.9 gs): the reader exchanges its
+// errRulesChanged refuses a cookie for a marker reads:{ns}:g:{view} at a
+// checkpoint it doesn't stand for (§7.9 view): the reader exchanges its
 // grant again; errUncovered one for a namespace no longer covered.
 var (
 	errRulesChanged = &grant.AuthError{Status: 403, Msg: "the rules this subject set was issued under have changed: exchange the grant again (§7.9)"}
 	errUncovered    = &grant.AuthError{Status: 403, Msg: "the namespace is no longer read filtered: exchange the grant again (§7.9)"}
 )
 
-// storedFview is the view of the cookie for marker m, reads:{ns}:g:{gs},
+// storedFview is the view of the cookie for marker m, reads:{ns}:g:{view},
 // that expires at exp, at cp, judged from what the exchanges recorded
-// alone (rec, gsKeysAt), never from a grant the request doesn't carry:
-// 403 where, for any key that cookie came from (gsKeysAt: those of one
+// alone (rec, viewKeysAt), never from a grant the request doesn't carry:
+// 403 where, for any key that cookie came from (viewKeysAt: those of one
 // exchange with several grants, each of which must hold), its whole entry or
 // one of its roles' whole definitions in ns's document as of cp differs
-// in any member from what the exchange recorded (entryHolds; §7.9 gs,
+// in any member from what the exchange recorded (entryHolds; §7.9 view,
 // v0.82), the scope digest of its kid's scope rules and
 // its roles' definitions, read from ns's document as of cp (a branch's
 // keys follow its base, §C.4), with rec's block rules and principal,
 // differs from the one rec's subjects carry (a kid or role gone, or no
 // longer listing read, counts as differing), or the key with its kid no
-// longer has the pub it had (§7.9 gs: a key "no longer accepted" as
+// longer has the pub it had (§7.9 view: a key "no longer accepted" as
 // §C.4 judges a base's keys, "only while the base has it with the same
 // pub"; a record without one, from before migration 006, never does),
 // or where m has no such key recorded (from before migration 011);
@@ -256,7 +256,7 @@ var (
 // a key no longer accepted, nor one vouched for again by an exchange
 // that isn't its own.
 func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *markerRec, exp int64) (*fview, error) {
-	recorded, err := ix.gsKeysAt(ctx, m, exp)
+	recorded, err := ix.viewKeysAt(ctx, m, exp)
 	if err != nil {
 		return nil, err
 	}
@@ -287,23 +287,23 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *marker
 		holds := func(d string) bool {
 			return slices.Contains(rec.subjects, grantcheck.ScopePrefix+scopeKeyDigest(d, k.kid, k.pub))
 		}
-		if !gsKeyHolds(cfg, []grant.Key{key}, rec.f, k, holds) {
+		if !viewKeyHolds(cfg, []grant.Key{key}, rec.f, k, holds) {
 			return nil, errRulesChanged
 		}
 	}
 	return ix.newFview(cp, rec.subjects, rec.f), nil
 }
 
-// gsKeyHolds reports whether k, a key a cookie of a marker came from, is
+// viewKeyHolds reports whether k, a key a cookie of a marker came from, is
 // still accepted with the pub it had, among keys (cfg's, or for a branch
 // its effective ones, §C.4), and lists read, and whether its scope rules
 // and its roles' definitions in cfg, each role still listing read, with
 // f's block rules and principal, still digest to what the marker stands
 // for (holds: for a g: marker, the scope subject its subjects carry,
 // storedFview; for a scope marker, the marker's own digest,
-// scopeKeysHold). §7.9 gs ends a gs cookie so, and §A.4 a scope cookie
-// "where a marker's key, rules or roles would end a gs cookie".
-func gsKeyHolds(cfg *grantcheck.Config, keys []grant.Key, f *grantcheck.ReadFilter, k gsKey, holds func(digest string) bool) bool {
+// scopeKeysHold). §7.9 view ends a view cookie so, and §A.4 a scope cookie
+// "where a marker's key, rules or roles would end a view cookie".
+func viewKeyHolds(cfg *grantcheck.Config, keys []grant.Key, f *grantcheck.ReadFilter, k viewKey, holds func(digest string) bool) bool {
 	i := slices.IndexFunc(keys, func(key grant.Key) bool { return key.Kid == k.kid })
 	if i < 0 || !keys[i].Lists("read") || k.pub == "" || keyPub(keys[i]) != k.pub {
 		return false
@@ -312,7 +312,7 @@ func gsKeyHolds(cfg *grantcheck.Config, keys []grant.Key, f *grantcheck.ReadFilt
 		BlockRules: f.BlockRules, Roles: map[string][]any{}, Principal: f.Principal}
 	for _, r := range k.roles {
 		// A role that no longer lists read counts as gone, as at the
-		// origin (core gsDigestHolds): a cookie never reads where its
+		// origin (core viewDigestHolds): a cookie never reads where its
 		// grant couldn't (§2.1, §A.4).
 		def, ok := cfg.Roles[r]
 		if !ok || !def.Lists("read") {
@@ -325,12 +325,12 @@ func gsKeyHolds(cfg *grantcheck.Config, keys []grant.Key, f *grantcheck.ReadFilt
 }
 
 // gMarker is the marker of a partial reader of covered ns with §7.9
-// subject set gs (§A.4).
-func gMarker(ns, gs string) string { return "reads:" + ns + ":g:" + gs }
+// view view (§A.4).
+func gMarker(ns, vid string) string { return "reads:" + ns + ":g:" + vid }
 
 // cover computes a's view of covered namespace ns at the checkpoint with
 // ns at z ("" for the index's committed one), and with a grant (not a
-// cookie) sets a's marker and gs to it (§A.4). It is errUncovered for a
+// cookie) sets a's marker and view to it (§A.4). It is errUncovered for a
 // namespace not covered there (a grant's access is then that of an
 // uncovered namespace, a cookie's 403), errNotReached before the index's
 // first checkpoint of ns and errPurgedNS once ns is purged.
@@ -365,11 +365,11 @@ func (ix *Index) cover(ctx context.Context, a *access, ns, z string) error {
 	return nil
 }
 
-// setView makes fv a's view; with a grant, a's marker and gs are fv's.
+// setView makes fv a's view; with a grant, a's marker and view are fv's.
 func (a *access) setView(ns string, fv *fview) {
 	a.cov, a.allow, a.filter = fv, fv.visible, fv.filter
 	if !a.cookie {
-		a.marker = gMarker(ns, fv.gs)
+		a.marker = gMarker(ns, fv.vid)
 		marked(a)
 	}
 }

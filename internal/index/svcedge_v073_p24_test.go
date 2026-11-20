@@ -27,7 +27,7 @@ func svcOpenDB(t *testing.T, path string) *sql.DB {
 	t.Cleanup(func() { db.Close() })
 	// The tables of the index's migration 015, the edge store's alone.
 	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS edge_subjects (gs TEXT PRIMARY KEY, subjects TEXT NOT NULL, exp INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS edge_subjects (prefix TEXT PRIMARY KEY, subjects TEXT NOT NULL, exp INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS edge_buckets (k TEXT PRIMARY KEY, tokens REAL NOT NULL, last INTEGER NOT NULL) WITHOUT ROWID`,
 	} {
 		if _, err := db.Exec(q); err != nil {
@@ -112,7 +112,7 @@ func TestV073BucketsAtomicDraw(t *testing.T) {
 	}
 }
 
-// §B.11.5, §C.5.3: the subjects behind a gs recorded by one instance are
+// §B.11.5, §C.5.3: the subjects behind a view recorded by one instance are
 // found by another on the same database, until the last edge grant for
 // it expires.
 func TestV073SubjectsShared(t *testing.T) {
@@ -128,7 +128,7 @@ func TestV073SubjectsShared(t *testing.T) {
 		t.Fatalf("b: %v %v", subs, ok)
 	}
 	if _, ok := b.Subjects(ctx, "gs2"); ok {
-		t.Fatal("a gs nobody recorded")
+		t.Fatal("a vid nobody recorded")
 	}
 	// Recorded again later, the expired one is dropped.
 	if err := a.Record(ctx, "gs2", []string{"group:x"}, now.Add(3*time.Minute), now.Add(2*time.Minute)); err != nil {
@@ -209,13 +209,13 @@ func TestV073MintAndWithdraw(t *testing.T) {
 	}
 	ours := func(p string) bool { return strings.HasPrefix(p, "/cat/view/") }
 	w = httptest.NewRecorder()
-	svcWithdraw(w, httptest.NewRequest("DELETE", "/edge-grants?prefix=/cat/view/a&prefix=/cat/view/a&prefix=/cat/view/b", nil), c, ours, "/cat/view/{gs}")
+	svcWithdraw(w, httptest.NewRequest("DELETE", "/edge-grants?prefix=/cat/view/a&prefix=/cat/view/a&prefix=/cat/view/b", nil), c, ours, "/cat/view/{vid}")
 	if w.Code != http.StatusNoContent || len(w.Result().Cookies()) != 2 {
 		t.Fatalf("withdraw: %d %v", w.Code, w.Result().Cookies())
 	}
 	for _, q := range []string{"", "?prefix=/r/x", "?other=1"} {
 		w = httptest.NewRecorder()
-		svcWithdraw(w, httptest.NewRequest("DELETE", "/edge-grants"+q, nil), c, ours, "/cat/view/{gs}")
+		svcWithdraw(w, httptest.NewRequest("DELETE", "/edge-grants"+q, nil), c, ours, "/cat/view/{vid}")
 		if w.Code != 400 || svcDecodeBody(t, w)["code"] != "bad_input" {
 			t.Errorf("withdraw %q: %d", q, w.Code)
 		}

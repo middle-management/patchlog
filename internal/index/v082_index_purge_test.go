@@ -17,7 +17,7 @@ import (
 
 // V82-05 (v0.82), SVC-10 and SPEC §8.5: the 410 of a purged namespace,
 // with the purge's head, is for a request that passes the read check. A
-// cookie that had ended (SERVICES §A.4 gs, §7.9 gs), or that no key
+// cookie that had ended (SERVICES §A.4 view, §7.9 view), or that no key
 // was recorded for with its entry, doesn't pass it once the namespace is
 // purged either: it is 403 as before, and a cookie that held is 410.
 
@@ -38,12 +38,12 @@ func v82Plant(t *testing.T, x *svc, how string) {
 	ctx := context.Background()
 	switch how {
 	case "no row": // as every cookie minted before migration 011
-		if n := must(x.ix.ExecForTest(ctx, `DELETE FROM edge_gs_keys`)); n == 0 {
-			t.Fatal("no edge_gs_keys row")
+		if n := must(x.ix.ExecForTest(ctx, `DELETE FROM edge_view_keys`)); n == 0 {
+			t.Fatal("no edge_view_keys row")
 		}
 	case "no entry": // an exchange that couldn't vouch for its key's entry
-		if n := must(x.ix.ExecForTest(ctx, `UPDATE edge_gs_keys SET entry = ''`)); n == 0 {
-			t.Fatal("no edge_gs_keys row")
+		if n := must(x.ix.ExecForTest(ctx, `UPDATE edge_view_keys SET entry = ''`)); n == 0 {
+			t.Fatal("no edge_view_keys row")
 		}
 	}
 }
@@ -95,7 +95,7 @@ func TestV082EndedCookiePurged(t *testing.T) {
 }
 
 // TestV082EndedGCookiePurged: the same for a cookie of
-// reads:matches:g:{gs} (§7.9), which has no checkpoint left to be
+// reads:matches:g:{view} (§7.9), which has no checkpoint left to be
 // judged at once matches is purged: by the document matches had.
 func TestV082EndedGCookiePurged(t *testing.T) {
 	t.Parallel()

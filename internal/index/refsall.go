@@ -49,19 +49,19 @@ import (
 // listing every one refused (refsMins). min always redirects (§A.5): once
 // every min is reached, on an at URL whose answer is kept and includes
 // every min, to that URL without min, otherwise (and after a purged one)
-// to the current at, in the reader's subject set either way. Redirects
+// to the current at, in the reader's view either way. Redirects
 // name the query in its canonical form (§A.5,
 // derived.CanonicalQuery), and an at URL in another form is redirected to
 // it.
 //
-// gs is computed as for subject sets (§B.11.5), over markers of what the
+// view is computed as for views (§B.11.5), over markers of what the
 // answer depends on (Index.access): for every private namespace where the
 // reader's grant would be issued a namespace-wide edge grant (§C.5.2),
 // reads:{ns}:{k}, or where it reads otherwise (its hits filtered per resource)
 // reads:{ns}:scope:{digest}, digest covering the rules its reads there are
 // judged by and the /principal values they refer to (readsScope); a
 // namespace where those rules refer to /now counts as unreadable. A
-// reader with no marker gets the public answer, whose gs is that of the
+// reader with no marker gets the public answer, whose view is that of the
 // empty set. at is the combined checkpoint (§B.5),
 // text(trunc160(sha256(canonical({ ns: ns_id, … })))), over the
 // namespaces the answer covers; namespaces lists them. So writes in
@@ -150,23 +150,23 @@ func parseRefsQuery(v url.Values) (*refsQuery, error) {
 	return rq, nil
 }
 
-// refsReader is who asks: the namespaces its subject set may see and how.
+// refsReader is who asks: the namespaces its view may see and how.
 type refsReader struct {
-	gs     string
+	vid    string
 	public bool                 // reads no private namespace: the answer is public
 	nss    []string             // the namespaces asked, sorted
 	allow  map[string]allowFunc // namespaces it reads only in part
 	// covs are the namespaces §7.9 covers that it reads as a partial
 	// reader, whose views decide allow there and whose combined
 	// checkpoints join at (§A.4 Across namespaces); markers, with a
-	// grant, its marker in each namespace, which gs is over, nil under a
-	// cookie, whose gs is fixed.
+	// grant, its marker in each namespace, which view is over, nil under a
+	// cookie, whose view is fixed.
 	covs    map[string]*access
 	markers map[string]string
 	// unverified: the request carries no grant the service verified in a
 	// private namespace it names (§B.11.5): none, one that doesn't decode,
 	// or one refused 401 wherever it was checked (malformed, badly signed,
-	// revoked, expired or not yet valid, §C.2, §12.1). At another gs's URL
+	// revoked, expired or not yet valid, §C.2, §12.1). At another view's URL
 	// such a request is 401 only if its grant verifies in no namespace the
 	// service follows either (verifiesFollowed), else 403.
 	unverified bool
@@ -189,7 +189,7 @@ func (rd *refsReader) covered(ns string) bool {
 // recover computes rd's views of the namespaces §7.9 covers again at
 // their committed checkpoints, after an apply moved one (errMoved), or,
 // with force, after a wait for min that may have moved the heads of the
-// namespaces they read; with a grant, its gs is over the markers they
+// namespaces they read; with a grant, its view is over the markers they
 // give.
 func (ix *Index) recover(ctx context.Context, rd *refsReader, force bool) error {
 	for ns, a := range rd.covs {
@@ -209,7 +209,7 @@ func (ix *Index) recover(ctx context.Context, rd *refsReader, force bool) error 
 		for _, m := range rd.markers {
 			ms = append(ms, m)
 		}
-		rd.gs = grantcheck.ViewID(ms)
+		rd.vid = grantcheck.ViewID(ms)
 	}
 	return nil
 }
@@ -245,7 +245,7 @@ func (ix *Index) refsNamespaces() []string {
 // 401 if any refusal is, else 403; or, for a grant every namespace of
 // which it names is purged, and that verifies in each, the purge, 410
 // (*purgedNS, purgedOnly). Otherwise it notes whether the grant
-// verified (unverified), which decides the refusal at another gs's URL.
+// verified (unverified), which decides the refusal at another view's URL.
 func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[string]string) (*refsReader, error) {
 	if bearer(r) == "" {
 		// One of the service's edge grants for /_refs/view/{view}, on a
@@ -327,7 +327,7 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 	default:
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant reads no namespace the service follows"}
 	}
-	rd.gs = grantcheck.ViewID(markers)
+	rd.vid = grantcheck.ViewID(markers)
 	rd.unverified = !verified
 	return rd, nil
 }
@@ -337,7 +337,7 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 // revoked) in some namespace the service follows that it names, whatever
 // the namespace's read and whether the service has reached it or skips
 // it: Verify passes, or refuses it only once it has verified (403). It
-// decides 401 against 403 at another gs's /_refs URL for a request
+// decides 401 against 403 at another view's /_refs URL for a request
 // refsReader found no such grant in (refsReader.unverified), so it runs
 // only there.
 func (ix *Index) verifiesFollowed(ctx context.Context, token string) bool {
@@ -386,27 +386,27 @@ var combinedAt = grantcheck.CombinedAt
 // serveRefs answers /_refs and /_refs/view/{view}/at/{at} (segs, from
 // "_refs"), the view before the checkpoint (§A.4).
 func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string) {
-	var at, gs string
+	var at, vid string
 	switch {
 	case len(segs) == 1:
 		telemetry.SetRoute(r, "/_refs")
 	case len(segs) == 5 && segs[1] == "view" && segs[3] == "at":
-		gs, at = segs[2], segs[4]
+		vid, at = segs[2], segs[4]
 		telemetry.SetRoute(r, "/_refs/view/{view}/at/{at}")
 		if _, err := ids.Parse(at); err != nil {
 			writeErr(w, http.StatusBadRequest, "bad_input", "malformed at")
 			return
 		}
-		if _, err := ids.Parse(gs); err != nil {
+		if _, err := ids.Parse(vid); err != nil {
 			writeErr(w, http.StatusNotFound, "not_found", "malformed view")
 			return
 		}
 	case len(segs) == 3 && segs[1] == "view":
-		// The head pointer under a subject set's prefix, which its edge
+		// The head pointer under a view's prefix, which its edge
 		// grants cover (§B.11.5).
-		gs = segs[2]
+		vid = segs[2]
 		telemetry.SetRoute(r, "/_refs/view/{view}")
-		if _, err := ids.Parse(gs); err != nil {
+		if _, err := ids.Parse(vid); err != nil {
 			writeErr(w, http.StatusNotFound, "not_found", "malformed view")
 			return
 		}
@@ -441,7 +441,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		return
 	}
 	setPtr := func() {
-		// The pointer names the reader's subject set: shared caches key
+		// The pointer names the reader's view: shared caches key
 		// it by Authorization, and keep none of a private one.
 		w.Header().Add("Vary", "Authorization")
 		if rd.public {
@@ -455,26 +455,26 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 			w.Header().Set("Surrogate-Control", "no-store")
 		}
 	}
-	// Another subject set's URL space: a grant reads only at its own gs
+	// Another view's URL space: a grant reads only at its own view
 	// (§A.4, §B.11.5), as of the URL's at, so it is 403 there, with or
 	// without min, never redirected (changelog v0.76: "a grant at another
-	// gs's /_refs URL is 403, not 401"), wherever in the namespaces the
+	// view's /_refs URL is 403, not 401"), wherever in the namespaces the
 	// service follows it verifies, public, unreached and skipped ones
 	// among them (verifiesFollowed); a request with no grant, one that
 	// doesn't decode, or one that verifies in no namespace the service
 	// follows, is 401, as §B.11.5 answers a request without a grant that
 	// verifies, and a query of one namespace does (§12.1). Only the
-	// pointer redirects into the reader's. The grant's gs as of an older at
+	// pointer redirects into the reader's. The grant's view as of an older at
 	// differs from its current one where its marker in a namespace §7.9
-	// covers does (gMarker): where the URL is a kept answer at the gs the
+	// covers does (gMarker): where the URL is a kept answer at the view the
 	// grant had there (refsOwnAt), it is the grant's own.
 	var oldURL string
-	if gs != "" && gs != rd.gs && at != "" {
-		if url := "/_refs/view/" + gs + "/at/" + at + derived.CanonicalQuery(vals, "min"); ix.refsOwnAt(ctx, rd, gs, url) {
+	if vid != "" && vid != rd.vid && at != "" {
+		if url := "/_refs/view/" + vid + "/at/" + at + derived.CanonicalQuery(vals, "min"); ix.refsOwnAt(ctx, rd, vid, url) {
 			oldURL = url
 		}
 	}
-	if gs != "" && gs != rd.gs && oldURL == "" {
+	if vid != "" && vid != rd.vid && oldURL == "" {
 		w.Header().Set("Cache-Control", "no-store")
 		if rd.unverified && !ix.verifiesFollowed(ctx, bearer(r)) {
 			w.Header().Set("WWW-Authenticate", "Bearer")
@@ -503,7 +503,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	// hit is bound to (§E.2.6). Only it is answered 200: another form of
 	// it, or one with min, is redirected.
 	target := func(at string) string {
-		return "/_refs/view/" + rd.gs + "/at/" + at + derived.CanonicalQuery(vals, "min")
+		return "/_refs/view/" + rd.vid + "/at/" + at + derived.CanonicalQuery(vals, "min")
 	}
 	// min is waited for first, so no min is judged against the core's log
 	// before the index has reached it.
@@ -522,7 +522,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		}
 	}
 	if at != "" && !purged {
-		// The answer at the URL's at, at the grant's gs there.
+		// The answer at the URL's at, at the grant's view there.
 		atTarget := target(at)
 		if oldURL != "" {
 			atTarget = oldURL
@@ -570,14 +570,14 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	ix.writeRefs(w, r, rd, cur, st)
 }
 
-// refsOwnAt reports whether url, a kept answer at gs, is rd's own though
-// rd's gs is not gs now: rd is a grant's (its markers known), and its
+// refsOwnAt reports whether url, a kept answer at view, is rd's own though
+// rd's view is not view now: rd is a grant's (its markers known), and its
 // markers, those in the namespaces §7.9 covers that it reads in part
 // as of the checkpoints of them the answer was read at (keptCP, each one
-// the index still holds), make gs (§A.4, §B.11.5: a grant reads at
-// its own gs as of the URL's at). A namespace whose checkpoint there
+// the index still holds), make view (§A.4, §B.11.5: a grant reads at
+// its own view as of the URL's at). A namespace whose checkpoint there
 // isn't held, or isn't told apart, is not.
-func (ix *Index) refsOwnAt(ctx context.Context, rd *refsReader, gs, url string) bool {
+func (ix *Index) refsOwnAt(ctx context.Context, rd *refsReader, vid, url string) bool {
 	if rd.markers == nil || len(rd.covs) == 0 {
 		return false
 	}
@@ -607,7 +607,7 @@ func (ix *Index) refsOwnAt(ctx context.Context, rd *refsReader, gs, url string) 
 	for _, m := range markers {
 		ms = append(ms, m)
 	}
-	return grantcheck.ViewID(ms) == gs
+	return grantcheck.ViewID(ms) == vid
 }
 
 // refsBadMins answers a /_refs request with mins refused as given (bad,
@@ -729,7 +729,7 @@ var errRefsKeys = errors.New("the index cannot obtain the key that seals results
 // refsStored returns the answer kept or stored at url, and whether it is
 // bound to url (it has sealed hits), while rd may still see every
 // namespace it covers (its idx: tags). A namespace that turned private, or
-// that the index left, moves no gs: public ones add no marker.
+// that the index left, moves no view: public ones add no marker.
 func (ix *Index) refsStored(ctx context.Context, rd *refsReader, url string) (derived.Stored, bool, bool) {
 	st, bound, ok := ix.refs.Get(url)
 	if !ok {
@@ -756,7 +756,7 @@ func (ix *Index) refsStored(ctx context.Context, rd *refsReader, url string) (de
 //
 // A partial reader's view of a namespace §7.9 covers is computed at
 // its checkpoint: where an apply moved it meanwhile, the views are
-// computed again (recover), and rd's gs may change with them.
+// computed again (recover), and rd's view may change with them.
 func (ix *Index) refsAnswer(ctx context.Context, rd *refsReader, rq *refsQuery, target func(string) string) (derived.Stored, string, bool, error) {
 	for try, moved := 0, 0; ; try++ {
 		gen := ix.refs.Generation(refsScope)
@@ -1038,7 +1038,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		// bound to its URL.
 		// Sealed once (§E.2.6): stored while at is current, as sealed
 		// results of one namespace are.
-		scope := "/_refs/view/" + rd.gs
+		scope := "/_refs/view/" + rd.vid
 		if st, err = ix.sealed.PutSince(ctx, view, scope, at, sgen, st); err != nil {
 			ix.opt.Logf("index: storing a sealed result: %v", err)
 		}

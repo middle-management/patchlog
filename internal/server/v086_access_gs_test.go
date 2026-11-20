@@ -5,8 +5,8 @@ import (
 	"time"
 )
 
-// CONFORMANCE Access 145 at the origin, over HTTP (SERVICES §7.9 gs,
-// v0.86): li holds a filtered gs cookie for matches; matches changes the
+// CONFORMANCE Access 145 at the origin, over HTTP (SERVICES §7.9 view,
+// v0.86): li holds a filtered view cookie for matches; matches changes the
 // groups scope of the key her grant came from, then changes it back in a
 // later config entry. On the cookie, at the later at, /heads, the log
 // range, long-poll and events are 403 until she exchanges again; before
@@ -16,8 +16,8 @@ func TestV086FilteredCookieStaysEnded(t *testing.T) {
 	w := newV75s(t, v75sOpts{})
 	w.seed([]string{"derby"}, nil, []string{"derby"})
 	g := w.li()
-	c, gs := w.cookie(g)
-	base := "/ns/matches/view/" + gs
+	c, vid := w.cookie(g)
+	base := "/ns/matches/view/" + vid
 	// paths are the reads at the current at, which li's grant names.
 	paths := func() []string {
 		_, at := w.filtered(w.li())
@@ -61,8 +61,8 @@ func TestV086FilteredCookieStaysEnded(t *testing.T) {
 	// from it (§C.5.2), and reads at the later at; the old one stays
 	// ended.
 	c2, gs2 := w.cookie(g)
-	if gs2 != gs {
-		t.Fatalf("gs after the undo %s, was %s", gs2, gs)
+	if gs2 != vid {
+		t.Fatalf("vid after the undo %s, was %s", gs2, vid)
 	}
 	if !c2.Expires.Equal(c.Expires.Add(-time.Second)) {
 		t.Fatalf("the new cookie expires %v, the ended one %v: want a second earlier", c2.Expires, c.Expires)

@@ -7,7 +7,7 @@ package core
 // long-poll and events filtered to what it may see, at URLs under
 // /ns/{ns}/view/{view}, where view is its view: scope:{digest} of its
 // read rules (§A.4) and a subject binding it to its grant's key
-// (grantcheck.KeySubject; gsSubjects). A resource is visible to it where
+// (grantcheck.KeySubject; ViewSubjects). A resource is visible to it where
 // its grant's blocks, key scope and roles allow reading it.
 //
 // The files of this feature, each read inside one read transaction:

@@ -6,10 +6,10 @@ import (
 	"time"
 )
 
-// v82encFilteredLog is the gs and at a partial reader's unfiltered log of
+// v82encFilteredLog is the view and at a partial reader's unfiltered log of
 // matches redirects to. A purged namespace's log still redirects, where
 // its /heads no longer does (§7.9 Purged namespaces).
-func v82encFilteredLog(w *v75s, bearer string) (gs, at string) {
+func v82encFilteredLog(w *v75s, bearer string) (vid, at string) {
 	w.t.Helper()
 	r := w.get("/ns/matches/rev/"+w.nsHead("matches", w.admin)+"/log", bearer)
 	expect(w.t, r, 302)
@@ -71,6 +71,6 @@ func TestV082PurgedHeadsPartialReader410(t *testing.T) {
 	}
 	// The unfiltered log still redirects, and the filtered /heads it
 	// leads to answers the same 410.
-	gs, at := v82encFilteredLog(w, li)
-	expectCode(t, w.get("/ns/matches/view/"+gs+"/at/"+at+"/heads", li), 410, "purged")
+	vid, at := v82encFilteredLog(w, li)
+	expectCode(t, w.get("/ns/matches/view/"+vid+"/at/"+at+"/heads", li), 410, "purged")
 }

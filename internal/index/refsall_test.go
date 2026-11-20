@@ -29,9 +29,9 @@ func refsAllHits(body map[string]any) string {
 	return strings.Join(out, " ")
 }
 
-// refsPointer asks GET /_refs{query} and returns the at and gs it
+// refsPointer asks GET /_refs{query} and returns the at and view it
 // redirects to, and the Location.
-func (s *svc) refsPointer(query, token string) (at, gs, loc string) {
+func (s *svc) refsPointer(query, token string) (at, vid, loc string) {
 	s.t.Helper()
 	r := s.raw("/_refs"+query, token)
 	loc = r.header.Get("Location")
@@ -44,7 +44,7 @@ func (s *svc) refsPointer(query, token string) (at, gs, loc string) {
 
 // GET /_refs asks every namespace the index follows that the reader may
 // read (§A.4 "Across namespaces"): two readers who see different
-// namespaces get different subject sets and checkpoints, and writes in a
+// namespaces get different views and checkpoints, and writes in a
 // namespace one can't see never move its at.
 func TestRefsAcrossNamespaces(t *testing.T) {
 	t.Parallel()
@@ -105,8 +105,8 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	q := "?to=" + url.QueryEscape(x)
 
 	// amy reads pa and the public namespace: a private pointer and answer.
-	amyAt, amyGs, amyLoc := idx.refsPointer(q, amy)
-	// A redirect that adds a private /view/{gs} is private, no-store (§A.4,
+	amyAt, amyView, amyLoc := idx.refsPointer(q, amy)
+	// A redirect that adds a private /view/{view} is private, no-store (§A.4,
 	// v0.73).
 	if r := idx.raw("/_refs"+q, amy); r.header.Get("Cache-Control") != "private, no-store" || r.header.Get("Vary") != "Authorization" || !strings.HasSuffix(amyLoc, q) {
 		t.Errorf("pointer %s %v", amyLoc, r.header)
@@ -134,31 +134,31 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 		t.Errorf("self %v", b)
 	}
 
-	// bob reads both private namespaces: another subject set and at.
-	bobAt, bobGs, bobLoc := idx.refsPointer(q, bob)
-	if bobGs == amyGs || bobAt == amyAt {
-		t.Errorf("bob shares amy's gs or at: %s %s", bobLoc, amyLoc)
+	// bob reads both private namespaces: another view and at.
+	bobAt, bobView, bobLoc := idx.refsPointer(q, bob)
+	if bobView == amyView || bobAt == amyAt {
+		t.Errorf("bob shares amy's vid or at: %s %s", bobLoc, amyLoc)
 	}
 	if got := refsAllHits(idx.search(bobLoc, bob)); got != "pa/a1 pa/a2 pb/b1 pb/b2 pub/p1" {
 		t.Errorf("bob: %s", got)
 	}
-	// li reads one resource of pb: filtered per item, under its own gs.
-	_, liGs, liLoc := idx.refsPointer(q, li)
-	if got := refsAllHits(idx.search(liLoc, li)); got != "pb/b1 pub/p1" || liGs == bobGs {
-		t.Errorf("li: %s (gs %s)", got, liGs)
+	// li reads one resource of pb: filtered per item, under its own view.
+	_, liView, liLoc := idx.refsPointer(q, li)
+	if got := refsAllHits(idx.search(liLoc, li)); got != "pb/b1 pub/p1" || liView == bobView {
+		t.Errorf("li: %s (vid %s)", got, liView)
 	}
-	// gs is over markers of what the answer depends on alone: readers of
+	// view is over markers of what the answer depends on alone: readers of
 	// the same namespaces share it whatever their subjects and groups, and
 	// so do readers limited by the same rules, unless the /principal
 	// values those refer to differ.
 	carl := issuer.Grant(t, s.Now(), "user:carl", []string{"pa"}, []string{"read"}, map[string]any{"groups": []any{"writers"}})
-	if _, gs, _ := idx.refsPointer(q, carl); gs != amyGs {
-		t.Errorf("carl reads what amy does, under gs %s, not %s", gs, amyGs)
+	if _, vid, _ := idx.refsPointer(q, carl); vid != amyView {
+		t.Errorf("carl reads what amy does, under vid %s, not %s", vid, amyView)
 	}
 	lu := issuer.Grant(t, s.Now(), "user:lu", []string{"pb"}, []string{"read"}, map[string]any{"groups": []any{"x"},
 		"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "b1"}}})
-	if _, gs, _ := idx.refsPointer(q, lu); gs != liGs {
-		t.Errorf("lu has li's rules, under gs %s, not %s", gs, liGs)
+	if _, vid, _ := idx.refsPointer(q, lu); vid != liView {
+		t.Errorf("lu has li's rules, under vid %s, not %s", vid, liView)
 	}
 	byGroups := func(sub string, groups ...any) string {
 		return issuer.Grant(t, s.Now(), sub, []string{"pb"}, []string{"read"}, map[string]any{"groups": groups, "rules": []any{
@@ -169,12 +169,12 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	_, gs1, _ := idx.refsPointer(q, byGroups("user:g1", "editors"))
 	_, gs2, _ := idx.refsPointer(q, byGroups("user:g2", "editors"))
 	_, gs3, loc3 := idx.refsPointer(q, byGroups("user:g3", "editors", "x"))
-	if gs1 != gs2 || gs1 == gs3 || gs1 == liGs || refsAllHits(idx.search(loc3, byGroups("user:g3", "editors", "x"))) != "pb/b1 pub/p1" {
-		t.Errorf("rules on /principal/groups: gs %s %s %s", gs1, gs2, gs3)
+	if gs1 != gs2 || gs1 == gs3 || gs1 == liView || refsAllHits(idx.search(loc3, byGroups("user:g3", "editors", "x"))) != "pb/b1 pub/p1" {
+		t.Errorf("rules on /principal/groups: vid %s %s %s", gs1, gs2, gs3)
 	}
 	// Without a grant, or with one that reads nothing private here, the
 	// public answer: public caching, tagged with the public namespace.
-	_, anonGs, anonLoc := idx.refsPointer(q, "")
+	_, anonView, anonLoc := idx.refsPointer(q, "")
 	if r := idx.raw("/_refs"+q, ""); r.header.Get("Cache-Control") != "public, max-age=0, s-maxage=1, stale-while-revalidate=5" || r.header.Get("Cache-Tag") != "ns:pub" {
 		t.Errorf("public pointer %v", r.header)
 	}
@@ -183,8 +183,8 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 		t.Errorf("anonymous: %d %v %v", r.status, r.body, r.header)
 	}
 	other := issuer.Grant(t, s.Now(), "user:zed", []string{"elsewhere"}, []string{"read"}, editors)
-	if _, gs, _ := idx.refsPointer(q, other); gs != anonGs || anonGs == amyGs {
-		t.Errorf("a grant reading nothing private: gs %s, anonymous %s", gs, anonGs)
+	if _, vid, _ := idx.refsPointer(q, other); vid != anonView || anonView == amyView {
+		t.Errorf("a grant reading nothing private: vid %s, anonymous %s", vid, anonView)
 	}
 	// A namespace read in part by rules on /now counts as unreadable: an
 	// answer at an at can't change.
@@ -192,7 +192,7 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 		map[string]any{"op": "test", "path": "/resource", "value": "b1"},
 		map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}},
 	}})
-	if _, gs, loc := idx.refsPointer(q, soon); gs != anonGs || refsAllHits(idx.search(loc, soon)) != "pub/p1" {
+	if _, vid, loc := idx.refsPointer(q, soon); vid != anonView || refsAllHits(idx.search(loc, soon)) != "pub/p1" {
 		t.Errorf("rules on /now: %s", loc)
 	}
 	// A qualifying role (a read role without rules on /resource or /now)
@@ -203,11 +203,11 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	// v0.73; IX-15).
 	_, pbGs, _ := idx.refsPointer(q, issuer.Grant(t, s.Now(), "user:pbr", []string{"pb"}, []string{"read"}))
 	r1 := issuer.Grant(t, s.Now(), "user:r1", []string{"pb"}, nil, map[string]any{"roles": []any{"reader", "timed"}})
-	if _, gs, loc := idx.refsPointer(q, r1); gs != pbGs || refsAllHits(idx.search(loc, r1)) != "pb/b1 pb/b2 pub/p1" {
+	if _, vid, loc := idx.refsPointer(q, r1); vid != pbGs || refsAllHits(idx.search(loc, r1)) != "pb/b1 pb/b2 pub/p1" {
 		t.Errorf("reader and timed: %s", loc)
 	}
 	r2 := issuer.Grant(t, s.Now(), "user:r2", []string{"pb"}, nil, map[string]any{"roles": []any{"reader", "editor"}, "rules": []any{isNow}})
-	if _, gs, loc := idx.refsPointer(q, r2); gs != anonGs || refsAllHits(idx.search(loc, r2)) != "pub/p1" {
+	if _, vid, loc := idx.refsPointer(q, r2); vid != anonView || refsAllHits(idx.search(loc, r2)) != "pub/p1" {
 		t.Errorf("reader and editor, a rule on /now: %s", loc)
 	}
 
@@ -255,8 +255,8 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 		}
 	}
 	for _, p := range []string{
-		"/_refs/view/" + amyGs + "/at/" + idx.ix.Checkpoint("pa") + q, // never computed
-		"/_refs/view/" + amyGs + "/at/" + amyAt + q + "&min=pa:" + idx.ix.Checkpoint("pa"),
+		"/_refs/view/" + amyView + "/at/" + idx.ix.Checkpoint("pa") + q, // never computed
+		"/_refs/view/" + amyView + "/at/" + amyAt + q + "&min=pa:" + idx.ix.Checkpoint("pa"),
 	} {
 		if r := idx.raw(p, amy); r.status != 302 || r.header.Get("Location") != newLoc {
 			t.Errorf("%s: %d %s", p, r.status, r.header.Get("Location"))
@@ -264,19 +264,19 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	}
 	// The query in another form redirects to the canonical one, at the
 	// same at (§A.5).
-	if r := idx.raw("/_refs/view/"+amyGs+"/at/"+amyAt+"?to="+x, amy); r.status != 302 || r.header.Get("Location") != amyLoc {
+	if r := idx.raw("/_refs/view/"+amyView+"/at/"+amyAt+"?to="+x, amy); r.status != 302 || r.header.Get("Location") != amyLoc {
 		t.Errorf("not canonical: %d %s", r.status, r.header.Get("Location"))
 	}
-	// A grant reads only at its own subject set (§A.4, §B.11.5, v0.73):
+	// A grant reads only at its own view (§A.4, §B.11.5, v0.73):
 	// someone else's is 403, no-store, with or without min, never
 	// redirected; without a grant it is 401.
-	for _, p := range []string{bobLoc, "/_refs/view/" + bobGs + "/at/" + amyAt + q + "&min=pa:" + a1, bobLoc + "&min=pa:" + a1} {
+	for _, p := range []string{bobLoc, "/_refs/view/" + bobView + "/at/" + amyAt + q + "&min=pa:" + a1, bobLoc + "&min=pa:" + a1} {
 		if r := idx.raw(p, amy); r.status != 403 || r.body["code"] != "forbidden" || r.header.Get("Cache-Control") != "no-store" || r.header.Get("Location") != "" {
-			t.Errorf("foreign gs %s: %d %v %v", p, r.status, r.body, r.header)
+			t.Errorf("foreign vid %s: %d %v %v", p, r.status, r.body, r.header)
 		}
 	}
 	if r := idx.raw(bobLoc, ""); r.status != 401 || r.header.Get("WWW-Authenticate") != "Bearer" || r.header.Get("Cache-Control") != "no-store" {
-		t.Errorf("foreign gs without a grant: %d %v %v", r.status, r.body, r.header)
+		t.Errorf("foreign vid without a grant: %d %v %v", r.status, r.body, r.header)
 	}
 
 	// Pages: in namespace, then resource order; next is the after of the
@@ -336,7 +336,7 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	// Bad input.
 	for _, p := range []string{
 		"/_refs", "/_refs?to=garbage", "/_refs" + q + "&to=" + url.QueryEscape("/r/target/y"), "/_refs" + q + "&q=x",
-		"/_refs" + q + "&limit=0", "/_refs" + q + "&limit=101", "/_refs/view/" + amyGs + "/at/zzz" + q,
+		"/_refs" + q + "&limit=0", "/_refs" + q + "&limit=101", "/_refs/view/" + amyView + "/at/zzz" + q,
 		"/_refs" + q + "&after=pa", "/_refs" + q + "&after=pa/a1&after=pa/a2",
 	} {
 		if r := idx.raw(p, amy); r.status != 400 {
@@ -348,9 +348,9 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 			t.Errorf("%s: %d", p, r.status)
 		}
 	}
-	// The head pointer under the subject set's prefix, which its edge
+	// The head pointer under the view's prefix, which its edge
 	// grants cover (§B.11.5), redirects to its current at.
-	if r := idx.raw("/_refs/view/"+amyGs+q, amy); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/_refs/view/"+amyGs+"/at/") {
+	if r := idx.raw("/_refs/view/"+amyView+q, amy); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/_refs/view/"+amyView+"/at/") {
 		t.Errorf("pointer under the prefix: %d %s", r.status, r.header.Get("Location"))
 	}
 
@@ -448,7 +448,7 @@ func TestRefsUnreached(t *testing.T) {
 }
 
 // An answer is served at its at only while the reader may still see every
-// namespace it covers: a namespace that turns private moves no subject set
+// namespace it covers: a namespace that turns private moves no view
 // (public ones add no marker), so the at URL alone doesn't say.
 func TestRefsAfterPrivate(t *testing.T) {
 	t.Parallel()
@@ -612,7 +612,7 @@ func TestRefsAcrossSealed(t *testing.T) {
 	}
 
 	// A stored answer is dropped once a namespace it covers turns private
-	// (§A.1, §9, v0.73), and not served, though the anonymous subject set
+	// (§A.1, §9, v0.73), and not served, though the anonymous view
 	// stays the same.
 	must(createNonced(w, "sec", "s2", doc))
 	idx.caughtUp("sec")

@@ -410,8 +410,8 @@ func TestE2EPruneRetention(t *testing.T) {
 	g0 := etagOf(g.writeRaw("e", "p", "", sealed(t, gk, "e#1", "e", "p", "", addRoot(map[string]any{"n": 0.0})), g.writerG))
 	g1 := etagOf(g.writeRaw("e", "p", g0, sealed(t, gk, "e#1", "e", "p", g0, ops(op("replace", "/n", 1.0))), g.writerG))
 	g.clock.Advance(10 * time.Minute)
-	gs, _ := seal.SealSnapshot(gk, "e#1", "e", "p", g1, map[string]any{"n": 1.0})
-	expectCode(t, g.prune("e", "p", map[string]any{"horizon": g1, "snapshot": gs}, g.adminG), 422, "invalid")
+	vid, _ := seal.SealSnapshot(gk, "e#1", "e", "p", g1, map[string]any{"n": 1.0})
+	expectCode(t, g.prune("e", "p", map[string]any{"horizon": g1, "snapshot": vid}, g.adminG), 422, "invalid")
 }
 
 func TestE2EEpochsBranchesLevels(t *testing.T) {

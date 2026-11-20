@@ -11,10 +11,10 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
-// §2.1 Edge prefix, §7.9 Edge grants, §C.5.4: /ns/{ns}/view/{gs} is a core
-// prefix, withdrawn like the others, with gs an id ("all" is a service's
+// §2.1 Edge prefix, §7.9 Edge grants, §C.5.4: /ns/{ns}/view/{view} is a core
+// prefix, withdrawn like the others, with view an id ("all" is a service's
 // and isn't one); its cookie authorises nothing outside its path, and
-// reaches the engine with GS set.
+// reaches the engine with View set.
 func TestV075EdgePrefixG(t *testing.T) {
 	t.Parallel()
 	ck := edge.NewCookies("", nil)
@@ -23,8 +23,8 @@ func TestV075EdgePrefixG(t *testing.T) {
 	e.opPriv = priv
 	k := newKey("k")
 	head := e.mkNS("demo", map[string]any{"read": "grant", "keys": []any{k.entry("*")}})
-	gs := ids.Of([]byte("a subject set")).String()
-	prefix := "/ns/demo/view/" + gs
+	vid := ids.Of([]byte("a subject set")).String()
+	prefix := "/ns/demo/view/" + vid
 
 	r := e.do(req{method: "DELETE", path: "/edge-grants?prefix=" + prefix})
 	expect(t, r, 204)
@@ -32,10 +32,10 @@ func TestV075EdgePrefixG(t *testing.T) {
 	if len(gone) != 1 || gone[0].Path != prefix || gone[0].Name != edge.Name(prefix) || gone[0].MaxAge >= 0 {
 		t.Fatalf("Set-Cookie %v", r.H.Values("Set-Cookie"))
 	}
-	for _, p := range []string{"/ns/demo/view/all", "/ns/demo/view/xyz", "/ns/demo/view/" + gs + "/at", "/ns/demo/view/", "/ns/Demo/view/" + gs} {
+	for _, p := range []string{"/ns/demo/view/all", "/ns/demo/view/xyz", "/ns/demo/view/" + vid + "/at", "/ns/demo/view/", "/ns/Demo/view/" + vid} {
 		expectCode(t, e.do(req{method: "DELETE", path: "/edge-grants?prefix=" + p}), 400, "bad_input")
 	}
-	if p, ok := edge.ParseCorePrefix(prefix); !ok || p != (edge.Prefix{NS: "demo", View: gs}) {
+	if p, ok := edge.ParseCorePrefix(prefix); !ok || p != (edge.Prefix{NS: "demo", View: vid}) {
 		t.Fatalf("ParseCorePrefix = %+v, %v", p, ok)
 	}
 	if _, _, ok := edge.ParsePrefix(prefix); ok {
@@ -50,12 +50,12 @@ func TestV075EdgePrefixG(t *testing.T) {
 		t.Fatalf("heads under a g cookie: %d %s", r.Code, r.Body)
 	}
 
-	// Under its path, the request carries the edge grant with GS set.
+	// Under its path, the request carries the edge grant with View set.
 	s := New(e.e, WithEdgeGrants(ck))
 	hr := httptest.NewRequest("GET", "https://cms.example"+prefix+"/heads", nil)
 	hr.AddCookie(c)
 	eg, _ := s.edgeCred(hr).Context().Value(edgeGrantKey{}).(*core.EdgeGrant)
-	if eg == nil || eg.NS != "demo" || eg.View != gs || eg.Resource != "" || eg.Prefix != prefix {
+	if eg == nil || eg.NS != "demo" || eg.View != vid || eg.Resource != "" || eg.Prefix != prefix {
 		t.Fatalf("edge grant %+v", eg)
 	}
 	if got := eg.Prefixes(); len(got) != 1 || got[0] != prefix {
@@ -64,7 +64,7 @@ func TestV075EdgePrefixG(t *testing.T) {
 	// The engine refuses it at the namespace's unfiltered URLs (§7.9:
 	// only the filtered entry points admit it).
 	if _, err := e.e.NamespaceHeads(t.Context(), "demo", head, "", core.Credentials{Edge: eg}); !v075IsStatus(err, 403) {
-		t.Fatalf("NamespaceHeads under a GS edge grant: %v", err)
+		t.Fatalf("NamespaceHeads under a View edge grant: %v", err)
 	}
 }
 

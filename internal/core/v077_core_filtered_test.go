@@ -50,8 +50,8 @@ func TestV077OriginPurgedCoveredHeads(t *testing.T) {
 	w.seed()
 	ctx := context.Background()
 	li := w.li()
-	gs := v075GS(t, w, li)
-	red, st := v76fRedirect(t, w, "matches", gs, li)
+	vid := v075ViewID(t, w, li)
+	red, st := v76fRedirect(t, w, "matches", vid, li)
 	if red == nil {
 		t.Fatalf("matches before its purge: %d", st)
 	}
@@ -61,32 +61,32 @@ func TestV077OriginPurgedCoveredHeads(t *testing.T) {
 			t.Fatal("purged matches is no longer covered")
 		}
 	})
-	err := w.e.FilteredCurrent(ctx, "matches", gs, "/heads", li)
+	err := w.e.FilteredCurrent(ctx, "matches", vid, "/heads", li)
 	if e, _ := err.(*Error); e == nil || e.Status != 410 || e.Body["code"] != "purged" || e.Body["head"] != head {
 		t.Fatalf("FilteredCurrent /heads: %v, want 410 purged with head %s", err, head)
 	}
-	if err := w.e.FilteredCurrent(ctx, "matches", gs, "/heads", Credentials{}); v75Status(err) != 401 {
+	if err := w.e.FilteredCurrent(ctx, "matches", vid, "/heads", Credentials{}); v75Status(err) != 401 {
 		t.Fatalf("without credentials: %v, want 401", err)
 	}
 	// An unrestricted reader passes §8.5's read check at its unfiltered
 	// /heads, 410; at this URL its grant is 403, as at a filtered URL that
 	// serves rows ("reads unrestricted"), with or without at (v0.82;
 	// before, 410 here too).
-	v077PurgedHeads(t, w, "matches", gs, red.At, head, w.admin, true)
-	v077PurgedHeads(t, w, "matches", gs, red.At, head, li, false)
+	v077PurgedHeads(t, w, "matches", vid, red.At, head, w.admin, true)
+	v077PurgedHeads(t, w, "matches", vid, red.At, head, li, false)
 	// /log without at keeps the redirect: the range stays readable (§8.5).
 	var fr *FilteredRedirect
-	if err := w.e.FilteredCurrent(ctx, "matches", gs, "/log", li); !errors.As(err, &fr) {
+	if err := w.e.FilteredCurrent(ctx, "matches", vid, "/log", li); !errors.As(err, &fr) {
 		t.Fatalf("FilteredCurrent /log: %v, want a redirect", err)
 	}
 }
 
-// v077PurgedHeads checks that purged ns's filtered /heads for gs, without
+// v077PurgedHeads checks that purged ns's filtered /heads for view, without
 // at and at at, are each 410 purged with head for a partial reader's
 // cred; where cred reads ns unrestricted, that its unfiltered /heads is
 // that 410 and the filtered ones 403 (§8.5, §7.9 Purged namespaces,
 // Partial reader; v0.82).
-func v077PurgedHeads(t *testing.T, w *v75World, ns, gs, at, head string, cred Credentials, unrestricted bool) {
+func v077PurgedHeads(t *testing.T, w *v75World, ns, vid, at, head string, cred Credentials, unrestricted bool) {
 	t.Helper()
 	ctx := context.Background()
 	purged := func(what string, err error) {
@@ -103,18 +103,18 @@ func v077PurgedHeads(t *testing.T, w *v75World, ns, gs, at, head string, cred Cr
 		// v0.82 (§7.9 Purged namespaces, Partial reader): the filtered
 		// URL's read check comes first, and an unrestricted reader's
 		// grant in Authorization is 403 there, as at a live namespace's.
-		if err := w.e.FilteredCurrent(ctx, ns, gs, "/heads", cred); v75Status(err) != 403 {
-			t.Fatalf("/view/{gs}/heads of purged %s for an unrestricted grant: %v, want 403", ns, err)
+		if err := w.e.FilteredCurrent(ctx, ns, vid, "/heads", cred); v75Status(err) != 403 {
+			t.Fatalf("/view/{vid}/heads of purged %s for an unrestricted grant: %v, want 403", ns, err)
 		}
-		if _, _, err := w.e.FilteredHeads(ctx, ns, gs, at, "", "", cred); v75Status(err) != 403 {
-			t.Fatalf("/view/{gs}/at/{at}/heads of purged %s for an unrestricted grant: %v, want 403", ns, err)
+		if _, _, err := w.e.FilteredHeads(ctx, ns, vid, at, "", "", cred); v75Status(err) != 403 {
+			t.Fatalf("/view/{vid}/at/{at}/heads of purged %s for an unrestricted grant: %v, want 403", ns, err)
 		}
 		return
 	}
-	purged("/view/{gs}/heads", w.e.FilteredCurrent(ctx, ns, gs, "/heads", cred))
-	_, info, err := w.e.FilteredHeads(ctx, ns, gs, at, "", "", cred)
-	purged("/view/{gs}/at/{at}/heads", err)
-	if info == nil || info.View != gs || info.At == "" {
-		t.Fatalf("/view/{gs}/at/{at}/heads of purged %s: info %+v, want the checkpoint", ns, info)
+	purged("/view/{vid}/heads", w.e.FilteredCurrent(ctx, ns, vid, "/heads", cred))
+	_, info, err := w.e.FilteredHeads(ctx, ns, vid, at, "", "", cred)
+	purged("/view/{vid}/at/{at}/heads", err)
+	if info == nil || info.View != vid || info.At == "" {
+		t.Fatalf("/view/{vid}/at/{at}/heads of purged %s: info %+v, want the checkpoint", ns, info)
 	}
 }

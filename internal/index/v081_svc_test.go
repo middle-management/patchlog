@@ -32,7 +32,7 @@ func v081Exchange(t *testing.T, x *svc, tok, kind string) (string, []*http.Cooki
 	return "", nil
 }
 
-// TestV081SvcIndexNowRoles (§A.4 gs markers, §C.2 item 5, v0.78): a role
+// TestV081SvcIndexNowRoles (§A.4 view markers, §C.2 item 5, v0.78): a role
 // with a rule on /now doesn't count for read, so a grant carrying it and
 // prefixed (/resource ^pub-) gets docs' scope marker and reads pub- names
 // alone, on a query and on /_refs; once prefixed gains a rule on /now,
@@ -74,9 +74,9 @@ func TestV081SvcIndexNowRoles(t *testing.T) {
 		t.Errorf("query hits %s", got)
 	}
 	q := "?to=" + url.QueryEscape(target)
-	_, gs, loc := x.refsPointer(q, tok)
-	if _, gsOnly, _ := x.refsPointer(q, only); gs != gsOnly {
-		t.Errorf("/_refs gs %s, without the /now role %s", gs, gsOnly)
+	_, vid, loc := x.refsPointer(q, tok)
+	if _, viewOnly, _ := x.refsPointer(q, only); vid != viewOnly {
+		t.Errorf("/_refs vid %s, without the /now role %s", vid, viewOnly)
 	}
 	if got := refsAllHits(x.search(loc, tok)); got != "docs/pub-a" {
 		t.Errorf("/_refs hits %s", got)
@@ -103,7 +103,7 @@ func TestV081SvcIndexNowRoles(t *testing.T) {
 	if got, _ := p37Follow(t, x, dprefix, dcks, ""); got.status != 403 {
 		t.Errorf("the old cookie on docs: %d %v", got.status, got.body)
 	}
-	if got, _ := p37Follow(t, x, "/_refs/view/"+gs+q, cks, ""); got.status != 403 {
+	if got, _ := p37Follow(t, x, "/_refs/view/"+vid+q, cks, ""); got.status != 403 {
 		t.Errorf("the old cookie on /_refs: %d %v", got.status, got.body)
 	}
 	if r := x.raw("/docs", tok); r.status != 403 {

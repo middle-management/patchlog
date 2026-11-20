@@ -9,9 +9,9 @@ import (
 // Cross-review (conformance lens): scenario tests for the v0.76
 // filtered-read scenarios that had none.
 
-func v076XrevLog(t *testing.T, w *v75World, ns, gs, at string, cred Credentials) ([]map[string]any, int) {
+func v076XrevLog(t *testing.T, w *v75World, ns, vid, at string, cred Credentials) ([]map[string]any, int) {
 	t.Helper()
-	lg, _, err := w.e.FilteredLog(context.Background(), ns, gs, at, "", 0, cred)
+	lg, _, err := w.e.FilteredLog(context.Background(), ns, vid, at, "", 0, cred)
 	if _, ok := err.(*FilteredRedirect); ok {
 		return nil, -1
 	}
@@ -30,21 +30,21 @@ func v076XrevHasEntry(es []map[string]any, kind, res string) bool {
 	return false
 }
 
-// Scenario 95: a cookie for a gs the origin keeps no row for -> 401.
+// Scenario 95: a cookie for a view the origin keeps no row for -> 401.
 func TestV076Scenario95(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
 	w.seed()
-	gs := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: gs, Prefix: "/ns/matches/view/" + gs, Exp: w.now().Add(10 * time.Minute)}}
-	err := w.e.FilteredCurrent(context.Background(), "matches", gs, "/heads", cookie)
+	vid := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: vid, Prefix: "/ns/matches/view/" + vid, Exp: w.now().Add(10 * time.Minute)}}
+	err := w.e.FilteredCurrent(context.Background(), "matches", vid, "/heads", cookie)
 	if v75Status(err) != 401 {
 		t.Fatalf("%v, want 401", err)
 	}
 	if e, _ := err.(*Error); e == nil || e.Body["code"] != "unauthenticated" {
 		t.Fatalf("%v, want unauthenticated", err)
 	}
-	// Contrast: a gs the origin does keep a row for (li's, exchanged for
+	// Contrast: a view the origin does keep a row for (li's, exchanged for
 	// matches) is admitted, even with another namespace present.
 	li := w.li()
 	res, err := w.e.IssueEdgeGrants(context.Background(), []string{li.Bearer})
@@ -57,11 +57,11 @@ func TestV076Scenario95(t *testing.T) {
 	if err := w.e.FilteredCurrent(context.Background(), "matches", gs2, "/heads", cookie2); err == nil {
 		t.Fatal("nil")
 	} else if _, ok := err.(*FilteredRedirect); !ok {
-		t.Fatalf("own gs: %v", err)
+		t.Fatalf("own vid: %v", err)
 	}
 }
 
-// Scenario 96: matches removes the role li's gs stored as effective ->
+// Scenario 96: matches removes the role li's view stored as effective ->
 // her cookie is 403 at a later at until she exchanges again.
 func TestV076Scenario96(t *testing.T) {
 	t.Parallel()
@@ -73,19 +73,19 @@ func TestV076Scenario96(t *testing.T) {
 	if err != nil || len(res.Grants) != 1 {
 		t.Fatal(res, err)
 	}
-	gs := res.Grants[0].View
-	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: gs, Prefix: "/ns/matches/view/" + gs, Exp: w.now().Add(10 * time.Minute)}}
-	if red, st := v76fRedirect(t, w, "matches", gs, cookie); red == nil {
+	vid := res.Grants[0].View
+	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: vid, Prefix: "/ns/matches/view/" + vid, Exp: w.now().Add(10 * time.Minute)}}
+	if red, st := v76fRedirect(t, w, "matches", vid, cookie); red == nil {
 		t.Fatalf("before: %d", st)
 	}
 	w.patchConfig("matches", map[string]any{"op": "add", "path": "/roles/viewer", "value": map[string]any{"can": []any{"read"}}},
 		map[string]any{"op": "remove", "path": "/roles/reader"})
-	if red, st := v76fRedirect(t, w, "matches", gs, cookie); st != 403 {
+	if red, st := v76fRedirect(t, w, "matches", vid, cookie); st != 403 {
 		t.Fatalf("after the role went: %+v %d, want 403", red, st)
 	}
 }
 
-// Scenario 103: li at /ns/matches/view/{gs}/heads of a gs no exchange gave
+// Scenario 103: li at /ns/matches/view/{view}/heads of a view no exchange gave
 // her -> 403; without credentials 401.
 func TestV076Scenario103(t *testing.T) {
 	t.Parallel()
@@ -94,11 +94,11 @@ func TestV076Scenario103(t *testing.T) {
 	ctx := context.Background()
 	li := w.cred(w.catPriv, map[string]any{"kid": "reader-01", "sub": "user:li", "groups": []any{"editors"}, "roles": []any{"reader"},
 		"ns": []any{"matches"}, "can": []any{"read"}})
-	gs := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-	if st := v75Status(w.e.FilteredCurrent(ctx, "matches", gs, "/heads", li)); st != 403 {
+	vid := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if st := v75Status(w.e.FilteredCurrent(ctx, "matches", vid, "/heads", li)); st != 403 {
 		t.Errorf("li: %d, want 403", st)
 	}
-	if st := v75Status(w.e.FilteredCurrent(ctx, "matches", gs, "/heads", Credentials{})); st != 401 {
+	if st := v75Status(w.e.FilteredCurrent(ctx, "matches", vid, "/heads", Credentials{})); st != 401 {
 		t.Errorf("no credentials: %d, want 401", st)
 	}
 }

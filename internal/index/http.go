@@ -53,9 +53,9 @@ const minOther = "min names a namespace other than the one queried"
 //	                              302 → current checkpoint if ns_id is neither
 //	                              current nor kept for this query
 //	GET /{ns}/view/{view}/at/{ns_id}?… private namespaces: as above, keyed by the
-//	                              reader's subject set gs (§A.4, §B.11.5), the
-//	                              subject set before the checkpoint
-//	GET /{ns}/view/{view}?…            the head pointer under the subject set's
+//	                              reader's view view (§A.4, §B.11.5), the
+//	                              view before the checkpoint
+//	GET /{ns}/view/{view}?…            the head pointer under the view's
 //	                              prefix, which its edge grants cover
 //	POST, DELETE /edge-grants     the service's own edge grants (edgegrants.go)
 //
@@ -77,15 +77,15 @@ const minOther = "min names a namespace other than the one queried"
 // anything else to the current checkpoint.
 //
 // Private namespaces need Authorization: Bearer <grant>, which reads only
-// under its own gs: an at URL of another gs is 403; the head pointer and
+// under its own view: an at URL of another view is 403; the head pointer and
 // an at URL without /view/{view} are redirected into the reader's (with min, by
 // the redirect above), private, no-store (§A.4, §B.11.5). A request
 // without Authorization may carry instead an edge grant the service
-// minted for the gs of its URL (Options.EdgeGrants), and is read as that
-// subject set; one with neither is 401.
+// minted for the view of its URL (Options.EdgeGrants), and is read as that
+// view; one with neither is 401.
 //
 // Where §7.9 covers a namespace (filtered.go), a partial reader's
-// marker is reads:{ns}:g:{gs}, gs the origin's subject set; its hits are
+// marker is reads:{ns}:g:{view}, view the origin's view; its hits are
 // those visible to it (§7.9 Visible); and at is the combined
 // checkpoint of every namespace visibility reads there, which its answers
 // list as namespaces and min may name ({ns}:{ns_id}). Its pages are filled
@@ -137,7 +137,7 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	segs := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	var gs, ns, at string
+	var vid, ns, at string
 	isAt := false
 	switch {
 	case len(segs) == 1 && segs[0] == "_status":
@@ -156,10 +156,10 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(segs) == 3 && segs[1] == "view":
 		// The head pointer under a view's prefix, which its edge grants
 		// cover (§A.4).
-		ns, gs = segs[0], segs[2]
+		ns, vid = segs[0], segs[2]
 		telemetry.SetRoute(r, "/{ns}/view/{view}")
 	case len(segs) == 5 && segs[1] == "view" && segs[3] == "at":
-		ns, gs, at, isAt = segs[0], segs[2], segs[4], true
+		ns, vid, at, isAt = segs[0], segs[2], segs[4], true
 		telemetry.SetRoute(r, "/{ns}/view/{view}/at/{at}")
 	default:
 		writeErr(w, http.StatusNotFound, "not_found", "not found")
@@ -177,13 +177,13 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if gs != "" {
-		if _, err := ids.Parse(gs); err != nil {
+	if vid != "" {
+		if _, err := ids.Parse(vid); err != nil {
 			writeErr(w, http.StatusNotFound, "not_found", "malformed view")
 			return
 		}
 	}
-	ix.serve(w, r, gs, ns, at, isAt)
+	ix.serve(w, r, vid, ns, at, isAt)
 }
 
 // access is the outcome of the read check for one request.
@@ -192,7 +192,7 @@ type access struct {
 	v      *grant.Verified // nil under an edge grant (cookie)
 	all    bool            // reads every resource: no per-resource filtering
 	marker string          // what the reader's answers depend on (private only, §A.4)
-	gs     string          // subject-set id over marker (private only)
+	vid    string          // subject-set id over marker (private only)
 	// allow is the per-resource read check of a reader that isn't all:
 	// the grant's, or under an edge grant the filter its marker stands
 	// for (markerRec), or for a partial reader of a namespace §7.9
@@ -377,7 +377,7 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 	if ok, _ := v.Allows("read"); !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
 	}
-	// Results are keyed by a subject set over the reader's marker (§A.4,
+	// Results are keyed by a view over the reader's marker (§A.4,
 	// as /_refs computes it, §B.11.5): reads:{ns}:{k}, k the key: string
 	// of the key that verified the grant (readsMarker, v0.85), for a
 	// grant that would be issued a namespace-wide edge grant (§C.5.2),
@@ -387,8 +387,8 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 	// allow, digest covering those rules, the /principal values they
 	// refer to (grantcheck.ReadsScope) and its key's key: string
 	// (scopeMarker), so readers limited alike through one key share them;
-	// and where §7.9 covers ns, reads:{ns}:g:{gs} for such a
-	// partial reader, gs being the origin's, its hits filtered by
+	// and where §7.9 covers ns, reads:{ns}:g:{view} for such a
+	// partial reader, view being the origin's, its hits filtered by
 	// visibility (filtered.go). Where those rules refer to /now the
 	// namespace counts as unreadable: a result at an at can't change with
 	// the clock.
@@ -439,14 +439,14 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 // Readers alike through one key share it, and so their results.
 func marked(a *access) *access {
 	if a.v == nil {
-		a.gs = grantcheck.ViewID([]string{a.marker})
+		a.vid = grantcheck.ViewID([]string{a.marker})
 		return a
 	}
 	d, scoped := "", !a.all
 	if scoped {
 		d, _ = grantcheck.ReadsScope(a.v)
 	}
-	a.gs = grantcheck.ViewID(grantcheck.ViewSubjects(d, a.v.Key.Kid, keyPub(*a.v.Key), scoped))
+	a.vid = grantcheck.ViewID(grantcheck.ViewSubjects(d, a.v.Key.Kid, keyPub(*a.v.Key), scoped))
 	return a
 }
 
@@ -463,10 +463,10 @@ func base(a *access, ns string) string {
 	if a.public {
 		return "/" + ns
 	}
-	return "/" + ns + "/view/" + a.gs
+	return "/" + ns + "/view/" + a.vid
 }
 
-func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string, isAt bool) {
+func (ix *Index) serve(w http.ResponseWriter, r *http.Request, vid, ns, at string, isAt bool) {
 	ctx := r.Context()
 	vals := r.URL.Query()
 	q, err := ParseQuery(vals)
@@ -535,7 +535,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	}
 	// A partial reader of a namespace §7.9 covers reads at the combined
 	// checkpoint with ns at its committed checkpoint (filtered.go): cur
-	// below is that at, the reader's gs that at's.
+	// below is that at, the reader's view that at's.
 	if a.cov != nil {
 		if err := ix.cover(ctx, a, ns, head); err != nil {
 			ix.writeCoverErr(w, ns, err)
@@ -557,36 +557,36 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		}
 	}
 	// An older at whose checkpoint the index still holds is read at the
-	// reader's gs as of that at (§7.9, §B.11.5: a grant reads at its own
-	// gs as of the URL's at): where that is the URL's gs, old is the
+	// reader's view as of that at (§7.9, §B.11.5: a grant reads at its own
+	// view as of the URL's at): where that is the URL's view, old is the
 	// reader's view there, and the URL is the reader's own, answered as
 	// any older at is below: its kept result, else a redirect to the
 	// current at.
 	var old *access
-	if isAt && a.cov != nil && gs != "" && gs != a.gs && at != a.cov.cp.at {
+	if isAt && a.cov != nil && vid != "" && vid != a.vid && at != a.cov.cp.at {
 		if cp := ix.keptCP(ns, at); cp != nil {
-			if b := a.at(ctx, ns, cp); b != nil && b.gs == gs {
+			if b := a.at(ctx, ns, cp); b != nil && b.vid == vid {
 				old = b
 			}
 		}
 	}
-	// The reader's URL space: public, or keyed by its subject set. The
+	// The reader's URL space: public, or keyed by its view. The
 	// head pointer /{ns} is everyone's, and redirects there below. A grant
-	// reads only at its own gs (§A.4, §B.11.5), as of the URL's at (old):
-	// an at URL of another subject set is 403, with or without min, never
+	// reads only at its own view (§A.4, §B.11.5), as of the URL's at (old):
+	// an at URL of another view is 403, with or without min, never
 	// redirected. An at URL
 	// without /view/{view} of a private namespace, or one with it of a public
 	// one, which no grant decides, is redirected to the same at in the
 	// reader's space; with min, the redirects below land there, without
 	// min (§A.5).
-	if !isAt && gs != "" && gs != a.gs && !a.public {
-		// The head pointer under another subject set's prefix (§B.11.5).
+	if !isAt && vid != "" && vid != a.vid && !a.public {
+		// The head pointer under another view's prefix (§B.11.5).
 		w.Header().Set("Cache-Control", "no-store")
 		writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
 		return
 	}
-	if isAt && gs != a.gs && old == nil {
-		if gs != "" && !a.public {
+	if isAt && vid != a.vid && old == nil {
+		if vid != "" && !a.public {
 			w.Header().Set("Cache-Control", "no-store")
 			writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
 			return
@@ -609,7 +609,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	}
 	target := func(id string) string { return targetOf(vals, id) }
 	// atA and atTarget are the reader's view at the URL's at and this
-	// query's canonical URL there: old's where the reader's gs there
+	// query's canonical URL there: old's where the reader's view there
 	// differs from its current one.
 	atA, atTarget := a, target(at)
 	if old != nil {

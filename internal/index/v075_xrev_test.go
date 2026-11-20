@@ -72,8 +72,8 @@ func wantGrantLacks(t *testing.T, what string, r resp, logs *logged, ns string) 
 	}
 }
 
-// TestV075XrevIndexCookieAfterRoleLosesRead (§7.9 gs, §A.4, §2.1): the
-// index's cookie for reads:matches:g:{gs} is judged from what the exchange
+// TestV075XrevIndexCookieAfterRoleLosesRead (§7.9 view, §A.4, §2.1): the
+// index's cookie for reads:matches:g:{view} is judged from what the exchange
 // recorded, and is 403 at an at where the rules its marker digests differ,
 // of each effective role that lists read among them. Folders give fans the
 // role viewer; the reader's grant reads matches only through its role

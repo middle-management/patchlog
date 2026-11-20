@@ -236,11 +236,11 @@ func TestV081AccessBranchUncovered(t *testing.T) {
 	expect(t, w.do(req{method: "POST", path: "/ns/matches/branches", ifNoneMatch: "*", bearer: w.admin,
 		body: map[string]any{"name": "matches-r7", "at": w.nsHead("matches", w.admin), "patches": []any{}}}), 201)
 	w.put("matches-r7", "final", map[string]any{"title": "final"})
-	gs, at := w.filtered(w.li())
+	vid, at := w.filtered(w.li())
 	li := w.grant(w.cat, "user:li", []string{"matches-r7"}, []string{"read"}, map[string]any{"groups": []any{"editors", "interns"},
 		"roles": []any{"reader"},
 		"exp":   w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)})
-	base := "/ns/matches-r7/view/" + gs
+	base := "/ns/matches-r7/view/" + vid
 	for _, path := range []string{base + "/heads", base + "/at/" + at + "/heads", base + "/at/" + at + "/log"} {
 		expect(t, w.get(path, li), 403)
 		expect(t, w.get(path), 401)
@@ -283,8 +283,8 @@ func TestV081AccessFirstPrev(t *testing.T) {
 		t.Fatalf("second entry's prev %v, want %v", m2["prev"], m["id"])
 	}
 	li := w.li()
-	gs, at := w.filtered(li)
-	fm := first(w.get("/ns/matches/view/"+gs+"/at/"+at+"/log", li))
+	vid, at := w.filtered(li)
+	fm := first(w.get("/ns/matches/view/"+vid+"/at/"+at+"/log", li))
 	if p, ok := fm["prev"]; !ok || p != "" {
 		t.Fatalf("first filtered entry %v: prev %v %v, want \"\"", fm, p, ok)
 	}
