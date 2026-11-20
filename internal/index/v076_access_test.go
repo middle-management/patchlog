@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
-	"github.com/middle-management/patchlog/internal/svcedge"
+	"github.com/middle-management/patchlog/internal/index"
 )
 
 // V76-02 (v0.76): the index's markers are per namespace (§A.4 Across
@@ -27,7 +27,7 @@ import (
 func TestV076AccessExchangePerNamespace(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	w := p37Setup(t, index.DefaultExchangeRate)
 	op := w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "user:root", []string{"pb"}, []string{"read", "config"})))
 	must(op.PatchConfig(ctx, "pb", must(op.NSHead(ctx, "pb")).Config, []any{map[string]any{"op": "replace", "path": "/keys/1", "value": w.issuer.Entry("append")}}))
 	w.x.caughtUp("pb")
@@ -138,7 +138,7 @@ func TestV076AccessForeignRefsVerified(t *testing.T) {
 func TestV076AccessExchangePurged(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	w := p37Setup(t, index.DefaultExchangeRate)
 	op := w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "user:root", []string{"pa", "pb"}, []string{"read", "config", "purge-ns"})))
 	cfg := must(op.NSHead(ctx, "pb")).Config
 	must(op.PatchConfig(ctx, "pb", cfg, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))

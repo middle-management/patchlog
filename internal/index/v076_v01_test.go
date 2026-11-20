@@ -4,13 +4,13 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
 // TestV076V01IndexGSPerKey (§B.11.9 gs, §C.4): grants through two keys
 // with the same scope rules get different subject sets, each bound to its
-// key's kid and pub as the origin's are (catvis.KeySubject), so that no
+// key's kid and pub as the origin's are (grantcheck.KeySubject), so that no
 // stored row judges another key's cookies, and the index's gs stays the
 // origin's (TestV075IndexSubjectSets).
 func TestV076V01IndexGSPerKey(t *testing.T) {
@@ -23,8 +23,8 @@ func TestV076V01IndexGSPerKey(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !slices.Contains(fv.subjects, catvis.KeySubject(kid, pub)) {
-			t.Fatalf("subjects %v lack %s", fv.subjects, catvis.KeySubject(kid, pub))
+		if !slices.Contains(fv.subjects, grantcheck.KeySubject(kid, pub)) {
+			t.Fatalf("subjects %v lack %s", fv.subjects, grantcheck.KeySubject(kid, pub))
 		}
 		return fv
 	}

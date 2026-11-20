@@ -1,4 +1,4 @@
-package svcedge
+package index
 
 import (
 	"context"
@@ -17,24 +17,29 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// openDB opens the SQLite database at path as a service does.
-func openDB(t *testing.T, path string) *sql.DB {
+// svcOpenDB opens the SQLite database at path as a service does.
+func svcOpenDB(t *testing.T, path string) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("sqlite", sqlitedsn.DSN(path, "_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
+	// The tables of the index's migration 015, the edge store's alone.
+	for _, q := range []string{
+		`CREATE TABLE IF NOT EXISTS edge_subjects (gs TEXT PRIMARY KEY, subjects TEXT NOT NULL, exp INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS edge_buckets (k TEXT PRIMARY KEY, tokens REAL NOT NULL, last INTEGER NOT NULL) WITHOUT ROWID`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return db
 }
 
-func newStore(t *testing.T, db *sql.DB) *Store {
+func svcNewStore(t *testing.T, db *sql.DB) *edgeStore {
 	t.Helper()
-	s, err := NewStore(context.Background(), db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return s
+	return newEdgeStore(db)
 }
 
 // TC-16 (§B.11.5, §6.6): a service's exchangeRate buckets are shared by
@@ -46,7 +51,7 @@ func TestV073BucketsSharedAcrossInstances(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "svc.db")
-	a, b := newStore(t, openDB(t, path)), newStore(t, openDB(t, path))
+	a, b := svcNewStore(t, svcOpenDB(t, path)), svcNewStore(t, svcOpenDB(t, path))
 	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
 	r := Rate{Rate: 1, Burst: 2}
 	for i := range 2 {
@@ -79,7 +84,7 @@ func TestV073BucketsAtomicDraw(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "svc.db")
-	stores := []*Store{newStore(t, openDB(t, path)), newStore(t, openDB(t, path))}
+	stores := []*edgeStore{svcNewStore(t, svcOpenDB(t, path)), svcNewStore(t, svcOpenDB(t, path))}
 	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
 	r := Rate{Rate: 0.001, Burst: 5}
 	var mu sync.Mutex
@@ -114,7 +119,7 @@ func TestV073SubjectsShared(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "svc.db")
-	a, b := newStore(t, openDB(t, path)), newStore(t, openDB(t, path))
+	a, b := svcNewStore(t, svcOpenDB(t, path)), svcNewStore(t, svcOpenDB(t, path))
 	now := time.Now()
 	if err := a.Record(ctx, "gs1", []string{"group:eds"}, now.Add(time.Minute), now); err != nil {
 		t.Fatal(err)
@@ -129,12 +134,12 @@ func TestV073SubjectsShared(t *testing.T) {
 	if err := a.Record(ctx, "gs2", []string{"group:x"}, now.Add(3*time.Minute), now.Add(2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := newStore(t, openDB(t, path)).Subjects(ctx, "gs1"); ok {
+	if _, ok := svcNewStore(t, svcOpenDB(t, path)).Subjects(ctx, "gs1"); ok {
 		t.Fatal("gs1 kept after its last edge grant expired")
 	}
 }
 
-func decodeBody(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
+func svcDecodeBody(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
 	var m map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
@@ -158,7 +163,7 @@ func TestV073BearersBody(t *testing.T) {
 		{"one grant", `{"grants":["abc"]}`, "application/json", "", 0, "", 1},
 		{"a noncharacter, raw", "{\"grants\":[\"a﷐\"]}", "application/json", "", 400, "bad_input", 0},
 		{"a noncharacter, escaped", `{"grants":["a￿"]}`, "application/json", "", 400, "bad_input", 0},
-		{"over 50 grants of grantSize", `{"grants":["` + strings.Repeat("a", BodyMax(DefaultGrantSize)) + `"]}`, "application/json", "", 400, "bad_input", 0},
+		{"over 50 grants of grantSize", `{"grants":["` + strings.Repeat("a", svcBodyMax(svcDefaultGrantSize)) + `"]}`, "application/json", "", 400, "bad_input", 0},
 		{"a body and Authorization", `{"grants":["abc"]}`, "application/json", "Bearer x", 400, "bad_input", 0},
 		{"not JSON", `{"grants":["abc"]}`, "text/plain", "", 415, "unsupported_type", 0},
 		{"no grants", `{"grants":[]}`, "application/json", "", 400, "bad_input", 0},
@@ -172,7 +177,7 @@ func TestV073BearersBody(t *testing.T) {
 		if tc.auth != "" {
 			r.Header.Set("Authorization", tc.auth)
 		}
-		bs, e := Bearers(r, DefaultGrantSize)
+		bs, e := svcBearers(r, svcDefaultGrantSize)
 		switch {
 		case tc.status == 0 && (e != nil || len(bs) != tc.bearers):
 			t.Errorf("%s: %v %v", tc.name, bs, e)
@@ -191,33 +196,33 @@ func TestV073MintAndWithdraw(t *testing.T) {
 	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
 	c := edge.NewCookies("svc", nil)
 	c.Vouches = func(p string) bool { return strings.HasPrefix(p, "/cat/g/") }
-	merged := Merge([]Issue{{"/cat/g/a", now.Add(5 * time.Minute)}, {"/cat/g/b", now.Add(2 * time.Minute)}, {"/cat/g/a", now.Add(9 * time.Minute)}})
+	merged := svcMerge([]svcIssue{{"/cat/g/a", now.Add(5 * time.Minute)}, {"/cat/g/b", now.Add(2 * time.Minute)}, {"/cat/g/a", now.Add(9 * time.Minute)}})
 	if len(merged) != 2 || merged[0].Prefix != "/cat/g/a" || !merged[0].Exp.Equal(now.Add(9*time.Minute)) || merged[1].Prefix != "/cat/g/b" {
 		t.Fatalf("merged %v", merged)
 	}
 	w := httptest.NewRecorder()
-	Mint(w, c, now, merged)
-	b := decodeBody(t, w)
+	svcMint(w, c, now, merged)
+	b := svcDecodeBody(t, w)
 	if w.Code != 200 || len(w.Result().Cookies()) != 2 || b["exp"] != now.Add(2*time.Minute).Format(time.RFC3339) ||
 		strings.Join(toStrings(b["prefixes"]), " ") != "/cat/g/a /cat/g/b" || w.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("mint: %d %v %v", w.Code, b, w.Header())
 	}
 	ours := func(p string) bool { return strings.HasPrefix(p, "/cat/g/") }
 	w = httptest.NewRecorder()
-	Withdraw(w, httptest.NewRequest("DELETE", "/edge-grants?prefix=/cat/g/a&prefix=/cat/g/a&prefix=/cat/g/b", nil), c, ours, "/cat/g/{gs}")
+	svcWithdraw(w, httptest.NewRequest("DELETE", "/edge-grants?prefix=/cat/g/a&prefix=/cat/g/a&prefix=/cat/g/b", nil), c, ours, "/cat/g/{gs}")
 	if w.Code != http.StatusNoContent || len(w.Result().Cookies()) != 2 {
 		t.Fatalf("withdraw: %d %v", w.Code, w.Result().Cookies())
 	}
 	for _, q := range []string{"", "?prefix=/r/x", "?other=1"} {
 		w = httptest.NewRecorder()
-		Withdraw(w, httptest.NewRequest("DELETE", "/edge-grants"+q, nil), c, ours, "/cat/g/{gs}")
-		if w.Code != 400 || decodeBody(t, w)["code"] != "bad_input" {
+		svcWithdraw(w, httptest.NewRequest("DELETE", "/edge-grants"+q, nil), c, ours, "/cat/g/{gs}")
+		if w.Code != 400 || svcDecodeBody(t, w)["code"] != "bad_input" {
 			t.Errorf("withdraw %q: %d", q, w.Code)
 		}
 	}
 	w = httptest.NewRecorder()
-	RateLimited(1500 * time.Millisecond).Write(w)
-	if b := decodeBody(t, w); w.Code != 429 || w.Header().Get("Retry-After") != "2" || b["limit"] != "exchangeRate" || b["code"] != "rate" || b["retryAfter"] != 1.5 {
+	svcRateLimited(1500 * time.Millisecond).Write(w)
+	if b := svcDecodeBody(t, w); w.Code != 429 || w.Header().Get("Retry-After") != "2" || b["limit"] != "exchangeRate" || b["code"] != "rate" || b["retryAfter"] != 1.5 {
 		t.Fatalf("rate: %d %v %v", w.Code, b, w.Header())
 	}
 }

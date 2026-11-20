@@ -1,6 +1,9 @@
 package index
 
-import "context"
+import (
+	"context"
+	"database/sql"
+)
 
 // SealedViews returns the stored sealed results, view → Cache-Tag (tests).
 func (ix *Index) SealedViews() map[string]string {
@@ -96,3 +99,7 @@ func (ix *Index) KeptHas(url string) bool { _, _, ok := ix.kept.Get(url); return
 // OnBeforeAnswer calls f once a reader's views are computed, before the
 // answer is: a query's head pointer, or /_refs (tests).
 func (ix *Index) OnBeforeAnswer(f func()) { ix.testBeforeAnswer = f }
+
+// NewEdgeStore opens the service's edge grant state in db, as another
+// instance of the service on the same database would (tests).
+func NewEdgeStore(db *sql.DB) *edgeStore { return newEdgeStore(db) }

@@ -336,7 +336,7 @@ func TestHeadMetaSealedLater(t *testing.T) {
 		}
 		e.noRevMeta("/r/" + ns + "/a/rev/" + a)
 		// Later config writes don't purge again.
-		expect(t, e.patchNS(ns, ops(op("add", "/maxLag", "PT1H")), ""), 201)
+		expect(t, e.patchNS(ns, ops(op("add", "/x-note", "PT1H")), ""), 201)
 		if calls := rec.take(); purged(calls, "ns:"+ns) {
 			t.Fatalf("%s: a sealed config write purged %v", ns, calls)
 		}

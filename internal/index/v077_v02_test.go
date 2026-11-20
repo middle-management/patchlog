@@ -14,8 +14,8 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/index"
 	"github.com/middle-management/patchlog/internal/seal"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // V77-02 (v0.77): the index's markers, scope cookies, coverage, exchange
@@ -54,8 +54,7 @@ func TestV077HeadPointerDropsOpaqueAfter(t *testing.T) {
 	}
 }
 
-// v77docs is an uncovered private namespace docs (it names no catalog and
-// is none) whose keys k1 and k2 have the same scope rules, testing
+// v77docs is an private namespace docs whose keys k1 and k2 have the same scope rules, testing
 // /resource by type, so their grants read docs in part; its role reader
 // lists read. docs holds a, b and secret. One index follows it, minting
 // edge grants of its own.
@@ -92,7 +91,7 @@ func newV77Docs(t *testing.T) *v77docs {
 	d.x = startSvcWith(t, s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "svc:indexer", []string{"docs"}, []string{"read"}))),
 		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"docs"}, untyped: true, now: s.Now},
 		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate, ev
 		})
 	d.x.caughtUp("docs")
 	return d
@@ -255,7 +254,7 @@ func TestV077AuthDisabledUncovers(t *testing.T) {
 func TestV077ExchangePurgedOnly(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	w := p37Setup(t, index.DefaultExchangeRate)
 	op := w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "user:root", []string{"pb"}, []string{"read", "config", "purge-ns"})))
 	must(op.PatchConfig(ctx, "pb", must(op.NSHead(ctx, "pb")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
 	head := must(op.PurgeNamespace(ctx, "pb", must(op.NSHead(ctx, "pb")).ID))

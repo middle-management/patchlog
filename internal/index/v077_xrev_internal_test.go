@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
@@ -27,10 +26,10 @@ func TestV077XrevGSScopeSubjectIsMarkerDigest(t *testing.T) {
 		t.Fatal("reads refer to /now")
 	}
 	_, marker, _ := strings.Cut(scopeMarker("matches", d, "fan", "pubA"), ":scope:")
-	if !slices.Contains(fv.subjects, catvis.ScopePrefix+marker) {
+	if !slices.Contains(fv.subjects, grantcheck.ScopePrefix+marker) {
 		t.Errorf("subjects %v, want scope:%s, the digest of §A.4's marker", fv.subjects, marker)
 	}
-	if slices.Contains(fv.subjects, catvis.ScopePrefix+d) {
+	if slices.Contains(fv.subjects, grantcheck.ScopePrefix+d) {
 		t.Errorf("subjects %v carry the rules' digest alone", fv.subjects)
 	}
 }

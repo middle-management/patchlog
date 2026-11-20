@@ -9,8 +9,8 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/index"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // pub76Cookie exchanges a partial reader's grant of matches at w's index
@@ -38,9 +38,9 @@ func pub76Cookie(t *testing.T, w *v75x) (string, []*http.Cookie) {
 // key or role they came from is gone or, as §C.4 judges a base's keys, no
 // longer accepted"; §C.4: a shared kid is accepted "only while the base
 // has it with the same pub"): a partial reader's cookie for
-// reads:matches:g:{gs}, exchanged through catalog-01, is 403 "exchange the
-// grant again" once matches gives catalog-01 another pub, its scope,
-// requireAt and roles unchanged. Before v0.76 edge_gs kept only the kid,
+// reads:matches:g:{gs}, exchanged through reader-01, is 403 "exchange the
+// grant again" once matches gives reader-01 another pub, its scope,
+// and roles unchanged. Before v0.76 edge_gs kept only the kid,
 // and the cookie was still served.
 func TestV076PubKeyReplaced(t *testing.T) {
 	t.Parallel()
@@ -50,7 +50,7 @@ func TestV076PubKeyReplaced(t *testing.T) {
 	doc := must(w.admin.NSDoc(ctx, "matches", w.head("matches"))).Value
 	keys := doc["keys"].([]any)
 	old := keys[1].(map[string]any)
-	e := clienttest.NewKey("catalog-01").Entry("read")
+	e := clienttest.NewKey("reader-01").Entry("read")
 	for k, v := range old {
 		if k != "pub" {
 			e[k] = v
@@ -65,7 +65,7 @@ func TestV076PubKeyReplaced(t *testing.T) {
 	w.x.ix.ExpireGrantChecks()
 	got, _ := p37Follow(t, w.x, prefix, cookies, "")
 	if got.status != 403 || !strings.Contains(got.body["message"].(string), "exchange the grant again") {
-		t.Errorf("under the cookie once catalog-01's pub changed: %d %v", got.status, got.body)
+		t.Errorf("under the cookie once reader-01's pub changed: %d %v", got.status, got.body)
 	}
 }
 
@@ -87,7 +87,7 @@ func TestV076PubNoneStored(t *testing.T) {
 			restart := func() {
 				w.x = startSvcWith(t, w.x.core, svcOpts{db: w.x.dbPath, ns: []string{"matches"}, untyped: true, now: w.s.Now},
 					func(o *indexOpts) {
-						o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate
+						o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate
 					})
 				w.x.caughtUp("matches")
 			}
@@ -113,10 +113,10 @@ func TestV076PubNoneStored(t *testing.T) {
 }
 
 // TestV076PubSharedMarker (§B.11.9 gs, §C.4): a g: marker's subjects
-// include catvis.KeySubject(kid, pub), so readers whose grants come from
+// include grantcheck.KeySubject(kid, pub), so readers whose grants come from
 // different keys, or from one kid under different pubs, never share a
-// marker. Reader A's cookie came from catalog-01's old pub; once matches
-// gives catalog-01 another pub, A's cookie is 403, and stays 403 after
+// marker. Reader A's cookie came from reader-01's old pub; once matches
+// gives reader-01 another pub, A's cookie is 403, and stays 403 after
 // reader B, with the same subjects and rules, exchanges a grant signed under
 // the new pub: B gets a marker of its own, which reads. Before v0.76, B's
 // exchange overwrote the shared marker's pub and A's cookie was served
@@ -130,7 +130,7 @@ func TestV076PubSharedMarker(t *testing.T) {
 	doc := must(w.admin.NSDoc(ctx, "matches", w.head("matches"))).Value
 	keys := doc["keys"].([]any)
 	old := keys[1].(map[string]any)
-	nk := clienttest.NewKey("catalog-01")
+	nk := clienttest.NewKey("reader-01")
 	e := nk.Entry("read")
 	for k, v := range old {
 		if k != "pub" {
@@ -142,7 +142,7 @@ func TestV076PubSharedMarker(t *testing.T) {
 	w.x.caughtUp("matches")
 	w.x.ix.ExpireGrantChecks()
 	if got, _ := p37Follow(t, w.x, prefix, cookies, ""); got.status != 403 {
-		t.Fatalf("A under its cookie once catalog-01's pub changed: %d %v", got.status, got.body)
+		t.Fatalf("A under its cookie once reader-01's pub changed: %d %v", got.status, got.body)
 	}
 	w.cat = nk
 	b := w.reader("user:other", []any{"fans"})

@@ -108,9 +108,6 @@ func blockView(b grant.Block, now time.Time) map[string]any {
 		m["expired"] = !b.Exp.After(now)
 		m["expires"] = relTime(*b.Exp, now)
 	}
-	if b.At != nil {
-		m["at"] = b.At
-	}
 	if len(b.Rules) > 0 {
 		m["rules"] = b.Rules
 	}
@@ -171,7 +168,7 @@ func yesNo(b bool) string {
 }
 
 // blockOrder is the order a block's fields are printed in.
-var blockOrder = []string{"kid", "sub", "via", "ns", "can", "roles", "groups", "attrs", "nbf", "exp", "at", "rules", "signers", "enc"}
+var blockOrder = []string{"kid", "sub", "via", "ns", "can", "roles", "groups", "attrs", "nbf", "exp", "rules", "signers", "enc"}
 
 func writeBlock(out io.Writer, m map[string]any) {
 	for _, k := range blockOrder {

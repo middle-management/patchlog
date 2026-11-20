@@ -20,7 +20,6 @@ import (
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/index"
 	"github.com/middle-management/patchlog/internal/seal"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // indexCmd runs the indexing service of Addendum A:
@@ -142,7 +141,7 @@ func (a *indexCmd) run(string) {
 		if err != nil {
 			log.Fatalf("index: --exchange-rate: %v", err)
 		}
-		opt.ExchangeRate = svcedge.Rate{Rate: r.Rate, Burst: r.Burst}
+		opt.ExchangeRate = index.Rate{Rate: r.Rate, Burst: r.Burst}
 	}
 	// The core may still be starting: retry reading its origin.
 	var ix *index.Index
@@ -249,4 +248,19 @@ func recipientKey(svc, value, file string) *ecdh.PrivateKey {
 	jwk, _ := json.Marshal(seal.RecipientJWK(k.PublicKey()))
 	log.Printf("%s: recipient key %s (enc of the service grant, keyring recipient)", svc, jwk)
 	return k
+}
+
+// originKids flattens repeated and comma-separated --origin-edge-grant-kid
+// values, dropping duplicates, edge.DefaultKid if there are none.
+func originKids(vals []string) []string {
+	var out []string
+	for _, k := range splitList(vals...) {
+		if !slices.Contains(out, k) {
+			out = append(out, k)
+		}
+	}
+	if len(out) > 0 {
+		return out
+	}
+	return []string{edge.DefaultKid}
 }

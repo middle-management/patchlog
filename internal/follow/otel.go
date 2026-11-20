@@ -11,7 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
-// OpenTelemetry metrics of consumers (index, tree and catalog services):
+// OpenTelemetry metrics of consumers (the index and other services that follow the log):
 // how many units they apply, and how far behind the log they are when
 // they apply them. Namespaces are not metric attributes (tenant-scale).
 

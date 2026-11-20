@@ -6,8 +6,7 @@ import (
 	"testing"
 )
 
-// V77-01 (v0.77): filtered coverage of purged catalogs (§B.11.9 Where) and
-// a covered purged namespace's /heads without at (§B.11.9 Purged
+// V77-01 (v0.77): a covered purged namespace's /heads without at (§B.11.9 Purged
 // namespaces).
 
 // v077Purge freezes and purges ns with the operator key.

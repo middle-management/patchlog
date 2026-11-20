@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
@@ -21,14 +20,14 @@ import (
 )
 
 // V75-01 (v0.75): the visibility engine of filtered namespace reads
-// (§B.11.9) in the core: coverage, access classification, catalog graphs
-// at a checkpoint, the visible predicate, gs, stored state, admission and
+// (§7.9) in the core: coverage, access classification, the visible
+// predicate, gs, stored state, admission and
 // the exchange.
 
 // v75World is an engine with authentication on and two private
-// namespaces, cat-season and matches. matches's key catalog-01 has a
+// namespaces, cat-season and matches. matches's key reader-01 has a
 // scope rule allowing /resource derby and shared only, so its grants read
-// matches only in part, and §B.11.9 covers both. k is a * key in both.
+// matches only in part, and §7.9 covers both. k is a * key in both.
 type v75World struct {
 	t       *testing.T
 	e       *Engine
@@ -53,7 +52,7 @@ type v75Opts struct {
 	file bool
 }
 
-// v75Visible is the schema catalog-01's rule tests /resource with: the
+// v75Visible is the schema reader-01's rule tests /resource with: the
 // names its grants read in matches.
 var v75Visible = map[string]any{"pattern": "^(derby|shared)$"}
 
@@ -78,7 +77,7 @@ func newV75World(t *testing.T, o v75Opts) *v75World {
 		o.cat(cat)
 	}
 	w.mkNS("cat-season", cat)
-	matches := map[string]any{"read": "grant", "keys": []any{w.kEntry(), map[string]any{"kid": "catalog-01", "alg": "ed25519", "pub": w.catPub,
+	matches := map[string]any{"read": "grant", "keys": []any{w.kEntry(), map[string]any{"kid": "reader-01", "alg": "ed25519", "pub": w.catPub,
 		"can": []any{"read"}, "maxTtl": "PT15M",
 		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": v75Visible}}}},
 		"roles": map[string]any{"reader": map[string]any{"can": []any{"read"}}}}
@@ -205,7 +204,7 @@ func v75Parents(names ...string) []any {
 }
 
 // seed writes cat-season's documents and matches's derby, shared,
-// opener and secret, of which catalog-01's rule allows derby and shared.
+// opener and secret, of which reader-01's rule allows derby and shared.
 func (w *v75World) seed() {
 	w.t.Helper()
 	w.put("cat-season", "root", map[string]any{"parents": []any{}, "$access": map[string]any{"group:editors": []any{"reader"}, "user:li": []any{"reader"}}})
@@ -219,13 +218,13 @@ func (w *v75World) seed() {
 	}
 }
 
-// li is a partial reader of matches: catalog-01's grant for user:li, in
+// li is a partial reader of matches: reader-01's grant for user:li, in
 // editors and interns, with the reader role.
 func (w *v75World) li(extra ...map[string]any) Credentials {
 	return w.catGrant("user:li", []any{"editors", "interns"}, extra...)
 }
 
-// bo is a partial reader of matches who sees none of it: catalog-01's
+// bo is a partial reader of matches who sees none of it: reader-01's
 // grant for user:bo in chiefs, whose block rule allows only secret, which
 // the key's rule doesn't.
 func (w *v75World) bo() Credentials {
@@ -235,7 +234,7 @@ func (w *v75World) bo() Credentials {
 
 func (w *v75World) catGrant(sub string, groups []any, extra ...map[string]any) Credentials {
 	w.t.Helper()
-	root := map[string]any{"kid": "catalog-01", "sub": sub, "groups": groups, "roles": []any{"reader"}, "ns": []any{"matches"},
+	root := map[string]any{"kid": "reader-01", "sub": sub, "groups": groups, "roles": []any{"reader"}, "ns": []any{"matches"},
 		"can": []any{"read"},
 		"exp": w.now().Add(10 * time.Minute).UTC().Format(time.RFC3339)}
 	for _, x := range extra {
@@ -465,9 +464,8 @@ func TestV075VisibleBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.put("matches-r7", "final", map[string]any{"title": "final"})
-	w.put("cat-season", "matches.final", map[string]any{"parents": v75Parents("season")})
-	li := w.cred(w.catPriv, map[string]any{"kid": "catalog-01", "sub": "user:li", "groups": []any{"editors"}, "roles": []any{"reader"},
-		"ns": []any{"matches-r7"}, "can": []any{"read"}, "at": map[string]any{"ns": "cat-season", "id": w.head("cat-season")},
+	li := w.cred(w.catPriv, map[string]any{"kid": "reader-01", "sub": "user:li", "groups": []any{"editors"}, "roles": []any{"reader"},
+		"ns": []any{"matches-r7"}, "can": []any{"read"},
 		"exp": w.now().Add(10 * time.Minute).UTC().Format(time.RFC3339)})
 	w.inTx(func(t2 *tx) {
 		a, kind, fs, err := t2.nsAccess(t2.nsByName("matches-r7"), li)
@@ -488,7 +486,6 @@ func (w *v75World) catReader(sub string, groups ...any) Credentials {
 }
 
 var _ = slices.Contains[[]string]
-var _ = catvis.Partial
 
 // §B.11.9 gs: a partial reader's subjects are its scope digest and its
 // key subject alone: readers with the same rules through the same key
@@ -514,7 +511,7 @@ func TestV075GS(t *testing.T) {
 			digest = d
 		}
 	}
-	if want := []string{grantcheck.KeySubject("catalog-01", w.catPub), "scope:" + digest}; digest == "" || !reflect.DeepEqual(liSubs, want) {
+	if want := []string{grantcheck.KeySubject("reader-01", w.catPub), "scope:" + digest}; digest == "" || !reflect.DeepEqual(liSubs, want) {
 		t.Fatalf("li's subjects %v, want %v", liSubs, want)
 	}
 	if liGS != grantcheck.SubjectSetID(liSubs) {
@@ -606,7 +603,7 @@ func TestV075State(t *testing.T) {
 	w.open(nil)
 	w.inTx(func(t2 *tx) {
 		got := t2.loadGS("matches", rec.gs)
-		if got == nil || got.exp != rec.exp || !reflect.DeepEqual(got.subjects, rec.subjects) || got.kid != "catalog-01" ||
+		if got == nil || got.exp != rec.exp || !reflect.DeepEqual(got.subjects, rec.subjects) || got.kid != "reader-01" ||
 			!reflect.DeepEqual(got.roles, []string{"reader"}) || got.digest != rec.digest || got.filter != rec.filter {
 			t.Fatalf("after a restart: %+v, want %+v", got, rec)
 		}

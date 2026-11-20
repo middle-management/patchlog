@@ -7,11 +7,8 @@
 // namespace, but sealed and end-to-end ones, which need keys it doesn't
 // hold (§H.7). A flat namespace's directory is the flat view (§H.2): a raw
 // document (its root a blob reference, §7.8) as its resource name, any
-// other as {name}.json; a catalog (Addendum B) with catalog.files is a
-// file tree (§H.2), its folder nodes as directories and its placements as
-// files holding their items, each named by its node's title. The tree
-// owns the items of its catalog.files.ns: served flat too, that
-// namespace is read-only there (readOnly).
+// other as {name}.json. (File trees, folders and names kept as document
+// fields, TOOLS Addendum H, are not served yet.)
 //
 // A raw file reads as its blob's bytes, typed by its name (§H.1); a JSON
 // file as its rendering, the document's canonical JSON (§3.1) laid out,
@@ -79,34 +76,12 @@ type Options struct {
 	// Namespaces are the flat namespaces served, each a directory of its
 	// files (§H.2 "Flat view").
 	Namespaces []string
-	// Catalogs are the catalog namespaces served as file trees (§H.2),
-	// each with catalog.files in its namespace document.
-	Catalogs []string
-	// TreeService is the base URL of the tree service (§B.5) following
-	// the catalogs served, such as http://tree:8082, and TreeServices
-	// that of a catalog with its own, by catalog. A tree's folder is then
-	// listed from the tree service's children listing, read with the
-	// request's grant, which the tree service filters by (§H.3, §H.7,
-	// §B.11.5), with the file metadata it adds; without one, from the
-	// catalog's node documents read from the core, the fallback for
-	// deployments without a tree service (treesvc.go).
-	TreeService  string
-	TreeServices map[string]string
-	// TreeWait bounds how long a listing waits for the tree service to
-	// reach the user's own writes through this server (?min=, §B.5),
-	// before the folder is listed from the node documents (default 3s).
-	TreeWait time.Duration
 	// InlinePDF serves a PDF (a raw file stored as application/pdf) for
 	// display in the browser; by default it is sent as an attachment
 	// (Content-Disposition: attachment). Either way its 200 and 206 go
 	// without the sandbox, which blanks browsers' PDF viewers, and keep
 	// nosniff (§7.8, §H.6 "Headers").
 	InlinePDF bool
-	// CaseSensitive compares the names of a tree's siblings after NFC
-	// only; by default they are compared after Unicode case folding too
-	// (§H.2 "Siblings"), as the file systems of macOS and Windows, whose
-	// clients can't hold two names that differ only in case, compare them.
-	CaseSensitive bool
 	// Gateway takes each request's Basic password as the grant sent
 	// upstream as Authorization: Bearer, the user name ignored; over a
 	// core with authentication disabled (GET / auth, §1), the Basic user
@@ -124,8 +99,7 @@ type Options struct {
 	FetchConcurrency int
 	// CacheBytes bounds the rendered documents kept by revision id
 	// (default 64 MiB); the files' sizes and types are kept apart
-	// (maxMetas). It bounds, apart too, the catalogs' graphs and the
-	// folders' listings kept by token (views).
+	// (maxMetas).
 	CacheBytes int
 	// MaxFileSize bounds a written JSON file and a scratch file, buffered
 	// whole (default 16 MiB).
@@ -170,9 +144,6 @@ type Options struct {
 	// writer), and whether the core has authentication disabled, are kept
 	// for no longer.
 	VerifyEvery time.Duration
-	// CatalogTTL is how long a token's read of a catalog's tree serves its
-	// requests, unless this server writes meanwhile (default 5s).
-	CatalogTTL time.Duration
 	// Retries bounds the resends of a write whose head moved (412,
 	// default 5).
 	Retries int
@@ -209,7 +180,6 @@ const maxMetas = 1 << 18
 type Server struct {
 	opt   Options
 	flat  map[string]bool
-	cats  map[string]bool
 	start time.Time
 	fs    *davFS
 
@@ -243,9 +213,6 @@ type Server struct {
 	opErr    error     // the failed read, while none was read
 	opFlight singleflight.Group
 
-	viewMu sync.Mutex
-	views  lru.Cache[string, tokenView] // by token id: catalogs' graphs and folders it read (views)
-
 	keyHistMu sync.Mutex
 	keyHists  lru.Cache[string, *keyHistory] // gateway mode, by namespace: its keys over time, as a token read them (kidhist.go)
 
@@ -262,8 +229,6 @@ type Server struct {
 	group    singleflight.Group
 	inflight *semaphore.Weighted
 	heavy    chan struct{} // requests with a body over heavyBody being handled
-	gen      atomic.Uint64 // writes through this server: catalog reads older are stale
-	ts       treeShared    // the tree service's client, and the catalogs' settings
 }
 
 // writeGuard keeps a request that writes (reqState.writes) from writing to
@@ -357,8 +322,7 @@ func (st *reqState) upKey(r *http.Request) string {
 	return fmt.Sprintf("%s #%d", key, st.upSeq.Add(1))
 }
 
-// sawUpstream keeps how a request to an upstream (what: the core, or a
-// catalog's service) made for st's request ended: a 408, a 429, a 5xx, no
+// sawUpstream keeps how a request to an upstream (what: the core) made for st's request ended: a 408, a 429, a 5xx, no
 // connection or no answer in time is a failure for now (§H.4 "Answers"),
 // 503 after a 429, a 503 or no answer in time and 502 otherwise, naming
 // the upstream alone. Anything else is an answer, and clears an earlier
@@ -471,7 +435,7 @@ func New(opt Options) (*Server, error) {
 	if !opt.Gateway && opt.Password == "" {
 		return nil, errors.New("dav: local mode needs a password")
 	}
-	if len(opt.Namespaces)+len(opt.Catalogs) == 0 {
+	if len(opt.Namespaces) == 0 {
 		return nil, errors.New("dav: no namespace to serve")
 	}
 	def := func(v *int, d int) {
@@ -500,9 +464,7 @@ func New(opt Options) (*Server, error) {
 	defDur(&opt.ScratchIdle, time.Hour)
 	defDur(&opt.RecordIdle, 24*time.Hour)
 	defDur(&opt.VerifyEvery, maxVerifyEvery)
-	defDur(&opt.CatalogTTL, 5*time.Second)
 	defDur(&opt.MaxRetryWait, 2*time.Second)
-	defDur(&opt.TreeWait, 3*time.Second)
 	if opt.VerifyEvery > maxVerifyEvery {
 		return nil, fmt.Errorf("dav: VerifyEvery %v is longer than %v: a gateway re-checks a grant at least every five minutes (§H.7)", opt.VerifyEvery, maxVerifyEvery)
 	}
@@ -515,7 +477,7 @@ func New(opt Options) (*Server, error) {
 	if opt.Logf == nil {
 		opt.Logf = func(string, ...any) {}
 	}
-	s := &Server{opt: opt, flat: map[string]bool{}, cats: map[string]bool{}, tokens: map[string]*token{},
+	s := &Server{opt: opt, flat: map[string]bool{}, tokens: map[string]*token{},
 		principals: map[string]*principal{}, recRoots: map[string]*recStore{},
 		sem: make(chan struct{}, opt.FetchConcurrency), inflight: semaphore.NewWeighted(int64(opt.InflightBytes)),
 		heavy: make(chan struct{}, maxHeavy)}
@@ -529,22 +491,9 @@ func New(opt Options) (*Server, error) {
 		}
 		s.flat[ns] = true
 	}
-	for _, ns := range opt.Catalogs {
-		if !client.ValidNSName(ns) {
-			return nil, fmt.Errorf("dav: invalid namespace name %q", ns)
-		}
-		if s.flat[ns] {
-			return nil, fmt.Errorf("dav: %s is both a namespace and a catalog", ns)
-		}
-		s.cats[ns] = true
-	}
 	s.fs = &davFS{s: s}
-	if err := s.ts.init(&s.opt); err != nil {
-		return nil, err
-	}
 	opt.Client = s.opt.Client
 	s.anon = opt.Client.With(client.WithBearer(""))
-	s.views.MaxEntries, s.views.MaxBytes = 1<<16, opt.CacheBytes
 	if opt.Gateway {
 		s.verifySem = make(chan struct{}, maxVerifying)
 		s.refused.MaxEntries = 1 << 12
@@ -561,13 +510,10 @@ func New(opt Options) (*Server, error) {
 // realm is the WWW-Authenticate challenge.
 func (s *Server) realm() string { return fmt.Sprintf("Basic realm=%q, charset=\"UTF-8\"", s.opt.Realm) }
 
-// namespaces lists the served namespaces, flat and catalogs, sorted.
+// namespaces lists the served namespaces, sorted.
 func (s *Server) namespaces() []string {
-	out := make([]string, 0, len(s.flat)+len(s.cats))
+	out := make([]string, 0, len(s.flat))
 	for ns := range s.flat {
-		out = append(out, ns)
-	}
-	for ns := range s.cats {
 		out = append(out, ns)
 	}
 	sort.Strings(out)
@@ -611,7 +557,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		switch st.depth {
 		case "":
 			// RFC 4918 §9.1 makes a missing Depth infinity, which this
-			// server doesn't walk (a catalog DAG can be large); listings
+			// server doesn't walk (a namespace can be large); listings
 			// take one level.
 			r.Header.Set("Depth", "1")
 			st.depth = "1"
@@ -712,23 +658,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	r = r.WithContext(context.WithValue(r.Context(), stateKey{}, st))
-	if de := st.readOnly(r.Context()); de != nil {
-		if up := st.upFailure(); up != nil && de.status != http.StatusBadGateway && de.status != http.StatusServiceUnavailable {
-			// A read made for it failed for now: that, not a refusal
-			// made of the rest (§H.4 "Answers", v0.86).
-			de = up
-		}
-		// Which tree owns the namespace is a read the answer depends on
-		// (§H.4 "Answers"): one that failed for now carries Retry-After.
-		for k, v := range de.header {
-			w.Header()[k] = v
-		}
-		if de.cause != nil {
-			s.opt.Logf("dav: %s %s: %v", r.Method, r.URL.Path, de)
-		}
-		http.Error(w, de.msg, de.status)
-		return
-	}
 	switch {
 	case r.Body != nil && r.Method == "PUT":
 		r.Body = &bodyReader{ReadCloser: r.Body, st: st}
@@ -764,93 +693,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ew := &errWriter{ResponseWriter: w, st: st, realm: s.realm()}
 	h.ServeHTTP(ew, r)
 	ew.finish()
-}
-
-// readOnly refuses (403) a request that would write in the flat view of
-// a namespace a served file tree owns (§H.2 "A file tree is a catalog":
-// the tree owns the items in its files.ns, and a gateway doesn't also
-// serve files.ns as a writable flat folder): a PUT, DELETE, MKCOL or
-// LOCK there, a MOVE out of it or into it, a COPY into it. It is shown
-// read-only, its files read and copied out as anywhere; its items are
-// written through the tree.
-func (st *reqState) readOnly(ctx context.Context) *davError {
-	var paths []string
-	switch st.method {
-	case "PUT", "DELETE", "MKCOL", "LOCK":
-		paths = []string{st.path}
-	case "MOVE":
-		paths = []string{st.path, st.dst}
-	case "COPY":
-		paths = []string{st.dst}
-	}
-	for _, p := range paths {
-		ns, _, _ := strings.Cut(strings.TrimPrefix(p, "/"), "/")
-		cat, unread, err := st.ownedBy(ctx, ns)
-		switch {
-		case err != nil:
-			if de, ok := upstream(err).(*davError); ok {
-				return de
-			}
-			return &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("%s: file tree settings couldn't be read", p), cause: err}
-		case cat != "":
-			return fail(http.StatusForbidden, "%s is read-only here: file tree %s owns the items of namespace %s (its catalog.files.ns, §H.2), so they are written, moved and deleted through /%s/, not in %s's flat view", p, cat, ns, cat, ns)
-		case unread != "":
-			return fail(http.StatusForbidden, "%s is read-only here for now: file tree %s may own the items of namespace %s (its catalog.files.ns, §H.2), whose flat view isn't written then, and its settings can't be read with your grant, nor were they read with another since this server started; they are once a user whose grant reads catalog %s opens /%s/", p, unread, ns, unread, unread)
-		}
-	}
-	return nil
-}
-
-// ownedBy returns the served catalog whose file tree owns flat namespace
-// ns, the one its catalog.files.ns names (§H.2), "" for none: as the
-// token reads the catalog's settings (nsInfo), else as last read with
-// any grant, the server's own at start included (learn). Where some
-// served catalog's settings are known neither way (a gateway's start
-// reads them without a grant), it fails closed: unread names that
-// catalog, which may own ns; err is a read that failed for now.
-func (st *reqState) ownedBy(ctx context.Context, ns string) (owner, unread string, err error) {
-	if !st.s.flat[ns] {
-		return "", "", nil
-	}
-	cats := make([]string, 0, len(st.s.cats))
-	for cat := range st.s.cats {
-		cats = append(cats, cat)
-	}
-	sort.Strings(cats)
-	for _, cat := range cats {
-		in, err := st.s.nsInfoErr(ctx, st.tk, cat)
-		var files *treeFiles
-		switch {
-		case err == nil && in.files != nil:
-			files = in.files
-			st.s.learn(cat, &catConf{files: in.files, trust: in.trust, trustKnown: in.trustKnown, titled: in.titled})
-		case err == nil && in.notTree != "":
-			// Not a file tree.
-			st.s.learn(cat, nil)
-			continue
-		default:
-			// Not read with this token, refused or failed for now: as
-			// read with another grant.
-			c, ok := st.s.learned(cat)
-			switch {
-			case ok:
-				files = c.files
-			case st.s.settingsRead(cat):
-				continue
-			case err != nil:
-				return "", "", err
-			default:
-				if unread == "" {
-					unread = cat
-				}
-				continue
-			}
-		}
-		if files != nil && files.ns == ns {
-			return cat, "", nil
-		}
-	}
-	return "", unread, nil
 }
 
 // allowed are the methods served (RFC 9110 §10.2.1 Allow).
@@ -2004,9 +1846,7 @@ func (s *Server) userInflight() int64 {
 // with the client sending it, the served namespaces it names, the
 // namespace that verified it, and what was read with it, since another
 // token of the same user may read less (attenuated offline): writers'
-// settings and namespace documents (nsInfo); its catalogs' graphs and the
-// folders a tree service listed to it are kept by its id (views). What is
-// kept for its user is in its principal, shared by every token of the
+// settings and namespace documents (nsInfo). What is kept for its user is in its principal, shared by every token of the
 // user (§H.7), and in its principal's scope for its narrowing (scopeOf).
 type token struct {
 	id string
@@ -2026,18 +1866,12 @@ type token struct {
 
 	mu      sync.Mutex
 	writers map[string]writerAt    // by namespace: §7.4's writer block
-	docs    map[string]nsDocAt     // by namespace: what its document says
-	issued  map[string]issuedGrant // by ns/name: grants a catalog service issued it (catgrants.go)
 	keyHist map[string]*keyHistory // by namespace: its keys over time (kidhist.go)
 }
 
-// newToken makes a token sending its requests with c, but those a
-// catalog service issued it a grant for (route).
+// newToken makes a token sending its requests with c.
 func (s *Server) newToken(id string, c *client.Client, sc *scope, named map[string]bool) *token {
-	tk := &token{id: id, p: sc.p, sc: sc, named: named, used: s.opt.Now(), writers: map[string]writerAt{}, docs: map[string]nsDocAt{},
-		issued: map[string]issuedGrant{}}
-	tk.c = c.With(client.WithTransport(tk.route(s.opt.Now)))
-	return tk
+	return &token{id: id, c: c, p: sc.p, sc: sc, named: named, used: s.opt.Now(), writers: map[string]writerAt{}}
 }
 
 // principal is a user as the server keeps state for them (§H.7): their
@@ -2054,23 +1888,18 @@ type principal struct {
 	inflight int             // requests in flight, over its tokens
 	toks     map[*token]bool // its tokens kept
 
-	ts treeSvc // its writes its tree listings wait for (treesvc.go)
-
 	mu      sync.Mutex
-	held    int64                 // bytes of written files being buffered (hold)
-	scopes  map[string]*scope     // by scopeOf; membership under Server.mu too
-	deletes map[string]ownDelete  // by ns/name: its latest DELETEs
-	trees   map[string]treeDelete // by path: the files of trees its latest DELETEs removed
-	aside   map[string]time.Time  // documents' paths moved aside to a backup, and when
-	guards  map[string][]guard    // by document path: its refused saves' guards, oldest first
+	held    int64                // bytes of written files being buffered (hold)
+	scopes  map[string]*scope    // by scopeOf; membership under Server.mu too
+	deletes map[string]ownDelete // by ns/name: its latest DELETEs
+	aside   map[string]time.Time // documents' paths moved aside to a backup, and when
+	guards  map[string][]guard   // by document path: its refused saves' guards, oldest first
 	nguards int
 	// who the user is as the core records its writes (§H.7 "Users",
 	// wroteAs): its root sub and key thumbprint, or, with authentication
 	// disabled, its X-Author (author); kids, by namespace, the kids that
 	// named key there when the user's grants were verified there (true),
-	// or under which the catalog issued them grants there (false,
-	// §B.11.4), each entry judged by the key its kid named when written
-	// (kidhist.go)
+	// each entry judged by the key its kid named when written (kidhist.go)
 	sub, key, author string
 	kids             map[string]map[string]bool
 }
@@ -2257,48 +2086,6 @@ func (p *principal) forgetDelete(ns, name string) {
 	delete(p.deletes, ns+"/"+name)
 }
 
-// treeDelete is a file of a tree a principal's DELETE removed (§H.5): its
-// placement node in catalog cat, in folder parent, and its tombstone; its
-// item, and the item's tombstone if the DELETE deleted it too.
-type treeDelete struct {
-	cat, node, nodeTomb, parent string
-	itemNS, itemName, itemTomb  string
-	at                          time.Time
-}
-
-// noteTreeDelete remembers that the principal's DELETE of path removed
-// file d.
-func (p *principal) noteTreeDelete(path string, d treeDelete, now time.Time) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.trees) >= maxDeletes {
-		var old string
-		for k, t := range p.trees {
-			if old == "" || t.at.Before(p.trees[old].at) {
-				old = k
-			}
-		}
-		delete(p.trees, old)
-	}
-	d.at = now
-	p.trees[path] = d
-}
-
-// treeDeleted returns the file of a tree the principal's DELETE of path
-// removed within ownDeleteUndo of now.
-func (p *principal) treeDeleted(path string, now time.Time) (treeDelete, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	d, ok := p.trees[path]
-	return d, ok && now.Sub(d.at) <= ownDeleteUndo
-}
-
-func (p *principal) forgetTreeDelete(path string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.trees, path)
-}
-
 // A refused save of a file (a PUT, a COPY of a file, or a MOVE onto an
 // existing file, answered 4xx or 5xx without writing to the core; a case
 // variant refused, §H.2, among them) sets a guard (§H.6):
@@ -2407,12 +2194,13 @@ func (p *principal) guarded(path string, now time.Time) bool {
 
 func (s *Server) newPrincipal(id string) *principal {
 	return &principal{id: id, toks: map[*token]bool{}, scopes: map[string]*scope{}, deletes: map[string]ownDelete{},
-		trees: map[string]treeDelete{}, aside: map[string]time.Time{}, guards: map[string][]guard{}, used: s.opt.Now(),
+		aside: map[string]time.Time{}, guards: map[string][]guard{}, used: s.opt.Now(),
 		kids: map[string]map[string]bool{}}
 }
 
-// maxKids bounds the kids a user's identity keeps for one namespace.
-const maxKids = 16
+// maxKids bounds the kids a user's identity keeps for one namespace, and
+// maxKidNS the namespaces it keeps them for.
+const maxKids, maxKidNS = 16, 64
 
 // verifiedAs notes what GET /ns/{ns}/principal said a grant of user p's
 // is in ns (info): the user's sub and key, if not known yet (local mode's
@@ -2435,27 +2223,15 @@ func (p *principal) verifiedAs(ns string, info *client.PrincipalInfo) {
 	p.addKidLocked(ns, info.Kid, true)
 }
 
-// issuedTo notes that a grant kid signed for the user's sub in ns, which
-// the catalog issued the user (§B.11.4): its writes there are the user's
-// (§H.7).
-func (p *principal) issuedTo(ns, sub, kid string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if sub != "" && sub == p.sub {
-		p.addKidLocked(ns, kid, false)
-	}
-}
-
 // addKidLocked notes kid as one of the user's in ns: verified, one that
-// named the user's key there (verifiedAs), else one the catalog issued it
-// a grant under (issuedTo).
+// named the user's key there (verifiedAs).
 func (p *principal) addKidLocked(ns, kid string, verified bool) {
 	if kid == "" {
 		return
 	}
 	ks := p.kids[ns]
 	if ks == nil {
-		if len(p.kids) >= maxWroteNS {
+		if len(p.kids) >= maxKidNS {
 			return
 		}
 		ks = map[string]bool{}
@@ -2470,8 +2246,7 @@ func (p *principal) addKidLocked(ns, kid string, verified bool) {
 // written by user p as the core records its writes (§H.7 "Users"): with
 // authentication disabled, under its X-Author (author, no grant); else
 // under a grant with its sub and one of its kids in ns, verified when it
-// named the user's key there (verifiedAs), key, else the catalog's kid
-// there for its sub (issuedTo). Which key the kid named when the entry was
+// named the user's key there (verifiedAs), key. Which key the kid named when the entry was
 // written is reqState.wroteAs's to judge.
 func (p *principal) wroteAs(ns string, e client.LogEntry) (known, verified bool, key string) {
 	p.mu.Lock()
@@ -2662,7 +2437,7 @@ type reqState struct {
 	// a tree that couldn't be read), or a COPY's file (open), and saveDoc
 	// whether a PUT's is a flat namespace's document; committed: the
 	// request wrote to the core (a
-	// revision, a catalog node), not counting a restore of the
+	// revision), not counting a restore of the
 	// principal's own DELETE as it was (undoOwnDelete), which undeleted
 	// says it did.
 	saveTo    string
@@ -2682,14 +2457,8 @@ type reqState struct {
 	// which any answer but its 200 or 206 puts back (errWriter)
 	pdf bool
 
-	lists  map[string]*listing     // by directory path
-	graphs map[string]*catGraph    // by catalog
-	fresh  map[string]bool         // by catalog: its graph was read by the request (freshGraph)
-	dirs   map[string]*treeDir     // by catalog/folder node
-	heads  map[string]*client.Head // by ns/name
-	// byNodes: catalogs whose paths the request resolves from their node
-	// documents, a tree service's listing having disagreed (resolveCatalog)
-	byNodes map[string]bool
+	lists map[string]*listing     // by directory path
+	heads map[string]*client.Head // by ns/name
 }
 
 type stateKey struct{}
@@ -2737,11 +2506,9 @@ func (st *reqState) record(err error) error {
 	return de
 }
 
-// changed forgets what the request read, after it wrote, and makes other
-// requests' catalog reads stale.
+// changed forgets what the request read, after it wrote.
 func (st *reqState) changed() {
-	st.lists, st.graphs, st.fresh, st.dirs, st.heads = nil, nil, nil, nil, nil
-	st.s.gen.Add(1)
+	st.lists, st.heads = nil, nil
 }
 
 // slashClean is path.Clean of name rooted at /.

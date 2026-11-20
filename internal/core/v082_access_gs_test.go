@@ -62,7 +62,7 @@ func TestV082AccessGSEntryAnyMember(t *testing.T) {
 		"the key's roles":    v82accessOp("add", "/keys/1/roles", map[string]any{"allow": []any{"reader"}}),
 		"the key's attrs":    v82accessOp("add", "/keys/1/attrs", true),
 		"the key's maxTtl":   v82accessOp("replace", "/keys/1/maxTtl", "PT14M"),
-		"the key's maxLag":   v82accessOp("add", "/keys/1/maxLag", "PT50S"),
+		"the key's rate":     v82accessOp("add", "/keys/1/rate", map[string]any{"rate": 50.0, "burst": 50.0}),
 		"the key's can":      v82accessOp("replace", "/keys/1/can", []any{"read", "append"}),
 		"the role's can":     v82accessOp("replace", "/roles/reader/can", []any{"read", "append"}),
 		"the role's x-label": v82accessOp("add", "/roles/reader/x-label", "Readers"),
@@ -70,7 +70,7 @@ func TestV082AccessGSEntryAnyMember(t *testing.T) {
 	keeps := map[string]map[string]any{
 		"another key's member": v82accessOp("add", "/keys/0/maxTtl", "PT2H"),
 		"another role":         v82accessOp("add", "/roles/other", map[string]any{"can": []any{"read", "append"}}),
-		"a limit":              v82accessOp("add", "/maxLag", "PT55S"),
+		"a member of its own":  v82accessOp("add", "/x-note", "PT55S"),
 	}
 	for name, patch := range ends {
 		t.Run(name, func(t *testing.T) {
@@ -134,9 +134,7 @@ func TestV082AccessGSEntryAnyMember(t *testing.T) {
 
 // §B.11.9 gs: the changes that ended a cookie before v0.82 still do, and
 // are 403 too: a role gaining a rule (its scope digest differs, and her
-// next exchange gives another gs), and the key's requireAt, which is a
-// member of its entry and also decides whether matches trusts the catalog
-// at all (with requireAt true it trusts none, and is no longer covered).
+// next exchange gives another gs), the key or the role removed.
 func TestV082AccessGSEntryEarlierEndings(t *testing.T) {
 	t.Parallel()
 	for name, patch := range map[string]map[string]any{
@@ -177,7 +175,7 @@ func TestV082AccessGSEntryPerAt(t *testing.T) {
 	if old == nil {
 		t.Fatalf("before: %d", st)
 	}
-	w.patchConfig("matches", v82accessOp("add", "/keys/1/maxLag", "PT50S"))
+	w.patchConfig("matches", v82accessOp("add", "/keys/1/rate", map[string]any{"rate": 50.0, "burst": 50.0}))
 	if _, st := v76fHeads(t, w, "matches", gs, old.At, cookie); st != 0 {
 		t.Fatalf("the earlier at before a new exchange: %d", st)
 	}
@@ -246,7 +244,7 @@ func TestV082AccessGSStoredWithoutEntry(t *testing.T) {
 }
 
 // The window between a narrowing and the next exchange, for readers who
-// share a gs: bo and cy, both in editors through catalog-01, have one gs
+// share a gs: bo and cy, both in editors through reader-01, have one gs
 // and so one filtered_gs row (§B.11.9 gs: "The origin keeps, per namespace
 // and gs ..."), and a cookie names its prefix and expiry alone (§C.5.3).
 // The key's attrs scope is narrowed to cy's alone (a sub scope would give
@@ -390,7 +388,7 @@ func TestV082AccessGSEntryAfterOtherCookies(t *testing.T) {
 	if st := v82accessCookieReads(t, w, gs, noExp); st != 403 {
 		t.Fatalf("a cookie without an expiry, before any change: %d, want 403", st)
 	}
-	w.patchConfig("matches", v82accessOp("add", "/keys/1/maxLag", "PT50S"))
+	w.patchConfig("matches", v82accessOp("add", "/keys/1/rate", map[string]any{"rate": 50.0, "burst": 50.0}))
 	v82accessLater(w, time.Second)
 	cookie2, _ := v82accessCookie(t, w, w.li())
 	if st := v82accessCookieReads(t, w, gs, cookie2); st != 0 {
@@ -411,8 +409,8 @@ func TestV082AccessGSEntryAfterOtherCookies(t *testing.T) {
 // text(trunc160(sha256(canonical({ "key": K, "roles": R })))).
 func TestV082AccessEntryDigestVector(t *testing.T) {
 	t.Parallel()
-	key := map[string]any{"kid": "catalog-01", "alg": "ed25519", "pub": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-		"can": []any{"read"}, "requireAt": "cat-season", "maxTtl": "PT15M",
+	key := map[string]any{"kid": "reader-01", "alg": "ed25519", "pub": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+		"can": []any{"read"}, "maxTtl": "PT15M",
 		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}}
 	roles := map[string]any{"reader": map[string]any{"can": []any{"read"}}}
 	for _, c := range []struct {
@@ -420,9 +418,9 @@ func TestV082AccessEntryDigestVector(t *testing.T) {
 		roles map[string]any
 		want  string
 	}{
-		{"one role", roles, "1tgoxfk3zovxbwszogjaifs34qebbmbx7"},
-		{"no roles", map[string]any{}, "1rdlzgylsx4ico373fnjq5hsd3ekeghxy"},
-		{"nil roles, as {}", nil, "1rdlzgylsx4ico373fnjq5hsd3ekeghxy"},
+		{"one role", roles, "1tm77qzwtfacpjdi6gn2z4qpyvngm6vlb"},
+		{"no roles", map[string]any{}, "1irlyte76oluqesl6gq2yhlv5d6dezqa6"},
+		{"nil roles, as {}", nil, "1irlyte76oluqesl6gq2yhlv5d6dezqa6"},
 	} {
 		if got := entryDigest(key, c.roles); got != c.want {
 			t.Errorf("%s: %s, want %s", c.what, got, c.want)

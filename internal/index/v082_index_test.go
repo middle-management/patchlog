@@ -11,14 +11,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/index"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // V82-05 (v0.82), SVC-10: an index cookie ends on any change to the entry
@@ -47,7 +45,7 @@ func newV82Whole(t *testing.T) *v77docs {
 	d.x = startSvcWith(t, s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "svc:indexer", []string{"docs"}, []string{"read"}))),
 		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"docs"}, untyped: true, now: s.Now},
 		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate, ev
 		})
 	d.x.caughtUp("docs")
 	return d
@@ -57,7 +55,7 @@ func newV82Whole(t *testing.T) *v77docs {
 // subject set of its one marker, reads:{ns}:{k}, k's key: string by kid
 // and pub (§A.4 gs, v0.85).
 func readsGS(ns string, k clienttest.Key) string {
-	return grantcheck.SubjectSetID([]string{"reads:" + ns + ":" + catvis.KeySubject(k.Kid, k.Pub)})
+	return grantcheck.SubjectSetID([]string{"reads:" + ns + ":" + grantcheck.KeySubject(k.Kid, k.Pub)})
 }
 
 // v82Grant is k's grant for sub with the role reader, expiring exp from
@@ -377,8 +375,8 @@ func TestV082ScopeCookieEndsOnAnyMember(t *testing.T) {
 }
 
 // TestV082GCookieEndsOnAnyMember (SVC-10; §B.11.9 gs, v0.82): a partial
-// reader's cookie for reads:matches:g:{gs}, through catalog-01 with the
-// role reader, is 403 once matches changes catalog-01's maxTtl, which no
+// reader's cookie for reads:matches:g:{gs}, through reader-01 with the
+// role reader, is 403 once matches changes reader-01's maxTtl, which no
 // scope digest reads, or gives reader another verb, judged by matches's
 // document at the checkpoint, until the reader exchanges again.
 func TestV082GCookieEndsOnAnyMember(t *testing.T) {
@@ -387,7 +385,7 @@ func TestV082GCookieEndsOnAnyMember(t *testing.T) {
 		name string
 		op   map[string]any
 	}{
-		{"catalog-01's maxTtl", map[string]any{"op": "replace", "path": "/keys/1/maxTtl", "value": "PT20M"}},
+		{"reader-01's maxTtl", map[string]any{"op": "replace", "path": "/keys/1/maxTtl", "value": "PT20M"}},
 		{"reader gains a verb", map[string]any{"op": "replace", "path": "/roles/reader/can", "value": []any{"read", "append"}}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -455,7 +453,7 @@ func TestV082BranchCookieFollowsBaseKey(t *testing.T) {
 	x := startSvcWith(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", both, []string{"read"}))),
 		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"docs"}, untyped: true, branches: true, now: s.Now},
 		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate
+			o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate
 		})
 	x.caughtUp("docs")
 	x.caughtUp("docs-b")

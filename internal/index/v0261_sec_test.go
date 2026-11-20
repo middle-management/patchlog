@@ -18,8 +18,8 @@ import (
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/index"
 	"github.com/middle-management/patchlog/internal/seal"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // v0261NarrowPR is pr, public, with one document, and an index of it;
@@ -461,7 +461,7 @@ func v0261Start(w *v75x, db string, rebuild, snapshot bool, nss ...string) *svc 
 	x := startSvcWith(w.t, w.s.Client(w.t, client.WithBearer(w.k.Grant(w.t, w.s.Now(), "svc:indexer", all, []string{"read"}))),
 		svcOpts{db: db, ns: nss, untyped: true, rebuild: rebuild, now: w.s.Now},
 		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate, ev
 			if snapshot {
 				o.FollowOptions = append(o.FollowOptions, follow.WithSnapshot())
 			}

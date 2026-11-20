@@ -21,12 +21,10 @@ func TestV086MaxValidationStepsFlag(t *testing.T) {
 	if n, err := validationSteps(7); n != 7 || err != nil {
 		t.Errorf("7: %d %v", n, err)
 	}
-	var tr treeCmd
-	parseArgs(t, &tr, "--catalog", "cat")
 	var ix indexCmd
 	parseArgs(t, &ix, "--ns", "docs")
-	if tr.MaxValidationSteps != core.DefaultMaxValidationSteps || ix.MaxValidationSteps != core.DefaultMaxValidationSteps {
-		t.Errorf("service defaults: tree %d, index %d", tr.MaxValidationSteps, ix.MaxValidationSteps)
+	if ix.MaxValidationSteps != core.DefaultMaxValidationSteps {
+		t.Errorf("service default: index %d", ix.MaxValidationSteps)
 	}
 	parseArgs(t, &ix, "--ns", "docs", "--max-validation-steps", "1234")
 	if ix.MaxValidationSteps != 1234 {

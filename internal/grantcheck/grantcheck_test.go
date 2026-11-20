@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
@@ -260,52 +259,6 @@ func TestBranchKeysFollowBase(t *testing.T) {
 	}
 	if f.serverReads(t, "rel", "a", ownTok) {
 		t.Fatal("server ignores the base revocation")
-	}
-}
-
-func TestRequireAt(t *testing.T) {
-	ctx := context.Background()
-	f := newFixture(t)
-	at := clienttest.NewKey("at")
-	e := at.Entry("read")
-	e["requireAt"] = true
-	cfgID := must(f.adminC.NSHead(ctx, "sec")).Config
-	must(f.adminC.PatchConfig(ctx, "sec", cfgID, []any{map[string]any{"op": "add", "path": "/keys/-", "value": e}}))
-	head := must(f.adminC.NSHead(ctx, "sec")).ID
-
-	// Issuance is the root's nbf, the key setting no maxTtl (§C.4).
-	nbf := f.s.Now().Format(time.RFC3339)
-	ok := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"at": head, "nbf": nbf})
-	if _, err := f.ch.Verify(ctx, "sec", ok); err != nil {
-		t.Fatalf("at at head: %v", err)
-	}
-	missing := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"nbf": nbf})
-	bogus := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"at": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "nbf": nbf})
-	// Without nbf or a key maxTtl, nothing dates its issuance (v0.65).
-	undated := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"at": head})
-	for _, tok := range []string{missing, bogus, undated} {
-		if _, err := f.ch.Verify(ctx, "sec", tok); authStatus(err) != 403 {
-			t.Fatalf("bad at accepted: %v", err)
-		}
-	}
-	// An older at is fine within the default maxLag (60 s) of issuance,
-	// however long ago the head moved on.
-	must(f.adminC.CreateDoc(ctx, "sec", "z", map[string]any{}))
-	if _, err := f.ch.Verify(ctx, "sec", ok); err != nil {
-		t.Fatalf("older at: %v", err)
-	}
-	// Issuance is nbf here (the key sets no maxTtl): a grant issued 61 s
-	// after its at stopped being the head is refused, one issued at 59 s
-	// isn't, and both stay so as the clock moves.
-	moved := f.s.Now()
-	late := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"at": head, "nbf": moved.Add(61 * time.Second).Format(time.RFC3339)})
-	inTime := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"at": head, "nbf": moved.Add(59 * time.Second).Format(time.RFC3339)})
-	f.s.Clock.Advance(2 * time.Minute)
-	if _, err := f.ch.Verify(ctx, "sec", late); authStatus(err) != 403 {
-		t.Fatalf("at older than maxLag at issuance: %v", err)
-	}
-	if _, err := f.ch.Verify(ctx, "sec", inTime); err != nil {
-		t.Fatalf("at within maxLag at issuance: %v", err)
 	}
 }
 

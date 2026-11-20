@@ -390,7 +390,7 @@ func TestServiceKeys(t *testing.T) {
 	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
 	exp := now.Add(MaxGrantTTL).Unix()
 	origin := NewCookies("", testKey)
-	svc := NewCookies("catalog-cat", testKey)
+	svc := NewCookies("svc-cat", testKey)
 	svc.Vouches = func(p string) bool { return strings.HasPrefix(p, "/cat/g/") && strings.Count(p, "/") == 3 }
 	// A Vouches that would allow core prefixes is overruled.
 	greedy := NewCookies("greedy", testKey)

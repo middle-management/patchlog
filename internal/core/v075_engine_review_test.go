@@ -13,8 +13,8 @@ import (
 func TestV075EngineGSPerNamespace(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
-	// results: matches's document, same key catalog-01 and same roles.
-	results := map[string]any{"read": "grant", "keys": []any{w.kEntry(), map[string]any{"kid": "catalog-01", "alg": "ed25519", "pub": w.catPub,
+	// results: matches's document, same key reader-01 and same roles.
+	results := map[string]any{"read": "grant", "keys": []any{w.kEntry(), map[string]any{"kid": "reader-01", "alg": "ed25519", "pub": w.catPub,
 		"can": []any{"read"}, "maxTtl": "PT15M",
 		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": v75Visible}}}},
 		"roles": map[string]any{"reader": map[string]any{"can": []any{"read"}}}}

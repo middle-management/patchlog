@@ -16,8 +16,8 @@ import (
 // a cookie (FCORE-3), a branch among them since v0.78; and a stored
 // subject set is bound to its key's pub (FSVC-7).
 
-// v76fWorld is a v75World whose matches also has key fan, without
-// requireAt and with a scope rule testing /resource by type, so its grants
+// v76fWorld is a v75World whose matches also has key fan, with a scope
+// rule testing /resource by type, so its grants
 // read matches and its branches in part; root's $access gives fan-club
 // reader too. With branch, matches-r7 is cut after seeding.
 type v76fWorld struct {
@@ -203,7 +203,7 @@ func TestV076OriginGSBoundToPub(t *testing.T) {
 	for _, c := range []struct {
 		name, ns string
 		kid      int // index of the key in matches's keys
-	}{{"matches, catalog-01", "matches", 1}} {
+	}{{"matches, reader-01", "matches", 1}} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			w := newV76fWorld(t, c.ns != "matches")
@@ -265,7 +265,7 @@ func TestV076OriginGSBoundToPub(t *testing.T) {
 				t.Fatalf("the old grant's exchange: %v, want 401", err)
 			}
 			// A grant of the new key exchanges for a gs of its own, bound
-			// to the new pub (catvis.KeySubject); the old gs stays 403.
+			// to the new pub (grantcheck.KeySubject); the old gs stays 403.
 			fresh := grantOf(newPriv)
 			res, err = w.e.IssueEdgeGrants(ctx, []string{fresh.Bearer})
 			if err != nil || len(res.Grants) != 1 || res.Grants[0].GS == "" || res.Grants[0].GS == gs {
@@ -398,7 +398,7 @@ func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
 // scope rules never share a gs, so neither's filtered_gs row judges the
 // other's cookies: once fan's pub is replaced, a cookie from fan's grant
 // is 403 whatever is exchanged through fan2, before or after, and fan2's
-// cookie reads on. Before catvis.KeySubject both got one gs, whose row
+// cookie reads on. Before grantcheck.KeySubject both got one gs, whose row
 // kept the kid and pub of the last exchange.
 func TestV076OriginGSPerKey(t *testing.T) {
 	t.Parallel()

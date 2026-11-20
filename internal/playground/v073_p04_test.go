@@ -72,9 +72,8 @@ FUNCTIONS
 // ENC-1: a sealed namespace document is bound to pl {ns, id, kind: "doc"}
 // (§E.2.2). Bytes sealed before v0.63 with kind "config" don't open (v0.78,
 // "Reading this spec": no compatibility with data written under an earlier
-// draft; since v0.81 they would be under K_e, which seals nothing). The
-// catalog tab reads namespace documents through nsHeadDoc, like refreshNS
-// (both take nsDocPL).
+// draft; since v0.81 they would be under K_e, which seals nothing).
+// nsHeadDoc reads namespace documents like refreshNS (both take nsDocPL).
 func TestNSHeadDocPLWithNode(t *testing.T) {
 	t.Parallel()
 	node, err := exec.LookPath("node")
@@ -90,7 +89,7 @@ func TestNSHeadDocPLWithNode(t *testing.T) {
 		fns = append(fns, jsFunction(t, js, f))
 	}
 	key := seal.NewKey()
-	doc := []byte(`{"catalog":{"trust":["content"]}}`)
+	doc := []byte(`{"x-note":"content"}`)
 	type nsCase struct {
 		NS   string `json:"ns"`
 		Head string `json:"head"`
@@ -138,7 +137,7 @@ func TestNSHeadDocPLWithNode(t *testing.T) {
 		}
 		if opened := g.Doc != nil; opened != want[i] {
 			t.Errorf("case %d: opened %v, want %v", i, opened, want[i])
-		} else if opened && g.Doc["catalog"] == nil {
+		} else if opened && g.Doc["x-note"] == nil {
 			t.Errorf("case %d: doc %v", i, g.Doc)
 		}
 	}

@@ -23,7 +23,7 @@
 //	cdn_repurge(id, tags, due)       second CDN purges (package repurge), kept by a rebuild
 //	edge_subjects, edge_buckets      the markers of each subject set the service minted edge
 //	                                 grants for, until the last of them expires, and its
-//	                                 exchangeRate buckets (svcedge.Store, edgegrants.go)
+//	                                 exchangeRate buckets (edgeStore, edgegrants.go)
 //	edge_filters(marker, filter, exp) what each scope or g: marker of those stands for (markerRec)
 //	edge_gs(marker, subjects, kid, roles, pub, exp)  and, for a g: marker (§B.11.9), its subjects;
 //	                                      its kid, roles and pub are no longer read (edge_gs_keys)
@@ -91,7 +91,6 @@ import (
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/repurge"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // Purger purges the index service's own cache tags (§A.1: a purge "also
@@ -159,10 +158,10 @@ type Options struct {
 	EdgeGrants *edge.Cookies
 	// ExchangeRate is the exchangeRate bucket each principal draws one
 	// token from per exchange at POST /edge-grants (§C.5.2, §6.6; default
-	// svcedge.DefaultExchangeRate). It is a deployment's limit, so the
+	// DefaultExchangeRate). It is a deployment's limit, so the
 	// service has its own buckets, shared by every instance on its
-	// database DB (§B.11.5, svcedge.Store).
-	ExchangeRate svcedge.Rate
+	// database DB (§B.11.5, edgeStore).
+	ExchangeRate Rate
 	// Now is the clock for grant checks, kept results and the due times
 	// of second purges (default time.Now).
 	Now func() time.Time
@@ -208,7 +207,7 @@ type Index struct {
 	sealed  *derived.Cache // sealed results
 	kept    *kept.Store    // results kept past their checkpoint
 	repurge *repurge.Queue // second CDN purges
-	edge    *svcedge.Store // the service's edge grants (EdgeGrants)
+	edge    *edgeStore     // the service's edge grants (EdgeGrants)
 
 	fmu     sync.Mutex
 	filters map[string]keptFilter // scope or g: marker -> what it stands for (edge_filters, edge_gs)
@@ -355,7 +354,7 @@ func (ix *Index) Origin() string { return ix.origin }
 var migrations embed.FS
 
 // resetStmts empty what a rebuild replays (cdn_repurge stays, and so do
-// the edge grants' tables, edge_filters, edge_gs and svcedge.Store's), in
+// the edge grants' tables, edge_filters, edge_gs and edgeStore's), in
 // one transaction. checkpoints_bootstrap too: a snapshot left part-way would
 // otherwise be resumed, not replayed from its first page. text, made by
 // initSchema rather than a migration, is dropped, so a rebuild decides

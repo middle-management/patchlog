@@ -19,9 +19,9 @@ import (
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/index"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // p37World is pa and pb (read: grant) and pub (public), followed by one
@@ -32,10 +32,10 @@ type p37World struct {
 	x             *svc
 	admin, issuer clienttest.Key
 	db            string
-	rate          svcedge.Rate
+	rate          index.Rate
 }
 
-func p37Setup(t *testing.T, rate svcedge.Rate) *p37World {
+func p37Setup(t *testing.T, rate index.Rate) *p37World {
 	t.Helper()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
@@ -178,7 +178,7 @@ func p37Hits(body map[string]any) []string {
 // at another gs, which it doesn't cover. DELETE /edge-grants withdraws.
 func TestV073P37IndexEdgeGrants(t *testing.T) {
 	t.Parallel()
-	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	w := p37Setup(t, index.DefaultExchangeRate)
 	x := w.x
 	amy := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"pa", "pb"}, []string{"read"})
 	carl := w.issuer.Grant(t, w.s.Now(), "user:carl", []string{"pa"}, []string{"read"},
@@ -276,11 +276,11 @@ func path(p string) (ns, gs string) {
 func TestV073P37IndexExchangeRateShared(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	rate := svcedge.Rate{Rate: 0.001, Burst: 1}
+	rate := index.Rate{Rate: 0.001, Burst: 1}
 	w := p37Setup(t, rate)
 	sdb := must(sql.Open("sqlite", sqlitedsn.DSN(w.db, "_pragma=busy_timeout(10000)")))
 	t.Cleanup(func() { sdb.Close() })
-	other := must(svcedge.NewStore(ctx, sdb))
+	other := index.NewEdgeStore(sdb)
 	amy := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"pa"}, []string{"read"})
 	w.exchange(t, w.x, amy)
 	if wait := must(other.Draw(ctx, w.s.Now(), rate, []string{"user:amy\x00issuer"})); wait == 0 {
@@ -567,7 +567,7 @@ func p37CoreExchange(t *testing.T, s *clienttest.Server, token string) (int, map
 func TestV073P37ExchangePurged(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	w := p37Setup(t, index.DefaultExchangeRate)
 	op := w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "user:root", []string{"pa", "pb"}, []string{"read", "config", "purge-ns"})))
 	heads := map[string]string{}
 	purge := func(ns string) {
@@ -620,7 +620,7 @@ func TestV073P37ExchangePurged(t *testing.T) {
 // it fixes gets its scope marker's cookies.
 func TestV073P37ExchangeFixedNames(t *testing.T) {
 	t.Parallel()
-	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	w := p37Setup(t, index.DefaultExchangeRate)
 	test := func(v string) map[string]any { return map[string]any{"op": "test", "path": "/resource", "value": v} }
 	for _, c := range []struct {
 		name  string

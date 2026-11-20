@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
@@ -24,7 +23,7 @@ func v077xCookie(t *testing.T, w *v75World, cred Credentials) (Credentials, stri
 	return Credentials{Edge: &EdgeGrant{NS: g.NS, GS: g.GS, Prefix: "/ns/" + g.NS + "/g/" + g.GS, Exp: w.now().Add(10 * time.Minute)}}, g.GS
 }
 
-// Tree-derived access 111: li through access-02, bo through catalog-01,
+// Access 111: li through access-02, bo through reader-01,
 // same deciding subjects and rules -> different gs. access-02's pub then
 // changes and a third reader exchanges under the new key -> li's old
 // cookie at a later at -> 403; her exchange under the old grant -> 401.
@@ -33,17 +32,17 @@ func TestV077XconfScenario111(t *testing.T) {
 	a2Pub, a2Priv := grant.GenerateKey()
 	w := newV75World(t, v75Opts{matches: func(doc map[string]any) {
 		doc["keys"] = append(doc["keys"].([]any), map[string]any{"kid": "access-02", "alg": "ed25519", "pub": a2Pub,
-			"can": []any{"read"}, "requireAt": "cat-season", "maxTtl": "PT15M",
+			"can": []any{"read"}, "maxTtl": "PT15M",
 			"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}})
 	}})
 	w.seed()
 	grantBy := func(priv []byte, kid, sub string) Credentials {
 		return w.cred(priv, map[string]any{"kid": kid, "sub": sub, "groups": []any{"editors", "interns"}, "roles": []any{"reader"},
-			"ns": []any{"matches"}, "can": []any{"read"}, "at": map[string]any{"ns": "cat-season", "id": w.head("cat-season")},
+			"ns": []any{"matches"}, "can": []any{"read"},
 			"exp": w.now().Add(10 * time.Minute).UTC().Format(time.RFC3339)})
 	}
 	li := grantBy(a2Priv, "access-02", "user:li")
-	bo := grantBy(w.catPriv, "catalog-01", "user:li")
+	bo := grantBy(w.catPriv, "reader-01", "user:li")
 	liCookie, liGS := v077xCookie(t, w, li)
 	_, boGS := v077xCookie(t, w, bo)
 	if liGS == boGS {
@@ -62,7 +61,7 @@ func TestV077XconfScenario111(t *testing.T) {
 	}
 }
 
-// Tree-derived access 112 (key half): matches keeps catalog-01 but drops
+// Tree-derived access 112 (key half): matches keeps reader-01 but drops
 // read from its can -> li on her cookie at a later at -> 403.
 func TestV077XconfScenario112Key(t *testing.T) {
 	t.Parallel()
@@ -74,12 +73,12 @@ func TestV077XconfScenario112Key(t *testing.T) {
 	}
 	w.patchConfig("matches", map[string]any{"op": "replace", "path": "/keys/1/can", "value": []any{"create"}})
 	if red, st := v76fRedirect(t, w, "matches", gs, cookie); st != 403 {
-		t.Errorf("after catalog-01 lost read: %+v %d, want 403", red, st)
+		t.Errorf("after reader-01 lost read: %+v %d, want 403", red, st)
 	}
 }
 
 // Tree-derived access 113 (origin half): after matches-r7 is created,
-// matches edits only catalog-01's maxTtl -> a partial reader of the branch
+// matches edits only reader-01's maxTtl -> a partial reader of the branch
 // -> filtered /heads 403; the exchange gives no /ns/matches-r7/g/{gs}.
 // Since v0.78 no branch is covered (§B.11.9 Where), before the edit too.
 func TestV077XconfScenario113(t *testing.T) {
@@ -111,7 +110,7 @@ func TestV077XconfScenario113(t *testing.T) {
 	}
 }
 
-// Grant scope 63 and 64: private namespace naming no catalog. A grant
+// Grant scope 63 and 64: a private namespace. A grant
 // fixed to derby -> namespace log or events -> 403, never 404; a grant
 // whose block rule is not /resource = "secret" -> /r/priv/secret 404,
 // events 403.
@@ -178,7 +177,7 @@ func TestV077XconfScenario118(t *testing.T) {
 
 // Cross-review (conformance lens), §B.11.9 gs: a gs's subjects carry "the
 // string scope:{digest} of §A.4's marker for {ns}", whose digest covers
-// the rules and the key's key: string (catvis.ScopeKeyDigest), not the
+// the rules and the key's key: string (grantcheck.ScopeKeyDigest), not the
 // rules' digest alone.
 func TestV077XrevGSScopeSubjectIsMarkerDigest(t *testing.T) {
 	t.Parallel()
@@ -196,11 +195,11 @@ func TestV077XrevGSScopeSubjectIsMarkerDigest(t *testing.T) {
 			t.Fatal("li's reads refer to /now")
 		}
 		fv := v075View(t, t2, "matches", li)
-		want := catvis.ScopePrefix + catvis.ScopeKeyDigest(d, a.verified.Key.Kid, keyPub(*a.verified.Key))
+		want := grantcheck.ScopePrefix + grantcheck.ScopeKeyDigest(d, a.verified.Key.Kid, keyPub(*a.verified.Key))
 		if !slices.Contains(fv.subjects, want) {
 			t.Errorf("subjects %v, want %s, §A.4's marker digest", fv.subjects, want)
 		}
-		if slices.Contains(fv.subjects, catvis.ScopePrefix+d) {
+		if slices.Contains(fv.subjects, grantcheck.ScopePrefix+d) {
 			t.Errorf("subjects %v carry the rules' digest alone", fv.subjects)
 		}
 	})

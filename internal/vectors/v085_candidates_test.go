@@ -22,7 +22,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -57,7 +56,7 @@ func loadCandidates(t *testing.T) candidatesFile {
 
 // C.4 (SERVICES §E.2.6 Whole-response sealing, §A.4, §B.11.9 gs): the
 // key: string of demo's key ops-2026 with I.14's pub, as the reference
-// binds a gs to a key (catvis.KeySubject: canonical([kid, pub]), pub the
+// binds a gs to a key (grantcheck.KeySubject: canonical([kid, pub]), pub the
 // key entry's base64url string, the reading the candidates call
 // underdetermined); the marker reads:demo:{key: string} and the gs over
 // that one marker (grantcheck.SubjectSetID); the view of §I.23's query at
@@ -72,7 +71,7 @@ func TestV085C4WholeResponse(t *testing.T) {
 	t.Parallel()
 	p := loadCandidates(t).C4
 	i23 := loadAddendumI(t).I23
-	ks := catvis.KeySubject(p.Kid, p.Pub)
+	ks := grantcheck.KeySubject(p.Kid, p.Pub)
 	if ks != p.KeySubject {
 		t.Errorf("the key: string of %s is %s, want %s", p.Kid, ks, p.KeySubject)
 	}

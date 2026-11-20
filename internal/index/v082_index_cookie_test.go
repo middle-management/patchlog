@@ -150,9 +150,9 @@ func TestV082ScopeCookieRevivedByAnotherReader(t *testing.T) {
 }
 
 // TestV082GCookieNotRevivedByAnotherReader: the same for a g: marker
-// (§B.11.9 gs). al and bo, in the same groups through catalog-01, share
+// (§B.11.9 gs). al and bo, in the same groups through reader-01, share
 // reads:matches:g:{gs} and, their grants expiring together, a cookie.
-// matches changes catalog-01's maxTtl, which neither the gs nor the
+// matches changes reader-01's maxTtl, which neither the gs nor the
 // scope digest reads: the cookie is 403, bo's exchange gives him another
 // for the same prefix, and the one al holds stays 403 until she
 // exchanges, for another of her own.
@@ -202,7 +202,7 @@ func TestV082GCookieNotRevivedByAnotherReader(t *testing.T) {
 	w.x.caughtUp("matches")
 	w.x.ix.ExpireGrantChecks()
 	if got := status(path, alC); got != 403 {
-		t.Fatalf("al under her cookie once catalog-01's maxTtl changed: %d", got)
+		t.Fatalf("al under her cookie once reader-01's maxTtl changed: %d", got)
 	}
 	boPath, boC = exchange(bo)
 	if boPath != path || value(path, boC) == value(path, alC) {

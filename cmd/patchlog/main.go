@@ -48,7 +48,6 @@ type runner interface{ run(name string) }
 type cli struct {
 	Serve   *serveCmd   `arg:"subcommand:serve" group:"Server commands" help:"run the patch-log server"`
 	Index   *indexCmd   `arg:"subcommand:index" group:"Server commands" help:"run the search index service (Addendum A)"`
-	Tree    *treeCmd    `arg:"subcommand:tree" group:"Server commands" help:"run the tree service, or with --access the catalog service (Addendum B); tree ls lists a catalog"`
 	Dav     *davCmd     `arg:"subcommand:dav" group:"Server commands" help:"serve namespaces over WebDAV (a prototype)"`
 	Streams *streamsCmd `arg:"subcommand:streams" group:"Server commands" help:"run the stream proxy (TOOLS Addendum J.1-J.4); streams read prints a stream"`
 
@@ -116,7 +115,7 @@ $PATCHLOG_AUTHOR; resources are named NS/NAME, and JSON is given inline, as
 
 // telemetryCommands are the commands that set up OpenTelemetry, if
 // configured by OTEL_* (off by default).
-var telemetryCommands = []string{"serve", "index", "tree", "dav", "streams", "merge", "rebase", "janitor", "export", "import", "bundle", "archive", "schema"}
+var telemetryCommands = []string{"serve", "index", "dav", "streams", "merge", "rebase", "janitor", "export", "import", "bundle", "archive", "schema"}
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -176,7 +175,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error:", err)
 		return 2
 	}
-	if slices.Contains(telemetryCommands, names[0]) && !((names[0] == "tree" || names[0] == "streams") && len(names) > 1) { // tree ls and streams read are clients, not the services
+	if slices.Contains(telemetryCommands, names[0]) && !(names[0] == "streams" && len(names) > 1) { // streams read is a client, not the service
 		// Flushed when the command returns (after a server's graceful
 		// shutdown), not on log.Fatal.
 		defer startTelemetry(names[0])()
@@ -245,7 +244,6 @@ type serveCmd struct {
 	Dev                 bool          `arg:"--dev" help:"disable authentication (development only); X-Author names the author"`
 	Playground          bool          `arg:"--playground" default:"true" help:"serve the web playground at /playground/ (--playground=false to turn it off)"`
 	InlinePDF           bool          `arg:"--inline-pdf" help:"serve application/pdf blobs for inline display, without the sandbox that blanks Chromium's viewer, instead of with Content-Disposition: attachment (§7.8)"`
-	TreeURL             []string      `arg:"--tree-url,separate" placeholder:"[CATALOG=]URL" help:"tree service (Addendum B) the playground reads through a read-only proxy at /playground/tree/, e.g. http://tree:8082; CATALOG=URL maps one catalog to its own (repeatable)"`
 	IndexURL            string        `arg:"--index-url" placeholder:"URL" help:"search index (Addendum A) the playground reads through a read-only proxy at /playground/index/, e.g. http://index:8081; one index serves several namespaces"`
 	SchemaFetch         bool          `arg:"--schema-fetch" help:"let the playground's schema import fetch http(s) URLs (off: it takes uploaded files only); private, loopback and link-local addresses are refused unless the host is in --schema-fetch-hosts"`
 	SchemaFetchHosts    string        `arg:"--schema-fetch-hosts" placeholder:"H,H" help:"comma-separated hosts --schema-fetch is limited to, e.g. www.schemastore.org,raw.githubusercontent.com (also trusted with private addresses)"`
@@ -425,15 +423,6 @@ func (a *serveCmd) run(string) {
 	} else if a.MasterKeyCreate {
 		log.Fatal("--master-key-create needs --master-key")
 	}
-	var treeProxy http.Handler
-	if len(a.TreeURL) > 0 {
-		if !a.Playground {
-			log.Fatal("--tree-url needs the playground (it proxies under " + server.TreeProxyPrefix + ")")
-		}
-		if treeProxy, err = server.NewTreeProxy(a.TreeURL...); err != nil {
-			log.Fatal(err)
-		}
-	}
 	var indexProxy http.Handler
 	if a.IndexURL != "" {
 		if !a.Playground {
@@ -468,7 +457,7 @@ func (a *serveCmd) run(string) {
 	if a.InlinePDF {
 		sopts = append(sopts, server.WithInlinePDF())
 	}
-	srv := &http.Server{Addr: a.Addr, Handler: a.corsArgs.wrap(handler(server.New(e, sopts...), a.Playground, treeProxy, indexProxy, playground.Options{SchemaFetch: a.SchemaFetch, SchemaFetchHosts: splitList(a.SchemaFetchHosts)})), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: a.Addr, Handler: a.corsArgs.wrap(handler(server.New(e, sopts...), a.Playground, indexProxy, playground.Options{SchemaFetch: a.SchemaFetch, SchemaFetchHosts: splitList(a.SchemaFetchHosts)})), ReadHeaderTimeout: 10 * time.Second}
 	ls := a.shutdownArgs.server("patchlog", srv, e.Ping)
 	sigCtx, sigs := shutdownSignals("patchlog")
 	ln, err := net.Listen("tcp", a.Addr)
@@ -478,9 +467,6 @@ func (a *serveCmd) run(string) {
 	log.Printf("patchlog %s listening on %s (origin %s, dev=%v)", version, a.Addr, a.Origin, a.Dev)
 	if a.Playground {
 		log.Printf("playground: %s%s", localURL(a.Addr), playground.Prefix)
-	}
-	if treeProxy != nil {
-		log.Printf("tree proxy: %s%s -> %s (GET/HEAD only)", localURL(a.Addr), server.TreeProxyPrefix, strings.Join(a.TreeURL, ","))
 	}
 	if indexProxy != nil {
 		log.Printf("index proxy: %s%s -> %s (GET/HEAD only)", localURL(a.Addr), server.IndexProxyPrefix, a.IndexURL)
@@ -684,7 +670,7 @@ func edgeGrantCookies(kid string, keyFlags []string, ev *edge.Verifier, c *corsA
 	}
 	for _, k := range keys {
 		if k.derived() {
-			warn = append(warn, fmt.Sprintf("edge grants: --edge-grant-key %s=%s holds the key derived from --edge-secret: every holder of the edge secret, the catalog service and the search index included, can derive it and mint cookies for any namespace with it. Use it only to migrate to key files, and drop it once its cookies have expired (§C.5)", k.kid, edgeSecretKey))
+			warn = append(warn, fmt.Sprintf("edge grants: --edge-grant-key %s=%s holds the key derived from --edge-secret: every holder of the edge secret, the search index included, can derive it and mint cookies for any namespace with it. Use it only to migrate to key files, and drop it once its cookies have expired (§C.5)", k.kid, edgeSecretKey))
 		}
 	}
 	ck, err = cookiesOf(keys, c)
@@ -811,10 +797,9 @@ func remoteOptions(bearers, urls, identities, originURLs []string) (core.RemoteO
 // The playground has its own ServeMux, but the API is not put behind one:
 // http.ServeMux cleans paths and answers 301, where §3.6 requires the API's
 // own 400 for non-canonical URLs, so only playground paths reach the mux.
-// treeProxy, if not nil, serves server.TreeProxyPrefix (--tree-url);
-// without it those paths are the playground's 404. indexProxy likewise
-// serves server.IndexProxyPrefix (--index-url).
-func handler(api http.Handler, withPlayground bool, treeProxy, indexProxy http.Handler, pgOpt ...playground.Options) http.Handler {
+// indexProxy, if not nil, serves server.IndexProxyPrefix (--index-url);
+// without it those paths are the playground's 404.
+func handler(api http.Handler, withPlayground bool, indexProxy http.Handler, pgOpt ...playground.Options) http.Handler {
 	if !withPlayground {
 		return api
 	}
@@ -824,9 +809,6 @@ func handler(api http.Handler, withPlayground bool, treeProxy, indexProxy http.H
 		po = pgOpt[0]
 	}
 	mux.Handle(playground.Prefix, playground.HandlerWith(api, po))
-	if treeProxy != nil {
-		mux.Handle(server.TreeProxyPrefix, treeProxy)
-	}
 	if indexProxy != nil {
 		mux.Handle(server.IndexProxyPrefix, indexProxy)
 	}

@@ -9,28 +9,14 @@ package merge
 //     the bases too. A schema resource the base changed since the branch
 //     started can't fast-forward: a conflict (rebase the release, and
 //     migrate documents with replace /$schema).
-//  2. Catalog changes that narrow access: for every subject, the effective
-//     roles on every node afterwards are a subset of those before, judged
-//     by the test of §B.11.4 on the step-2 batch as a whole (whoever
-//     merges). A folder the release creates goes here, with its own
-//     $access, when a narrowing move needs it: an empty folder gives
-//     access to nothing but its title and its tree powers, so the subset
-//     test applies to the items moved into it, not to the folder itself.
-//  3. Content branches, in any order: new documents aren't placed yet.
-//  4. Catalog changes that widen access: new placements and the remaining
-//     moves and $access edits. This publishes the release.
+//  3. Content branches, in any order. (v0.87 removed steps 2 and 4; the
+//     numbers are kept, as stored plans and their digests name them.)
 //
 // Conflicts reported before anything is submitted (ReleaseConflict): a
-// catalog node narrowing for some subjects and widening for others
-// (resolved by a split: the document after step 2, given by a person,
-// each half changing the node); a
-// content item step 3 creates or restores that a placement in the catalog
-// base already names (fine if step 2 removes that placement, or if the
-// release keeps it unchanged and the approver accepts it); a pinned x-ref
-// or manifest entry
-// naming a revision of another listed branch that the merge replays; a
-// document resolving a draft schema revision in a branch the release
-// doesn't list; and every merge conflict of §F.3.
+// pinned x-ref or manifest entry naming a revision of another listed
+// branch that the merge replays; a document resolving a draft schema
+// revision in a branch the release doesn't list; and every merge conflict
+// of §F.3.
 //
 // Lifecycle. PlanRelease checks that each listed branch's base is the
 // namespace it is keyed by (or, for a release built on another, that
@@ -41,9 +27,8 @@ package merge
 // over { release: <revision path>, batches: [{ ns, source: { ns, at },
 // items: [{ resource, ifMatch | ifNoneMatch, steps }] }] }, the batches in
 // submission order, each step its plaintext patch set without fresh $nonce
-// ops (nor a fresh top-level $nonce in a root op's value) or "delete", and
-// a precondition on an earlier batch's result (the second half of a split
-// node) { batch, item }. ApproveRelease, run by the person approving, plans
+// ops (nor a fresh top-level $nonce in a root op's value) or "delete".
+// ApproveRelease, run by the person approving, plans
 // again, requires it clean, for the same revision and with the same
 // digest, and freezes every listed branch (§8.4), recording each branch's
 // config id and its ns_id before the freeze, which stays every batch's
@@ -56,52 +41,26 @@ package merge
 // above or each branch's at) is planned and approved again, unless that
 // version stopped part-way through merging it: that merge resumes from the
 // stored plan, each step checked against the step digest the earlier
-// version recorded. Catalog batches are submitted by the merge service
-// under grants the catalog service signs for it for exactly that batch,
-// or, where they change $access, under a catalog admin's grant narrowed
-// with the merge service's via (§F.8, MergeGranter). Every branch records
-// merged only after step 4, with at the target's ns_id after the last
-// batch into it.
-//
-// One release per catalog base at a time: ApplyRelease holds the merge
-// lock, resource merge-lock.{catalog base} in the release document's own
-// namespace (§F.9), whose document is { "holder": <the merge service's
-// sub>, "plan": <plan digest> } while held and {} while free (with a
-// $nonce where one is needed). Taking it is a create with If-None-Match: *
-// or an append with If-Match on a free head, setting holder; then plan is
-// set by a further compare-and-append, and releasing is an append back to
-// {}. A merge resuming from a stored plan takes over (sets holder, by
-// compare-and-append) only a lock whose plan is that plan's digest, or,
-// resuming a merge an earlier version stopped, the lock that version took
-// for the release ({ "release" }, in StateNS); any other held lock, one
-// written by an earlier version included, is released by a person. It is
-// held from the first step until every branch records merged.
+// version recorded. Every branch records merged only after its last step,
+// with at the target's ns_id after the last batch into it.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/middle-management/patchlog/internal/catalog"
 	"github.com/middle-management/patchlog/internal/client"
-	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/release"
 	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sig"
-	"github.com/middle-management/patchlog/internal/tree"
-
-	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // Release plan states.
@@ -115,18 +74,14 @@ const (
 
 // Release conflict kinds.
 const (
-	RCBaseChain      = "base_chain"         // the branch's base isn't the namespace it is keyed by (§F.9)
-	RCFrozen         = "frozen"             // the branch is frozen (not by this plan's approval)
-	RCPurged         = "purged"             // the branch is purged
-	RCSchemaChanged  = "schema_changed"     // a schema resource can't fast-forward (§F.9)
-	RCNarrowAndWiden = "narrows_and_widens" // a catalog node narrows for some subjects, widens for others
-	RCStep2Widens    = "step2_widens"       // the narrowing batch as a whole widens
-	RCBadSplit       = "bad_split"          // a split's halves don't narrow, then widen, or one changes nothing
-	RCPlacedItem     = "placed_item"        // step 3 would publish an item under an existing placement
-	RCDanglingPin    = "dangling_pin"       // a pinned link to a revision the merge replays
-	RCForeignDraft   = "foreign_draft"      // a draft resolved in a branch the release doesn't list
-	RCUnresolved     = "schema_unavailable" // a $schema the merger can't resolve anywhere
-	RCMerge          = "merge"              // a §F.3 conflict of a resource
+	RCBaseChain     = "base_chain"         // the branch's base isn't the namespace it is keyed by (§F.9)
+	RCFrozen        = "frozen"             // the branch is frozen (not by this plan's approval)
+	RCPurged        = "purged"             // the branch is purged
+	RCSchemaChanged = "schema_changed"     // a schema resource can't fast-forward (§F.9)
+	RCDanglingPin   = "dangling_pin"       // a pinned link to a revision the merge replays
+	RCForeignDraft  = "foreign_draft"      // a draft resolved in a branch the release doesn't list
+	RCUnresolved    = "schema_unavailable" // a $schema the merger can't resolve anywhere
+	RCMerge         = "merge"              // a §F.3 conflict of a resource
 )
 
 // ReleaseConflict is a reason the release needs a person.
@@ -144,10 +99,8 @@ type ReleaseBranch struct {
 	Key    string `json:"key"`
 	NS     string `json:"ns"`
 	Target string `json:"target"` // the namespace it merges into
-	// Catalog: the target is a catalog namespace (§B.6).
-	Catalog bool `json:"catalog,omitempty"`
 	// Schemas are its schema resources in $ref order (step 1), Content the
-	// rest (step 3; for a catalog, steps 2 and 4).
+	// rest (step 3).
 	Schemas []string `json:"schemas,omitempty"`
 	Content []string `json:"content,omitempty"`
 	// At is the branch's ns_id the plan classifies from, every batch's
@@ -156,7 +109,7 @@ type ReleaseBranch struct {
 	At string `json:"at,omitempty"`
 	// FrozenConfig is the config id the approval's freeze produced.
 	FrozenConfig string `json:"frozenConfig,omitempty"`
-	// Merged is the merged.at recorded after step 4.
+	// Merged is the merged.at recorded after its last step.
 	Merged string `json:"merged,omitempty"`
 }
 
@@ -171,18 +124,6 @@ type ReleaseStep struct {
 	// Digest is the digest of this step's part of the plan (its items),
 	// which the step must still have when it is submitted.
 	Digest string `json:"digest,omitempty"`
-}
-
-// Half is a catalog node merged in two halves: the document after step 2
-// (Narrow) and after step 4 (Wide, the branch's document). Reason is
-// "split": a person's resolution of a node that narrows and widens. Its
-// step-2 batch records a pair for it, but the step-4 batch is more recent
-// and replaces that pair (§F.3); until then the stored plan, not
-// classification, decides what is left.
-type Half struct {
-	Narrow any    `json:"narrow"`
-	Wide   any    `json:"wide"`
-	Reason string `json:"reason"`
 }
 
 // PlanFormat is the stored plan's format. 2: the plan digest of v0.73
@@ -205,13 +146,9 @@ type ReleasePlan struct {
 	// Digest is the plan's digest (PlanDigest), what a person approves.
 	Digest string `json:"digest,omitempty"`
 
-	Branches  []*ReleaseBranch           `json:"branches"`
-	Steps     []*ReleaseStep             `json:"steps"`
-	Halves    map[string]map[string]Half `json:"halves,omitempty"` // key -> node -> halves
-	Conflicts []ReleaseConflict          `json:"conflicts,omitempty"`
-	// Accepted lists placements (ns.name) whose item step 3 publishes,
-	// accepted by the approver.
-	Accepted []string `json:"acceptedPlacements,omitempty"`
+	Branches  []*ReleaseBranch  `json:"branches"`
+	Steps     []*ReleaseStep    `json:"steps"`
+	Conflicts []ReleaseConflict `json:"conflicts,omitempty"`
 	// Resolutions are resolution sets of content resources, "key/name" ->
 	// { steps, at } (§F.3).
 	Resolutions map[string]StoredResolution `json:"resolutions,omitempty"`
@@ -241,145 +178,16 @@ func (rp *ReleasePlan) Branch(key string) *ReleaseBranch {
 	return nil
 }
 
-// MergeGrantResult is a catalog service's answer for one catalog merge
-// batch (§F.8): a grant covering exactly that batch, signed with the
-// catalog's merge key for the merge service, or, for a batch that needs
-// catalog-admins (§B.11.3: it changes $access, restores a folder, or
-// widens), Admin: checked as a dry run with CheckedAs, the admin whose
-// grant it goes under, as the caller, to be submitted under that grant.
-type MergeGrantResult struct {
-	Grant      string
-	Admin      bool
-	ApprovedBy string
-	CheckedAs  string
-}
-
-// MergeGranter obtains a catalog service's decision on exactly one catalog
-// merge batch (§F.8). adminGrant, if set, is the grant of the catalog
-// admin the batch would go under: for a batch that needs catalog-admins,
-// the service judges its dry run with that admin as the caller too (F-T4).
-// A catalog the service offers no merge grants for (an end-to-end one,
-// 404 not_offered) is an error wrapping ErrNotOffered.
-type MergeGranter interface {
-	MergeGrant(ctx context.Context, catalog string, batch map[string]any, adminGrant string) (*MergeGrantResult, error)
-}
-
-// HTTPGranter asks catalog services over HTTP: POST {URL}/merge-grants
-// with the merge service's grant for the catalog as Authorization, the
-// approving person's in Approver-Authorization and, when given, the
-// catalog admin's in Admin-Authorization (catalog.AdminHeader).
-type HTTPGranter struct {
-	URLs map[string]string // catalog namespace -> catalog service base URL
-	// Bearer is the merge service's own grant for the catalog: merge
-	// grants are issued only to it (§F.8).
-	Bearer string
-	// Approver is the approving person's grant for the catalog, whose
-	// powers the catalog service checks ("" sends none: Bearer's).
-	Approver string
-	Author   string // X-Author, for development servers
-	HTTP     *http.Client
-}
-
-// ErrBehind is returned when a catalog service hasn't caught up yet.
-var ErrBehind = errors.New("merge: the catalog service is behind")
-
-// ErrAdminNeeded is returned when a catalog batch needs catalog-admins
-// (§B.11.3, §F.8) and no catalog admin's grant to submit it under is
-// given (ReleaseOptions.AdminGrant).
-var ErrAdminNeeded = errors.New("merge: the catalog batch needs catalog-admins")
-
-// ErrNotOffered is returned when a catalog service offers no merge grants
-// for a catalog, as for an end-to-end one (§F.8, 404 not_offered).
-var ErrNotOffered = errors.New("merge: the catalog service issues no merge grants for this catalog")
-
-// MergeGrant implements MergeGranter.
-func (h *HTTPGranter) MergeGrant(ctx context.Context, cat string, batch map[string]any, adminGrant string) (*MergeGrantResult, error) {
-	u := h.URLs[cat]
-	if u == "" {
-		return nil, fmt.Errorf("merge: no catalog service for %s (give one with --catalog-service %s=URL)", cat, cat)
-	}
-	body, err := json.Marshal(map[string]any{"batch": batch})
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(u, "/")+"/merge-grants", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if h.Bearer != "" {
-		req.Header.Set("Authorization", "Bearer "+h.Bearer)
-	}
-	if h.Approver != "" {
-		req.Header.Set(catalog.ApproverHeader, "Bearer "+h.Approver)
-	}
-	if adminGrant != "" {
-		req.Header.Set(catalog.AdminHeader, "Bearer "+adminGrant)
-	}
-	if h.Author != "" {
-		req.Header.Set("X-Author", h.Author)
-	}
-	hc := h.HTTP
-	if hc == nil {
-		hc = telemetry.DefaultClient
-	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	var out struct {
-		Grant      string `json:"grant"`
-		Admin      bool   `json:"admin"`
-		ApprovedBy string `json:"approvedBy"`
-		CheckedAs  string `json:"checkedAs"`
-		Code       string `json:"code"`
-		Message    string `json:"message"`
-	}
-	_ = json.Unmarshal(b, &out)
-	switch {
-	case resp.StatusCode == 503 && out.Code == "behind":
-		return nil, fmt.Errorf("%w: %s", ErrBehind, out.Message)
-	case resp.StatusCode == 404 && out.Code == "not_offered":
-		return nil, fmt.Errorf("%w (%s): %s", ErrNotOffered, cat, out.Message)
-	case resp.StatusCode != 200 || (out.Grant == "" && !out.Admin):
-		return nil, fmt.Errorf("merge: catalog service for %s refused the merge grant: %d %s %s", cat, resp.StatusCode, out.Code, out.Message)
-	}
-	return &MergeGrantResult{Grant: out.Grant, Admin: out.Admin, ApprovedBy: out.ApprovedBy, CheckedAs: out.CheckedAs}, nil
-}
-
 // ReleaseOptions configure the release functions.
 type ReleaseOptions struct {
 	// Release is the release document's link, /r/{ns}/{name}.
 	Release string
 	// StateNS holds the stored plan (default: the release document's
-	// namespace). The merge locks are always in the release document's
-	// namespace, which every release on a catalog base shares (§F.9).
+	// namespace).
 	StateNS string
-	// Granter signs catalog merge batches (needed when a branch's target
-	// is a catalog).
-	Granter MergeGranter
-	// AdminGrant is a catalog admin's grant for the catalog (often the
-	// approver's), under which a catalog batch that needs catalog-admins
-	// (it changes $access, restores a folder, or widens) is submitted,
-	// narrowed to exactly that batch with Via (§F.8). The catalog service
-	// judges such a batch, which only an approver in catalog-admins gets
-	// through, with this admin as the caller too (F-T4). Every catalog
-	// batch of an end-to-end catalog, which it checks no batch of, goes
-	// under it, whatever the batch changes; its root groups must list
-	// catalog-admins. Via is the merge service's sub (default: Who).
-	AdminGrant string
-	Via        string
 	// Digest, if set, is the digest the approving person reviewed:
 	// ApproveRelease fails unless planning again gives it (§F.9).
 	Digest string
-	// Splits are resolutions of catalog nodes that narrow and widen:
-	// key -> node -> the document after step 2 (§F.3 two resolution sets).
-	Splits map[string]map[string]any
-	// Accept lists placements (ns.name) whose existing placement the
-	// approver accepts publishing under.
-	Accept []string
 	// Resolutions resolve content conflicts: "key/name" -> steps against
 	// the base's current head.
 	Resolutions map[string][]client.Step
@@ -392,9 +200,6 @@ type ReleaseOptions struct {
 	// AfterStep, if set, is called after each step is submitted and
 	// recorded; an error stops the merge there (tests simulate a crash).
 	AfterStep func(step *ReleaseStep) error
-	// BehindWait bounds how long a catalog service that is behind is
-	// waited for (default 30s).
-	BehindWait time.Duration
 	// AcceptFrozen are freezes this release's own approval made (branch
 	// -> config id, ReleasePlan.FrozenBy): PlanRelease doesn't count them
 	// as frozen, and classifies those branches as of their ns_id before
@@ -402,8 +207,7 @@ type ReleaseOptions struct {
 	AcceptFrozen map[string]string
 	// Signer, if set, signs every step the release writes (§C.3.1). Its
 	// key must be listed in the signers of the grant the batches are sent
-	// under, which for catalog batches is the service's, so a catalog
-	// merge normally signs with the service's key or not at all.
+	// under.
 	Signer *sig.Key
 }
 
@@ -417,12 +221,8 @@ func (o *ReleaseOptions) now() time.Time {
 // PlanName is the stored plan's resource name for a release.
 func PlanName(rel string) string { return rel + ".merge" }
 
-// LockName is the lock resource of a catalog base.
-func LockName(catalogBase string) string { return "merge-lock." + catalogBase }
-
 type relCtx struct {
 	c   *client.Client
-	e2e *client.E2E // if set, catalogBase reads an end-to-end catalog's documents with it (Plan.e2eTarget)
 	opt ReleaseOptions
 	rel *release.Loaded
 	rp  *ReleasePlan
@@ -469,7 +269,7 @@ func planRelease(ctx context.Context, c *client.Client, opt ReleaseOptions, own 
 	}
 	x := &relCtx{c: c, opt: opt, rel: rel, docs: map[string]map[string]any{}, plans: map[string]*Plan{}, listed: map[string]bool{}, ownCfgs: own}
 	x.rp = &ReleasePlan{Format: PlanFormat, Release: rel.Ref.Live(), Revision: rel.Ref.Rev, Name: rel.Doc.Name, State: ReleasePlanned,
-		PlannedBy: opt.Who, Halves: map[string]map[string]Half{}, Accepted: append([]string(nil), opt.Accept...)}
+		PlannedBy: opt.Who}
 	for _, k := range rel.Doc.Keys() {
 		x.listed[rel.Doc.Branches[k].NS] = true
 	}
@@ -595,12 +395,6 @@ func (x *relCtx) branches(ctx context.Context) error {
 				ownFreeze = true
 			}
 		}
-		tdoc, _, err := x.nsDoc(ctx, b.Target)
-		if err != nil {
-			return fmt.Errorf("merge: target %s: %w", b.Target, err)
-		}
-		_, b.Catalog = tdoc["catalog"].(map[string]any)
-
 		// Changed resources, sorted into schemas and the rest, as of the
 		// branch's at: its head, or once our approval froze it, its ns_id
 		// before that freeze (§F.9).
@@ -649,7 +443,7 @@ func (x *relCtx) branches(ctx context.Context) error {
 			}
 			docs[ch.Resource] = d
 			x.docs[k][ch.Resource] = d
-			if schemaRes && !b.Catalog {
+			if schemaRes {
 				schemas = append(schemas, ch.Resource)
 			} else {
 				b.Content = append(b.Content, ch.Resource)
@@ -746,7 +540,7 @@ func (x *relCtx) classify(ctx context.Context) error {
 	// Step 3 plans (content), classified now for the conflict checks.
 	var contentSteps []*ReleaseStep
 	for _, b := range rp.Branches {
-		if b.Catalog || len(b.Content) == 0 {
+		if len(b.Content) == 0 {
 			continue
 		}
 		p, err := NewPlan(ctx, x.c, b.Target, b.NS, Options{Resources: b.Content, BranchAt: b.At, SourceAuthorizations: x.opt.SourceAuthorizations, Signer: x.opt.Signer})
@@ -768,30 +562,8 @@ func (x *relCtx) classify(ctx context.Context) error {
 		}
 		contentSteps = append(contentSteps, &ReleaseStep{Step: 3, Key: b.Key, Resources: b.Content})
 	}
-	// Steps 2 and 4: catalog branches.
-	var narrow, wide []*ReleaseStep
-	for _, b := range rp.Branches {
-		if !b.Catalog || len(b.Content) == 0 {
-			continue
-		}
-		n, w, err := x.catalogSteps(ctx, b)
-		if err != nil {
-			return err
-		}
-		if len(n) > 0 {
-			narrow = append(narrow, &ReleaseStep{Step: 2, Key: b.Key, Resources: n})
-		}
-		if len(w) > 0 {
-			wide = append(wide, &ReleaseStep{Step: 4, Key: b.Key, Resources: w})
-		}
-	}
-	rp.Steps = append(rp.Steps, narrow...)
 	rp.Steps = append(rp.Steps, contentSteps...)
-	rp.Steps = append(rp.Steps, wide...)
 
-	if err := x.placedItems(ctx); err != nil {
-		return err
-	}
 	if err := x.pins(ctx); err != nil {
 		return err
 	}
@@ -840,283 +612,6 @@ func (x *relCtx) applyResolutions(b *ReleaseBranch, p *Plan) error {
 			x.rp.Resolutions = map[string]StoredResolution{}
 		}
 		x.rp.Resolutions[name] = StoredResolution{Steps: StepsJSON(steps), At: r.resolvedAt}
-	}
-	return nil
-}
-
-// catalogBase reads a catalog target's configuration, node documents and
-// the declared role inclusions of its trusted namespaces.
-func (x *relCtx) catalogBase(ctx context.Context, target string) (map[string]any, map[string]any, map[string]catalog.Includes, error) {
-	cfg, _, err := x.nsDoc(ctx, target)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	h, err := x.c.NSHead(ctx, target)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	heads, err := x.c.Heads(ctx, target, h.ID)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	docs := map[string]any{}
-	for _, hi := range heads {
-		if hi.Kind != "head" {
-			continue
-		}
-		if x.e2e != nil {
-			// An end-to-end catalog: its documents folded with the keys,
-			// its plaintext keyring no node (§E.3.2).
-			if hi.Resource == client.KeyringName {
-				continue
-			}
-			d, err := x.e2e.DocE2E(ctx, target, hi.Resource, hi.Target)
-			if err != nil {
-				return nil, nil, nil, err
-			}
-			docs[hi.Resource] = d.Value
-			continue
-		}
-		d, err := x.c.Doc(ctx, target, hi.Resource, hi.Target)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		docs[hi.Resource] = d.Value
-	}
-	incs := map[string]catalog.Includes{}
-	g := tree.BuildGraph(target, cfg, nil)
-	for ns := range g.Trust {
-		d, _, err := x.nsDoc(ctx, ns)
-		if err != nil {
-			if client.IsAuth(err) || client.IsNotFound(err) {
-				continue
-			}
-			return nil, nil, nil, err
-		}
-		incs[ns] = catalog.ParseIncludes(d)
-	}
-	return cfg, docs, incs, nil
-}
-
-// catalogSteps sorts a catalog branch's changes into step 2 (narrowing)
-// and step 4 (the rest), with halves for split nodes and for new folders
-// a narrowing move needs.
-func (x *relCtx) catalogSteps(ctx context.Context, b *ReleaseBranch) (narrow, wide []string, err error) {
-	p, err := NewPlan(ctx, x.c, b.Target, b.NS, Options{Resources: b.Content, BranchAt: b.At, Signer: x.opt.Signer})
-	if err != nil {
-		return nil, nil, err
-	}
-	x.plans[stepKey(2, b.Key)] = p
-	cfg, baseDocs, incs, err := x.catalogBase(ctx, b.Target)
-	if err != nil {
-		return nil, nil, err
-	}
-	before := tree.BuildGraph(b.Target, cfg, baseDocs)
-	brDocs := x.docs[b.Key]
-	halves := map[string]Half{}
-	splits := x.opt.Splits[b.Key]
-
-	var changed []string
-	for _, r := range p.Resources {
-		if r.Class == Merged || r.Class == Behind {
-			continue
-		}
-		if r.NeedsPerson() {
-			x.conflict(RCMerge, b.Key, b.NS, r.Name, "merge conflict in the catalog: "+conflictText(r)+"; rebase the release")
-			continue
-		}
-		if r.Class == Purged {
-			x.conflict(RCMerge, b.Key, b.NS, r.Name, "purged: "+r.Note)
-			continue
-		}
-		changed = append(changed, r.Name)
-	}
-	isNewFolder := func(name string) bool {
-		_, inBase := baseDocs[name]
-		return !inBase && !strings.Contains(name, ".") && brDocs[name] != nil
-	}
-	parentsOf := func(doc any) []string {
-		var out []string
-		for _, pp := range tree.ParseNode(b.Target, "x", "", doc).Parents {
-			if pp.Name != "" {
-				out = append(out, pp.Name)
-			}
-		}
-		return out
-	}
-	// Each change, with the new folders it moves into created with their
-	// own $access; their own appearance doesn't count (§F.9: an empty
-	// folder gives access to nothing but its title and its tree powers, so
-	// the subset test applies to the items moved into it).
-	without := func(d catalog.AccessDiff, skip map[string]bool) catalog.AccessDiff {
-		var o catalog.AccessDiff
-		for _, w := range d.Widens {
-			if !skip[w.Node] {
-				o.Widens = append(o.Widens, w)
-			}
-		}
-		for _, n := range d.Narrows {
-			if !skip[n.Node] {
-				o.Narrows = append(o.Narrows, n)
-			}
-		}
-		return o
-	}
-	inStep2 := map[string]bool{}
-	helpers := map[string]bool{}
-	step2Docs := map[string]any{}
-	for _, name := range changed {
-		if isNewFolder(name) {
-			continue // decided below, with the moves that need it
-		}
-		doc := brDocs[name]
-		if sd, ok := splits[name]; ok {
-			// A person's split: the first half must narrow, the second
-			// mustn't.
-			mid := before.With(map[string]any{name: sd})
-			d1 := catalog.DiffAccess(before, mid, incs)
-			d2 := catalog.DiffAccess(mid, mid.With(map[string]any{name: doc}), incs)
-			if len(d1.Widens) > 0 || len(d2.Narrows) > 0 {
-				x.conflict(RCBadSplit, b.Key, b.NS, name, fmt.Sprintf("the split must narrow, then widen: its first half %s, its second %s", d1.Kind(), d2.Kind()))
-				continue
-			}
-			// Each half must change the node ($nonce aside), or its step
-			// has no item for it, and the plan's digest no item for the
-			// second half's precondition to name (§F.9).
-			if bd, ok := baseDocs[name]; ok && jsonv.Equal(dropNonce(bd), dropNonce(jsonv.FromGo(sd))) {
-				x.conflict(RCBadSplit, b.Key, b.NS, name, "the split's first half is the catalog base's document as it is, so step 2 has nothing to merge for it: drop the split, and the change merges whole (§F.9)")
-				continue
-			}
-			if jsonv.Equal(dropNonce(jsonv.FromGo(sd)), dropNonce(doc)) {
-				x.conflict(RCBadSplit, b.Key, b.NS, name, "the split's second half is its first, so step 4 has nothing to merge for it: drop the split, and the change merges whole (§F.9)")
-				continue
-			}
-			halves[name] = Half{Narrow: sd, Wide: doc, Reason: "split"}
-			inStep2[name], step2Docs[name] = true, sd
-			continue
-		}
-		ch := map[string]any{name: doc}
-		hs := map[string]bool{}
-		for _, pn := range parentsOf(doc) {
-			if isNewFolder(pn) {
-				ch[pn] = brDocs[pn]
-				hs[pn] = true
-			}
-		}
-		d := without(catalog.DiffAccess(before, before.With(ch), incs), hs)
-		switch d.Kind() {
-		case "narrows":
-			inStep2[name], step2Docs[name] = true, doc
-			for f := range hs {
-				helpers[f] = true
-				step2Docs[f] = ch[f]
-			}
-		case "both":
-			var who []string
-			for _, w := range d.Widens {
-				who = append(who, w.Subject+" +"+w.Role+" on "+w.Node)
-			}
-			for _, n := range d.Narrows {
-				who = append(who, n.Subject+" -"+n.Role+" on "+n.Node)
-			}
-			x.conflict(RCNarrowAndWiden, b.Key, b.NS, name, "the change narrows access for some subjects and widens it for others; resolve it with two resolution sets: -split "+b.Key+"/"+name+"=narrow.json, the document after the narrowing step (§F.3, §F.9)", who...)
-		}
-	}
-	for f := range helpers {
-		inStep2[f] = true
-	}
-	// The narrowing batch as a whole.
-	if len(step2Docs) > 0 {
-		d := without(catalog.DiffAccess(before, before.With(step2Docs), incs), helpers)
-		if len(d.Widens) > 0 {
-			var who []string
-			for _, w := range d.Widens {
-				who = append(who, w.Subject+" +"+w.Role+" on "+w.Node)
-			}
-			x.conflict(RCStep2Widens, b.Key, b.NS, "", "the narrowing changes widen access together (judged as one batch, §F.9)", who...)
-		}
-	}
-	for _, name := range changed {
-		if inStep2[name] {
-			narrow = append(narrow, name)
-		}
-		if !inStep2[name] || halves[name].Wide != nil {
-			wide = append(wide, name)
-		}
-	}
-	if len(halves) > 0 {
-		x.rp.Halves[b.Key] = halves
-	}
-	for f := range helpers {
-		x.rp.Notes = append(x.rp.Notes, fmt.Sprintf("%s/%s: created in step 2, with its own $access, since a narrowing move needs it; its title, and the tree powers its $access gives, take effect from then on", b.Key, f))
-	}
-	sort.Strings(x.rp.Notes)
-	return narrow, wide, nil
-}
-
-// placedItems: a content item step 3 creates or restores that a placement
-// in a catalog base already names would be published under it by step 3
-// (§F.9), unless the release keeps that placement and the approver accepts.
-func (x *relCtx) placedItems(ctx context.Context) error {
-	accepted := map[string]bool{}
-	for _, a := range x.opt.Accept {
-		accepted[a] = true
-	}
-	for _, cb := range x.rp.Branches {
-		if !cb.Catalog {
-			continue
-		}
-		cfg, _, err := x.nsDoc(ctx, cb.Target)
-		if err != nil {
-			return err
-		}
-		g := tree.BuildGraph(cb.Target, cfg, nil)
-		changedInRelease := map[string]bool{}
-		for _, n := range cb.Content {
-			changedInRelease[n] = true
-		}
-		// Placements step 2 removes: unplacing narrows (§F.9).
-		unplacedInStep2 := map[string]bool{}
-		for _, st := range x.rp.Steps {
-			if st.Step == 2 && st.Key == cb.Key {
-				for _, n := range st.Resources {
-					if d, ok := x.docs[cb.Key][n]; ok && d == nil {
-						unplacedInStep2[n] = true
-					}
-				}
-			}
-		}
-		for _, b := range x.rp.Branches {
-			if b.Catalog || !g.Trust[b.Key] {
-				continue
-			}
-			p := x.plans[stepKey(3, b.Key)]
-			if p == nil {
-				continue
-			}
-			for _, r := range p.Resources {
-				creates := r.HasItem() && !r.BranchDeleted && (r.BaseState == client.NotFound.String() || r.BaseState == client.Tombstoned.String() || r.Base == "")
-				if !creates {
-					continue
-				}
-				pl := b.Key + "." + r.Name
-				h, err := x.c.Head(ctx, cb.Target, pl)
-				if err != nil {
-					return err
-				}
-				if h.State != client.Live {
-					continue
-				}
-				switch {
-				case unplacedInStep2[pl]:
-					// Step 2 removes it before step 3 creates the item.
-				case changedInRelease[pl]:
-					x.conflict(RCPlacedItem, b.Key, b.NS, r.Name, fmt.Sprintf("step 3 creates or restores %s/%s, which the placement %s/%s already names, and the release changes that placement other than by removing it in step 2: step 3 would publish the item under the base's placement before step 4 changes it", b.Key, r.Name, cb.Target, pl))
-				case !accepted[pl]:
-					x.conflict(RCPlacedItem, b.Key, b.NS, r.Name, fmt.Sprintf("step 3 creates or restores %s/%s, which the placement %s/%s already names: step 3 publishes it under that placement; accept with --accept-placement %s, or unplace it in the release", b.Key, r.Name, cb.Target, pl, pl))
-				}
-			}
-		}
 	}
 	return nil
 }
@@ -1375,12 +870,6 @@ func ApproveRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (
 	}
 	own := stored.FrozenBy()
 	// The person approves what they reviewed: the stored plan's choices.
-	if opt.Splits == nil {
-		opt.Splits = stored.splits()
-	}
-	if opt.Accept == nil {
-		opt.Accept = stored.Accepted
-	}
 	if opt.Resolutions == nil {
 		opt.Resolutions = stored.resolutions()
 	}
@@ -1482,22 +971,6 @@ func entryBefore(ctx context.Context, c *client.Client, ns, id, since string) (s
 	return log[len(log)-1].Prev, nil
 }
 
-func (rp *ReleasePlan) splits() map[string]map[string]any {
-	out := map[string]map[string]any{}
-	for k, hs := range rp.Halves {
-		for n, h := range hs {
-			if h.Reason != "split" {
-				continue
-			}
-			if out[k] == nil {
-				out[k] = map[string]any{}
-			}
-			out[k][n] = h.Narrow
-		}
-	}
-	return out
-}
-
 func (rp *ReleasePlan) resolutions() map[string][]client.Step {
 	out := map[string][]client.Step{}
 	for k, r := range rp.Resolutions {
@@ -1546,8 +1019,7 @@ func ApplyRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (*R
 	// a merge resumes from that plan and never reverts (§F.9), its steps
 	// checked against the step digests it stored (approvedStep), each
 	// source.at its branch's ns_id before the approval's freeze
-	// (legacyAts), and the lock it took for its release taken over
-	// (acquireLock).
+	// (legacyAts).
 	legacy := rp.Format == 0 && rp.State == ReleaseMerging
 	if rp.Digest == "" || (rp.Format != PlanFormat && !legacy) {
 		return rp, fmt.Errorf("%w: it was approved without the plan digest of §F.9 (format %d, now %d): plan and approve again", ErrInvalidPlan, rp.Format, PlanFormat)
@@ -1558,14 +1030,6 @@ func ApplyRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (*R
 	if legacy {
 		if err := legacyAts(ctx, c, rp); err != nil {
 			return rp, err
-		}
-	}
-	// One release per catalog base at a time.
-	for _, b := range rp.Branches {
-		if b.Catalog {
-			if err := acquireLock(ctx, c, opt, rp, b.Target); err != nil {
-				return rp, err
-			}
 		}
 	}
 	if rp.State == ReleaseApproved {
@@ -1592,10 +1056,9 @@ func ApplyRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (*R
 			}
 		}
 	}
-	// Every branch records merged only after step 4, with at the target's
-	// ns_id after the last batch into it (§F.9): for the catalog, after
-	// step 4. A branch none of whose batches had anything left to do
-	// records the target's head.
+	// Every branch records merged only after the last step, with at the
+	// target's ns_id after the last batch into it (§F.9). A branch none of
+	// whose batches had anything left to do records the target's head.
 	for _, b := range rp.Branches {
 		if b.Merged != "" {
 			continue
@@ -1622,17 +1085,7 @@ func ApplyRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (*R
 		}
 	}
 	rp.State = ReleaseDone
-	if err := SaveReleasePlan(ctx, c, opt, rp); err != nil {
-		return rp, err
-	}
-	for _, b := range rp.Branches {
-		if b.Catalog {
-			if err := releaseLock(ctx, c, opt, rp, b.Target); err != nil {
-				return rp, err
-			}
-		}
-	}
-	return rp, nil
+	return rp, SaveReleasePlan(ctx, c, opt, rp)
 }
 
 // checkApproved verifies that the plan still holds: the release document
@@ -1684,8 +1137,7 @@ func allDone(rp *ReleasePlan) bool {
 // AbandonRelease gives a release up (§F.9 Abandoning): every listed
 // branch is frozen with "abandoned": true, which the janitor accepts only
 // from a grant chained to a * key of the branch (§F.6), so c should carry
-// an administrator's. A stored plan is marked abandoned and its catalog
-// locks released. What step 1 merged stays in the schema namespace's
+// an administrator's. A stored plan is marked abandoned. What step 1 merged stays in the schema namespace's
 // history, unused. It returns the branches it abandoned.
 func AbandonRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) ([]string, error) {
 	rel, err := release.Load(ctx, c, opt.Release)
@@ -1727,234 +1179,8 @@ func AbandonRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (
 		if err := SaveReleasePlan(ctx, c, opt, rp); err != nil {
 			return out, err
 		}
-		for _, b := range rp.Branches {
-			if b.Catalog {
-				if err := releaseLock(ctx, c, opt, rp, b.Target); err != nil {
-					return out, err
-				}
-			}
-		}
 	}
 	return out, nil
-}
-
-// ErrLocked is returned when another release holds a catalog base.
-var ErrLocked = errors.New("merge: another release is merging into the catalog base")
-
-// Lock is the state of a catalog base's merge lock (§F.9).
-type Lock struct {
-	NS    string       `json:"ns"` // the release document's namespace
-	Name  string       `json:"name"`
-	Head  string       `json:"head,omitempty"` // "" if it doesn't exist
-	State client.State `json:"-"`
-	// Holder is the sub of the merge service that holds it, and Plan the
-	// digest of its plan; both "" while it is free.
-	Holder string `json:"holder,omitempty"`
-	Plan   string `json:"plan,omitempty"`
-	// Legacy is the release an earlier version's lock ({ "release" })
-	// names: held, for a person to release.
-	Legacy string `json:"legacy,omitempty"`
-	nonced bool
-}
-
-// Free reports a lock nobody holds: absent, or {} aside from $nonce (an
-// earlier version's { "release": null } counts as free too).
-func (l *Lock) Free() bool {
-	return l.State == client.NotFound || (l.State == client.Live && l.Holder == "" && l.Plan == "" && l.Legacy == "")
-}
-
-// heldFor reports a lock held for rp: for its digest, or, for a plan an
-// earlier version stored (format 0), the lock ({ "release" }) that version
-// took for rp's release.
-func (l *Lock) heldFor(rp *ReleasePlan) bool {
-	if l.State != client.Live {
-		return false
-	}
-	return (l.Plan != "" && l.Plan == rp.Digest) || (rp.Format == 0 && l.Legacy != "" && l.Legacy == rp.Release)
-}
-
-// lockNS is the namespace of a release's merge locks: the release
-// document's own, which every release on a catalog base shares (§F.9),
-// whatever StateNS says.
-func lockNS(rel string) (string, error) {
-	r, err := release.ParseRef(rel)
-	if err != nil {
-		return "", err
-	}
-	return r.NS, nil
-}
-
-// ReadLock reads the merge lock of a catalog base for the release opt
-// names.
-func ReadLock(ctx context.Context, c *client.Client, opt ReleaseOptions, catalogBase string) (*Lock, error) {
-	ns, err := lockNS(opt.Release)
-	if err != nil {
-		return nil, err
-	}
-	return readLock(ctx, c, ns, catalogBase)
-}
-
-func readLock(ctx context.Context, c *client.Client, ns, base string) (*Lock, error) {
-	l := &Lock{NS: ns, Name: LockName(base)}
-	h, err := c.Head(ctx, ns, l.Name)
-	if err != nil {
-		return nil, err
-	}
-	l.State = h.State
-	if h.State != client.Live {
-		return l, nil
-	}
-	l.Head = h.ID
-	d, err := c.Doc(ctx, ns, l.Name, h.ID)
-	if err != nil {
-		return nil, err
-	}
-	m, _ := d.Value.(map[string]any)
-	l.Holder, _ = m["holder"].(string)
-	l.Plan, _ = m["plan"].(string)
-	l.Legacy, _ = m["release"].(string)
-	_, l.nonced = m["$nonce"]
-	return l, nil
-}
-
-// LockHolder returns the sub of the merge service holding a catalog base's
-// lock, or the release an earlier version's lock names ("" if it is free).
-func LockHolder(ctx context.Context, c *client.Client, opt ReleaseOptions, catalogBase string) (string, error) {
-	l, err := ReadLock(ctx, c, opt, catalogBase)
-	if err != nil {
-		return "", err
-	}
-	if l.Holder == "" && l.Legacy != "" {
-		return l.Legacy, nil
-	}
-	return l.Holder, nil
-}
-
-// writeLock writes doc to the lock: a create with If-None-Match: * when it
-// doesn't exist, otherwise an append with If-Match on the head read, with
-// a fresh $nonce where one is needed (stateNonce).
-func writeLock(ctx context.Context, c *client.Client, l *Lock, doc map[string]any) error {
-	if l.State == client.NotFound {
-		ps, _ := stateNonce(ctx, c, l.NS, false, client.GenesisPatches(doc))
-		_, err := c.Create(ctx, l.NS, l.Name, ps)
-		return err
-	}
-	ps, _ := stateNonce(ctx, c, l.NS, l.nonced, []any{map[string]any{"op": "replace", "path": "", "value": doc}})
-	_, err := c.Append(ctx, l.NS, l.Name, l.Head, ps)
-	return err
-}
-
-// acquireLock takes the lock of a catalog base for rp (§F.9): a free lock
-// is taken by setting holder, this service's sub (a create with
-// If-None-Match: *, or an append with If-Match on its free head), then
-// plan, rp's digest, is set by a further compare-and-append. A lock held
-// for rp (heldFor: for its digest, or the lock an earlier version took
-// for the release of a plan it stored and stopped merging) is resumed,
-// set to this service's sub and rp's digest where it differs. Any other
-// held lock is ErrLocked, naming its holder and plan, for a person to
-// release; so too, resuming a merge an earlier version stopped, a lock
-// held for another release in StateNS, where that version kept its locks.
-func acquireLock(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan, base string) error {
-	ns, err := lockNS(rp.Release)
-	if err != nil {
-		return err
-	}
-	if sns, err := opt.stateNS(rp.Release); err == nil && rp.Format == 0 && sns != ns {
-		l, err := readLock(ctx, c, sns, base)
-		if err != nil {
-			return err
-		}
-		if l.State == client.Live && !l.Free() && !l.heldFor(rp) {
-			return lockedErr(l, rp)
-		}
-	}
-	sub, _, err := c.Principal(ctx)
-	if err != nil {
-		return err
-	}
-	took := false
-	for i := 0; i < 5; i++ {
-		l, err := readLock(ctx, c, ns, base)
-		if err != nil {
-			return err
-		}
-		var doc map[string]any
-		switch {
-		case l.State != client.NotFound && l.State != client.Live:
-			return fmt.Errorf("merge: the lock %s/%s is %s", ns, l.Name, l.State)
-		case l.Free():
-			doc = map[string]any{"holder": sub}
-		case l.Plan == rp.Digest && l.Holder == sub:
-			return nil
-		case l.heldFor(rp), took && l.Holder == sub && l.Plan == "":
-			// Resuming rp, or ours from this call's take: (re)set holder
-			// and plan.
-			doc = map[string]any{"holder": sub, "plan": rp.Digest}
-		default:
-			return lockedErr(l, rp)
-		}
-		err = writeLock(ctx, c, l, doc)
-		switch {
-		case err == nil && doc["plan"] != nil:
-			return nil
-		case err == nil:
-			took = true
-		case !client.IsStale(err) && !deletedSince(err):
-			// Anything but a lock that moved since it was read, which the
-			// next round reads again.
-			return fmt.Errorf("merge: taking the lock %s/%s: %w", ns, l.Name, err)
-		}
-	}
-	return fmt.Errorf("merge: the lock %s/%s keeps changing", ns, LockName(base))
-}
-
-// deletedSince reports the 410 gone with head that a create, or an
-// append on an older head, gets on a resource deleted since it was read; a
-// create used to get a 412 (§7.2, §8.1). The resource moved, as for a 412.
-func deletedSince(err error) bool {
-	ae, ok := client.AsAPIError(err)
-	return ok && ae.Status == 410 && ae.Code == "gone" && ae.Head() != ""
-}
-
-// lockedErr is ErrLocked for a lock held other than for rp, naming its
-// holder and plan.
-func lockedErr(l *Lock, rp *ReleasePlan) error {
-	holder, plan := l.Holder, l.Plan
-	if l.Legacy != "" {
-		holder = "an earlier version's merge of " + l.Legacy
-	}
-	if plan == "" {
-		plan = "(none)"
-	}
-	return fmt.Errorf("%w: %s holds %s/%s for plan %s, not this release's %s; a person releases it", ErrLocked, holder, l.NS, l.Name, plan, rp.Digest)
-}
-
-// releaseLock releases the lock of a catalog base if it is held for rp
-// (heldFor): an append back to {} (§F.9). For a plan an earlier version
-// stored, so too the lock that version took in StateNS, where it kept its
-// locks.
-func releaseLock(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan, base string) error {
-	ns, err := lockNS(rp.Release)
-	if err != nil {
-		return err
-	}
-	nss := []string{ns}
-	if sns, err := opt.stateNS(rp.Release); err == nil && rp.Format == 0 && sns != ns {
-		nss = append(nss, sns)
-	}
-	for _, ns := range nss {
-		l, err := readLock(ctx, c, ns, base)
-		if err != nil {
-			return err
-		}
-		if !l.heldFor(rp) {
-			continue
-		}
-		if err := writeLock(ctx, c, l, map[string]any{}); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // stepItem is one item of a step's batch as a plan's digest renders it
@@ -1968,83 +1194,14 @@ type stepItem struct {
 // stepPlan builds one step's batch from the stored plan, classified again
 // against the targets as they are: the plan (nil if nothing is left to
 // do) and the step's items (§F.9). planning builds it before anything is
-// submitted: the second half of a split node then applies to the first
-// half's result, which isn't in the target yet.
+// submitted.
 func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan, st *ReleaseStep, planning bool) (*Plan, []stepItem, error) {
 	b := rp.Branch(st.Key)
 	if b == nil {
 		return nil, nil, fmt.Errorf("no branch for %s in the plan", st.Key)
 	}
-	halves := rp.Halves[st.Key]
-	names := st.Resources
-	var keep []string // resources with an item from the branch
-	type half struct {
-		name string
-		doc  any // the document this step reaches
-	}
-	var hs []half
-	if b.Catalog {
-		for _, n := range names {
-			h, ok := halves[n]
-			if !ok {
-				keep = append(keep, n)
-				continue
-			}
-			target := h.Wide
-			if st.Step == 2 {
-				target = h.Narrow
-			}
-			hs = append(hs, half{n, target})
-		}
-	} else {
-		keep = names
-	}
-	// Halves: resolution sets against the base's current head; one whose
-	// head already has the document is done (a resumed step). Planned
-	// second halves apply to the first half's result.
-	var resolve []half
 	var items []stepItem
-	var np *Plan // the target's nonce needs, for planned second halves
-	for _, h := range hs {
-		if planning && st.Step == 4 {
-			if np == nil {
-				var err error
-				if np, err = noncePlan(ctx, c, b.Target); err != nil {
-					return nil, nil, err
-				}
-			}
-			// As Force will build it from the first half's result.
-			diff := Diff(np.nonceless(jsonv.FromGo(halves[h.name].Narrow)), np.nonceless(jsonv.FromGo(h.doc)))
-			if diff == nil {
-				diff = []any{}
-			}
-			items = append(items, stepItem{h.name, map[string]any{"after": map[string]any{"step": 2, "key": st.Key, "item": h.name}}, np.withNonces([]client.Step{client.PatchStep(diff)})})
-			continue
-		}
-		cur, err := c.Head(ctx, b.Target, h.name)
-		if err != nil {
-			return nil, nil, err
-		}
-		if cur.State == client.Live {
-			d, err := c.Doc(ctx, b.Target, h.name, cur.ID)
-			if err != nil {
-				return nil, nil, err
-			}
-			// $nonce aside: where the target needs one, the half was
-			// written with a fresh one (§C.7).
-			if jsonv.Equal(dropNonce(d.Value), dropNonce(jsonv.FromGo(h.doc))) {
-				continue
-			}
-			if st.Step == 4 && !jsonv.Equal(dropNonce(d.Value), dropNonce(jsonv.FromGo(halves[h.name].Narrow))) {
-				return nil, nil, fmt.Errorf("%s/%s changed in %s between steps 2 and 4: plan again", b.Target, h.name, b.Target)
-			}
-		}
-		resolve = append(resolve, h)
-	}
-	all := append([]string(nil), keep...)
-	for _, h := range resolve {
-		all = append(all, h.name)
-	}
+	all := st.Resources
 	if len(all) == 0 {
 		return nil, items, nil
 	}
@@ -2075,35 +1232,6 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 			}
 		}
 	}
-	second := map[string]bool{}
-	for _, h := range resolve {
-		r := p.Resource(h.name)
-		if r == nil {
-			return nil, nil, fmt.Errorf("%s: not changed by %s", h.name, b.NS)
-		}
-		var step client.Step
-		switch {
-		case r.Base == "" || r.BaseState != client.Live.String():
-			step = client.PatchStep(client.GenesisPatches(jsonv.FromGo(h.doc)))
-			if r.BaseState == client.Tombstoned.String() {
-				step = client.PatchStep([]any{map[string]any{"op": "replace", "path": "", "value": jsonv.FromGo(h.doc)}})
-			}
-		default:
-			d, err := c.Doc(ctx, b.Target, h.name, r.Base)
-			if err != nil {
-				return nil, nil, err
-			}
-			diff := Diff(p.nonceless(d.Value), p.nonceless(jsonv.FromGo(h.doc)))
-			if diff == nil {
-				diff = []any{}
-			}
-			step = client.PatchStep(diff)
-		}
-		if err := p.Force(h.name, step); err != nil {
-			return nil, nil, err
-		}
-		second[h.name] = st.Step == 4
-	}
 	if !p.Clean() {
 		var msgs []string
 		for _, r := range p.Conflicting() {
@@ -2114,8 +1242,6 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 	for _, r := range p.Items() {
 		var pre map[string]any
 		switch {
-		case second[r.Name]:
-			pre = map[string]any{"after": map[string]any{"step": 2, "key": st.Key, "item": r.Name}}
 		case r.IfNoneMatch:
 			pre = map[string]any{"ifNoneMatch": "*"}
 		default:
@@ -2141,8 +1267,8 @@ func digestItems(st *ReleaseStep, items []stepItem) []any {
 
 // digestItem is one item of a plan's digest (§F.9): the resource, its
 // precondition and its steps (digestSteps). A precondition on the result
-// of an earlier step, the second half of a split node, is written here as
-// "after": { step, key, item }; PlanDigest turns it into { batch, item }.
+// of an earlier step, written here as "after": { step, key, item },
+// PlanDigest turns into { batch, item }.
 func digestItem(name string, pre map[string]any, steps []client.Step) map[string]any {
 	m := map[string]any{"resource": name, "steps": digestSteps(steps)}
 	for k, v := range pre {
@@ -2404,19 +1530,6 @@ func runStep(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rele
 	if st.Digest != "" && !approvedStep(rp, st, items) {
 		return "", fmt.Errorf("%w (step %d, %s)", ErrPlanChanged, st.Step, st.Key)
 	}
-	if b.Catalog {
-		if st.Step == 2 {
-			if err := checkNarrowing(ctx, c, b, p); err != nil {
-				return "", err
-			}
-		}
-		if opt.Granter == nil {
-			return "", errors.New("a catalog batch needs a catalog service's merge grant (§F.8), and no granter is configured")
-		}
-		if err := grantFor(ctx, c, opt, b.Target, p); err != nil {
-			return "", err
-		}
-	}
 	if _, err := p.DryRun(ctx); err != nil {
 		return "", fmt.Errorf("dry run: %w", err)
 	}
@@ -2428,250 +1541,6 @@ func runStep(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rele
 		return "noop", nil
 	}
 	return res.NSID, nil
-}
-
-// checkNarrowing judges the step-2 batch as a whole against the catalog
-// base as it is now, with the dry run (§F.9 Several releases): its result
-// must widen nothing (new folders' own appearance aside).
-func checkNarrowing(ctx context.Context, c *client.Client, b *ReleaseBranch, p *Plan) error {
-	x := &relCtx{c: c, e2e: p.e2eTarget()}
-	cfg, docs, incs, err := x.catalogBase(ctx, b.Target)
-	if err != nil {
-		return err
-	}
-	before := tree.BuildGraph(b.Target, cfg, docs)
-	changes := map[string]any{}
-	newFolders := map[string]bool{}
-	for _, r := range p.Items() {
-		start := docState{}
-		if d, ok := docs[r.Name]; ok {
-			start = docState{doc: jsonv.Clone(d), exists: true}
-		} else if !strings.Contains(r.Name, ".") {
-			newFolders[r.Name] = true
-		}
-		sc, err := foldWrites(start, r.Steps, false)
-		if err != nil {
-			return err
-		}
-		if sc.final.deleted || !sc.final.exists {
-			changes[r.Name] = nil
-		} else {
-			changes[r.Name] = sc.final.doc
-		}
-	}
-	d := catalog.DiffAccess(before, before.With(changes), incs)
-	for _, w := range d.Widens {
-		if !newFolders[w.Node] {
-			return fmt.Errorf("the narrowing batch would give %s the role %s on %s against %s as it is now; plan again", w.Subject, w.Role, w.Node, b.Target)
-		}
-	}
-	return nil
-}
-
-// grantFor obtains the catalog service's decision on the plan's batch and
-// sets the client the batch is submitted with, waiting while the service
-// is behind (§F.8):
-//
-//   - the merge grant the service signs for the merge service, from the
-//     approver's checks;
-//   - for a batch that needs catalog-admins (it changes $access, restores
-//     a folder, or widens), which the service answers Admin, and only to
-//     an approver in catalog-admins (CONFORMANCE scenario 44), the
-//     service's dry run asked again with AdminGrant in
-//     Admin-Authorization, so that it is judged with the admin whose grant
-//     the batch goes under as the caller too (F-T4), and then AdminGrant
-//     narrowed to exactly that batch with the merge service's via;
-//   - for an end-to-end catalog, whose batches the service doesn't check
-//     (404 not_offered), grantE2E: every batch goes under AdminGrant.
-func grantFor(ctx context.Context, c *client.Client, opt ReleaseOptions, cat string, p *Plan) error {
-	if p.TargetLevel == "e2e" {
-		return grantE2E(ctx, c, opt, cat, p)
-	}
-	wait := opt.BehindWait
-	if wait == 0 {
-		wait = 30 * time.Second
-	}
-	deadline := time.Now().Add(wait)
-	pause := 20 * time.Millisecond
-	body := BatchBody(p.Batch())
-	for {
-		res, err := opt.Granter.MergeGrant(ctx, cat, body, "")
-		if err == nil && res.Admin {
-			if opt.AdminGrant == "" {
-				return fmt.Errorf("%w (§F.8): give a catalog admin's grant to submit it under (ReleaseOptions.AdminGrant)", ErrAdminNeeded)
-			}
-			res, err = opt.Granter.MergeGrant(ctx, cat, body, opt.AdminGrant)
-		}
-		if err == nil {
-			g := res.Grant
-			if res.Admin {
-				if g, err = adminGrant(opt, cat, p); err != nil {
-					return err
-				}
-			}
-			p.SetBatchClient(c.With(client.WithBearer(g)))
-			return nil
-		}
-		if !errors.Is(err, ErrBehind) || time.Now().After(deadline) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(pause):
-		}
-		if pause < time.Second {
-			pause *= 2
-		}
-	}
-}
-
-// grantE2E sets the client an end-to-end catalog's batch is submitted with
-// (§F.8). The catalog service issues no merge grants and checks no batch
-// for such a catalog, so every catalog batch of it, one that needs
-// catalog-admins (adminChange) or not, goes only with an approver in
-// catalog-admins: under AdminGrant, a grant whose root groups list
-// catalog-admins, narrowed to exactly that batch with the merge service's
-// via, without the service's dry run. adminChange says why the batch would
-// need catalog-admins elsewhere, for the error only.
-func grantE2E(ctx context.Context, c *client.Client, opt ReleaseOptions, cat string, p *Plan) error {
-	why, err := adminChange(ctx, c, cat, p)
-	if err != nil {
-		return err
-	}
-	if why == "" {
-		why = cat + " is an end-to-end catalog, whose every catalog batch goes under a catalog admin's grant"
-	}
-	if opt.AdminGrant != "" {
-		g, err := grant.Decode(opt.AdminGrant, 0)
-		if err != nil {
-			return fmt.Errorf("merge: the admin grant: %w", err)
-		}
-		if len(g.Blocks) == 0 || !slicesContains(g.Blocks[0].Groups, "catalog-admins") {
-			return fmt.Errorf("%s: %w: the grant given (ReleaseOptions.AdminGrant) isn't a catalog-admins member's (§F.8)", why, ErrAdminNeeded)
-		}
-	}
-	g, err := adminGrant(opt, cat, p)
-	if err != nil {
-		return fmt.Errorf("%s: %w", why, err)
-	}
-	p.SetBatchClient(c.With(client.WithBearer(g)))
-	return nil
-}
-
-// adminChange reports why the plan's catalog batch needs catalog-admins
-// (§B.11.3, §B.11.4, §F.8), "" if it doesn't, as the merge service judges
-// it for a catalog whose service checks no batch (an end-to-end one,
-// grantE2E), from the catalog base's documents (decrypted with the plan's
-// keys) and the batch's plaintext steps:
-//
-//   - it changes a node's $access, or creates one with $access;
-//   - it restores a node: folders are restored only by catalog admins, and
-//     the merge service holds no deleted placement's rows to judge a
-//     re-placing against (§B.11.7), so one counts as widening;
-//   - it widens: some subject gets a role at a node the base has that it
-//     didn't have before, by §B.11.4's test (catalog.DiffAccess).
-func adminChange(ctx context.Context, c *client.Client, cat string, p *Plan) (string, error) {
-	x := &relCtx{c: c, e2e: p.e2eTarget()}
-	cfg, docs, incs, err := x.catalogBase(ctx, cat)
-	if err != nil {
-		return "", err
-	}
-	before := tree.BuildGraph(cat, cfg, docs)
-	changes := map[string]any{}
-	for _, r := range p.Items() {
-		start := docState{}
-		if d, ok := docs[r.Name]; ok {
-			start = docState{doc: jsonv.Clone(d), exists: true}
-		}
-		sc, err := foldWrites(start, r.Steps, false)
-		if err != nil {
-			return "", err
-		}
-		live := sc.final.exists && !sc.final.deleted
-		if !live {
-			changes[r.Name] = nil
-			continue
-		}
-		if r.BaseState == client.Tombstoned.String() {
-			return fmt.Sprintf("restoring %s needs catalog-admins (§B.11.4, §F.8)", r.Name), nil
-		}
-		bm, _ := docs[r.Name].(map[string]any)
-		am, _ := sc.final.doc.(map[string]any)
-		_, had := bm["$access"]
-		_, has := am["$access"]
-		if had != has || has && !jsonv.Equal(jsonv.FromGo(bm["$access"]), jsonv.FromGo(am["$access"])) {
-			return fmt.Sprintf("changing the $access of %s needs catalog-admins (§B.11.3, §F.8)", r.Name), nil
-		}
-		if am == nil {
-			am = map[string]any{}
-		}
-		changes[r.Name] = am
-	}
-	for _, w := range catalog.DiffAccess(before, before.With(changes), incs).Widens {
-		if _, existed := docs[w.Node]; existed {
-			return fmt.Sprintf("the batch would give %s the role %s on %s, which needs catalog-admins (§B.11.4, §F.8)", w.Subject, w.Role, w.Node), nil
-		}
-	}
-	return "", nil
-}
-
-// e2eTarget is the plan's key-holding view if its target is end-to-end,
-// which catalogBase then reads the catalog's documents with.
-func (p *Plan) e2eTarget() *client.E2E {
-	if p.TargetLevel == "e2e" {
-		return p.opt.E2E
-	}
-	return nil
-}
-
-// adminGrant narrows a catalog admin's grant to exactly the plan's batch:
-// a block with the merge service's via, the catalog only, the batch's
-// actions, its pairs of /resource and /action, and a few minutes' life
-// (§F.8, §C.1).
-func adminGrant(opt ReleaseOptions, cat string, p *Plan) (string, error) {
-	if opt.AdminGrant == "" {
-		return "", fmt.Errorf("%w, under whose grant it is submitted (§F.8): give one (ReleaseOptions.AdminGrant)", ErrAdminNeeded)
-	}
-	g, err := grant.Decode(opt.AdminGrant, 0)
-	if err != nil {
-		return "", fmt.Errorf("merge: the admin grant: %w", err)
-	}
-	// The pairs as one alternative per action naming its resources, so
-	// the rule's forms stay within rulesPerGrant (§12.2) however many
-	// items the batch has.
-	var can []string
-	names := map[string][]any{}
-	for _, r := range p.Items() {
-		for _, a := range itemActions(r) {
-			if !slicesContains(can, a) {
-				can = append(can, a)
-			}
-			names[a] = append(names[a], r.Name)
-		}
-	}
-	sort.Strings(can)
-	alts := []any{}
-	for _, a := range can {
-		alts = append(alts, map[string]any{"all": []any{
-			map[string]any{"op": "test", "path": "/action", "value": a},
-			map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": names[a]}},
-		}})
-	}
-	via := opt.Via
-	if via == "" {
-		via = opt.Who
-	}
-	block := map[string]any{"ns": []any{cat}, "can": anyStrings(can), "rules": []any{map[string]any{"any": alts}},
-		"exp": opt.now().Add(5 * time.Minute).UTC().Format(time.RFC3339)}
-	if via != "" {
-		block["via"] = via
-	}
-	ng, err := g.Narrow(block)
-	if err != nil {
-		return "", fmt.Errorf("merge: narrowing the admin grant: %w", err)
-	}
-	return ng.Encode(), nil
 }
 
 // itemActions are the actions an item's steps take (§6.2): create on an

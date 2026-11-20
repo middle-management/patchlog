@@ -24,7 +24,7 @@ import (
 
 // v75s is a server with authentication on and two private namespaces,
 // cat-season and matches, as the core's v75World: matches's key
-// catalog-01 has a scope rule testing /resource by type, so its grants
+// reader-01 has a scope rule testing /resource by type, so its grants
 // read matches only in part, through role reader (derby, shared, a, c,
 // final: li's) or chief (secret, b: bo's). k is a * key in both.
 type v75s struct {
@@ -52,10 +52,10 @@ func newV75s(t *testing.T, o v75sOpts) *v75s {
 	}
 	e := newEnvWith(t, []Option{WithEdgeGrants(ck)}, append([]envOpt{withAuth(&priv), fast}, o.env...)...)
 	e.opPriv = priv
-	w := &v75s{tenv: e, ck: ck, k: newKey("k"), cat: newKey("catalog-01")}
+	w := &v75s{tenv: e, ck: ck, k: newKey("k"), cat: newKey("reader-01")}
 	cat := map[string]any{"read": "grant", "keys": []any{w.k.entry("*")}}
 	w.mkNS("cat-season", cat)
-	matches := map[string]any{"read": "grant", "keys": []any{w.k.entry("*"), map[string]any{"kid": "catalog-01", "alg": "ed25519", "pub": w.cat.pub,
+	matches := map[string]any{"read": "grant", "keys": []any{w.k.entry("*"), map[string]any{"kid": "reader-01", "alg": "ed25519", "pub": w.cat.pub,
 		"can": []any{"read"}, "maxTtl": "PT15M",
 		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}}},
 		"roles": map[string]any{
@@ -109,7 +109,7 @@ func (w *v75s) put(ns, name string, doc map[string]any, hdr ...map[string]string
 	return etagOf(r)
 }
 
-// li is a partial reader of matches: catalog-01's grant for user:li, in
+// li is a partial reader of matches: reader-01's grant for user:li, in
 // editors and interns, with the reader role.
 func (w *v75s) li(extra ...map[string]any) string {
 	return w.catGrant("user:li", []any{"editors", "interns"}, extra...)
@@ -748,8 +748,8 @@ func TestV075BranchesPartial(t *testing.T) {
 		body: map[string]any{"name": "matches-r7", "at": w.nsHead("matches", w.admin), "patches": []any{}}}), 201)
 	expect(t, w.get("/ns/matches/branches", w.li()), 403)
 	both := w.grant(w.cat, "user:li", []string{"matches", "matches-r7"}, []string{"read"}, map[string]any{"groups": []any{"editors"},
-		"roles": []any{"reader"}, "at": map[string]any{"ns": "cat-season", "id": w.nsHead("cat-season", w.admin)},
-		"exp": w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)})
+		"roles": []any{"reader"},
+		"exp":   w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)})
 	expect(t, w.get("/ns/matches/branches", both), 403)
 	// Unrestricted: the head pointer class, as before.
 	r := w.get("/ns/matches/branches", w.admin)

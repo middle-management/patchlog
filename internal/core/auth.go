@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
-	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/rules"
@@ -208,7 +207,6 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 		env.Keys = t.effectiveKeys(n, cfg)
 		env.Revoked = t.effectiveRevoked(n, cfg)
 		env.Roles = cfg.Roles
-		env.CheckAt = t.checkAt(n)
 	}
 	// grantSize and rulesPerGrant were checked as the bearer was decoded,
 	// at the deployment's values (decodeGrant, §C.8).
@@ -346,74 +344,6 @@ func (t *tx) effectiveRevoked(n *nsRow, cfg *Config) map[string]bool {
 		}
 	}
 	return out
-}
-
-// errAtRejected is every refusal of a key's requireAt at the origin: one
-// text for a namespace that doesn't exist, an at that isn't in its chain
-// and one that wasn't its head within maxLag, and for an at of another
-// shape or namespace, so that no key-scope 403 names the namespace
-// requireAt gives, or tells whether it exists (§C.4 requireAt: "answered
-// as any other scope failure. ... No key-scope 403 names the namespace
-// requireAt gives"; v0.82).
-var errAtRejected = errors.New("at rejected by requireAt")
-
-// checkAt resolves a key's requireAt (§C.4): the grant's at must be an
-// ns_id in the named chain, and must have been that namespace's head at
-// some point within maxLag before the grant was issued (or later). maxLag
-// is the target namespace's (default 60 seconds), or the key's when that
-// is stricter. At the origin, at is in no chain of a namespace that
-// doesn't exist: the grant fails the scope as for any other at, with
-// errAtRejected, and so it does where requireAt names a purged namespace
-// (v0.85).
-func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
-	return func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
-		target := n
-		if s, ok := requireAt.(string); ok {
-			target = t.nsByName(s)
-			// A purged namespace as one that doesn't exist (§C.4,
-			// v0.85): its log is kept, and its purge-ns entry stays
-			// its head for good, but the grant fails the scope. Not
-			// the one the grant is checked in (v0.86): named by its
-			// own name it is as with requireAt: true, so the grant
-			// verifies against its kept chain and the purged
-			// namespace's own 410 answers, never the scope's 403.
-			if target == nil || target.purged && (n == nil || target.id != n.id) {
-				return errAtRejected
-			}
-		}
-		var idText string
-		switch x := at.(type) {
-		case string:
-			idText = x
-		case map[string]any:
-			ns, _ := x["ns"].(string)
-			if ns != target.name {
-				return errAtRejected
-			}
-			idText, _ = x["id"].(string)
-		}
-		id, err := ids.Parse(idText)
-		if err != nil {
-			// Not reached through grant.Verify: a grant decodes only
-			// with at an ns_id or {"ns","id"} with one, and one without
-			// at is refused before (key "requires at").
-			return errAtRejected
-		}
-		seq, ok := t.nsLogSeq(target.id, id)
-		if !ok {
-			return errAtRejected
-		}
-		var nextMs int64
-		if err := t.QueryRow(`SELECT created FROM ns_log WHERE ns = ? AND prev_seq = ?`, target.id, seq).Scan(&nextMs); err != nil {
-			return nil // at is still the head
-		}
-		next := time.UnixMilli(nextMs)
-		lag := grant.EffectiveMaxLag(t.config(target.configSeq).MaxLag, keyMaxLag)
-		if !grant.HeadWithin(&next, issued, lag) {
-			return errAtRejected
-		}
-		return nil
-	}
 }
 
 // basicEnvelope is the envelope of step 1 and of reads. A read envelope
@@ -633,7 +563,7 @@ func (t *tx) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
 // readerCheck authenticates a read that isn't of a resource URL, such as
 // /ns/{ns} and the URLs under it, or POST /ns/{ns}/keys, and decides
 // access with may. A grant its key's scope doesn't allow (sub, groups,
-// maxTtl, requireAt, readScope …) is 403 there, as for a write: only a
+// maxTtl, readScope …) is 403 there, as for a write: only a
 // read of a resource URL in a private namespace answers 404 (§C.2 item
 // 1, §7). A verified grant that may not read is 403 too (§7, v0.74).
 func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
@@ -1029,7 +959,7 @@ func (t *tx) allowanceOf(cfg *Config, a *actor) *Allowance {
 
 // guardedPaths need a grant chained to a * key (§7.4, §C.2): a config
 // write or a branch's patches covering or overlapping one of them.
-var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/merge", "/retention", "/encryption", "/signatures", "/nonce", "/schemaReads", "/catalogs", "/maxLag"}
+var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/merge", "/retention", "/encryption", "/signatures", "/nonce", "/schemaReads"}
 
 func touchesGuarded(writes []string) bool {
 	for _, w := range writes {

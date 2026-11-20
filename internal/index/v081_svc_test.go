@@ -12,7 +12,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
-	"github.com/middle-management/patchlog/internal/svcedge"
+	"github.com/middle-management/patchlog/internal/index"
 )
 
 // v081Exchange exchanges tok at x and returns the prefix it gives for
@@ -64,7 +64,7 @@ func TestV081SvcIndexNowRoles(t *testing.T) {
 	x := startSvcWith(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"docs"}, []string{"read"}))),
 		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"docs"}, untyped: true, now: s.Now},
 		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate, ev
 		})
 	x.caughtUp("docs")
 

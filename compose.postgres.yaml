@@ -7,8 +7,8 @@
 # The core reads its database URL from PATCHLOG_DB (so the password stays
 # out of its arguments). Blob bytes go to files in the data volume
 # (--blob-dir); more core instances would all mount that same volume. The
-# search index and tree service keep their own SQLite databases in the data
-# volume: they are derived state, rebuilt from the core's API.
+# search index keeps its own SQLite database in the data
+# volume: it is derived state, rebuilt from the core's API.
 # `docker compose down -v` wipes Postgres's volume too.
 
 services:
@@ -40,7 +40,6 @@ services:
       - --archive=file:///data/archive
       - --master-key=/data/master.key
       - --master-key-create
-      - --tree-url=http://tree:8082
       - --index-url=http://index:8081
       - --schema-fetch
       - --schema-fetch-hosts=www.schemastore.org,json.schemastore.org,raw.githubusercontent.com

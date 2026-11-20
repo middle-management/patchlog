@@ -11,7 +11,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -28,7 +27,6 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sig"
-	"github.com/middle-management/patchlog/internal/tree"
 	"github.com/middle-management/patchlog/internal/vectors/golden"
 	"github.com/middle-management/patchlog/internal/verify"
 )
@@ -535,8 +533,8 @@ func TestI7ResourceKey(t *testing.T) {
 	}
 }
 
-// I.8 (§B.5, §B.11.5): a subject set's gs, and the combined checkpoint a
-// tree service computes over its catalog and a namespace it trusts.
+// I.8 (§7.9, §A.4): a subject set's view, and the combined checkpoint
+// over two namespaces' ns_ids.
 func TestI8SubjectSetAndCheckpoint(t *testing.T) {
 	t.Parallel()
 	const gs = "17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm"
@@ -549,10 +547,8 @@ func TestI8SubjectSetAndCheckpoint(t *testing.T) {
 			t.Errorf("SubjectSetID(%q) = %s, want %s", subjects, got, gs)
 		}
 	}
-	g := &tree.Graph{Catalog: "cat", Trust: map[string]bool{"matches": true}}
-	at, nss := tree.CombinedAt(g, map[string]string{"cat": nsID1, "matches": nsID2})
-	if at != "1vwnfnoyshruyx4lul4a25rtctooiph5v" || !slices.Equal(nss, []string{"cat", "matches"}) {
-		t.Errorf("CombinedAt = %s %v", at, nss)
+	if at := grantcheck.CombinedAt(map[string]string{"cat": nsID1, "matches": nsID2}); at != "1vwnfnoyshruyx4lul4a25rtctooiph5v" {
+		t.Errorf("CombinedAt = %s", at)
 	}
 }
 

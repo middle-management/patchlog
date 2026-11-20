@@ -1,7 +1,6 @@
 package server
 
 import (
-	"strconv"
 	"testing"
 	"time"
 )
@@ -85,77 +84,4 @@ func TestAuthPublicIgnoresUnnamedGrant(t *testing.T) {
 	}
 	// Writes still need a grant naming the namespace.
 	expectCode(t, e.write("PATCH", "pub", "b", "", addRoot(map[string]any{}), f.issuerG), 403, "forbidden")
-}
-
-// §C.4 v0.21: at must have been the head within maxLag before the grant was
-// issued, max(nbf, exp − maxTtl); maxLag defaults to 60 seconds, and a key
-// may set a stricter one.
-func TestAuthMaxLagAtIssuance(t *testing.T) {
-	t.Parallel()
-	f := newAuthFixture(t, nil) // no maxLag: the default 60 s
-	e := f.tenv
-	cat := newKey("cat")
-	entry := cat.entry("read", "create", "append")
-	entry["requireAt"] = true
-	entry["maxTtl"] = "PT10M"
-	strict := newKey("strict")
-	sEntry := strict.entry("read", "create")
-	sEntry["requireAt"] = true
-	sEntry["maxTtl"] = "PT10M"
-	sEntry["maxLag"] = "PT10S"
-	expect(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: e.configID("sec", f.adminG), bearer: f.adminG,
-		body: ops(op("add", "/keys/-", entry), op("add", "/keys/-", sEntry))}), 201)
-	n := 0
-	create := func(g string) *resp {
-		n++
-		return e.write("PATCH", "sec", "r"+strconv.Itoa(n), "", addRoot(map[string]any{}), g)
-	}
-	// Issued now (exp − maxTtl), at the head.
-	mintAt := func(k keyPair, at string) string {
-		return e.grant(k, "user:li", []string{"sec"}, []string{"read", "create"},
-			map[string]any{"at": at, "exp": e.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)})
-	}
-	moveHead := func() { n++; e.create("sec", "m"+strconv.Itoa(n), map[string]any{}, f.issuerG) }
-
-	at := e.nsHead("sec", f.adminG)
-	g := mintAt(cat, at)
-	expect(t, create(g), 201)
-	// The head moves on; the grant was issued while at was the head, so it
-	// keeps working long after maxLag, until it expires.
-	moveHead()
-	e.clock.Advance(5 * time.Minute)
-	expect(t, create(g), 201)
-	// A grant issued now from that at is too late.
-	expect(t, create(mintAt(cat, at)), 403)
-
-	// Issued 59 s after at stopped being the head: in time, and it stays
-	// valid; at 61 s: too late.
-	at = e.nsHead("sec", f.adminG)
-	moveHead()
-	e.clock.Advance(59 * time.Second)
-	inTime := mintAt(cat, at)
-	e.clock.Advance(2 * time.Second)
-	late := mintAt(cat, at)
-	e.clock.Advance(3 * time.Minute)
-	expect(t, create(inTime), 201)
-	expect(t, create(late), 403)
-	// nbf counts as issuance when it is later than exp − maxTtl.
-	backdated := e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": at,
-		"nbf": e.clock.Now().Add(-3*time.Minute - 2*time.Second).Format(time.RFC3339), "exp": e.clock.Now().Add(time.Minute).Format(time.RFC3339)})
-	expect(t, create(backdated), 201)
-
-	// A key's stricter maxLag applies: 20 s is within 60 s, not within 10 s.
-	at = e.nsHead("sec", f.adminG)
-	moveHead()
-	e.clock.Advance(20 * time.Second)
-	expect(t, create(mintAt(cat, at)), 201)
-	expect(t, create(mintAt(strict, at)), 403)
-	// The namespace's own maxLag replaces the default; the key's still wins
-	// when stricter.
-	expect(t, e.patchNS("sec", ops(op("add", "/maxLag", "PT5M")), f.adminG), 201)
-	at = e.nsHead("sec", f.adminG)
-	moveHead()
-	e.clock.Advance(2 * time.Minute)
-	expect(t, create(mintAt(cat, at)), 201)
-	expect(t, create(mintAt(strict, at)), 403)
 }

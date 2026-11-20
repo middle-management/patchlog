@@ -22,7 +22,7 @@ func TestV076PubKeysKept(t *testing.T) {
 	const m = "reads:matches:g:1abc"
 	rec := func(pub string) *markerRec {
 		return &markerRec{f: &grantcheck.ReadFilter{Principal: map[string]any{}}, subjects: []string{"group:fans"},
-			key: gsKey{kid: "catalog-01", roles: []string{"reader"}, pub: pub}}
+			key: gsKey{kid: "reader-01", roles: []string{"reader"}, pub: pub}}
 	}
 	must := func(err error) {
 		t.Helper()
@@ -36,7 +36,7 @@ func TestV076PubKeysKept(t *testing.T) {
 		must(err)
 		var out []string
 		for _, k := range ks {
-			if k.kid != "catalog-01" || len(k.roles) != 1 || k.roles[0] != "reader" {
+			if k.kid != "reader-01" || len(k.roles) != 1 || k.roles[0] != "reader" {
 				t.Errorf("key %+v", k)
 			}
 			out = append(out, k.pub)

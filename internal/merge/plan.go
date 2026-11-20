@@ -276,8 +276,8 @@ type Options struct {
 	// resolve (§6.1).
 	SourceAuthorizations []string
 	// BatchClient, if set, submits the batches (dry runs included) in
-	// place of the plan's client, e.g. under a catalog service's merge
-	// grant (§F.8). Reads still use the plan's client.
+	// place of the plan's client, e.g. under a grant narrowed to the
+	// batch (§F.8). Reads still use the plan's client.
 	BatchClient *client.Client
 	// Signer, if set, signs every step the plan's batches write (§C.3.1):
 	// the digest binds the target deployment's origin, the target

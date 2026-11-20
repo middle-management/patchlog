@@ -51,15 +51,10 @@ var (
 
 // errGrantLacks is a namespace the index's own grant (Options.Client)
 // can't read, 401 or 403, that it reads only to tell whether §B.11.9
-// covers a namespace it follows, or what visibility reads there: a
-// catalog that namespace's catalogs names through a requireAt key, each
-// namespace a followed catalog's catalog.trust lists, a branch's bases,
-// and their state at a checkpoint. Its coverage can't be told, so a
-// partial reader is refused (502) rather than answered as by an
-// uncovered namespace's rules, which could show what visibility hides
-// (§B.11.9 Visible). Its Error names the namespace, for the operator's
-// log; answers don't, as /principal doesn't name a catalog's trust to
-// one who can't read the catalog whole (§7.4).
+// covers a namespace it follows: its state at a checkpoint. Its coverage
+// can't be told, so a partial reader is refused (502) rather than
+// answered as by an uncovered namespace's rules. Its Error names the
+// namespace, for the operator's log; answers don't.
 type errGrantLacks struct {
 	ns  string
 	err error

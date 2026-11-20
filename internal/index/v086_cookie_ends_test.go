@@ -10,7 +10,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
-	"github.com/middle-management/patchlog/internal/svcedge"
+	"github.com/middle-management/patchlog/internal/index"
 )
 
 // CONFORMANCE Tree 145 at the index (SERVICES §B.11.9 gs, §A.4 gs, v0.86):
@@ -45,7 +45,7 @@ func v86Start(d *v77docs, ns []string, o svcOpts, mods ...func(*indexOpts)) {
 	d.x = startSvcWith(d.t, d.s.Client(d.t, client.WithBearer(d.admin.Grant(d.t, d.s.Now(), "svc:indexer", ns, []string{"read"}))),
 		svcOpts{db: db, ns: ns, untyped: true, rebuild: o.rebuild, noRun: o.noRun, now: d.s.Now},
 		append([]func(*indexOpts){func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate, ev
 		}}, mods...)...)
 }
 
@@ -223,7 +223,7 @@ func newV86Branch(t *testing.T) (*v77docs, []string) {
 	d.x = startSvcWith(t, s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "svc:indexer", nss, []string{"read"}))),
 		svcOpts{db: t.TempDir() + "/i.db", ns: nss, untyped: true, now: s.Now},
 		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate, ev
 		})
 	d.x.caughtUp("docs")
 	d.x.caughtUp("docs-b")
@@ -302,7 +302,7 @@ func TestV086CookieMintedBehindOutlivesBacklog(t *testing.T) {
 				t.Fatalf("li under the cookie minted against the head, once the index applied the %d config entries before it: %d, want 200", len(backlog), got)
 			}
 			// An entry of docs that changes nothing of its keys or roles.
-			d.patch(map[string]any{"op": "add", "path": "/maxLag", "value": "PT30S"})
+			d.patch(map[string]any{"op": "add", "path": "/x-note", "value": "PT30S"})
 			if got := status(); got != 200 {
 				t.Fatalf("li under her cookie after a config entry that leaves k1 as it was: %d, want 200", got)
 			}
@@ -349,7 +349,7 @@ func TestV086CookieOfAStaleHeadIsJudged(t *testing.T) {
 		o.db, o.ns, o.untyped, o.now = db, []string{"docs"}, true, s.Now
 		return startSvcWith(t, s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "svc:indexer", []string{"docs"}, []string{"read"}))), o,
 			append([]func(*indexOpts){func(o *indexOpts) {
-				o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+				o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate, ev
 			}}, mods...)...)
 	}
 	// The serving instance, whose checker reads docs' document at H.

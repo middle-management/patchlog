@@ -281,11 +281,6 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			// its document is 410 (§8.5), and it is left out as above.
 			continue
 		}
-		// A requireAt chain the verifier can't read is 503 or 502 for the
-		// whole answer, never a refusal (§C.4, writeUpstreamErr).
-		if _, ok := chainErr(err); ok {
-			return nil, err
-		}
 		// A private namespace the grant names verifies it (access): a
 		// refusal there is 401 if it doesn't verify, 403 once it does.
 		var ae *grant.AuthError

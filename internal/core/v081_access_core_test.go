@@ -10,8 +10,7 @@ import (
 // V81-02 (v0.78, v0.81): access in the core. A rule referring to /now
 // never passes for a read (§C.2 item 5); a gs holds all the caller's
 // groups and a stored "partial" set is refused (§B.11.5, §B.11.9 gs);
-// filtered reads cover no branch, and a branch catalog is dark (§B.11.9
-// Where).
+// filtered reads cover no branch (§B.11.9 Where).
 
 // v081Heads are the names li's filtered /heads lists in matches, after
 // following its redirect, and the redirect.

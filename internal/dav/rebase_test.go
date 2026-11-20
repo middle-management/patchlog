@@ -18,7 +18,7 @@ import (
 // the file as written wins on the paths it changes.
 func TestSaveBaseForms(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	mine := rendered(map[string]any{"a": "mine", "b": "1"})
 	for i, hdr := range [][]string{
 		{"If-Match", `W/"%s", "other"`},
@@ -47,7 +47,7 @@ func TestSaveBaseForms(t *testing.T) {
 // the reload the edit saves.
 func TestSavePrunedBase(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	r0 := e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/b", "2"))
@@ -81,7 +81,7 @@ func TestSavePrunedBase(t *testing.T) {
 // change again.
 func TestSaveLogWrites(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"a": "1", "items": []any{"p", "q"}, "n": "0"})
 	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/a", "2"))
@@ -113,7 +113,7 @@ func TestSaveLogWrites(t *testing.T) {
 func TestSaveOverOthersDelete(t *testing.T) {
 	t.Parallel()
 	c := newClock()
-	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.Now = c.now })
+	e := newEnv(t, []string{"docs"}, nil, func(_ *clienttest.Options, o *dav.Options) { o.Now = c.now })
 	whole := func(name string) {
 		t.Helper()
 		if p := patchPaths(t, e.lastEntry("docs", name).Patches); len(p) != 1 || p[0] != "" {
@@ -193,10 +193,11 @@ func TestSaveOverOthersDelete(t *testing.T) {
 func TestOversizeSave(t *testing.T) {
 	t.Parallel()
 	// 3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize (§6.6 Values).
-	e := newEnv(t, []string{"lim", "dflt", "sealedish"}, nil, map[string]map[string]any{
+	e := newEnv(t, []string{"lim", "dflt", "sealedish"}, map[string]map[string]any{
 		"lim":       {"limits": map[string]any{"patchSetSize": 2048, "valueSize": 300, "pathSize": 40, "opsPerSet": 3}},
 		"sealedish": {"nonce": "required", "limits": map[string]any{"patchSetSize": 2048, "valueSize": 300, "pathSize": 40}},
 	})
+
 	isWhole := func(ns, name string) {
 		t.Helper()
 		p := patchPaths(t, e.lastEntry(ns, name).Patches)
@@ -278,7 +279,7 @@ func TestOversizeSave(t *testing.T) {
 // a file of a purged namespace.
 func TestSavePurged(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs", "gone"}, nil, nil)
+	e := newEnv(t, []string{"docs", "gone"}, nil)
 	e.create("docs", "x", map[string]any{"a": "1"})
 	e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET")
 	h, _ := e.load("docs", "x")
@@ -303,7 +304,7 @@ func TestSavePurged(t *testing.T) {
 // newer version it read part of; a GET of the whole file is.
 func TestSaveRangeReadNoBase(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"title": "A", "n": "1"})
 	editor := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/title", "Theirs"))
@@ -322,7 +323,7 @@ func TestSaveRangeReadNoBase(t *testing.T) {
 func TestSaveRecordsForADay(t *testing.T) {
 	t.Parallel()
 	c := newClock()
-	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.Now = c.now })
+	e := newEnv(t, []string{"docs"}, nil, func(_ *clienttest.Options, o *dav.Options) { o.Now = c.now })
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/b", "theirs"))
@@ -340,36 +341,4 @@ func TestSaveRecordsForADay(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/y.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT after the reload")
 	_, doc = e.load("docs", "y")
 	sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
-}
-
-// A write moments after the user's own DELETE restores the file rebased
-// on its last live document (§H.6), and a restore patch set over
-// opsPerSet or patchSetSize is written whole from there, as an edit from
-// the head is (§H.4), in the flat view and in a tree, rather than refused
-// and the DELETE undone.
-func TestOversizeRestore(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t, []string{"lim"}, []string{"cat"}, map[string]map[string]any{
-		"lim": {"limits": map[string]any{"opsPerSet": 3}},
-		"cat": {"catalog": treeCatalog("tlim")},
-	})
-	must(e.c.CreateNamespace(e.ctx, "tlim", map[string]any{"read": "public", "limits": map[string]any{"opsPerSet": 3}}))
-	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
-	e.create("lim", "ops", map[string]any{"a": "0", "b": "0", "c": "0", "d": "0"})
-	e.create("tlim", "t", map[string]any{"a": "0", "b": "0", "c": "0", "d": "0"})
-	e.create("cat", "tlim.t", map[string]any{"title": "t.json", "parents": parents("cat", "root")})
-	for _, c := range []struct{ path, ns, name string }{{"/lim/ops.json", "lim", "ops"}, {"/cat/t.json", "tlim", "t"}} {
-		e.expect(e.do("GET", c.path, ""), 200, "GET "+c.path)
-		e.expect(e.do("DELETE", c.path, ""), 204, "DELETE "+c.path)
-		e.expect(e.do("PUT", c.path, `{"a": "2", "b": "2", "c": "2", "d": "2"}`), 201, "PUT over opsPerSet after the DELETE of "+c.path)
-		h, doc := e.load(c.ns, c.name)
-		if h.State != client.Live {
-			t.Fatalf("%s: %v", c.path, h.State)
-		}
-		sameJSON(t, doc, map[string]any{"a": "2", "b": "2", "c": "2", "d": "2"})
-		if p := patchPaths(t, e.lastEntry(c.ns, c.name).Patches); len(p) == 0 || p[0] != "" {
-			t.Fatalf("%s: not a root replace: %q", c.path, p)
-		}
-	}
-	sameStrings(t, "tree", names(e.propfind("/cat/"), "/cat/"), []string{"t.json"})
 }

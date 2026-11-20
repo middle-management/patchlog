@@ -22,7 +22,6 @@ import (
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
-	"github.com/middle-management/patchlog/internal/svcedge"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -232,15 +231,14 @@ type access struct {
 
 // writeLimit answers a grant over grantSize or rulesPerGrant, which the
 // checker decodes as a *grantcheck.LimitError, as the origin answers it:
-// 413, code limit, naming the limit (§C.8), as the tree and catalog
-// services do (§C.6); a public namespace's reads ignore the grant, so
+// 413, code limit, naming the limit (§C.8); a public namespace's reads ignore the grant, so
 // this comes up only where one is used. It reports whether it answered.
 func writeLimit(w http.ResponseWriter, err error) bool {
 	var le *grantcheck.LimitError
 	if !errors.As(err, &le) {
 		return false
 	}
-	svcedge.Limit(le.Limit, le.Measured, le.Max).Write(w)
+	svcLimit(le.Limit, le.Measured, le.Max).Write(w)
 	return true
 }
 
@@ -908,18 +906,12 @@ var errMoving = errors.New("the index is applying the namespace's log: try again
 var errVisibility = errors.New("visibility")
 
 // writeAccessErr answers err, a failed read check (Index.access,
-// refsReader): 413 for a grant over a limit (writeLimit); a requireAt
-// chain the verifier can't read, whatever else err is, as
-// writeUpstreamErr answers it (§C.4: "never 403"); a grant every
+// refsReader): 413 for a grant over a limit (writeLimit); a grant every
 // namespace of which it names is purged 410 (purgedNS); a refusal as such,
 // no-store; a namespace not reached yet behind; anything else as
 // writeUpstreamErr answers it, with msg.
 func (ix *Index) writeAccessErr(w http.ResponseWriter, what string, err error, msg string) {
 	if writeLimit(w, err) {
-		return
-	}
-	if _, ok := chainErr(err); ok {
-		ix.writeUpstreamErr(w, what, err, msg)
 		return
 	}
 	var pn *purgedNS
@@ -945,35 +937,9 @@ func (ix *Index) writeAccessErr(w http.ResponseWriter, what string, err error, m
 	ix.writeUpstreamErr(w, what, err, msg)
 }
 
-// chainUnreadable is an error of a grant check that couldn't read the
-// chain a requireAt key names (§C.4 requireAt), its ChainUnreadable
-// telling whether the cause is transient (a transport error, a deadline,
-// a 5xx, 408 or 429). grantcheck's chain error has this method; the index
-// matches it by the method alone.
-type chainUnreadable interface{ ChainUnreadable() bool }
-
-// chainErr reports whether err is a requireAt chain the verifier couldn't
-// read (ok), and whether for now (transient).
-func chainErr(err error) (transient, ok bool) {
-	var c chainUnreadable
-	if !errors.As(err, &c) {
-		return false, false
-	}
-	return c.ChainUnreadable(), true
-}
-
-// Answers to a requireAt chain the verifier can't read (§C.4: "503
-// (behind) while the cause is transient (§A.1), and 502 (upstream)
-// otherwise, naming no namespace, never 403"), and to a namespace
-// visibility reads not followed yet (§A.4 Private namespaces: 503 behind;
-// /principal hides catalog.trust, §7.4, so it names none either).
-const (
-	msgChainBehind   = "the chain a requireAt key names cannot be read yet (§C.4)"
-	msgChainUpstream = "cannot read the chain a requireAt key names (§C.4)"
-	// The core's root, which says whether authentication is on (§B.11.9
-	// Where), for now (rootErr).
-	msgRootBehind = "the index cannot read the core's configuration yet (§B.11.9)"
-)
+// msgRootBehind answers the core's root, which says whether
+// authentication is on (§7.9 Where), unreadable for now (rootErr).
+const msgRootBehind = "the index cannot read the core's configuration yet (§7.9)"
 
 // writeCoverErr answers a failure to compute a partial reader's view of a
 // namespace §B.11.9 covers (Index.cover): a refusal as such, no-store;
@@ -983,10 +949,7 @@ const (
 // fetched yet (writeUpstreamErr).
 func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 	var ae *grant.AuthError
-	_, chain := chainErr(err)
 	switch {
-	case chain:
-		ix.writeUpstreamErr(w, "visibility in "+ns, err, "cannot read a namespace visibility reads (§B.11.9)")
 	case errors.As(err, &ae):
 		code := "forbidden"
 		if ae.Status == 401 {
@@ -1004,13 +967,9 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 
 // upstreamBehind reports whether err, a failure to read upstream what
 // answering needs, is one for now, answered 503 behind with msg, rather
-// than 502 upstream (writeUpstreamErr, worseUpstream): a requireAt chain
-// unreadable for a transient cause, the core's root or a sealed namespace's keys that can't
-// be fetched for now.
+// than 502 upstream (writeUpstreamErr, worseUpstream): the core's root
+// or a sealed namespace's keys that can't be fetched for now.
 func upstreamBehind(err error) (msg string, behind bool) {
-	if transient, ok := chainErr(err); ok {
-		return msgChainBehind, transient
-	}
 	if errors.Is(err, errExchangeBehind) {
 		return "the index has not reached a change to a key or role the grant reads through: exchange it again (§A.4)", true
 	}
@@ -1034,19 +993,12 @@ func upstreamBehind(err error) (msg string, behind bool) {
 // lacks the keys"), and one for now (a 5xx, a 408, a 429, the core
 // unreachable) is 503
 // behind, with Retry-After (scenario 100: "While those keys only can't
-// yet be fetched → 503 behind", §12.1). A requireAt chain the
-// verifier can't read (chainErr) is 503 behind while the cause is
-// transient, else 502 upstream, each with a fixed message naming no
-// namespace (§C.4). Every read check and view this service answers 502
+// yet be fetched → 503 behind", §12.1). Every read check and view this service answers 502
 // for passes through here, so each gets the same answer.
 func (ix *Index) writeUpstreamErr(w http.ResponseWriter, what string, err error, msg string) {
 	ix.opt.Logf("index: %s: %v", what, err)
 	if msg, behind := upstreamBehind(err); behind {
 		writeBehind(w, msg)
-		return
-	}
-	if _, ok := chainErr(err); ok {
-		writeErr(w, http.StatusBadGateway, "upstream", msgChainUpstream)
 		return
 	}
 	var gl *errGrantLacks

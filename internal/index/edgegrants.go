@@ -20,7 +20,6 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
-	"github.com/middle-management/patchlog/internal/svcedge"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -48,7 +47,7 @@ import (
 //
 // A cookie carries only kid, p and exp. A read under one is the subject
 // set's, so the service keeps the markers behind each gs it minted a
-// cookie for (svcedge.Store: edge_subjects), and, for a marker
+// cookie for (edgeStore: edge_subjects), and, for a marker
 // reads:{ns}:scope:{digest}, what its digest covers, the rules that limit
 // the reads and the /principal values they refer to (edge_filters,
 // markerRec), from which it filters hits per resource as for any grant
@@ -343,7 +342,7 @@ func (ix *Index) entryOfIn(ctx context.Context, cfg *grantcheck.Config, kid stri
 // with the pub it had, and with its whole entry and each of its roles'
 // whole definitions digesting to k.entry (§B.11.9 gs, v0.82: "gone or
 // changes in any member"), whether or not a scope digest reads the member
-// that changed: a changed sub, groups, attrs, maxTtl, requireAt or can of
+// that changed: a changed sub, groups, attrs, maxTtl, rate or can of
 // the key, or a role's can or rules. A key recorded without its entry or
 // its pub never holds. The key is returned for gsKeyHolds.
 func (ix *Index) entryHolds(ctx context.Context, cfg *grantcheck.Config, k gsKey) (grant.Key, bool, error) {
@@ -421,8 +420,8 @@ func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, 
 }
 
 // errExchangeBehind is an exchange whose cookie would be 403 at once
-// (exchangeEntry): 503 behind, ranked as a requireAt chain that can't be
-// read for now (upstreamBehind, worseUpstream; §A.4 gs, §C.5.2).
+// (exchangeEntry): 503 behind, ranked as any failure to read upstream
+// for now (upstreamBehind, worseUpstream; §A.4 gs, §C.5.2).
 var errExchangeBehind = errors.New("the index hasn't applied a change to a key or role the grant reads through")
 
 // markerRecOf is what a's marker stands for, a's grant being v: its
@@ -523,7 +522,7 @@ type gsKeyRow struct{ kid, roles, pub, entry, pending, chain string }
 // at now, stand for (edge_filters, and for g: markers edge_gs), and the
 // keys each cookie came from (edge_gs_keys), and drops what the last edge
 // grant of has expired, from the database and from memory, as
-// svcedge.Store.Record does for subject sets. It sets each rec's exp to
+// edgeStore.Record does for subject sets. It sets each rec's exp to
 // the one its cookie must carry.
 //
 // A cookie carries its prefix and exp alone, so cookies of one marker
@@ -1549,7 +1548,7 @@ func (ix *Index) serveEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodDelete:
 		// The core's DELETE /edge-grants takes only core prefixes, so the
 		// service withdraws its own (§C.5.3, §C.5.4).
-		svcedge.Withdraw(w, r, ix.opt.EdgeGrants, func(p string) bool { _, _, ok := edgeGS(p); return ok },
+		svcWithdraw(w, r, ix.opt.EdgeGrants, func(p string) bool { _, _, ok := edgeGS(p); return ok },
 			"/{ns}/g/{gs} or /_refs/g/{gs} (§A.4, §B.11.5)")
 	default:
 		ix.issueEdgeGrants(w, r)
@@ -1565,16 +1564,16 @@ const maxPrefixes = 100
 // from (markerRec, for every marker), and the exchangeRate bucket of its
 // principal.
 type exchanged struct {
-	issues   []svcedge.Issue
+	issues   []svcIssue
 	subjects map[string][]string
 	filters  map[string]*markerRec
 	bucket   string
 }
 
 // issueEdgeGrants is POST /edge-grants (§A.4, §B.11.5, following §C.5.2's
-// issuance): with the grant in Authorization, or 1 to svcedge.MaxGrants
+// issuance): with the grant in Authorization, or 1 to svcMaxGrants
 // grants as { "grants": [ … ] } in an application/json body (415
-// otherwise, svcedge.Bearers), it answers 200 { prefixes, exp } and one
+// otherwise, svcBearers), it answers 200 { prefixes, exp } and one
 // Set-Cookie per prefix. Each grant gives, for every private namespace
 // the service follows that it names, /{ns}/g/{gs} of the reader's
 // marker there (exchangeGrant), and /_refs/g/{gs} of its markers in those
@@ -1586,16 +1585,16 @@ type exchanged struct {
 // it answers all or nothing (§C.5.2): a grant over grantSize or
 // rulesPerGrant is 413 limit (§C.8); a grant left with no edge grant is
 // refused 401 if any such is 401, else 403; else, where a namespace
-// document a grant names, or the chain a requireAt key names, can't be
-// read, 502 if any such failure is lasting and 503 behind only if every
-// one is for now (worseUpstream; §C.4, §C.5.2); once none is, a grant left with
+// document a grant names can't be read, 502 if any such failure is
+// lasting and 503 behind only if every one is for now (worseUpstream;
+// §C.5.2); once none is, a grant left with
 // no edge grant whose only refusals are purges is 410 purged, with ns and
 // head naming the first in the order the grants and their root blocks
 // list them (§8.5).
 // More than maxPrefixes prefixes is 400.
 // Once nothing is refused, it draws one token from the exchangeRate
 // bucket of each distinct principal among the grants (ExchangeRate,
-// §6.6), shared with the instances on its database (svcedge.Store), and
+// §6.6), shared with the instances on its database (edgeStore), and
 // is 429 (code "rate", limit "exchangeRate", with Retry-After) while any
 // is empty. While the core's authentication is disabled (§1), it is 404
 // not_offered, before the body is read; it takes no query parameter (400,
@@ -1618,7 +1617,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_input", "POST /edge-grants takes no query parameters (§7)")
 		return
 	}
-	bearers, refusal := svcedge.Bearers(r, svcedge.DefaultGrantSize)
+	bearers, refusal := svcBearers(r, svcDefaultGrantSize)
 	if refusal != nil {
 		refusal.Write(w)
 		return
@@ -1646,16 +1645,11 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		ex, pn, err := ix.exchangeGrant(ctx, b, reached, now)
 		var le *grantcheck.LimitError
 		var ae *grant.AuthError
-		_, chain := chainErr(err)
 		switch {
 		case errors.As(err, &le):
 			if limit == nil {
 				limit = le
 			}
-		case chain:
-			// A requireAt chain the verifier can't read: 503 or 502,
-			// never a refusal (§C.4, writeUpstreamErr).
-			upErr = worseUpstream(upErr, err)
 		case errors.As(err, &ae):
 			if denied == nil || ae.Status == http.StatusUnauthorized && denied.Status != http.StatusUnauthorized {
 				denied = ae
@@ -1672,7 +1666,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case limit != nil:
-		svcedge.Limit(limit.Limit, limit.Measured, limit.Max).Write(w)
+		svcLimit(limit.Limit, limit.Measured, limit.Max).Write(w)
 		return
 	case denied != nil:
 		code := "forbidden"
@@ -1689,7 +1683,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		purged.write(w)
 		return
 	}
-	var issues []svcedge.Issue
+	var issues []svcIssue
 	subjects := map[string][]string{}
 	filters := map[string]*markerRec{}
 	var keys []string
@@ -1711,7 +1705,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 			keys = append(keys, ex.bucket)
 		}
 	}
-	issues = svcedge.Merge(issues)
+	issues = svcMerge(issues)
 	if len(issues) > maxPrefixes {
 		writeErr(w, http.StatusBadRequest, "bad_input", "the grants give more than 100 distinct prefixes (§C.5.2)")
 		return
@@ -1724,7 +1718,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal", "cannot draw from the exchangeRate buckets")
 		return
 	case wait > 0:
-		svcedge.RateLimited(wait).Write(w)
+		svcRateLimited(wait).Write(w)
 		return
 	}
 	// What each marker stands for, and the keys it came from, per cookie:
@@ -1764,15 +1758,14 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	svcedge.Mint(w, ix.opt.EdgeGrants, now, issues)
+	svcMint(w, ix.opt.EdgeGrants, now, issues)
 }
 
 // worseUpstream is the one of cur and err, failures to read upstream
 // what an exchange needs, that answers it: the first that is lasting
 // (502 upstream), else the first (503 behind), so that an exchange is 503
 // only where every such failure is for now, whatever the order of its
-// grants and of the namespaces each names (§C.4: "503 (behind) while the
-// cause is transient, and 502 (upstream) otherwise"; writeUpstreamErr).
+// grants and of the namespaces each names (writeUpstreamErr).
 func worseUpstream(cur, err error) error {
 	if cur == nil {
 		return err
@@ -1833,7 +1826,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 	// first 401 answering if nothing is left, else the first 403.
 	deny := func(err error) bool {
 		var ae *grant.AuthError
-		if _, chain := chainErr(err); chain || !errors.As(err, &ae) {
+		if !errors.As(err, &ae) {
 			return false
 		}
 		if denied == nil || ae.Status == http.StatusUnauthorized && denied.Status != http.StatusUnauthorized {
@@ -1910,7 +1903,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		}
 		ex.filters[a.marker] = rec
 		if _, _, ok := edgeGS(nsPrefix(ns, a.gs)); ok {
-			ex.issues = append(ex.issues, svcedge.Issue{Prefix: nsPrefix(ns, a.gs), Exp: exp})
+			ex.issues = append(ex.issues, svcIssue{Prefix: nsPrefix(ns, a.gs), Exp: exp})
 			ex.subjects[a.gs] = []string{a.marker}
 		}
 		if _, ok := reached[ns]; ok && ix.keys.Skipped(ns) == "" {
@@ -1926,7 +1919,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 	if len(markers) > 0 {
 		gs := grantcheck.SubjectSetID(markers)
 		slices.Sort(markers)
-		ex.issues = append(ex.issues, svcedge.Issue{Prefix: refsPrefix(gs), Exp: refsExp})
+		ex.issues = append(ex.issues, svcIssue{Prefix: refsPrefix(gs), Exp: refsExp})
 		ex.subjects[gs] = markers
 	}
 	switch {
@@ -2094,7 +2087,7 @@ func grantExp(v *grant.Verified) time.Time {
 
 // initEdge sets up the service's edge grants, with EdgeGrants: its key
 // vouches only for its own prefixes (edgeGS), and their state lives in
-// the database (svcedge.Store, and edge_filters, migration 004).
+// the database (edgeStore, and edge_filters, migration 004).
 func (ix *Index) initEdge(ctx context.Context, db *sql.DB) error {
 	ix.filters = map[string]keptFilter{}
 	if ix.opt.EdgeGrants == nil {
@@ -2102,11 +2095,10 @@ func (ix *Index) initEdge(ctx context.Context, db *sql.DB) error {
 	}
 	ix.opt.EdgeGrants.Vouches = func(p string) bool { _, _, ok := edgeGS(p); return ok }
 	if ix.opt.ExchangeRate.Rate <= 0 || ix.opt.ExchangeRate.Burst < 1 {
-		ix.opt.ExchangeRate = svcedge.DefaultExchangeRate
+		ix.opt.ExchangeRate = DefaultExchangeRate
 	}
-	var err error
-	ix.edge, err = svcedge.NewStore(ctx, db)
-	return err
+	ix.edge = newEdgeStore(db)
+	return nil
 }
 
 // maxChain bounds a branch's chain of bases (the deployment's branch

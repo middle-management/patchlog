@@ -673,11 +673,6 @@ func TestKeyScope(t *testing.T) {
 		{"roles deny ok", map[string]any{"roles": map[string]any{"deny": []any{"editor"}}}, map[string]any{"roles": []string{"reader"}}, true},
 		{"attrs ok", map[string]any{"attrs": map[string]any{"region": "se"}}, nil, true},
 		{"attrs violated", map[string]any{"attrs": map[string]any{"region": "no"}}, nil, false},
-		{"requireAt missing", map[string]any{"requireAt": true}, nil, false},
-		{"requireAt ok", map[string]any{"requireAt": true}, map[string]any{"at": "1" + strings.Repeat("a", 32), "nbf": ts(-time.Minute)}, true},
-		{"requireAt lag", map[string]any{"requireAt": "cat", "maxLag": "PT1M"}, map[string]any{"at": map[string]any{"ns": "cat", "id": "1" + strings.Repeat("a", 32)}}, false},
-		{"requireAt default lag", map[string]any{"requireAt": "cat"}, map[string]any{"at": map[string]any{"ns": "cat", "id": "1" + strings.Repeat("a", 32)}}, false},
-		{"requireAt key lag laxer", map[string]any{"requireAt": "cat", "maxLag": "PT5M"}, map[string]any{"at": map[string]any{"ns": "cat", "id": "1" + strings.Repeat("a", 32)}}, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -687,16 +682,6 @@ func TestKeyScope(t *testing.T) {
 			env.ValidateAttrs = func(schema any, attrs map[string]any) error {
 				if !jsonv.Equal(schema, attrs) {
 					return errors.New("mismatch")
-				}
-				return nil
-			}
-			// A map at stopped being the head 2 minutes before issuance.
-			env.CheckAt = func(req, at any, issued time.Time, keyMaxLag *time.Duration) error {
-				if _, ok := at.(map[string]any); ok {
-					next := issued.Add(-2 * time.Minute)
-					if !HeadWithin(&next, issued, EffectiveMaxLag(nil, keyMaxLag)) {
-						return errors.New("too old")
-					}
 				}
 				return nil
 			}
@@ -827,13 +812,13 @@ func TestParseKeysAndRoles(t *testing.T) {
 	}
 	good := jsonv.FromGo([]any{map[string]any{"kid": "a", "alg": "ed25519", "pub": pub, "can": []any{"read"},
 		"maxTtl": "P1DT2H3M4.5S", "rate": map[string]any{"rate": 1.0, "burst": 5.0}, "readScope": "resource",
-		"requireAt": "cat", "maxLag": "PT60S", "roles": map[string]any{"allow": []any{"r"}}}})
+		"roles": map[string]any{"allow": []any{"r"}}}})
 	ks, err := ParseKeys(good)
 	if err != nil {
 		t.Fatal(err)
 	}
 	k := ks[0]
-	if *k.MaxTTL != 26*time.Hour+3*time.Minute+4500*time.Millisecond || k.Rate.Burst != 5 || !k.ReadScopeResource || k.RequireAt != "cat" || *k.MaxLag != time.Minute || k.IsStar() {
+	if *k.MaxTTL != 26*time.Hour+3*time.Minute+4500*time.Millisecond || k.Rate.Burst != 5 || !k.ReadScopeResource || k.IsStar() {
 		t.Fatalf("key %+v", k)
 	}
 	if _, err := ParseKeys([]any{good.([]any)[0], good.([]any)[0]}); err == nil {
@@ -856,46 +841,5 @@ func TestPrivateKeyRoundtrip(t *testing.T) {
 	}
 	if _, err := ParsePrivateKey("abc"); err == nil {
 		t.Fatal("bad key accepted")
-	}
-}
-
-func TestIssuedAndMaxLag(t *testing.T) {
-	ttl := time.Hour
-	exp := now.Add(30 * time.Minute)
-	nbf := now.Add(-50 * time.Minute)
-	withTTL := &Key{MaxTTL: &ttl}
-	if _, ok := Issued(Block{Exp: &exp}, &Key{}); ok {
-		t.Fatal("nothing: issued without nbf or maxTtl")
-	}
-	cases := []struct {
-		name string
-		root Block
-		key  *Key
-		want time.Time
-	}{
-		{"nbf, no maxTtl", Block{Exp: &exp, Nbf: &nbf}, &Key{}, nbf},
-		{"exp - maxTtl", Block{Exp: &exp}, withTTL, exp.Add(-ttl)},
-		{"max(nbf, exp - maxTtl)", Block{Exp: &exp, Nbf: &nbf}, withTTL, exp.Add(-ttl)},
-	}
-	late := now.Add(-10 * time.Minute)
-	cases = append(cases, struct {
-		name string
-		root Block
-		key  *Key
-		want time.Time
-	}{"later nbf", Block{Exp: &exp, Nbf: &late}, withTTL, late})
-	for _, c := range cases {
-		if got, ok := Issued(c.root, c.key); !ok || !got.Equal(c.want) {
-			t.Errorf("%s: %v, want %v", c.name, got, c.want)
-		}
-	}
-	m := 10 * time.Second
-	h := 5 * time.Minute
-	if EffectiveMaxLag(nil, nil) != 60*time.Second || EffectiveMaxLag(&h, nil) != h || EffectiveMaxLag(&h, &m) != m || EffectiveMaxLag(&m, &h) != m {
-		t.Fatal("EffectiveMaxLag")
-	}
-	next := now.Add(-time.Minute)
-	if !HeadWithin(nil, now, 0) || !HeadWithin(&next, now, time.Minute) || HeadWithin(&next, now, time.Minute-time.Millisecond) {
-		t.Fatal("HeadWithin")
 	}
 }

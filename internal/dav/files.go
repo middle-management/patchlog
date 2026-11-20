@@ -153,6 +153,9 @@ func scratchName(base string) bool {
 // letters or digits, as mkstemp draws them.
 var sedTemp = regexp.MustCompile(`^sed[A-Za-z0-9]{6}$`)
 
+// maxTitle bounds a file name's UTF-8 (§H.2).
+const maxTitle = 255
+
 // dupName is the name a file whose name another has is shown by (§H.2
 // "Siblings"): name (2).ext, name (3).ext, …, the number before the
 // extension (a folder's at the end), skipping one taken reports taken;

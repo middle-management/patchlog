@@ -39,7 +39,7 @@ func TestVectorPlanDigest(t *testing.T) {
 		}
 		return m
 	}
-	branches := []*ReleaseBranch{{Key: "cat-season", NS: "cat-season-r7", Target: "cat-season", Catalog: true, At: branchAt}}
+	branches := []*ReleaseBranch{{Key: "cat-season", NS: "cat-season-r7", Target: "cat-season", At: branchAt}}
 	s2 := &ReleaseStep{Step: 2, Key: "cat-season", Resources: []string{"season", "matches.cup", "matches.old"}}
 	s4 := &ReleaseStep{Step: 4, Key: "cat-season", Resources: []string{"matches.cup", "matches.newbie"}}
 	// The items as the planner holds them, steps as they would be sent.

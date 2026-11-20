@@ -115,7 +115,7 @@ func (st *reqState) mayKeep(name string) error {
 		return nil
 	}
 	ns, _, _ := strings.Cut(strings.TrimPrefix(name, "/"), "/")
-	if (st.s.flat[ns] || st.s.cats[ns]) && !st.tk.named[ns] {
+	if st.s.flat[ns] && !st.tk.named[ns] {
 		return fail(http.StatusForbidden, "your grant doesn't name namespace %s: nothing is kept there for you (temporary files included)", ns)
 	}
 	return nil

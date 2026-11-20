@@ -238,8 +238,8 @@ func TestV081AccessBranchUncovered(t *testing.T) {
 	w.put("matches-r7", "final", map[string]any{"title": "final"})
 	gs, at := w.filtered(w.li())
 	li := w.grant(w.cat, "user:li", []string{"matches-r7"}, []string{"read"}, map[string]any{"groups": []any{"editors", "interns"},
-		"roles": []any{"reader"}, "at": map[string]any{"ns": "cat-season", "id": w.nsHead("cat-season", w.admin)},
-		"exp": w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)})
+		"roles": []any{"reader"},
+		"exp":   w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)})
 	base := "/ns/matches-r7/g/" + gs
 	for _, path := range []string{base + "/heads", base + "/at/" + at + "/heads", base + "/at/" + at + "/log"} {
 		expect(t, w.get(path, li), 403)

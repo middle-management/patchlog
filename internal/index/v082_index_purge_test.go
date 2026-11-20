@@ -11,8 +11,8 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/index"
 	"github.com/middle-management/patchlog/internal/seal"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // V82-05 (v0.82), SVC-10 and SPEC §8.5: the 410 of a purged namespace,
@@ -152,7 +152,7 @@ func TestV082EndedCookieSealedPurged(t *testing.T) {
 				client.WithKeys(client.NewKeys(priv)))
 			x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, untyped: true, now: s.Now}, func(o *indexOpts) {
 				o.Recipient = priv
-				o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate
+				o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate
 			})
 			x.caughtUp("sec")
 			r := p37Do(t, x, "POST", "/edge-grants", k.Grant(t, s.Now(), "user:r", []string{"sec"}, []string{"read"}), "", nil, "")

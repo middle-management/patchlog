@@ -11,8 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/merge"
 )
 
-// Spec v0.34 (§F.9, §F.8): the plan digest, who submits catalog batches,
-// and merged.at.
+// Spec v0.34 (§F.9, §F.8): the plan digest and merged.at.
 
 // entryOf returns the target's log entry with ns_id id.
 func entryOf(t *testing.T, c *client.Client, ns, id string) client.NSEntry {
@@ -27,56 +26,12 @@ func entryOf(t *testing.T, c *client.Client, ns, id string) client.NSEntry {
 	return client.NSEntry{}
 }
 
-// Catalog batches: the one changing $access (step 2 creates locked with
-// its $access) goes in under the admin's grant narrowed with the merge
-// service's via; the other (step 4) under the merge grant, whose root is
-// the merge service and the merge key. merged.at is the target's ns_id
-// after the last batch into it.
-func TestReleaseCatalogSubmitters(t *testing.T) {
-	t.Parallel()
-	w := newRelWorld(t)
-	w.startCatalog()
-	w.release7()
-	o := w.opts("release-7")
-	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, must(merge.PlanRelease(ctx, w.anna, o))))
-	must(merge.ApproveRelease(ctx, w.anna, o))
-	rp := must(merge.ApplyRelease(ctx, w.anna, o))
-	var step2, step4 string
-	last := map[string]string{}
-	for _, st := range rp.Steps {
-		if st.Done != "noop" {
-			last[st.Key] = st.Done
-		}
-		switch {
-		case st.Step == 2 && st.Key == "cat-season":
-			step2 = st.Done
-		case st.Step == 4 && st.Key == "cat-season":
-			step4 = st.Done
-		}
-	}
-	if e := entryOf(t, w.anna, "cat-season", step2); e.Author != "user:anna" || e.Grant == nil || e.Grant.Sub != "user:anna" || e.Grant.Kid != "idp" {
-		t.Fatalf("the $access batch is %s/%+v, want the admin's", e.Author, e.Grant)
-	}
-	if e := entryOf(t, w.anna, "cat-season", step4); e.Author != "svc:merge" || e.Grant == nil || e.Grant.Sub != "svc:merge" || e.Grant.Kid != "catalog-merge" {
-		t.Fatalf("the step-4 batch is %s/%+v, want the merge service's under the merge key", e.Author, e.Grant)
-	}
-	for _, b := range rp.Branches {
-		h := must(w.anna.NSHead(ctx, b.NS))
-		d := must(w.anna.NSDoc(ctx, b.NS, h.ID))
-		m, _ := d.Value["merged"].(map[string]any)
-		if m["at"] != last[b.Key] || b.Merged != last[b.Key] {
-			t.Fatalf("%s: merged %v (plan %s), want the last batch %s", b.NS, m, b.Merged, last[b.Key])
-		}
-	}
-}
-
 // Approval binds to the plan's digest: it fails if planning again gives
 // another digest, or if the person reviewed another one; applying stops
 // for a new approval if a step differs from the approved plan.
 func TestReleaseDigest(t *testing.T) {
 	t.Parallel()
 	w := newRelWorld(t)
-	w.startCatalog()
 	w.release7()
 	o := w.opts("release-7")
 	rp := must(merge.PlanRelease(ctx, w.anna, o))
@@ -123,47 +78,12 @@ func TestReleaseDigest(t *testing.T) {
 	}
 }
 
-// §F.9: a placement in the catalog base that names an item step 3
-// creates is fine if step 2 removes it.
-func TestReleasePlacedItemRemovedInStep2(t *testing.T) {
-	t.Parallel()
-	w := newRelWorld(t)
-	w.startCatalog()
-	must(w.ops.CreateDoc(ctx, "cat-season", "matches.newbie", map[string]any{"parents": parentsOf("season")}))
-	w.release7()
-	must(w.anna.CreateDoc(ctx, "matches-r7", "newbie", map[string]any{"$schema": "/r/schemas/match/rev/" + w.T0, "home": "N", "away": "B"}))
-	o := w.opts("release-7")
-	rp := must(merge.PlanRelease(ctx, w.anna, o))
-	if len(conflictKinds(rp)[merge.RCPlacedItem]) != 1 {
-		t.Fatalf("conflicts %+v", rp.Conflicts)
-	}
-	// The catalog branch unplaces it: step 2 removes it before step 3.
-	h := must(w.anna.Head(ctx, "cat-season-r7", "matches.newbie"))
-	must(w.anna.Delete(ctx, "cat-season-r7", "matches.newbie", h.ID))
-	rp = must(merge.PlanRelease(ctx, w.anna, o))
-	if !rp.Clean() {
-		t.Fatalf("conflicts %+v", rp.Conflicts)
-	}
-	found := false
-	for _, st := range rp.Steps {
-		if st.Step == 2 {
-			for _, r := range st.Resources {
-				found = found || r == "matches.newbie"
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("the unplacing isn't in step 2: %v", stepsOf(rp))
-	}
-}
-
 // §F.9 Abandoning: the branches are frozen with abandoned: true by an
 // administrator, and the janitor cleans them up (§F.6); an editor's
 // abandoning isn't accepted.
 func TestReleaseAbandon(t *testing.T) {
 	t.Parallel()
 	w := newRelWorld(t)
-	w.startCatalog()
 	w.release7()
 	o := w.opts("release-7")
 	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, must(merge.PlanRelease(ctx, w.anna, o))))

@@ -11,8 +11,7 @@ import (
 
 // V76-01 (v0.76): origin filtered reads over HTTP (§B.11.9): 401 at an
 // uncovered namespace's filtered URLs without a grant that verifies there
-// or a cookie, and a branch uncovered once its root stops trusting the
-// catalog through the key item 1 counted (conformance 105).
+// or a cookie.
 
 // §B.11.9 Purged namespaces ("403, or 401 as §B.11.5 says"), §B.11.5: a
 // public namespace is never covered; its filtered URLs are 401 with no
@@ -54,7 +53,7 @@ func TestV076FilteredUncovered401(t *testing.T) {
 // /heads and log, 401 there without credentials, and its exchange no
 // /ns/matches-r7/g/{gs}; derby is never listed. Before v0.78 the branch
 // was covered until matches stopped trusting cat-season through
-// catalog-01.
+// reader-01.
 func TestV076FilteredBranchUncovered(t *testing.T) {
 	t.Parallel()
 	fan := newKey("fan")

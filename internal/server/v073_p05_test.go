@@ -213,7 +213,7 @@ func TestV073ValuesNotOnStoredDocuments(t *testing.T) {
 	})
 	need := 3*(64<<10+2<<10) + 1<<10 + 36*1000
 	expectLimit(t, e.patchNS("e3", ops(op("add", "/limits", map[string]any{"opsPerSet": 100})), ""), 422, "patchSetSize", int64(need), 200<<10)
-	expect(t, e.patchNS("e3", ops(op("add", "/maxLag", "PT1H")), ""), 201)
+	expect(t, e.patchNS("e3", ops(op("add", "/x-note", "PT1H")), ""), 201)
 	expect(t, e.patchNS("e3", ops(op("add", "/frozen", true)), ""), 201)
 	// A creation is held to it.
 	expectLimit(t, e.do(req{method: "PATCH", path: "/ns/e4", ifNoneMatch: "*", author: "admin", body: addRoot(e2eDoc(map[string]any{}))}),

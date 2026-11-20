@@ -322,62 +322,6 @@ func TestV082PlaygroundSealCountWithNode(t *testing.T) {
 	}
 }
 
-// SVC-11c (SERVICES §B.5): the playground reads ancestors and where
-// answers in v0.82's shape, paths as arrays of node names with the nodes
-// map, tooDeep and truncated as booleans, and in the shape before it,
-// path elements as objects and tooDeep a count. A cut, a missing paths
-// and anything that doesn't decode are a cut, never a complete answer.
-func TestV082PlaygroundWherePathsWithNode(t *testing.T) {
-	t.Parallel()
-	cases := map[string]string{
-		"v0.82":             `{"at":"1x","of":"matches.derby","paths":[["root","season-2026","matches.derby"],["archive","matches.derby"]],"nodes":{"root":{"href":"/r/cat/root","title":"Root"},"season-2026":{"href":"/r/cat/season-2026","sealed":"x"},"matches.derby":{"href":"/r/cat/matches.derby","title":"Derby"},"archive":{"href":"/r/cat/archive"}}}`,
-		"v0.82 tooDeep":     `{"paths":[["a","b"]],"nodes":{},"tooDeep":true}`,
-		"v0.82 truncated":   `{"paths":[["a","b"]],"nodes":{},"truncated":true}`,
-		"before":            `{"paths":[[{"href":"/r/cat/root","name":"root","title":"Root"},{"href":"/r/cat/x","name":"x"}]]}`,
-		"before, tooDeep":   `{"paths":[[{"href":"/r/cat/root","name":"root"}]],"tooDeep":2}`,
-		"before, zero deep": `{"paths":[[{"href":"/r/cat/root","name":"root"}]],"tooDeep":0}`,
-		"no paths":          `{"at":"1x"}`,
-		"paths not arrays":  `{"paths":{"a":1}}`,
-		"a bad element":     `{"paths":[["a",7],["b"]]}`,
-		"a bad path":        `{"paths":["a",["b"]]}`,
-		"tooDeep a string":  `{"paths":[["a"]],"tooDeep":"yes"}`,
-		"not an object":     `[]`,
-		"null":              `null`,
-		"empty, complete":   `{"paths":[]}`,
-		"proto name":        `{"paths":[["__proto__","constructor"]],"nodes":{}}`,
-	}
-	var out map[string]struct {
-		Paths [][]struct{ Name, Href, Title string }
-		Cut   bool
-		Why   string
-	}
-	runV82(t, []string{"wherePaths"}, "", `
-  for (const [k, v] of Object.entries(input.cases)) out[k] = wherePaths(JSON.parse(v));
-`, map[string]any{"cases": cases}, &out)
-	g := out["v0.82"]
-	if g.Cut || len(g.Paths) != 2 || len(g.Paths[0]) != 3 || g.Paths[0][0].Title != "Root" || g.Paths[0][0].Href != "/r/cat/root" ||
-		g.Paths[0][1].Name != "season-2026" || g.Paths[0][1].Title != "" || g.Paths[0][2].Title != "Derby" || g.Paths[1][0].Name != "archive" {
-		t.Errorf("v0.82: %+v", g)
-	}
-	g = out["before"]
-	if g.Cut || len(g.Paths) != 1 || g.Paths[0][0].Title != "Root" || g.Paths[0][1].Name != "x" || g.Paths[0][1].Href != "/r/cat/x" {
-		t.Errorf("before v0.82: %+v", g)
-	}
-	for key, paths := range map[string]int{"v0.82 tooDeep": 1, "v0.82 truncated": 1, "before, tooDeep": 1, "no paths": 0, "paths not arrays": 0, "a bad element": 1, "a bad path": 1, "tooDeep a string": 1, "not an object": 0, "null": 0} {
-		if g := out[key]; !g.Cut || g.Why == "" || len(g.Paths) != paths {
-			t.Errorf("%s: %+v, want a cut with %d paths", key, g, paths)
-		}
-	}
-	for key, paths := range map[string]int{"before, zero deep": 1, "empty, complete": 0, "proto name": 1} {
-		if g := out[key]; g.Cut || len(g.Paths) != paths {
-			t.Errorf("%s: %+v, want %d paths and no cut", key, g, paths)
-		}
-	}
-	if g := out["proto name"]; g.Paths[0][0].Name != "__proto__" || g.Paths[0][0].Href != "" || g.Paths[0][0].Title != "" {
-		t.Errorf("a node named __proto__: %+v", g)
-	}
-}
-
 // SVC-11c (SERVICES §E.2.6 Values of another resource): a reader
 // compares a nested value's pl.ns and pl.name with the resource the entry
 // draws it from, where the entry names it: a placement's item, or, for

@@ -36,8 +36,7 @@ import (
 // Unix seconds, the key's name and the prefix. The origin's key vouches
 // only for the core prefixes (ParsePrefix); a service's key, with
 // Cookies.Vouches set, only for prefixes under a root of its own, never
-// under /r/ or /ns/, such as a catalog service's /{catalog}/g/{gs}
-// (§B.11.5). So a cookie one mints never covers the other's URLs, even
+// under /r/ or /ns/, such as the index's /{ns}/g/{gs} (§A.4). So a cookie one mints never covers the other's URLs, even
 // under the other's key. A verifying edge holding the
 // key checks a request as Check does; without one the origin checks it
 // itself. The key is the minter's, given on its own, which the edge holds
@@ -179,7 +178,7 @@ func KeyFromSecret(secret []byte) []byte {
 
 // CookieKey is the edge-grant key derived from v's secret (KeyFromSecret),
 // nil without a Verifier. Every holder of the edge secret can derive it,
-// the catalog service and the search index included, and mint core
+// the search index included, and mint core
 // cookies with it, so the origin never signs with it by default: only
 // when the deployment names it (patchlog serve --edge-grant-key
 // KID=edge-secret), to migrate to key files of the origin's own. A

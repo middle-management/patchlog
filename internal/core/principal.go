@@ -5,16 +5,14 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
-	"slices"
 	"sort"
-	"strings"
 
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // PrincipalAnswer is the answer of GET /ns/{ns}/principal (§7.4): Body is
-// { principal, kid, key, operator, can, roles, writer, catalog? }, Config
+// { principal, kid, key, operator, can, roles, writer }, Config
 // the X-Config-Revision.
 type PrincipalAnswer struct {
 	Body   map[string]any
@@ -65,18 +63,6 @@ func (e *Engine) Principal(ctx context.Context, ns string, cred Credentials) (*P
 			v = a.verified
 		}
 		body := t.principalBody(v, cfg)
-		// A catalog namespace's catalog member (§7.4, §B.6, §H.2), whole
-		// to a grant with unrestricted read, a public namespace's or one
-		// while authentication is disabled included (readsNS). An
-		// operator grant reads nothing but what needs no grant: any other
-		// read under one is 401, whatever its blocks allow (§C.4).
-		whole := t.readsNS(n, cfg, a, false)
-		if v != nil && v.Operator && cfg.Read != "public" {
-			whole = false
-		}
-		if c := principalCatalog(cfg.Doc, whole); c != nil {
-			body["catalog"] = c
-		}
 		ans = &PrincipalAnswer{Body: body, Config: t.configID(n.configSeq).String()}
 		return nil
 	})
@@ -180,46 +166,6 @@ func keyThumbprint(pub ed25519.PublicKey) string {
 	jwk := map[string]any{"crv": "Ed25519", "kty": "OKP", "x": base64.RawURLEncoding.EncodeToString(pub)}
 	sum := sha256.Sum256(jsonv.Canonical(jwk))
 	return base64.RawURLEncoding.EncodeToString(sum[:])
-}
-
-// principalCatalog is /principal's catalog member for a namespace whose
-// document has catalog (§7.4, §B.6, §H.2), nil for any other: trust ([]
-// when absent) and files, if set. A grant without unrestricted read of
-// the catalog (whole) gets files without its x- members, and in place of
-// trust only trusted, whether files.ns is one of the trusted namespaces:
-// false without files, which names no namespace.
-func principalCatalog(doc map[string]any, whole bool) map[string]any {
-	c, ok := doc["catalog"].(map[string]any)
-	if !ok {
-		return nil
-	}
-	trust := []any{}
-	if tr, ok := c["trust"].([]any); ok {
-		trust = jsonv.Clone(tr).([]any)
-	}
-	files, hasFiles := c["files"].(map[string]any)
-	out := map[string]any{}
-	if whole {
-		out["trust"] = trust
-		if hasFiles {
-			out["files"] = jsonv.Clone(files)
-		}
-		return out
-	}
-	trusted := false
-	if hasFiles {
-		f := map[string]any{}
-		for k, v := range files {
-			if !strings.HasPrefix(k, "x-") {
-				f[k] = jsonv.Clone(v)
-			}
-		}
-		out["files"] = f
-		ns, _ := files["ns"].(string)
-		trusted = ns != "" && slices.Contains(trust, any(ns))
-	}
-	out["trusted"] = trusted
-	return out
 }
 
 // limitsInForce are the limits of §6.6 as the server applies them in a

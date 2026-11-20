@@ -85,16 +85,14 @@ func TestV076Scenario96(t *testing.T) {
 	}
 }
 
-// Scenario 103: matches has no key whose requireAt names cat-season ->
-// li at /ns/matches/g/{gs}/heads -> 403; without credentials 401.
+// Scenario 103: li at /ns/matches/g/{gs}/heads of a gs no exchange gave
+// her -> 403; without credentials 401.
 func TestV076Scenario103(t *testing.T) {
 	t.Parallel()
-	w := newV75World(t, v75Opts{matches: func(doc map[string]any) {
-		delete(doc["keys"].([]any)[1].(map[string]any), "requireAt")
-	}})
+	w := newV75World(t, v75Opts{})
 	w.seed()
 	ctx := context.Background()
-	li := w.cred(w.catPriv, map[string]any{"kid": "catalog-01", "sub": "user:li", "groups": []any{"editors"}, "roles": []any{"reader"},
+	li := w.cred(w.catPriv, map[string]any{"kid": "reader-01", "sub": "user:li", "groups": []any{"editors"}, "roles": []any{"reader"},
 		"ns": []any{"matches"}, "can": []any{"read"}})
 	gs := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 	if st := v75Status(w.e.FilteredCurrent(ctx, "matches", gs, "/heads", li)); st != 403 {

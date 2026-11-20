@@ -98,8 +98,8 @@ func TestV086NoWriteAfterFailedRead(t *testing.T) {
 // answer (§H.4 "Answers", v0.86).
 func TestV086FailureClearedBySameRequestOnly(t *testing.T) {
 	t.Parallel()
-	const u = "http://svc.example/grants"
-	const what = "catalog cat's catalog service"
+	const u = "http://core.example/ns/docs/batch"
+	const what = "the core"
 	res := func(status int) *http.Response { return &http.Response{StatusCode: status, Header: http.Header{}} }
 	st := &reqState{method: "GET"}
 	st.sawUpstream(what, v86Req(t, st, "POST", u, `{"item":"a"}`), res(503), nil)

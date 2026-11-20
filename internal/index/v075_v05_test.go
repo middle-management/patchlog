@@ -15,7 +15,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grantcheck"
-	"github.com/middle-management/patchlog/internal/svcedge"
+	"github.com/middle-management/patchlog/internal/index"
 )
 
 // V75-05 (v0.75): the index's answers for namespaces §B.11.9 covers
@@ -26,7 +26,7 @@ import (
 // name; covered branches judge their bases at baseAt.
 
 // v75x is two private namespaces against a real core: cat-season and
-// matches, whose key catalog-01 has a scope rule allowing /resource derby
+// matches, whose key reader-01 has a scope rule allowing /resource derby
 // and shared only, so its grants read matches only in part; matches holds
 // derby, shared, secret and opener, each referencing /r/target/x. One
 // index follows matches, minting edge grants of its own.
@@ -50,7 +50,7 @@ func newV75X(t *testing.T, branches bool) *v75x {
 func newV75XOn(t *testing.T, s *clienttest.Server) *v75x {
 	t.Helper()
 	ctx := context.Background()
-	w := &v75x{t: t, s: s, k: clienttest.NewKey("k"), cat: clienttest.NewKey("catalog-01")}
+	w := &v75x{t: t, s: s, k: clienttest.NewKey("k"), cat: clienttest.NewKey("reader-01")}
 	mk := func(ns string, doc map[string]any) {
 		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
 	}
@@ -75,7 +75,7 @@ func newV75XOn(t *testing.T, s *clienttest.Server) *v75x {
 	return w
 }
 
-// v75Visible is the schema catalog-01's rule tests /resource with: the
+// v75Visible is the schema reader-01's rule tests /resource with: the
 // names its grants read in matches.
 var v75Visible = map[string]any{"pattern": "^(derby|shared)$"}
 
@@ -87,7 +87,7 @@ func (w *v75x) start(branches bool, nss ...string) *svc {
 	x := startSvcWith(w.t, w.s.Client(w.t, client.WithBearer(w.k.Grant(w.t, w.s.Now(), "svc:indexer", all, []string{"read"}))),
 		svcOpts{db: filepath.Join(w.t.TempDir(), "i.db"), ns: nss, untyped: true, branches: branches, now: w.s.Now},
 		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate, ev
 		})
 	for _, ns := range nss {
 		x.caughtUp(ns)
@@ -131,7 +131,7 @@ func (w *v75x) head(ns string) string {
 	return must(w.admin.NSHead(context.Background(), ns)).ID
 }
 
-// reader is catalog-01's grant for sub in groups, with the reader role,
+// reader is reader-01's grant for sub in groups, with the reader role,
 // reading ns in part.
 func (w *v75x) reader(sub string, groups []any, ns ...string) string {
 	w.t.Helper()
@@ -143,7 +143,7 @@ func (w *v75x) reader(sub string, groups []any, ns ...string) string {
 }
 
 // readerVia is reader through key k, with a block rule on /resource that
-// makes it a partial reader of matches as catalog-01's scope rule does.
+// makes it a partial reader of matches as reader-01's scope rule does.
 func (w *v75x) readerVia(sub string, groups []any) string {
 	w.t.Helper()
 	return w.k.Grant(w.t, w.s.Now(), sub, []string{"matches"}, []string{"read"}, map[string]any{"groups": groups, "roles": []any{"reader"},
@@ -341,14 +341,14 @@ func TestV075IndexCookies(t *testing.T) {
 	w.x.stop()
 	w.x = startSvcWith(t, w.x.core, svcOpts{db: w.x.dbPath, ns: []string{"matches"}, untyped: true, now: w.s.Now},
 		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate
+			o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate
 		})
 	w.x.caughtUp("matches")
 	got, _ = p37Follow(t, w.x, prefix, r.cookies, "")
 	if got.status != 200 || strings.Join(p37Hits(got.body), ",") != "derby,shared" {
 		t.Fatalf("under the cookie after a restart: %d %v", got.status, got.body)
 	}
-	// catalog-01's scope rule changes: the cookie no longer stands for it.
+	// reader-01's scope rule changes: the cookie no longer stands for it.
 	doc := must(w.admin.NSDoc(ctx, "matches", w.head("matches"))).Value
 	keys := doc["keys"].([]any)
 	keys[1].(map[string]any)["rules"] = []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string", "minLength": 1}}}

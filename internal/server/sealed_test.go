@@ -628,7 +628,7 @@ func TestSealedRotateOnRevoke(t *testing.T) {
 		return ep
 	}
 	// A change that doesn't revoke doesn't rotate.
-	expect(t, e.patchNS("s", ops(op("add", "/maxLag", "PT1H")), star), 201)
+	expect(t, e.patchNS("s", ops(op("add", "/x-note", "PT1H")), star), 201)
 	if epoch("s") != 1 {
 		t.Fatal("rotated without a revocation")
 	}

@@ -5,8 +5,6 @@ import (
 	"net"
 	"net/url"
 	"regexp"
-	"slices"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,7 +14,6 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/rules"
-	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/sig"
 )
 
@@ -163,7 +160,6 @@ type Config struct {
 	Revoked    map[string]bool
 	Limits     Limits
 	Retention  []RetentionRule
-	MaxLag     *time.Duration // §C.4: how old a grant's `at` in this namespace may be
 	Allowances []Allowance
 	// MergeAuthors are merge.authors (§F.3): the principals (root sub and
 	// signing kid) whose merge batches merge tools and the janitor trust.
@@ -201,15 +197,7 @@ type Config struct {
 	// append and restore must result in a document with a fresh $nonce
 	// that differs from its parent's. False for "optional", the default.
 	NonceRequired bool
-	// Catalogs are the names of the catalogs a content namespace's
-	// catalogs member names (§B.11.3), sorted. IsCatalog reports a catalog
-	// namespace (a catalog member, §B.6), and CatalogTrust is its
-	// catalog.trust, the namespaces it trusts, sorted.
-	// Filtered reads read them (§B.11.9 Where, filtered_scope.go).
-	Catalogs     []string
-	IsCatalog    bool
-	CatalogTrust []string
-	level        int
+	level         int
 	// ruleForms counts the rule forms of rules, roles and key scopes,
 	// nested ones included, which rulesPerNamespace bounds (§12.2).
 	ruleForms int
@@ -328,13 +316,12 @@ func ValidRemoteOrigin(s string) bool {
 }
 
 // nsMembers are the namespace-document members this version of the spec
-// defines (§7.4): the core's, then Addendum B's and Addendum F's. Any other
+// defines (§7.4): the core's, then Addendum F's. Any other
 // member must start with "x-" and is stored as data.
 var nsMembers = map[string]bool{
 	"read": true, "keys": true, "roles": true, "revoked": true, "rules": true, "limits": true,
-	"allowances": true, "retention": true, "encryption": true, "maxLag": true, "base": true,
+	"allowances": true, "retention": true, "encryption": true, "base": true,
 	"frozen": true, "successor": true, "drafts": true, "signatures": true, "schemaReads": true, "nonce": true,
-	"catalog": true, "catalogs": true, // Addendum B
 	"merge": true, "merged": true, "cleanup": true, "abandoned": true, // Addendum F
 }
 
@@ -387,8 +374,7 @@ func isX(k string) bool { return strings.HasPrefix(k, "x-") }
 // top-level member is one the spec defines, in its shape, or starts with
 // "x-" and is stored as data, so a typo or a setting from a newer version
 // is refused rather than ignored. So may members inside the addenda's
-// objects (catalog, each catalogs entry, merge, merged, cleanup), except
-// as keys of catalogs, which are catalog names; role entries are open
+// objects (merge, merged, cleanup); role entries are open
 // (grant.ParseRoles reads can and rules and ignores the rest); key entries
 // and other nested objects are strict. parseConfig checks the core's
 // members, and reads stored documents too; this checks the rest, which
@@ -436,10 +422,6 @@ func checkMembers(doc, prev map[string]any) error {
 			}
 		case "keys":
 			err = checkKeyFields(v, prev[k])
-		case "catalog":
-			err = checkCatalog(v)
-		case "catalogs":
-			err = checkCatalogs(v)
 		case "merge":
 			// parseConfig checked its shape; x- members are data.
 		case "merged":
@@ -511,129 +493,6 @@ func checkKeyFields(v, prev any) *memberError {
 		if a, ok := m["attrs"]; ok {
 			if _, err := rules.CompileStrict(map[string]any{"op": "test", "path": "/attrs", "schema": a}); err != nil {
 				return badAt(pointer.Pointer{"keys", strconv.Itoa(i), "attrs"}, "must be a JSON Schema held to the rules of a rule's schema (§C.4, §6.4.2): %v", err)
-			}
-		}
-	}
-	return nil
-}
-
-// checkCatalog checks a catalog namespace's "catalog" (§B.6, §7.4):
-// { "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer,
-// "files"?: { "ns", "root", "folder"?, "placement"? } }, and x- members.
-func checkCatalog(v any) *memberError {
-	m, ok := v.(map[string]any)
-	if !ok {
-		return badAt(pointer.Pointer{"catalog"}, `must be { "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer, "files"?: { "ns", "root", "folder"?, "placement"? } } (§B.6)`)
-	}
-	for _, k := range sortedKeys(m) {
-		switch x := m[k]; {
-		case k == "trust":
-			arr, ok := x.([]any)
-			if !ok {
-				return badAt(pointer.Pointer{"catalog", "trust"}, "must be an array of namespace names (§B.6)")
-			}
-			for i, e := range arr {
-				if s, ok := e.(string); !ok || !ValidNSName(s) {
-					return badAt(pointer.Pointer{"catalog", "trust", strconv.Itoa(i)}, "must be a namespace name (§3.6)")
-				}
-			}
-		case k == "mode":
-			if x != "tree" && x != "dag" {
-				return badAt(pointer.Pointer{"catalog", "mode"}, `must be "tree" or "dag" (§B.6)`)
-			}
-		case k == "title":
-			if t, ok := x.(string); !ok {
-				return badAt(pointer.Pointer{"catalog", "title"}, "must be a JSON Pointer (§B.5)")
-			} else if _, err := pointer.Parse(t); err != nil {
-				return badAt(pointer.Pointer{"catalog", "title"}, "must be a JSON Pointer (§B.5)")
-			}
-		case k == "files":
-			if err := checkCatalogFiles(x); err != nil {
-				return err
-			}
-		case isX(k):
-		default:
-			return badAt(pointer.Pointer{"catalog", k}, `is not a known field; other members must start with "x-" (§B.6, §7.4)`)
-		}
-	}
-	return nil
-}
-
-// checkCatalogFiles checks "catalog.files", which makes a catalog a file tree
-// (§H.2): "ns" a namespace name, "root" a folder name (a resource name
-// without a dot, §B.2), "folder" and "placement" schema revision paths
-// (§6.1), and x- members. Whether the catalog trusts "ns", or the schemas
-// resolve, is the tools' to check (§H.4).
-func checkCatalogFiles(v any) *memberError {
-	at := func(k string) pointer.Pointer { return pointer.Pointer{"catalog", "files", k} }
-	m, ok := v.(map[string]any)
-	if !ok {
-		return badAt(pointer.Pointer{"catalog", "files"}, `must be { "ns", "root", "folder"?, "placement"? } (§H.2)`)
-	}
-	for _, k := range []string{"ns", "root"} {
-		if _, ok := m[k]; !ok {
-			return badAt(pointer.Pointer{"catalog", "files"}, "must have %q (§H.2)", k)
-		}
-	}
-	for _, k := range sortedKeys(m) {
-		x := m[k]
-		switch {
-		case k == "ns":
-			if s, ok := x.(string); !ok || !ValidNSName(s) {
-				return badAt(at(k), "must be a namespace name (§3.6, §H.2)")
-			}
-		case k == "root":
-			if s, ok := x.(string); !ok || !ValidResourceName(s) || strings.Contains(s, ".") {
-				return badAt(at(k), "must be a folder name: a resource name without a dot (§3.6, §B.2, §H.2)")
-			}
-		case k == "folder" || k == "placement":
-			if s, ok := x.(string); !ok {
-				return badAt(at(k), "must be a schema revision path (§6.1, §H.2)")
-			} else if _, ok := schema.ParseRef(s); !ok {
-				return badAt(at(k), "must be a schema revision path (§6.1, §H.2)")
-			}
-		case isX(k):
-		default:
-			return badAt(at(k), `is not a known field; other members must start with "x-" (§H.2, §7.4)`)
-		}
-	}
-	return nil
-}
-
-// subjectRe is a catalog subject (§B.11.1): a group or a user.
-var subjectRe = regexp.MustCompile(`^(group|user):.+$`)
-
-// checkCatalogs checks a content namespace's "catalogs" (§B.11.3):
-// { catalog namespace: { "place"?: [subjects] } }. Its keys are catalog
-// names, never x- members; each entry may hold x- members.
-func checkCatalogs(v any) *memberError {
-	m, ok := v.(map[string]any)
-	if !ok {
-		return badAt(pointer.Pointer{"catalogs"}, `must be { catalog namespace: { "place": ["group:…" or "user:…", …] } } (§B.11.3)`)
-	}
-	for _, cat := range sortedKeys(m) {
-		if !ValidNSName(cat) {
-			return badAt(pointer.Pointer{"catalogs", cat}, "is not a catalog namespace name: the keys of /catalogs must be catalog namespace names (§B.11.3)")
-		}
-		o, ok := m[cat].(map[string]any)
-		if !ok {
-			return badAt(pointer.Pointer{"catalogs", cat}, `must be { "place": ["group:…" or "user:…", …] } (§B.11.3)`)
-		}
-		for _, k := range sortedKeys(o) {
-			if isX(k) {
-				continue
-			}
-			if k != "place" {
-				return badAt(pointer.Pointer{"catalogs", cat, k}, `is not a known field; other members must start with "x-" (§B.11.3, §7.4)`)
-			}
-			arr, ok := o[k].([]any)
-			if !ok {
-				return badAt(pointer.Pointer{"catalogs", cat, "place"}, `must be an array of subjects, "group:…" or "user:…" (§B.11.3)`)
-			}
-			for i, e := range arr {
-				if s, ok := e.(string); !ok || !subjectRe.MatchString(s) {
-					return badAt(pointer.Pointer{"catalogs", cat, "place", strconv.Itoa(i)}, `must be a subject, "group:…" or "user:…" (§B.11.1)`)
-				}
 			}
 		}
 	}
@@ -858,13 +717,6 @@ func parseConfigIn(doc any, defaults, max Limits, md configMode) (*Config, error
 				return nil, err
 			}
 			c.MergeAuthors = ma
-		case "maxLag":
-			str, ok := v.(string)
-			d, err := ParseDuration(str)
-			if !ok || err != nil || d <= 0 {
-				return nil, fmt.Errorf("/maxLag must be a positive ISO 8601 duration")
-			}
-			c.MaxLag = &d
 		case "retention":
 			rs, err := parseRetention(v)
 			if err != nil {
@@ -922,28 +774,6 @@ func parseConfigIn(doc any, defaults, max Limits, md configMode) (*Config, error
 				return nil, fmt.Errorf("/base must be { ns, at } or { origin, ns, at }")
 			}
 			c.Base = &BaseRef{NS: ns, At: at}
-		case "catalogs":
-			// Checked as a member (checkCatalogs): its keys are catalog
-			// names.
-			if m, ok := v.(map[string]any); ok {
-				for cat := range m {
-					if ValidNSName(cat) {
-						c.Catalogs = append(c.Catalogs, cat)
-					}
-				}
-				sort.Strings(c.Catalogs)
-			}
-		case "catalog":
-			c.IsCatalog = true
-			if m, ok := v.(map[string]any); ok {
-				arr, _ := m["trust"].([]any)
-				for _, x := range arr {
-					if s, ok := x.(string); ok && ValidNSName(s) && !slices.Contains(c.CatalogTrust, s) {
-						c.CatalogTrust = append(c.CatalogTrust, s)
-					}
-				}
-				sort.Strings(c.CatalogTrust)
-			}
 		case "signatures":
 			switch v {
 			case "optional":

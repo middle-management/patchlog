@@ -14,7 +14,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
-	"github.com/middle-management/patchlog/internal/svcedge"
+	"github.com/middle-management/patchlog/internal/index"
 )
 
 // V82-05 (v0.82): clauses the index already met, pinned (SVC-08, SVC-14i,
@@ -28,7 +28,7 @@ func v82Start(w *v75x, branches bool, all []string, nss ...string) *svc {
 	x := startSvcWith(w.t, w.s.Client(w.t, client.WithBearer(w.k.Grant(w.t, w.s.Now(), "svc:indexer", all, []string{"read"}))),
 		svcOpts{db: filepath.Join(w.t.TempDir(), "i.db"), ns: nss, untyped: true, branches: branches, now: w.s.Now},
 		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate, ev
 		})
 	for _, ns := range nss {
 		x.caughtUp(ns)

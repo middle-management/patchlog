@@ -1,7 +1,6 @@
 package index_test
 
 import (
-	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -82,46 +81,6 @@ func TestV086CookiesToldApartByExp(t *testing.T) {
 	if r.status != 503 || r.body["code"] != "behind" || r.header.Get("Retry-After") == "" || len(r.cookies) != 0 || r.header.Get("Set-Cookie") != "" {
 		t.Errorf("an exchange with no second left for its cookie: %d %v, Retry-After %q, %d cookies; want 503 behind, Retry-After and no cookie",
 			r.status, r.body, r.header.Get("Retry-After"), len(r.cookies))
-	}
-}
-
-// TestV086ExchangeChainUnreadMixed (CONFORMANCE Tree 148; SERVICES §A.4
-// gs: the exchange "refuses only as Coverage, §B.11.9 Where, §C.4's 502
-// and 503 for a requireAt chain it can't read"): one grant names m2,
-// where its key isn't listed, so the index leaves m2 out, and m1, whose
-// key's requireAt chain the index can't read. The exchange is 503 while
-// the cause is transient and 502 otherwise, for the whole exchange:
-// never a cookie that merely lacks m1's marker. With the chain read, the
-// same grant gets a cookie for m1 and none for m2.
-func TestV086ExchangeChainUnreadMixed(t *testing.T) {
-	t.Parallel()
-	w := newV82Chains(t)
-	both := w.ka.Grant(t, w.s.Now(), "user:li", []string{"m2", "m1"}, []string{"read"}, map[string]any{
-		"at":  map[string]any{"ns": "cat-a", "id": must(w.admin.NSHead(context.Background(), "cat-a")).ID},
-		"exp": w.s.Now().Add(10 * time.Minute).Format(time.RFC3339)})
-	r := w.exchange(both)
-	if r.status != 200 || len(r.cookies) == 0 {
-		t.Fatalf("the exchange while the chain is read: %d %v", r.status, r.body)
-	}
-	for _, p := range r.body["prefixes"].([]any) {
-		if strings.HasPrefix(p.(string), "/m2/") {
-			t.Fatalf("the grant, which no key of m2 verifies, has a prefix in m2: %v", r.body)
-		}
-	}
-	for _, c := range []struct {
-		upstream, status int
-		code             string
-	}{{503, 503, "behind"}, {403, 502, "upstream"}} {
-		w.fail.set("/ns/cat-a", c.upstream)
-		w.x.ix.ExpireGrantChecks()
-		r := w.exchange(both)
-		if r.status != c.status || r.body["code"] != c.code || len(r.cookies) != 0 || r.header.Get("Set-Cookie") != "" || r.body["prefixes"] != nil {
-			t.Errorf("cat-a answering the index %d: the exchange is %d %v with %d cookies, want %d %s for the whole exchange and no cookie",
-				c.upstream, r.status, r.body, len(r.cookies), c.status, c.code)
-		}
-		if c.status == 503 && r.header.Get("Retry-After") == "" {
-			t.Errorf("cat-a answering the index %d: no Retry-After", c.upstream)
-		}
 	}
 }
 

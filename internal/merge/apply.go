@@ -252,7 +252,7 @@ func (p *Plan) batch() (client.BatchRequest, error) {
 func (p *Plan) empty(req client.BatchRequest) bool { return len(req.Items) == 0 && req.Config == nil }
 
 // batchClient is the client batches are submitted with: Options.BatchClient
-// if set (e.g. under a catalog service's merge grant, §F.8), else the
+// if set (e.g. under a grant narrowed to the batch, §F.8), else the
 // plan's.
 func (p *Plan) batchClient() *client.Client {
 	if p.opt.BatchClient != nil {

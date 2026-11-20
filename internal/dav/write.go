@@ -1287,12 +1287,6 @@ func (st *reqState) undoOwnDelete(ctx context.Context, t target, err error) erro
 	if t.rawName != "" {
 		todo = append(todo, res{t.docNS, t.rawName})
 	}
-	if d, ok := st.p.treeDeleted(t.path, st.s.opt.Now()); ok && t.kind == kNewNode && d.cat == t.ns {
-		todo = append(todo, res{d.cat, d.node})
-		if d.itemTomb != "" {
-			todo = append(todo, res{d.itemNS, d.itemName})
-		}
-	}
 	for _, r := range todo {
 		if !st.p.deletedOwn(r.ns, r.name, "", st.s.opt.Now()) {
 			continue

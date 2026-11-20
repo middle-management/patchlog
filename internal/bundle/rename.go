@@ -45,8 +45,7 @@ import (
 // the source's schemas declare them. A string of the reference form
 // anywhere else can't be found, so it stays, and the report lists it
 // (UndeclaredRef.Renamed), as for pinned strings in snapshot documents.
-// Catalog placement names (<ns>.<name>) aren't renamed, and a namespace's
-// configuration isn't in the bundle (§G.7). Documents of the bundle's
+// A namespace's configuration isn't in the bundle (§G.7). Documents of the bundle's
 // unmapped namespaces that reference a renamed one are rewritten too, in
 // their own namespace. A renamed namespace's snapshot documents go
 // through {dst}-upstream (upstreamNS), whose name checkUpstreams checks
@@ -193,7 +192,7 @@ func (im *importer) resolveRenames(ctx context.Context) error {
 	}
 	im.rep.Renamed = im.renames
 	im.rep.Notes = append(im.rep.Notes, fmt.Sprintf("renames %s (§G.4.4): references to them are rewritten where they are declared, and documents that change get new ids; "+
-		"catalog placement names (<ns>.<name>) aren't renamed, and namespace configuration isn't in the bundle (§G.7): "+
+		"namespace configuration isn't in the bundle (§G.7): "+
 		"create the renamed targets with theirs first, or the import creates them with defaults", strings.Join(names, ", ")))
 	return nil
 }

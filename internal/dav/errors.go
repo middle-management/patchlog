@@ -31,13 +31,6 @@ type davError struct {
 	// a nonce, a limit), which the token's copy of §7.4's writer block
 	// may have had out of date (record)
 	refresh bool
-	// tooBig: a folder holds more than a tree service listing takes
-	// (svcList), refused as a listing, not as a path (resolveCatalog)
-	tooBig bool
-	// svcRefused: a tree service refused the token's grant a listing
-	// (403), as one without tree-derived access refuses every grant that
-	// doesn't read its namespaces whole (§B.11.5)
-	svcRefused bool
 }
 
 func (e *davError) Error() string {
@@ -181,8 +174,7 @@ func upstream(err error) error {
 	return upFailed(theCore, err)
 }
 
-// theCore names the core in a 502 or 503, as a catalog's tree or catalog
-// service is named by its catalog.
+// theCore names the core in a 502 or 503.
 const theCore = "the core"
 
 // The Retry-After of this server's 503s, its own (§H.4 "Answers", v0.86):
@@ -192,7 +184,7 @@ const (
 	retryLate = "5" // one that didn't answer in time
 )
 
-// upBusy is the 503 for an upstream (what: the core, or a catalog's
+// upBusy is the 503 for an upstream (what: the core, or another
 // service) that answered 429 or 503: it names the upstream and nothing of
 // its answer (cause, which is logged), with this server's Retry-After.
 func upBusy(what string, cause error) *davError {

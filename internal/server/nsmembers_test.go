@@ -59,17 +59,15 @@ func TestNamespaceMembers(t *testing.T) {
 	// The addenda's members are checked in their shapes (Addenda B, F).
 	id := e.nsHead("docs")
 	for name, patch := range map[string]map[string]any{
-		"catalog mode":     op("add", "/catalog", map[string]any{"trust": strs([]string{"matches"}), "mode": "forest"}),
-		"catalog trust":    op("add", "/catalog", map[string]any{"trust": "matches"}),
-		"catalog field":    op("add", "/catalog", map[string]any{"trusted": strs([]string{"matches"})}),
-		"catalogs subject": op("add", "/catalogs", map[string]any{"cat": map[string]any{"place": strs([]string{"match-desk"})}}),
-		"catalogs field":   op("add", "/catalogs", map[string]any{"cat": map[string]any{"move": strs([]string{"group:x"})}}),
-		"merged":           op("add", "/merged", true),
-		"merged at":        op("add", "/merged", map[string]any{"at": "yesterday"}),
-		"cleanup":          op("add", "/cleanup", map[string]any{"merged": "a week"}),
-		"cleanup field":    op("add", "/cleanup", map[string]any{"purged": "P7D"}),
-		"abandoned":        op("add", "/abandoned", "yes"),
-		"revoked":          op("add", "/revoked", strs([]string{"not-a-revocation-id"})),
+		"catalog":       op("add", "/catalog", map[string]any{"trust": strs([]string{"matches"})}),
+		"catalogs":      op("add", "/catalogs", map[string]any{}),
+		"maxLag":        op("add", "/maxLag", "PT1M"),
+		"merged":        op("add", "/merged", true),
+		"merged at":     op("add", "/merged", map[string]any{"at": "yesterday"}),
+		"cleanup":       op("add", "/cleanup", map[string]any{"merged": "a week"}),
+		"cleanup field": op("add", "/cleanup", map[string]any{"purged": "P7D"}),
+		"abandoned":     op("add", "/abandoned", "yes"),
+		"revoked":       op("add", "/revoked", strs([]string{"not-a-revocation-id"})),
 	} {
 		r := e.patchNS("docs", ops(patch), "")
 		if r.Code != 422 || r.Str("code") != "invalid" {
@@ -77,8 +75,6 @@ func TestNamespaceMembers(t *testing.T) {
 		}
 	}
 	expect(t, e.patchNS("docs", ops(
-		op("add", "/catalog", map[string]any{"trust": strs([]string{"matches"}), "mode": "dag"}),
-		op("add", "/catalogs", map[string]any{"cat": map[string]any{"place": strs([]string{"group:match-desk", "user:anna"})}}),
 		op("add", "/merged", map[string]any{"at": id}),
 		op("add", "/cleanup", map[string]any{"merged": "P7D", "superseded": "P30D", "abandoned": "P30D"}),
 		op("add", "/abandoned", false),

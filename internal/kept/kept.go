@@ -24,8 +24,7 @@ import (
 // For is how long a Store keeps a result.
 const For = time.Minute
 
-// Store keeps results in memory. Its purges are per scope: a namespace,
-// or a catalog for the listings over it and the namespaces it trusts.
+// Store keeps results in memory. Its purges are per scope, a namespace.
 type Store struct {
 	now func() time.Time
 

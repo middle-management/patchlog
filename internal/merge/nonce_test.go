@@ -73,53 +73,20 @@ func TestRequiredNoncesMerge(t *testing.T) {
 	}
 }
 
-// §C.7, §F.9: a release into a catalog target that requires nonces splits
-// a node into two halves; step 2 writes the narrow half with a fresh
-// $nonce, and step 4 still finds it there and matches its planned digest.
-func TestRequiredNoncesReleaseSplit(t *testing.T) {
-	t.Parallel()
-	w := newRelWorld(t)
-	w.startCatalog()
-	h := must(w.ops.NSHead(ctx, "cat-season"))
-	must(w.ops.PatchConfig(ctx, "cat-season", h.Config, ops(op("add", "/nonce", "required"))))
-	w.branch("cat-season", "cat-season-r7")
-	bn := seal.NewNonce()
-	w.appendTo("cat-season-r7", "matches.cup", op("replace", "/parents", parentsOf("embargo")), op("add", "/$nonce", bn))
-	w.writeRelease("release-9", map[string]string{"cat-season": "cat-season-r7"})
-	o := w.opts("release-9")
-	o.Splits = map[string]map[string]any{"cat-season": {"matches.cup": map[string]any{"parents": parentsOf("vault")}}}
-	rp := must(merge.PlanRelease(ctx, w.anna, o))
-	if got := stepsOf(rp); !rp.Clean() || len(got) != 2 {
-		t.Fatalf("plan %q, conflicts %+v", got, rp.Conflicts)
-	}
-	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, rp))
-	must(merge.ApproveRelease(ctx, w.anna, o))
-	must(merge.ApplyRelease(ctx, w.anna, o))
-	d := w.doc("cat-season", "matches.cup")
-	if got := parentNames(d); len(got) != 1 || got[0] != "embargo" {
-		t.Fatalf("matches.cup in %v", got)
-	}
-	if n, _ := d["$nonce"].(string); !seal.ValidNonce(n) || n == bn {
-		t.Fatalf("matches.cup nonce %q", n)
-	}
-}
-
 // §C.7, §F.9: in a state namespace that requires nonces, the release
 // tool's own documents get a fresh $nonce in every revision: the stored
 // plan (created, restored with a root replace after a delete, appended to
-// at every step) and the catalog base's lock (taken, given its plan, and
-// released).
+// at every step).
 func TestRequiredNoncesReleaseState(t *testing.T) {
 	t.Parallel()
 	w := newRelWorld(t)
-	w.startCatalog()
 	h := must(w.ops.NSHead(ctx, "releases"))
 	must(w.ops.PatchConfig(ctx, "releases", h.Config, ops(op("add", "/nonce", "required"))))
 	w.branch("cat-season", "cat-season-r8")
 	w.appendTo("cat-season-r8", "season", op("replace", "/title", "Season 2026"))
 	w.writeRelease("release-8", map[string]string{"cat-season": "cat-season-r8"})
 	o := w.opts("release-8")
-	plan, lock := merge.PlanName("release-8"), merge.LockName("cat-season")
+	plan := merge.PlanName("release-8")
 	// nonces returns the $nonce of every revision of a state document,
 	// oldest first, each fresh and differing from its parent's.
 	nonces := func(name string) []string {
@@ -154,13 +121,6 @@ func TestRequiredNoncesReleaseState(t *testing.T) {
 	}
 	if ns := nonces(plan); len(ns) < 5 {
 		t.Fatalf("plan revisions %v", ns)
-	}
-	// Taken (holder), its plan set, released (§F.9).
-	if ns := nonces(lock); len(ns) != 3 {
-		t.Fatalf("lock revisions %v", ns)
-	}
-	if holder := must(merge.LockHolder(ctx, w.anna, o, "cat-season")); holder != "" {
-		t.Fatalf("lock held by %s", holder)
 	}
 	if got := w.doc("cat-season", "season")["title"]; got != "Season 2026" {
 		t.Fatalf("season title %v", got)

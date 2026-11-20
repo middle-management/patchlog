@@ -1,4 +1,4 @@
-package svcedge
+package index
 
 import (
 	"net/http/httptest"
@@ -15,7 +15,7 @@ func TestV074BearersEmptyAuthorization(t *testing.T) {
 		r := httptest.NewRequest("POST", "/edge-grants", strings.NewReader(`{"grants":["abc"]}`))
 		r.Header.Set("Content-Type", ct)
 		r.Header["Authorization"] = []string{""}
-		bs, e := Bearers(r, DefaultGrantSize)
+		bs, e := svcBearers(r, svcDefaultGrantSize)
 		if e == nil || e.Status != 400 || e.Body["code"] != "bad_input" {
 			t.Errorf("%s with an empty Authorization: %v %+v, want 400 bad_input", ct, bs, e)
 		}

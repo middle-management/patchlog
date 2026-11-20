@@ -6,8 +6,7 @@ import (
 	"time"
 )
 
-// V82-02 (v0.82): access at the origin. requireAt's refusal names nothing
-// (ACC-10o); /now over the whole envelope, as the read check's ordinary
+// V82-02 (v0.82): access at the origin. /now over the whole envelope, as the read check's ordinary
 // answer and ignored where reads are public (ACC-1, ACC-2, ACC-4o);
 // request-shape errors and other Authorization schemes (ACC-13); and a
 // purged namespace's filtered /heads over HTTP (ACC-8b).

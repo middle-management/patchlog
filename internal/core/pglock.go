@@ -32,8 +32,8 @@ import (
 //     entry to, and on every other namespace
 //     whose state a decision read (nsByName, nsByID): the bases whose keys
 //     and revocations a branch write re-checks (§C.4), the namespaces its
-//     $schema and $ref resolve into (§6.1), a requireAt's or a batch
-//     source's namespace. A schema purge, a base revocation, a config
+//     $schema and $ref resolve into (§6.1), a batch source's
+//     namespace. A schema purge, a base revocation, a config
 //     change, a frozen or purged flag therefore can't commit between a
 //     write's check and its insert, and READ COMMITTED is enough: every
 //     read of a namespace happens after its lock is held.
