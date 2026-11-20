@@ -733,12 +733,15 @@ time only): the consumers read the revision each namespace entry names
   share about 2,900, with write latency rising in proportion.
 - **Nothing is CPU-bound at 2,900.** RDS was at 25–39% (CloudWatch, 1-minute averages while
   namespaces were busy), the core's instance at most 38%, the consumers' at most 38% and the
-  writers' at most 18%. A likely limit, not measured, is the core's Postgres pool: 4
-  connections per vCPU, 16 on a `c7g.xlarge` (`internal/core/pgpool.go`). Each write is about 13
-  statements (one writer does 200–240 writes a second, [Deployment](#deployment)), and the pool
-  is shared with the followers' reads (about 900–1,000 a second here). `pool_max_conns` in the
-  database URL raises it, and a run with it is not yet done. More core instances are the other
-  lever.
+  writers' at most 18%.
+- **The core's Postgres pool is not the limit.** It is 4 connections per vCPU, 16 on a
+  `c7g.xlarge` (`internal/core/pgpool.go`). With `pool_max_conns=64` in the database URL, four,
+  eight and sixteen namespaces wrote 3,126, 3,105 and 3,074 a second: 7% more, with the same
+  latencies (p99 258, 637 and 1,419 ms). RDS CPU stayed at 24–38%.
+- **The next suspect is storage.** The runs used 20 GiB of gp3, which RDS gives 3,000 IOPS under
+  400 GiB and 12,000 from it, and writes stop near 3,000 a second. Each commit flushes the WAL,
+  so a write costs at least one write IOPS. RDS's WriteIOPS for these windows, and a run with
+  400 GiB, will tell.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
