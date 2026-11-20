@@ -123,9 +123,20 @@ func (t *tx) recordImport(n *nsRow, src any, st []*itemState) {
 	if cursor != at {
 		pending = 1
 	}
-	for _, s := range st {
-		_, err := t.Exec(`INSERT INTO purge_follow_names (ns, origin, src_ns, name, from_at, pending) VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
-			n.id, origin, srcNS, s.Resource, at, pending)
+	// A statement per hundred names, not per name: the batch holds its
+	// namespace's lock.
+	for i := 0; i < len(st); i += 100 {
+		chunk := st[i:min(i+100, len(st))]
+		q := `INSERT INTO purge_follow_names (ns, origin, src_ns, name, from_at, pending) VALUES `
+		args := make([]any, 0, 6*len(chunk))
+		for j, s := range chunk {
+			if j > 0 {
+				q += `,`
+			}
+			q += `(?,?,?,?,?,?)`
+			args = append(args, n.id, origin, srcNS, s.Resource, at, pending)
+		}
+		_, err := t.Exec(q+` ON CONFLICT DO NOTHING`, args...)
 		t.must(err)
 	}
 }
@@ -134,9 +145,9 @@ func (t *tx) recordImport(n *nsRow, src any, st []*itemState) {
 type followRow struct {
 	followKey
 	cursor string
-	// rescans are the source.at values of pending names, read from once
-	// more.
-	rescans []string
+	// rescans are the pending names by the source.at that brought them,
+	// read from once more.
+	rescans map[string][]string
 }
 
 // FollowPurges follows, once, the namespace log of every trusted origin
@@ -165,12 +176,15 @@ func (e *Engine) FollowPurges(ctx context.Context) error {
 		t.must(q.Err())
 		q.Close()
 		for _, r := range rows {
-			q, err := t.Query(`SELECT DISTINCT from_at FROM purge_follow_names WHERE ns = ? AND origin = ? AND src_ns = ? AND pending = 1 ORDER BY from_at`, r.ns, r.origin, r.srcNS)
+			q, err := t.Query(`SELECT from_at, name FROM purge_follow_names WHERE ns = ? AND origin = ? AND src_ns = ? AND pending = 1`, r.ns, r.origin, r.srcNS)
 			t.must(err)
 			for q.Next() {
-				var at string
-				t.must(q.Scan(&at))
-				r.rescans = append(r.rescans, at)
+				var at, name string
+				t.must(q.Scan(&at, &name))
+				if r.rescans == nil {
+					r.rescans = map[string][]string{}
+				}
+				r.rescans[at] = append(r.rescans[at], name)
 			}
 			t.must(q.Err())
 			q.Close()
@@ -205,29 +219,47 @@ func (e *Engine) followOne(ctx context.Context, r *followRow, po PurgeOrigin) er
 	if err != nil {
 		return errors.Join(append(errs, err)...)
 	}
+	// The log after the cursor. A cursor the origin doesn't know (404), as
+	// an asserted source's made-up at would be, is moved to the head a
+	// rescan below reaches, so a later genuine import is followed.
+	unknown := false
 	entries, head, err := originLog(ctx, c, r.srcNS, r.cursor)
+	if err == nil {
+		err = e.applyFollowed(ctx, r.followKey, entries, func(id string) error { return e.moveCursor(ctx, r.followKey, r.cursor, id, &r.cursor) })
+	}
+	if err == nil && head != r.cursor {
+		err = e.moveCursor(ctx, r.followKey, r.cursor, head, &r.cursor)
+	}
 	if err != nil {
-		return errors.Join(append(errs, err)...)
+		ae, ok := client.AsAPIError(err)
+		unknown = ok && ae.Status == http.StatusNotFound
+		errs = append(errs, fmt.Errorf("reading after %s: %w", r.cursor, err))
 	}
-	if err := e.applyFollowed(ctx, r.followKey, entries, func(id string) error { return e.moveCursor(ctx, r.followKey, r.cursor, id, &r.cursor) }); err != nil {
-		return errors.Join(append(errs, err)...)
+	ats := make([]string, 0, len(r.rescans))
+	for at := range r.rescans {
+		ats = append(ats, at)
 	}
-	if head != r.cursor {
-		if err := e.moveCursor(ctx, r.followKey, r.cursor, head, &r.cursor); err != nil {
-			return errors.Join(append(errs, err)...)
-		}
-	}
-	for _, at := range r.rescans {
-		entries, _, err := originLog(ctx, c, r.srcNS, at)
+	sort.Strings(ats)
+	for _, at := range ats {
+		entries, head, err := originLog(ctx, c, r.srcNS, at)
 		if err == nil {
 			err = e.applyFollowed(ctx, r.followKey, entries, nil)
 		}
 		if err == nil {
+			// Exactly the names read for: one a batch of the same bundle
+			// added meanwhile stays pending.
 			err = e.update(ctx, func(t *tx) error {
-				_, err := t.Exec(`UPDATE purge_follow_names SET pending = 0 WHERE ns = ? AND origin = ? AND src_ns = ? AND from_at = ? AND pending = 1`, r.ns, r.origin, r.srcNS, at)
-				t.must(err)
+				for _, name := range r.rescans[at] {
+					_, err := t.Exec(`UPDATE purge_follow_names SET pending = 0 WHERE ns = ? AND origin = ? AND src_ns = ? AND name = ? AND from_at = ?`, r.ns, r.origin, r.srcNS, name, at)
+					t.must(err)
+				}
 				return nil
 			})
+		}
+		if err == nil && unknown {
+			if err = e.moveCursor(ctx, r.followKey, r.cursor, head, &r.cursor); err == nil {
+				unknown = false
+			}
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("reading again from %s for the names imported from there: %w", at, err))
@@ -389,9 +421,26 @@ func (t *tx) followedPurge(k followKey, name string) error {
 	}
 	plan := t.purgePlan(n, name)
 	gone := func(ns *nsRow, res string) bool { return res == name && plan.covers(t, ns) }
-	if err := t.refsInUse(refChange{exclude: gone, removed: gone, name: name},
-		"the purge followed from "+k.origin+" would remove the last available copy of a referenced schema revision (§6.1, §G.1)"); err != nil {
-		return &errInUse{err}
+	// The referencing namespaces are the operator's to see, whoever may
+	// read them (refsInUse lists a caller's only).
+	ch := refChange{exclude: gone, removed: gone, name: name}
+	var referencing []any
+	more := false
+	t.brokenEach(&ch, func(m *nsRow) bool {
+		if len(referencing) == t.e.opt.Maximums.LogPageSize {
+			more = true
+			return false
+		}
+		referencing = append(referencing, m.name)
+		return true
+	})
+	if len(referencing) > 0 {
+		refusal := apiErr(409, "in_use", "referencing", referencing, "message",
+			"the purge followed from "+k.origin+" would remove the last available copy of a referenced schema revision (§6.1, §G.1)")
+		if more {
+			refusal.Body["more"] = true
+		}
+		return &errInUse{refusal}
 	}
 	author := t.authorID(FollowAuthor)
 	t.asServer(func() { t.purgeApply(plan, author, false) })

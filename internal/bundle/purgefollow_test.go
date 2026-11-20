@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/client"
@@ -296,4 +297,54 @@ func TestPurgesFollowInUseWaits(t *testing.T) {
 	if w := must(dst.e.FollowedPurgesWaiting(ctx)); len(w) != 0 {
 		t.Fatalf("still waiting: %+v", w)
 	}
+}
+
+// A source asserting the trusted origin with an at the origin doesn't know
+// doesn't hold up a later genuine import's follow.
+func TestPurgesFollowUnknownAt(t *testing.T) {
+	src := newDeployment(t, stagingOrigin)
+	src.ns("matches", nil)
+	src.ns("other", nil)
+	unknown := src.create("other", "x", map[string]any{"a": 1}) // an id, not in matches' chain
+	src.create("matches", "derby", map[string]any{"title": "Derby"})
+	b := exportBundle(t, src, bundle.ExportOptions{Select: []string{"matches"}})
+	dst := follower(t, &tagPurger{}, src)
+	dst.ns("matches", nil)
+	must(dst.c.Batch(ctx, "matches", client.BatchRequest{
+		Items:  []client.BatchItem{{Resource: "asserted", IfNoneMatch: true, Steps: []client.Step{{Patches: ops(op("add", "", map[string]any{"title": "A"}))}}}},
+		Source: map[string]any{"origin": stagingOrigin, "ns": "matches", "at": unknown, "bundle": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	}, false))
+	if err := dst.e.FollowPurges(ctx); err == nil {
+		t.Fatal("following from an unknown at: no error")
+	}
+	importB(t, dst, b, bundle.ImportOptions{})
+	src.purge("matches", "derby")
+	_ = dst.e.FollowPurges(ctx) // the unknown cursor is reported once more, and replaced
+	if st := dst.status("matches", "derby"); st != 410 {
+		t.Fatalf("derby: %d, want 410", st)
+	}
+	dst.followedEntry("matches", "derby")
+	dst.follow() // and the follow is clean again
+}
+
+// The leader's loop follows every interval.
+func TestPurgesFollowLoop(t *testing.T) {
+	src := newDeployment(t, stagingOrigin)
+	src.ns("matches", nil)
+	src.create("matches", "derby", map[string]any{"title": "Derby"})
+	b := exportBundle(t, src, bundle.ExportOptions{Select: []string{"matches"}})
+	dst := newDeployment(t, cmsOrigin, func(o *core.Options) {
+		o.FollowPurges.Interval = 20 * time.Millisecond
+		o.FollowPurges.Origins = map[string]core.PurgeOrigin{src.origin: {BaseURL: src.url}}
+	})
+	importB(t, dst, b, bundle.ImportOptions{})
+	src.purge("matches", "derby")
+	deadline := time.Now().Add(20 * time.Second)
+	for dst.status("matches", "derby") != 410 {
+		if time.Now().After(deadline) {
+			t.Fatal("the loop didn't follow the purge")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	dst.followedEntry("matches", "derby")
 }
