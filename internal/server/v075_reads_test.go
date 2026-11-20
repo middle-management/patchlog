@@ -22,10 +22,11 @@ import (
 // /heads, ranges, long-poll and events, /branches, the gestures listing,
 // and ?prefix= on /heads for every reader (§7.4).
 
-// v75s is a server with authentication on and §B.11.3's catalog setup, as
-// the core's v75World: cat-season trusts matches, whose key catalog-01 has
-// requireAt cat-season and a scope rule testing /resource by type, so its
-// grants read matches only in part. k is a * key in both.
+// v75s is a server with authentication on and two private namespaces,
+// cat-season and matches, as the core's v75World: matches's key
+// catalog-01 has a scope rule testing /resource by type, so its grants
+// read matches only in part, through role reader (derby, shared, a, c,
+// final: li's) or chief (secret, b: bo's). k is a * key in both.
 type v75s struct {
 	*tenv
 	ck    *edge.Cookies
@@ -52,13 +53,14 @@ func newV75s(t *testing.T, o v75sOpts) *v75s {
 	e := newEnvWith(t, []Option{WithEdgeGrants(ck)}, append([]envOpt{withAuth(&priv), fast}, o.env...)...)
 	e.opPriv = priv
 	w := &v75s{tenv: e, ck: ck, k: newKey("k"), cat: newKey("catalog-01")}
-	cat := map[string]any{"read": "grant", "keys": []any{w.k.entry("*")}, "catalog": map[string]any{"trust": []any{"matches"}}}
+	cat := map[string]any{"read": "grant", "keys": []any{w.k.entry("*")}}
 	w.mkNS("cat-season", cat)
 	matches := map[string]any{"read": "grant", "keys": []any{w.k.entry("*"), map[string]any{"kid": "catalog-01", "alg": "ed25519", "pub": w.cat.pub,
-		"can": []any{"read"}, "requireAt": "cat-season", "maxTtl": "PT15M",
+		"can": []any{"read"}, "maxTtl": "PT15M",
 		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}}},
-		"roles":    map[string]any{"reader": map[string]any{"can": []any{"read"}}},
-		"catalogs": map[string]any{"cat-season": map[string]any{"place": []any{}}}}
+		"roles": map[string]any{
+			"reader": map[string]any{"can": []any{"read"}, "rules": []any{v75sNames("derby", "shared", "a", "c", "final")}},
+			"chief":  map[string]any{"can": []any{"read"}, "rules": []any{v75sNames("secret", "b")}}}}
 	if o.matches != nil {
 		o.matches(matches)
 	}
@@ -66,6 +68,11 @@ func newV75s(t *testing.T, o v75sOpts) *v75s {
 	w.admin = e.grant(w.k, "user:root", []string{"cat-season", "matches", "matches-r7"},
 		[]string{"read", "create", "append", "delete", "restore", "purge", "purge-ns", "config", "branch"})
 	return w
+}
+
+// v75sNames is a rule allowing /resource names alone, without fixing it.
+func v75sNames(names ...string) map[string]any {
+	return map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": "^(" + strings.Join(names, "|") + ")$"}}
 }
 
 func v75sParents(names ...string) []any {
@@ -76,20 +83,10 @@ func v75sParents(names ...string) []any {
 	return out
 }
 
-// seed writes root, whose $access gives editors and li reader, season
-// under it, embargo for chiefs alone, and the placements of placed under
-// season and hidden under embargo; and every name of docs in matches.
+// seed writes every name of docs in matches. placed, the names li's role
+// reads, and hidden, bo's, document the test: the roles fix them.
 func (w *v75s) seed(placed, hidden, docs []string) {
 	w.t.Helper()
-	w.put("cat-season", "root", map[string]any{"parents": []any{}, "$access": map[string]any{"group:editors": []any{"reader"}, "user:li": []any{"reader"}}})
-	w.put("cat-season", "season", map[string]any{"parents": v75sParents("root")})
-	w.put("cat-season", "embargo", map[string]any{"parents": v75sParents("root"), "$access": map[string]any{"inherit": false, "group:chiefs": []any{"reader"}}})
-	for _, n := range placed {
-		w.put("cat-season", "matches."+n, map[string]any{"parents": v75sParents("season")})
-	}
-	for _, n := range hidden {
-		w.put("cat-season", "matches."+n, map[string]any{"parents": v75sParents("embargo")})
-	}
 	for _, n := range docs {
 		w.put("matches", n, map[string]any{"title": n})
 	}
@@ -118,12 +115,14 @@ func (w *v75s) li(extra ...map[string]any) string {
 	return w.catGrant("user:li", []any{"editors", "interns"}, extra...)
 }
 
-// bo is a partial reader in chiefs alone, who sees what embargo holds.
-func (w *v75s) bo() string { return w.catGrant("user:bo", []any{"chiefs"}) }
+// bo is a partial reader in chiefs alone, through role chief.
+func (w *v75s) bo() string {
+	return w.catGrant("user:bo", []any{"chiefs"}, map[string]any{"roles": []any{"chief"}})
+}
 
 func (w *v75s) catGrant(sub string, groups []any, extra ...map[string]any) string {
 	w.t.Helper()
-	x := map[string]any{"groups": groups, "roles": []any{"reader"}, "at": map[string]any{"ns": "cat-season", "id": w.nsHead("cat-season", w.admin)},
+	x := map[string]any{"groups": groups, "roles": []any{"reader"},
 		"exp": w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)}
 	for _, m := range extra {
 		for k, v := range m {
@@ -280,10 +279,9 @@ func TestV075PartialRedirects(t *testing.T) {
 	// Unrestricted readers keep the unfiltered answers.
 	expect(t, w.get("/ns/matches/rev/"+head+"/heads", w.admin), 200)
 
-	// Uncovered: NoFilteredReads, or a namespace trusting no catalog.
+	// Uncovered: NoFilteredReads.
 	for _, o := range []v75sOpts{
 		{env: []envOpt{func(o *core.Options) { o.NoFilteredReads = true }}},
-		{matches: func(doc map[string]any) { delete(doc, "catalogs") }},
 	} {
 		w2 := newV75s(t, o)
 		w2.seed([]string{"derby"}, nil, []string{"derby"})
@@ -311,11 +309,12 @@ func TestV075FilteredRoutes(t *testing.T) {
 	ck := cookieHdr(c)
 	base := "/ns/matches/g/" + gs
 	head := w.nsHead("matches", w.admin)
+	otherAt := w.nsHead("cat-season", w.admin) // no entry of matches
 	for path, loc := range map[string]string{
-		base + "/heads?prefix=d":                    base + "/at/" + at + "/heads?prefix=d",
-		base + "/log?since=" + head:                 base + "/at/" + at + "/log?since=" + head,
-		base + "/at/" + head + "/heads":             base + "/at/" + at + "/heads",
-		base + "/at/" + head + "/log?since=" + head: base + "/at/" + at + "/log?since=" + head,
+		base + "/heads?prefix=d":                       base + "/at/" + at + "/heads?prefix=d",
+		base + "/log?since=" + head:                    base + "/at/" + at + "/log?since=" + head,
+		base + "/at/" + otherAt + "/heads":             base + "/at/" + at + "/heads",
+		base + "/at/" + otherAt + "/log?since=" + head: base + "/at/" + at + "/log?since=" + head,
 	} {
 		r := w.do(req{method: "GET", path: path, hdr: ck})
 		expect(t, r, 302)
@@ -366,7 +365,7 @@ func TestV075FilteredHeads(t *testing.T) {
 			t.Fatalf("X-Namespace-Revision %q, want %q", r.H.Get("X-Namespace-Revision"), head)
 		}
 		tags := strings.Split(r.H.Get("Cache-Tag"), ",")
-		for _, want := range []string{"ns:matches", "heads:matches", "ns:cat-season", "heads:cat-season"} {
+		for _, want := range []string{"ns:matches", "heads:matches"} {
 			if !strings.Contains(","+r.H.Get("Cache-Tag")+",", ","+want+",") {
 				t.Fatalf("Cache-Tag %v lacks %s", tags, want)
 			}
@@ -522,7 +521,7 @@ func TestV075FilteredLog(t *testing.T) {
 	// A since not in the chain is 404, short, tagged.
 	r := w.get("/ns/matches/g/"+gs+"/at/"+at+"/log?since="+ids.Of([]byte("nope")).String(), li)
 	expect(t, r, 404)
-	if !strings.Contains(r.H.Get("Cache-Tag"), "ns:cat-season") || r.H.Get("X-Namespace-Revision") == "" {
+	if !strings.Contains(r.H.Get("Cache-Tag"), "ns:matches") || r.H.Get("X-Namespace-Revision") == "" {
 		t.Fatalf("404 headers %v", r.H)
 	}
 }
@@ -700,10 +699,8 @@ func TestV075FilteredEvents(t *testing.T) {
 	if ev, ok := nextEvent(ch, 300*time.Millisecond); ok {
 		t.Fatalf("a second event %+v", ev)
 	}
-	// derby's placement moves under embargo, out of li's view.
-	w.put("cat-season", "embargo", map[string]any{"parents": v75sParents("root"), "$access": map[string]any{"inherit": false, "group:chiefs": []any{"reader"}}})
-	w.put("cat-season", "matches.derby", map[string]any{"parents": v75sParents("embargo")})
-	w.put("matches", "derby", map[string]any{"v": 2})
+	// opener, out of li's view, and shared, in it, are written.
+	w.put("matches", "opener", map[string]any{"v": 2})
 	w.put("matches", "shared", map[string]any{"v": 2})
 	ev, ok = nextEvent(ch, 5*time.Second)
 	if !ok || !strings.Contains(ev.data, `"resource":"shared"`) {
@@ -785,7 +782,7 @@ func TestV075FilteredPurged(t *testing.T) {
 	// As the unfiltered /heads' 410, tagged as filtered answers are.
 	u := w.get("/ns/matches/rev/"+purgeNS+"/heads", w.admin)
 	expectCode(t, u, 410, "purged")
-	if r.H.Get("Cache-Control") != u.H.Get("Cache-Control") || !strings.Contains(r.H.Get("Cache-Tag"), "ns:cat-season") {
+	if r.H.Get("Cache-Control") != u.H.Get("Cache-Control") || !strings.Contains(r.H.Get("Cache-Tag"), "ns:matches") {
 		t.Fatalf("410 headers %v, unfiltered %v", r.H, u.H)
 	}
 	entries, _ := w.readRange(gs, at, from, li)

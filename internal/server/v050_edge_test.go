@@ -286,7 +286,7 @@ func TestV050EdgeGrantsAllOrNothing(t *testing.T) {
 // verified.
 func TestV050EdgeGrantsFiniteSets(t *testing.T) {
 	t.Parallel()
-	f := newAuthFixture(t, nil)
+	f := newAuthFixture(t, nil, noFilteredReads)
 	e := f.tenv
 	e.mkNS("sec2", map[string]any{"read": "grant", "keys": []any{f.admin.entry("*"), f.issuer.entry("read")}})
 	for _, n := range []string{"a", "b", "c", "d"} {

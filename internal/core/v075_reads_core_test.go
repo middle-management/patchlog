@@ -26,7 +26,7 @@ func TestV075FilteredLiveCost(t *testing.T) {
 		mu.Unlock()
 	}
 	t.Cleanup(func() { testFilteredJudge = nil })
-	li, bo := w.li(), w.catGrant("user:bo", []any{"chiefs"})
+	li, bo := w.li(), w.bo()
 	lgs, bgs := v075GS(t, w, li), v075GS(t, w, bo)
 	since := w.head("matches")
 	w.put("matches", "derby", map[string]any{"v": 2})
@@ -121,16 +121,9 @@ func TestV075RedirectRecordsAt(t *testing.T) {
 	if !ok || fr.At == "" || fr.NS != "matches" || fr.GS != v075GS(t, w, w.li()) {
 		t.Fatalf("redirect %v", err)
 	}
-	w.inTx(func(t2 *tx) {
-		var n int
-		t2.must(t2.QueryRow(`SELECT COUNT(*) FROM filtered_ats WHERE at = ?`, fr.At).Scan(&n))
-		if n != 1 {
-			t.Fatalf("at %s not recorded", fr.At)
-		}
-	})
 	// Events and long-poll carry no at, and record none.
 	_, err = w.e.NamespaceEvents(ctx, "matches", "", 10, w.li())
-	if fr, ok := err.(*FilteredRedirect); !ok || fr.At != "" || fr.CP != nil {
+	if fr, ok := err.(*FilteredRedirect); !ok || fr.At != "" {
 		t.Fatalf("events redirect %v", err)
 	}
 	// The filtered page at it, after a write moved the current at.

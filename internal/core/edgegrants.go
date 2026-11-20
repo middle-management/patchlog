@@ -366,7 +366,7 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 		return nil, forbidden("the grant does not allow read in " + ns)
 	}
 	names, safe := edgeReadScope(a)
-	if names == nil && !t.readsNS(n, cfg, a, false) {
+	if names == nil && !t.readsNS(n, cfg, a, false) && t.partialReader(a) {
 		// A partial reader whose rules fix no names reads a covered
 		// namespace filtered (§B.11.9 Edge grants).
 		if fs := t.filteredScope(n); fs != nil {

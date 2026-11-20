@@ -977,6 +977,32 @@ func fixedNames(a *actor) ([]string, bool) {
 	return names, true
 }
 
+// fixesSomeResource reports whether a rule of a's blocks or its key's
+// scope, at top level or nested only in alls, tests /resource against
+// literal names (grant.ResourceLiterals), whatever names they leave, an
+// empty or invalid set included: such a grant reads the names it fixes at
+// their own URLs, never a namespace filtered (§7.9 Partial reader).
+func fixesSomeResource(a *actor) bool {
+	var walk func(rs []any) bool
+	walk = func(rs []any) bool {
+		for _, rv := range rs {
+			if m, ok := rv.(map[string]any); ok && len(m) == 1 {
+				if all, ok := m["all"].([]any); ok {
+					if walk(all) {
+						return true
+					}
+					continue
+				}
+			}
+			if _, ok := grant.ResourceLiterals(rv); ok {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(a.verified.KeyRules) || walk(a.verified.BlockRules)
+}
+
 // keysReadScope classifies a grant for /keys at E3 (§C.5, §E.2.3). K_e only
 // through rules none of which refers to /resource. Roles are
 // alternatives: if the unrestricted ones fail, a read role that refers to

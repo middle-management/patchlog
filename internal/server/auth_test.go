@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/grant"
 )
 
@@ -15,6 +16,10 @@ type authFixture struct {
 	admin, issuer, svc keyPair
 	adminG, issuerG    string
 }
+
+// noFilteredReads turns filtered reads (§7.9) off: a partial reader is
+// then answered as §C.5 answers one without them.
+func noFilteredReads(o *core.Options) { o.NoFilteredReads = true }
 
 func newAuthFixture(t *testing.T, extra map[string]any, opts ...envOpt) *authFixture {
 	e := newAuthEnv(t, opts...)

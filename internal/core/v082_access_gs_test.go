@@ -141,7 +141,6 @@ func TestV082AccessGSEntryEarlierEndings(t *testing.T) {
 	t.Parallel()
 	for name, patch := range map[string]map[string]any{
 		"the role gains a rule": v82accessOp("add", "/roles/reader/rules", []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": "^d"}}}),
-		"the key's requireAt":   v82accessOp("replace", "/keys/1/requireAt", true),
 		"the key is removed":    {"op": "remove", "path": "/keys/1"},
 		"the role is removed":   {"op": "remove", "path": "/roles/reader"},
 	} {

@@ -92,3 +92,7 @@ func (ix *Index) OnJudge(f func()) { ix.testJudge = f }
 
 // KeptHas reports whether a result is kept under url (tests).
 func (ix *Index) KeptHas(url string) bool { _, _, ok := ix.kept.Get(url); return ok }
+
+// OnBeforeAnswer calls f once a reader's views are computed, before the
+// answer is: a query's head pointer, or /_refs (tests).
+func (ix *Index) OnBeforeAnswer(f func()) { ix.testBeforeAnswer = f }

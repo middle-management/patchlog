@@ -20,7 +20,7 @@ func TestV047UnrestrictedRead(t *testing.T) {
 		"one":      map[string]any{"can": []any{"read"}, "rules": onlyA},
 		"all":      map[string]any{"can": []any{"read", "branch", "export"}},
 		"brancher": map[string]any{"can": []any{"branch", "export"}},
-	}})
+	}}, noFilteredReads)
 	e := f.tenv
 	hdr := map[string]string{"Gesture": gA}
 	a0 := etagOf(e.do(req{method: "PATCH", path: "/r/sec/a", ifNoneMatch: "*", body: addRoot(map[string]any{"n": 0.0}), bearer: f.adminG, hdr: hdr}))

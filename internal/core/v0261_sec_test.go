@@ -33,7 +33,7 @@ func TestV0261FilteredPurgedHeadsDifferential(t *testing.T) {
 		w := newV75World(t, v75Opts{})
 		w.seed()
 		li := w.li()
-		bo := w.catGrant("user:bo", []any{"chiefs"})
+		bo := w.bo()
 		x := &world{w: w}
 		x.gs = v075GS(t, w, li)
 		x.bo = v075GS(t, w, bo)

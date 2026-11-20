@@ -36,7 +36,7 @@ func TestV082AccessPurgedFilteredHeadsReadCheck(t *testing.T) {
 	w := newV75World(t, v75Opts{})
 	w.seed()
 	ctx := context.Background()
-	li, bo := w.li(), w.catGrant("user:bo", []any{"chiefs"})
+	li, bo := w.li(), w.bo()
 	liCookie, liGS := v82accessCookie(t, w, li)
 	boGS := v075GS(t, w, bo)
 	if liGS == boGS {

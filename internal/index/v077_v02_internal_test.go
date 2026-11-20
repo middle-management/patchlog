@@ -95,25 +95,6 @@ func TestV077ChainUnreadable(t *testing.T) {
 	}
 }
 
-// TestV077MemberBehindNamesNone (FSVC-12; §A.4 Private namespaces: "503
-// (behind, §B.5) until it has reached each"; /principal hides
-// catalog.trust, §7.4): a namespace visibility reads whose follower holds
-// no checkpoint yet is 503 behind with a fixed body; only the log names
-// it.
-func TestV077MemberBehindNamesNone(t *testing.T) {
-	t.Parallel()
-	var logged []string
-	ix := &Index{opt: Options{Logf: func(f string, a ...any) { logged = append(logged, fmt.Sprintf(f, a...)) }}}
-	rec := httptest.NewRecorder()
-	ix.writeCoverErr(rec, "matches", fmt.Errorf("%w: %s (§A.4)", errMemberBehind, "cat-season"))
-	if rec.Code != 503 || strings.Contains(rec.Body.String(), "cat-season") || rec.Header().Get("Retry-After") == "" {
-		t.Errorf("member behind: %d %s", rec.Code, rec.Body)
-	}
-	if len(logged) != 1 || !strings.Contains(logged[0], "cat-season") {
-		t.Errorf("the log %q doesn't name cat-season", logged)
-	}
-}
-
 // TestV077JudgeEpochs (ENC-5; §E.2.6: the epoch of a revision a hit
 // derives from is "judged once, when the service first seals a value
 // derived from it"): a pending docs.epoch is judged by the first answer,

@@ -18,7 +18,6 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/pgtest"
-	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // V75-01 (v0.75): the visibility engine of filtered namespace reads
@@ -26,10 +25,10 @@ import (
 // at a checkpoint, the visible predicate, gs, stored state, admission and
 // the exchange.
 
-// v75World is an engine with authentication on and the catalog setup of
-// §B.11.3: cat-season trusts matches, whose key catalog-01 has requireAt
-// cat-season and a scope rule testing /resource by type, so its grants
-// read matches only in part. k is a * key in both.
+// v75World is an engine with authentication on and two private
+// namespaces, cat-season and matches. matches's key catalog-01 has a
+// scope rule allowing /resource derby and shared only, so its grants read
+// matches only in part, and §B.11.9 covers both. k is a * key in both.
 type v75World struct {
 	t       *testing.T
 	e       *Engine
@@ -54,6 +53,10 @@ type v75Opts struct {
 	file bool
 }
 
+// v75Visible is the schema catalog-01's rule tests /resource with: the
+// names its grants read in matches.
+var v75Visible = map[string]any{"pattern": "^(derby|shared)$"}
+
 func newV75World(t *testing.T, o v75Opts) *v75World {
 	t.Helper()
 	w := &v75World{t: t, clock: &atomic.Int64{}, path: pgtest.DB(t)}
@@ -70,17 +73,15 @@ func newV75World(t *testing.T, o v75Opts) *v75World {
 	// cat-reader's scope rule tests /resource by type: its grants read
 	// cat-season in part (catReader).
 	cat := map[string]any{"read": "grant", "keys": []any{w.kEntry(), map[string]any{"kid": "cat-reader", "alg": "ed25519", "pub": w.catPub,
-		"can": []any{"read"}, "rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}}},
-		"catalog": map[string]any{"trust": []any{"matches"}}}
+		"can": []any{"read"}, "rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}}}}
 	if o.cat != nil {
 		o.cat(cat)
 	}
 	w.mkNS("cat-season", cat)
 	matches := map[string]any{"read": "grant", "keys": []any{w.kEntry(), map[string]any{"kid": "catalog-01", "alg": "ed25519", "pub": w.catPub,
-		"can": []any{"read"}, "requireAt": "cat-season", "maxTtl": "PT15M",
-		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}}},
-		"roles":    map[string]any{"reader": map[string]any{"can": []any{"read"}}},
-		"catalogs": map[string]any{"cat-season": map[string]any{"place": []any{}}}}
+		"can": []any{"read"}, "maxTtl": "PT15M",
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": v75Visible}}}},
+		"roles": map[string]any{"reader": map[string]any{"can": []any{"read"}}}}
 	if o.matches != nil {
 		o.matches(matches)
 	}
@@ -203,10 +204,8 @@ func v75Parents(names ...string) []any {
 	return out
 }
 
-// seed writes the catalog of the conformance scenarios: root, whose
-// $access gives editors and li reader, and season under it, with
-// placements of derby, shared and final; and matches's derby, shared and
-// opener, which is never placed.
+// seed writes cat-season's documents and matches's derby, shared,
+// opener and secret, of which catalog-01's rule allows derby and shared.
 func (w *v75World) seed() {
 	w.t.Helper()
 	w.put("cat-season", "root", map[string]any{"parents": []any{}, "$access": map[string]any{"group:editors": []any{"reader"}, "user:li": []any{"reader"}}})
@@ -221,15 +220,23 @@ func (w *v75World) seed() {
 }
 
 // li is a partial reader of matches: catalog-01's grant for user:li, in
-// editors and interns, with the reader role, at cat-season's head.
+// editors and interns, with the reader role.
 func (w *v75World) li(extra ...map[string]any) Credentials {
 	return w.catGrant("user:li", []any{"editors", "interns"}, extra...)
+}
+
+// bo is a partial reader of matches who sees none of it: catalog-01's
+// grant for user:bo in chiefs, whose block rule allows only secret, which
+// the key's rule doesn't.
+func (w *v75World) bo() Credentials {
+	return w.catGrant("user:bo", []any{"chiefs"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": "^secret$"}}}})
 }
 
 func (w *v75World) catGrant(sub string, groups []any, extra ...map[string]any) Credentials {
 	w.t.Helper()
 	root := map[string]any{"kid": "catalog-01", "sub": sub, "groups": groups, "roles": []any{"reader"}, "ns": []any{"matches"},
-		"can": []any{"read"}, "at": map[string]any{"ns": "cat-season", "id": w.head("cat-season")},
+		"can": []any{"read"},
 		"exp": w.now().Add(10 * time.Minute).UTC().Format(time.RFC3339)}
 	for _, x := range extra {
 		for k, v := range x {
@@ -262,13 +269,10 @@ func TestV075FilteredScope(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
 	w.inTx(func(t2 *tx) {
-		fs := t2.filteredScope(t2.nsByName("matches"))
-		if fs == nil || fs.kind != fsContent || fs.root.name != "matches" || len(fs.cats) != 1 || fs.cats[0].n.name != "cat-season" ||
-			fs.cats[0].e2e || !reflect.DeepEqual(fs.cats[0].kids, []string{"catalog-01"}) {
-			t.Fatalf("matches: %+v", fs)
-		}
-		if fs := t2.filteredScope(t2.nsByName("cat-season")); fs == nil || fs.kind != fsCatalog || fs.cats[0].n.name != "cat-season" {
-			t.Fatalf("cat-season: %+v", fs)
+		for _, ns := range []string{"matches", "cat-season"} {
+			if fs := t2.filteredScope(t2.nsByName(ns)); fs == nil || fs.n.name != ns {
+				t.Fatalf("%s: %+v", ns, fs)
+			}
 		}
 	})
 	// A local branch of matches isn't covered (v0.78, §B.11.9 Where).
@@ -287,37 +291,23 @@ func TestV075FilteredScope(t *testing.T) {
 			t.Fatalf("NoFilteredReads: %+v", fs)
 		}
 	})
-
 	for name, o := range map[string]v75Opts{
-		"requireAt true": {matches: func(doc map[string]any) {
-			doc["keys"].([]any)[1].(map[string]any)["requireAt"] = true
-		}},
 		"sealed": {matches: func(doc map[string]any) { doc["encryption"] = map[string]any{"level": "sealed"} }},
 		"public": {matches: func(doc map[string]any) { doc["read"] = "public" }},
-		"not in catalog.trust": {cat: func(doc map[string]any) {
-			doc["catalog"] = map[string]any{"trust": []any{}}
-		}},
 	} {
 		w := newV75World(t, o)
 		w.inTx(func(t2 *tx) {
 			if fs := t2.filteredScope(t2.nsByName("matches")); fs != nil {
 				t.Errorf("%s: matches covered: %+v", name, fs)
 			}
-			if fs := t2.filteredScope(t2.nsByName("cat-season")); fs != nil {
-				t.Errorf("%s: cat-season covered: %+v", name, fs)
-			}
 		})
 	}
-	// An e2e catalog is trusted, flagged, and stays out of at.
-	w = newV75World(t, v75Opts{cat: func(doc map[string]any) { doc["encryption"] = map[string]any{"level": "e2e"} }})
+	// The checkpoint is {ns}'s ns_id at its head.
+	head := w.head("matches")
 	w.inTx(func(t2 *tx) {
 		fs := t2.filteredScope(t2.nsByName("matches"))
-		if fs == nil || len(fs.cats) != 1 || !fs.cats[0].e2e {
-			t.Fatalf("e2e catalog: %+v", fs)
-		}
-		cp := t2.filteredCurrent(fs)
-		if _, ok := cp.ids["cat-season"]; ok || len(cp.cats) != 0 {
-			t.Fatalf("e2e catalog in at: %+v", cp)
+		if cp := t2.filteredCurrent(fs); cp.at != head {
+			t.Fatalf("at %s, want %s", cp.at, head)
 		}
 	})
 }
@@ -346,7 +336,7 @@ func TestV075NSAccess(t *testing.T) {
 		}
 	})
 	// The same grant in an uncovered namespace is nsReader's 403.
-	w2 := newV75World(t, v75Opts{matches: func(doc map[string]any) { delete(doc, "catalogs") }})
+	w2 := newV75World(t, v75Opts{matches: func(doc map[string]any) { doc["encryption"] = map[string]any{"level": "sealed"} }})
 	li2 := w2.li()
 	w2.inTx(func(t2 *tx) {
 		n := t2.nsByName("matches")
@@ -413,8 +403,8 @@ func v075Visible(t *testing.T, w *v75World, ns string, cred Credentials, names .
 	return out
 }
 
-// §B.11.9 Visible, Placement, Deleted resources (conformance 60–63, 65,
-// 87, 92 at engine level).
+// §B.11.9 Visible: a name is visible where the grant's rules allow
+// reading it, live, tombstoned or purged alike.
 func TestV075Visible(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -437,19 +427,7 @@ func TestV075Visible(t *testing.T) {
 	if got := v075Visible(t, w, "matches", noDerby, "derby"); got["derby"] {
 		t.Fatal("tombstoned derby visible past the block")
 	}
-	// A placement whose item doesn't exist yet (place before create).
-	w.put("cat-season", "matches.final", map[string]any{"parents": v75Parents("season")})
-	// derby's placement deleted: hidden at the new checkpoint.
-	w.del("cat-season", "matches.derby")
-	if got := v075Visible(t, w, "matches", li, "derby", "shared"); got["derby"] || !got["shared"] {
-		t.Fatalf("after unplacing derby: %v", got)
-	}
-	// Placed again: visible as a tombstone.
-	w.put("cat-season", "matches.derby", map[string]any{"parents": v75Parents("season")})
-	if got := v075Visible(t, w, "matches", li, "derby"); !got["derby"] {
-		t.Fatal("re-placed tombstoned derby hidden")
-	}
-	// A purged resource is judged at its placement as if live.
+	// A purged resource is judged as if live.
 	h, _ := w.e.ResourceHead(context.Background(), "matches", "derby", w.admin)
 	if _, err := w.e.Purge(context.Background(), Request{NS: "matches", Cred: w.admin}, "derby", h.Head, false); err != nil {
 		t.Fatal(err)
@@ -457,17 +435,12 @@ func TestV075Visible(t *testing.T) {
 	if got := v075Visible(t, w, "matches", li, "derby"); !got["derby"] {
 		t.Fatal("purged derby hidden from li")
 	}
-	// bo, in no group the catalog names, sees nothing.
-	bo := w.catGrant("user:bo", []any{"interns"})
-	if got := v075Visible(t, w, "matches", bo, "derby", "shared"); got["derby"] || got["shared"] {
-		t.Fatalf("bo sees %v", got)
-	}
-	// Candidates: the root's placements, in byte order.
+	// Candidates: the namespace's names, in byte order.
 	w.inTx(func(t2 *tx) {
 		fv := v075View(t, t2, "matches", li)
 		var names []string
 		fv.candidates(t2, "", "", func(n string) bool { names = append(names, n); return true })
-		if !reflect.DeepEqual(names, []string{"derby", "final", "secret", "shared"}) {
+		if !reflect.DeepEqual(names, []string{"derby", "opener", "secret", "shared"}) {
 			t.Errorf("candidates %v", names)
 		}
 		names = nil
@@ -508,50 +481,6 @@ func TestV075VisibleBranch(t *testing.T) {
 	}
 }
 
-// §B.11.9 Catalogs (conformance 92): a catalog shows a node only if the
-// node test passes, never a placement whose item doesn't exist or is
-// tombstoned; a deleted node visible live is visible as a tombstone.
-func TestV075VisibleCatalog(t *testing.T) {
-	t.Parallel()
-	w := newV75World(t, v75Opts{
-		// catalog-01 without scope rules, so roles count for folders
-		// through it (§B.11.5).
-		matches: func(doc map[string]any) { delete(doc["keys"].([]any)[1].(map[string]any), "rules") },
-	})
-	w.seed()
-	w.put("cat-season", "matches.final", map[string]any{"parents": v75Parents("season")})
-	w.put("cat-season", "old", map[string]any{"parents": v75Parents("root")})
-	w.put("cat-season", "matches.gone", map[string]any{"parents": v75Parents("season")})
-	li := w.catReader("user:li", "editors")
-	all := []string{"root", "season", "embargo", "matches.derby", "matches.shared", "matches.secret", "matches.final", "old", "matches.gone"}
-	got := v075Visible(t, w, "cat-season", li, all...)
-	want := map[string]bool{"root": true, "season": true, "embargo": false, "matches.derby": true, "matches.shared": true,
-		"matches.secret": false, "matches.final": false, "old": true, "matches.gone": false}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("li sees %v, want %v", got, want)
-	}
-	// An item tombstoned hides its live placement; a deleted node that was
-	// visible live is visible as a tombstone, a hidden one stays hidden,
-	// a placement whose item never existed included (Catalogs).
-	w.del("matches", "shared")
-	w.del("cat-season", "old")
-	w.del("cat-season", "matches.derby")
-	w.del("cat-season", "embargo")
-	w.del("cat-season", "matches.gone")
-	got = v075Visible(t, w, "cat-season", li, "matches.shared", "old", "matches.derby", "embargo", "matches.gone")
-	if want := map[string]bool{"matches.shared": false, "old": true, "matches.derby": true, "embargo": false, "matches.gone": false}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("after deletes li sees %v, want %v", got, want)
-	}
-	w.inTx(func(t2 *tx) {
-		fv := v075View(t, t2, "cat-season", li)
-		var names []string
-		fv.candidates(t2, "matches.f", "matches.", func(n string) bool { names = append(names, n); return true })
-		if !reflect.DeepEqual(names, []string{"matches.final", "matches.gone", "matches.secret", "matches.shared"}) {
-			t.Errorf("catalog candidates %v", names)
-		}
-	})
-}
-
 // catReader is a partial reader of cat-season: a cat-reader grant for
 // sub in groups.
 func (w *v75World) catReader(sub string, groups ...any) Credentials {
@@ -561,77 +490,9 @@ func (w *v75World) catReader(sub string, groups ...any) Credentials {
 var _ = slices.Contains[[]string]
 var _ = catvis.Partial
 
-// §B.11.9 Visible, D: catalogAt builds the graph tree.BuildGraph would
-// from the catalog's documents at the checkpoint's seq, and an earlier
-// checkpoint's graph doesn't change with later writes.
-func TestV075CatalogAt(t *testing.T) {
-	t.Parallel()
-	w := newV75World(t, v75Opts{})
-	w.seed()
-	w.put("cat-season", "deep", map[string]any{"parents": v75Parents("season")})
-	w.put("cat-season", "matches.opener", map[string]any{"parents": v75Parents("deep")})
-	type snap struct {
-		names   []string
-		parents map[string][]string
-	}
-	shape := func(g *tree.Graph) snap {
-		s := snap{names: g.Names(), parents: map[string][]string{}}
-		for _, n := range s.names {
-			s.parents[n] = g.WalkableParents(g.Node(n))
-		}
-		return s
-	}
-	var before snap
-	var oldCP *fcp
-	var fs0 *fscope
-	w.inTx(func(t2 *tx) {
-		fs0 = t2.filteredScope(t2.nsByName("matches"))
-		oldCP = t2.filteredCurrent(fs0)
-		c := t2.catalogAt(&oldCP.cats[0], oldCP)
-		docs := map[string]any{}
-		cat := t2.nsByName("cat-season")
-		for _, h := range t2.listHeads(cat, nil) {
-			d, err := t2.docAt(h.row)
-			if err != nil {
-				t.Fatal(err)
-			}
-			docs[h.name] = d
-		}
-		want := tree.BuildGraph("cat-season", t2.config(cat.configSeq).Doc, docs)
-		before = shape(c.G)
-		if !reflect.DeepEqual(before, shape(want)) || !reflect.DeepEqual(before.parents["matches.opener"], []string{"deep"}) {
-			t.Fatalf("catalogAt %+v, BuildGraph %+v", before, shape(want))
-		}
-	})
-	// Move opener under root.
-	w.put("cat-season", "matches.opener", map[string]any{"parents": v75Parents("root")})
-	w.inTx(func(t2 *tx) {
-		fs := t2.filteredScope(t2.nsByName("matches"))
-		cp := t2.filteredCurrent(fs)
-		if cp.at == oldCP.at {
-			t.Fatal("a catalog write left the checkpoint")
-		}
-		if got := shape(t2.catalogAt(&cp.cats[0], cp).G); !reflect.DeepEqual(got.parents["matches.opener"], []string{"root"}) {
-			t.Fatalf("after the move: %v", got.parents["matches.opener"])
-		}
-		old, ok := t2.filteredAt(fs, oldCP.at)
-		if ok {
-			t.Fatal("an unrecorded at resolved")
-		}
-		_ = old
-		cat := t2.nsByName("cat-season")
-		c := &fsCat{n: cat}
-		if got := shape(t2.catalogAt(c, oldCP).G); !reflect.DeepEqual(got, before) {
-			t.Fatalf("the old checkpoint's graph changed: %+v", got)
-		}
-	})
-}
-
-// §B.11.9 gs (conformance 69, 71, 79, 85; v0.78: "A gs hashes all the
-// caller's groups"): li's subjects are all her groups, interns too, which
-// nothing names, her sub (root's $access has a direct entry for her), the
-// scope digest and the key subject, never "partial"; before v0.78 only the
-// groups a catalog named counted, with "partial" for the rest.
+// §B.11.9 gs: a partial reader's subjects are its scope digest and its
+// key subject alone: readers with the same rules through the same key
+// share a gs, whatever their sub or groups.
 func TestV075GS(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -653,20 +514,15 @@ func TestV075GS(t *testing.T) {
 			digest = d
 		}
 	}
-	if want := []string{"group:editors", "group:interns", catvis.KeySubject("catalog-01", w.catPub), "scope:" + digest, "user:li"}; digest == "" || !reflect.DeepEqual(liSubs, want) {
+	if want := []string{grantcheck.KeySubject("catalog-01", w.catPub), "scope:" + digest}; digest == "" || !reflect.DeepEqual(liSubs, want) {
 		t.Fatalf("li's subjects %v, want %v", liSubs, want)
 	}
-	if liGS == "all" || liGS != grantcheck.SubjectSetID(liSubs) {
+	if liGS != grantcheck.SubjectSetID(liSubs) {
 		t.Fatalf("gs %s", liGS)
 	}
-	// bo, in the same groups but without a direct entry: another gs.
-	boSubs, boGS := subjects(w.catGrant("user:bo", []any{"editors", "interns"}))
-	if boGS == liGS || slices.Contains(boSubs, "user:bo") || !slices.Contains(boSubs, "group:interns") {
-		t.Fatalf("bo's subjects %v", boSubs)
-	}
-	// li without interns, which nothing names: another gs (TDA 78).
-	if _, gs := subjects(w.catGrant("user:li", []any{"editors"})); gs == liGS {
-		t.Fatal("li without interns shares the gs")
+	// bo, in other groups: the same gs.
+	if _, boGS := subjects(w.catGrant("user:bo", []any{"interns"})); boGS != liGS {
+		t.Fatal("bo's gs differs")
 	}
 	// Other /resource block rules: another gs.
 	_, narrowGS := subjects(w.li(map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": "^d"}}}}))
@@ -681,13 +537,6 @@ func TestV075GS(t *testing.T) {
 			t.Fatalf("/now rule: %v %v, want 403", kind, err)
 		}
 	})
-	// A role rule reading /principal/groups by position changes nothing:
-	// every group is kept anyway.
-	w.patchConfig("matches", map[string]any{"op": "add", "path": "/roles/reader/rules",
-		"value": []any{map[string]any{"op": "test", "path": "/principal/groups/0", "exists": true}}})
-	if subs, _ := subjects(w.li()); !reflect.DeepEqual(subs[:4], []string{"group:editors", "group:interns", catvis.KeySubject("catalog-01", w.catPub), "scope:" + subs[3][6:]}) || slices.Contains(subs, "partial") {
-		t.Fatalf("all groups kept: %v", subs)
-	}
 }
 
 // v075GSRedirect is cred's partialRedirect in matches.
@@ -709,8 +558,8 @@ func v075GSRedirect(t *testing.T, w *v75World, cred Credentials) *FilteredRedire
 	return red
 }
 
-// §B.11.9 at, G: checkpoints are recorded and resolve while their members
-// do; subject sets are stored and survive a restart.
+// §B.11.9 at, G: checkpoints are entries of {ns}'s chain; subject sets
+// are stored and survive a restart.
 func TestV075State(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{file: true})
@@ -718,30 +567,27 @@ func TestV075State(t *testing.T) {
 	ctx := context.Background()
 	li := w.li()
 	red := v075GSRedirect(t, w, li)
-	if red.NS != "matches" || red.At != red.CP.at || red.CP.nsID("matches") != w.head("matches") ||
-		!reflect.DeepEqual(red.CP.others("matches"), []string{"cat-season"}) {
+	if red.NS != "matches" || red.At != w.head("matches") {
 		t.Fatalf("redirect %+v", red)
 	}
-	if err := w.e.recordFilteredAt(ctx, red.CP); err != nil {
-		t.Fatal(err)
-	}
-	// A catalog-only move: a new at; the recorded one still resolves.
-	w.put("cat-season", "matches.derby", map[string]any{"parents": v75Parents("root")})
+	// A move: a new at; the old one still resolves, as any entry of the
+	// chain does.
+	w.put("matches", "derby", map[string]any{"title": "moved"})
+	catHead := w.head("cat-season")
 	w.inTx(func(t2 *tx) {
 		fs := t2.filteredScope(t2.nsByName("matches"))
 		cur := t2.filteredCurrent(fs)
 		if cur.at == red.At {
-			t.Fatal("same at after a catalog write")
+			t.Fatal("same at after a write")
 		}
-		old, ok := t2.filteredAt(fs, red.At)
-		if !ok || !reflect.DeepEqual(old.ids, red.CP.ids) || len(old.cats) != 1 {
-			t.Fatalf("recorded at: %v %+v", ok, old)
+		if old, ok := t2.filteredAt(fs, red.At); !ok || old.at != red.At {
+			t.Fatalf("old at: %v %+v", ok, old)
 		}
 		if _, ok := t2.filteredAt(fs, cur.at); !ok {
 			t.Fatal("current at")
 		}
-		if _, ok := t2.filteredAt(fs, grantcheck.CombinedAt(map[string]string{"matches": cur.ids["matches"]})); ok {
-			t.Fatal("an unknown at resolved")
+		if _, ok := t2.filteredAt(fs, catHead); ok {
+			t.Fatal("another namespace's ns_id resolved")
 		}
 	})
 	// A subject set, recorded, survives a restart on the same database.
@@ -761,7 +607,7 @@ func TestV075State(t *testing.T) {
 	w.inTx(func(t2 *tx) {
 		got := t2.loadGS("matches", rec.gs)
 		if got == nil || got.exp != rec.exp || !reflect.DeepEqual(got.subjects, rec.subjects) || got.kid != "catalog-01" ||
-			!reflect.DeepEqual(got.roles, []string{"reader"}) || got.digest != rec.digest || got.filter != rec.filter || got.partial {
+			!reflect.DeepEqual(got.roles, []string{"reader"}) || got.digest != rec.digest || got.filter != rec.filter {
 			t.Fatalf("after a restart: %+v, want %+v", got, rec)
 		}
 		if t2.loadGS("matches", grantcheck.SubjectSetID([]string{"x"})) != nil {
@@ -852,9 +698,6 @@ func TestV075FilteredAdmit(t *testing.T) {
 	// there), and at the recorded one.
 	var oldCP *fcp
 	w.inTx(func(t2 *tx) { oldCP = t2.filteredCurrent(t2.filteredScope(t2.nsByName("matches"))) })
-	if err := w.e.recordFilteredAt(ctx, oldCP); err != nil {
-		t.Fatal(err)
-	}
 	w.patchConfig("matches", map[string]any{"op": "add", "path": "/roles/auditor", "value": map[string]any{"can": []any{"read"},
 		"rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/principal/groups", "schema": map[string]any{"contains": map[string]any{"const": "contractors"}}}}}}})
 	if _, st := admit(liGS, gCookie(liGS, exp)); st != 0 {
@@ -923,7 +766,7 @@ func TestV075Exchange(t *testing.T) {
 		t.Fatalf("prefixes %v", got)
 	}
 	w.inTx(func(t2 *tx) {
-		if r := t2.loadGS("matches", gs); r == nil || r.ns != "matches" || r.partial || r.exp > w.now().Add(10*time.Minute).Unix() {
+		if r := t2.loadGS("matches", gs); r == nil || r.ns != "matches" || r.exp > w.now().Add(10*time.Minute).Unix() {
 			t.Fatalf("filtered_gs row %+v", r)
 		}
 	})

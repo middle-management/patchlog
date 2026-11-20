@@ -2,11 +2,8 @@ package core
 
 import (
 	"context"
-	"slices"
 	"testing"
 	"time"
-
-	"github.com/middle-management/patchlog/internal/catvis"
 )
 
 // §B.11.9 gs: a grant reading two covered namespaces with the same key
@@ -15,18 +12,14 @@ import (
 // cookie is admitted, by its own row.
 func TestV075EngineGSPerNamespace(t *testing.T) {
 	t.Parallel()
-	w := newV75World(t, v75Opts{cat: func(doc map[string]any) {
-		doc["catalog"] = map[string]any{"trust": []any{"matches", "results"}}
-	}})
+	w := newV75World(t, v75Opts{})
 	// results: matches's document, same key catalog-01 and same roles.
 	results := map[string]any{"read": "grant", "keys": []any{w.kEntry(), map[string]any{"kid": "catalog-01", "alg": "ed25519", "pub": w.catPub,
-		"can": []any{"read"}, "requireAt": "cat-season", "maxTtl": "PT15M",
-		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}}},
-		"roles":    map[string]any{"reader": map[string]any{"can": []any{"read"}}},
-		"catalogs": map[string]any{"cat-season": map[string]any{"place": []any{}}}}
+		"can": []any{"read"}, "maxTtl": "PT15M",
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": v75Visible}}}},
+		"roles": map[string]any{"reader": map[string]any{"can": []any{"read"}}}}
 	w.mkNS("results", results)
 	w.seed()
-	w.put("cat-season", "results.derby", map[string]any{"parents": v75Parents("season")})
 	admin := w.admin
 	w.admin = w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:root", "ns": []any{"results"}, "can": []any{"read", "create", "append"}})
 	w.put("results", "derby", map[string]any{"title": "derby"})
@@ -54,62 +47,4 @@ func TestV075EngineGSPerNamespace(t *testing.T) {
 			}
 		})
 	}
-}
-
-// §B.11.9 Catalogs never show a placement whose item doesn't exist or is
-// tombstoned, and a node's own tombstone reaches exactly those who could
-// see it live (Deleted resources): the tombstone of a placement hidden
-// while live, because its item never existed or was tombstoned, stays
-// hidden, and so does its name.
-func TestV075EngineCatalogTombstoneOfDanglingPlacement(t *testing.T) {
-	t.Parallel()
-	w := newV75World(t, v75Opts{
-		matches: func(doc map[string]any) { delete(doc["keys"].([]any)[1].(map[string]any), "rules") },
-	})
-	w.seed()
-	w.put("cat-season", "matches.gone", map[string]any{"parents": v75Parents("season")})
-	li := w.catReader("user:li", "editors")
-	if got := v075Visible(t, w, "cat-season", li, "matches.gone", "matches.shared"); got["matches.gone"] || !got["matches.shared"] {
-		t.Fatalf("live: %v", got)
-	}
-	// shared's item is tombstoned: its live placement is hidden.
-	w.del("matches", "shared")
-	if got := v075Visible(t, w, "cat-season", li, "matches.shared"); got["matches.shared"] {
-		t.Fatalf("placement of a tombstoned item: %v", got)
-	}
-	w.del("cat-season", "matches.gone")
-	w.del("cat-season", "matches.shared")
-	got := v075Visible(t, w, "cat-season", li, "matches.gone", "matches.shared")
-	if got["matches.gone"] {
-		t.Errorf("the tombstone of matches.gone, a placement hidden while live (its item never existed), is visible")
-	}
-	if got["matches.shared"] {
-		t.Errorf("the tombstone of matches.shared, hidden while live (its item tombstoned), is visible")
-	}
-}
-
-// A deleted catalog node's tombstone reaches those who could see it live
-// (§B.11.9 Deleted resources, Catalogs), through its own $access too: the
-// group only that $access named keeps deciding, so the reader's gs keeps
-// it.
-func TestV075EngineTombstoneVisibleThroughItsOwnAccess(t *testing.T) {
-	t.Parallel()
-	w := newV75World(t, v75Opts{
-		matches: func(doc map[string]any) { delete(doc["keys"].([]any)[1].(map[string]any), "rules") },
-	})
-	w.seed()
-	w.put("cat-season", "audit", map[string]any{"parents": v75Parents("root"), "$access": map[string]any{"group:auditors": []any{"reader"}}})
-	bo := w.catReader("user:bo", "auditors")
-	if got := v075Visible(t, w, "cat-season", bo, "audit", "root"); !got["audit"] || got["root"] {
-		t.Fatalf("live: %v", got)
-	}
-	w.del("cat-season", "audit")
-	if got := v075Visible(t, w, "cat-season", bo, "audit"); !got["audit"] {
-		t.Errorf("the tombstone of audit, visible to bo while live, is hidden from bo")
-	}
-	w.inTx(func(t2 *tx) {
-		if subs := v075View(t, t2, "cat-season", bo).subjects; !slices.Contains(subs, "group:auditors") || slices.Contains(subs, catvis.Partial) {
-			t.Errorf("bo's subjects after the delete: %v", subs)
-		}
-	})
 }

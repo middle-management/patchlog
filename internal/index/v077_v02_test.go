@@ -22,36 +22,6 @@ import (
 // 410, /_refs, purges before serving, upstream errors and judged-once
 // epochs (§A.1, §A.4, §B.11.9, §C.4, §E.2.6).
 
-// TestV077MembersBehindNamesNone (FSVC-12; §A.4 Private namespaces: a
-// partial reader is answered "503 (behind, §B.5) until it has reached
-// each"; /principal hides catalog.trust, §7.4): before cat-season's
-// follower holds its first checkpoint, li's 503 at /matches and at /_refs
-// doesn't name cat-season. Before v0.77 its body did.
-func TestV077MembersBehindNamesNone(t *testing.T) {
-	t.Parallel()
-	w := newV75XOn(t, clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}))
-	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
-	x, _ := members76Start(t, w, filepath.Join(t.TempDir(), "i.db"), func(ctx context.Context, m string) {
-		if m == "cat-season" {
-			select {
-			case <-release:
-			case <-ctx.Done():
-			}
-		}
-	})
-	x.ix.SetMinWait(50 * time.Millisecond)
-	w.x = x
-	x.caughtUp("matches")
-	li := w.reader("user:li", []any{"fans"})
-	for _, path := range []string{"/matches", "/_refs?to=%2Fr%2Ftarget%2Fx"} {
-		r := x.raw(path, li)
-		if r.status != 503 || r.body["code"] != "behind" || strings.Contains(r.body["message"].(string), "cat-season") {
-			t.Errorf("%s before cat-season's first checkpoint: %d %v", path, r.status, r.body)
-		}
-	}
-}
-
 // TestV077HeadPointerDropsOpaqueAfter (FSVC-8, index part; §A.4: "A
 // redirect from a head pointer or to another at ... keeps an after naming
 // a resource, applied to the new result, and drops an opaque one, starting
@@ -236,50 +206,10 @@ func TestV077ScopeCookieEnds(t *testing.T) {
 	}
 }
 
-// TestV077PurgedCatalogDark (FSVC-4; §B.11.9 Where: "an end-to-end
-// catalog, which the origin can't read, or a purged one, makes nothing
-// visible"; scenario 115): once cat-season, matches' only trusted
-// catalog, is purged, matches stays covered: li's query is redirected to
-// /matches/g/{gs}/at/{at} under her g: marker, and answered with no hits,
-// cat-season out of at. Before v0.77 matches became uncovered, and li got
-// the hits her rules allow.
-func TestV077PurgedCatalogDark(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	w := newV75X(t, false)
-	li := w.readerVia("user:li", []any{"fans"})
-	if got := strings.Join(resources(w.x.search("/matches", li)), ","); got != "derby,shared" {
-		t.Fatalf("li sees %s before the purge", got)
-	}
-	purger := w.s.Client(t, client.WithBearer(w.k.Grant(t, w.s.Now(), "user:root", []string{"cat-season"}, []string{"purge-ns"})))
-	must(w.admin.PatchConfig(ctx, "cat-season", must(w.admin.NSHead(ctx, "cat-season")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
-	must(purger.PurgeNamespace(ctx, "cat-season", w.head("cat-season")))
-	waitFor(t, "the index learns cat-season is purged", func() bool {
-		w.x.ix.ExpireGrantChecks()
-		r := w.x.raw("/matches", li)
-		return r.status == 302 && strings.Contains(r.header.Get("Location"), "/g/") && w.x.ix.Members()["cat-season"] == ""
-	})
-	r := w.x.raw("/matches", li)
-	loc := r.header.Get("Location")
-	if r.status != 302 || !strings.HasPrefix(loc, "/matches/g/") || !strings.Contains(loc, "/at/") {
-		t.Fatalf("li's pointer after the purge: %d %s %v", r.status, loc, r.body)
-	}
-	b := w.x.search(loc, li)
-	if len(resources(b)) != 0 {
-		t.Errorf("li sees %v after the purge, want none", resources(b))
-	}
-	if ns := v75Namespaces(t, b); ns["cat-season"] != "" || ns["matches"] != w.x.ix.Checkpoint("matches") {
-		t.Errorf("namespaces %v, want matches alone", ns)
-	}
-}
-
-// TestV077AuthDisabledUncovers (FSVC-5; §B.11.9 Where: "It covers, only
-// while authentication is on (§1), a namespace that trusts a catalog";
-// §A.4 follows coverage): against a core running with authentication
-// disabled, matches, which trusts cat-season, isn't covered: a partial
-// reader gets no g: marker, and, matches naming a catalog, no marker at
-// all (403, FSVC-3). Before v0.77 the index covered it whatever the core
-// said.
+// TestV077AuthDisabledUncovers (FSVC-5; §B.11.9 Where: "only while
+// authentication is on (§1)"; §A.4 follows coverage): against a core
+// running with authentication disabled, matches isn't covered: a partial
+// reader gets no g: marker, but a scope marker, and so another gs.
 func TestV077AuthDisabledUncovers(t *testing.T) {
 	t.Parallel()
 	// The core's root says whether authentication is disabled (§1, §7);
@@ -303,100 +233,13 @@ func TestV077AuthDisabledUncovers(t *testing.T) {
 	_, gs, _ := w.pointer("/matches", li)
 	off.Store(true)
 	time.Sleep(5 * time.Millisecond) // the index's CheckerTTL
-	if r := w.x.raw("/matches", li); r.status != 403 {
-		t.Errorf("li with authentication disabled: %d %s %v", r.status, r.header.Get("Location"), r.body)
+	if _, off, _ := w.pointer("/matches", li); off == gs {
+		t.Errorf("li with authentication disabled: gs %s, the covered one", off)
 	}
 	off.Store(false)
 	time.Sleep(5 * time.Millisecond)
 	if _, again, _ := w.pointer("/matches", li); again != gs {
 		t.Errorf("li once authentication is on again: gs %s, want %s", again, gs)
-	}
-}
-
-// TestV077NoMarkerShapes (FSVC-3; §A.4: "where it doesn't [cover] but
-// {ns} is neither sealed nor end-to-end and is a catalog (§B.6) or its
-// catalogs, or a local base's, names one, a partial reader has none";
-// scenarios 101, 113, 114, 119, 122): a partial reader gets 403, never the
-// hits its rules allow, and /_refs shows nothing of the namespace, in
-// matches once cat-season no longer trusts it, in the matches-r7 branch,
-// which no filtered read covers (v0.78), and in cat-season, followed,
-// once nothing trusts it. Before v0.77 each was read by rules alone.
-func TestV077NoMarkerShapes(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	refs := "/_refs?to=" + url.QueryEscape("/r/target/x")
-	t.Run("matches", func(t *testing.T) {
-		t.Parallel()
-		w := newV75X(t, false)
-		must(w.admin.PatchConfig(ctx, "cat-season", must(w.admin.NSHead(ctx, "cat-season")).Config,
-			[]any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": []any{}}}))
-		w.x.ix.ExpireGrantChecks()
-		fan := w.reader("user:fan", []any{"fans"})
-		if r := w.x.raw("/matches?q=derby", fan); r.status != 403 {
-			t.Errorf("/matches: %d %v", r.status, r.body)
-		}
-		if r := w.x.follow(refs, fan); r.status == 200 && len(resources(r.body)) > 0 {
-			t.Errorf("/_refs: %d %v", r.status, r.body)
-		}
-		if r := p37Do(t, w.x, "POST", "/edge-grants", fan, "", nil, ""); r.status != 403 {
-			t.Errorf("exchange: %d %v", r.status, r.body)
-		}
-	})
-	t.Run("matches-r7", func(t *testing.T) {
-		t.Parallel()
-		// No branch is covered (v0.78), so a partial reader of one whose
-		// base names a catalog never has a marker.
-		w := cover76Branch(t)
-		fan := w.reader("user:fan", []any{"fans"}, "matches-r7")
-		if r := w.x.raw("/matches-r7", fan); r.status != 403 {
-			t.Fatalf("/matches-r7: %d %v", r.status, r.body)
-		}
-		w.patchKeys(func(keys []any) []any { keys[1].(map[string]any)["maxTtl"] = "PT14M"; return keys })
-		if r := w.x.raw("/matches-r7", fan); r.status != 403 {
-			t.Errorf("/matches-r7 once its keys change: %d %v", r.status, r.body)
-		}
-	})
-	t.Run("cat-season", func(t *testing.T) {
-		t.Parallel()
-		w := newV75X(t, false)
-		x := w.start(false, "cat-season", "matches")
-		must(w.admin.PatchConfig(ctx, "cat-season", must(w.admin.NSHead(ctx, "cat-season")).Config,
-			[]any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": []any{}}}))
-		x.caughtUp("cat-season")
-		x.ix.ExpireGrantChecks()
-		fan := w.catReader("user:fan", "fans")
-		if r := x.raw("/cat-season", fan); r.status != 403 {
-			t.Errorf("/cat-season once nothing trusts it: %d %v", r.status, r.body)
-		}
-	})
-}
-
-// TestV077NoMarkerCookie (FSVC-3, cookies): a scope cookie for docs,
-// issued while docs named no catalog, is 403 once docs names one in its
-// catalogs (one that doesn't trust it back, so docs stays uncovered),
-// at /docs/g/{gs} and under /_refs. Before v0.77 it read on by rules
-// alone.
-func TestV077NoMarkerCookie(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	d := newV77Docs(t)
-	op := d.s.Client(t, client.WithBearer(d.s.OperatorGrant(t, "cat")))
-	must(op.CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{d.admin.Entry("*")}, "catalog": map[string]any{"trust": []any{}}}))
-	prefixes, cookies := d.exchange(d.reader(d.k1))
-	refs := prefixes["_refs"] + "?to=" + url.QueryEscape("/r/docs/schema")
-	for _, p := range []string{prefixes["docs"], refs} {
-		if got, _ := p37Follow(t, d.x, p, cookies, ""); got.status != 200 {
-			t.Fatalf("%s under the cookie: %d %v", p, got.status, got.body)
-		}
-	}
-	d.patch(map[string]any{"op": "add", "path": "/catalogs", "value": map[string]any{"cat": map[string]any{"place": []any{}}}})
-	for _, p := range []string{prefixes["docs"], refs} {
-		if got, _ := p37Follow(t, d.x, p, cookies, ""); got.status != 403 {
-			t.Errorf("%s once docs names cat: %d %v", p, got.status, got.body)
-		}
-	}
-	if r := d.x.raw("/docs", d.reader(d.k1)); r.status != 403 {
-		t.Errorf("the grant once docs names cat: %d %v", r.status, r.body)
 	}
 }
 
@@ -485,49 +328,6 @@ func TestV077PurgeBeforeServe(t *testing.T) {
 	}
 	if r := w.x.raw(old, whole); r.status != 302 {
 		t.Errorf("GET %s again: %d %v, want a redirect: nothing kept there", old, r.status, r.body)
-	}
-}
-
-// TestV077RefsPurgeBeforeServe (FSVC-9 at /_refs; scenario 117): li's
-// /_refs answer, read before matches.derby's placement in cat-season is
-// purged, is computed again with her views after the purge, never served
-// as read: it shows shared alone. Before v0.77 it was retried with the
-// views read before the purge, and served on the last try.
-func TestV077RefsPurgeBeforeServe(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	w := newV75X(t, false)
-	li := w.reader("user:li", []any{"fans"})
-	refs := "/_refs?to=" + url.QueryEscape("/r/target/x")
-	if got := refsAllHits(w.x.follow(refs, li).body); got != "matches/derby matches/shared" {
-		t.Fatalf("before the purge: %s", got)
-	}
-	// The at URL of another query, whose answer isn't kept: computed and
-	// served at once, were it not for the purge.
-	p := w.x.raw(refs, li)
-	loc := p.header.Get("Location")
-	if p.status != 302 {
-		t.Fatalf("pointer: %d %v", p.status, p.body)
-	}
-	at := strings.SplitN(loc, "?", 2)[0] + "?limit=7&to=" + url.QueryEscape("/r/target/x")
-	var once atomic.Bool
-	w.x.ix.OnRefsRead(func() {
-		if once.CompareAndSwap(false, true) {
-			must(w.admin.Purge(ctx, "cat-season", "matches.derby", must(w.admin.Head(ctx, "cat-season", "matches.derby")).ID, false))
-			waitFor(t, "the purge in cat-season to be applied", func() bool {
-				return w.x.ix.Members()["cat-season"] == w.head("cat-season")
-			})
-		}
-	})
-	r := w.x.raw(at, li)
-	if !once.Load() {
-		t.Fatalf("the answer was never computed: %d %v", r.status, r.body)
-	}
-	if r.status == 200 && refsAllHits(r.body) != "matches/shared" {
-		t.Fatalf("GET %s: served the answer read before the purge: %v", at, r.body)
-	}
-	if r = w.x.follow(at, li); r.status != 200 || refsAllHits(r.body) != "matches/shared" {
-		t.Errorf("after the purge: %d %v", r.status, r.body)
 	}
 }
 
@@ -672,60 +472,6 @@ func TestV077BeforeAnswerRaisedToSealed(t *testing.T) {
 		t.Fatalf("never computed: %s %s", f.path, f.body)
 	}
 	v77AllSealed(t, "GET "+f.path, f.body)
-}
-
-// TestV077RootFailureUncovered (FSVC-5 review; §B.11.9 Where; §A.4): docs
-// names no catalog and is none, so §B.11.9 can never cover it, and its
-// partial readers read it by their rules (scope marker) whatever the
-// core's root says. While GET / fails, they are answered at /docs and at
-// /_refs as before. Before, coverage read the root first, and they got 502.
-func TestV077RootFailureUncovered(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	var down atomic.Bool
-	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond, Wrap: func(h http.Handler) http.Handler {
-		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/" && down.Load() {
-				rw.Header().Set("Content-Type", "application/json")
-				rw.WriteHeader(503)
-				rw.Write([]byte(`{"code":"unavailable","message":"down"}`))
-				return
-			}
-			h.ServeHTTP(rw, r)
-		})
-	}})
-	admin, k1 := clienttest.NewKey("admin"), clienttest.NewKey("k1")
-	e := k1.Entry("read")
-	e["rules"] = []any{v77TypeRule}
-	op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "docs")))
-	must(op.CreateNamespace(ctx, "docs", map[string]any{"read": "grant", "keys": []any{admin.Entry("*"), e}}))
-	w := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:root", []string{"docs"}, []string{"read", "create"})))
-	sch := must(w.CreateDoc(ctx, "docs", "schema", map[string]any{"$schema": d2020, "type": "object",
-		"properties": map[string]any{"title": map[string]any{"type": "string", "x-index": "text"}}}))
-	must(w.CreateDoc(ctx, "docs", "a", map[string]any{"$schema": "/r/docs/schema/rev/" + sch.ID, "title": "word a"}))
-	ev := must(edge.New([]byte("s3cret"), "", ""))
-	x := startSvcWith(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"docs"}, []string{"read"}))),
-		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"docs"}, untyped: true, now: s.Now},
-		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
-		})
-	x.caughtUp("docs")
-	g := k1.Grant(t, s.Now(), "user:li", []string{"docs"}, []string{"read"})
-	if got := resources(x.search("/docs?q=word", g)); len(got) != 1 {
-		t.Fatalf("before: %v", got)
-	}
-	down.Store(true)
-	time.Sleep(5 * time.Millisecond) // CheckerTTL
-	x.ix.ExpireGrantChecks()
-	if r := x.raw("/docs?q=word&limit=3", g); r.status != 302 {
-		t.Errorf("/docs, uncovered, while GET / fails: %d %v", r.status, r.body)
-	}
-	if r := x.raw("/_refs?to="+url.QueryEscape("/r/docs/schema"), g); r.status != 302 {
-		t.Errorf("/_refs while GET / fails: %d %v", r.status, r.body)
-	}
-	if r := p37Do(t, x, "POST", "/edge-grants", g, "", nil, ""); r.status != 200 {
-		t.Errorf("exchange while GET / fails: %d %v", r.status, r.body)
-	}
 }
 
 // TestV077RootFailureCovered (FSVC-5 review; §B.11.9 Where; transient as

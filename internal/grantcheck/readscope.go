@@ -352,3 +352,40 @@ func (f *ReadFilter) allows(resource string, item bool) bool {
 	}
 	return false
 }
+
+// KeyPrefix prefixes the subject binding a filtered-read gs to its
+// grant's key (KeySubject).
+const KeyPrefix = "key:"
+
+// ScopePrefix prefixes a filtered-read gs's scope subject, scope:{digest}.
+const ScopePrefix = "scope:"
+
+// KeySubject is the subject that binds a filtered-read gs to the key its
+// grant came from, by kid and pub, the pub member string as the key's
+// entry has it: key:{text(trunc160(sha256(canonical([kid, pub]))))}.
+// Without it readers through two keys with the same scope rules would
+// share a gs, and so one stored row, whose kid and pub, those of its last
+// exchange, would judge both keys' cookies.
+func KeySubject(kid, pub string) string {
+	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo([]any{kid, pub})))
+	return KeyPrefix + ids.FromBytes(sum[:ids.Size]).String()
+}
+
+// ScopeKeyDigest is the digest of §A.4's scope marker
+// reads:{ns}:scope:{digest}, which covers the rules that limit a reader's
+// reads, d (ReadsScope), and its key's key: string (KeySubject): the
+// digest of canonical([d, key:…]). A filtered-read gs carries the same as
+// its scope:{digest} subject (FilteredSubjects).
+func ScopeKeyDigest(d, kid, pub string) string {
+	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo([]any{d, KeySubject(kid, pub)})))
+	return ids.FromBytes(sum[:ids.Size]).String()
+}
+
+// FilteredSubjects are a filtered-read gs's subjects, sorted:
+// scope:{ScopeKeyDigest(d, kid, pub)} and KeySubject(kid, pub). Its gs is
+// SubjectSetID of the result.
+func FilteredSubjects(d, kid, pub string) []string {
+	out := []string{ScopePrefix + ScopeKeyDigest(d, kid, pub), KeySubject(kid, pub)}
+	slices.Sort(out)
+	return out
+}

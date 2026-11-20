@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"slices"
 
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -13,60 +12,21 @@ import (
 )
 
 // grantView is the view of a partial reader's grant at cp (§B.11.9 gs):
-// its subjects are gsSubjects, and its gs their
-// grantcheck.SubjectSetID, never "all". Its scope digest and filter are
-// over the rules a read is judged by, roles whose rules refer to /now
-// left out, as they don't count for read (§C.2 item 5, readScopeInput,
-// readFilterOf); a grant that carries roles and keeps none doesn't read
-// (403), nor does one whose blocks or key scope refer to /now, which the
-// read check refuses before (readerCheckURL).
+// its subjects are grantcheck.FilteredSubjects, scope:{digest} and
+// key:{…}, and its gs their grantcheck.SubjectSetID. Its scope digest and
+// filter are over the rules a read is judged by, roles whose rules refer
+// to /now left out, as they don't count for read (§C.2 item 5,
+// readScopeInput, readFilterOf); a grant that carries roles and keeps
+// none doesn't read (403), nor does one whose blocks or key scope refer
+// to /now, which the read check refuses before (readerCheckURL).
 func (t *tx) grantView(fs *fscope, cp *fcp, a *actor) (*fview, *Error) {
 	in := readScopeInput(a.verified)
 	digest, ok := grantcheck.ScopeDigest(in)
 	if !ok || a.verified.HasRoles() && len(in.Roles) == 0 {
 		return nil, forbidden("the grant's rules don't allow reading " + fs.n.name + " (§C.2 item 5, §B.11.9 Partial reader)")
 	}
-	cats := make([]*catvis.Catalog, len(cp.cats))
-	for i := range cp.cats {
-		cats[i] = t.catalogAt(&cp.cats[i], cp)
-	}
-	kid, pub := a.verified.Key.Kid, keyPub(*a.verified.Key)
-	subjects := gsSubjects(cats, a.principal, catvis.ScopeKeyDigest(digest, kid, pub), catvis.KeySubject(kid, pub))
+	subjects := grantcheck.FilteredSubjects(digest, a.verified.Key.Kid, keyPub(*a.verified.Key))
 	return t.newFview(fs, cp, grantcheck.SubjectSetID(subjects), subjects, readFilterOf(a.verified), a), nil
-}
-
-// gsSubjects are §B.11.9's subjects of a gs: every group: entry of the
-// caller's (deduped), its user: subject where §B.11.5 would add it for one
-// of cats (a direct entry for it, or a sub-scoped catalog key:
-// catvis.Profile's Users and SubScoped), scope:{scopeKeyDigest}, §A.4's
-// marker digest, and keySubject, sorted. No gs leaves a group out, so it
-// never holds "partial" (§B.11.5, v0.78). catvis.FilteredSubjects is
-// given every group as deciding, which yields the same whether it reads
-// its deciding argument or not.
-func gsSubjects(cats []*catvis.Catalog, pr grant.Principal, scopeKeyDigest, keySubject string) []string {
-	var all []string
-	for _, g := range pr.Groups {
-		if s := grantcheck.GroupPrefix + g; !slices.Contains(all, s) {
-			all = append(all, s)
-		}
-	}
-	var users []string
-	if u := catvis.UserSubject(pr.ID); u != "" {
-		for _, c := range cats {
-			if p := c.Profile(); p.Users[u] || p.SubScoped {
-				users = append(users, u)
-				break
-			}
-		}
-	}
-	subjects := catvis.FilteredSubjects([][]string{append(slices.Clone(all), users...)}, pr.Groups, scopeKeyDigest)
-	for _, s := range append(users, keySubject) {
-		if !slices.Contains(subjects, s) {
-			subjects = append(subjects, s)
-		}
-	}
-	slices.Sort(subjects)
-	return subjects
 }
 
 // readScopeInput is grantcheck.ScopeInputOf(v) without the roles whose
@@ -111,7 +71,7 @@ func gsRecordOf(fv *fview, exp int64) *gsRecord {
 		roles = append(roles, r)
 	}
 	slices.Sort(roles)
-	return &gsRecord{gs: fv.gs, ns: fv.fs.n.name, subjects: fv.subjects, partial: slices.Contains(fv.subjects, catvis.Partial),
+	return &gsRecord{gs: fv.gs, ns: fv.fs.n.name, subjects: fv.subjects,
 		kid: v.Key.Kid, pub: keyPub(*v.Key), roles: roles, blockRules: v.BlockRules, readScope: v.Key.ReadScopeResource, principal: in.Principal,
 		digest: digest, filter: fv.filter.Encode(), exp: exp}
 }
@@ -135,11 +95,8 @@ func gsRecordOf(fv *fview, exp int64) *gsRecord {
 //     v0.82), or did under any document of {ns} between the exchange's
 //     and cp's, whatever a later one undoes (gsHeldSince, v0.86), the
 //     entry and the exchange's document being those of the cookie's own
-//     exp (filtered_gs_exps), so that another exchange revives none; 403 where it holds
-//     "partial", a set stored before v0.78 that leaves groups out, which
-//     no gs does now (§B.11.5, §B.11.9 gs), whatever the catalogs decide;
-//     otherwise item 1 from the stored subjects and item 2 from the
-//     stored filter;
+//     exp (filtered_gs_exps), so that another exchange revives none;
+//     otherwise visibility from the stored filter;
 //   - a cookie for /ns/{ns}, which covers these URLs too, is judged as a
 //     cookie for urlGS would be;
 //   - no credentials, or an expired cookie, are 401.
@@ -194,9 +151,6 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 	if !ok || !t.gsDigestHolds(n, cp, rec) || !t.gsHeldSince(n, cp, rec) {
 		return nil, forbidden("the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)")
 	}
-	if rec.partial || slices.Contains(rec.subjects, catvis.Partial) {
-		return nil, forbidden("this subject set was stored leaving out some of the caller's groups, which no gs does now: exchange the grant again (§B.11.5, §B.11.9 gs)")
-	}
 	filter, err := grantcheck.DecodeReadFilter(rec.filter)
 	if err != nil {
 		return nil, apiErr(401, "unauthenticated", "message", "unknown subject set: exchange the grant again (§B.11.9)")
@@ -221,30 +175,26 @@ func keyPub(k grant.Key) string {
 // (§B.11.9 gs, "no longer accepted"; §C.4, a shared kid "accepted only
 // while the base has it with the same pub"). An empty stored pub, from a
 // row recorded before pubs were kept, never holds, nor does a row whose
-// subjects don't bind its kid and pub (catvis.KeySubject), so that no row is
+// subjects don't bind its kid and pub (grantcheck.KeySubject), so that no row is
 // shared by readers through different keys.
 //
 // Nor does it hold where the key's entry or a role's definition differs
 // in any member from the one the exchange recorded (rec.entry,
 // gsEntryDigest), whether or not the scope digest reads that member: a
-// changed sub, groups, attrs, maxTtl, requireAt or can of the key, or a
+// changed sub, groups, attrs, maxTtl or can of the key, or a
 // role's can or rules (§B.11.9 gs, v0.82: "or the key its key: string
 // names, or a key or role they came from, is gone or changes in any
 // member, until the reader exchanges again"). An empty stored entry,
 // from a row recorded before it was kept, never holds.
 func (t *tx) gsDigestHolds(n *nsRow, cp *fcp, rec *gsRecord) bool {
-	seq, ok := cp.seqs[n.name]
-	if !ok {
-		return false
-	}
-	return t.gsHoldsUnder(n, t.fconfigAt(seq), rec)
+	return t.gsHoldsUnder(n, t.fconfigAt(cp.seq), rec)
 }
 
 // gsHoldsUnder is gsDigestHolds for n's document cfg.
 func (t *tx) gsHoldsUnder(n *nsRow, cfg *Config, rec *gsRecord) bool {
 	key, ok := findKey(t.effectiveKeys(n, cfg), rec.kid)
 	if !ok || !key.Lists("read") || rec.pub == "" || keyPub(key) != rec.pub ||
-		!slices.Contains(rec.subjects, catvis.KeySubject(rec.kid, rec.pub)) {
+		!slices.Contains(rec.subjects, grantcheck.KeySubject(rec.kid, rec.pub)) {
 		return false
 	}
 	if entry := t.gsEntryDigest(n, cfg, rec.kid, rec.roles); rec.entry == "" || entry != rec.entry {
@@ -286,11 +236,10 @@ const gsWalk = 64
 // A read at the exchange's own document, the usual one, costs the lookup
 // of the checkpoint's ns_config seq and no more.
 func (t *tx) gsHeldSince(n *nsRow, cp *fcp, rec *gsRecord) bool {
-	seq, ok := cp.seqs[n.name]
-	if !ok || rec.conf == 0 {
+	if rec.conf == 0 {
 		return false
 	}
-	c := t.fconfigSeqAt(seq)
+	c := t.fconfigSeqAt(cp.seq)
 	if c <= rec.conf {
 		return true
 	}
@@ -420,11 +369,9 @@ func entryDigest(key map[string]any, roles map[string]any) string {
 // FilteredRedirect is a partial reader's request at an unfiltered URL,
 // answered 302 to its filtered form (§B.11.9 URLs): /ns/{NS}/g/{GS}/at/{At}/…
 // for ranges, or /ns/{NS}/g/{GS}/… with At "" for long-poll and events,
-// which the caller clears. CP is the checkpoint At names: the caller
-// records it (Engine.recordFilteredAt) before answering.
+// which the caller clears.
 type FilteredRedirect struct {
 	NS, GS, At string
-	CP         *fcp
 }
 
 func (r *FilteredRedirect) Error() string {
@@ -441,5 +388,5 @@ func (t *tx) partialRedirect(n *nsRow, fs *fscope, a *actor) error {
 	if err != nil {
 		return err
 	}
-	return &FilteredRedirect{NS: n.name, GS: fv.gs, At: cp.at, CP: cp}
+	return &FilteredRedirect{NS: n.name, GS: fv.gs, At: cp.at}
 }

@@ -80,7 +80,7 @@ func v76fRedirect(t *testing.T, w *v75World, ns, gs string, cred Credentials) (*
 // URL of ns (§B.11.9 URLs), recorded as the server records it.
 func v76fUnfiltered(ctx context.Context, e *Engine, ns string, cred Credentials) (*actor, error) {
 	var a *actor
-	err := e.filteredRead(ctx, func(t *tx) error {
+	err := e.read(ctx, func(t *tx) error {
 		var err error
 		a, err = t.nsReaderOrRedirect(t.nsByName(ns), cred)
 		return err

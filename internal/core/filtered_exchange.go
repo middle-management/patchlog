@@ -1,6 +1,10 @@
 package core
 
-import "time"
+import (
+	"time"
+
+	"github.com/middle-management/patchlog/internal/grant"
+)
 
 // maxEdgeTTL is the longest an edge grant lives (§C.5.2), edge.MaxGrantTTL,
 // which the core can't import (internal/edge's tests import the core).
@@ -67,7 +71,64 @@ func (t *tx) filteredEdgeGrant(n *nsRow, fs *fscope, a *actor, exp time.Time) (*
 	// this read snapshot, so a change that commits before the record is
 	// written is one after the exchange.
 	rec := gsRecordOf(fv, until.Unix())
-	rec.conf = t.fconfigSeqAt(fv.cp.seqs[n.name])
+	rec.conf = t.fconfigSeqAt(fv.cp.seq)
 	rec.entry = t.gsEntryDigest(n, t.config(rec.conf), rec.kid, rec.roles)
 	return &edgeIssue{gs: fv.gs, rec: rec, bucket: a.bucketKey}, nil
+}
+
+// partialReader reports whether a, whose grant allows read in n without
+// reading it unrestricted, is a partial reader there (§7.9 Partial
+// reader): its blocks and key scope fix no /resource (fixesSomeResource);
+// its read rules refer to /resource, those of its blocks or key scope or
+// of a read role that tests no literal name; it has a read role without a
+// rule on /now if it carries roles (readRoles); and its block and
+// key-scope rules that refer neither to /resource nor to /now pass now,
+// within its validationSteps. Any other such grant reads nothing of n
+// but the resources its rules allow, at their own URLs.
+func (t *tx) partialReader(a *actor) bool {
+	if a == nil || a.verified == nil {
+		return false
+	}
+	roles, ok := readRoles(a)
+	if !ok || fixesSomeResource(a) {
+		return false
+	}
+	refers := refersToResource(a.verified.KeyRules) || refersToResource(a.verified.BlockRules)
+	for _, r := range roles {
+		if rs := a.verified.RoleRules(r); refersToResource(rs) && !literalResource(rs) {
+			refers = true
+		}
+	}
+	if !refers {
+		return false
+	}
+	env := t.basicEnvelope("read", "", a)
+	for _, src := range [][]any{a.verified.KeyRules, a.verified.BlockRules} {
+		for _, rv := range src {
+			r, err := compileCached(rv)
+			if err != nil || refersToNow(r) {
+				return false
+			}
+			if !r.Refs()["resource"] && !t.readRule(r, env) {
+				return false
+			}
+		}
+	}
+	return !t.readSpent()
+}
+
+// literalResource reports whether a rule of rs, at top level or nested
+// only in alls, tests /resource against literal names.
+func literalResource(rs []any) bool {
+	for _, rv := range rs {
+		if m, ok := rv.(map[string]any); ok && len(m) == 1 {
+			if all, ok := m["all"].([]any); ok && literalResource(all) {
+				return true
+			}
+		}
+		if _, ok := grant.ResourceLiterals(rv); ok {
+			return true
+		}
+	}
+	return false
 }

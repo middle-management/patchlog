@@ -4,8 +4,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/middle-management/patchlog/internal/ids"
 )
 
 // V82-02 (v0.82): access at the origin. requireAt's refusal names nothing
@@ -18,84 +16,6 @@ var (
 	v82accessNow   = map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}
 	v82accessWhole = map[string]any{"op": "test", "path": "", "schema": map[string]any{"required": []any{"action"}}}
 )
-
-// Grant scope 74 (§C.4 requireAt): "At the origin, at is in no chain of a
-// namespace that doesn't exist, so the grant fails the scope (403),
-// answered as any other scope failure. ... No key-scope 403 names the
-// namespace requireAt gives." A requireAt naming nope, which doesn't
-// exist, an at that isn't in an existing catalog's chain and one that
-// wasn't its head within maxLag are each 403 at the namespace's URLs, at
-// a write and at the exchange, and 404 at a resource URL, as is an at
-// that names another namespace than requireAt gives, with one body for
-// them all that names neither nope nor the catalog. Before v0.82
-// the three bodies differed: "unknown namespace \"nope\"", "at is not in
-// the chain of cat-season", "at was not the head of cat-season within
-// maxLag".
-func TestV082AccessRequireAtNamesNothing(t *testing.T) {
-	t.Parallel()
-	nope := newKey("nope-01")
-	w := newV75s(t, v75sOpts{matches: func(doc map[string]any) {
-		doc["keys"] = append(doc["keys"].([]any), map[string]any{"kid": "nope-01", "alg": "ed25519", "pub": nope.pub,
-			"can": []any{"read", "append"}, "requireAt": "nope", "maxTtl": "PT15M"})
-		doc["keys"].([]any)[1].(map[string]any)["can"] = []any{"read", "append"}
-	}})
-	w.seed([]string{"derby"}, nil, []string{"derby"})
-	old := w.nsHead("cat-season", w.admin)
-	w.put("cat-season", "later", map[string]any{"parents": v75sParents("root")})
-	w.clock.Advance(5 * time.Minute)
-	exp := w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)
-	stray := ids.Of([]byte("in no chain")).String()
-	grants := map[string]string{
-		"a namespace that doesn't exist": w.grant(nope, "user:li", []string{"matches"}, []string{"read", "append"},
-			map[string]any{"at": map[string]any{"ns": "nope", "id": stray}, "exp": exp}),
-		"an at not in the chain": w.catGrant("user:li", []any{"editors"}, map[string]any{"can": []any{"read", "append"},
-			"at": map[string]any{"ns": "cat-season", "id": stray}, "exp": exp}),
-		"an at beyond maxLag": w.catGrant("user:li", []any{"editors"}, map[string]any{"can": []any{"read", "append"},
-			"at": map[string]any{"ns": "cat-season", "id": old}, "exp": exp, "nbf": w.clock.Now().Format(time.RFC3339)}),
-		// An at that names another namespace than requireAt gives, each
-		// with an ns_id really in the chain it names: a wrong name, and a
-		// guess at a target that doesn't exist.
-		"an at in another namespace": w.catGrant("user:li", []any{"editors"}, map[string]any{"can": []any{"read", "append"},
-			"at": map[string]any{"ns": "matches", "id": w.nsHead("matches", w.admin)}, "exp": exp}),
-		"a guessed name against a namespace that doesn't exist": w.grant(nope, "user:li", []string{"matches"}, []string{"read", "append"},
-			map[string]any{"at": map[string]any{"ns": "cat-season", "id": w.nsHead("cat-season", w.admin)}, "exp": exp}),
-	}
-	// The grant is otherwise good: at the catalog's head it reads.
-	expect(t, w.get("/r/matches/derby", w.catGrant("user:li", []any{"editors"})), 302)
-	head := w.nsHead("matches", w.admin)
-	requests := map[string]struct {
-		q    req
-		code int
-	}{
-		"the log":       {req{method: "GET", path: "/ns/matches/log"}, 403},
-		"/heads":        {req{method: "GET", path: "/ns/matches/rev/" + head + "/heads"}, 403},
-		"the principal": {req{method: "GET", path: "/ns/matches/principal"}, 403},
-		"a resource":    {req{method: "GET", path: "/r/matches/derby"}, 404},
-		"a write":       {req{method: "PATCH", path: "/r/matches/derby", ifMatch: head, body: ops(op("add", "/x", 1.0))}, 403},
-		"the exchange":  {req{method: "POST", path: "/edge-grants"}, 403},
-	}
-	for rn, rq := range requests {
-		bodies := map[string]string{}
-		for gn, g := range grants {
-			q := rq.q
-			q.bearer = g
-			r := w.do(q)
-			if r.Code != rq.code {
-				t.Errorf("%s, %s: %d %s, want %d", rn, gn, r.Code, r.Body, rq.code)
-			}
-			body := r.String()
-			for _, name := range []string{"nope", "cat-season", "maxLag", "chain", "another"} {
-				if strings.Contains(body, name) {
-					t.Errorf("%s, %s: the body says %q: %s", rn, gn, name, body)
-				}
-			}
-			bodies[body] = gn
-		}
-		if len(bodies) != 1 {
-			t.Errorf("%s: the refusals differ: %v", rn, bodies)
-		}
-	}
-}
 
 // Grant scope 71 (§2.1 Refers to, §C.2 Unrestricted read, item 5): "a
 // rule on the whole envelope refers to /now, so it fails every read and
@@ -235,7 +155,7 @@ func TestV082AccessNowRoleReadsNothing(t *testing.T) {
 	// Beside a /resource role: read per resource, never unrestricted.
 	both := with("clock", "prefixed")
 	expect(t, e.get("/r/p/pub-a", both), 302)
-	expect(t, e.get("/ns/p/log", both), 403)
+	expect(t, e.get("/ns/p/log", both), 302) // a partial reader (§7.9)
 	if c := keys(both); c != 403 {
 		t.Errorf("/keys with a /now role and a /resource role: %d, want 403 (no K_e)", c)
 	}

@@ -111,24 +111,6 @@ func TestV077XconfScenario113(t *testing.T) {
 	}
 }
 
-// Tree-derived access 122 (origin half): matches removes its only
-// requireAt "cat-season" key -> a partial reader of cat-season -> filtered
-// /heads -> 403.
-func TestV077XconfScenario122(t *testing.T) {
-	t.Parallel()
-	w := newV75World(t, v75Opts{})
-	w.seed()
-	cr := w.catReader("user:li", "editors")
-	red, st := v76fRedirect(t, w, "cat-season", "", cr)
-	if red == nil {
-		t.Fatalf("before: %d", st)
-	}
-	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/1"})
-	if st := v75Status(w.e.FilteredCurrent(context.Background(), "cat-season", red.GS, "/heads", cr)); st != 403 {
-		t.Errorf("after the key went: %d, want 403", st)
-	}
-}
-
 // Grant scope 63 and 64: private namespace naming no catalog. A grant
 // fixed to derby -> namespace log or events -> 403, never 404; a grant
 // whose block rule is not /resource = "secret" -> /r/priv/secret 404,
@@ -165,24 +147,9 @@ func TestV077XconfGrantScope63And64(t *testing.T) {
 	if _, err := w.e.ResourceHead(ctx, "priv", "secret", notSecret); v75Status(err) != 404 {
 		t.Errorf("64: /r/priv/secret: %v, want 404", err)
 	}
-	if _, err := w.e.NamespaceEvents(ctx, "priv", "", 0, notSecret); v75Status(err) != 403 {
-		t.Errorf("64: events: %v, want 403", err)
-	}
-}
-
-// §B.11.9 Deleted resources (v0.77): "a tombstoned one's $access decides
-// subjects here (§B.11.5) until it is purged": a group only a tombstoned
-// node's $access names is a deciding subject of filtered reads.
-func TestV077XconfTombstonedNodeDecides(t *testing.T) {
-	t.Parallel()
-	w := newV75World(t, v75Opts{})
-	w.seed()
-	w.put("cat-season", "gone", map[string]any{"parents": v75Parents("root"), "$access": map[string]any{"group:x-del": []any{"reader"}}})
-	w.del("cat-season", "gone")
-	with := w.catGrant("user:li", []any{"editors", "x-del"})
-	without := w.catGrant("user:li", []any{"editors"})
-	if v075GS(t, w, with) == v075GS(t, w, without) {
-		t.Errorf("a group only a tombstoned node's $access names doesn't decide")
+	// A partial reader (§7.9): redirected to its filtered events.
+	if _, err := w.e.NamespaceEvents(ctx, "priv", "", 0, notSecret); func() bool { _, ok := err.(*FilteredRedirect); return !ok }() {
+		t.Errorf("64: events: %v, want a redirect", err)
 	}
 }
 

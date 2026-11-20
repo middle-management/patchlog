@@ -62,9 +62,9 @@ func TestV081AccessNowDeadline(t *testing.T) {
 
 // Grant scope 2 (§C.2 item 5, §2.1): roles B (an office-hours rule on
 // /now, no /resource rule) and A (not /resource = "secret"), in hours or
-// out: the namespace log is 403. B never counts for read, and A's
-// /resource rule keeps it from counting where unrestricted read is needed.
-// A alone still reads x.
+// out: B never counts for read, and A's /resource rule keeps it from
+// counting where unrestricted read is needed: the namespace log redirects
+// to the partial reader's filtered form (§7.9). A alone still reads x.
 func TestV081AccessNowOfficeHoursRole(t *testing.T) {
 	t.Parallel()
 	e := newAuthEnv(t)
@@ -85,8 +85,9 @@ func TestV081AccessNowOfficeHoursRole(t *testing.T) {
 	onlyB := e.grant(rk, "user:r", []string{"oh"}, []string{"read"}, map[string]any{"roles": []any{"B"}, "exp": day})
 	for _, at := range []time.Duration{0, 3 * time.Hour} {
 		e.clock.Advance(at)
-		expect(t, e.get("/ns/oh/log", both), 403)
-		expect(t, e.get("/ns/oh/rev/"+e.nsHead("oh", admin)+"/heads", both), 403)
+		// A partial reader through A (§7.9): redirected to its view.
+		expect(t, e.get("/ns/oh/log", both), 302)
+		expect(t, e.get("/ns/oh/rev/"+e.nsHead("oh", admin)+"/heads", both), 302)
 		expect(t, e.get("/r/oh/x", onlyB), 404)
 		expect(t, e.get("/r/oh/x", both), 302)
 	}

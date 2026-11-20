@@ -11,23 +11,22 @@ import (
 
 // Filtered namespace reads (§B.11.9).
 //
-// Where an origin filters a namespace by catalog visibility, a partial
+// Where an origin filters a namespace by the grant's read rules, a partial
 // reader (one whose grant allows read there without unrestricted read,
 // §2.1) is redirected from the unfiltered URLs to filtered ones under
 // /ns/{ns}/g/{gs}: ranges at /ns/{ns}/g/{gs}/at/{at}/heads and …/log,
 // long-poll at /ns/{ns}/g/{gs}/log and events at /ns/{ns}/g/{gs}/events.
-// gs stands for the reader's subject set and grant, at for the combined
-// checkpoint of every namespace visibility reads. The answers keep their
+// gs stands for the reader's subject set and grant, at for the ns_id of
+// {ns} the answer is at. The answers keep their
 // shapes; only the set changes. A range ends at the ns_id its answers
 // name in X-Namespace-Revision, pages may be empty, and X-Log-Next may
 // name an entry the page doesn't hold. Filtered logs carry no branch
 // entries and aren't chain-verifiable: a partial reader learns of
-// branches from Branches, and of changes of visibility, which write no
-// entry in the namespace, from the catalogs' logs or by listing /heads
+// branches from Branches, and of changes of its rules by listing /heads
 // again (§10).
 
 // FilteredAt names a filtered answer (§B.11.9 URLs): the namespace, the
-// gs and at of its URL, and End, the ns_id of NS in at, which answers at
+// gs and at of its URL, and End, the ns_id of NS at at, which answers at
 // an at carry as X-Namespace-Revision. GS and At are "" for an answer
 // that wasn't filtered, as for an unrestricted reader, whose End is the
 // ns_id of the unfiltered URL.

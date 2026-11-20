@@ -440,15 +440,7 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 		if may, err := ix.mayBeCovered(ctx, ns); err != nil || may {
 			return nil, errors.Join(errNotReached, err)
 		}
-	case errors.Is(err, errUncovered):
-		// One that could be covered by its shape but isn't gives a
-		// partial reader no marker (§A.4): never hits by rules alone.
-		if shaped, err := ix.catalogShaped(ctx, ns); err != nil {
-			return nil, err
-		} else if shaped {
-			return nil, errNoMarker
-		}
-	case errors.Is(err, errPurgedNS):
+	case errors.Is(err, errUncovered), errors.Is(err, errPurgedNS):
 	default:
 		return nil, err
 	}
@@ -978,7 +970,6 @@ func chainErr(err error) (transient, ok bool) {
 const (
 	msgChainBehind   = "the chain a requireAt key names cannot be read yet (§C.4)"
 	msgChainUpstream = "cannot read the chain a requireAt key names (§C.4)"
-	msgMemberBehind  = "a namespace visibility reads is not reached yet (§A.4)"
 	// The core's root, which says whether authentication is on (§B.11.9
 	// Where), for now (rootErr).
 	msgRootBehind = "the index cannot read the core's configuration yet (§B.11.9)"
@@ -1014,16 +1005,11 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 // upstreamBehind reports whether err, a failure to read upstream what
 // answering needs, is one for now, answered 503 behind with msg, rather
 // than 502 upstream (writeUpstreamErr, worseUpstream): a requireAt chain
-// unreadable for a transient cause, a namespace visibility reads not
-// followed yet, the core's root or a sealed namespace's keys that can't
+// unreadable for a transient cause, the core's root or a sealed namespace's keys that can't
 // be fetched for now.
 func upstreamBehind(err error) (msg string, behind bool) {
 	if transient, ok := chainErr(err); ok {
 		return msgChainBehind, transient
-	}
-	if errors.Is(err, errMemberBehind) {
-		// A namespace visibility reads not followed yet (members.go).
-		return msgMemberBehind, true
 	}
 	if errors.Is(err, errExchangeBehind) {
 		return "the index has not reached a change to a key or role the grant reads through: exchange it again (§A.4)", true
@@ -1048,9 +1034,7 @@ func upstreamBehind(err error) (msg string, behind bool) {
 // lacks the keys"), and one for now (a 5xx, a 408, a 429, the core
 // unreachable) is 503
 // behind, with Retry-After (scenario 100: "While those keys only can't
-// yet be fetched → 503 behind", §12.1), as is a namespace visibility reads
-// whose follower holds no checkpoint yet (errMemberBehind, members.go),
-// whose name only the log gives (msgMemberBehind). A requireAt chain the
+// yet be fetched → 503 behind", §12.1). A requireAt chain the
 // verifier can't read (chainErr) is 503 behind while the cause is
 // transient, else 502 upstream, each with a fixed message naming no
 // namespace (§C.4). Every read check and view this service answers 502
@@ -1199,12 +1183,6 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	for try := 0; a.cov != nil; try++ {
 		if at == a.cov.cp.ids[ns] {
 			cp, at = a.cov.cp, a.cov.cp.at
-			if g := cp.gens; g != nil {
-				// The view read other namespaces before gen was taken
-				// (serve's cover): kept only if no purge since carried
-				// its tags (fcp.gens).
-				gen, sgen = min(gen, g.kept), min(sgen, g.sealed)
-			}
 			break
 		}
 		if try == 2 {

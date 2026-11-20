@@ -222,7 +222,7 @@ func cookieHdr(c *http.Cookie) map[string]string {
 // grants as cookies, which authorise GET and HEAD under their prefix.
 func TestV046EdgeGrants(t *testing.T) {
 	t.Parallel()
-	f := newAuthFixture(t, nil)
+	f := newAuthFixture(t, nil, noFilteredReads)
 	e := f.tenv
 	a := e.create("sec", "a", map[string]any{"v": 1.0}, f.adminG)
 	e.create("sec", "b", map[string]any{"v": 2.0}, f.adminG)

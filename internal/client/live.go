@@ -62,10 +62,8 @@ func (c *Client) LongPoll(ctx context.Context, ns, since, cursor string) (*LongP
 // Long-poll, §7.7): only visible entries answer 200 or end a wait, so an
 // interval with none ends 204, whose X-Namespace-Revision, the newest
 // entry scanned, becomes Since even when it is hidden; a since naming a
-// hidden entry is accepted. Filtered logs carry no branch entries, and a
-// change of visibility writes no entry: a follower learns of branches
-// from Branches, and of visibility from the catalogs' logs or by listing
-// /heads again (§10).
+// hidden entry is accepted. Filtered logs carry no branch entries: a
+// follower learns of branches from Branches (§10).
 func (c *Client) FilteredLongPoll(ctx context.Context, ns, gs, since, cursor string) (*LongPollResult, error) {
 	if err := checkNS(ns); err != nil {
 		return nil, err

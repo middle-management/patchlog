@@ -78,36 +78,20 @@ func headsPrefix(q url.Values) (string, error) {
 }
 
 // filteredTags are the Cache-Tags of a filtered answer at an at: its
-// unfiltered form's, then ns:{x} for every other namespace in at (§B.11.9
-// URLs), which a purge or prune of any of them purges.
-func filteredTags(info *core.FilteredInfo, tags ...string) []string {
-	if info != nil {
-		for _, x := range info.Others {
-			tags = append(tags, "ns:"+x)
-		}
-	}
-	return tags
-}
+// unfiltered form's (§B.11.9 URLs).
+func filteredTags(_ *core.FilteredInfo, tags ...string) []string { return tags }
 
-// filteredHeadsTags are a filtered /heads answer's tags: filteredTags of
-// the unfiltered /heads' with heads:{x} too for every other namespace in
-// at, so that a resource purge in a deciding catalog, which purges its
-// own /heads (heads:{x}, §8.3), reaches the pages it decided.
+// filteredHeadsTags are a filtered /heads answer's tags: the unfiltered
+// /heads' (§B.11.9 URLs).
 func filteredHeadsTags(info *core.FilteredInfo, ns string) []string {
-	tags := filteredTags(info, "ns:"+ns, "heads:"+ns)
-	if info != nil {
-		for _, x := range info.Others {
-			tags = append(tags, "heads:"+x)
-		}
-	}
-	return tags
+	return filteredTags(info, "ns:"+ns, "heads:"+ns)
 }
 
-// setFilteredAt sets X-Namespace-Revision, {ns}'s ns_id in the answer's at
+// setFilteredAt sets X-Namespace-Revision, {ns}'s ns_id the answer is at
 // (§B.11.9 Log ranges).
 func setFilteredAt(w http.ResponseWriter, info *core.FilteredInfo) {
-	if info != nil && info.NSID != "" {
-		w.Header().Set("X-Namespace-Revision", info.NSID)
+	if info != nil && info.At != "" {
+		w.Header().Set("X-Namespace-Revision", info.At)
 	}
 }
 

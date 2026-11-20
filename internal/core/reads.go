@@ -720,7 +720,7 @@ func (e *Engine) NamespaceLogHead(ctx context.Context, ns string, cred Credentia
 
 func (e *Engine) namespaceHead(ctx context.Context, ns string, cred Credentials, redirect bool) (*NSInfo, error) {
 	var out *NSInfo
-	err := e.filteredRead(ctx, func(t *tx) error {
+	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -822,7 +822,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 	var out *Log
 	var jobs []*sealJob
 	var nsRowID int64
-	err := e.filteredRead(ctx, func(t *tx) error {
+	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		var a *actor
 		var aerr *Error
@@ -846,7 +846,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			if a, err = t.nsReaderOrRedirect(n, cred); err != nil {
 				var fr *FilteredRedirect
 				if errors.As(err, &fr) && (perEntry || live != nil) {
-					fr.At, fr.CP = "", nil
+					fr.At = ""
 				}
 				return err
 			}
@@ -1025,7 +1025,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 // (§B.11.9 URLs), unless the namespace is purged: then 410 directly.
 func (e *Engine) NamespaceHeadsPrefix(ctx context.Context, ns, nsID, after, prefix string, cred Credentials) (*HeadsPage, error) {
 	var out *HeadsPage
-	err := e.filteredRead(ctx, func(t *tx) error {
+	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)

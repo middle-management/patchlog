@@ -25,14 +25,11 @@ import (
 // namespace visibility reads, which they list as namespaces and min may
 // name; covered branches judge their bases at baseAt.
 
-// v75x is the catalog setup of §B.11.3 against a real core: cat-season
-// trusts matches, whose key catalog-01 has requireAt cat-season and a
-// scope rule testing /resource by type, so its grants read matches only
-// in part. root gives group:fans reader; season is under root, tr under
-// root with inherit false (only chiefs); matches.derby and matches.shared
-// are placed in season, matches.secret in tr; matches holds derby,
-// shared, secret and opener (never placed), each referencing /r/target/x.
-// One index follows matches, minting edge grants of its own.
+// v75x is two private namespaces against a real core: cat-season and
+// matches, whose key catalog-01 has a scope rule allowing /resource derby
+// and shared only, so its grants read matches only in part; matches holds
+// derby, shared, secret and opener, each referencing /r/target/x. One
+// index follows matches, minting edge grants of its own.
 type v75x struct {
 	t      *testing.T
 	s      *clienttest.Server
@@ -62,29 +59,25 @@ func newV75XOn(t *testing.T, s *clienttest.Server) *v75x {
 	// cat-season in part (catReader).
 	catReader := w.cat.Entry("read")
 	catReader["kid"], catReader["rules"] = "cat-reader", []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}
-	mk("cat-season", map[string]any{"read": "grant", "keys": []any{w.k.Entry("*"), catReader}, "catalog": map[string]any{"trust": []any{"matches"}}})
+	mk("cat-season", map[string]any{"read": "grant", "keys": []any{w.k.Entry("*"), catReader}})
 	key := w.cat.Entry("read")
-	key["requireAt"], key["maxTtl"] = "cat-season", "PT15M"
-	key["rules"] = []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}
+	key["maxTtl"] = "PT15M"
+	key["rules"] = []any{map[string]any{"op": "test", "path": "/resource", "schema": v75Visible}}
 	mk("matches", map[string]any{"read": "grant", "keys": []any{w.k.Entry("*"), key},
-		"roles":    map[string]any{"reader": map[string]any{"can": []any{"read"}}},
-		"catalogs": map[string]any{"cat-season": map[string]any{"place": []any{}}}})
+		"roles": map[string]any{"reader": map[string]any{"can": []any{"read"}}}})
 	all := []string{"schemas", "cat-season", "matches", "matches-r7"}
 	w.admin = s.Client(t, client.WithBearer(w.k.Grant(t, s.Now(), "user:root", all,
 		[]string{"read", "create", "append", "delete", "restore", "purge", "config", "branch"})))
 	w.schema = "/r/schemas/page/rev/" + must(w.admin.CreateDoc(ctx, "schemas", "page", pageSchema(true))).ID
-	w.put("cat-season", "root", map[string]any{"parents": []any{}, "$access": map[string]any{"group:fans": []any{"reader"}}})
-	w.put("cat-season", "season", map[string]any{"parents": v75Parents("root")})
-	w.put("cat-season", "tr", map[string]any{"parents": v75Parents("root"), "$access": map[string]any{"inherit": false, "group:chiefs": []any{"reader"}}})
-	for _, n := range []string{"derby", "shared"} {
-		w.put("cat-season", "matches."+n, map[string]any{"parents": v75Parents("season")})
-	}
-	w.put("cat-season", "matches.secret", map[string]any{"parents": v75Parents("tr")})
 	for n, kind := range map[string]string{"derby": "cup", "shared": "league", "secret": "cup", "opener": "cup"} {
 		w.put("matches", n, w.page(n, kind))
 	}
 	return w
 }
+
+// v75Visible is the schema catalog-01's rule tests /resource with: the
+// names its grants read in matches.
+var v75Visible = map[string]any{"pattern": "^(derby|shared)$"}
 
 // start starts an index following nss, minting edge grants of its own.
 func (w *v75x) start(branches bool, nss ...string) *svc {
@@ -146,18 +139,15 @@ func (w *v75x) reader(sub string, groups []any, ns ...string) string {
 		ns = []string{"matches"}
 	}
 	return w.cat.Grant(w.t, w.s.Now(), sub, ns, []string{"read"}, map[string]any{"groups": groups, "roles": []any{"reader"},
-		"at": map[string]any{"ns": "cat-season", "id": w.head("cat-season")}, "exp": w.s.Now().Add(10 * time.Minute).Format(time.RFC3339)})
+		"exp": w.s.Now().Add(10 * time.Minute).Format(time.RFC3339)})
 }
 
 // readerVia is reader through key k, with a block rule on /resource that
-// makes it a partial reader of matches as the catalog's key's scope rule
-// does: a grant that still verifies once cat-season is purged, as one of
-// the catalog's key, whose requireAt names it, no longer does (§C.4,
-// v0.85).
+// makes it a partial reader of matches as catalog-01's scope rule does.
 func (w *v75x) readerVia(sub string, groups []any) string {
 	w.t.Helper()
 	return w.k.Grant(w.t, w.s.Now(), sub, []string{"matches"}, []string{"read"}, map[string]any{"groups": groups, "roles": []any{"reader"},
-		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}},
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": v75Visible}},
 		"exp":   w.s.Now().Add(10 * time.Minute).Format(time.RFC3339)})
 }
 
@@ -187,23 +177,21 @@ func v75Namespaces(t *testing.T, body map[string]any) map[string]string {
 	return out
 }
 
-// TestV075IndexCombinedCheckpoint (MUST-11, SVC-4, §A.4 Private
-// namespaces): where §B.11.9 covers matches, a partial reader's answers
-// are at the combined checkpoint of matches and cat-season, which they
-// list as namespaces, and min may name cat-season; when the catalog moves
-// derby out of the fans' reach while matches is unchanged, the query is
-// redirected to a new at whose answer leaves derby out of hits, facets
-// and counts. Before v0.75 the at was matches' ns_id, without namespaces,
-// and derby stayed.
-func TestV075IndexCombinedCheckpoint(t *testing.T) {
+// TestV075IndexCheckpoint (MUST-11, SVC-4, §A.4 Private namespaces):
+// where §B.11.9 covers matches, a partial reader's answers are at the
+// index's checkpoint of matches, which they list as namespaces, its hits,
+// facets and counts filtered by visibility; an unrestricted reader's
+// list no namespaces.
+func TestV075IndexCheckpoint(t *testing.T) {
 	t.Parallel()
 	w := newV75X(t, false)
 	fan := w.reader("user:fan", []any{"fans"})
 	q := "/matches?counts=%2Fkind&schema=" + url.QueryEscape(w.schema)
 	loc, _, at := w.pointer(q, fan)
-	want := map[string]string{"matches": w.x.ix.Checkpoint("matches"), "cat-season": w.head("cat-season")}
-	if at != grantcheck.CombinedAt(want) {
-		t.Fatalf("at %s, want the combined checkpoint of %v", at, want)
+	cp := w.x.ix.Checkpoint("matches")
+	want := map[string]string{"matches": cp}
+	if at != cp {
+		t.Fatalf("at %s, want %s", at, cp)
 	}
 	b := w.x.search(loc, fan)
 	if got := strings.Join(resources(b), ","); got != "derby,shared" {
@@ -216,60 +204,12 @@ func TestV075IndexCombinedCheckpoint(t *testing.T) {
 		t.Errorf("counts %v", c)
 	}
 	r := w.x.raw(loc, fan)
-	if tags := r.header.Get("Cache-Tag"); !strings.Contains(tags, "idx:matches") || !strings.Contains(tags, "idx:cat-season") {
+	if tags := r.header.Get("Cache-Tag"); !strings.Contains(tags, "idx:matches") {
 		t.Errorf("Cache-Tag %q", tags)
-	}
-	// min may name cat-season (a namespace at covers): redirected, never
-	// 400; one naming another namespace is.
-	if r := w.x.raw(q+"&min=cat-season:"+w.head("cat-season"), fan); r.status != 302 {
-		t.Errorf("min=cat-season: %d %v", r.status, r.body)
 	}
 	if r := w.x.raw(q+"&min=schemas:"+w.head("schemas"), fan); r.status != 400 {
 		t.Errorf("min=schemas: %d %v", r.status, r.body)
 	}
-
-	// The catalog moves derby under tr; matches doesn't change.
-	cp := w.x.ix.Checkpoint("matches")
-	w.put("cat-season", "matches.derby", map[string]any{"parents": v75Parents("tr")})
-	if r := w.x.raw(loc, fan); r.status != 200 {
-		t.Errorf("the old at, kept: %d", r.status)
-	}
-	loc2, _, at2 := w.pointer(q, fan)
-	if at2 == at || w.x.ix.Checkpoint("matches") != cp {
-		t.Fatalf("at %s after the catalog moved (was %s); matches %s (was %s)", at2, at, w.x.ix.Checkpoint("matches"), cp)
-	}
-	b = w.x.search(loc2, fan)
-	if got := strings.Join(resources(b), ","); got != "shared" {
-		t.Errorf("after the move fan sees %s, want shared", got)
-	}
-	if ns := v75Namespaces(t, b); ns["cat-season"] != w.head("cat-season") || ns["matches"] != cp {
-		t.Errorf("namespaces %v", ns)
-	}
-	if c := b["counts"].(map[string]any)["/kind"].(map[string]any); c["cup"] != nil || c["league"] != 1.0 {
-		t.Errorf("counts after the move %v", c)
-	}
-	for _, h := range b["hits"].([]any) {
-		if _, ok := h.(map[string]any)["/kind"]; !ok {
-			t.Errorf("hit without its facet: %v", h)
-		}
-	}
-	// An at URL whose at is neither current nor kept: redirected.
-	stale := strings.Replace(loc2, "/at/"+at2, "/at/"+cp, 1)
-	if r := w.x.raw(stale, fan); r.status != 302 || r.header.Get("Location") != loc2 {
-		t.Errorf("stale at: %d %s, want %s", r.status, r.header.Get("Location"), loc2)
-	}
-	// A direct $access entry for user:fan makes its sub decide: a new gs
-	// at the next at, while the grant still reads the kept answer at loc2
-	// under its gs as of that at.
-	w.put("cat-season", "fanclub", map[string]any{"parents": v75Parents("root"), "$access": map[string]any{"user:fan": []any{"reader"}}})
-	loc3, gs3, _ := w.pointer(q, fan)
-	if strings.Contains(loc2, "/g/"+gs3+"/") {
-		t.Fatalf("gs unchanged by a direct entry: %s", loc3)
-	}
-	if r := w.x.raw(loc2, fan); r.status != 200 || strings.Join(resources(r.body), ",") != "shared" {
-		t.Errorf("the kept answer at its own gs: %d %v", r.status, r.body)
-	}
-
 	// An unrestricted reader keeps matches' own ns_id and every hit.
 	all := w.k.Grant(t, w.s.Now(), "user:root", []string{"matches"}, []string{"read"})
 	_, _, uat := w.pointer(q, all)
@@ -284,14 +224,12 @@ func TestV075IndexCombinedCheckpoint(t *testing.T) {
 func TestV075IndexPagesFilled(t *testing.T) {
 	t.Parallel()
 	w := newV75X(t, false)
-	for _, n := range []string{"a1", "a3", "a5"} {
-		w.put("cat-season", "matches."+n, map[string]any{"parents": v75Parents("season")})
-	}
 	for _, n := range []string{"a1", "a2", "a3", "a4", "a5"} {
 		w.put("matches", n, w.page(n, "cup"))
 	}
 	w.x.caughtUp("matches")
-	fan := w.reader("user:fan", []any{"fans"})
+	fan := w.k.Grant(t, w.s.Now(), "user:fan", []string{"matches"}, []string{"read"}, map[string]any{
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": "^(a1|a3|a5|derby|shared)$"}}}})
 	var got []string
 	path := "/matches?limit=2"
 	for range 10 {
@@ -313,11 +251,10 @@ func TestV075IndexPagesFilled(t *testing.T) {
 }
 
 // TestV075IndexSubjectSets (SVC-5, §A.4, §B.11.9 gs): two partial readers
-// with the same key-scope rule, one in fans (whom root's $access gives
-// reader) and one in interns (whom it gives nothing), get different
-// subject sets, the gs inside each marker reads:matches:g:{gs} being the
-// origin's own, at the origin's at; the interns reader sees nothing.
-// Before v0.75 both had reads:matches:scope:{digest} and saw derby.
+// with the same rules through the same key, whatever their groups, share
+// a subject set, the gs inside the marker reads:matches:g:{gs} being the
+// origin's own, at the index's checkpoint of matches; a reader with other
+// rules gets another.
 func TestV075IndexSubjectSets(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -326,36 +263,35 @@ func TestV075IndexSubjectSets(t *testing.T) {
 	intern := w.reader("user:intern", []any{"interns"})
 	_, fgs, fat := w.pointer("/matches", fan)
 	_, igs, _ := w.pointer("/matches", intern)
-	if fgs == igs {
-		t.Fatalf("fans and interns share gs %s", fgs)
+	if fgs != igs {
+		t.Fatalf("fans and interns: gs %s and %s", fgs, igs)
 	}
-	if got := resources(w.x.search("/matches", intern)); len(got) != 0 {
-		t.Errorf("intern sees %v", got)
+	narrow := w.cat.Grant(t, w.s.Now(), "user:fan", []string{"matches"}, []string{"read"}, map[string]any{"roles": []any{"reader"},
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": "^d"}}},
+		"exp":   w.s.Now().Add(10 * time.Minute).Format(time.RFC3339)})
+	if _, ngs, _ := w.pointer("/matches", narrow); ngs == fgs {
+		t.Errorf("other rules share gs %s", ngs)
 	}
-	if got := strings.Join(resources(w.x.search("/matches", fan)), ","); got != "derby,shared" {
-		t.Errorf("fan sees %s", got)
+	if got := resources(w.x.search("/matches", narrow)); strings.Join(got, ",") != "derby" {
+		t.Errorf("narrow sees %v", got)
 	}
-	// The origin's own subject sets for the same grants, which its
-	// exchange gives a partial reader as the prefix /ns/matches/g/{gs}
-	// (§B.11.9 Edge grants): the gs inside the index's marker is the
-	// origin's, and the index's at the combined checkpoint over the
-	// origin's heads (§B.11.9 URLs).
-	for _, c := range []struct{ tok, gs string }{{fan, fgs}, {intern, igs}} {
-		req := must(http.NewRequestWithContext(ctx, "POST", w.s.URL+"/edge-grants", nil))
-		req.Header.Set("Authorization", "Bearer "+c.tok)
-		res := must(noFollow.Do(req))
-		var body struct{ Prefixes []string }
-		err := json.NewDecoder(res.Body).Decode(&body)
-		res.Body.Close()
-		if err != nil || res.StatusCode != 200 || len(body.Prefixes) != 1 || !strings.HasPrefix(body.Prefixes[0], "/ns/matches/g/") {
-			t.Fatalf("the origin's exchange: %d %v %v", res.StatusCode, err, body)
-		}
-		ogs := strings.TrimPrefix(body.Prefixes[0], "/ns/matches/g/")
-		if want := grantcheck.SubjectSetID([]string{"reads:matches:g:" + ogs}); c.gs != want {
-			t.Errorf("index gs %s, want that of reads:matches:g:%s (%s)", c.gs, ogs, want)
-		}
+	// The origin's own subject set for the same grant, which its exchange
+	// gives a partial reader as the prefix /ns/matches/g/{gs} (§B.11.9
+	// Edge grants): the gs inside the index's marker is the origin's.
+	req := must(http.NewRequestWithContext(ctx, "POST", w.s.URL+"/edge-grants", nil))
+	req.Header.Set("Authorization", "Bearer "+fan)
+	res := must(noFollow.Do(req))
+	var body struct{ Prefixes []string }
+	err := json.NewDecoder(res.Body).Decode(&body)
+	res.Body.Close()
+	if err != nil || res.StatusCode != 200 || len(body.Prefixes) != 1 || !strings.HasPrefix(body.Prefixes[0], "/ns/matches/g/") {
+		t.Fatalf("the origin's exchange: %d %v %v", res.StatusCode, err, body)
 	}
-	if want := grantcheck.CombinedAt(map[string]string{"matches": w.head("matches"), "cat-season": w.head("cat-season")}); fat != want {
+	ogs := strings.TrimPrefix(body.Prefixes[0], "/ns/matches/g/")
+	if want := grantcheck.SubjectSetID([]string{"reads:matches:g:" + ogs}); fgs != want {
+		t.Errorf("index gs %s, want that of reads:matches:g:%s (%s)", fgs, ogs, want)
+	}
+	if want := w.x.ix.Checkpoint("matches"); fat != want {
 		t.Errorf("index at %s, want %s", fat, want)
 	}
 }
@@ -398,7 +334,7 @@ func TestV075IndexCookies(t *testing.T) {
 		}
 	}
 	got, _ = p37Follow(t, w.x, refs+"?to=/r/target/x", r.cookies, "")
-	if got.status != 200 || strings.Join(p37Hits(got.body), ",") != "matches/derby,matches/shared" || v75Namespaces(t, got.body)["cat-season"] == "" {
+	if got.status != 200 || strings.Join(p37Hits(got.body), ",") != "matches/derby,matches/shared" || v75Namespaces(t, got.body)["matches"] == "" {
 		t.Fatalf("/_refs under the cookie: %d %v", got.status, got.body)
 	}
 	// A restart reads what the marker stands for from the database.
@@ -425,95 +361,19 @@ func TestV075IndexCookies(t *testing.T) {
 }
 
 // TestV075IndexRefs (SVC-6, §A.4 Across namespaces): /_refs by a partial
-// reader of covered matches is at the combined checkpoint over matches
-// and cat-season, which namespaces lists and min may name, its hits from
-// matches filtered by visibility. Before v0.75 at covered matches alone,
-// min=cat-season:… was 400 and every hit the rules allow was shown.
+// reader of covered matches is at the checkpoint of matches, which
+// namespaces lists, its hits from matches filtered by visibility.
 func TestV075IndexRefs(t *testing.T) {
 	t.Parallel()
 	w := newV75X(t, false)
 	fan := w.reader("user:fan", []any{"fans"})
-	at, _, loc := w.x.refsPointer("?to=/r/target/x", fan)
-	want := map[string]string{"matches": w.x.ix.Checkpoint("matches"), "cat-season": w.head("cat-season")}
-	if at != grantcheck.CombinedAt(want) {
-		t.Errorf("at %s, want the combined checkpoint of %v", at, want)
-	}
+	_, _, loc := w.x.refsPointer("?to=/r/target/x", fan)
+	want := map[string]string{"matches": w.x.ix.Checkpoint("matches")}
 	b := w.x.search(loc, fan)
 	if got := refsAllHits(b); got != "matches/derby matches/shared" {
 		t.Errorf("hits %s", got)
 	}
 	if !maps.Equal(v75Namespaces(t, b), want) {
 		t.Errorf("namespaces %v, want %v", b["namespaces"], want)
-	}
-	r := w.x.raw(loc, fan)
-	if tags := r.header.Get("Cache-Tag"); !strings.Contains(tags, "idx:cat-season") {
-		t.Errorf("Cache-Tag %q", tags)
-	}
-	if r := w.x.raw("/_refs?to=/r/target/x&min=cat-season:"+w.head("cat-season"), fan); r.status != 302 {
-		t.Errorf("min=cat-season: %d %v", r.status, r.body)
-	}
-	// The catalog moves: a new at, derby gone.
-	w.put("cat-season", "matches.derby", map[string]any{"parents": v75Parents("tr")})
-	at2, _, loc2 := w.x.refsPointer("?to=/r/target/x&min=cat-season:"+w.head("cat-season"), fan)
-	if at2 == at {
-		t.Fatal("at unchanged after the catalog moved")
-	}
-	if got := refsAllHits(w.x.search(loc2, fan)); got != "matches/shared" {
-		t.Errorf("hits after the move %s", got)
-	}
-}
-
-// TestV075IndexUncovered: a namespace whose catalog doesn't trust it,
-// though its catalogs names one, gives a partial reader no marker (v0.77,
-// §A.4): 403, never every hit the grant's rules allow; one that names no
-// catalog is read as before v0.75: the scope marker, matches' own ns_id,
-// every hit the grant's rules allow.
-func TestV075IndexUncovered(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	w := newV75X(t, false)
-	must(w.admin.PatchConfig(ctx, "cat-season", must(w.admin.NSHead(ctx, "cat-season")).Config, []any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": []any{}}}))
-	fan := w.reader("user:fan", []any{"fans"})
-	if r := w.x.raw("/matches", fan); r.status != 403 {
-		t.Errorf("uncovered, naming cat-season: %d %v", r.status, r.body)
-	}
-	must(w.admin.PatchConfig(ctx, "matches", must(w.admin.NSHead(ctx, "matches")).Config, []any{map[string]any{"op": "remove", "path": "/catalogs"}}))
-	w.x.caughtUp("matches")
-	w.x.ix.ExpireGrantChecks()
-	_, _, at := w.pointer("/matches", fan)
-	b := w.x.search("/matches", fan)
-	if at != w.x.ix.Checkpoint("matches") || b["namespaces"] != nil || strings.Join(resources(b), ",") != "derby,opener,secret,shared" {
-		t.Errorf("uncovered: at %s, %v", at, b)
-	}
-}
-
-// TestV075IndexCatalog (§A.4, §B.11.9 Catalogs): a catalog §B.11.9 covers,
-// followed as a namespace of its own, answers a partial reader with the
-// nodes the node test shows it, at the combined checkpoint over the
-// catalog and its trusted members: never a placement whose item doesn't
-// exist (final), nor one under tr; folders count only through a key
-// whose rules don't refer to /resource, which catalog-01's do.
-func TestV075IndexCatalog(t *testing.T) {
-	t.Parallel()
-	w := newV75X(t, false)
-	w.put("cat-season", "matches.final", map[string]any{"parents": v75Parents("season")})
-	x := w.start(false, "cat-season", "matches")
-	fan := w.catReader("user:fan", "fans")
-	r := x.raw("/cat-season", fan)
-	loc := r.header.Get("Location")
-	if r.status != 302 || !strings.HasPrefix(loc, "/cat-season/g/") {
-		t.Fatalf("pointer: %d %s %v", r.status, loc, r.body)
-	}
-	b := x.search(loc, fan)
-	if got := strings.Join(resources(b), ","); got != "matches.derby,matches.shared" {
-		t.Errorf("fan sees %s in cat-season", got)
-	}
-	want := map[string]string{"cat-season": x.ix.Checkpoint("cat-season"), "matches": x.ix.Checkpoint("matches")}
-	if ns := v75Namespaces(t, b); !maps.Equal(ns, want) || b["at"] != grantcheck.CombinedAt(want) {
-		t.Errorf("namespaces %v at %v, want %v", ns, b["at"], want)
-	}
-	all := w.k.Grant(t, w.s.Now(), "user:root", []string{"cat-season"}, []string{"read"})
-	if got := resources(x.search("/cat-season", all)); len(got) != 7 {
-		t.Errorf("unrestricted reader sees %v", got)
 	}
 }

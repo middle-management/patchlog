@@ -581,8 +581,8 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 // refsOwnAt reports whether url, a kept answer at gs, is rd's own though
 // rd's gs is not gs now: rd is a grant's (its markers known), and its
 // markers, those in the namespaces §B.11.9 covers that it reads in part
-// as of the checkpoints of them the answer was read at (keptCPsIn, each
-// one the index still holds), make gs (§A.4, §B.11.5: a grant reads at
+// as of the checkpoints of them the answer was read at (keptCP, each one
+// the index still holds), make gs (§A.4, §B.11.5: a grant reads at
 // its own gs as of the URL's at). A namespace whose checkpoint there
 // isn't held, or isn't told apart, is not.
 func (ix *Index) refsOwnAt(ctx context.Context, rd *refsReader, gs, url string) bool {
@@ -601,17 +601,15 @@ func (ix *Index) refsOwnAt(ctx context.Context, rd *refsReader, gs, url string) 
 	}
 	markers := maps.Clone(rd.markers)
 	for ns, a := range rd.covs {
-		cps := ix.keptCPsIn(ns, body.Namespaces)
-		if len(cps) == 0 {
+		cp := ix.keptCP(ns, body.Namespaces[ns])
+		if cp == nil {
 			return false
 		}
-		for i, cp := range cps {
-			b := a.at(ctx, ns, cp)
-			if b == nil || (i > 0 && b.marker != markers[ns]) {
-				return false
-			}
-			markers[ns] = b.marker
+		b := a.at(ctx, ns, cp)
+		if b == nil {
+			return false
 		}
+		markers[ns] = b.marker
 	}
 	ms := make([]string, 0, len(markers))
 	for _, m := range markers {
@@ -795,14 +793,6 @@ func (ix *Index) refsAnswer(ctx context.Context, rd *refsReader, rq *refsQuery, 
 		if err != nil {
 			return st, at, bound, err
 		}
-		// The views read other namespaces before gen was taken
-		// (refsReader, recover): kept only if no purge since carried
-		// their tags (fcp.gens).
-		for _, a := range rd.covs {
-			if a.cov != nil && a.cov.cp.gens != nil {
-				gen = min(gen, a.cov.cp.gens.refs)
-			}
-		}
 		st, o := ix.refs.PutOutcome(target(at), refsScope, gen, bound, st)
 		switch {
 		case o != kept.PurgedSince:
@@ -821,12 +811,6 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 	// read keeps a bound answer from being stored below (PutSince), as
 	// its Retire may not run (a covered namespace that moved, refsMerge).
 	sgen := ix.sealed.Generation()
-	for _, a := range rd.covs {
-		// The views were computed before (fcp.gens).
-		if a.cov != nil && a.cov.cp.gens != nil {
-			sgen = min(sgen, a.cov.cp.gens.sealed)
-		}
-	}
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
 		return derived.Stored{}, "", false, err
@@ -845,8 +829,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		nss = append(nss, ns)
 	}
 	sort.Strings(nss)
-	before := func(ns, a, b string) bool { return ix.chainBefore(ctx, ns, a, b) }
-	if cps, err = refsMerge(cps, rd, before); err != nil {
+	if cps, err = refsMerge(cps, rd); err != nil {
 		return derived.Stored{}, "", false, err
 	}
 	at := combinedAt(cps)
@@ -1070,7 +1053,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		if now, err := ix.refsCheckpoints(ctx, ix.db, rd.nss); err == nil {
 			// A covered namespace's checkpoint moved meanwhile: the next
 			// answer retires these.
-			if merged, err := refsMerge(now, rd, before); err == nil {
+			if merged, err := refsMerge(now, rd); err == nil {
 				if err := ix.sealed.Retire(ctx, ix.db, scope, combinedAt(merged)); err != nil {
 					ix.opt.Logf("index: retiring sealed results of %s: %v", scope, err)
 				}
@@ -1081,86 +1064,22 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 }
 
 // refsMerge is cps, the checkpoints of the namespaces an answer's hits
-// come from, with the combined checkpoint of each namespace §B.11.9 covers
-// that rd reads in part (§A.4 Across namespaces): errMoved if a view was
-// computed at another checkpoint of one of them than cps holds, or two
-// views take a namespace they read at its head at two. A base listed only
-// as a base, at its baseAt, which the branch's own ns_id fixes (fcp.
-// onlyBase), is left to the base's checkpoint where the answer has one
-// (the base itself, or another view's member): a namespace read at its
-// head is listed at it (§A.4 Answers, one ns_id per namespace), and the
-// branch's stands for its base; a base that branches read only as of
-// different ats is listed at the earliest in its chain (§A.4 Answers;
-// before, the first by bytes), as before tells.
-func refsMerge(cps map[string]string, rd *refsReader, before func(ns, a, b string) bool) (map[string]string, error) {
+// come from, checked against the checkpoint of each namespace §B.11.9
+// covers that rd reads in part (§A.4 Across namespaces): errMoved if a
+// view was computed at another checkpoint of one of them than cps holds.
+func refsMerge(cps map[string]string, rd *refsReader) (map[string]string, error) {
 	if len(rd.covs) == 0 {
 		return cps, nil
 	}
 	out := maps.Clone(cps)
-	var bases []fsBase
 	for ns, a := range rd.covs {
 		cp := a.cov.cp
-		if id, ok := cps[ns]; ok && id != cp.ids[ns] {
+		if id, ok := cps[ns]; ok && id != cp.at {
 			return nil, errMoved
 		}
-		for m, id := range cp.ids {
-			if cp.onlyBase[m] {
-				bases = append(bases, fsBase{ns: m, at: id})
-				continue
-			}
-			if got, ok := out[m]; ok && got != id {
-				return nil, errMoved
-			}
-			out[m] = id
-		}
+		out[ns] = cp.at
 	}
-	// In a fixed order, so that ats no comparison tells apart give one
-	// answer.
-	slices.SortFunc(bases, func(a, b fsBase) int { return strings.Compare(a.ns+"\x00"+a.at, b.ns+"\x00"+b.at) })
-	earliest := map[string]string{}
-	for _, b := range bases {
-		if _, ok := out[b.ns]; ok {
-			continue
-		}
-		if cur, ok := earliest[b.ns]; !ok || before(b.ns, b.at, cur) {
-			earliest[b.ns] = b.at
-		}
-	}
-	maps.Copy(out, earliest)
 	return out, nil
-}
-
-// chainBefore reports whether ns_id a comes before b in ns's chain (§A.4
-// Answers: a base "that branches read only as of different ats at the
-// earliest"), as grantcheck tells an at in a chain: ns's log up to b
-// after a is found only where a is in b's chain. What it tells is kept
-// (a chain never changes); a read that fails otherwise than with 404
-// tells nothing, and is logged: the answer lists the first by bytes.
-func (ix *Index) chainBefore(ctx context.Context, ns, a, b string) bool {
-	if a == b {
-		return false
-	}
-	k := ns + "\x00" + a + "\x00" + b
-	ix.fs.mu.Lock()
-	v, ok := ix.fs.order.Get(k)
-	ix.fs.mu.Unlock()
-	if ok {
-		return v
-	}
-	_, _, err := ix.c.NSLogPage(ctx, ns, b, a)
-	switch {
-	case err == nil:
-		v = true
-	case client.IsNotFound(err):
-		v = false
-	default:
-		ix.opt.Logf("index: whether %s comes before %s in %s's chain: %v", a, b, ns, err)
-		return false
-	}
-	ix.fs.mu.Lock()
-	ix.fs.order.Put(k, v, 1)
-	ix.fs.mu.Unlock()
-	return v
 }
 
 // queryer runs queries (a *sql.DB or *sql.Tx).

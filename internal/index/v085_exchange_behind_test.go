@@ -10,7 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // v85Gate holds requests of path, once on, until it is released.
@@ -108,4 +111,16 @@ func TestV085ExchangeBehindKeyChange(t *testing.T) {
 			}
 		})
 	}
+}
+
+// v06Start starts an index on db following matches over hc, not running
+// until the caller runs it.
+func v06Start(t *testing.T, w *v75x, db string, hc *http.Client, noRun bool) *svc {
+	t.Helper()
+	all := []string{"schemas", "cat-season", "matches", "matches-r7"}
+	return startSvcWith(t, w.s.Client(t, client.WithBearer(w.k.Grant(t, w.s.Now(), "svc:indexer", all, []string{"read"}))),
+		svcOpts{db: db, ns: []string{"matches"}, untyped: true, now: w.s.Now, noRun: noRun, hc: hc},
+		func(o *indexOpts) {
+			o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate
+		})
 }

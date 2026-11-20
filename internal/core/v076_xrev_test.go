@@ -4,8 +4,6 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"github.com/middle-management/patchlog/internal/grant"
 )
 
 // Cross-review (conformance lens): scenario tests for the v0.76
@@ -30,67 +28,6 @@ func v076XrevHasEntry(es []map[string]any, kind, res string) bool {
 		}
 	}
 	return false
-}
-
-// Scenario 93: derby, visible to li, is deleted, its placement then moved
-// into TR (embargo here) -> derby's tombstone isn't shown at a later at.
-func TestV076Scenario93(t *testing.T) {
-	t.Parallel()
-	w := newV75World(t, v75Opts{})
-	w.seed()
-	li := w.li()
-	w.del("matches", "derby")
-	red, _ := v76fRedirect(t, w, "matches", "", li)
-	if red == nil {
-		t.Fatal("no redirect")
-	}
-	es, st := v076XrevLog(t, w, "matches", red.GS, red.At, li)
-	if st != 0 || !v076XrevHasEntry(es, "tombstone", "derby") {
-		t.Fatalf("before the move: %d, want derby's tombstone", st)
-	}
-	w.put("cat-season", "matches.derby", map[string]any{"parents": v75Parents("embargo")})
-	red2, _ := v76fRedirect(t, w, "matches", red.GS, li)
-	if red2 == nil || red2.At == red.At {
-		t.Fatalf("no new at: %+v", red2)
-	}
-	es, st = v076XrevLog(t, w, "matches", red2.GS, red2.At, li)
-	if st != 0 || v076XrevHasEntry(es, "tombstone", "derby") || v076XrevHasEntry(es, "head", "derby") {
-		t.Fatalf("after the move: %d %v", st, es)
-	}
-}
-
-// Scenario 94: a placement in cat-season is purged -> its purge entry
-// isn't shown to a partial reader of cat-season.
-func TestV076Scenario94(t *testing.T) {
-	t.Parallel()
-	w := newV75World(t, v75Opts{})
-	w.seed()
-	ctx := context.Background()
-	cr := w.catReader("user:li", "editors")
-	red, st := v76fRedirect(t, w, "cat-season", "", cr)
-	if red == nil {
-		t.Fatalf("cat-season: %d", st)
-	}
-	h, err := w.e.ResourceHead(ctx, "cat-season", "matches.shared", w.admin)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := w.e.Purge(ctx, Request{NS: "cat-season", Cred: w.admin}, "matches.shared", h.Head, false); err != nil {
-		t.Fatal(err)
-	}
-	red2, st := v76fRedirect(t, w, "cat-season", red.GS, cr)
-	if red2 == nil {
-		t.Fatalf("after purge: %d", st)
-	}
-	es, st := v076XrevLog(t, w, "cat-season", red2.GS, red2.At, cr)
-	if st != 0 {
-		t.Fatal(st)
-	}
-	for _, e := range es {
-		if e["resource"] == "matches.shared" {
-			t.Errorf("shown: %v %v", e["kind"], e["resource"])
-		}
-	}
 }
 
 // Scenario 95: a cookie for a gs the origin keeps no row for -> 401.
@@ -168,41 +105,6 @@ func TestV076Scenario103(t *testing.T) {
 	}
 }
 
-// Scenario 104: catalog-01 and catalog-02, both requireAt cat-season,
-// catalog-02's scope admitting only ^pub- -> a document is listed when
-// either key, judged alone, makes it visible. catalog-01's scope admits
-// only ^d here, so pub-a is visible through catalog-02 alone and derby
-// through catalog-01 alone; the reader is fan, through a key no item
-// counts.
-func TestV076Scenario104(t *testing.T) {
-	t.Parallel()
-	pub2, _ := grant.GenerateKey()
-	fanPub, fanPriv := grant.GenerateKey()
-	w := newV75World(t, v75Opts{matches: func(doc map[string]any) {
-		k1 := doc["keys"].([]any)[1].(map[string]any)
-		k1["rules"] = []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string", "pattern": "^d"}}}
-		doc["keys"] = append(doc["keys"].([]any), map[string]any{"kid": "catalog-02", "alg": "ed25519", "pub": pub2,
-			"can": []any{"read"}, "requireAt": "cat-season",
-			"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string", "pattern": "^pub-"}}}},
-			v76fFanEntry(fanPub))
-	}})
-	w.seed()
-	w.put("cat-season", "root", map[string]any{"parents": []any{}, "$access": map[string]any{"group:editors": []any{"reader"},
-		"user:li": []any{"reader"}, "group:fan-club": []any{"reader"}}})
-	w.put("matches", "pub-a", map[string]any{"title": "a"})
-	w.put("cat-season", "matches.pub-a", map[string]any{"parents": v75Parents("season")})
-	fw := &v76fWorld{v75World: w, fanPub: fanPub, fanPriv: fanPriv}
-	fan := fw.fan("matches", fanPriv)
-	red, st := v76fRedirect(t, w, "matches", "", fan)
-	if red == nil {
-		t.Fatalf("fan: %d", st)
-	}
-	names, st := v76fHeads(t, w, "matches", red.GS, red.At, fan)
-	if st != 0 || !v76fHas(names, "pub-a") || !v76fHas(names, "derby") || v76fHas(names, "shared") {
-		t.Fatalf("heads %v %d: want derby (catalog-01) and pub-a (catalog-02), not shared", names, st)
-	}
-}
-
 // Scenario 102: a partial reader whose block rule refers to /now ->
 // GET /ns/matches/gestures/G -> 403.
 func TestV076Scenario102(t *testing.T) {
@@ -222,8 +124,7 @@ func TestV076Scenario102(t *testing.T) {
 // Scenario 109: at matches-r7's at, reader has not /principal/groups
 // contains const "contractors", which matches has since removed; li is in
 // contractors -> the branch isn't read filtered at all since v0.78
-// (§B.11.9 Where: 403, no redirect), and in matches her gs keeps all her
-// groups.
+// (§B.11.9 Where: 403, no redirect).
 func TestV076Scenario109(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{matches: func(doc map[string]any) {
@@ -249,10 +150,5 @@ func TestV076Scenario109(t *testing.T) {
 	if names, st := v76fHeads(t, w, "matches", red2.GS, red2.At, lim); st != 0 || !v76fHas(names, "derby") {
 		t.Fatalf("matches heads %v %d", names, st)
 	}
-	// gs keeps all groups: li without contractors gets a different gs.
-	li2 := w.catGrant("user:li", []any{"editors"})
-	red3, _ := v76fRedirect(t, w, "matches", "", li2)
-	if red3 == nil || red3.GS == red2.GS {
-		t.Fatalf("gs of li without contractors %+v equals %s", red3, red2.GS)
-	}
+
 }

@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
@@ -98,7 +97,7 @@ type markerRec struct {
 // must still digest to the marker's scope subject (g:) or its digest
 // (scope:), and the pub its kid had, which the key with that kid must
 // still have (§B.11.9 gs, §C.4, §A.4; storedFview, scopeKeysHold). A g:
-// marker's gs digests the key too (catvis.KeySubject), but readers whose
+// marker's gs digests the key too (grantcheck.KeySubject), but readers whose
 // grants come from different keys, or from one key before and after its
 // entry changes, may share a marker, and a cookie says only its prefix
 // and exp: the gsKeys of each cookie are kept by its marker and exp
@@ -393,7 +392,7 @@ func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, 
 		return out, false
 	}
 	if a.cov != nil {
-		doc, err := ix.docAt(ctx, ns, a.cov.cp.reads[ns])
+		doc, err := ix.docAt(ctx, ns, a.cov.cp.at)
 		if err != nil {
 			return out, false
 		}
@@ -445,7 +444,7 @@ func markerRecOf(a *access, v *grant.Verified) *markerRec {
 
 // readsMarker is the marker reads:{ns}:{k} of a reader whose grant would
 // be issued a namespace-wide edge grant in ns (§A.4 gs, v0.85): k is the
-// key: string (catvis.KeySubject, §B.11.9 gs) of the key that verified
+// key: string (grantcheck.KeySubject, §B.11.9 gs) of the key that verified
 // the grant there, by kid and pub, so reads:{ns}:key:{id}. Readers
 // through two keys never share the marker, so neither its gs, its
 // results nor its cookie prefix, and a change to one key ends only the
@@ -453,17 +452,17 @@ func markerRecOf(a *access, v *grant.Verified) *markerRec {
 // every key's readers; a cookie for that form reads nothing now
 // (markerAccess).
 func readsMarker(ns, kid, pub string) string {
-	return "reads:" + ns + ":" + catvis.KeySubject(kid, pub)
+	return "reads:" + ns + ":" + grantcheck.KeySubject(kid, pub)
 }
 
 // readsPrefix is what every reads:{ns}:{k} marker of ns starts with
 // (readsMarker): no scope or g: marker of any namespace does.
-func readsPrefix(ns string) string { return "reads:" + ns + ":" + catvis.KeyPrefix }
+func readsPrefix(ns string) string { return "reads:" + ns + ":" + grantcheck.KeyPrefix }
 
 // scopeMarker is the marker reads:{ns}:scope:{digest} of a reader of
 // uncovered ns whose reads there have grantcheck.ReadsScope digest d,
 // through the key with kid and pub (§A.4): its digest covers d and the
-// key's key: string (catvis.KeySubject, §B.11.9 gs), so readers through
+// key's key: string (grantcheck.KeySubject, §B.11.9 gs), so readers through
 // two keys with the same rules never share a marker, its gs, its edge
 // filter or its cookie prefix. A gs's scope: subject is the same digest
 // (§B.11.9 gs: "scope:{digest} of §A.4's marker"), at the origin too.
@@ -472,8 +471,8 @@ func scopeMarker(ns, d, kid, pub string) string {
 }
 
 // scopeKeyDigest is scopeMarker's digest: of d and the key's key: string
-// (catvis.ScopeKeyDigest).
-func scopeKeyDigest(d, kid, pub string) string { return catvis.ScopeKeyDigest(d, kid, pub) }
+// (grantcheck.ScopeKeyDigest).
+func scopeKeyDigest(d, kid, pub string) string { return grantcheck.ScopeKeyDigest(d, kid, pub) }
 
 // keyPub is k's pub member as the namespace document gives it, "" if it
 // has none (§B.11.9 gs: "accepted only while the base has it with the
@@ -1407,12 +1406,9 @@ func (ix *Index) readsKeysHold(ctx context.Context, ns, m string, exp int64) err
 // is rec, which has no checkpoint left to be judged at (storedFview): as
 // there, by ns's document at its head (keysHold).
 func (ix *Index) purgedGKeysHold(ctx context.Context, ns, m string, rec *markerRec, exp int64) error {
-	if slices.Contains(rec.subjects, catvis.Partial) {
-		return errPartial
-	}
 	return ix.keysHold(ctx, ns, m, exp, func(cfg *grantcheck.Config, key grant.Key, k gsKey) bool {
 		return gsKeyHolds(cfg, []grant.Key{key}, rec.f, k, func(d string) bool {
-			return slices.Contains(rec.subjects, catvis.ScopePrefix+scopeKeyDigest(d, k.kid, k.pub))
+			return slices.Contains(rec.subjects, grantcheck.ScopePrefix+scopeKeyDigest(d, k.kid, k.pub))
 		})
 	})
 }
@@ -1424,8 +1420,7 @@ var errCoveredNow = &grant.AuthError{Status: 403, Msg: "the namespace is read fi
 
 // stillUncovered checks that §B.11.9 doesn't cover ns at the index's
 // committed checkpoint, as when a scope marker of it was issued: else
-// errCoveredNow; and that ns isn't one a partial reader has no marker in
-// (catalogShaped): else errNoMarker. Before the index's first checkpoint
+// errCoveredNow. Before the index's first checkpoint
 // of a namespace that may be covered once it has, its coverage can't be
 // told: errNotReached, as for a grant (grantAccess). A purged one passes,
 // answered 410 past the read check (§8.5).
@@ -1448,13 +1443,6 @@ func (ix *Index) stillUncovered(ctx context.Context, ns string) error {
 		return err
 	case cp != nil:
 		return errCoveredNow
-	}
-	// One that could be covered by its shape gives a partial reader no
-	// marker (§A.4), so no cookie of one reads it.
-	if shaped, err := ix.catalogShaped(ctx, ns); err != nil {
-		return err
-	} else if shaped {
-		return errNoMarker
 	}
 	return nil
 }
@@ -2120,3 +2108,7 @@ func (ix *Index) initEdge(ctx context.Context, db *sql.DB) error {
 	ix.edge, err = svcedge.NewStore(ctx, db)
 	return err
 }
+
+// maxChain bounds a branch's chain of bases (the deployment's branch
+// depth is 8 by default, grantcheck's bound 32).
+const maxChain = 32

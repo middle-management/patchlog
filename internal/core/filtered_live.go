@@ -91,7 +91,7 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, gs, since string, limi
 		if t.fromPurgeEntry(n, since) {
 			return t.purgedRead(n)
 		}
-		fv, info, until = v, filteredInfo(n, v), t.admittedUntil(n, cred, v.a)
+		fv, info, until = v, filteredInfo(v), t.admittedUntil(n, cred, v.a)
 		return nil
 	})
 	if err != nil {
@@ -117,7 +117,7 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, gs, since string, limi
 				if n == nil || n.id != fv.fs.n.id {
 					return notFound()
 				}
-				lg = t.filteredRange(n, fv, since, fv.cp.seqs[ns], limit)
+				lg = t.filteredRange(n, fv, since, fv.cp.seq, limit)
 				return nil
 			})
 			if err == nil && len(lg.Entries) <= maxLiveDoneEntries {

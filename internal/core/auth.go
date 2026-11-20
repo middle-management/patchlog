@@ -592,7 +592,7 @@ func (t *tx) nsAccess(n *nsRow, cred Credentials) (*actor, accessKind, *fscope, 
 		if a == nil || a.verified == nil {
 			return false
 		}
-		if _, ok := readRoles(a); !ok {
+		if !t.partialReader(a) {
 			return false
 		}
 		if fs = t.filteredScope(n); fs != nil {

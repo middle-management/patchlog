@@ -229,13 +229,13 @@ func narrowNames(parent map[string]any, key string, byName map[string]any, visib
 // stays readable and ends with its purge-ns entry (§8.5). An at it can't
 // answer is a *FilteredRedirect to the current one.
 func (e *Engine) FilteredLog(ctx context.Context, ns, gs, at, since string, limit int, cred Credentials) (lg *Log, info *FilteredInfo, err error) {
-	err = e.filteredRead(ctx, func(t *tx) error {
+	err = e.read(ctx, func(t *tx) error {
 		n, fv, err := t.filteredAtView(ns, gs, at, cred)
 		if err != nil {
 			return err
 		}
-		info = filteredInfo(n, fv)
-		lg = t.filteredRange(n, fv, since, fv.CP().seqs[n.name], limit)
+		info = filteredInfo(fv)
+		lg = t.filteredRange(n, fv, since, fv.CP().seq, limit)
 		lg.Until = t.admittedUntil(n, cred, fv.a)
 		return nil
 	})

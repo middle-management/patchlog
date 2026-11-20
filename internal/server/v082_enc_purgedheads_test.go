@@ -4,8 +4,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/middle-management/patchlog/internal/core"
 )
 
 // v82encFilteredLog is the gs and at a partial reader's unfiltered log of
@@ -25,14 +23,12 @@ func v82encFilteredLog(w *v75s, bearer string) (gs, at string) {
 
 // ACC-8a (SERVICES §B.11.9 Purged namespaces, SPEC §8.5; scenario 124):
 // a partial reader's unfiltered /heads of a covered namespace that is
-// purged is 410 purged, with head, at once: no 302 and no Location, and
-// no at is recorded. The read check comes first: without a grant 401, and
+// purged is 410 purged, with head, at once: no 302 and no Location. The read check comes first: without a grant 401, and
 // a grant whose read is refused 403, neither with head. The unfiltered
 // log of the purged namespace still redirects.
 func TestV082PurgedHeadsPartialReader410(t *testing.T) {
 	t.Parallel()
-	var path string
-	w := newV75s(t, v75sOpts{env: []envOpt{withFileDB(t), func(o *core.Options) { path = o.Path }}})
+	w := newV75s(t, v75sOpts{})
 	w.seed([]string{"derby"}, nil, []string{"derby"})
 	li := w.li()
 	// Before the purge: the 302 to the filtered form, as ever.
@@ -45,8 +41,6 @@ func TestV082PurgedHeadsPartialReader410(t *testing.T) {
 	expect(t, w.patchNS("matches", ops(op("add", "/frozen", true)), w.admin), 201)
 	expect(t, w.do(req{method: "POST", path: "/ns/matches/purge?force=1", ifMatch: w.nsHead("matches", w.admin), bearer: opg}), 204)
 	purgeNS := w.nsHead("matches", w.admin)
-	db, pg := v0261DB(t, path)
-	ats := v0261Count(t, db, pg, `SELECT COUNT(*) FROM filtered_ats`)
 	bogus := "1nyv2d2ibcop4nnp4k5niguadz7lvyjad"
 	for _, id := range []string{purgeNS, before, bogus} {
 		r := w.get("/ns/matches/rev/"+id+"/heads", li)
@@ -60,9 +54,6 @@ func TestV082PurgedHeadsPartialReader410(t *testing.T) {
 		if string(u.Body) != string(r.Body) || u.H.Get("Cache-Control") != r.H.Get("Cache-Control") {
 			t.Fatalf("/heads at %s: partial %v %s, unrestricted %v %s", id, r.H, r.Body, u.H, u.Body)
 		}
-	}
-	if n := v0261Count(t, db, pg, `SELECT COUNT(*) FROM filtered_ats`); n != ats {
-		t.Fatalf("the 410 recorded an at: %d rows, were %d", n, ats)
 	}
 	// The read check first.
 	if r := w.get("/ns/matches/rev/"+purgeNS+"/heads", ""); r.Code != 401 || r.Obj()["head"] != nil {

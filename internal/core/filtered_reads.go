@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"errors"
 
 	"github.com/middle-management/patchlog/internal/ids"
 )
@@ -15,31 +14,14 @@ import (
 // events in filtered_live.go.
 
 // FilteredInfo is the checkpoint a filtered answer is at (§B.11.9 URLs):
-// its subject set and at, NSID the ns_id of {ns} in at, which the answer
-// carries as X-Namespace-Revision, and Others the other members of at,
-// whose ns:{x} Cache-Tags it carries beside its unfiltered form's.
+// its subject set and at, the ns_id of {ns} the answer carries as
+// X-Namespace-Revision.
 type FilteredInfo struct {
-	GS, At, NSID string
-	Others       []string
+	GS, At string
 }
 
-func filteredInfo(n *nsRow, fv *fview) *FilteredInfo {
-	cp := fv.CP()
-	return &FilteredInfo{GS: fv.GS(), At: cp.at, NSID: cp.nsID(n.name), Others: cp.others(n.name)}
-}
-
-// filteredRead is read for a request that may answer a *FilteredRedirect:
-// the checkpoint its at names is recorded, in a write transaction of its
-// own after the read, before the redirect is returned (§B.11.9 at).
-func (e *Engine) filteredRead(ctx context.Context, f func(t *tx) error) error {
-	err := e.read(ctx, f)
-	var fr *FilteredRedirect
-	if errors.As(err, &fr) && fr.At != "" && fr.CP != nil {
-		if rerr := e.recordFilteredAt(ctx, fr.CP); rerr != nil {
-			return rerr
-		}
-	}
-	return err
+func filteredInfo(fv *fview) *FilteredInfo {
+	return &FilteredInfo{GS: fv.GS(), At: fv.CP().at}
 }
 
 // nsReaderOrRedirect is nsReader for an unfiltered URL of n that §B.11.9
@@ -149,7 +131,7 @@ func (t *tx) filteredCurrentRedirect(n *nsRow, fs *fscope, gs string, cred Crede
 	if err != nil {
 		return err
 	}
-	return &FilteredRedirect{NS: n.name, GS: fv.GS(), At: cp.at, CP: cp}
+	return &FilteredRedirect{NS: n.name, GS: fv.GS(), At: cp.at}
 }
 
 // FilteredCurrent answers a URL under /ns/{ns}/g/{gs} without at, suffix
@@ -161,7 +143,7 @@ func (t *tx) filteredCurrentRedirect(n *nsRow, fs *fscope, gs string, cred Crede
 // without at as /heads"); its /log keeps the redirect, a purged range
 // staying readable. It never returns nil.
 func (e *Engine) FilteredCurrent(ctx context.Context, ns, gs, suffix string, cred Credentials) error {
-	return e.filteredRead(ctx, func(t *tx) error {
+	return e.read(ctx, func(t *tx) error {
 		heads := suffix == "/heads"
 		n, fs, err := t.filteredOpen(ns, cred)
 		if err != nil {
@@ -182,22 +164,21 @@ func (e *Engine) FilteredCurrent(ctx context.Context, ns, gs, suffix string, cre
 // visible to the subject set, in ascending byte order after after and
 // under prefix ("" for all), in pages filled to the log page size, with
 // next, the last row, on every full page and no other. The candidates are
-// the deciding catalogs' placement names (fview.candidates), so a sparse
-// reader never scans the namespace. A purged namespace is 410, after
+// the namespace's names (fview.candidates). A purged namespace is 410, after
 // admission (§8.5). info is set wherever the checkpoint is known, errors
 // included, for the answer's tags.
 func (e *Engine) FilteredHeads(ctx context.Context, ns, gs, at, after, prefix string, cred Credentials) (page *HeadsPage, info *FilteredInfo, err error) {
-	err = e.filteredRead(ctx, func(t *tx) error {
+	err = e.read(ctx, func(t *tx) error {
 		n, fv, cp, err := t.filteredHeadsView(ns, gs, at, cred)
 		if err != nil {
 			return err
 		}
 		if n.purged {
-			info = &FilteredInfo{GS: gs, At: cp.at, NSID: cp.nsID(n.name), Others: cp.others(n.name)}
+			info = &FilteredInfo{GS: gs, At: cp.at}
 			return t.purgedRead(n)
 		}
-		info = filteredInfo(n, fv)
-		asOf := fv.CP().seqs[n.name]
+		info = filteredInfo(fv)
+		asOf := fv.CP().seq
 		limit := e.opt.Maximums.LogPageSize
 		var rows []headItem
 		fv.candidates(t, after, prefix, func(name string) bool {
