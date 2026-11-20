@@ -14,8 +14,8 @@ import (
 func (p *Plan) nonces() bool { return p.TargetLevel == "sealed" || p.TargetNonce }
 
 // noncePlan is a plan that knows only whether target needs a fresh $nonce
-// (nonces), for steps built before the target can classify them: the
-// planned second half of a split node (stepPlan).
+// (nonces), for steps built outside a classified plan: a release's step 3
+// (runPublish).
 func noncePlan(ctx context.Context, c *client.Client, target string) (*Plan, error) {
 	p := &Plan{}
 	var err error

@@ -1,48 +1,76 @@
 package merge
 
 // Releases across namespaces (§F.9): merging every branch a release
-// document lists, one batch per branch and step, in an order that keeps
-// each state in between safe.
+// document lists, one batch per branch and step, in three steps:
 //
 //  1. Schema resources (documents whose $schema is a dialect URL, §6.1),
 //     by fast-forward only, in $ref order: then $schema paths resolve in
 //     the bases too. A schema resource the base changed since the branch
 //     started can't fast-forward: a conflict (rebase the release, and
 //     migrate documents with replace /$schema).
-//  3. Content branches, in any order. (v0.87 removed steps 2 and 4; the
-//     numbers are kept, as stored plans and their digests name them.)
+//  2. Content, in any order.
+//  3. Publishing (ReleaseOptions.Publish): where readers' rules test a
+//     field that marks documents published, one batch per content
+//     namespace, without source, sets it on the documents the release
+//     created, which carried it unset. Each item's precondition is the id
+//     step 2's item left the document at.
 //
 // Conflicts reported before anything is submitted (ReleaseConflict): a
-// pinned x-ref or manifest entry naming a revision of another listed
-// branch that the merge replays; a document resolving a draft schema
-// revision in a branch the release doesn't list; and every merge conflict
-// of §F.3.
+// pinned x-ref naming a revision of another listed branch that the merge
+// replays; a document resolving a draft schema revision in a branch the
+// release doesn't list; a change to the published field in steps 1 and 2;
+// and every merge conflict of §F.3.
+//
+// The published field and the merge service's grant. The content base
+// guards the field as §6.4.4 guards fields that read rules test, with
+// rules that only principals in a group its issuer asserts pass, e.g. for
+// /published and the group publishers:
+//
+//	{ "if":   [{ "not": { "op": "test", "path": "/principal/groups", "schema": { "contains": { "const": "publishers" } } } },
+//	           { "op": "test", "path": "/action", "schema": { "enum": ["append", "restore"] } }],
+//	  "then": [{ "not": { "op": "writes", "overlaps": "/published" } }] },
+//	{ "if":   [{ "not": { "op": "test", "path": "/principal/groups", "schema": { "contains": { "const": "publishers" } } } },
+//	           { "op": "test", "path": "/action", "value": "create" }],
+//	  "then": [{ "op": "test", "path": "/doc/published", "exists": false }] }
+//
+// and the grant the merge service submits under carries that group in its
+// root block (a role the base defines works the same, but then grants the
+// merge service's verbs too). Writers without it can't set the field;
+// the merge service, and whoever else is in the group, can. A branch
+// starts with a copy of these rules, but its own from then on (§7.6), and
+// the server can't tell step 2 from step 3, as one grant submits both, so
+// the planner keeps the field out of steps 1 and 2: an item whose
+// resulting document has another value there than the base's live
+// document (none for a document the release creates or restores) is a
+// conflict (RCPublished). A release built on another merges into that
+// release's branches, whose readers aren't filtered (§7.9), so it has no
+// step 3: what it adds is created in the earlier release's branch, whose
+// own step 3 publishes it.
 //
 // Lifecycle. PlanRelease checks that each listed branch's base is the
 // namespace it is keyed by (or, for a release built on another, that
-// release's branch for the key), classifies and checks; the plan is stored
-// as a resource ({release name}.merge) in a state namespace (by default the
-// release document's own), with the release document's revision and the
-// plan's digest (PlanDigest, §F.9): text(trunc160(sha256(canonical(plan))))
-// over { release: <revision path>, batches: [{ ns, source: { ns, at },
-// items: [{ resource, ifMatch | ifNoneMatch, steps }] }] }, the batches in
+// release's branch for the key), classifies and checks, and builds the
+// plan: { release: <revision path>, batches: [{ ns, source?, items: [{
+// resource, ifMatch | ifNoneMatch, steps }] }] }, the batches in
 // submission order, each step its plaintext patch set without fresh $nonce
-// ops (nor a fresh top-level $nonce in a root op's value) or "delete".
-// ApproveRelease, run by the person approving, plans
-// again, requires it clean, for the same revision and with the same
-// digest, and freezes every listed branch (§8.4), recording each branch's
-// config id and its ns_id before the freeze, which stays every batch's
-// source.at; unfreezing a branch (any config change) invalidates the
-// plan. ApplyRelease runs the steps from the stored plan, each classified
-// again with a dry run right before it is submitted, and stops for a new
-// approval if a step's items differ from the approved ones; it records
-// each step as it completes, and resumes from there after a stop. It never
-// reverts. A plan an earlier version stored (format 0, without the digest
-// above or each branch's at) is planned and approved again, unless that
-// version stopped part-way through merging it: that merge resumes from the
-// stored plan, each step checked against the step digest the earlier
-// version recorded. Every branch records merged only after its last step,
-// with at the target's ns_id after the last batch into it.
+// ops (nor a fresh top-level $nonce in a root op's value) or "delete", a
+// precondition on an earlier batch's item { batch, item }. Its digest
+// (PlanDigest) is text(trunc160(sha256(canonical(plan)))). The plan is
+// stored, with the digest and each branch's at, as a resource ({release
+// name}.merge) in a state namespace (by default the release document's
+// own). ApproveRelease, run by the person approving, plans again, requires
+// it clean, for the same revision and with the same digest, and freezes
+// every listed branch (§8.4), recording each branch's config id and its
+// ns_id before the freeze, which stays every batch's source.at;
+// unfreezing a branch (any config change) invalidates the plan.
+// ApplyRelease merges from the stored plan: each step is classified again
+// and dry-run right before it is submitted, and stops for a new approval
+// if its items differ from the stored plan's; a 412 stops it too. Each
+// step's batch and the ids it left are recorded as it completes; a merge
+// that stops resumes from the stored plan, finding a batch that went in
+// before its record in the target's log, and never reverts. Every branch
+// records merged only after the last step, with at the target's ns_id
+// after the last batch into it.
 
 import (
 	"context"
@@ -57,6 +85,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/release"
 	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -72,6 +101,13 @@ const (
 	ReleaseAbandoned = "abandoned"
 )
 
+// The steps of a release merge (§F.9 Merging).
+const (
+	StepSchemas = 1 // schema resources, by fast-forward only
+	StepContent = 2 // the rest of each branch
+	StepPublish = 3 // the published field, on the documents the release created
+)
+
 // Release conflict kinds.
 const (
 	RCBaseChain     = "base_chain"         // the branch's base isn't the namespace it is keyed by (§F.9)
@@ -82,6 +118,7 @@ const (
 	RCForeignDraft  = "foreign_draft"      // a draft resolved in a branch the release doesn't list
 	RCUnresolved    = "schema_unavailable" // a $schema the merger can't resolve anywhere
 	RCMerge         = "merge"              // a §F.3 conflict of a resource
+	RCPublished     = "published"          // steps 1 or 2 change the published field (§F.9)
 )
 
 // ReleaseConflict is a reason the release needs a person.
@@ -100,7 +137,7 @@ type ReleaseBranch struct {
 	NS     string `json:"ns"`
 	Target string `json:"target"` // the namespace it merges into
 	// Schemas are its schema resources in $ref order (step 1), Content the
-	// rest (step 3).
+	// rest (step 2).
 	Schemas []string `json:"schemas,omitempty"`
 	Content []string `json:"content,omitempty"`
 	// At is the branch's ns_id the plan classifies from, every batch's
@@ -109,28 +146,71 @@ type ReleaseBranch struct {
 	At string `json:"at,omitempty"`
 	// FrozenConfig is the config id the approval's freeze produced.
 	FrozenConfig string `json:"frozenConfig,omitempty"`
-	// Merged is the merged.at recorded after its last step.
+	// Merged is the merged.at recorded after the last step.
 	Merged string `json:"merged,omitempty"`
 }
 
 // ReleaseStep is one batch of the merge.
 type ReleaseStep struct {
-	Step      int      `json:"step"`
+	Step      int      `json:"step"` // StepSchemas, StepContent or StepPublish
 	Key       string   `json:"key"`
 	Resources []string `json:"resources"`
+	// Batch is the step's index among the plan's batches, nil if it has
+	// nothing to submit.
+	Batch *int `json:"batch,omitempty"`
 	// Done is the batch's ns_id once submitted ("noop" if there was
-	// nothing left to do).
+	// nothing to do).
 	Done string `json:"done,omitempty"`
-	// Digest is the digest of this step's part of the plan (its items),
-	// which the step must still have when it is submitted.
-	Digest string `json:"digest,omitempty"`
+	// IDs are the ids the batch left its resources at, which step 3's
+	// preconditions name.
+	IDs map[string]string `json:"ids,omitempty"`
 }
 
-// PlanFormat is the stored plan's format. 2: the plan digest of v0.73
-// (§F.9) and each branch's at; a plan stored under an earlier format (0,
-// none recorded) is planned and approved again, unless its merge stopped
-// part-way, which ApplyRelease resumes.
-const PlanFormat = 2
+// Publish is the field step 3 sets (§F.9): Path, a JSON pointer readers'
+// rules test, e.g. /published, and Value, what it is set to (true if nil).
+type Publish struct {
+	Path  string `json:"path"`
+	Value any    `json:"value"`
+}
+
+func (pb *Publish) check() error {
+	p, err := pointer.Parse(pb.Path)
+	if err != nil || len(p) == 0 {
+		return fmt.Errorf("merge: the published field %q is not a JSON pointer below the document's root", pb.Path)
+	}
+	if strings.HasPrefix(pb.Path, "/$") {
+		return fmt.Errorf("merge: the published field %q is a reserved member (§6.5)", pb.Path)
+	}
+	if pb.Value == nil {
+		pb.Value = true
+	}
+	return nil
+}
+
+func (pb *Publish) ptr() pointer.Pointer { return pointer.MustParse(pb.Path) }
+
+// step is the patch set step 3 writes.
+func (pb *Publish) step() client.Step {
+	return client.PatchStep([]any{map[string]any{"op": "add", "path": pb.Path, "value": jsonv.FromGo(pb.Value)}})
+}
+
+func samePublish(a, b *Publish) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	val := func(p *Publish) any {
+		if p.Value == nil {
+			return true
+		}
+		return jsonv.FromGo(p.Value)
+	}
+	return a.Path == b.Path && jsonv.Equal(val(a), val(b))
+}
+
+// PlanFormat is the stored plan's format: 3, the three steps of v0.87
+// with the plan itself stored. A plan stored under another format is
+// planned and approved again.
+const PlanFormat = 3
 
 // ReleasePlan is the stored plan of a release merge.
 type ReleasePlan struct {
@@ -145,6 +225,11 @@ type ReleasePlan struct {
 	ApprovedAt string `json:"approvedAt,omitempty"`
 	// Digest is the plan's digest (PlanDigest), what a person approves.
 	Digest string `json:"digest,omitempty"`
+	// Plan is what Digest is over (PlanObject), which the merge resumes
+	// from: each step submits exactly its batch.
+	Plan map[string]any `json:"plan,omitempty"`
+	// Publish is step 3's field, nil for none.
+	Publish *Publish `json:"publish,omitempty"`
 
 	Branches  []*ReleaseBranch  `json:"branches"`
 	Steps     []*ReleaseStep    `json:"steps"`
@@ -188,6 +273,10 @@ type ReleaseOptions struct {
 	// Digest, if set, is the digest the approving person reviewed:
 	// ApproveRelease fails unless planning again gives it (§F.9).
 	Digest string
+	// Publish, if set, is the field step 3 sets on the documents the
+	// release created (§F.9). PlanRelease plans with it; ApproveRelease
+	// and ApplyRelease take the stored plan's.
+	Publish *Publish
 	// Resolutions resolve content conflicts: "key/name" -> steps against
 	// the base's current head.
 	Resolutions map[string][]client.Step
@@ -200,6 +289,10 @@ type ReleaseOptions struct {
 	// AfterStep, if set, is called after each step is submitted and
 	// recorded; an error stops the merge there (tests simulate a crash).
 	AfterStep func(step *ReleaseStep) error
+	// AfterSubmit, if set, is called right after a step's batch went in,
+	// before it is recorded; an error stops the merge there (tests
+	// simulate a crash between the two).
+	AfterSubmit func(step *ReleaseStep) error
 	// AcceptFrozen are freezes this release's own approval made (branch
 	// -> config id, ReleasePlan.FrozenBy): PlanRelease doesn't count them
 	// as frozen, and classifies those branches as of their ns_id before
@@ -229,8 +322,10 @@ type relCtx struct {
 	// per key
 	docs    map[string]map[string]any // key -> resource -> branch head doc (nil = deleted)
 	plans   map[string]*Plan          // "step/key" -> plan used for classification
-	listed  map[string]bool           // branch namespaces listed
+	listed  map[string]bool           // branch namespaces listed, by this release or one it builds on
 	ownCfgs map[string]string         // branch -> config id our approval left (resume)
+	// onBranches are the branches of the releases this one builds on.
+	onBranches []string
 }
 
 // PlanRelease classifies a release and reports its conflicts, without
@@ -263,13 +358,21 @@ func (rp *ReleasePlan) FrozenBy() map[string]string {
 }
 
 func planRelease(ctx context.Context, c *client.Client, opt ReleaseOptions, own map[string]string) (*ReleasePlan, error) {
+	var pub *Publish
+	if opt.Publish != nil {
+		cp := *opt.Publish
+		if err := cp.check(); err != nil {
+			return nil, err
+		}
+		pub = &cp
+	}
 	rel, err := release.Load(ctx, c, opt.Release)
 	if err != nil {
 		return nil, err
 	}
 	x := &relCtx{c: c, opt: opt, rel: rel, docs: map[string]map[string]any{}, plans: map[string]*Plan{}, listed: map[string]bool{}, ownCfgs: own}
 	x.rp = &ReleasePlan{Format: PlanFormat, Release: rel.Ref.Live(), Revision: rel.Ref.Rev, Name: rel.Doc.Name, State: ReleasePlanned,
-		PlannedBy: opt.Who}
+		PlannedBy: opt.Who, Publish: pub}
 	for _, k := range rel.Doc.Keys() {
 		x.listed[rel.Doc.Branches[k].NS] = true
 	}
@@ -312,7 +415,7 @@ func (x *relCtx) nsDoc(ctx context.Context, ns string) (map[string]any, string, 
 
 // targets resolves where each key merges: the key itself, or for a
 // release built on another one (on), the earlier release's branch for the
-// key (§F.9 Several releases).
+// key (§F.9 Releases built on another).
 func (x *relCtx) targets(ctx context.Context) (map[string]string, error) {
 	out := map[string]string{}
 	for _, k := range x.rel.Doc.Keys() {
@@ -330,14 +433,30 @@ func (x *relCtx) targets(ctx context.Context) (map[string]string, error) {
 			out[k] = b.NS
 		}
 	}
+	// Its documents resolve drafts from the releases it builds on too
+	// (§F.9, §6.1), so their branches count as listed for drafts.
+	for depth, r := 0, on; r != nil && depth < 8; depth++ {
+		for _, n := range r.Doc.BranchNames() {
+			if !x.listed[n] {
+				x.listed[n] = true
+				x.onBranches = append(x.onBranches, n)
+			}
+		}
+		if r.Doc.On == "" {
+			break
+		}
+		if r, err = release.Load(ctx, x.c, r.Doc.On); err != nil {
+			return nil, fmt.Errorf("merge: a release this one builds on: %w", err)
+		}
+	}
 	return out, nil
 }
 
-// branches runs the pre-approval checks (§F.9 Merging): each listed
-// branch's base is the namespace it is keyed by, or for a release built on
-// another, that release's branch for the key (targets), and it is neither
-// frozen (but by our own approval) nor purged; and sorts its changed
-// resources into schemas and content.
+// branches runs the checks before approval (§F.9): each listed branch's
+// base is the namespace it is keyed by, or for a release built on another,
+// that release's branch for the key (targets), and it is neither frozen
+// (but by our own approval) nor purged; and sorts its changed resources
+// into schemas and content.
 func (x *relCtx) branches(ctx context.Context) error {
 	tg, err := x.targets(ctx)
 	if err != nil {
@@ -533,12 +652,16 @@ func (x *relCtx) classify(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		x.plans[stepKey(1, k)] = p
+		x.plans[stepKey(StepSchemas, k)] = p
 		x.schemaConflicts(b, p)
-		rp.Steps = append(rp.Steps, &ReleaseStep{Step: 1, Key: k, Resources: b.Schemas})
+		if err := x.publishChanges(ctx, b, p); err != nil {
+			return err
+		}
+		rp.Steps = append(rp.Steps, &ReleaseStep{Step: StepSchemas, Key: k, Resources: b.Schemas})
 	}
-	// Step 3 plans (content), classified now for the conflict checks.
-	var contentSteps []*ReleaseStep
+	// Step 2 plans (content), classified now for the conflict checks, and
+	// step 3's documents: those step 2 creates or restores.
+	var contentSteps, publishSteps []*ReleaseStep
 	for _, b := range rp.Branches {
 		if len(b.Content) == 0 {
 			continue
@@ -550,7 +673,7 @@ func (x *relCtx) classify(ctx context.Context) error {
 		if err := x.applyResolutions(b, p); err != nil {
 			return err
 		}
-		x.plans[stepKey(3, b.Key)] = p
+		x.plans[stepKey(StepContent, b.Key)] = p
 		for _, r := range p.Conflicting() {
 			kinds := []string{}
 			var paths []string
@@ -558,11 +681,25 @@ func (x *relCtx) classify(ctx context.Context) error {
 				kinds = append(kinds, c.Kind)
 				paths = append(paths, c.Paths...)
 			}
-			x.conflict(RCMerge, b.Key, b.NS, r.Name, "merge conflict ("+strings.Join(kinds, ", ")+"): resolve with -resolve "+b.Key+"/"+r.Name+"=file.json, or rebase the release", paths...)
+			x.conflict(RCMerge, b.Key, b.NS, r.Name, "merge conflict ("+strings.Join(kinds, ", ")+"): resolve with --resolve "+b.Key+"/"+r.Name+"=file.json, or rebase the release", paths...)
 		}
-		contentSteps = append(contentSteps, &ReleaseStep{Step: 3, Key: b.Key, Resources: b.Content})
+		if err := x.publishChanges(ctx, b, p); err != nil {
+			return err
+		}
+		contentSteps = append(contentSteps, &ReleaseStep{Step: StepContent, Key: b.Key, Resources: b.Content})
+		if rp.Publish == nil {
+			continue
+		}
+		if b.Target != b.Key {
+			rp.Notes = append(rp.Notes, fmt.Sprintf("%s merges into %s, a branch of the release this one builds on: no step 3 there, as that release's step 3 publishes what it creates", b.NS, b.Target))
+			continue
+		}
+		if created := createdItems(p); len(created) > 0 {
+			publishSteps = append(publishSteps, &ReleaseStep{Step: StepPublish, Key: b.Key, Resources: created})
+		}
 	}
 	rp.Steps = append(rp.Steps, contentSteps...)
+	rp.Steps = append(rp.Steps, publishSteps...)
 
 	if err := x.pins(ctx); err != nil {
 		return err
@@ -571,6 +708,21 @@ func (x *relCtx) classify(ctx context.Context) error {
 }
 
 func stepKey(step int, key string) string { return fmt.Sprintf("%d/%s", step, key) }
+
+// createdItems are the names of the resources p's batch creates or
+// restores, leaving them live: the documents a release created, which
+// step 3 publishes (§F.9).
+func createdItems(p *Plan) []string {
+	var out []string
+	for _, r := range p.Items() {
+		if r.BaseState == client.Live.String() || r.BranchDeleted || r.Dropped {
+			continue
+		}
+		out = append(out, r.Name)
+	}
+	sort.Strings(out)
+	return out
+}
 
 func (x *relCtx) schemaConflicts(b *ReleaseBranch, p *Plan) {
 	for _, r := range p.Resources {
@@ -585,6 +737,59 @@ func (x *relCtx) schemaConflicts(b *ReleaseBranch, p *Plan) {
 			x.conflict(RCSchemaChanged, b.Key, b.NS, r.Name, "the schema resource is purged: "+r.Note)
 		}
 	}
+}
+
+// publishChanges reports a change to the published field in steps 1 and
+// 2 (§F.9): an item whose resulting document has another value there, or
+// one where there was none, than the target's live document, none for a
+// document the item creates or restores, which must carry it unset. An
+// item that deletes changes nothing there. Items that can't be folded are
+// conflicts already.
+func (x *relCtx) publishChanges(ctx context.Context, b *ReleaseBranch, p *Plan) error {
+	pub := x.rp.Publish
+	if pub == nil {
+		return nil
+	}
+	ptr := pub.ptr()
+	for _, r := range p.Items() {
+		var start any
+		exists, deleted, live := false, false, false
+		switch r.BaseState {
+		case client.Live.String():
+			d, err := p.doc(ctx, p.Target, r.Name, r.Base)
+			if err != nil {
+				return fmt.Errorf("merge: %s/%s: %w", p.Target, r.Name, err)
+			}
+			start, exists, live = d, true, true
+		case client.Tombstoned.String():
+			if r.baseLast != "" {
+				if d, err := p.doc(ctx, p.Target, r.Name, r.baseLast); err == nil {
+					start, exists, deleted = d, true, true
+				}
+			}
+		}
+		after, del, err := ApplySteps(start, exists, deleted, r.Steps)
+		if err != nil || del {
+			continue
+		}
+		bv, bok := any(nil), false
+		if live {
+			bv, bok = pointer.Get(start, ptr)
+		}
+		av, aok := pointer.Get(after, ptr)
+		if aok == bok && (!aok || jsonv.Equal(av, bv)) {
+			continue
+		}
+		what := "changes " + pub.Path
+		if !live {
+			what = "creates the document with " + pub.Path + " set"
+			if r.BaseState == client.Tombstoned.String() {
+				what = "restores the document with " + pub.Path + " set"
+			}
+		}
+		x.conflict(RCPublished, b.Key, b.NS, r.Name, fmt.Sprintf("%s %s, which only step 3 sets (§F.9): leave it as in %s, or unset in a document the release creates", r.Name, what, b.Target), pub.Path)
+	}
+	return nil
 }
 
 func conflictText(r *Resource) string {
@@ -618,8 +823,8 @@ func (x *relCtx) applyResolutions(b *ReleaseBranch, p *Plan) error {
 
 var pinRe = regexp.MustCompile(`^/r/([a-z0-9][a-z0-9_-]{0,63})/([a-z0-9][a-z0-9._-]{0,127})/rev/(1[a-z2-7]{32})(#.*)?$`)
 
-// pins: a pinned reference (§6.5) or manifest entry (§B.4) naming a
-// revision of another listed branch that the merge replays would dangle.
+// pins: a pinned reference (§6.5) naming a revision of another listed
+// branch that the merge replays would dangle.
 func (x *relCtx) pins(ctx context.Context) error {
 	for _, b := range x.rp.Branches {
 		for name, d := range x.docs[b.Key] {
@@ -636,14 +841,15 @@ func (x *relCtx) pins(ctx context.Context) error {
 					continue
 				}
 				var r *Resource
-				for _, step := range []int{1, 2, 3} {
+				var tp *Plan
+				for _, step := range []int{StepSchemas, StepContent} {
 					if p := x.plans[stepKey(step, tb.Key)]; p != nil {
 						if rr := p.Resource(res); rr != nil {
-							r = rr
+							r, tp = rr, p
 						}
 					}
 				}
-				replays := r != nil && (r.Class == Replay || (r.Class == FastForward && p0(x, tb).Reencrypt))
+				replays := r != nil && (r.Class == Replay || (r.Class == FastForward && tp.Reencrypt))
 				if !replays {
 					continue
 				}
@@ -655,15 +861,6 @@ func (x *relCtx) pins(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-func p0(x *relCtx, b *ReleaseBranch) *Plan {
-	for _, s := range []int{3, 2, 1} {
-		if p := x.plans[stepKey(s, b.Key)]; p != nil {
-			return p
-		}
-	}
-	return &Plan{}
 }
 
 // pinnedLinks lists strings in d that are pinned links, except $schema
@@ -697,7 +894,7 @@ func pinnedLinks(d any) []string {
 // as clients do (§6.1): the path's namespace, then the release's branches,
 // then the others.
 func (x *relCtx) drafts(ctx context.Context) error {
-	prefer := x.rel.Doc.BranchNames()
+	prefer := append(x.rel.Doc.BranchNames(), x.onBranches...)
 	checked := map[string]bool{}
 	var check func(b *ReleaseBranch, name, path string, depth int) error
 	check = func(b *ReleaseBranch, name, path string, depth int) error {
@@ -848,11 +1045,11 @@ func SaveReleasePlan(ctx context.Context, c *client.Client, opt ReleaseOptions, 
 	return nil
 }
 
-// ApproveRelease plans again and, if the plan is clean and for the
-// release document's revision that was planned, freezes every listed
-// branch and stores the approved plan. A stored plan that is already
-// approved, or an approval that stopped part-way, is resumed: freezes
-// recorded by this approval are accepted.
+// ApproveRelease plans again and, if the plan is clean, for the release
+// document's revision that was planned and with the same digest, freezes
+// every listed branch and stores the approved plan. A stored plan that is
+// already approved, or an approval that stopped part-way, is resumed:
+// freezes recorded by this approval are accepted.
 func ApproveRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (*ReleasePlan, error) {
 	stored, err := LoadReleasePlan(ctx, c, opt)
 	if err != nil {
@@ -866,13 +1063,17 @@ func ApproveRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (
 		return stored, fmt.Errorf("merge: the release is already %s", stored.State)
 	}
 	if stored.Format != PlanFormat {
-		return stored, fmt.Errorf("%w: the stored plan predates the plan digest of §F.9 (format %d, now %d): plan again and review", ErrDigest, stored.Format, PlanFormat)
+		return stored, fmt.Errorf("%w: the stored plan is of format %d, not %d: plan again and review", ErrDigest, stored.Format, PlanFormat)
 	}
-	own := stored.FrozenBy()
 	// The person approves what they reviewed: the stored plan's choices.
+	if opt.Publish != nil && !samePublish(opt.Publish, stored.Publish) {
+		return stored, fmt.Errorf("%w: the stored plan publishes %v, not %v: plan again and review", ErrDigest, stored.Publish, opt.Publish)
+	}
+	opt.Publish = stored.Publish
 	if opt.Resolutions == nil {
 		opt.Resolutions = stored.resolutions()
 	}
+	own := stored.FrozenBy()
 	fresh, err := planRelease(ctx, c, opt, own)
 	if err != nil {
 		return nil, err
@@ -927,35 +1128,6 @@ func ApproveRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (
 		}
 	}
 	return fresh, SaveReleasePlan(ctx, c, opt, fresh)
-}
-
-// legacyAts gives each branch of a plan an earlier version stored, which
-// records no at, its ns_id before the approval's freeze (§F.9): the entry
-// before the config entry of its FrozenConfig. A branch that records
-// merged has no step left and keeps none.
-func legacyAts(ctx context.Context, c *client.Client, rp *ReleasePlan) error {
-	for _, b := range rp.Branches {
-		if b.At != "" || b.Merged != "" || b.FrozenConfig == "" {
-			continue
-		}
-		h, err := c.NSHead(ctx, b.NS)
-		if err != nil {
-			return err
-		}
-		log, err := c.NSLog(ctx, b.NS, h.ID, "")
-		if err != nil {
-			return err
-		}
-		for i := len(log) - 1; i > 0 && b.At == ""; i-- {
-			if log[i].Kind == "config" && log[i].Target == b.FrozenConfig {
-				b.At = log[i].Prev
-			}
-		}
-		if b.At == "" {
-			return fmt.Errorf("%w: %s's log has no freeze %s by the approval", ErrInvalidPlan, b.NS, b.FrozenConfig)
-		}
-	}
-	return nil
 }
 
 // entryBefore returns the ns_id before the entry id of ns's chain, which
@@ -1014,23 +1186,11 @@ func ApplyRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (*R
 	default:
 		return rp, fmt.Errorf("merge: the plan is %s, not approved", rp.State)
 	}
-	// A plan an earlier version stored (format 0) is planned and approved
-	// again, unless that version stopped part-way through merging it: such
-	// a merge resumes from that plan and never reverts (§F.9), its steps
-	// checked against the step digests it stored (approvedStep), each
-	// source.at its branch's ns_id before the approval's freeze
-	// (legacyAts).
-	legacy := rp.Format == 0 && rp.State == ReleaseMerging
-	if rp.Digest == "" || (rp.Format != PlanFormat && !legacy) {
-		return rp, fmt.Errorf("%w: it was approved without the plan digest of §F.9 (format %d, now %d): plan and approve again", ErrInvalidPlan, rp.Format, PlanFormat)
+	if rp.Format != PlanFormat || rp.Plan == nil || rp.Digest != PlanDigest(rp.Plan) {
+		return rp, fmt.Errorf("%w: the stored plan (format %d, now %d) doesn't hold the plan its digest is over: plan and approve again", ErrInvalidPlan, rp.Format, PlanFormat)
 	}
 	if err := checkApproved(ctx, c, rp); err != nil {
 		return rp, err
-	}
-	if legacy {
-		if err := legacyAts(ctx, c, rp); err != nil {
-			return rp, err
-		}
 	}
 	if rp.State == ReleaseApproved {
 		rp.State = ReleaseMerging
@@ -1042,11 +1202,16 @@ func ApplyRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (*R
 		if st.Done != "" {
 			continue
 		}
-		done, err := runStep(ctx, c, opt, rp, st)
+		done, idsOf, err := runStep(ctx, c, opt, rp, st)
 		if err != nil {
 			return rp, fmt.Errorf("merge: step %d (%s): %w", st.Step, st.Key, err)
 		}
-		st.Done = done
+		if done != "noop" && opt.AfterSubmit != nil {
+			if err := opt.AfterSubmit(st); err != nil {
+				return rp, err
+			}
+		}
+		st.Done, st.IDs = done, idsOf
 		if err := SaveReleasePlan(ctx, c, opt, rp); err != nil {
 			return rp, err
 		}
@@ -1137,8 +1302,9 @@ func allDone(rp *ReleasePlan) bool {
 // AbandonRelease gives a release up (§F.9 Abandoning): every listed
 // branch is frozen with "abandoned": true, which the janitor accepts only
 // from a grant chained to a * key of the branch (§F.6), so c should carry
-// an administrator's. A stored plan is marked abandoned. What step 1 merged stays in the schema namespace's
-// history, unused. It returns the branches it abandoned.
+// an administrator's. A stored plan is marked abandoned. What step 1
+// merged stays in the schema namespace's history, unused. It returns the
+// branches it abandoned.
 func AbandonRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) ([]string, error) {
 	rel, err := release.Load(ctx, c, opt.Release)
 	if err != nil {
@@ -1191,25 +1357,24 @@ type stepItem struct {
 	steps []client.Step
 }
 
-// stepPlan builds one step's batch from the stored plan, classified again
-// against the targets as they are: the plan (nil if nothing is left to
-// do) and the step's items (§F.9). planning builds it before anything is
-// submitted.
-func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan, st *ReleaseStep, planning bool) (*Plan, []stepItem, error) {
+// stepPlan builds the batch of step 1 or 2 from the stored plan's
+// branches, classified against the targets as they are: the plan (nil if
+// nothing is left to do) and the step's items (§F.9). A 412 on submitting
+// it stops the merge rather than classifying again (Options.noRetry).
+func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan, st *ReleaseStep) (*Plan, []stepItem, error) {
 	b := rp.Branch(st.Key)
 	if b == nil {
 		return nil, nil, fmt.Errorf("no branch for %s in the plan", st.Key)
 	}
 	var items []stepItem
-	all := st.Resources
-	if len(all) == 0 {
+	if len(st.Resources) == 0 {
 		return nil, items, nil
 	}
-	p, err := NewPlan(ctx, c, b.Target, b.NS, Options{Resources: all, BranchAt: b.At, SourceAuthorizations: opt.SourceAuthorizations, Signer: opt.Signer})
+	p, err := NewPlan(ctx, c, b.Target, b.NS, Options{Resources: st.Resources, BranchAt: b.At, SourceAuthorizations: opt.SourceAuthorizations, Signer: opt.Signer, noRetry: true})
 	if err != nil {
 		return nil, nil, err
 	}
-	if st.Step == 1 {
+	if st.Step == StepSchemas {
 		p.Order(st.Resources)
 		for _, r := range p.Resources {
 			if r.Class == Replay || r.Class == Purged || (r.Class == FastForward && r.NeedsPerson()) {
@@ -1217,7 +1382,7 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 			}
 		}
 	}
-	if st.Step == 3 {
+	if st.Step == StepContent {
 		for k, sr := range rp.Resolutions {
 			key, res, _ := strings.Cut(k, "/")
 			if key != st.Key || p.Resource(res) == nil {
@@ -1255,6 +1420,17 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 	return p, items, nil
 }
 
+// publishItems are step 3's digest items: for each document step 2
+// created, the published field set, its precondition the id step 2's item
+// leaves it at, { "batch", "item" } in the plan.
+func publishItems(st *ReleaseStep, pub *Publish) []any {
+	out := make([]any, 0, len(st.Resources))
+	for _, name := range st.Resources {
+		out = append(out, digestItem(name, map[string]any{"after": map[string]any{"step": StepContent, "key": st.Key, "item": name}}, []client.Step{pub.step()}))
+	}
+	return orderItems(st, out)
+}
+
 // digestItems renders a step's items for the plan's digest (§F.9), in the
 // order its batch sends them (orderItems).
 func digestItems(st *ReleaseStep, items []stepItem) []any {
@@ -1268,7 +1444,7 @@ func digestItems(st *ReleaseStep, items []stepItem) []any {
 // digestItem is one item of a plan's digest (§F.9): the resource, its
 // precondition and its steps (digestSteps). A precondition on the result
 // of an earlier step, written here as "after": { step, key, item },
-// PlanDigest turns into { batch, item }.
+// PlanObject turns into { batch, item }.
 func digestItem(name string, pre map[string]any, steps []client.Step) map[string]any {
 	m := map[string]any{"resource": name, "steps": digestSteps(steps)}
 	for k, v := range pre {
@@ -1282,7 +1458,7 @@ func digestItem(name string, pre map[string]any, steps []client.Step) map[string
 // a plan lists resources.
 func orderItems(st *ReleaseStep, items []any) []any {
 	pos := map[string]int{}
-	if st.Step == 1 {
+	if st.Step == StepSchemas {
 		for i, n := range st.Resources {
 			pos[n] = i + 1
 		}
@@ -1354,81 +1530,17 @@ func freshNonce(v any) bool {
 	return ok && seal.ValidNonce(s)
 }
 
-// stepDigest is the digest of one step's part of a plan, which the step
-// must still have when it is submitted.
-func stepDigest(st *ReleaseStep, items []any) string {
-	return ids.Of(jsonv.Canonical(map[string]any{"step": float64(st.Step), "key": st.Key, "items": items})).String()
-}
-
-// approvedStep reports whether a step's items are the ones approved: its
-// stored digest (stepDigest over digestItems), or, for a plan an earlier
-// version stored (format 0), that digest as the earlier version rendered
-// the items (legacyDigestItems), so a merge it stopped part-way resumes
-// from that plan (§F.9).
-func approvedStep(rp *ReleasePlan, st *ReleaseStep, items []stepItem) bool {
-	if stepDigest(st, digestItems(st, items)) == st.Digest {
-		return true
-	}
-	return rp.Format == 0 && stepDigest(st, legacyDigestItems(items)) == st.Digest
-}
-
-// legacyDigestItems renders a step's items as the step digests of format
-// 0 did: each step list with every $nonce member of a value, and the value
-// of every operation on a $nonce path, left out; the items by resource
-// name.
-func legacyDigestItems(items []stepItem) []any {
-	out := make([]any, 0, len(items))
-	for _, it := range items {
-		m := map[string]any{"resource": it.name, "steps": legacyStripNonces(jsonv.FromGo(StepsJSON(it.steps)))}
-		if m["steps"] == nil {
-			m["steps"] = []any{}
-		}
-		for k, v := range it.pre {
-			m[k] = v
-		}
-		out = append(out, m)
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		return out[i].(map[string]any)["resource"].(string) < out[j].(map[string]any)["resource"].(string)
-	})
-	return out
-}
-
-func legacyStripNonces(v any) any {
-	switch t := v.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(t))
-		for k, x := range t {
-			if k == "$nonce" {
-				continue
-			}
-			out[k] = legacyStripNonces(x)
-		}
-		if path, _ := t["path"].(string); path == "/$nonce" || strings.HasSuffix(path, "/$nonce") {
-			delete(out, "value")
-		}
-		return out
-	case []any:
-		out := make([]any, len(t))
-		for i, x := range t {
-			out[i] = legacyStripNonces(x)
-		}
-		return out
-	}
-	return v
-}
-
 // PlanObject is the plan a release's digest is over (§F.9):
 //
 //	{ "release": <the release document's revision path>,
-//	  "batches": [ { "ns", "source": { "ns", "at" },
+//	  "batches": [ { "ns", "source"?: { "ns", "at" },
 //	                 "items": [ { "resource", "ifMatch" | "ifNoneMatch", "steps" } … ] } … ] }
 //
-// the batches in the order they are submitted, one per step with items
-// (release batches carry no config), the items in batch order, and a
-// precondition on the result of an earlier batch's item { "batch", "item" },
-// indices from 0, in place of an id. items are each step's digest items
-// (stepPlan).
+// the batches in the order they are submitted, one per step with items,
+// only step 3's without source (release batches carry no config), the
+// items in batch order, and a precondition on the result of an earlier
+// batch's item { "batch", "item" }, indices from 0, in place of an id.
+// items are each step's digest items (digestItems, publishItems).
 func PlanObject(release string, branches []*ReleaseBranch, steps []*ReleaseStep, items map[*ReleaseStep][]any) (map[string]any, error) {
 	branch := map[string]*ReleaseBranch{}
 	for _, b := range branches {
@@ -1468,7 +1580,11 @@ func PlanObject(release string, branches []*ReleaseBranch, steps []*ReleaseStep,
 		}
 		k := stepKey(st.Step, st.Key)
 		index[k], names[k] = len(batches), ns
-		batches = append(batches, map[string]any{"ns": b.Target, "source": map[string]any{"ns": b.NS, "at": b.At}, "items": out})
+		batch := map[string]any{"ns": b.Target, "items": out}
+		if st.Step != StepPublish {
+			batch["source"] = map[string]any{"ns": b.NS, "at": b.At}
+		}
+		batches = append(batches, batch)
 	}
 	return map[string]any{"release": release, "batches": batches}, nil
 }
@@ -1476,7 +1592,7 @@ func PlanObject(release string, branches []*ReleaseBranch, steps []*ReleaseStep,
 // PlanDigest is text(trunc160(sha256(canonical(plan)))) (§F.9), plan as
 // PlanObject builds it.
 func PlanDigest(plan map[string]any) string {
-	return ids.Of(jsonv.Canonical(plan)).String()
+	return ids.Of(jsonv.Canonical(jsonv.FromGo(plan))).String()
 }
 
 func slicesIndex(xs []string, s string) int {
@@ -1488,23 +1604,73 @@ func slicesIndex(xs []string, s string) int {
 	return -1
 }
 
-// digest computes the plan's digest and each step's, building every step
-// as it would be submitted (stepPlan, planning).
+// digest builds every step as it would be submitted (stepPlan,
+// publishItems), the plan (PlanObject) and its digest, and each step's
+// batch index.
 func (x *relCtx) digest(ctx context.Context) error {
 	items := map[*ReleaseStep][]any{}
+	content := map[string][]stepItem{}
 	for _, st := range x.rp.Steps {
-		_, its, err := stepPlan(ctx, x.c, x.opt, x.rp, st, true)
-		if err != nil {
-			return err
+		switch st.Step {
+		case StepSchemas, StepContent:
+			_, its, err := stepPlan(ctx, x.c, x.opt, x.rp, st)
+			if err != nil {
+				return err
+			}
+			items[st] = digestItems(st, its)
+			if st.Step == StepContent {
+				content[st.Key] = its
+			}
+		case StepPublish:
+			for _, n := range st.Resources {
+				found := false
+				for _, it := range content[st.Key] {
+					found = found || it.name == n
+				}
+				if !found {
+					return fmt.Errorf("merge: %s/%s is to be published but has no item in step 2", st.Key, n)
+				}
+			}
+			items[st] = publishItems(st, x.rp.Publish)
 		}
-		items[st] = digestItems(st, its)
-		st.Digest = stepDigest(st, items[st])
 	}
 	plan, err := PlanObject(x.rp.Release+"/rev/"+x.rp.Revision, x.rp.Branches, x.rp.Steps, items)
 	if err != nil {
 		return err
 	}
-	x.rp.Digest = PlanDigest(plan)
+	n := 0
+	for _, st := range x.rp.Steps {
+		st.Batch = nil
+		if len(items[st]) > 0 && x.rp.Branch(st.Key) != nil {
+			i := n
+			st.Batch = &i
+			n++
+		}
+	}
+	// As stored: the JSON value model, so a reloaded plan compares equal.
+	x.rp.Plan = jsonv.FromGo(plan).(map[string]any)
+	x.rp.Digest = PlanDigest(x.rp.Plan)
+	return nil
+}
+
+// batchItems returns the stored plan's items of batch i.
+func (rp *ReleasePlan) batchItems(i int) ([]any, error) {
+	bs, _ := rp.Plan["batches"].([]any)
+	if i < 0 || i >= len(bs) {
+		return nil, fmt.Errorf("%w: the stored plan has no batch %d", ErrInvalidPlan, i)
+	}
+	m, _ := bs[i].(map[string]any)
+	its, _ := m["items"].([]any)
+	return its, nil
+}
+
+// stepOfBatch returns the step whose batch is i.
+func (rp *ReleasePlan) stepOfBatch(i int) *ReleaseStep {
+	for _, st := range rp.Steps {
+		if st.Batch != nil && *st.Batch == i {
+			return st
+		}
+	}
 	return nil
 }
 
@@ -1512,65 +1678,230 @@ func (x *relCtx) digest(ctx context.Context) error {
 // were approved: the merge stops for a new approval (§F.9).
 var ErrPlanChanged = errors.New("merge: the step differs from the approved plan; plan and approve again")
 
-// runStep classifies one step again, checks it against the approved
-// plan, dry-runs it and submits it. It returns the batch's ns_id, or
-// "noop".
-func runStep(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan, st *ReleaseStep) (string, error) {
-	b := rp.Branch(st.Key)
-	if b == nil {
-		return "", fmt.Errorf("no branch for %s in the plan", st.Key)
+// runStep submits one step: classified again, checked against the stored
+// plan's batch, dry-run and submitted. It returns the batch's ns_id, or
+// "noop", and the ids the batch left its resources at. A step whose batch
+// went in before it was recorded is found in the target's log.
+func runStep(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan, st *ReleaseStep) (string, map[string]string, error) {
+	if st.Batch == nil {
+		return "noop", nil, nil
 	}
-	p, items, err := stepPlan(ctx, c, opt, rp, st, false)
+	want, err := rp.batchItems(*st.Batch)
 	if err != nil {
-		return "", err
+		return "", nil, err
+	}
+	if st.Step == StepPublish {
+		return runPublish(ctx, c, opt, rp, st, want)
+	}
+	b := rp.Branch(st.Key)
+	p, items, err := stepPlan(ctx, c, opt, rp, st)
+	if err != nil {
+		return "", nil, err
 	}
 	if p == nil {
-		return "noop", nil // nothing left: a resumed step that went in
+		// Nothing left: the batch went in before it was recorded.
+		id, got, err := findMergeBatch(ctx, c, b.Target, b.NS, b.At, st.Resources)
+		if err != nil {
+			return "", nil, err
+		}
+		if id == "" {
+			return "", nil, fmt.Errorf("%w (step %d, %s: nothing is left to merge, and %s's log has no batch of it)", ErrPlanChanged, st.Step, st.Key, b.Target)
+		}
+		return id, got, nil
 	}
-	if st.Digest != "" && !approvedStep(rp, st, items) {
-		return "", fmt.Errorf("%w (step %d, %s)", ErrPlanChanged, st.Step, st.Key)
+	if !jsonv.Equal(jsonv.FromGo(digestItems(st, items)), want) {
+		return "", nil, fmt.Errorf("%w (step %d, %s)", ErrPlanChanged, st.Step, st.Key)
 	}
 	if _, err := p.DryRun(ctx); err != nil {
-		return "", fmt.Errorf("dry run: %w", err)
+		return "", nil, fmt.Errorf("dry run: %w", err)
 	}
 	res, err := p.Apply(ctx)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if res.Noop {
-		return "noop", nil
+		return "noop", nil, nil
 	}
-	return res.NSID, nil
+	got := map[string]string{}
+	for name, ids := range res.IDs {
+		if len(ids) > 0 {
+			got[name] = ids[len(ids)-1]
+		}
+	}
+	return res.NSID, got, nil
 }
 
-// itemActions are the actions an item's steps take (§6.2): create on an
-// absent resource, restore on a tombstone, append on a live document,
-// delete for a "delete" step.
-func itemActions(r *Resource) []string {
-	var out []string
-	add := func(a string) {
-		if !slicesContains(out, a) {
-			out = append(out, a)
+// findMergeBatch finds, in target's log, the latest batch whose source is
+// branch at at and that has an entry for one of resources: its ns_id and
+// the ids its entries left them at, or "".
+func findMergeBatch(ctx context.Context, c *client.Client, target, branch, at string, resources []string) (string, map[string]string, error) {
+	return findBatch(ctx, c, target, func(e client.NSEntry) bool {
+		if !IsMergeOf(e, branch) || e.Source["at"] != at {
+			return false
+		}
+		for _, s := range e.Entries {
+			if slicesContains(resources, s.Resource) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// findBatch returns the latest batch entry of ns's log that match accepts:
+// its ns_id and, per resource, the id its entry left it at.
+func findBatch(ctx context.Context, c *client.Client, ns string, match func(client.NSEntry) bool) (string, map[string]string, error) {
+	h, err := c.NSHead(ctx, ns)
+	if err != nil {
+		return "", nil, err
+	}
+	log, err := c.NSLog(ctx, ns, h.ID, "")
+	if err != nil {
+		return "", nil, err
+	}
+	for i := len(log) - 1; i >= 0; i-- {
+		e := log[i]
+		if e.Kind != "batch" || !match(e) {
+			continue
+		}
+		got := map[string]string{}
+		for _, s := range e.Entries {
+			if s.Kind == "head" || s.Kind == "tombstone" {
+				got[s.Resource] = s.Target
+			}
+		}
+		return e.ID, got, nil
+	}
+	return "", nil, nil
+}
+
+// runPublish submits step 3 (§F.9): one batch without source, each item
+// setting the published field on a document step 2 created, with If-Match
+// the id step 2 left it at. A document that has moved on since is a
+// change to the approved plan, unless the move is this step's own item,
+// which went in before it was recorded.
+func runPublish(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan, st *ReleaseStep, want []any) (string, map[string]string, error) {
+	b := rp.Branch(st.Key)
+	pub := rp.Publish
+	if b == nil || pub == nil {
+		return "", nil, fmt.Errorf("%w: step 3 of %s without a branch or a published field", ErrInvalidPlan, st.Key)
+	}
+	np, err := noncePlan(ctx, c, b.Target)
+	if err != nil {
+		return "", nil, err
+	}
+	if np.TargetLevel == "e2e" {
+		return "", nil, fmt.Errorf("%s is an e2e namespace, whose readers aren't filtered by its documents (§7.9): it has no step 3", b.Target)
+	}
+	ptr := pub.ptr()
+	// No source, so no Source-Authorization: step 3 reads nothing of the
+	// branches, and the schemas its documents name are in the bases.
+	req := client.BatchRequest{}
+	got := map[string]string{}
+	var gone []string // items that went in before they were recorded
+	for i, it := range want {
+		m, _ := it.(map[string]any)
+		name, _ := m["resource"].(string)
+		pre, _ := m["ifMatch"].(map[string]any)
+		bi, ok1 := pre["batch"].(float64)
+		ii, ok2 := pre["item"].(float64)
+		src := rp.stepOfBatch(int(bi))
+		if !ok1 || !ok2 || src == nil || src.Done == "" {
+			return "", nil, fmt.Errorf("%w: step 3's item %d of %s names no submitted batch", ErrInvalidPlan, i, st.Key)
+		}
+		srcItems, err := rp.batchItems(int(bi))
+		if err != nil {
+			return "", nil, err
+		}
+		if int(ii) >= len(srcItems) || srcItems[int(ii)].(map[string]any)["resource"] != name {
+			return "", nil, fmt.Errorf("%w: step 3's item %s of %s follows another resource", ErrInvalidPlan, name, st.Key)
+		}
+		parent := src.IDs[name]
+		if parent == "" {
+			return "", nil, fmt.Errorf("%w: step %d recorded no id for %s", ErrInvalidPlan, src.Step, name)
+		}
+		steps := []client.Step{pub.step()}
+		if !jsonv.Equal(jsonv.FromGo(digestItem(name, nil, steps)["steps"]), m["steps"]) {
+			return "", nil, fmt.Errorf("%w (step 3, %s/%s)", ErrPlanChanged, st.Key, name)
+		}
+		h, err := c.Head(ctx, b.Target, name)
+		if err != nil {
+			return "", nil, err
+		}
+		if h.State == client.Live && h.ID != parent {
+			// The item went in already: the one revision after step 2's
+			// sets the field, and nothing else.
+			es, err := c.Log(ctx, b.Target, name, h.ID, parent)
+			if err == nil && len(es) == 1 && es[0].Parent == parent {
+				if d, err := c.Doc(ctx, b.Target, name, h.ID); err == nil {
+					pd, perr := c.Doc(ctx, b.Target, name, parent)
+					if v, ok := pointer.Get(d.Value, ptr); ok && perr == nil && jsonv.Equal(v, jsonv.FromGo(pub.Value)) {
+						if after, _, err := ApplySteps(pd.Value, true, false, steps); err == nil && jsonv.Equal(np.nonceless(after), np.nonceless(d.Value)) {
+							got[name] = h.ID
+							gone = append(gone, name)
+							continue
+						}
+					}
+				}
+			}
+		}
+		if h.State != client.Live || h.ID != parent {
+			return "", nil, fmt.Errorf("%w (step 3: %s/%s is %s %s, not %s, which step %d left it at)", ErrPlanChanged, b.Target, name, h.State, h.ID, parent, src.Step)
+		}
+		req.Items = append(req.Items, client.BatchItem{Resource: name, IfMatch: parent, Steps: np.withNonces(steps)})
+	}
+	if len(req.Items) == 0 {
+		id, _, err := findBatch(ctx, c, b.Target, func(e client.NSEntry) bool {
+			if e.HasSource {
+				return false
+			}
+			for _, s := range e.Entries {
+				if s.Kind == "head" && got[s.Resource] == s.Target {
+					return true
+				}
+			}
+			return false
+		})
+		if err != nil {
+			return "", nil, err
+		}
+		if id == "" {
+			id = "noop"
+		}
+		return id, got, nil
+	}
+	if len(gone) > 0 {
+		// A batch is atomic (§7.5): part of one can't have gone in.
+		return "", nil, fmt.Errorf("%w (step 3 of %s: %s published, the rest not)", ErrPlanChanged, st.Key, strings.Join(gone, ", "))
+	}
+	if opt.Signer != nil {
+		origin, err := c.Origin(ctx)
+		if err != nil {
+			return "", nil, fmt.Errorf("signing needs the deployment's origin: %w", err)
+		}
+		for i, it := range req.Items {
+			if req.Items[i].Steps, err = SignSteps(*opt.Signer, origin, b.Target, it.Resource, it.IfMatch, it.Steps); err != nil {
+				return "", nil, err
+			}
 		}
 	}
-	live := !r.IfNoneMatch && r.BaseState == client.Live.String()
-	exists := !r.IfNoneMatch && r.BaseState != client.NotFound.String() && r.Base != ""
-	for _, s := range r.Steps {
-		switch {
-		case s.Delete:
-			add("delete")
-			live = false
-		case live:
-			add("append")
-		case exists:
-			add("restore")
-			live = true
-		default:
-			add("create")
-			live, exists = true, true
+	dry, err := c.Batch(ctx, b.Target, req, true)
+	if err != nil {
+		return "", nil, fmt.Errorf("dry run: %w", err)
+	}
+	if fe := failedItems(b.Target, dry); fe != nil {
+		return "", nil, fmt.Errorf("dry run: %w", fe)
+	}
+	res, err := c.Batch(ctx, b.Target, req, false)
+	if err != nil {
+		return "", nil, err
+	}
+	for _, it := range res.Items {
+		if len(it.IDs) > 0 {
+			got[it.Resource] = it.IDs[len(it.IDs)-1]
 		}
 	}
-	return out
+	return res.NSID, got, nil
 }
 
 func slicesContains(xs []string, s string) bool {
@@ -1580,14 +1911,6 @@ func slicesContains(xs []string, s string) bool {
 		}
 	}
 	return false
-}
-
-func anyStrings(xs []string) []any {
-	out := make([]any, len(xs))
-	for i, x := range xs {
-		out[i] = x
-	}
-	return out
 }
 
 // BatchBody renders a batch request as its JSON body.

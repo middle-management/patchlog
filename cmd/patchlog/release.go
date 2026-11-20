@@ -6,14 +6,20 @@ package main
 //
 // plan classifies the release and reports its conflicts, and stores the
 // plan (as {release}.merge in --state-ns, default the release document's
-// namespace) unless --dry-run. approve, run by the approving person, plans
-// again, requires it clean and for the same release revision, and freezes
-// every listed branch. apply merges in its steps (schemas by
-// fast-forward, then content), each classified again with a dry run right
-// before it is submitted, and resumes a merge that stopped. status shows
-// the stored plan. rebase creates a successor of every branch (§F.5) and
-// writes a new revision of the release document listing them. abandon
-// freezes every branch with abandoned: true (needs a * key, §F.6).
+// namespace) unless --dry-run; with --publish, step 3 sets that field on
+// the documents the release creates. approve, run by the approving
+// person, plans again, requires it clean, for the same release revision
+// and digest, and freezes every listed branch. apply merges from the
+// stored plan in its steps (schemas by fast-forward, then content, then
+// publishing), each classified again with a dry run right before it is
+// submitted, and resumes a merge that stopped. status shows the stored
+// plan. rebase creates a successor of every branch (§F.5) and writes a new
+// revision of the release document listing them. abandon freezes every
+// branch with abandoned: true (needs a * key, §F.6).
+//
+// The published field is guarded in the content bases by a rule that
+// only a group (or role) of the merge service's grant passes (§6.4.4,
+// internal/merge's package documentation): --bearer for apply carries it.
 
 import (
 	"context"
@@ -24,6 +30,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/merge"
 	"github.com/middle-management/patchlog/internal/release"
 )
@@ -44,7 +51,8 @@ type releaseVerbCmd struct {
 	StateNS     string   `arg:"--state-ns" placeholder:"NS" help:"namespace of the stored plan (default: the release document's)"`
 	DryRun      bool     `arg:"--dry-run" help:"plan: report only, store nothing"`
 	Suffix      string   `arg:"--suffix" help:"rebase: successor names are each branch's name plus this suffix"`
-	At          string   `arg:"--at" placeholder:"ID" help:"rebase: the new release document's combined checkpoint (§F.9), if known"`
+	Publish     string   `arg:"--publish" placeholder:"PTR" help:"plan: the field readers' rules test that marks documents published, e.g. /published; step 3 sets it on the documents the release creates, which must carry it unset, and a change to it in steps 1 and 2 is a conflict (§F.9)"`
+	PublishVal  string   `arg:"--publish-value" placeholder:"JSON" help:"plan: the value step 3 sets --publish to (default true)"`
 	LeaveOut    bool     `arg:"--leave-out" help:"rebase: each branch's switch, although the replay leaves resources the old branch changed unrecorded in the successor (left out of an item, purged in the successor only), giving them up (§F.5): their changes stay only in the frozen old branch"`
 	Digest      string   `arg:"--digest" placeholder:"D" help:"approve: the plan digest you reviewed (plan prints it); approval fails unless planning again gives it (§F.9)"`
 	Identity    []string `arg:"--identity,separate" placeholder:"KEY.JWK" help:"rebase: file with an X25519 private key (a private JWK {kty, crv, x, d}, or base64url d) for e2e namespaces (Addendum E.3): the key the keyrings (and --bearer's enc) name, to read the branch and re-encrypt for the target (§F.8); repeatable when they name different keys"`
@@ -72,7 +80,7 @@ func (a *releaseVerbCmd) run(sub string) {
 		if err != nil {
 			toolFatal(err)
 		}
-		res, err := merge.RebaseRelease(ctx, c, merge.RebaseReleaseOptions{Release: link, Suffix: a.Suffix, At: a.At, LeaveOut: a.LeaveOut, SuccessorReaders: succReaders,
+		res, err := merge.RebaseRelease(ctx, c, merge.RebaseReleaseOptions{Release: link, Suffix: a.Suffix, LeaveOut: a.LeaveOut, SuccessorReaders: succReaders,
 			Plan: merge.Options{E2E: e2eView(c, a.Identity), Signer: tf.signer()}})
 		if tf.JSON {
 			out := map[string]any{"result": res}
@@ -141,6 +149,22 @@ func (a *releaseVerbCmd) run(sub string) {
 
 	opt := merge.ReleaseOptions{Release: link, StateNS: a.StateNS, SourceAuthorizations: a.SourceGrant, Who: whoAmI(tf),
 		Digest: a.Digest, Signer: tf.signer()}
+	if a.PublishVal != "" && a.Publish == "" {
+		toolFatal(errors.New("--publish-value needs --publish"))
+	}
+	if a.Publish != "" {
+		if sub != "plan" {
+			toolFatal(fmt.Errorf("--publish is planned: %s takes the stored plan's", sub))
+		}
+		opt.Publish = &merge.Publish{Path: a.Publish}
+		if a.PublishVal != "" {
+			v, err := jsonv.Parse([]byte(a.PublishVal))
+			if err != nil {
+				toolFatal(fmt.Errorf("--publish-value: %w", err))
+			}
+			opt.Publish.Value = v
+		}
+	}
 	for _, s := range a.Resolve {
 		k, file, ok := strings.Cut(s, "=")
 		if !ok || !strings.Contains(k, "/") {
@@ -240,7 +264,10 @@ func printReleasePlan(rp *merge.ReleasePlan) {
 		}
 		fmt.Println(line)
 	}
-	names := map[int]string{1: "schemas (fast-forward)", 3: "content"}
+	if rp.Publish != nil {
+		fmt.Printf("  step 3 sets %s to %s\n", rp.Publish.Path, jsonv.Canonical(jsonv.FromGo(rp.Publish.Value)))
+	}
+	names := map[int]string{merge.StepSchemas: "schemas (fast-forward)", merge.StepContent: "content", merge.StepPublish: "publish"}
 	for _, st := range rp.Steps {
 		done := ""
 		if st.Done != "" {
