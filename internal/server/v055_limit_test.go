@@ -65,7 +65,6 @@ func TestV055LimitConfigFields(t *testing.T) {
 	expectLimit(t, put(map[string]any{"opsPerSet": 5000}), 422, "opsPerSet", 5000, int64(max.OpsPerSet))
 	expectLimit(t, put(map[string]any{"ratePerNamespace": map[string]any{"rate": 1e9, "burst": 1}}), 422, "ratePerNamespace", -1, -1)
 	expectLimit(t, put(map[string]any{"retryWindow": "P400D"}), 422, "retryWindow", -1, -1)
-	expectLimit(t, put(map[string]any{"remoteRegistration": "P100000D"}), 422, "remoteRegistration", -1, -1)
 	expectLimit(t, put(map[string]any{"blobGrace": "PT1M"}), 422, "blobGrace", -1, -1)
 
 	// The document's own rulesPerNamespace bounds its rules.

@@ -311,10 +311,8 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 	r := t.resource(n.id, name)
 	v.own = r
 	if r != nil {
-		// A remote branch's shadow mirrors a resource purged at its base
-		// before at with its head's id alone, and no history: purged as
-		// of at (insertShadow).
-		if r.state == statePurged && (asOf == nil || n.isShadow() && !t.hasHistory(r.id)) {
+		// Purged at the head.
+		if r.state == statePurged && asOf == nil {
 			v.state, v.src = Purged, r
 			if r.headSeq.Valid {
 				v.head = t.rev(r.headSeq.Int64)
@@ -370,14 +368,6 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 	}
 	v.state = NotFound
 	return v
-}
-
-// hasHistory reports whether res has head_history rows: entries of its
-// own namespace that moved its head.
-func (t *tx) hasHistory(res int64) bool {
-	var has bool
-	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM head_history WHERE res = ?)`, res).Scan(&has))
-	return has
 }
 
 // segment is a stretch of one resource's chain: rows of res with seq ≤ max.
@@ -822,8 +812,7 @@ func servedAtLeast(r *revRow) int {
 // prunedIn reports a range's newest pruned entry (§8.6) as a prunedError,
 // or purgedError if its resource is purged; segs are the range's segments,
 // newest first, the oldest one from lo (exclusive). Pruning drops the patch
-// sets of a resource's revisions below its horizon (a remote branch's
-// mirrored horizon has none itself, §G.3; a partial restore fills some
+// sets of a resource's revisions below its horizon (a partial restore fills some
 // back in), and purging all of them, so a resource that is neither is
 // looked at only at or below its horizon: a range above every horizon
 // costs a query per segment, not a row per entry.

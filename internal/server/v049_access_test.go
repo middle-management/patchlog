@@ -5,8 +5,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-
-	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // v0.49 §6.1, §7: a referrer in a listed namespace that is public, and
@@ -124,43 +122,6 @@ func TestV049KeysUnrestricted(t *testing.T) {
 	expectCode(t, r, 401, "unauthenticated")
 }
 
-// v0.49 §C.5 "Writes that need it": branching and remote registration
-// check read as gate step 1 checks verbs, in a public namespace too. The
-// grant must allow read and read the namespace unrestricted, and its rules
-// that refer only to /action, /principal or /now must pass with /action
-// read; rules over the rest of the envelope, such as /doc, are judged at
-// step 6 against the write's own envelope.
-func TestV049BranchReadCheck(t *testing.T) {
-	t.Parallel()
-	for _, read := range []string{"grant", "public"} {
-		f := newAuthFixture(t, map[string]any{"read": read})
-		e := f.tenv
-		e.create("sec", "a", map[string]any{"v": 1.0}, f.adminG)
-		at := e.nsHead("sec", f.adminG)
-		mk := func(can []string, rules ...any) string {
-			extra := map[string]any{}
-			if len(rules) > 0 {
-				extra["rules"] = rules
-			}
-			return e.grant(f.admin, "user:x", []string{"sec", "sec-b"}, can, extra)
-		}
-		onlyVerb := func(verb string) any { return map[string]any{"op": "test", "path": "/action", "value": verb} }
-		team := map[string]any{"op": "test", "path": "/doc/x-team", "value": "a"}
-
-		// No read, or a rule refusing it for /action read.
-		for _, g := range []string{mk([]string{"branch", "export"}), mk([]string{"read", "branch"}, onlyVerb("branch"))} {
-			expectCode(t, e.branch("sec", map[string]any{"name": "sec-b"}, g), 403, "forbidden")
-		}
-		expectCode(t, e.register("sec", "rel", at, "", mk([]string{"read", "export"}, onlyVerb("export"))), 403, "forbidden")
-
-		// A /doc rule is the branch's to pass, at step 6.
-		g := mk([]string{"read", "branch"}, team)
-		expectCode(t, e.branch("sec", map[string]any{"name": "sec-b"}, g), 403, "forbidden")
-		expect(t, e.branch("sec", map[string]any{"name": "sec-b", "patches": ops(op("add", "/x-team", "a"))}, g), 201)
-		expect(t, e.register("sec", "rel", at, "", mk([]string{"read", "export"})), 201)
-	}
-}
-
 // v0.49 §7.4, §C.7: a namespace can't start requiring nonces while a
 // dependent, a branch at any depth that isn't purged, doesn't: 409 in_use
 // with the dependents, leaves first, the order to set them in.
@@ -196,67 +157,6 @@ func TestV049NonceDependents(t *testing.T) {
 	expect(t, e.patchNS("m", require, ""), 201)
 	// Turning it off needs nothing of them.
 	expect(t, e.patchNS("m", ops(op("replace", "/nonce", "optional")), ""), 201)
-}
-
-// v0.49 §C.7, §G.3: a remote branch follows its base's current namespace
-// document, not the one at at. Schema namespaces created to mirror for it
-// start optional, since their history keeps its ids, and take their
-// source's setting with a config write once it is in; they stay optional
-// if B can't read the source's namespace document.
-func TestV049RemoteBranchNonces(t *testing.T) {
-	t.Parallel()
-	a, b, rt := pair(t, nil, nil)
-	schema := func(ns, name string) string {
-		a.mkNS(ns, map[string]any{"read": "public", "nonce": "required"})
-		return "/r/" + ns + "/" + name + "/rev/" + a.create(ns, name, map[string]any{"$schema": dialect, "type": "object", "$nonce": seal.NewNonce()})
-	}
-	match, team := schema("schemas", "match"), schema("hidden", "team")
-	a.mkNS("main", map[string]any{"read": "public"})
-	a.create("main", "derby", map[string]any{"$schema": match})
-	a.create("main", "oaks", map[string]any{"$schema": team})
-	at := a.nsHead("main")
-	// Required since at.
-	expect(t, a.patchNS("main", ops(op("add", "/nonce", "required")), ""), 201)
-	rt.set(refusing(t, a, "/ns/hidden", 404), "")
-	r := b.mkRemote("rel", remoteGenesis("main", at, nil))
-	if r.Code != 422 || !strings.Contains(r.String(), "/nonce") {
-		t.Fatalf("remote branch without nonce: %d %s", r.Code, r.Body)
-	}
-	expect(t, b.mkRemote("rel", remoteGenesis("main", at, map[string]any{"nonce": "required"})), 201)
-
-	log := func(ns string) []any { return b.get("/ns/" + ns + "/rev/" + b.nsHead(ns) + "/log").Arr() }
-	kinds := func(ns string) []string {
-		var out []string
-		for _, x := range log(ns) {
-			m := x.(map[string]any)
-			if m["author"] != "op" {
-				t.Fatalf("%s: entry %v isn't the creating operator's", ns, m)
-			}
-			out = append(out, m["kind"].(string))
-		}
-		return out
-	}
-	if k := kinds("schemas"); !slices.Equal(k, []string{"config", "batch", "config"}) {
-		t.Fatalf("schemas log %v", k)
-	}
-	first := b.get("/ns/schemas/rev/" + log("schemas")[0].(map[string]any)["id"].(string))
-	expect(t, first, 200)
-	if first.Obj()["nonce"] != nil || b.nsDoc("schemas")["nonce"] != "required" {
-		t.Fatalf("schemas: genesis %s, now %v", first.Body, b.nsDoc("schemas"))
-	}
-	if k := kinds("hidden"); !slices.Equal(k, []string{"config", "batch"}) || b.nsDoc("hidden")["nonce"] != nil {
-		t.Fatalf("hidden: log %v, document %v", k, b.nsDoc("hidden"))
-	}
-	h := b.head("schemas", "match")
-	expectCode(t, b.write("PATCH", "schemas", "match", h, ops(op("add", "/title", "x"))), 422, "nonce")
-
-	// Required at at but no longer: the branch may leave it optional.
-	a.mkNS("old", map[string]any{"read": "public", "nonce": "required"})
-	a.create("old", "x", map[string]any{"$nonce": seal.NewNonce()})
-	at = a.nsHead("old")
-	expect(t, a.patchNS("old", ops(op("replace", "/nonce", "optional")), ""), 201)
-	expect(t, b.mkRemote("rel-old", remoteGenesis("old", at, nil)), 201)
-	b.appendRev("rel-old", "x", b.head("rel-old", "x"), ops(op("add", "/v", 1.0)))
 }
 
 // v0.49 §C.5, §12: while authentication is disabled, edge-grant issuance
@@ -333,5 +233,39 @@ func TestV049EdgeGrantsPurged(t *testing.T) {
 		if len(r.H.Values("Set-Cookie")) > 0 {
 			t.Errorf("%s: cookies set on a refusal: %v", c.name, r.H.Values("Set-Cookie"))
 		}
+	}
+}
+
+// v0.49 §C.5 "Writes that need it": branching and remote registration
+// check read as gate step 1 checks verbs, in a public namespace too. The
+// grant must allow read and read the namespace unrestricted, and its rules
+// that refer only to /action, /principal or /now must pass with /action
+// read; rules over the rest of the envelope, such as /doc, are judged at
+// step 6 against the write's own envelope.
+func TestV049BranchReadCheck(t *testing.T) {
+	t.Parallel()
+	for _, read := range []string{"grant", "public"} {
+		f := newAuthFixture(t, map[string]any{"read": read})
+		e := f.tenv
+		e.create("sec", "a", map[string]any{"v": 1.0}, f.adminG)
+		mk := func(can []string, rules ...any) string {
+			extra := map[string]any{}
+			if len(rules) > 0 {
+				extra["rules"] = rules
+			}
+			return e.grant(f.admin, "user:x", []string{"sec", "sec-b"}, can, extra)
+		}
+		onlyVerb := func(verb string) any { return map[string]any{"op": "test", "path": "/action", "value": verb} }
+		team := map[string]any{"op": "test", "path": "/doc/x-team", "value": "a"}
+
+		// No read, or a rule refusing it for /action read.
+		for _, g := range []string{mk([]string{"branch"}), mk([]string{"read", "branch"}, onlyVerb("branch"))} {
+			expectCode(t, e.branch("sec", map[string]any{"name": "sec-b"}, g), 403, "forbidden")
+		}
+
+		// A /doc rule is the branch's to pass, at step 6.
+		g := mk([]string{"read", "branch"}, team)
+		expectCode(t, e.branch("sec", map[string]any{"name": "sec-b"}, g), 403, "forbidden")
+		expect(t, e.branch("sec", map[string]any{"name": "sec-b", "patches": ops(op("add", "/x-team", "a"))}, g), 201)
 	}
 }

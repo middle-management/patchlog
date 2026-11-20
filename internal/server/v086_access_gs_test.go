@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// CONFORMANCE Access 145 at the origin, over HTTP (SERVICES §B.11.9 gs,
+// CONFORMANCE Access 145 at the origin, over HTTP (SERVICES §7.9 gs,
 // v0.86): li holds a filtered gs cookie for matches; matches changes the
 // groups scope of the key her grant came from, then changes it back in a
 // later config entry. On the cookie, at the later at, /heads, the log

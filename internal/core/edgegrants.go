@@ -60,12 +60,12 @@ const maxEdgePrefixes = 100
 
 // EdgeGrant is one namespace's edge grant: reads of NS, fixed to Resource
 // if set, or to NS's filtered reads for the subject set GS if that is set
-// (§B.11.9). It names no principal (§C.5.3).
+// (§7.9). It names no principal (§C.5.3).
 type EdgeGrant struct {
 	NS       string
 	Resource string
 	// GS is a partial reader's subject set, whose edge grant covers
-	// /ns/{NS}/g/{GS} alone (§B.11.9 Edge grants). Only the filtered
+	// /ns/{NS}/g/{GS} alone (§7.9 Edge grants). Only the filtered
 	// entry points admit it (filteredAdmit); edgeReader refuses it.
 	GS string
 	// Prefix is a verified edge grant's prefix (empty when issuing).
@@ -115,7 +115,7 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 // IssueEdgeGrantsWithin is IssueEdgeGrants for a server whose edge grants
 // live ttl at the longest, at most a quarter of an hour (§C.5.2). The
 // cookie of a partial reader's subject set expires at the second its
-// edge grant's Exp names, which a read under it is judged by (§B.11.9
+// edge grant's Exp names, which a read under it is judged by (§7.9
 // gs, recordFilteredGS), so that second is within ttl.
 func (e *Engine) IssueEdgeGrantsWithin(ctx context.Context, bearers []string, ttl time.Duration) (*EdgeGrants, error) {
 	if ttl <= 0 || ttl > maxEdgeTTL {
@@ -199,7 +199,7 @@ func (e *Engine) IssueEdgeGrantsWithin(ctx context.Context, bearers []string, tt
 		return nil, err
 	}
 	// A partial reader's subject sets are recorded before their cookies
-	// are set, so every instance judges them (§B.11.9 gs).
+	// are set, so every instance judges them (§7.9 gs).
 	// Each takes the second its cookie expires at, at or before the one
 	// the exchange would give it, which its edge grant then carries
 	// (§C.5.2: whole seconds off, so that cookies that must be told
@@ -243,7 +243,7 @@ type edgeCollect struct {
 	grants []EdgeGrant
 	seen   map[string]bool // the prefixes of grants
 	over   bool
-	// recs are the filtered_gs rows of the GS edge grants (§B.11.9).
+	// recs are the filtered_gs rows of the GS edge grants (§7.9).
 	recs []*gsRecord
 }
 
@@ -341,7 +341,7 @@ func refusalRank(err *Error) int {
 // edgeIssue is a grant's edge grants in one namespace: one per name its
 // rules fix /resource to, else (names nil) one namespace-wide, or, for a
 // partial reader of a covered namespace, one for its subject set gs, with
-// rec its filtered_gs row (§B.11.9); and the key of its principal's
+// rec its filtered_gs row (§7.9); and the key of its principal's
 // buckets (actor.bucketKey).
 type edgeIssue struct {
 	names  []string
@@ -368,7 +368,7 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 	names, safe := edgeReadScope(a)
 	if names == nil && !t.readsNS(n, cfg, a, false) && t.partialReader(a) {
 		// A partial reader whose rules fix no names reads a covered
-		// namespace filtered (§B.11.9 Edge grants).
+		// namespace filtered (§7.9 Edge grants).
 		if fs := t.filteredScope(n); fs != nil {
 			return t.filteredEdgeGrant(n, fs, a, grantExp(g))
 		}
@@ -555,8 +555,8 @@ func (t *tx) edgeReader(n *nsRow, eg *EdgeGrant, resource string) (*actor, *Erro
 	}
 	if eg.GS != "" {
 		// A partial reader's edge grant authorises its filtered reads
-		// only, admitted by filteredAdmit (§B.11.9).
-		return nil, forbidden("this edge grant reads " + n.name + " filtered only: exchange or read under /ns/" + n.name + "/g/" + eg.GS + " (§B.11.9)")
+		// only, admitted by filteredAdmit (§7.9).
+		return nil, forbidden("this edge grant reads " + n.name + " filtered only: exchange or read under /ns/" + n.name + "/g/" + eg.GS + " (§7.9)")
 	}
 	if eg.Resource != "" && eg.Resource != resource {
 		return nil, notFound()

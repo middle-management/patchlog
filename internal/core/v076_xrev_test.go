@@ -122,7 +122,7 @@ func TestV076Scenario102(t *testing.T) {
 // Scenario 109: at matches-r7's at, reader has not /principal/groups
 // contains const "contractors", which matches has since removed; li is in
 // contractors -> the branch isn't read filtered at all since v0.78
-// (§B.11.9 Where: 403, no redirect).
+// (§7.9 Where: 403, no redirect).
 func TestV076Scenario109(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{matches: func(doc map[string]any) {

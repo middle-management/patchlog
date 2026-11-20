@@ -182,7 +182,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Revision", id)
 		if rev.SchemaRules != "" {
 			// The rules marker of a schema revision (§6.1), immutable as
-			// the revision is: a client or a remote mirror compiles it as
+			// the revision is: a client compiles it as
 			// this server does.
 			w.Header().Set(schema.RulesHeader, rev.SchemaRules)
 		}
@@ -218,8 +218,8 @@ func (s *Server) revGone(w http.ResponseWriter, r *http.Request, ns, name, id st
 		writeJSON(w, 410, prunedBody(rev.Horizon, rev.Archive))
 	case rev.Code == "tombstone":
 		// A tombstone id is immutable (§7.1), and its 410 names it and
-		// last, its parent, as a tombstoned head's does: a pruner and a
-		// mirroring remote branch learn the parent here (§E.3.1, §G.5.2).
+		// last, its parent, as a tombstoned head's does: a pruner learns the
+		// parent here (§E.3.1).
 		s.cache(w, r, ccImmutable, rev.Public, resTags(ns, name)...)
 		w.Header().Set("ETag", quote(id))
 		body := map[string]any{"code": "gone", "tombstone": id}
@@ -250,8 +250,8 @@ func (s *Server) revMeta(w http.ResponseWriter, rev *core.Rev) {
 
 // lastModified is a revision's Last-Modified: its created time to the
 // second, which never changes, but never later than now (RFC 9110
-// §8.8.2.1). Created times come from the writing instance's clock, or a
-// remote base's entries (§G.3), unchecked.
+// §8.8.2.1). Created times come from the writing instance's clock,
+// unchecked.
 func (s *Server) lastModified(rev *core.Rev) (time.Time, bool) {
 	if rev.Created.IsZero() {
 		return time.Time{}, false

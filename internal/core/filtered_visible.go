@@ -7,10 +7,10 @@ import (
 )
 
 // fview is one subject set's view of a covered namespace at one
-// checkpoint (§B.11.9 Visible): the subjects of its gs and the grant's
+// checkpoint (§7.9 Visible): the subjects of its gs and the grant's
 // read filter. Every filtered read path, the gestures listing and the
 // index judge names with visible. It memoises each name's answer, so
-// long-poll waiters sharing an fview judge each entry once (§B.11.9
+// long-poll waiters sharing an fview judge each entry once (§7.9
 // Cost); its methods are safe for concurrent use, but each call reads
 // through the transaction it is given.
 type fview struct {
@@ -27,7 +27,7 @@ type fview struct {
 	memo map[string]bool
 }
 
-// GS is the view's subject set (§B.11.9 gs).
+// GS is the view's subject set (§7.9 gs).
 func (fv *fview) GS() string { return fv.gs }
 
 // CP is the checkpoint the view judges at.

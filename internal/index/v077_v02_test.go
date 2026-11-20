@@ -20,7 +20,7 @@ import (
 
 // V77-02 (v0.77): the index's markers, scope cookies, coverage, exchange
 // 410, /_refs, purges before serving, upstream errors and judged-once
-// epochs (§A.1, §A.4, §B.11.9, §C.4, §E.2.6).
+// epochs (§A.1, §A.4, §7.9, §C.4, §E.2.6).
 
 // TestV077HeadPointerDropsOpaqueAfter (FSVC-8, index part; §A.4: "A
 // redirect from a head pointer or to another at ... keeps an after naming
@@ -128,7 +128,7 @@ func (d *v77docs) exchange(token string) (map[string]string, []*http.Cookie) {
 
 // TestV077ScopeMarkerKey (FSVC-1; §A.4 Across namespaces: the scope
 // marker's "digest covering the rules that limit it there ..., the
-// /principal values they refer to and its key's key: string (§B.11.9
+// /principal values they refer to and its key's key: string (§7.9
 // gs)"; CONFORMANCE Grant scope 66): grants through k1 and k2, whose
 // rules are the same, are redirected to different /docs/g/{gs}, and the
 // exchange gives them different prefixes. Before v0.77 both shared one.
@@ -154,7 +154,7 @@ func TestV077ScopeMarkerKey(t *testing.T) {
 
 // TestV077ScopeCookieEnds (FSVC-2; §A.4: "a cookie is 403 until the
 // reader exchanges again ... where a marker's key, rules or roles would
-// end a gs cookie (§B.11.9 gs)"; scenarios 66 and 121): li's cookie for
+// end a gs cookie (§7.9 gs)"; scenarios 66 and 121): li's cookie for
 // its scope marker in docs, through k1 with the role reader, is 403 at
 // /docs/g/{gs} and at /_refs once docs (a) removes k1, (b) changes k1's
 // pub, (c) narrows reader's rules, or (d) drops read from reader; a
@@ -205,7 +205,7 @@ func TestV077ScopeCookieEnds(t *testing.T) {
 	}
 }
 
-// TestV077AuthDisabledUncovers (FSVC-5; §B.11.9 Where: "only while
+// TestV077AuthDisabledUncovers (FSVC-5; §7.9 Where: "only while
 // authentication is on (§1)"; §A.4 follows coverage): against a core
 // running with authentication disabled, matches isn't covered: a partial
 // reader gets no g: marker, but a scope marker, and so another gs.
@@ -473,8 +473,8 @@ func TestV077BeforeAnswerRaisedToSealed(t *testing.T) {
 	v77AllSealed(t, "GET "+f.path, f.body)
 }
 
-// TestV077RootFailureCovered (FSVC-5 review; §B.11.9 Where; transient as
-// §A.1 and §12.1 answer it): matches, which §B.11.9 covers while the
+// TestV077RootFailureCovered (FSVC-5 review; §7.9 Where; transient as
+// §A.1 and §12.1 answer it): matches, which §7.9 covers while the
 // core's authentication is on, can't be judged while GET / fails: a
 // partial reader is 503 behind, with Retry-After, while the failure is for
 // now (a 503, a 408), and 502 upstream otherwise; neither names a

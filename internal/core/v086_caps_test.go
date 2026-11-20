@@ -23,7 +23,7 @@ func countRefusedPurge(t *testing.T, schemaNS string, branches, page int) (int, 
 	max := DefaultMaximums()
 	max.LogPageSize = page
 	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, Limits: lim, Maximums: max, Purger: discardPurger{},
-		RetentionInterval: -1, BlobSweepInterval: -1, RepurgeInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
+		RetentionInterval: -1, BlobSweepInterval: -1, RepurgeInterval: -1})
 	if err != nil {
 		t.Fatal(err)
 	}

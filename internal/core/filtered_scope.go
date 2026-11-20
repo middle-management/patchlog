@@ -1,6 +1,6 @@
 package core
 
-// Filtered namespace reads (§B.11.9), an origin MAY that this one
+// Filtered namespace reads (§7.9), an origin MAY that this one
 // implements unless Options.NoFilteredReads. A partial reader, one whose
 // grant verifies in a namespace and allows read there without reading it
 // unrestricted (§2.1), reads a covered namespace's /heads, log ranges,
@@ -12,7 +12,7 @@ package core
 //
 // The files of this feature, each read inside one read transaction:
 //
-//   - filtered_scope.go: which namespaces are covered (fscope, §B.11.9
+//   - filtered_scope.go: which namespaces are covered (fscope, §7.9
 //     Where);
 //   - filtered_state.go: the checkpoint a filtered answer is at (fcp, at),
 //     and the stored subject sets (filtered_gs);
@@ -24,20 +24,20 @@ package core
 //
 // Every path here is reached only through filteredScope. Branches are
 // never covered: their filtered URLs answer as any uncovered namespace's
-// (§B.11.9 Where).
+// (§7.9 Where).
 
-// fscope is a covered namespace (§B.11.9 Where), as of the read snapshot.
+// fscope is a covered namespace (§7.9 Where), as of the read snapshot.
 type fscope struct {
 	n *nsRow
 }
 
-// filteredScope is n's coverage by §B.11.9, nil if it isn't covered: a
-// local namespace, not a branch or a shadow, neither public nor sealed
+// filteredScope is n's coverage by §7.9, nil if it isn't covered: a
+// namespace, not a branch, neither public nor sealed
 // nor e2e (nsLevel below sealed). Nothing is covered with authentication
 // disabled, where every reader reads unrestricted (§1), or with
 // Options.NoFilteredReads.
 func (t *tx) filteredScope(n *nsRow) *fscope {
-	if n == nil || t.e.opt.NoFilteredReads || t.e.opt.AuthDisabled || n.isShadow() || n.isBranch() {
+	if n == nil || t.e.opt.NoFilteredReads || t.e.opt.AuthDisabled || n.isBranch() {
 		return nil
 	}
 	if !t.fsOpen(n, t.config(n.configSeq)) {
@@ -47,7 +47,7 @@ func (t *tx) filteredScope(n *nsRow) *fscope {
 }
 
 // fsOpen reports whether a namespace with document cfg can be covered:
-// not public, not sealed or e2e (§B.11.9 Where).
+// not public, not sealed or e2e (§7.9 Where).
 func (t *tx) fsOpen(n *nsRow, cfg *Config) bool {
 	return cfg.Read != "public" && cfg.level < levelSealed && t.nsLevel(n) < levelSealed
 }

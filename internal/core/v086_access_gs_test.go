@@ -39,7 +39,7 @@ func v86gsReads(t *testing.T, w *v75World, what, gs string, cookie Credentials, 
 	}
 }
 
-// CONFORMANCE Access 145 at the origin (SERVICES §B.11.9 gs, v0.86): "Once
+// CONFORMANCE Access 145 at the origin (SERVICES §7.9 gs, v0.86): "Once
 // an entry after its exchange changes one of them, the cookie is 403 from
 // that entry on, even where a later entry undoes the change." li holds a
 // filtered gs cookie for matches; matches changes the groups scope of the

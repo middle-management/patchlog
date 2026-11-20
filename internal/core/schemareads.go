@@ -41,7 +41,7 @@ import (
 // name in n by path under n's schemaReads (§6.1). g holds the read cache's
 // counters, loaded before the transaction began.
 func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials, g gens) bool {
-	if n.purged || n.isBranch() || n.isShadow() {
+	if n.purged || n.isBranch() {
 		return false
 	}
 	cfg := t.config(n.configSeq)
@@ -99,7 +99,7 @@ func (t *tx) schemaReadsListed(n *nsRow, cfg *Config) []*nsRow {
 		}
 	}
 	if scan {
-		rows, err := t.Query(`SELECT name FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
+		rows, err := t.Query(`SELECT name FROM namespaces WHERE purged = 0`)
 		t.must(err)
 		for rows.Next() {
 			var s string
@@ -113,7 +113,7 @@ func (t *tx) schemaReadsListed(n *nsRow, cfg *Config) []*nsRow {
 	}
 	var out []*nsRow
 	for _, s := range sortedKeys(names) {
-		if l := t.nsByName(s); l != nil && !l.purged && !l.isShadow() && !l.isBranch() {
+		if l := t.nsByName(s); l != nil && !l.purged && !l.isBranch() {
 			out = append(out, l)
 		}
 	}

@@ -51,7 +51,7 @@ import (
 // reads:{ns}:scope:{digest}, what its digest covers, the rules that limit
 // the reads and the /principal values they refer to (edge_filters,
 // markerRec), from which it filters hits per resource as for any grant
-// with that marker, for a marker reads:{ns}:g:{gs} (§B.11.9) also its
+// with that marker, for a marker reads:{ns}:g:{gs} (§7.9) also its
 // subjects (edge_gs), and for every marker, reads:{ns}:{k} included, every
 // key a cookie of it was minted under, its kid, the role names its grant
 // read through, its kid's pub and the digest of its whole entry and of
@@ -59,7 +59,7 @@ import (
 // each until that cookie expires: a cookie is 403 once one of the keys
 // or roles it came from is gone or changes in any member (§A.4 gs: "its
 // key being the one that verified the grant in {ns}, reads:{ns}:{k} markers
-// included", §B.11.9 gs; readsKeysHold, scopeKeysHold, storedFview), and
+// included", §7.9 gs; readsKeysHold, scopeKeysHold, storedFview), and
 // no later exchange vouches for it again: one whose keys or entries
 // differ mints a cookie with another exp (recordCookies). They
 // are kept across restarts and -rebuild until the last such cookie
@@ -76,7 +76,7 @@ import (
 // covers (grantcheck.ReadFilter: its key's scope, its blocks and, if it
 // carries roles, each effective role that lists read, and its
 // /principal), from which hits are filtered per resource as for any grant
-// with that marker; for reads:{ns}:g:{gs} (§B.11.9), also its subjects,
+// with that marker; for reads:{ns}:g:{gs} (§7.9), also its subjects,
 // from which item 1 is judged; and for either, from an exchange, the key
 // its grant came from (gsKey), recorded for its cookie (recordCookies;
 // keysHold and storedFview judge each key of a cookie). A rule
@@ -95,7 +95,7 @@ type markerRec struct {
 // the names of its grant's read roles, whose rules as of a checkpoint
 // must still digest to the marker's scope subject (g:) or its digest
 // (scope:), and the pub its kid had, which the key with that kid must
-// still have (§B.11.9 gs, §C.4, §A.4; storedFview, scopeKeysHold). A g:
+// still have (§7.9 gs, §C.4, §A.4; storedFview, scopeKeysHold). A g:
 // marker's gs digests the key too (grantcheck.KeySubject), but readers whose
 // grants come from different keys, or from one key before and after its
 // entry changes, may share a marker, and a cookie says only its prefix
@@ -105,7 +105,7 @@ type markerRec struct {
 //
 // entry is EntryDigest (entryDigest) of the key's whole entry and of each
 // of roles' whole definitions, as the document the marker is judged by
-// gave them at the exchange (§B.11.9 gs, v0.82: a cookie is 403 where
+// gave them at the exchange (§7.9 gs, v0.82: a cookie is 403 where
 // "the key its key: string names, or a key or role they came from, is
 // gone or changes in any member"; §A.4 gs: for every marker, reads:{ns}
 // included). "" is a key recorded before entries were kept, or one whose
@@ -207,7 +207,7 @@ func decodePending(s string) map[string]string {
 	return out
 }
 
-// entryDigest is EntryDigest of §B.11.9 gs as the reference defines it,
+// entryDigest is EntryDigest of §7.9 gs as the reference defines it,
 // here and at the origin alike:
 //
 //	text(trunc160(sha256(canonical({ "key": K, "roles": R }))))
@@ -286,7 +286,7 @@ func (ix *Index) copiedKids(ctx context.Context, cfg *grantcheck.Config) (map[st
 	}
 	entry := ""
 	for _, e := range entries {
-		if e.Kind == "branch" && e.Name == cfg.NS && e.Remote == nil {
+		if e.Kind == "branch" && e.Name == cfg.NS {
 			entry = e.ID
 			break
 		}
@@ -340,7 +340,7 @@ func (ix *Index) entryOfIn(ctx context.Context, cfg *grantcheck.Config, kid stri
 // entryHolds reports whether k, a key a cookie came from, is still, in
 // the document cfg, the key the exchange recorded: there, listing read,
 // with the pub it had, and with its whole entry and each of its roles'
-// whole definitions digesting to k.entry (§B.11.9 gs, v0.82: "gone or
+// whole definitions digesting to k.entry (§7.9 gs, v0.82: "gone or
 // changes in any member"), whether or not a scope digest reads the member
 // that changed: a changed sub, groups, attrs, maxTtl, rate or can of
 // the key, or a role's can or rules. A key recorded without its entry or
@@ -443,7 +443,7 @@ func markerRecOf(a *access, v *grant.Verified) *markerRec {
 
 // readsMarker is the marker reads:{ns}:{k} of a reader whose grant would
 // be issued a namespace-wide edge grant in ns (§A.4 gs, v0.85): k is the
-// key: string (grantcheck.KeySubject, §B.11.9 gs) of the key that verified
+// key: string (grantcheck.KeySubject, §7.9 gs) of the key that verified
 // the grant there, by kid and pub, so reads:{ns}:key:{id}. Readers
 // through two keys never share the marker, so neither its gs, its
 // results nor its cookie prefix, and a change to one key ends only the
@@ -461,10 +461,10 @@ func readsPrefix(ns string) string { return "reads:" + ns + ":" + grantcheck.Key
 // scopeMarker is the marker reads:{ns}:scope:{digest} of a reader of
 // uncovered ns whose reads there have grantcheck.ReadsScope digest d,
 // through the key with kid and pub (§A.4): its digest covers d and the
-// key's key: string (grantcheck.KeySubject, §B.11.9 gs), so readers through
+// key's key: string (grantcheck.KeySubject, §7.9 gs), so readers through
 // two keys with the same rules never share a marker, its gs, its edge
 // filter or its cookie prefix. A gs's scope: subject is the same digest
-// (§B.11.9 gs: "scope:{digest} of §A.4's marker"), at the origin too.
+// (§7.9 gs: "scope:{digest} of §A.4's marker"), at the origin too.
 func scopeMarker(ns, d, kid, pub string) string {
 	return "reads:" + ns + ":scope:" + scopeKeyDigest(d, kid, pub)
 }
@@ -474,7 +474,7 @@ func scopeMarker(ns, d, kid, pub string) string {
 func scopeKeyDigest(d, kid, pub string) string { return grantcheck.ScopeKeyDigest(d, kid, pub) }
 
 // keyPub is k's pub member as the namespace document gives it, "" if it
-// has none (§B.11.9 gs: "accepted only while the base has it with the
+// has none (§7.9 gs: "accepted only while the base has it with the
 // same pub", §C.4), compared as given.
 func keyPub(k grant.Key) string {
 	pub, _ := k.Raw["pub"].(string)
@@ -507,7 +507,7 @@ var errNoSlot = errors.New("no exp left for an edge grant of its own")
 // none. A cookie minted while the index is behind was verified against
 // the document at the head: the documents its backlog still brings, up
 // to and including that one, are from before the exchange and end
-// nothing of it (cookieEnds, §B.11.9 gs: "Once an entry after its
+// nothing of it (cookieEnds, §7.9 gs: "Once an entry after its
 // exchange changes one of them"). A namespace leaves pending as the
 // index applies the document named. Rows from before v0.86's second
 // migration have none, and are judged by every document.
@@ -530,7 +530,7 @@ type gsKeyRow struct{ kid, roles, pub, entry, pending, chain string }
 // recorded for that marker and exp (gsKeysAt), each of which must hold.
 // What is recorded there is therefore only ever what every exchange that
 // minted that cookie vouched for, the same keys with the same entries
-// (§A.4 gs, §B.11.9 gs): a row is never changed once written, and an
+// (§A.4 gs, §7.9 gs): a row is never changed once written, and an
 // exchange whose keys or entries differ from those recorded for its
 // marker and exp, in any of its markers, mints a cookie that expires a
 // second earlier, and so on until it finds a second that is free or
@@ -545,7 +545,7 @@ type gsKeyRow struct{ kid, roles, pub, entry, pending, chain string }
 // A document changed and then changed back gives a key the entry it had,
 // but a cookie minted before the change doesn't hold again: the index
 // ends its rows as it applies the entry that made the change (cookieEnds;
-// §B.11.9 gs, v0.86: "the cookie is 403 from that entry on, even where a
+// §7.9 gs, v0.86: "the cookie is 403 from that entry on, even where a
 // later entry undoes the change").
 func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.Time) error {
 	// With the batches' lock: a batch's transaction reads the rows before
@@ -914,7 +914,7 @@ func (ix *Index) cookieAccess(ctx context.Context, ns string, r *http.Request) (
 // under an edge grant that expires at exp: reads:{ns}:{k} reads it whole,
 // reads:{ns}:scope:… as its filter allows while ns is still uncovered
 // (stillUncovered), reads:{ns}:g:… as its subjects and filter see ns at
-// its current checkpoint, which must still be covered (§B.11.9,
+// its current checkpoint, which must still be covered (§7.9,
 // storedFview), each only while every key that cookie came from, and the
 // roles its grant read through, are as the exchange recorded them (§A.4
 // gs, "reads:{ns}:{k} markers included"; readsKeysHold, scopeKeysHold,
@@ -966,7 +966,7 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string, exp int64) (*ac
 // errRulesChanged unless every key that cookie came from (gsKeysAt) is
 // still there with the pub it had and lists read, with its whole entry
 // and its roles' whole definitions as the exchange recorded them
-// (entryHolds; §B.11.9 gs, v0.82: "gone or changes in any member"), and
+// (entryHolds; §7.9 gs, v0.82: "gone or changes in any member"), and
 // passes also, if any. A cookie with no key recorded, minted before
 // migration 011, is refused: the reader exchanges again. A document that
 // can't be read is an error, never a read.
@@ -1028,7 +1028,7 @@ func purgedKeysHold(recorded []gsKey) error {
 // "Once an entry after its exchange changes one of them [the key its key:
 // string names, or a key or role its rules came from], the cookie is 403
 // from that entry on, even where a later entry undoes the change"
-// (SERVICES §B.11.9 gs, §A.4 gs, v0.86; CONFORMANCE Tree 145). A live
+// (SERVICES §7.9 gs, §A.4 gs, v0.86; CONFORMANCE Tree 145). A live
 // namespace's cookie is judged by the document at its head on every read
 // (keysHold), which sees a change and not a change undone; so every
 // namespace document a batch brings, each config entry's in order, is
@@ -1378,7 +1378,7 @@ func (ce *cookieEnds) apply(ctx context.Context, tx *sql.Tx) error {
 }
 
 // scopeKeysHold checks a cookie for scope marker m of ns, whose record is
-// rec, as §B.11.9 gs ends a gs cookie (§A.4: "a cookie is 403 until the
+// rec, as §7.9 gs ends a gs cookie (§A.4: "a cookie is 403 until the
 // reader exchanges again ... where a marker's key, rules or roles would
 // end a gs cookie"): keysHold, each role a key digested still existing
 // and listing read, and the scope digest over the current rules, with
@@ -1393,7 +1393,7 @@ func (ix *Index) scopeKeysHold(ctx context.Context, ns, m string, rec *markerRec
 // readsKeysHold checks a cookie for marker reads:{ns}:{k}, m, that expires
 // at exp, as scopeKeysHold checks a scope marker's (§A.4 gs: a cookie is
 // 403 "where a marker's key, rules or roles would end a gs cookie
-// (§B.11.9 gs), its key being the one that verified the grant in {ns},
+// (§7.9 gs), its key being the one that verified the grant in {ns},
 // reads:{ns}:{k} markers included"): keysHold. Readers through one key
 // with other read roles, or with its entry as it was before a change,
 // share the marker, never a cookie (recordCookies).
@@ -1413,11 +1413,11 @@ func (ix *Index) purgedGKeysHold(ctx context.Context, ns, m string, rec *markerR
 }
 
 // errCoveredNow refuses a cookie for marker reads:{ns}:scope:… once
-// §B.11.9 covers ns: a partial reader's marker there is reads:{ns}:g:{gs},
+// §7.9 covers ns: a partial reader's marker there is reads:{ns}:g:{gs},
 // its hits filtered by visibility (§A.4), which rules alone don't do.
-var errCoveredNow = &grant.AuthError{Status: 403, Msg: "the namespace is read filtered now: exchange the grant again (§B.11.9)"}
+var errCoveredNow = &grant.AuthError{Status: 403, Msg: "the namespace is read filtered now: exchange the grant again (§7.9)"}
 
-// stillUncovered checks that §B.11.9 doesn't cover ns at the index's
+// stillUncovered checks that §7.9 doesn't cover ns at the index's
 // committed checkpoint, as when a scope marker of it was issued: else
 // errCoveredNow. Before the index's first checkpoint
 // of a namespace that may be covered once it has, its coverage can't be
@@ -1603,7 +1603,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	// Whether the core's authentication is on is what its root says now
 	// (authOff: read again once CheckerTTL has passed), never what an
-	// earlier read said (§B.11.9 Where, v0.82). While the root can't be
+	// earlier read said (§7.9 Where, v0.82). While the root can't be
 	// read the exchange goes on as with authentication on: it mints only
 	// for grants that verify, and a namespace whose coverage the root
 	// decides answers 503 or 502 for the whole exchange (coverage).

@@ -11,7 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
-// V76-01 (v0.76): origin filtered reads (§B.11.9): an uncovered
+// V76-01 (v0.76): origin filtered reads (§7.9): an uncovered
 // namespace's filtered URLs are 401 without a grant that verifies there or
 // a cookie (FCORE-3), a branch among them since v0.78; and a stored
 // subject set is bound to its key's pub (FSVC-7).
@@ -77,7 +77,7 @@ func v76fRedirect(t *testing.T, w *v75World, ns, gs string, cred Credentials) (*
 }
 
 // v76fUnfiltered is the redirect a partial reader gets at an unfiltered
-// URL of ns (§B.11.9 URLs), recorded as the server records it.
+// URL of ns (§7.9 URLs), recorded as the server records it.
 func v76fUnfiltered(ctx context.Context, e *Engine, ns string, cred Credentials) (*actor, error) {
 	var a *actor
 	err := e.read(ctx, func(t *tx) error {
@@ -115,7 +115,7 @@ func v76fHas(names []string, name string) bool {
 	return false
 }
 
-// §B.11.9 Where (v0.78: "Filtered reads cover no branch"; conformance
+// §7.9 Where (v0.78: "Filtered reads cover no branch"; conformance
 // TDA 63, 105, 106): a partial reader of matches-r7 gets no redirect, its
 // filtered URLs are 403 and its exchange 403 with no g prefix, whatever
 // matches trusts; once the base key that signed its grant is gone, the
@@ -160,7 +160,7 @@ func TestV076OriginBranchUncovered(t *testing.T) {
 	}
 }
 
-// §B.11.9 gs, §C.4 (conformance 106, ported from the branch case before
+// §7.9 gs, §C.4 (conformance 106, ported from the branch case before
 // v0.78): a partial reader of matches whose grant is signed by key fan,
 // which matches then removes: her cookie is 403 at a later at, and her
 // exchange then 401.
@@ -191,7 +191,7 @@ func TestV076OriginGSKeyRemoved(t *testing.T) {
 	}
 }
 
-// §B.11.9 gs, §C.4: a stored subject set is bound to its key's pub: a
+// §7.9 gs, §C.4: a stored subject set is bound to its key's pub: a
 // cookie is 403 once matches replaces that kid's pub, keeping its scope
 // and roles, until the reader exchanges again; an empty stored pub is 403
 // too.
@@ -287,7 +287,7 @@ func TestV076OriginGSBoundToPub(t *testing.T) {
 	}
 }
 
-// §B.11.9 Purged namespaces, §B.11.5: an uncovered namespace's filtered
+// §7.9 Purged namespaces, §B.11.5: an uncovered namespace's filtered
 // URLs are 401 for a request with neither a grant that verifies there nor
 // a cookie, a public namespace's included, and 403 otherwise.
 func TestV076OriginUncoveredFiltered401(t *testing.T) {
@@ -334,7 +334,7 @@ func TestV076OriginUncoveredFiltered401(t *testing.T) {
 	}
 }
 
-// §B.11.9 Purged covered namespaces (v0.85, scenario 141): only a purged
+// §7.9 Purged covered namespaces (v0.85, scenario 141): only a purged
 // namespace this section covers answers its filtered URLs as §8.5 answers
 // their unfiltered forms. One it doesn't cover answers every one of them
 // as any other uncovered namespace does, 401 without a grant that
@@ -394,7 +394,7 @@ func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
 	}
 }
 
-// §B.11.9 gs, §C.4: readers whose grants come from two keys with the same
+// §7.9 gs, §C.4: readers whose grants come from two keys with the same
 // scope rules never share a gs, so neither's filtered_gs row judges the
 // other's cookies: once fan's pub is replaced, a cookie from fan's grant
 // is 403 whatever is exchanged through fan2, before or after, and fan2's

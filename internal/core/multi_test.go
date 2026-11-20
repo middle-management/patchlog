@@ -27,7 +27,7 @@ func openInstance(t *testing.T, url, dir string) *Engine {
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e, err := Open(Options{Path: url, BlobDir: dir, AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: url, BlobDir: dir, AuthDisabled: true, RetentionInterval: -1,
 		Limits: lim, TailInterval: tailEvery, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
@@ -708,7 +708,7 @@ func TestPGLeaderJobStep(t *testing.T) {
 
 // D.8: on SQLite the one instance always leads.
 func TestLeaderJobStepSQLite(t *testing.T) {
-	e, err := Open(Options{Path: ":memory:", AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}})
+	e, err := Open(Options{Path: ":memory:", AuthDisabled: true, RetentionInterval: -1, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
 	}

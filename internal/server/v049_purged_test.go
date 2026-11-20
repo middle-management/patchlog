@@ -29,78 +29,6 @@ func (e *tenv) nsPurge(ns string) string {
 	return head
 }
 
-// v0.49 §8.5: every write to a purged namespace is 410 "purged" after
-// authorisation and the rate limits and before any other check, the
-// idempotent-retry lookup included: resource writes, batches (config-only
-// too), blob uploads and copies, purges, prunes, config writes, branching
-// and remote registration. Every such 410, and those of its URLs
-// (/ns/{ns}/keys among them), carries head, the purge-ns entry, which
-// stays the log's last; /ns/{ns} and its log stay readable.
-func TestV049PurgedWrites(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t)
-	e.mkNS("p", map[string]any{"read": "public"})
-	e.mkNS("src", map[string]any{"read": "public"})
-	a0 := e.create("p", "a", map[string]any{"n": 0.0})
-	next := ops(op("replace", "/n", 1.0))
-	a1 := e.appendRev("p", "a", a0, next)
-	bid := e.upload("src", "s", "text/plain", []byte("x"))
-	cfg := e.configID("p")
-	at := e.nsHead("p")
-	head := e.nsPurge("p")
-	cfg2 := e.configID("p")
-
-	batch := func(body map[string]any) req {
-		return req{method: "POST", path: "/ns/p/batch", body: body, author: "alice"}
-	}
-	item := map[string]any{"resource": "z", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}
-	change := map[string]any{"ifMatch": cfg2, "patches": ops(op("add", "/x-note", "n"))}
-	for name, q := range map[string]req{
-		// Retries of writes made before the purge: the lookup doesn't apply.
-		"retried append": {method: "PATCH", path: "/r/p/a", ifMatch: a0, body: next, author: "alice"},
-		"retried freeze": {method: "PATCH", path: "/ns/p", ifMatch: cfg, body: ops(op("add", "/frozen", true)), author: "admin"},
-		"append":         {method: "PATCH", path: "/r/p/a", ifMatch: a1, body: next, author: "alice"},
-		"create":         {method: "PATCH", path: "/r/p/n", ifNoneMatch: "*", body: addRoot(map[string]any{}), author: "alice"},
-		"delete":         {method: "DELETE", path: "/r/p/a", ifMatch: a1, author: "alice"},
-		"stale append":   {method: "PATCH", path: "/r/p/a", ifMatch: a0, body: ops(op("add", "/x", 1.0)), author: "alice"},
-		"batch":          batch(map[string]any{"items": []any{item}}),
-		"dry run":        {method: "POST", path: "/ns/p/batch?dry-run=1", body: map[string]any{"items": []any{item}}, author: "alice"},
-		"config batch":   batch(map[string]any{"config": change}),
-		"stale config batch": batch(map[string]any{"config": map[string]any{
-			"ifMatch": cfg, "patches": ops(op("add", "/x-note", "n"))}}),
-		"config and items": batch(map[string]any{"config": change, "items": []any{item}}),
-		"upload":           {method: "PUT", path: blobPath("p", "a", bid), raw: "x", hasRaw: true, ct: "text/plain", author: "alice"},
-		"copy":             {method: "PUT", path: blobPath("p", "a", bid), hdr: map[string]string{"Blob-From": blobPath("src", "s", bid)}, author: "alice"},
-		"purge":            {method: "POST", path: "/r/p/a/purge", ifMatch: a1, author: "admin"},
-		"stale purge":      {method: "POST", path: "/r/p/a/purge", ifMatch: a0, author: "admin"},
-		"forced purge":     {method: "POST", path: "/r/p/a/purge?force=1", ifMatch: a1, author: "admin"},
-		"purge-ns":         {method: "POST", path: "/ns/p/purge", ifMatch: head, author: "admin"},
-		"forced purge-ns":  {method: "POST", path: "/ns/p/purge?force=1", ifMatch: head, author: "admin"},
-		"prune":            {method: "POST", path: "/r/p/a/prune", body: map[string]any{"horizon": a1}, author: "admin"},
-		"config":           {method: "PATCH", path: "/ns/p", ifMatch: cfg2, body: ops(op("add", "/frozen", false)), author: "admin"},
-		"stale config":     {method: "PATCH", path: "/ns/p", ifMatch: cfg, body: ops(op("add", "/x-note", "n")), author: "admin"},
-		"no precondition":  {method: "PATCH", path: "/ns/p", body: ops(op("add", "/x-note", "n")), author: "admin"},
-		"branch":           {method: "POST", path: "/ns/p/branches", ifNoneMatch: "*", body: map[string]any{"name": "pb", "at": at}, author: "alice"},
-		"registration": {method: "POST", path: "/ns/p/branches", ifNoneMatch: "*", author: "alice",
-			body: map[string]any{"remote": map[string]any{"origin": originB, "ns": "rel"}, "at": at}},
-	} {
-		r := e.do(q)
-		if r.Code != 410 || r.Str("code") != "purged" || r.Str("head") != head {
-			t.Errorf("%s: %d %s", name, r.Code, r.Body)
-		}
-	}
-	// Reads after the read check, /ns/{ns}/keys too.
-	for _, p := range []string{"/r/p/a", "/r/p/a/rev/" + a0, "/r/p/a/blob/" + bid, "/ns/p/rev/" + at + "/heads", "/ns/p/gestures/" + gA} {
-		expectPurged(t, e.get(p), head)
-	}
-	expectPurged(t, e.do(req{method: "POST", path: "/ns/p/keys"}), head)
-
-	// Nothing followed the purge-ns entry; /ns/{ns} and its log still read.
-	if e.nsHead("p") != head || e.configID("p") != cfg2 || lastOf(e.nsKinds("p")) != "purge-ns" {
-		t.Fatalf("log after the refused writes %v", e.nsKinds("p"))
-	}
-}
-
 // v0.49 §8.5, §6.2: the 410 comes after authorisation and the rate limits,
 // those of a batch's items and config change included, and /ns/{ns}/keys
 // answers it after its read check.
@@ -240,24 +168,72 @@ func TestV049PurgedSkipped(t *testing.T) {
 	}
 }
 
-// v0.49 §8.5, §G.3: a remote branch purged here no longer follows its
-// base's purges: its log ends at its purge-ns entry.
-func TestV049RemotePurgeSkipsPurgedBranch(t *testing.T) {
+// v0.49 §8.5: every write to a purged namespace is 410 "purged" after
+// authorisation and the rate limits and before any other check, the
+// idempotent-retry lookup included: resource writes, batches (config-only
+// too), blob uploads and copies, purges, prunes, config writes, branching
+// and remote registration. Every such 410, and those of its URLs
+// (/ns/{ns}/keys among them), carries head, the purge-ns entry, which
+// stays the log's last; /ns/{ns} and its log stay readable.
+func TestV049PurgedWrites(t *testing.T) {
 	t.Parallel()
-	a, b, _ := pair(t, nil, nil)
-	f := populateA(t, a)
-	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
-	head := b.nsPurge("rel")
-	expect(t, a.purge("main", "derby", f.lateD, "admin"), 204)
-	ctx := context.Background()
-	if err := b.e.SyncRemotes(ctx); err != nil {
-		t.Fatal(err)
+	e := newEnv(t)
+	e.mkNS("p", map[string]any{"read": "public"})
+	e.mkNS("src", map[string]any{"read": "public"})
+	a0 := e.create("p", "a", map[string]any{"n": 0.0})
+	next := ops(op("replace", "/n", 1.0))
+	a1 := e.appendRev("p", "a", a0, next)
+	bid := e.upload("src", "s", "text/plain", []byte("x"))
+	cfg := e.configID("p")
+	at := e.nsHead("p")
+	head := e.nsPurge("p")
+	cfg2 := e.configID("p")
+
+	batch := func(body map[string]any) req {
+		return req{method: "POST", path: "/ns/p/batch", body: body, author: "alice"}
 	}
-	if b.nsHead("rel") != head {
-		t.Fatalf("purged remote branch %v", b.nsKinds("rel"))
+	item := map[string]any{"resource": "z", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}
+	change := map[string]any{"ifMatch": cfg2, "patches": ops(op("add", "/x-note", "n"))}
+	for name, q := range map[string]req{
+		// Retries of writes made before the purge: the lookup doesn't apply.
+		"retried append": {method: "PATCH", path: "/r/p/a", ifMatch: a0, body: next, author: "alice"},
+		"retried freeze": {method: "PATCH", path: "/ns/p", ifMatch: cfg, body: ops(op("add", "/frozen", true)), author: "admin"},
+		"append":         {method: "PATCH", path: "/r/p/a", ifMatch: a1, body: next, author: "alice"},
+		"create":         {method: "PATCH", path: "/r/p/n", ifNoneMatch: "*", body: addRoot(map[string]any{}), author: "alice"},
+		"delete":         {method: "DELETE", path: "/r/p/a", ifMatch: a1, author: "alice"},
+		"stale append":   {method: "PATCH", path: "/r/p/a", ifMatch: a0, body: ops(op("add", "/x", 1.0)), author: "alice"},
+		"batch":          batch(map[string]any{"items": []any{item}}),
+		"dry run":        {method: "POST", path: "/ns/p/batch?dry-run=1", body: map[string]any{"items": []any{item}}, author: "alice"},
+		"config batch":   batch(map[string]any{"config": change}),
+		"stale config batch": batch(map[string]any{"config": map[string]any{
+			"ifMatch": cfg, "patches": ops(op("add", "/x-note", "n"))}}),
+		"config and items": batch(map[string]any{"config": change, "items": []any{item}}),
+		"upload":           {method: "PUT", path: blobPath("p", "a", bid), raw: "x", hasRaw: true, ct: "text/plain", author: "alice"},
+		"copy":             {method: "PUT", path: blobPath("p", "a", bid), hdr: map[string]string{"Blob-From": blobPath("src", "s", bid)}, author: "alice"},
+		"purge":            {method: "POST", path: "/r/p/a/purge", ifMatch: a1, author: "admin"},
+		"stale purge":      {method: "POST", path: "/r/p/a/purge", ifMatch: a0, author: "admin"},
+		"forced purge":     {method: "POST", path: "/r/p/a/purge?force=1", ifMatch: a1, author: "admin"},
+		"purge-ns":         {method: "POST", path: "/ns/p/purge", ifMatch: head, author: "admin"},
+		"forced purge-ns":  {method: "POST", path: "/ns/p/purge?force=1", ifMatch: head, author: "admin"},
+		"prune":            {method: "POST", path: "/r/p/a/prune", body: map[string]any{"horizon": a1}, author: "admin"},
+		"config":           {method: "PATCH", path: "/ns/p", ifMatch: cfg2, body: ops(op("add", "/frozen", false)), author: "admin"},
+		"stale config":     {method: "PATCH", path: "/ns/p", ifMatch: cfg, body: ops(op("add", "/x-note", "n")), author: "admin"},
+		"no precondition":  {method: "PATCH", path: "/ns/p", body: ops(op("add", "/x-note", "n")), author: "admin"},
+		"branch":           {method: "POST", path: "/ns/p/branches", ifNoneMatch: "*", body: map[string]any{"name": "pb", "at": at}, author: "alice"},
+	} {
+		r := e.do(q)
+		if r.Code != 410 || r.Str("code") != "purged" || r.Str("head") != head {
+			t.Errorf("%s: %d %s", name, r.Code, r.Body)
+		}
 	}
-	if ns, err := b.e.RemoteNotices(ctx, "rel"); err != nil || len(ns) != 0 {
-		t.Fatalf("notices %+v %v", ns, err)
+	// Reads after the read check, /ns/{ns}/keys too.
+	for _, p := range []string{"/r/p/a", "/r/p/a/rev/" + a0, "/r/p/a/blob/" + bid, "/ns/p/rev/" + at + "/heads", "/ns/p/gestures/" + gA} {
+		expectPurged(t, e.get(p), head)
 	}
-	expectPurged(t, b.get("/r/rel/derby"), head)
+	expectPurged(t, e.do(req{method: "POST", path: "/ns/p/keys"}), head)
+
+	// Nothing followed the purge-ns entry; /ns/{ns} and its log still read.
+	if e.nsHead("p") != head || e.configID("p") != cfg2 || lastOf(e.nsKinds("p")) != "purge-ns" {
+		t.Fatalf("log after the refused writes %v", e.nsKinds("p"))
+	}
 }

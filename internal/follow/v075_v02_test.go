@@ -20,7 +20,7 @@ type v075CP string
 func (c v075CP) Load(context.Context, string, string) (string, error) { return string(c), nil }
 
 // A follower whose grant has become a partial reader's is redirected from
-// the namespace's long-poll and events to the filtered log (§B.11.9 URLs),
+// the namespace's long-poll and events to the filtered log (§7.9 URLs),
 // which isn't chain-verifiable and whose batches hold only visible items
 // (§10). It must not apply such a batch as the whole of it: Run stops with
 // the redirect, a *client.FilteredError naming gs, and applies nothing, in

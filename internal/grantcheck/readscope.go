@@ -15,7 +15,7 @@ import (
 
 // What a grant that reads a namespace only in part reads there, shared by
 // the index (§A.4's scope marker) and the origin's filtered reads
-// (§B.11.9's scope:{digest} subject and item 2).
+// (§7.9's scope:{digest} subject and item 2).
 
 // ScopeInput is what §A.4's scope marker digests: the rules a grant's
 // reads in a namespace are judged by, those of its key's scope, its blocks
@@ -67,7 +67,7 @@ func failsRead(rs []any) bool {
 }
 
 // ReadsScope digests what the reads of a grant that reads a namespace only
-// in part depend on (§A.4, §B.11.9): the rules they are judged by there
+// in part depend on (§A.4, §7.9): the rules they are judged by there
 // (its key's scope, its blocks' and those of its roles that grant read,
 // §C.5) and the /principal values those refer to, so readers with the same
 // rules and values share answers. It reports false if a rule refers to
@@ -86,7 +86,7 @@ func ReadsScope(v *grant.Verified) (digest string, ok bool) {
 }
 
 // ScopeDigest is ReadsScope over its inputs, so that the origin can digest
-// a stored gs's rules again as of another checkpoint (§B.11.9: a gs cookie
+// a stored gs's rules again as of another checkpoint (§7.9: a gs cookie
 // is 403 at an at where those rules differ). It reports false where any
 // rule, a role's included, refers to /now or the whole envelope: a stored
 // role that has gained one since doesn't count for read any more (§C.2
@@ -142,7 +142,7 @@ func CombinedAt(cps map[string]string) string {
 	return ids.FromBytes(sum[:ids.Size]).String()
 }
 
-// ReadFilter is what a scope marker, or a filtered-read gs (§B.11.9 item
+// ReadFilter is what a scope marker, or a filtered-read gs (§7.9 item
 // 2), stands for: the rules a grant's reads in a namespace are judged by,
 // those of its key's scope, its blocks and, if it carries roles, each
 // effective role that counts for read (any one passing), and its
@@ -282,7 +282,7 @@ func (f *ReadFilter) compile() {
 // with roles, every rule of some role does (§C.1.1).
 func (f *ReadFilter) Allows(resource string) bool { return f.allows(resource, false) }
 
-// AllowsItem is §B.11.9's item 2: Allows, but a role counts only as
+// AllowsItem is §7.9's item 2: Allows, but a role counts only as
 // §B.11.5 counts roles, so one with a rule that refers to anything in
 // /principal but /principal/groups and /principal/roles never allows.
 func (f *ReadFilter) AllowsItem(resource string) bool { return f.allows(resource, true) }

@@ -338,7 +338,7 @@ func ParsePrefix(p string) (ns, resource string, ok bool) {
 
 // Prefix is a core prefix (§2.1 Edge prefix): /r/{ns}/{name} (Resource
 // set), /r/{ns} or /ns/{ns}, or /ns/{ns}/g/{gs} (GS set), a filtered
-// namespace's prefix (§B.11.9).
+// namespace's prefix (§7.9).
 type Prefix struct{ NS, Resource, GS string }
 
 // ParseCorePrefix parses every core prefix the origin's key vouches for:

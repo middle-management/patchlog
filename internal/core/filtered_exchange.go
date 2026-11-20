@@ -11,7 +11,7 @@ import (
 const maxEdgeTTL = 15 * time.Minute
 
 // filteredEdgeGrant is edgeGrant for a partial reader of a covered
-// namespace whose grant doesn't fix /resource (§B.11.9 Edge grants): its
+// namespace whose grant doesn't fix /resource (§7.9 Edge grants): its
 // edge grant covers /ns/{ns}/g/{gs} alone, gs its subject set at the
 // current checkpoint. §C.5.2's refusals concerning /resource rules and
 // qualifying roles don't apply, and of its check that rules pass now only
@@ -19,7 +19,7 @@ const maxEdgeTTL = 15 * time.Minute
 // evaluated, item 2 judging the rest per resource; its refusal for no
 // read still does. A rule there that refers to /now fails, as for any
 // read, and a grant with roles needs one that lists read without a rule
-// on /now (§C.2 item 5, §B.11.9 Partial reader).
+// on /now (§C.2 item 5, §7.9 Partial reader).
 // The issue carries the filtered_gs row IssueEdgeGrants records, with exp
 // that of the cookie at the longest, never past the grant's.
 func (t *tx) filteredEdgeGrant(n *nsRow, fs *fscope, a *actor, exp time.Time) (*edgeIssue, *Error) {
@@ -65,7 +65,7 @@ func (t *tx) filteredEdgeGrant(n *nsRow, fs *fscope, a *actor, exp time.Time) (*
 	}
 	// The record keeps the digest of the key's entry and the read roles'
 	// definitions as of the checkpoint the view is at, which every read
-	// under the cookie compares (§B.11.9 gs, gsDigestHolds).
+	// under the cookie compares (§7.9 gs, gsDigestHolds).
 	// It keeps that document's ns_config seq too: the cookie is held to
 	// every document of {ns} after it (gsHeldSince, v0.86). Both are of
 	// this read snapshot, so a change that commits before the record is

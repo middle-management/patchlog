@@ -424,3 +424,15 @@ func TestAuthBranches(t *testing.T) {
 	purger := e.grant(f.admin, "user:p", []string{"sec"}, []string{"read", "purge"})
 	expectCode(t, e.do(req{method: "POST", path: "/ns/sec/purge", ifMatch: e.nsHead("sec", f.adminG), bearer: purger}), 403, "forbidden")
 }
+
+func withOrigin(o string) envOpt { return func(opt *core.Options) { opt.Origin = o } }
+
+// nsLog returns a namespace's log as maps.
+func (e *tenv) nsLog(ns string, bearer ...string) []map[string]any {
+	e.t.Helper()
+	var out []map[string]any
+	for _, x := range e.get("/ns/"+ns+"/rev/"+e.nsHead(ns, bearer...)+"/log", bearer...).Arr() {
+		out = append(out, x.(map[string]any))
+	}
+	return out
+}

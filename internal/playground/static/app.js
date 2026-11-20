@@ -581,8 +581,8 @@ function renderNsStatus() {
     h('dt', {}, 'config id'), h('dd', {}, S.config ? idEl(S.config) : h('span', { class: 'muted' }, 'unknown')),
     h('dt', {}, 'readable'), h('dd', {}, S.nsPurged ? 'nothing: purged, its documents and log are 410 (§8.5)' : S.nsDoc ? 'document, log, heads' : 'log only (document not readable)'));
   if (d.base) kv.append(h('dt', {}, 'base'), h('dd', {}, `${d.base.ns} @ `, idEl(d.base.at),
-    // a local branch (no origin, §G.3) merges into the base it names (§F.3)
-    d.base.origin === undefined && Z.isNamespaceName(d.base.ns) && Z.isNamespaceName(S.ns) && !S.nsPurged
+    // a branch merges into the base it names (§F.3)
+    Z.isNamespaceName(d.base.ns) && Z.isNamespaceName(S.ns) && !S.nsPurged
       ? [' ', h('button', { class: 'tiny', id: 'nsMergeInto', onclick: () => mgOpen(S.ns, d.base.ns) }, `Merge into ${d.base.ns}\u2026`)] : null));
   if (d.successor) kv.append(h('dt', {}, 'successor'), h('dd', {}, d.successor));
   if (S.nsLevel) {
@@ -685,14 +685,14 @@ function renderBranches() {
   if (S.branches.length) openUnlessSet(tb); // rows with open/merge buttons: shown unless the user closed the card
   if (!S.branches.length) { tb.replaceChildren(h('tr', {}, h('td', { class: 'empty', colspan: 6 }, 'No branches.'))); return; }
   tb.replaceChildren(...S.branches.map((b) => h('tr', {},
-    h('td', { class: 'mono' }, b.name || (b.remote ? 'remote ' + b.remote : '')),
+    h('td', { class: 'mono' }, b.name || ''),
     h('td', {}, b.at ? idEl(b.at) : ''),
     h('td', {}, b.frozen ? h('span', { class: 'badge warn' }, 'frozen') : 'no'),
     h('td', {}, b.purged ? h('span', { class: 'badge err' }, 'purged') : 'no'),
     h('td', { class: 'mono' }, b.successor || ''),
     h('td', {}, b.name ? h('button', { class: 'tiny', onclick: () => asUser(() => selectNS(b.name)) }, 'open') : '',
       // a local branch that still has its content can be merged into this namespace (§F.3)
-      b.name && !b.remote && !b.purged && Z.isNamespaceName(b.name) && Z.isNamespaceName(S.ns)
+      b.name && !b.purged && Z.isNamespaceName(b.name) && Z.isNamespaceName(S.ns)
         ? [' ', h('button', { class: 'tiny', title: `plan a merge of ${b.name} into ${S.ns}`, onclick: () => mgOpen(b.name, S.ns) }, 'merge\u2026')] : ''))));
 }
 
@@ -2109,7 +2109,7 @@ async function readDoc(ns, name, id, r, retried) {
  * asked for, which holds it (§7.1 Paging): nothing here is a read of the range. */
 async function nsFirstEntry(ns) {
   const l = await api('GET', `/ns/${ns}/log`, { auto: true, label: 'fork' });
-  // The range at the head, not a partial reader's filtered log (§B.11.9), which may leave the first entry out.
+  // The range at the head, not a partial reader's filtered log (§7.9), which may leave the first entry out.
   const whole = l.finalPath === undefined || new RegExp(`^/ns/${ns}(/rev/1[a-z2-7]{32})?/log$`).test(l.finalPath.split('?')[0]);
   const first = l.status === 200 && whole && Array.isArray(l.json) ? l.json[0] : null;
   return first && typeof first === 'object' && (first.prev || '') === '' ? first : null;
@@ -2132,8 +2132,7 @@ async function revPrecedes(ns, name, a, b) {
  * base's namespace is refused once the fold is past the fork
  * from that base: the base's head of the resource as of the branch's at, or none where the base had no such
  * resource. The fork is what the base's /heads lists at at, or else what the branch's own /heads lists at its first
- * namespace entry (§G.4.1), which is all there is for a remote base (§G.3), whose chain, base.chain, lies behind
- * that one fork. Where this reader can place a fork by neither, no namespace behind it is accepted (v0.86: the op
+ * namespace entry (§G.4.1). Where this reader can place a fork by neither, no namespace behind it is accepted (v0.86: the op
  * fails the check), as internal/client's chainCheck has it. */
 async function nsChainOK(ns, kns, at) {
   if (kns === ns) return true;
@@ -2145,7 +2144,7 @@ async function nsChainOK(ns, kns, at) {
     for (let page = 0; page < 20; page++) {
       const path = `/ns/${of}/rev/${nsID}/heads`;
       const r = await api('GET', path + (after ? `?after=${encodeURIComponent(after)}` : ''), { auto: true, label: 'fork' });
-      // A partial reader is redirected to its filtered listing (§B.11.9), which places no fork.
+      // A partial reader is redirected to its filtered listing (§7.9), which places no fork.
       if (r.status !== 200 || !r.json || (r.finalPath || path).split('?')[0] !== path) return null;
       const rows = r.json.heads || r.json.items || [];
       const row = rows.find((x) => x && x.resource >= name);
@@ -2164,13 +2163,12 @@ async function nsChainOK(ns, kns, at) {
   for (let cur = ns, i = 0; i < 16; i++) {
     const b = ((await nsInfo(cur)).doc || {}).base;
     if (!b || typeof b !== 'object' || typeof b.ns !== 'string' || typeof b.at !== 'string') return false;
-    const remote = b.origin !== undefined;
     if (at) {
       const k = cur + ' ' + at.name;
       let fork = forks.get(k);
       if (fork === undefined && at.missed && at.missed.has(k)) return false;
       if (fork === undefined) {
-        fork = remote ? null : await headAt(b.ns, b.at, at.name);
+        fork = await headAt(b.ns, b.at, at.name);
         if (fork === null) fork = await ownFork(cur, at.name);
         // A fork that isn't placed is asked for again by a later fold, as the /heads may be readable then, but
         // once in a fold (at.missed).
@@ -2187,7 +2185,6 @@ async function nsChainOK(ns, kns, at) {
         if (!forks.get(kk)) return false;
       }
     }
-    if (remote) return kns === b.ns || (Array.isArray(b.chain) && b.chain.includes(kns));
     if ((cur = b.ns) === kns) return true;
   }
   return false;
@@ -2872,8 +2869,8 @@ async function nsHeadDoc(ns) {
 }
 
 /* branchBase is the namespace a local branch ns was created from, the "base" of its namespace document (§7.6), which
- * never changes: "" where ns is no namespace name (nsHeadDoc asks for no such thing) or no branch, its base is
- * another deployment's (§G.3), or its document can't be read. A document naming a lower encryption level than this browser holds for ns is refused as
+ * never changes: "" where ns is no namespace name (nsHeadDoc asks for no such thing) or no branch, or its document
+ * can't be read. A document naming a lower encryption level than this browser holds for ns is refused as
  * nsInfo refuses it (§7.1, Levels): a sealed or e2e namespace's document in the clear is not its document, and
  * names no base. A base is kept for the page. That there is none is kept in none only, a Set the caller gives for
  * as long as one answer is read (a namespace may be created, or its document become readable, later), so the
@@ -2887,7 +2884,7 @@ async function branchBase(ns, none) {
   // The level the answer names, as nsInfo reads it: a sealed document's is sealed, a clear one's its own word.
   const lowered = d.status === 200 && Z.learnDoc(ns, d.sealed, doc).lowered;
   const b = doc && !lowered ? doc.base : null;
-  if (!b || typeof b !== 'object' || typeof b.ns !== 'string' || b.origin !== undefined) { if (none) none.add(ns); return ''; }
+  if (!b || typeof b !== 'object' || typeof b.ns !== 'string') { if (none) none.add(ns); return ''; }
   known.set(ns, b.ns);
   return b.ns;
 }

@@ -255,9 +255,6 @@ func (bs *batchSource) blob(t *tx, name string, bid ids.ID) *blobRow {
 	if bs == nil || bs.n == nil {
 		return nil
 	}
-	if t.upstreamRefusal(bs.n, name) != nil {
-		return nil
-	}
 	v := t.resolve(bs.n, name, &bs.atSeq)
 	if v.state == Purged || v.head == nil {
 		return nil
@@ -362,9 +359,7 @@ func (t *tx) availableBlob(n *nsRow, s *itemState, uploader string, cutoff int64
 	}
 	if n.isBranch() && s.view != nil && s.view.head != nil {
 		// Attached to the same resource in a base and referenced by a
-		// document in the history as the branch sees it. A remote
-		// branch's bases are shadows, which mirror the base's blobs with
-		// its chains (§G.3, remote_blobs.go).
+		// document in the history as the branch sees it.
 		if b, _ := t.historyBlob(s.view.head, own, bid); b != nil {
 			return b
 		}
@@ -378,23 +373,6 @@ func (t *tx) availableBlob(n *nsRow, s *itemState, uploader string, cutoff int64
 }
 
 // --- attaching (step 7) ---------------------------------------------------------
-
-// attachStep records which blobs the document of revision seq of res
-// references (blob_refs) and attaches them (§7.8 Attached): a write
-// attaches every blob its resulting document references to its own
-// resource, in the revision's transaction.
-func (t *tx) attachStep(res int64, step *stepState, seq int64) {
-	open := map[ids.ID]bool{}
-	rows, err := t.Query(`SELECT bid FROM blob_refs WHERE res = ? AND to_seq IS NULL`, res)
-	t.must(err)
-	for rows.Next() {
-		var b []byte
-		t.must(rows.Scan(&b))
-		open[ids.FromBytes(b)] = true
-	}
-	rows.Close()
-	t.attachStepFrom(res, step, seq, open)
-}
 
 // attachStepFrom is attachStep for a resource whose open blob_refs (the
 // blobs its previous revision's document references) are known. Those of
@@ -860,9 +838,6 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 	if n.purged {
 		return nil, t.purgedNS(n)
 	}
-	if err := t.upstreamRefusal(n, name); err != nil {
-		return nil, err
-	}
 	if t.resolve(n, name, nil).state == Purged {
 		return nil, gone()
 	}
@@ -976,7 +951,7 @@ func (t *tx) copySource(target *nsRow, req Request, ns, name string, bid ids.ID)
 	if sn == nil || sn.purged {
 		return nil
 	}
-	if !t.sourceReadable(sn, name, req) || t.upstreamRefusal(sn, name) != nil {
+	if !t.sourceReadable(sn, name, req) {
 		return nil
 	}
 	if sn.id != target.id && localSourceRank(t.config(sn.configSeq)) > targetRank(t.config(target.configSeq)) {

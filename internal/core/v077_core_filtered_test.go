@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// V77-01 (v0.77): a covered purged namespace's /heads without at (§B.11.9 Purged
+// V77-01 (v0.77): a covered purged namespace's /heads without at (§7.9 Purged
 // namespaces).
 
 // v077Purge freezes and purges ns with the operator key.
@@ -41,7 +41,7 @@ func v077ConfigOnly(entries []map[string]any) bool {
 	return true
 }
 
-// §B.11.9 Purged namespaces: a covered purged namespace's /heads without
+// §7.9 Purged namespaces: a covered purged namespace's /heads without
 // at answers as §8.5 answers /heads, 410 purged with head, once the read
 // check passes; never a 302 first. Without credentials it stays 401.
 func TestV077OriginPurgedCoveredHeads(t *testing.T) {
@@ -84,7 +84,7 @@ func TestV077OriginPurgedCoveredHeads(t *testing.T) {
 // v077PurgedHeads checks that purged ns's filtered /heads for gs, without
 // at and at at, are each 410 purged with head for a partial reader's
 // cred; where cred reads ns unrestricted, that its unfiltered /heads is
-// that 410 and the filtered ones 403 (§8.5, §B.11.9 Purged namespaces,
+// that 410 and the filtered ones 403 (§8.5, §7.9 Purged namespaces,
 // Partial reader; v0.82).
 func v077PurgedHeads(t *testing.T, w *v75World, ns, gs, at, head string, cred Credentials, unrestricted bool) {
 	t.Helper()
@@ -100,7 +100,7 @@ func v077PurgedHeads(t *testing.T, w *v75World, ns, gs, at, head string, cred Cr
 		purged("/heads", err)
 	}
 	if unrestricted {
-		// v0.82 (§B.11.9 Purged namespaces, Partial reader): the filtered
+		// v0.82 (§7.9 Purged namespaces, Partial reader): the filtered
 		// URL's read check comes first, and an unrestricted reader's
 		// grant in Authorization is 403 there, as at a live namespace's.
 		if err := w.e.FilteredCurrent(ctx, ns, gs, "/heads", cred); v75Status(err) != 403 {

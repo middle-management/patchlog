@@ -7,11 +7,11 @@ import (
 	"testing"
 )
 
-// V75-03 (v0.75): the core's filtered read paths (§B.11.9): long-poll
+// V75-03 (v0.75): the core's filtered read paths (§7.9): long-poll
 // sharing per gs, /branches to partial readers, and the redirect of
 // unfiltered reads.
 
-// §B.11.9 Cost (SHOULD): on each wake, each new entry's visibility is
+// §7.9 Cost (SHOULD): on each wake, each new entry's visibility is
 // judged at most once per gs with waiting followers, who share the answer;
 // another gs judges it on its own. Not parallel: it sets testFilteredJudge.
 func TestV075FilteredLiveCost(t *testing.T) {
@@ -70,7 +70,7 @@ func TestV075FilteredLiveCost(t *testing.T) {
 	}
 }
 
-// §B.11.9 Answers (TDA 68; v0.78: "a partial reader's /branches is 403"):
+// §7.9 Answers (TDA 68; v0.78: "a partial reader's /branches is 403"):
 // /branches to a partial reader is 403, as for any reader without
 // unrestricted read, a grant that also names a branch included. Before
 // v0.78 it listed, Private, the local branches its grant verified in.
@@ -83,16 +83,8 @@ func TestV075BranchListPartial(t *testing.T) {
 	if _, err := w.e.CreateBranch(ctx, Request{NS: "matches", Cred: w.admin}, BranchRequest{Name: "matches-r7", At: w.head("matches"), Patches: []any{}, IfNoneMatch: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.e.update(ctx, func(t *tx) error {
-		n := t.nsByName("matches")
-		_, err := t.Exec(`INSERT INTO remote_branches (ns, origin, name, at_seq, ns_seq, expires) VALUES (?, ?, ?, ?, ?, ?)`,
-			n.id, "https://other.example", "matches-x", n.headSeq.Int64, n.headSeq.Int64, t.now.Add(1e12).UnixMilli())
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
 	all, err := w.e.BranchList(ctx, "matches", "", w.admin)
-	if err != nil || len(all.List) != 2 {
+	if err != nil || len(all.List) != 1 {
 		t.Fatalf("admin: %+v %v", all, err)
 	}
 	if bl, err := w.e.BranchList(ctx, "matches", "", w.li()); v75Status(err) != 403 {
@@ -109,7 +101,7 @@ func TestV075BranchListPartial(t *testing.T) {
 	}
 }
 
-// §B.11.9 URLs, at: a partial reader's redirect names an at recorded
+// §7.9 URLs, at: a partial reader's redirect names an at recorded
 // before it is answered, which filteredAt then answers.
 func TestV075RedirectRecordsAt(t *testing.T) {
 	t.Parallel()

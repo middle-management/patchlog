@@ -94,8 +94,4 @@ func TestNamespaceMembers(t *testing.T) {
 	if r.Obj()["x-branchNote"] != "x" || r.Obj()["x-title"] != "Documents" {
 		t.Fatalf("branch document %s", r.Body)
 	}
-
-	// A remote branch's genesis is checked before anything is fetched (§G.3).
-	at := hashID(t, "", []byte("an ns_id at A"))
-	expectMember(t, e.mkRemote("rel", remoteGenesis("main", at, map[string]any{"title": "B's release"})), "/title")
 }

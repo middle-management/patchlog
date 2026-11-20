@@ -2,17 +2,9 @@ package grantcheck_test
 
 import (
 	"context"
-	"io"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
-	"time"
 
-	"github.com/middle-management/patchlog/internal/client"
-	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/grantcheck"
-	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // v073Rules returns rules of n forms in all: one all of n-1 leaves.
@@ -53,53 +45,6 @@ func TestV073DecodeLimitsAndRules(t *testing.T) {
 	bad := f.grant(f.issuer, "user:bob", []string{"other"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "frob"}}})
 	if _, err := f.ch.Verify(ctx, "sec", bad); authStatus(err) != 401 {
 		t.Fatalf("uncompilable rule: %v", err)
-	}
-}
-
-// A remote branch's base is in another deployment (§7.6, §G.3): a service
-// verifying grants for the branch takes keys and revocations from the
-// branch alone (§10, §C.4), never from a namespace of the base's name in
-// the deployment it reads, and needs no branch entry there.
-func TestV073RemoteBaseLendsNoKeys(t *testing.T) {
-	ctx := context.Background()
-	own, local := clienttest.NewKey("own"), clienttest.NewKey("local")
-	head := "1" + strings.Repeat("a", 32)
-	docs := map[string]map[string]any{
-		"rel": {"read": "grant", "keys": []any{own.Entry("read")},
-			"base": map[string]any{"origin": "https://a.example", "ns": "sec", "at": head, "chain": []any{"sec"}}},
-		"sec": {"read": "grant", "keys": []any{local.Entry("read")}},
-	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/ns/"), "/")
-		doc, ok := docs[parts[0]]
-		switch {
-		case !ok:
-			w.WriteHeader(404)
-			io.WriteString(w, `{"code":"not_found"}`)
-		case len(parts) == 1:
-			w.Header().Set("ETag", `"`+head+`"`)
-			w.WriteHeader(302)
-		case len(parts) == 3 && parts[1] == "rev" && parts[2] == head:
-			w.Header().Set("Content-Type", "application/json")
-			w.Write(jsonv.Canonical(jsonv.FromGo(doc)))
-		default:
-			t.Errorf("unexpected request %s", r.URL)
-			w.WriteHeader(404)
-		}
-	}))
-	defer srv.Close()
-	c := must(client.New(srv.URL))
-	cfg := must(grantcheck.ParseConfig("rel", head, jsonv.FromGo(docs["rel"]).(map[string]any)))
-	if cfg.Base != "" || cfg.BaseAt != "" {
-		t.Fatalf("remote base %q at %q", cfg.Base, cfg.BaseAt)
-	}
-	now := time.Now()
-	ch := grantcheck.New(c, grantcheck.WithTTL(0), grantcheck.WithClock(func() time.Time { return now }))
-	if _, err := ch.Verify(ctx, "rel", local.Grant(t, now, "user:x", []string{"rel"}, []string{"read"})); authStatus(err) != 401 {
-		t.Fatalf("a key of the local sec verified in the remote branch: %v", err)
-	}
-	if _, err := ch.Verify(ctx, "rel", own.Grant(t, now, "user:x", []string{"rel"}, []string{"read"})); err != nil {
-		t.Fatalf("the branch's own key: %v", err)
 	}
 }
 

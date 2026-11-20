@@ -198,9 +198,7 @@ func (im *importer) resolveRenames(ctx context.Context) error {
 }
 
 // ontoBranch reports whether target namespace dst is a branch whose base
-// chain reaches src, in the target or, for a remote branch, in the
-// bundle's origin, where its base.chain lists the bases it verified
-// (§G.3).
+// chain reaches src in the target.
 func (im *importer) ontoBranch(ctx context.Context, src, dst string) (bool, error) {
 	ns := dst
 	for i := 0; i < 64; i++ {
@@ -217,19 +215,7 @@ func (im *importer) ontoBranch(ctx context.Context, src, dst string) (bool, erro
 		}
 		bns, _ := b["ns"].(string)
 		if bns == src {
-			if o, remote := b["origin"].(string); remote && o != im.h.Origin {
-				return false, nil
-			}
 			return true, nil
-		}
-		if o, remote := b["origin"].(string); remote {
-			chain, _ := b["chain"].([]any)
-			for _, x := range chain {
-				if x == src && o == im.h.Origin {
-					return true, nil
-				}
-			}
-			return false, nil
 		}
 		ns = bns
 	}

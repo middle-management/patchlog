@@ -495,7 +495,7 @@ func validID(s string) bool {
 
 // idSegments are the path wildcards that hold ids (§3.2): a revision's or
 // namespace revision's {id}, a grant's {gid}, a blob's {bid}, and a
-// filtered read's subject set {gs} and checkpoint {at} (§B.11.9), for
+// filtered read's subject set {gs} and checkpoint {at} (§7.9), for
 // which "all", a service's, is no id either.
 var idSegments = map[string]bool{"{id}": true, "{gid}": true, "{bid}": true, "{gs}": true, "{at}": true}
 

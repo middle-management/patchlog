@@ -12,7 +12,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
-// fcp is a filtered answer's checkpoint (§B.11.9 URLs): at is the ns_id
+// fcp is a filtered answer's checkpoint (§7.9 URLs): at is the ns_id
 // text of an entry of {ns}, and seq its ns_log seq. It is immutable.
 type fcp struct {
 	at  string
@@ -40,7 +40,7 @@ func (t *tx) filteredAt(fs *fscope, at string) (*fcp, bool) {
 	return &fcp{at: at, seq: seq}, true
 }
 
-// gsRecord is a filtered_gs row (§B.11.9 gs): what a subject set stands
+// gsRecord is a filtered_gs row (§7.9 gs): what a subject set stands
 // for, from which cookies for it are judged, never from a grant the
 // request doesn't carry.
 type gsRecord struct {
@@ -52,7 +52,7 @@ type gsRecord struct {
 	kid string
 	// pub is the pub member of kid's key entry as the grant was verified
 	// against it: a cookie is accepted only while the key with that kid
-	// has the same pub (§B.11.9 gs, §C.4). "" (a row from before it was
+	// has the same pub (§7.9 gs, §C.4). "" (a row from before it was
 	// kept) never matches.
 	pub        string
 	roles      []string
@@ -63,10 +63,10 @@ type gsRecord struct {
 	// entry is EntryDigest (gsEntryDigest) over kid's whole key entry and
 	// the whole definition of each of roles, as {ns}'s document had them
 	// at the exchange: a cookie is accepted only while it is the same
-	// (§B.11.9 gs, "gone or changes in any member"). "" never holds.
+	// (§7.9 gs, "gone or changes in any member"). "" never holds.
 	// conf is the ns_config seq of that document, of the exchange's read
 	// snapshot: a cookie is held to every document of {ns} after it up to
-	// the one at the answer's checkpoint (§B.11.9 gs, v0.86: "Once an
+	// the one at the answer's checkpoint (§7.9 gs, v0.86: "Once an
 	// entry after its exchange changes one of them, the cookie is 403
 	// from that entry on, even where a later entry undoes the change";
 	// gsHeldSince). 0 never holds.
@@ -95,7 +95,7 @@ func errNoSecond() *Error {
 // recordFilteredGS records r in filtered_gs and takes the second its
 // cookie expires at, which it sets r.exp to, in a short write transaction
 // of its own; it sweeps rows past their exp and those of purged
-// namespaces (§B.11.9 gs). Rows are per (ns, gs): a gs names no
+// namespaces (§7.9 gs). Rows are per (ns, gs): a gs names no
 // namespace, so one grant's gs can be the same in two covered
 // namespaces, and each keeps its own kid and rules.
 //

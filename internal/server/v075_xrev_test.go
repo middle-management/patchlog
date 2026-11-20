@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// Cross-package review of v0.75 (§B.11.9): conformance.
+// Cross-package review of v0.75 (§7.9): conformance.
 
 // v75sLoseRead seeds derby, visible to li, and returns li's grant, her gs
 // cookie and gs, once her cookie reads derby at the current at.
@@ -44,7 +44,7 @@ func wantCookieRefused(t *testing.T, w *v75s, li string, ck map[string]string, g
 	}
 }
 
-// TestV075XrevCookieAfterRoleLosesRead (§B.11.9 gs, §A.4, §2.1): li's grant
+// TestV075XrevCookieAfterRoleLosesRead (§7.9 gs, §A.4, §2.1): li's grant
 // reads matches through its role reader; once reader no longer lists
 // read, the grant can't read matches (403), and the rules her marker
 // digests, of each effective role listing read, differ: her gs cookie is
@@ -73,7 +73,7 @@ func TestV075XrevCookieAfterKeyLosesRead(t *testing.T) {
 	wantCookieRefused(t, w, li, ck, gs)
 }
 
-// TestV075XrevFilteredHeadsPurgedUnknownAt (§B.11.9 Purged namespaces,
+// TestV075XrevFilteredHeadsPurgedUnknownAt (§7.9 Purged namespaces,
 // §8.5): /heads at any revision answers 410 as soon as the read check
 // passes, before any other answer to a well-formed request, as the
 // unfiltered /heads of a purged namespace does at a revision that isn't

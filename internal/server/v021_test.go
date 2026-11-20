@@ -156,23 +156,22 @@ func TestLimitKeys(t *testing.T) {
 		"rulesPerNamespace": 4, "itemsPerBatch": 10,
 		"batchSize": 1 << 20, "branchesPerNamespace": 3, "keepPerResource": 5,
 		"ratePerResource": map[string]any{"rate": 1, "burst": 2}, "ratePerPrincipal": map[string]any{"rate": 1, "burst": 2},
-		"ratePerNamespace": map[string]any{"rate": 1, "burst": 2}, "retryWindow": "PT5M", "remoteRegistration": "P1D",
+		"ratePerNamespace": map[string]any{"rate": 1, "burst": 2}, "retryWindow": "PT5M",
 	}
 	expect(t, mk("good", good), 201)
 	for i, bad := range []map[string]any{
-		{"liveBranches": 3},             // v0.20 name
-		{"remoteBranchLife": "P1D"},     // v0.20 name
-		{"logPageSize": 10},             // deployment only
-		{"branchDepth": 2},              // deployment only
-		{"rulesPerGrant": 4},            // deployment only (v0.63)
-		{"grantSize": 4096},             // deployment only (v0.63)
-		{"batchSize": "1 MiB"},          // sizes are integers in bytes
-		{"patchSetSize": "1024"},        //
-		{"remoteRegistration": 30},      // a duration
-		{"ratePerNamespace": 10},        // { rate, burst }
-		{"itemsPerBatch": 1.5},          // an integer
-		{"documentSize": 64 << 20},      // over the deployment maximum
-		{"remoteRegistration": "P400D"}, // over the deployment maximum
+		{"liveBranches": 3},           // v0.20 name
+		{"remoteBranchLife": "P1D"},   // v0.20 name
+		{"remoteRegistration": "P1D"}, // removed in v0.87
+		{"logPageSize": 10},           // deployment only
+		{"branchDepth": 2},            // deployment only
+		{"rulesPerGrant": 4},          // deployment only (v0.63)
+		{"grantSize": 4096},           // deployment only (v0.63)
+		{"batchSize": "1 MiB"},        // sizes are integers in bytes
+		{"patchSetSize": "1024"},      //
+		{"ratePerNamespace": 10},      // { rate, burst }
+		{"itemsPerBatch": 1.5},        // an integer
+		{"documentSize": 64 << 20},    // over the deployment maximum
 	} {
 		r := mk("bad", bad)
 		if r.Code != 422 {

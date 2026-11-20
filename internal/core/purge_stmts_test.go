@@ -38,7 +38,7 @@ func countPurge(t *testing.T, kind string, branches int) purgeCounts {
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
 	lim.BranchesPerNamespace = 1 << 20
 	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, Limits: lim, Purger: discardPurger{},
-		RetentionInterval: -1, BlobSweepInterval: -1, RepurgeInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
+		RetentionInterval: -1, BlobSweepInterval: -1, RepurgeInterval: -1})
 	if err != nil {
 		t.Fatal(err)
 	}

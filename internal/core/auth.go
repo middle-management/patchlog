@@ -37,7 +37,7 @@ type actor struct {
 	// noAuth: a request made while authentication is disabled (§1). The
 	// namespace entries written for it record "grant": null (§7.4).
 	noAuth bool
-	// gs is the subject set of a filtered read's edge grant (§B.11.9,
+	// gs is the subject set of a filtered read's edge grant (§7.9,
 	// filteredAdmit): such an actor never reads unrestricted (readsNS,
 	// canRead).
 	gs string
@@ -296,11 +296,8 @@ func validateAttrs(schema any, attrs map[string]any, steps int) error {
 // accepted, whatever the branch's entry says. A key the branch copied from
 // its base at creation that the base has since removed stops working. Keys
 // added only to the branch are its own.
-//
-// Keys don't follow a base in another deployment (§7.6, §G.3): a remote
-// branch's keys are its own.
 func (t *tx) effectiveKeys(n *nsRow, cfg *Config) []grant.Key {
-	if !n.isBranch() || t.remoteShadow(n) != nil {
+	if !n.isBranch() {
 		return cfg.Keys
 	}
 	base := t.base(n)
@@ -328,22 +325,37 @@ func findKey(ks []grant.Key, kid string) (grant.Key, bool) {
 }
 
 // effectiveRevoked merges the revocations of the namespace and all its
-// bases in this deployment; they stop at a remote base (§7.6, §G.3).
+// bases (§7.6).
 func (t *tx) effectiveRevoked(n *nsRow, cfg *Config) map[string]bool {
-	if !n.isBranch() || t.remoteShadow(n) != nil {
+	if !n.isBranch() {
 		return cfg.Revoked
 	}
 	out := map[string]bool{}
 	for k := range cfg.Revoked {
 		out[k] = true
 	}
-	for b := n; b.isBranch() && t.remoteShadow(b) == nil; {
+	for b := n; b.isBranch(); {
 		b = t.base(b)
 		for k := range t.config(b.configSeq).Revoked {
 			out[k] = true
 		}
 	}
 	return out
+}
+
+// admitOnce is admit, once for a request: a write whose transaction runs
+// again (Postgres, pglock.go) keeps its draw (rateDrawn).
+func (t *tx) admitOnce(draws []draw) *Error {
+	if t.rateDrawn != nil && *t.rateDrawn {
+		return nil
+	}
+	if err := t.admit(draws); err != nil {
+		return err
+	}
+	if t.rateDrawn != nil {
+		*t.rateDrawn = true
+	}
+	return nil
 }
 
 // basicEnvelope is the envelope of step 1 and of reads. A read envelope
@@ -455,9 +467,7 @@ func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 // doesn't exist, except that public namespaces ignore it and answer as to
 // an unauthenticated request; other refusals, a key-scope failure
 // included, answer 404 rather than 403, so that neither the resource's
-// nor the namespace's existence is revealed (§7, §C.2 item 1). Past the
-// check, a resource whose source was raised to a level this server lacks
-// answers 502 upstream (upstreamRefusal, §1).
+// nor the namespace's existence is revealed (§7, §C.2 item 1).
 func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	var a *actor
@@ -466,9 +476,6 @@ func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error
 		a, err = t.edgeReader(n, cred.Edge, resource)
 	} else {
 		a, err = t.readerCheckURL(n, cred, func(a *actor) bool { return t.canRead(n, cfg, a, resource) }, readResource)
-	}
-	if err == nil && resource != "" {
-		err = t.upstreamRefusal(n, resource)
 	}
 	return a, err
 }
@@ -485,7 +492,7 @@ func (t *tx) nsReader(n *nsRow, cred Credentials) (*actor, *Error) {
 	return t.readerCheck(n, cred, func(a *actor) bool { return t.readsNS(n, cfg, a, false) })
 }
 
-// accessKind classifies a reader of a namespace (§B.11.9 Partial reader).
+// accessKind classifies a reader of a namespace (§7.9 Partial reader).
 type accessKind int
 
 const (
@@ -660,10 +667,9 @@ func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, k
 // authentication disabled, and otherwise a grant that may read there
 // through rules none of which refers to /resource (unrestrictedRoles)
 // and that pass for a read, so none on /now (§C.2 item 5). /ns/{ns} and everything under it but the gestures listing need it, as
-// do a batch's source check (§7.5), branching (§7.6) and remote branch
-// registration (§G.3): a grant whose rules hide some resources could
+// do a batch's source check (§7.5), branching (§7.6): a grant whose rules hide some resources could
 // otherwise list their names and heads, or read them through a branch.
-// Branching and registration check it as step 1 checks verbs (stepOne,
+// Branching checks it as step 1 checks verbs (stepOne,
 // §6.2, §2.1, §C.2 item 2), in a public namespace too: the grant must read
 // n unrestricted and allow read, and its key-scope and block rules that
 // refer only to /action or /principal must pass with /action read,
@@ -681,7 +687,7 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 	}
 	if a.verified == nil {
 		// A namespace's edge grant (edgeReader), but not a filtered
-		// read's (§B.11.9).
+		// read's (§7.9).
 		return a.gs == ""
 	}
 	roles, ok := a.unrestrictedRoles()
@@ -901,22 +907,6 @@ func (t *tx) admit(draws []draw) *Error {
 		e := apiErr(429, "rate", "message", "rate limit exceeded", "limit", hit, "retryAfter", math.Ceil(wait.Seconds()*1000)/1000)
 		e.Header = map[string][]string{"Retry-After": {fmt.Sprint(secs)}}
 		return e
-	}
-	return nil
-}
-
-// admitOnce is admit, once for a request: a write that runs again, as one
-// that reads a remote branch's base does (withRemoteSource), keeps its
-// draw (rateDrawn).
-func (t *tx) admitOnce(draws []draw) *Error {
-	if t.rateDrawn != nil && *t.rateDrawn {
-		return nil
-	}
-	if err := t.admit(draws); err != nil {
-		return err
-	}
-	if t.rateDrawn != nil {
-		*t.rateDrawn = true
 	}
 	return nil
 }

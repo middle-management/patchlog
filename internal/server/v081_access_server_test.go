@@ -11,7 +11,7 @@ import (
 )
 
 // V81-02 (v0.78, v0.81): a rule referring to /now never passes for a
-// read (§C.2 item 5); filtered reads cover no branch (§B.11.9 Where); the
+// read (§C.2 item 5); filtered reads cover no branch (§7.9 Where); the
 // first namespace entry's prev is "" (§7.4).
 
 // v081NowEnv is a private namespace dl with a * key k and a key dk whose
@@ -199,7 +199,7 @@ func TestV081AccessNowKeysE3Public(t *testing.T) {
 	}
 }
 
-// §C.2 item 5, §B.11.9 Partial reader (ACCESS-2): a grant with a block
+// §C.2 item 5, §7.9 Partial reader (ACCESS-2): a grant with a block
 // rule on /now is no partial reader. At an unfiltered URL of covered
 // matches it is 403 at once, never a 302 to a filtered URL; and on a
 // purged matches its gestures listing is 403, not the 410 of a read that
@@ -224,7 +224,7 @@ func TestV081AccessNowNoPartialReader(t *testing.T) {
 	expectCode(t, w.get("/ns/matches/gestures/"+gA, w.li()), 410, "purged")
 }
 
-// TDA 63 (§B.11.9 Where, §C.5.2; v0.78): li's grant names matches-r7, a
+// TDA 63 (§7.9 Where, §C.5.2; v0.78): li's grant names matches-r7, a
 // branch of covered matches: its filtered URLs are 403, and 401 with
 // neither a grant nor a cookie; POST /edge-grants naming only matches-r7
 // is 403 with no /ns/matches-r7/g/ prefix. An unrestricted reader of

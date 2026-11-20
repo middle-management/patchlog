@@ -11,7 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
-// grantView is the view of a partial reader's grant at cp (§B.11.9 gs):
+// grantView is the view of a partial reader's grant at cp (§7.9 gs):
 // its subjects are grantcheck.FilteredSubjects, scope:{digest} and
 // key:{…}, and its gs their grantcheck.SubjectSetID. Its scope digest and
 // filter are over the rules a read is judged by, roles whose rules refer
@@ -23,7 +23,7 @@ func (t *tx) grantView(fs *fscope, cp *fcp, a *actor) (*fview, *Error) {
 	in := readScopeInput(a.verified)
 	digest, ok := grantcheck.ScopeDigest(in)
 	if !ok || a.verified.HasRoles() && len(in.Roles) == 0 {
-		return nil, forbidden("the grant's rules don't allow reading " + fs.n.name + " (§C.2 item 5, §B.11.9 Partial reader)")
+		return nil, forbidden("the grant's rules don't allow reading " + fs.n.name + " (§C.2 item 5, §7.9 Partial reader)")
 	}
 	subjects := grantcheck.FilteredSubjects(digest, a.verified.Key.Kid, keyPub(*a.verified.Key))
 	return t.newFview(fs, cp, grantcheck.SubjectSetID(subjects), subjects, readFilterOf(a.verified), a), nil
@@ -77,7 +77,7 @@ func gsRecordOf(fv *fview, exp int64) *gsRecord {
 }
 
 // filteredAdmit admits a request at a filtered URL of n, /ns/{ns}/g/{urlGS}
-// with checkpoint cp (§B.11.9 URLs, design H), and returns the view it
+// with checkpoint cp (§7.9 URLs, design H), and returns the view it
 // reads with:
 //
 //   - a grant in Authorization: an unrestricted reader's is 403 there,
@@ -107,7 +107,7 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 		case err != nil:
 			return nil, err
 		case kind == accessUnrestricted:
-			return nil, forbidden("this grant reads " + n.name + " unrestricted, at its unfiltered URLs (§B.11.9 Partial reader)")
+			return nil, forbidden("this grant reads " + n.name + " unrestricted, at its unfiltered URLs (§7.9 Partial reader)")
 		case kind != accessPartial:
 			return nil, forbidden("the grant does not allow this read in " + n.name)
 		}
@@ -116,7 +116,7 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 			return nil, err
 		}
 		if fv.gs != urlGS {
-			return nil, forbidden("the grant reads " + n.name + " at its own subject set, /ns/" + n.name + "/g/" + fv.gs + " (§B.11.9, §B.11.5)")
+			return nil, forbidden("the grant reads " + n.name + " at its own subject set, /ns/" + n.name + "/g/" + fv.gs + " (§7.9, §B.11.5)")
 		}
 		return fv, nil
 	}
@@ -131,11 +131,11 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 		return nil, nsNotNamed(n.name)
 	}
 	if eg.GS != "" && eg.GS != urlGS {
-		return nil, forbidden("the edge grant is for another subject set (§B.11.9)")
+		return nil, forbidden("the edge grant is for another subject set (§7.9)")
 	}
 	rec := t.loadGS(n.name, urlGS)
 	if rec == nil {
-		return nil, apiErr(401, "unauthenticated", "message", "unknown subject set: exchange the grant again (§B.11.9)")
+		return nil, apiErr(401, "unauthenticated", "message", "unknown subject set: exchange the grant again (§7.9)")
 	}
 	// The cookie is judged from the row of its own exp, the entry digest
 	// and document its exchanges recorded (recordFilteredGS): one whose
@@ -149,11 +149,11 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlGS string, cp *fcp, cred Cre
 	}
 	rec.entry, rec.conf = slot.entry, slot.conf
 	if !ok || !t.gsDigestHolds(n, cp, rec) || !t.gsHeldSince(n, cp, rec) {
-		return nil, forbidden("the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)")
+		return nil, forbidden("the rules this subject set was issued under have changed: exchange the grant again (§7.9)")
 	}
 	filter, err := grantcheck.DecodeReadFilter(rec.filter)
 	if err != nil {
-		return nil, apiErr(401, "unauthenticated", "message", "unknown subject set: exchange the grant again (§B.11.9)")
+		return nil, apiErr(401, "unauthenticated", "message", "unknown subject set: exchange the grant again (§7.9)")
 	}
 	a := &actor{principal: grant.Principal{ID: "edge:" + eg.Prefix}, bucketKey: "edge:" + eg.Prefix, gs: urlGS}
 	return t.newFview(fs, cp, urlGS, rec.subjects, filter, a), nil
@@ -167,12 +167,12 @@ func keyPub(k grant.Key) string {
 
 // gsDigestHolds reports whether rec's scope digest is the same with its
 // kid's scope rules and its roles' definitions as of n's document at cp
-// (§B.11.9 gs: "a gs cookie is 403 at an at where those rules differ"),
+// (§7.9 gs: "a gs cookie is 403 at an at where those rules differ"),
 // its kid and each of its roles still listing read there, so that a
 // cookie never reads where its grant couldn't. Keys follow the base
 // (§C.4), and the key with rec's kid must still have rec's pub: a kid
 // whose pub was replaced is no longer the key the cookie came from
-// (§B.11.9 gs, "no longer accepted"; §C.4, a shared kid "accepted only
+// (§7.9 gs, "no longer accepted"; §C.4, a shared kid "accepted only
 // while the base has it with the same pub"). An empty stored pub, from a
 // row recorded before pubs were kept, never holds, nor does a row whose
 // subjects don't bind its kid and pub (grantcheck.KeySubject), so that no row is
@@ -182,7 +182,7 @@ func keyPub(k grant.Key) string {
 // in any member from the one the exchange recorded (rec.entry,
 // gsEntryDigest), whether or not the scope digest reads that member: a
 // changed sub, groups, attrs, maxTtl or can of the key, or a
-// role's can or rules (§B.11.9 gs, v0.82: "or the key its key: string
+// role's can or rules (§7.9 gs, v0.82: "or the key its key: string
 // names, or a key or role they came from, is gone or changes in any
 // member, until the reader exchanges again"). An empty stored entry,
 // from a row recorded before it was kept, never holds.
@@ -223,7 +223,7 @@ const gsWalk = 64
 
 // gsHeldSince reports whether rec has held under every document of n
 // after the one its exchange recorded it under (rec.conf), up to the one
-// at cp (§B.11.9 gs, v0.86: "Once an entry after its exchange changes
+// at cp (§7.9 gs, v0.86: "Once an entry after its exchange changes
 // one of them, the cookie is 403 from that entry on, even where a later
 // entry undoes the change"; CONFORMANCE Access 145). gsDigestHolds judges
 // the document at cp alone, which a change made and undone gives back.
@@ -327,7 +327,7 @@ func (t *tx) configParent(seq int64) int64 {
 	return p.Int64
 }
 
-// gsEntryDigest is §B.11.9 gs's EntryDigest of the key named kid and of
+// gsEntryDigest is §7.9 gs's EntryDigest of the key named kid and of
 // roles in n with document cfg:
 //
 //	text(trunc160(sha256(canonical({ "key": K, "roles": R }))))
@@ -358,7 +358,7 @@ func (t *tx) gsEntryDigest(n *nsRow, cfg *Config, kid string, roles []string) st
 
 // entryDigest is EntryDigest, text(trunc160(sha256(canonical({ "key": key, "roles":
 // roles })))), the digest a gs cookie's record keeps of the key entry and
-// role definitions it came from (§B.11.9 gs). Nil roles are {}.
+// role definitions it came from (§7.9 gs). Nil roles are {}.
 func entryDigest(key map[string]any, roles map[string]any) string {
 	if roles == nil {
 		roles = map[string]any{}
@@ -367,7 +367,7 @@ func entryDigest(key map[string]any, roles map[string]any) string {
 }
 
 // FilteredRedirect is a partial reader's request at an unfiltered URL,
-// answered 302 to its filtered form (§B.11.9 URLs): /ns/{NS}/g/{GS}/at/{At}/…
+// answered 302 to its filtered form (§7.9 URLs): /ns/{NS}/g/{GS}/at/{At}/…
 // for ranges, or /ns/{NS}/g/{GS}/… with At "" for long-poll and events,
 // which the caller clears.
 type FilteredRedirect struct {

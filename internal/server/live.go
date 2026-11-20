@@ -152,7 +152,7 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 		lg, err := fetch(r.Context(), since)
 		if err != nil {
 			// A partial reader, by its grant: the filtered long-poll
-			// (§B.11.9 URLs).
+			// (§7.9 URLs).
 			if s.writeFilteredRedirect(w, err, "/log", keep(r.URL.Query(), "since", "live", "cursor")) {
 				return
 			}
@@ -291,7 +291,7 @@ func (s *Server) nsLive(w http.ResponseWriter, r *http.Request) {
 		info, err := s.e.NamespaceLogHead(r.Context(), ns, creds(r))
 		if err != nil {
 			// A partial reader's is the filtered range at the current at
-			// (§B.11.9 URLs).
+			// (§7.9 URLs).
 			if s.writeFilteredRedirect(w, err, "/log", keep(r.URL.Query(), "since")) {
 				return
 			}
@@ -313,7 +313,7 @@ func (s *Server) nsLive(w http.ResponseWriter, r *http.Request) {
 	wait := func() <-chan struct{} { return s.e.Wait(ns) }
 	s.longPoll(w, r, ns, "X-Namespace-Revision", []string{"ns:" + ns}, cursor, s.clockOf(nsLogPath(ns)), wait, func(ctx context.Context, since string) (*core.Log, error) {
 		// A partial reader's first read is redirected to the filtered
-		// long-poll (§B.11.9 URLs), which longPoll answers.
+		// long-poll (§7.9 URLs), which longPoll answers.
 		lg, p, err := s.e.NamespaceLiveLog(ctx, ns, since, lim, creds(r), pass)
 		pass = p
 		return lg, err
@@ -434,7 +434,7 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 	wait := s.e.Wait(ns)
 	lg, err := s.e.NamespaceEvents(r.Context(), ns, since, page, cred)
 	if err != nil {
-		// A partial reader, by its grant: the filtered stream (§B.11.9
+		// A partial reader, by its grant: the filtered stream (§7.9
 		// URLs).
 		if s.writeFilteredRedirect(w, err, "/events", keep(r.URL.Query(), "since")) {
 			return

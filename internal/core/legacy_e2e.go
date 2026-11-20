@@ -12,15 +12,13 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// Namespaces a pre-v0.78 deployment raised to e2e by a config write, and
-// remote branches that mirror a source raised so (Addendum E Levels: a
-// namespace is end-to-end from its creation or never; v0.78). What they
+// Namespaces a pre-v0.78 deployment raised to e2e by a config write
+// (Addendum E Levels: a namespace is end-to-end from its creation or never; v0.78). What they
 // stored before the raise (plaintext revisions, documents and snapshots,
 // pre-raise sealings and keys, plain blobs, grants recorded before it) has
 // no read path any more, and the E3 paths would serve it in the clear,
 // which the Invariant forbids. So Open fails closed, naming each, before
-// migration 016 drops the tables that mark them (e2e_raises,
-// remote_pending_sealings): an operator exports them with the v0.26.1
+// migration 016 drops the table that marks them (e2e_raises): an operator exports them with the v0.26.1
 // tools, has a key holder import them into new e2e namespaces under new
 // names (§G.5.1) and purges them, or starts with Options.PurgeRaisedE2E,
 // which purges them at Open, destroying their epoch keys (§8.5), so they
@@ -30,26 +28,21 @@ import (
 // Open then refuses again until a start with the flag purges them
 // (stored.md item 1: fail closed).
 
-// legacyE2E is what checkLegacyE2E found: the raised namespaces, and the
-// remote branches whose shadows were raised or hold pending pre-raise
-// sealings, by name.
+// legacyE2E is what checkLegacyE2E found: the raised namespaces, by name.
 type legacyE2E struct {
-	raised, remote []string
+	raised []string
 	// pendingOnly: found in legacy_e2e_pending alone, the marker tables
 	// gone (a --purge-raised-e2e start that didn't finish).
 	pendingOnly bool
 }
 
-func (l *legacyE2E) empty() bool { return l == nil || len(l.raised)+len(l.remote) == 0 }
+func (l *legacyE2E) empty() bool { return l == nil || len(l.raised) == 0 }
 
 // names lists them for an operator.
 func (l *legacyE2E) names() string {
 	var parts []string
 	for _, n := range l.raised {
 		parts = append(parts, "namespace "+n)
-	}
-	for _, n := range l.remote {
-		parts = append(parts, "remote branch "+n)
 	}
 	return strings.Join(parts, ", ")
 }
@@ -64,8 +57,7 @@ func errLegacyE2E(l *legacyE2E) error {
 		"No reference tool makes it end-to-end: the importer takes an e2e namespace only under its own name, and no plaintext into one, "+
 		"and no reference client re-seals an import (§G.5.1). Before upgrading, export each with the v0.26.1 tools to keep a copy; "+
 		"to keep its content end-to-end, a key holder writes it into a new e2e namespace, with a third-party importer that re-seals it "+
-		"or by recreating its current documents with a client (CreateDocSealed). Then purge it, its local branches first; "+
-		"a remote branch is purged and created again against a source that is e2e from its creation. "+
+		"or by recreating its current documents with a client (CreateDocSealed). Then purge it, its local branches first. "+
 		"Or start once with --purge-raised-e2e, which purges them and their local branches now, destroying their keys and content: they then answer 410 purged", l.names())
 }
 
@@ -84,33 +76,20 @@ func tableExists(db *sql.DB, pg bool, name string) (bool, error) {
 }
 
 // legacyPendingTable records, from a start with --purge-raised-e2e, what
-// it is to purge (recordLegacyE2E): kind 'raised' or 'remote' and the
-// name, kept until the purges commit (purgeRaisedE2E).
+// it is to purge (recordLegacyE2E): kind 'raised' and the name, kept until the purges commit (purgeRaisedE2E).
 const legacyPendingTable = "legacy_e2e_pending"
 
-// checkLegacyE2E finds the raised namespaces and the remote branches of
-// raised sources in db, before it is migrated: every unpurged namespace or
-// shadow with an e2e_raises row, every shadow with a
-// remote_pending_sealings row, and every one legacy_e2e_pending records.
-// A shadow ("~{branch}" or "~{branch}~{i}") names its remote branch.
+// checkLegacyE2E finds the raised namespaces in db, before it is
+// migrated: every unpurged namespace with an e2e_raises row, and every one
+// legacy_e2e_pending records as raised.
 func checkLegacyE2E(db *sql.DB, pg bool) (*legacyE2E, error) {
 	l := &legacyE2E{}
-	remote := map[string]bool{}
-	add := func(name string) {
-		if strings.HasPrefix(name, "~") {
-			b, _, _ := strings.Cut(name[1:], "~")
-			remote[b] = true
-			return
-		}
-		l.raised = append(l.raised, name)
-	}
+	add := func(name string) { l.raised = append(l.raised, name) }
 	markers, pending := false, false
 	for _, q := range []struct{ table, query string }{
 		{"e2e_raises", `SELECT n.name FROM e2e_raises r JOIN namespaces n ON n.ns = r.ns WHERE n.purged = 0 ORDER BY n.name`},
-		{"remote_pending_sealings", `SELECT DISTINCT n.name FROM remote_pending_sealings p JOIN namespaces n ON n.ns = p.shadow ORDER BY n.name`},
-		// Recorded by a start with the flag: a remote branch as "~{name}",
-		// which add reads as its shadow's.
-		{legacyPendingTable, `SELECT CASE WHEN kind = 'remote' THEN '~' || name ELSE name END FROM ` + legacyPendingTable + ` ORDER BY kind, name`},
+		// Recorded by a start with the flag.
+		{legacyPendingTable, `SELECT name FROM ` + legacyPendingTable + ` WHERE kind = 'raised' ORDER BY name`},
 	} {
 		ok, err := tableExists(db, pg, q.table)
 		if err != nil {
@@ -141,10 +120,6 @@ func checkLegacyE2E(db *sql.DB, pg bool) (*legacyE2E, error) {
 			return nil, err
 		}
 	}
-	for b := range remote {
-		l.remote = append(l.remote, b)
-	}
-	sort.Strings(l.remote)
 	l.raised = dedupSorted(l.raised)
 	l.pendingOnly = pending && !markers && !l.empty()
 	return l, nil
@@ -172,7 +147,7 @@ func recordLegacyE2E(db *sql.DB, pg bool, l *legacyE2E) error {
 	for _, kn := range []struct {
 		kind  string
 		names []string
-	}{{"raised", l.raised}, {"remote", l.remote}} {
+	}{{"raised", l.raised}} {
 		for _, name := range kn.names {
 			if _, err := tx.Exec(ins, kn.kind, name); err != nil {
 				return err
@@ -194,10 +169,9 @@ func dedupSorted(s []string) []string {
 }
 
 // purgeRaisedE2E purges what checkLegacyE2E found, once the schema is
-// migrated (Options.PurgeRaisedE2E): each namespace and remote branch, and
-// every local branch of them, leaves first, through the namespace purge
-// (purgeNSNow), which destroys their epoch keys and their shadows'
-// content (§8.5, §G.3). The purge-ns entries are by RotateAuthor's
+// migrated (Options.PurgeRaisedE2E): each namespace, and every local
+// branch of them, leaves first, through the namespace purge (purgeNSNow),
+// which destroys their epoch keys (§8.5). The purge-ns entries are by RotateAuthor's
 // sibling, the system author UpgradeAuthor.
 func (e *Engine) purgeRaisedE2E(ctx context.Context, l *legacyE2E) error {
 	if l.empty() {
@@ -221,11 +195,11 @@ func (e *Engine) purgeRaisedE2E(ctx context.Context, l *legacyE2E) error {
 			}
 			order = append(order, n) // leaves first
 		}
-		for _, name := range append(append([]string(nil), l.raised...), l.remote...) {
+		for _, name := range l.raised {
 			visit(t.nsByName(name))
 		}
 		for _, n := range order {
-			if n.purged || n.isShadow() {
+			if n.purged {
 				continue
 			}
 			t.purgeNSNow(n, false, author)
@@ -273,7 +247,7 @@ func (e *Engine) legacyE2EWarnings(ctx context.Context, purged *legacyE2E) []str
 		}
 		rows.Close()
 		for _, n := range nss {
-			if n.isShadow() || !t.isE2E(n) {
+			if !t.isE2E(n) {
 				continue
 			}
 			d := t.ownKeyring(n, nil)
@@ -289,7 +263,7 @@ func (e *Engine) legacyE2EWarnings(ctx context.Context, purged *legacyE2E) []str
 				lines = append(lines, fmt.Sprintf("namespace %s: its keyring isn't a keyring document of §E.3.2, so /keys relays none of its entries; a key holder writes one", n.name))
 			}
 		}
-		srows, err := t.Query(`SELECT n.name, r.name, s.jwe, v.id, v.kind, v.parent_seq FROM e2e_snapshots s JOIN resources r ON r.res = s.res JOIN namespaces n ON n.ns = r.ns JOIN revisions v ON v.res = s.res AND v.seq = s.seq WHERE n.purged = 0 AND n.name NOT LIKE '~%' AND r.state <> ?`, statePurged)
+		srows, err := t.Query(`SELECT n.name, r.name, s.jwe, v.id, v.kind, v.parent_seq FROM e2e_snapshots s JOIN resources r ON r.res = s.res JOIN namespaces n ON n.ns = r.ns JOIN revisions v ON v.res = s.res AND v.seq = s.seq WHERE n.purged = 0 AND r.state <> ?`, statePurged)
 		t.must(err)
 		type snap struct {
 			ns, name, jwe string
@@ -321,7 +295,7 @@ func (e *Engine) legacyE2EWarnings(ctx context.Context, purged *legacyE2E) []str
 	if err != nil {
 		log.Printf("checking for data this version no longer reads: %v", err)
 	}
-	for _, name := range append(append([]string(nil), purged.raisedOrNil()...), purged.remoteOrNil()...) {
+	for _, name := range purged.raisedOrNil() {
 		lines = append(lines, fmt.Sprintf("namespace %s was purged at start: $schema pins to its schema revisions now resolve as purged (schema_unavailable)", name))
 	}
 	return lines
@@ -332,13 +306,6 @@ func (l *legacyE2E) raisedOrNil() []string {
 		return nil
 	}
 	return l.raised
-}
-
-func (l *legacyE2E) remoteOrNil() []string {
-	if l == nil {
-		return nil
-	}
-	return l.remote
 }
 
 // keyringV2 reports whether a keyring document is in the v0.76 form

@@ -142,7 +142,7 @@ func (c *Client) ResolveSchema(ctx context.Context, ref schema.Ref, opt ResolveO
 			return nil, lerr
 		}
 		for _, b := range bs {
-			if b.Purged || b.Remote != nil || b.Name == "" {
+			if b.Purged || b.Name == "" {
 				continue
 			}
 			queue = append(queue, b.Name)
@@ -180,9 +180,6 @@ func (c *Client) baseChain(ctx context.Context, ns string) []string {
 		}
 		b, _ := d.Value["base"].(map[string]any)
 		if b == nil {
-			return out
-		}
-		if _, remote := b["origin"]; remote {
 			return out
 		}
 		ns, _ = b["ns"].(string)

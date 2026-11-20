@@ -2,8 +2,6 @@ package core
 
 import (
 	"fmt"
-	"net"
-	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,7 +12,6 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/rules"
-	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // Limits are the configurable limits of §6.6. Sizes are bytes; rates are
@@ -42,7 +39,6 @@ type Limits struct {
 	RetryWindowMin       time.Duration // deployment only
 	KeepPerResource      int
 	BlobsPerDocument     int
-	RemoteRegistration   time.Duration
 	// Blobs (§7.8): the largest blob, the bytes of pending blobs per
 	// uploader and namespace, the age at which a pending blob is deleted,
 	// and the bytes a principal may upload (a token bucket in bytes).
@@ -88,7 +84,6 @@ func DefaultLimits() Limits {
 		RetryWindowMin:       5 * time.Minute,
 		KeepPerResource:      100,
 		BlobsPerDocument:     1000,
-		RemoteRegistration:   30 * 24 * time.Hour,
 		BlobSize:             64 << 20,
 		BlobPending:          256 << 20,
 		BlobGrace:            24 * time.Hour,
@@ -270,49 +265,10 @@ func (c *Config) allowanceAt(now time.Time, sub, kid string) *Allowance {
 	return nil
 }
 
-// BaseRef is a branch's `+"`base`"+`. Origin is set for a remote branch,
-// whose base lives in another deployment (§7.6, §G.3).
+// BaseRef is a branch's `+"`base`"+` (§7.6).
 type BaseRef struct {
-	Origin string
-	NS     string
-	At     string
-	// Chain is a remote base's namespace and its bases as of At, as the
-	// branch's deployment followed them (§G.3); nil for a local base.
-	Chain []string
-}
-
-// Remote reports whether the base is in another deployment.
-func (b *BaseRef) Remote() bool { return b != nil && b.Origin != "" }
-
-// isLoopbackHost reports whether host is a loopback host: "localhost", an
-// address in 127.0.0.0/8, or "::1" (§G.3).
-func isLoopbackHost(host string) bool {
-	if host == "localhost" {
-		return true
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		// 127.0.0.0/8 for IPv4, exactly ::1 for IPv6.
-		return ip.IsLoopback()
-	}
-	return false
-}
-
-// ValidRemoteOrigin reports whether s is an origin another deployment may
-// have, in the RFC 6454 ASCII serialisation of §C.3 (sig.CanonicalOrigin:
-// scheme://host[:port], lowercase ASCII, default port omitted). It must be
-// https, except that plain http is accepted for loopback hosts, so two
-// local deployments can try remote branches.
-func ValidRemoteOrigin(s string) bool {
-	if !sig.CanonicalOrigin(s) {
-		return false
-	}
-	u, err := url.Parse(s)
-	if err != nil {
-		return false
-	}
-	// http is for loopback hosts: localhost, the whole 127.0.0.0/8 range,
-	// or [::1] (§G.3).
-	return u.Scheme == "https" || isLoopbackHost(u.Hostname())
+	NS string
+	At string
 }
 
 // nsMembers are the namespace-document members this version of the spec
@@ -739,39 +695,8 @@ func parseConfigIn(doc any, defaults, max Limits, md configMode) (*Config, error
 			b, ok := v.(map[string]any)
 			ns, _ := b["ns"].(string)
 			at, _ := b["at"].(string)
-			if _, remote := b["origin"]; ok && remote {
-				// A remote branch (§7.6, §G.3): { origin, ns, at, chain? }.
-				origin, _ := b["origin"].(string)
-				_, hasChain := b["chain"]
-				n := 3
-				if hasChain {
-					n = 4
-				}
-				if len(b) != n || !ValidRemoteOrigin(origin) || !ValidNSName(ns) {
-					return nil, fmt.Errorf("/base must be { origin, ns, at, chain? } with an https origin")
-				}
-				if _, err := ids.Parse(at); err != nil {
-					return nil, fmt.Errorf("/base/at must be an ns_id")
-				}
-				c.Base = &BaseRef{Origin: origin, NS: ns, At: at}
-				if hasChain {
-					// The base's namespace and its bases, as of at (§G.3).
-					arr, _ := b["chain"].([]any)
-					for _, x := range arr {
-						s, _ := x.(string)
-						if !ValidNSName(s) {
-							return nil, fmt.Errorf("/base/chain must list namespace names")
-						}
-						c.Base.Chain = append(c.Base.Chain, s)
-					}
-					if len(c.Base.Chain) == 0 || c.Base.Chain[0] != ns {
-						return nil, fmt.Errorf("/base/chain must start with /base/ns")
-					}
-				}
-				continue
-			}
 			if !ok || ns == "" || at == "" || len(b) != 2 {
-				return nil, fmt.Errorf("/base must be { ns, at } or { origin, ns, at }")
+				return nil, fmt.Errorf("/base must be { ns, at }")
 			}
 			c.Base = &BaseRef{NS: ns, At: at}
 		case "signatures":
@@ -859,7 +784,7 @@ func parseConfigIn(doc any, defaults, max Limits, md configMode) (*Config, error
 	if c.DraftsFor != nil && c.Base == nil {
 		return nil, fmt.Errorf("/drafts is only for local branches (§7.4)")
 	}
-	if c.DraftsFor != nil && (c.Base.Remote() || c.level == levelE2E) {
+	if c.DraftsFor != nil && c.level == levelE2E {
 		// It could have no effect there (§6.1, §7.4).
 		return nil, fmt.Errorf("/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
 	}
@@ -939,21 +864,6 @@ func parseLimits(v any, l *Limits, max Limits, md configMode) error {
 				r, b = min(r, mx.Rate), min(b, mx.Burst)
 			}
 			*f(l) = Rate{r, b}
-			continue
-		}
-		if k == "remoteRegistration" {
-			s, ok := x.(string)
-			d, err := ParseDuration(s)
-			if !ok || err != nil || d <= 0 {
-				return fmt.Errorf("/limits/remoteRegistration must be a positive ISO 8601 duration")
-			}
-			if d > max.RemoteRegistration {
-				if !kept {
-					return keyLimit(k, "/limits/remoteRegistration exceeds the deployment maximum")
-				}
-				d = max.RemoteRegistration
-			}
-			l.RemoteRegistration = d
 			continue
 		}
 		if k == "blobGrace" {
@@ -1254,7 +1164,6 @@ func (l Limits) Doc() map[string]any {
 	out["grantSize"], out["rulesPerGrant"] = int64(l.GrantSize), int64(l.RulesPerGrant)
 	out["exchangeRate"] = rate(l.ExchangeRate)
 	out["retryWindow"] = FormatDuration(l.RetryWindow)
-	out["remoteRegistration"] = FormatDuration(l.RemoteRegistration)
 	out["blobGrace"] = FormatDuration(l.BlobGrace)
 	return out
 }

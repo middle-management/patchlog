@@ -18,12 +18,12 @@ type LongPollResult struct {
 	Entries []NSEntry // oldest first; empty on timeout
 	// Since is the next since: X-Namespace-Revision, the last entry
 	// returned, or the request's since on timeout. In a filtered log
-	// (§B.11.9) it names the newest entry scanned, visible or not, on a
+	// (§7.9) it names the newest entry scanned, visible or not, on a
 	// timeout too, so a follower moves past hidden entries.
 	Since   string
 	Cursor  string // X-Cursor, to echo in the next request
 	Timeout bool   // 204: no entry arrived within the interval
-	// GS is the gs of the filtered log the answer came from (§B.11.9),
+	// GS is the gs of the filtered log the answer came from (§7.9),
 	// FilteredLongPoll's, "" for LongPoll's unfiltered log.
 	GS string
 }
@@ -37,7 +37,7 @@ type LongPollResult struct {
 // long pause or a clock change, is 400 bad_input (IsBadInput): poll again
 // once without it, as a follower does.
 //
-// A partial reader of a namespace the origin filters (§B.11.9) is
+// A partial reader of a namespace the origin filters (§7.9) is
 // redirected to the filtered log /ns/{ns}/g/{gs}/log, which LongPoll
 // doesn't follow: that log isn't chain-verifiable and its batches hold
 // only visible items (§10), so it returns the 302 as a *FilteredError
@@ -58,7 +58,7 @@ func (c *Client) LongPoll(ctx context.Context, ns, since, cursor string) (*LongP
 }
 
 // FilteredLongPoll waits, as LongPoll does, for entries after since in
-// the filtered log of gs, /ns/{ns}/g/{gs}/log?live=long-poll (§B.11.9
+// the filtered log of gs, /ns/{ns}/g/{gs}/log?live=long-poll (§7.9
 // Long-poll, §7.7): only visible entries answer 200 or end a wait, so an
 // interval with none ends 204, whose X-Namespace-Revision, the newest
 // entry scanned, becomes Since even when it is hidden; a since naming a
@@ -187,7 +187,7 @@ type Event struct {
 // an error (which NSEvents returns). A clean end of stream returns nil;
 // callers usually reconnect from the last id they processed.
 //
-// A partial reader of a namespace the origin filters (§B.11.9) is
+// A partial reader of a namespace the origin filters (§7.9) is
 // redirected to /ns/{ns}/g/{gs}/events, which NSEvents doesn't follow, as
 // LongPoll doesn't: it returns the 302 as a *FilteredError naming gs, and
 // a caller that accepts a filtered log streams it with FilteredNSEvents.
@@ -200,7 +200,7 @@ func (c *Client) NSEvents(ctx context.Context, ns, since string, fn func(NSEntry
 }
 
 // FilteredNSEvents streams, as NSEvents does, the entries after since of
-// the filtered log of gs, /ns/{ns}/g/{gs}/events (§B.11.9 Events, §7.3):
+// the filtered log of gs, /ns/{ns}/g/{gs}/events (§7.9 Events, §7.3):
 // only visible entries, judged again with each read check the stream
 // repeats; since may name a hidden entry. As for FilteredLongPoll, branch
 // entries never appear, and a change of visibility writes no entry (§10).

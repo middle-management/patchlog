@@ -33,7 +33,7 @@ func TestV073HistoryLinesCarryVia(t *testing.T) {
 	w2 := must(s.Client(t, client.WithBearer(rootBearer)).Append(ctx, "pub", "d", w.ID, ops(op("replace", "/n", 2))))
 
 	export := func(authors bool) []byte {
-		bearer := admin.Grant(t, s.Now(), "user:root", []string{"pub"}, []string{"read", "export"})
+		bearer := admin.Grant(t, s.Now(), "user:root", []string{"pub"}, []string{"read"})
 		var buf bytes.Buffer
 		if _, _, err := bundle.Export(ctx, s.Client(t, client.WithBearer(bearer)), &buf, bundle.ExportOptions{Select: []string{"pub"}, Authors: authors, Bearer: bearer}); err != nil {
 			t.Fatal(err)

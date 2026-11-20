@@ -6,14 +6,14 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
-// The read paths of filtered namespace reads (§B.11.9 Answers, URLs): a
+// The read paths of filtered namespace reads (§7.9 Answers, URLs): a
 // partial reader's request at an unfiltered URL is redirected to its
 // filtered form (nsReaderOrRedirect), and the filtered URLs under
 // /ns/{ns}/g/{gs} are admitted (filteredAdmit) and answered at a combined
 // checkpoint: /heads here, log ranges in filtered_log.go, long-poll and
 // events in filtered_live.go.
 
-// FilteredInfo is the checkpoint a filtered answer is at (§B.11.9 URLs):
+// FilteredInfo is the checkpoint a filtered answer is at (§7.9 URLs):
 // its subject set and at, the ns_id of {ns} the answer carries as
 // X-Namespace-Revision.
 type FilteredInfo struct {
@@ -24,10 +24,10 @@ func filteredInfo(fv *fview) *FilteredInfo {
 	return &FilteredInfo{GS: fv.GS(), At: fv.CP().at}
 }
 
-// nsReaderOrRedirect is nsReader for an unfiltered URL of n that §B.11.9
+// nsReaderOrRedirect is nsReader for an unfiltered URL of n that §7.9
 // redirects: a partial reader of a covered namespace, by the grant in
 // Authorization, gets a *FilteredRedirect to its gs at the current
-// checkpoint (§B.11.9 URLs) instead of 403; every other reader is judged
+// checkpoint (§7.9 URLs) instead of 403; every other reader is judged
 // as by nsReader, a cookie included, which never reads in part.
 func (t *tx) nsReaderOrRedirect(n *nsRow, cred Credentials) (*actor, error) {
 	a, kind, fs, err := t.nsAccess(n, cred)
@@ -41,14 +41,14 @@ func (t *tx) nsReaderOrRedirect(n *nsRow, cred Credentials) (*actor, error) {
 }
 
 // filteredOpen is the covered namespace a filtered URL names, or the
-// answer for one that isn't covered (§B.11.9 Where): its credentials are
+// answer for one that isn't covered (§7.9 Where): its credentials are
 // judged as at its unfiltered URLs (401 without, 403 for a
 // /ns/{ns}/g/{gs} cookie); then 401 for a request that carries neither a
 // grant that verifies in {ns} nor a cookie the origin verifies, as in a
 // public namespace, whose unfiltered URLs ignore an unusable grant; then
 // 403, as no filtered URL serves it. A purged namespace this section
 // doesn't cover answers so too, never the 410 of its unfiltered forms
-// (§B.11.9 Purged covered namespaces, v0.85: "Purged covered namespaces
+// (§7.9 Purged covered namespaces, v0.85: "Purged covered namespaces
 // answer these URLs as §8.5 answers their unfiltered forms ... Other
 // namespaces this section doesn't cover, branches among them, answer
 // them 403, or 401, in §7's order"); before v0.85 its /heads, and its
@@ -65,9 +65,9 @@ func (t *tx) filteredOpen(ns string, cred Credentials) (*nsRow, *fscope, error) 
 		}
 		if !t.e.opt.AuthDisabled && cred.Edge == nil && !t.grantVerifiesIn(n, cred) {
 			return nil, nil, apiErr(401, "unauthenticated", "message",
-				"no grant that verifies in "+ns+" and no cookie: "+ns+" isn't read filtered here (§B.11.9 Where, §B.11.5)")
+				"no grant that verifies in "+ns+" and no cookie: "+ns+" isn't read filtered here (§7.9 Where, §B.11.5)")
 		}
-		return nil, nil, forbidden(ns + " isn't read filtered here (§B.11.9 Where)")
+		return nil, nil, forbidden(ns + " isn't read filtered here (§7.9 Where)")
 	}
 	return n, fs, nil
 }
@@ -103,7 +103,7 @@ func (t *tx) grantVerifiesIn(n *nsRow, cred Credentials) bool {
 
 // filteredAtView admits a request at /ns/{ns}/g/{gs}/at/{at}/… and returns
 // its view at that checkpoint; an at filteredAt can't answer is a
-// *FilteredRedirect to the current one, after admission there (§B.11.9
+// *FilteredRedirect to the current one, after admission there (§7.9
 // URLs, at).
 func (t *tx) filteredAtView(ns, gs, at string, cred Credentials) (*nsRow, *fview, error) {
 	n, fs, err := t.filteredOpen(ns, cred)
@@ -123,7 +123,7 @@ func (t *tx) filteredAtView(ns, gs, at string, cred Credentials) (*nsRow, *fview
 
 // filteredCurrentRedirect is the redirect of a request at a filtered URL
 // of n for subject set gs to the current checkpoint, once admitted there
-// (§B.11.9 URLs): a grant in Authorization reads only at its own gs, as
+// (§7.9 URLs): a grant in Authorization reads only at its own gs, as
 // filteredAdmit judges.
 func (t *tx) filteredCurrentRedirect(n *nsRow, fs *fscope, gs string, cred Credentials) error {
 	cp := t.filteredCurrent(fs)
@@ -137,9 +137,9 @@ func (t *tx) filteredCurrentRedirect(n *nsRow, fs *fscope, gs string, cred Crede
 // FilteredCurrent answers a URL under /ns/{ns}/g/{gs} without at, suffix
 // "/heads" or "/log" (without live): a *FilteredRedirect to its form at
 // the current at, recorded first, once the request is admitted there
-// (§B.11.9 URLs). A covered purged namespace's /heads, once admitted at
+// (§7.9 URLs). A covered purged namespace's /heads, once admitted at
 // the current checkpoint, is 410 purged with head, as §8.5 answers its
-// unfiltered /heads, never a redirect (§B.11.9 Purged namespaces: "/heads
+// unfiltered /heads, never a redirect (§7.9 Purged namespaces: "/heads
 // without at as /heads"); its /log keeps the redirect, a purged range
 // staying readable. It never returns nil.
 func (e *Engine) FilteredCurrent(ctx context.Context, ns, gs, suffix string, cred Credentials) error {
@@ -160,7 +160,7 @@ func (e *Engine) FilteredCurrent(ctx context.Context, ns, gs, suffix string, cre
 }
 
 // FilteredHeads serves GET /ns/{ns}/g/{gs}/at/{at}/heads?after&prefix
-// (§B.11.9 /heads): the rows of §7.4 as of {ns}'s ns_id in at, only those
+// (§7.9 /heads): the rows of §7.4 as of {ns}'s ns_id in at, only those
 // visible to the subject set, in ascending byte order after after and
 // under prefix ("" for all), in pages filled to the log page size, with
 // next, the last row, on every full page and no other. The candidates are
@@ -203,7 +203,7 @@ func (e *Engine) FilteredHeads(ctx context.Context, ns, gs, at, after, prefix st
 // namespace's request at an at filteredAt can't answer is judged at the
 // current checkpoint instead of redirected there, so that it answers 410
 // as soon as the read check passes, as the unfiltered /heads of a purged
-// namespace does at any revision (§8.5, §B.11.9 Purged namespaces). Log
+// namespace does at any revision (§8.5, §7.9 Purged namespaces). Log
 // ranges keep the redirect: a purged namespace's range stays readable. For
 // a purged namespace it returns the checkpoint judged at and no view: the
 // read check is purgedHeadsCheck's, and the answer 410.
@@ -234,11 +234,11 @@ func (t *tx) filteredHeadsView(ns, gs, at string, cred Credentials) (*nsRow, *fv
 
 // purgedHeadsCheck is the read check of a filtered /heads of purged
 // covered n at cp, which then answers 410 purged: the URL's own, its gs
-// included (§B.11.9 Purged namespaces: "once the URL's read check passes,
+// included (§7.9 Purged namespaces: "once the URL's read check passes,
 // its gs included"), so filteredAdmit's, as for a live namespace. A
 // partial reader's grant passes at its own gs and is 403 at another, a
 // cookie is judged as that gs's, and a grant that reads n unrestricted is
-// 403 here as at any filtered URL (§B.11.9 Partial reader: "At filtered
+// 403 here as at any filtered URL (§7.9 Partial reader: "At filtered
 // ones their grant in Authorization is 403"): its 410 is at the
 // unfiltered /heads. Before v0.82 such a grant passed at any gs.
 func (t *tx) purgedHeadsCheck(n *nsRow, fs *fscope, gs string, cp *fcp, cred Credentials) *Error {
@@ -247,7 +247,7 @@ func (t *tx) purgedHeadsCheck(n *nsRow, fs *fscope, gs string, cp *fcp, cred Cre
 }
 
 // testFilteredJudge, if set, is called with each name a filtered read
-// judges that its view hasn't judged yet (tests: §B.11.9 Cost).
+// judges that its view hasn't judged yet (tests: §7.9 Cost).
 var testFilteredJudge func(gs, name string)
 
 // fvVisible is fv.visible, reporting first judgements to testFilteredJudge.

@@ -34,7 +34,7 @@ func pub76Cookie(t *testing.T, w *v75x) (string, []*http.Cookie) {
 	return prefix, r.cookies
 }
 
-// TestV076PubKeyReplaced (FSVC-7; §B.11.9 gs: a gs cookie is 403 where "a
+// TestV076PubKeyReplaced (FSVC-7; §7.9 gs: a gs cookie is 403 where "a
 // key or role they came from is gone or, as §C.4 judges a base's keys, no
 // longer accepted"; §C.4: a shared kid is accepted "only while the base
 // has it with the same pub"): a partial reader's cookie for
@@ -69,7 +69,7 @@ func TestV076PubKeyReplaced(t *testing.T) {
 	}
 }
 
-// TestV076PubNoneStored (FSVC-7, §B.11.9 gs): a g: marker whose key was
+// TestV076PubNoneStored (FSVC-7, §7.9 gs): a g: marker whose key was
 // recorded without its pub (migration 006 gives such a row an empty pub),
 // or recorded before edge_gs_keys kept every key a marker's cookies came
 // from (migration 007: no row there), is 403 under its cookie, until the
@@ -112,7 +112,7 @@ func TestV076PubNoneStored(t *testing.T) {
 	}
 }
 
-// TestV076PubSharedMarker (§B.11.9 gs, §C.4): a g: marker's subjects
+// TestV076PubSharedMarker (§7.9 gs, §C.4): a g: marker's subjects
 // include grantcheck.KeySubject(kid, pub), so readers whose grants come from
 // different keys, or from one kid under different pubs, never share a
 // marker. Reader A's cookie came from reader-01's old pub; once matches

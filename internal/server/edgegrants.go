@@ -29,7 +29,7 @@ type edgeGrantKey struct{}
 // its path, checked as an edge checks it (edge.Cookies.Check), when it
 // carries no Authorization, not even an empty one (§C.5.3). Writes, POST /edge-grants included,
 // never get one. Its namespace and resource are those of its prefix, and
-// for a filtered namespace's prefix /ns/{ns}/g/{gs} its GS (§B.11.9); a
+// for a filtered namespace's prefix /ns/{ns}/g/{gs} its GS (§7.9); a
 // cookie for a prefix the origin doesn't issue is ignored.
 func (s *Server) edgeCred(r *http.Request) *http.Request {
 	if s.cookies == nil || len(r.Header.Values("Authorization")) > 0 {

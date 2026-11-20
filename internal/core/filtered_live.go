@@ -10,7 +10,7 @@ import (
 	"github.com/middle-management/patchlog/internal/lru"
 )
 
-// Filtered long-poll and events (§B.11.9 Long-poll, Events, Cost).
+// Filtered long-poll and events (§7.9 Long-poll, Events, Cost).
 //
 // Each fetch of a waiter or a stream is admitted on its own, at the current
 // checkpoint (filteredAdmit), as §7.3 repeats an event stream's read check
@@ -68,7 +68,7 @@ func sharedView(e *Engine, fv *fview) *fview {
 }
 
 // FilteredLiveLog serves a fetch of GET /ns/{ns}/g/{gs}/log?live=long-poll
-// (§B.11.9 Long-poll) and of /ns/{ns}/g/{gs}/events (Events): the request
+// (§7.9 Long-poll) and of /ns/{ns}/g/{gs}/events (Events): the request
 // is admitted at the current checkpoint, and answered with a page of the
 // log after since up to the head as its gs sees it there (filteredRange):
 // its visible entries, possibly none, Last the newest entry scanned, which

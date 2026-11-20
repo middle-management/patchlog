@@ -84,8 +84,8 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 		}
 	}
 	p.exempt = a.star || freezeOnly(writes, newDoc)
-	// Once per request: a write that runs again, as one that reads a remote
-	// branch's base does (withRemoteSource), keeps its draw (rateDrawn).
+	// Once per request: a write whose transaction runs again (Postgres,
+	// pglock.go) keeps its draw (rateDrawn).
 	if !inBatch && !p.exempt && (t.rateDrawn == nil || !*t.rateDrawn) {
 		if err := t.rateLimit(n, cur, a, nil, 1); err != nil {
 			return nil, err
@@ -379,38 +379,26 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any) (*Config, *Error)
 	if cfg.DraftsFor != nil && t.draftRoot(n) == "" {
 		return nil, docInvalid("/drafts", "/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
 	}
-	// A raise to e2e is refused first, so a remote branch's never reads
-	// its source (Addendum E Levels, §G.5.2).
+	// A raise to e2e is refused first (Addendum E Levels).
 	if err := t.checkNoE2ERaise(cur, cfg); err != nil {
 		return nil, err
 	}
 	baseLevel := -1
-	remote := t.remoteShadow(n) != nil
-	if remote {
-		// A remote branch's shadow follows the branch itself, and holds
-		// only what its base was when it was created: a write that makes
-		// it public or turns off a nonce requirement is judged by the
-		// base's current namespace document (§G.5.2).
-		if err := t.checkRemoteSource(n, cur, cfg); err != nil {
-			return nil, err
-		}
-	} else if n.isBranch() {
+	if n.isBranch() {
 		baseLevel = t.nsLevel(t.nsByID(n.base.Int64))
 	}
 	if err := t.checkEncryption(cur, cfg, baseLevel); err != nil {
 		return nil, err
 	}
 	if n.isBranch() {
-		// A remote base's keys don't reach across (§7.6): the loop stops
-		// at the shadow, which has none.
-		for b := n; b.isBranch() && t.remoteShadow(b) == nil; {
+		for b := n; b.isBranch(); {
 			b = t.nsByID(b.base.Int64)
 			if err := keepsStarKeys(cur, cfg, b, t.config(b.configSeq)); err != nil {
 				return nil, err
 			}
 		}
 	}
-	if n.isBranch() && !remote {
+	if n.isBranch() {
 		base := t.nsByID(n.base.Int64)
 		if cfg.Read == "public" && t.config(base.configSeq).Read != "public" {
 			return nil, docInvalid("/read", "a branch of a non-public namespace cannot be public (§7.4)")
@@ -470,7 +458,7 @@ func (t *tx) checkSuccessor(n *nsRow, cur, cfg *Config) *Error {
 func (t *tx) successorOK(name string, self int64, bases map[string]bool) *Error {
 	s := t.nsByName(name)
 	switch {
-	case s == nil || s.isShadow():
+	case s == nil:
 		return docInvalid("/successor", "successor must name a namespace that exists (§7.4)")
 	case s.id == self:
 		return docInvalid("/successor", "successor must name another namespace (§7.4)")
@@ -478,30 +466,17 @@ func (t *tx) successorOK(name string, self int64, bases map[string]bool) *Error 
 		return docInvalid("/successor", "successor must name a namespace that isn't purged (§7.4)")
 	case bases == nil && s.isBranch():
 		return docInvalid("/successor", "the successor of a namespace that isn't a branch must not be a branch (§7.4)")
-	case bases != nil && (!s.isBranch() || !bases[t.baseIdentity(s)]):
+	case bases != nil && (!s.isBranch() || !bases[fmt.Sprint(s.base.Int64)]):
 		return docInvalid("/successor", "the successor of a branch must be a branch of the same base or of a namespace further up its base chain (§7.4)")
 	}
 	return nil
 }
 
-// successorBases are the baseIdentity values a branch's successor may
-// have (§7.4): n's base and every namespace further up its base chain. A
-// remote base in the chain contributes itself and its own bases as the
-// branch's base.chain names them, by origin and name, and ends the walk.
+// successorBases are the ids (in decimal) a branch's successor's base may
+// have (§7.4): n's base and every namespace further up its base chain.
 func (t *tx) successorBases(n *nsRow) map[string]bool {
 	out := map[string]bool{}
 	for b := n; b.isBranch(); {
-		if sh := t.remoteShadow(b); sh != nil {
-			var origin, ns string
-			t.must(t.QueryRow(`SELECT origin, ns FROM remote_bases WHERE shadow = ?`, sh.id).Scan(&origin, &ns))
-			out[origin+" "+ns] = true
-			if ref := t.config(b.configSeq).Base; ref != nil {
-				for _, c := range ref.Chain {
-					out[origin+" "+c] = true
-				}
-			}
-			break
-		}
 		b = t.nsByID(b.base.Int64)
 		out[fmt.Sprint(b.id)] = true
 	}
@@ -517,9 +492,6 @@ func (t *tx) unfreezeLimit(n *nsRow, cur, cfg *Config) *Error {
 		return nil
 	}
 	base := t.nsByID(n.base.Int64)
-	if base.isShadow() {
-		return nil
-	}
 	if live, max := t.liveBranches(base, n), t.config(base.configSeq).Limits.BranchesPerNamespace; live >= max {
 		return limitErr(422, "branchesPerNamespace", int64(live+1), int64(max), "too many live branches: the base already has branchesPerNamespace live branches (§6.6, §8.4)")
 	}
@@ -530,10 +502,7 @@ func (t *tx) unfreezeLimit(n *nsRow, cur, cfg *Config) *Error {
 // the *-key guard (§6.2, §6.1, §7.4).
 func (t *tx) configInUse(n *nsRow, cur, cfg *Config) *Error {
 	if cfg.level >= levelSealed && cur.level < levelSealed {
-		// A remote branch becoming sealed seals its read-through content
-		// under its own keys (§E.2.5). Registered remote branches of n are
-		// bound by §G.5, which only their deployments can enforce. Local
-		// public dependents that aren't sealed block it (§7.4): its content
+		// Local public dependents that aren't sealed block it (§7.4): its content
 		// would stay public through them.
 		var deps []string
 		for _, d := range t.publicDependents(n) {
@@ -711,24 +680,16 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 }
 
 // WriteConfig creates a namespace (IfNoneMatch) or changes its document.
-// A genesis whose base is in another deployment creates a remote branch
-// (§G.3), fetching and verifying the base before the write transaction.
-// A change to a remote branch that its base's current namespace document
-// judges reads that document outside the write lock (withRemoteSource,
-// §G.5.2).
 func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error) {
-	if cc.IfNoneMatch && remoteBaseIn(cc.Patches) {
-		return e.createRemoteBranch(ctx, req, cc)
-	}
 	var res *WriteResult
+	// A transaction that runs again (Postgres, pglock.go) doesn't draw its
+	// rate-limit tokens again.
 	drawn := false
-	err := e.withRemoteSource(ctx, func(ctx context.Context) error {
-		return e.update(ctx, func(t *tx) error {
-			t.rateDrawn = &drawn
-			r, err := t.writeConfig(req, cc)
-			res = r
-			return err
-		})
+	err := e.update(ctx, func(t *tx) error {
+		t.rateDrawn = &drawn
+		r, err := t.writeConfig(req, cc)
+		res = r
+		return err
 	})
 	return res, err
 }

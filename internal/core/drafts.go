@@ -106,17 +106,14 @@ func (t *tx) nsRowUnlocked(id int64) *nsRow {
 
 // draftRoot is the namespace whose schema paths n's own revisions may serve
 // as drafts: the root of n's chain of local bases. "" if n isn't a local
-// branch (no base, or a remote base's shadow in its chain).
+// branch.
 func (t *tx) draftRoot(n *nsRow) string {
-	if !n.isBranch() || n.isShadow() {
+	if !n.isBranch() {
 		return ""
 	}
 	b := linkOf(n)
 	for b.isBranch() {
 		b = t.link(b.base.Int64)
-		if b.isShadow() {
-			return ""
-		}
 	}
 	return b.name
 }
@@ -132,7 +129,7 @@ func (t *tx) cfgOf(n *nsRow, over map[int64]*Config) *Config {
 // isDraftCandidate reports whether c may hold drafts for schema paths of
 // namespace root: a local branch of it, not purged, not e2e.
 func (t *tx) isDraftCandidate(c *nsRow, root string, over map[int64]*Config) bool {
-	return c.isBranch() && !c.purged && !c.isShadow() && t.cfgOf(c, over).level != levelE2E && t.draftRoot(c) == root
+	return c.isBranch() && !c.purged && t.cfgOf(c, over).level != levelE2E && t.draftRoot(c) == root
 }
 
 // draftsServe reports whether candidate c, under its namespace document
@@ -147,9 +144,6 @@ func (t *tx) draftsServe(c *nsRow, ccfg *Config, w *nsRow) bool {
 			return false
 		}
 		x = t.link(x.base.Int64)
-		if x.isShadow() {
-			return false
-		}
 	}
 }
 
@@ -168,9 +162,6 @@ func (t *tx) schemaReadsServe(n *nsRow, w *nsRow) bool {
 			return x.id == n.id || DraftsMatch(cfg.SchemaReadsFor, x.name)
 		}
 		x = t.link(x.base.Int64)
-		if x.isShadow() {
-			return false
-		}
 	}
 }
 
@@ -389,7 +380,7 @@ func (t *tx) satisfyingCopies(ref schema.Ref, m *nsRow, over map[int64]*Config, 
 			continue
 		}
 		c := t.nsRowUnlocked(cr.ns)
-		if c.purged || c.isShadow() {
+		if c.purged {
 			continue
 		}
 		switch {
@@ -423,7 +414,7 @@ func (t *tx) schemaUses(exclude func(ns *nsRow, res string) bool) map[string]map
 	t.noLock++
 	defer func() { t.noLock-- }()
 	t.e.schemaScans.Add(1)
-	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
+	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0`)
 	t.must(err)
 	var all []*nsRow
 	for rows.Next() {
@@ -714,15 +705,14 @@ func (t *tx) usesWalkOf(targets []string, exclude func(ns *nsRow, res string) bo
 }
 
 // of is the paths that reach a target which n references (schemaUses'
-// rule for one namespace), in no order; none for a purged namespace or a
-// shadow.
+// rule for one namespace), in no order; none for a purged namespace.
 func (w *usesWalk) of(n *nsRow) []string {
 	t, exclude, reach, holds, byID, copies, docs := w.t, w.exclude, w.reach, w.holds, w.byID, w.copies, w.docs
 	t.noLock++ // as schemaUses
 	defer func() { t.noLock-- }()
 	var out []string
 	used := map[string]bool{}
-	if n.purged || strings.HasPrefix(n.name, "~") {
+	if n.purged {
 		return nil
 	}
 	// What n holds or reads through of those resources.

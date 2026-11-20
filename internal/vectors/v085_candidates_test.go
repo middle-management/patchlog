@@ -54,7 +54,7 @@ func loadCandidates(t *testing.T) candidatesFile {
 	return f
 }
 
-// C.4 (SERVICES §E.2.6 Whole-response sealing, §A.4, §B.11.9 gs): the
+// C.4 (SERVICES §E.2.6 Whole-response sealing, §A.4, §7.9 gs): the
 // key: string of demo's key ops-2026 with I.14's pub, as the reference
 // binds a gs to a key (grantcheck.KeySubject: canonical([kid, pub]), pub the
 // key entry's base64url string, the reading the candidates call

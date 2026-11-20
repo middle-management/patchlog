@@ -177,39 +177,12 @@ func TestDefinedMembers(t *testing.T) {
 	}
 }
 
-// A shadow keeps the encryption members this version defines, and only
-// valid ones (§G.3): a base of a newer version may carry others.
-func TestShadowEncryption(t *testing.T) {
-	t.Parallel()
-	e := &Engine{opt: Options{Limits: DefaultLimits(), Maximums: DefaultLimits()}}
-	got, err := e.shadowEncryption("matches", map[string]any{"level": "e2e", "epoch": 3.0, "historyEpochs": 2.0, "pad": true, "suite": "future"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := map[string]any{"level": "e2e", "epoch": 3.0, "historyEpochs": 2.0, "pad": true}
-	if !jsonv.Equal(jsonv.FromGo(got), jsonv.FromGo(want)) {
-		t.Fatalf("shadow encryption %v", got)
-	}
-	if _, err := e.shadowEncryption("matches", map[string]any{"level": "e2e", "epoch": "three"}); err == nil || err.Status != 502 {
-		t.Fatalf("malformed epoch: %v", err)
-	}
-	// Not held to §6.6 Values, which holds creations and config writes
-	// only, never a stored document such as the shadow's: the remote
-	// branch's own creation is (v0.73).
-	small := DefaultLimits()
-	small.PatchSetSize = 200 << 10
-	e = &Engine{opt: Options{Limits: small, Maximums: small}}
-	if _, err := e.shadowEncryption("matches", map[string]any{"level": "e2e"}); err != nil {
-		t.Fatalf("e2e under limits without room for it: %v", err)
-	}
-}
-
 // A namespace whose document was stored before this version, with members
 // it doesn't define, can still be configured, frozen and branched; a write
 // that changes such a member must give it an "x-" name (§7.4).
 func TestStoredMembersAfterUpgrade(t *testing.T) {
 	t.Parallel()
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1})
 	if err != nil {
 		t.Fatal(err)
 	}

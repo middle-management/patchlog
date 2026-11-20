@@ -16,10 +16,10 @@ import (
 	"github.com/middle-management/patchlog/internal/lru"
 )
 
-// Namespaces §B.11.9 covers (§A.4 Private namespaces).
+// Namespaces §7.9 covers (§A.4 Private namespaces).
 //
 // A followed namespace is covered, as the origin decides it, from its
-// namespace document alone (§B.11.9 Where), whether or not the origin
+// namespace document alone (§7.9 Where), whether or not the origin
 // implements filtered reads, and only while the core's authentication is
 // on (authOff): neither a branch, public, sealed nor e2e.
 //
@@ -50,7 +50,7 @@ var (
 )
 
 // errGrantLacks is a namespace the index's own grant (Options.Client)
-// can't read, 401 or 403, that it reads only to tell whether §B.11.9
+// can't read, 401 or 403, that it reads only to tell whether §7.9
 // covers a namespace it follows: its state at a checkpoint. Its coverage
 // can't be told, so a partial reader is refused (502) rather than
 // answered as by an uncovered namespace's rules. Its Error names the
@@ -61,13 +61,13 @@ type errGrantLacks struct {
 }
 
 func (e *errGrantLacks) Error() string {
-	return "the index's grant cannot read " + e.ns + ", which tells whether §B.11.9 covers a namespace the index follows, or what visibility reads there (widen Options.Client's grant to it): " + e.err.Error()
+	return "the index's grant cannot read " + e.ns + ", which tells whether §7.9 covers a namespace the index follows, or what visibility reads there (widen Options.Client's grant to it): " + e.err.Error()
 }
 
 func (e *errGrantLacks) Unwrap() error { return e.err }
 
 // msgGrantLacks answers errGrantLacks.
-const msgGrantLacks = "the index's grant cannot read a namespace that decides how this one is read (§B.11.9): see the index's log"
+const msgGrantLacks = "the index's grant cannot read a namespace that decides how this one is read (§7.9): see the index's log"
 
 // lacksRead is err, an upstream read of ns, as errGrantLacks where it is
 // 401 or 403.
@@ -132,13 +132,13 @@ func (ix *Index) docAt(ctx context.Context, ns, id string) (map[string]any, erro
 }
 
 // fsOpen reports whether a namespace with document doc can be covered:
-// not public, not sealed or e2e (§B.11.9 Where).
+// not public, not sealed or e2e (§7.9 Where).
 func fsOpen(doc map[string]any) bool {
 	read, _ := doc["read"].(string)
 	return read != "public" && !derived.Protected(derived.InfoOf(doc).Level)
 }
 
-// coverage is ns's checkpoint at z, the index's checkpoint of it (§B.11.9
+// coverage is ns's checkpoint at z, the index's checkpoint of it (§7.9
 // Where), nil if it isn't covered, as nothing is while the core's
 // authentication is off.
 func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, error) {
@@ -152,7 +152,7 @@ func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, error) {
 	if !coverable(doc) {
 		return nil, nil
 	}
-	// Nothing is covered while the core's authentication is off (§B.11.9
+	// Nothing is covered while the core's authentication is off (§7.9
 	// Where: "only while authentication is on (§1)").
 	if off, err := ix.authOff(ctx); err != nil {
 		return nil, err
@@ -164,14 +164,14 @@ func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, error) {
 
 // coverable reports whether a namespace with document doc is covered
 // while authentication is on: neither a branch (§7.6), public, sealed nor
-// end-to-end (§B.11.9 Where).
+// end-to-end (§7.9 Where).
 func coverable(doc map[string]any) bool {
 	_, branch := doc["base"]
 	return fsOpen(doc) && !branch
 }
 
 // checkpoint is ns's checkpoint with ns at z, the index's checkpoint of
-// it, nil if ns isn't covered (§B.11.9 URLs, §A.4). It keeps the result
+// it, nil if ns isn't covered (§7.9 URLs, §A.4). It keeps the result
 // by at.
 func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 	cp, err := ix.coverage(ctx, ns, z)
@@ -185,7 +185,7 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 }
 
 // keptCP is the checkpoint at of ns computed earlier, nil if none is
-// held: a reader's gs at an older at is computed there (§B.11.9: a
+// held: a reader's gs at an older at is computed there (§7.9: a
 // grant reads at its own gs as of the URL's at).
 func (ix *Index) keptCP(ns, at string) *fcp {
 	ix.fs.mu.Lock()
@@ -197,11 +197,11 @@ func (ix *Index) keptCP(ns, at string) *fcp {
 }
 
 // fview is one subject set's view of a covered namespace at a checkpoint
-// (§B.11.9 Visible): its read filter decides. It memoises each name's
+// (§7.9 Visible): its read filter decides. It memoises each name's
 // answer and is safe for concurrent use.
 type fview struct {
 	cp       *fcp
-	gs       string // the §B.11.9 gs of subjects, which the marker names
+	gs       string // the §7.9 gs of subjects, which the marker names
 	subjects []string
 	filter   *grantcheck.ReadFilter
 
@@ -230,7 +230,7 @@ func (fv *fview) visible(name string) bool {
 	return v
 }
 
-// grantFview is a partial reader's view at cp (§B.11.9 gs): its subjects
+// grantFview is a partial reader's view at cp (§7.9 gs): its subjects
 // are grantcheck.FilteredSubjects of its ReadsScope digest and key, as
 // the origin's; its filter the grant's (grantcheck.FilterOf). A grant
 // whose key-scope or block rules refer to /now, or whose roles all do,
@@ -247,11 +247,11 @@ func grantFview(cp *fcp, v *grant.Verified, steps int) (*fview, error) {
 }
 
 // errRulesChanged refuses a cookie for a marker reads:{ns}:g:{gs} at a
-// checkpoint it doesn't stand for (§B.11.9 gs): the reader exchanges its
+// checkpoint it doesn't stand for (§7.9 gs): the reader exchanges its
 // grant again; errUncovered one for a namespace no longer covered.
 var (
-	errRulesChanged = &grant.AuthError{Status: 403, Msg: "the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)"}
-	errUncovered    = &grant.AuthError{Status: 403, Msg: "the namespace is no longer read filtered: exchange the grant again (§B.11.9)"}
+	errRulesChanged = &grant.AuthError{Status: 403, Msg: "the rules this subject set was issued under have changed: exchange the grant again (§7.9)"}
+	errUncovered    = &grant.AuthError{Status: 403, Msg: "the namespace is no longer read filtered: exchange the grant again (§7.9)"}
 )
 
 // storedFview is the view of the cookie for marker m, reads:{ns}:g:{gs},
@@ -260,13 +260,13 @@ var (
 // 403 where, for any key that cookie came from (gsKeysAt: those of one
 // exchange with several grants, each of which must hold), its whole entry or
 // one of its roles' whole definitions in ns's document as of cp differs
-// in any member from what the exchange recorded (entryHolds; §B.11.9 gs,
+// in any member from what the exchange recorded (entryHolds; §7.9 gs,
 // v0.82), the scope digest of its kid's scope rules and
 // its roles' definitions, read from ns's document as of cp (a branch's
 // keys follow its base, §C.4), with rec's block rules and principal,
 // differs from the one rec's subjects carry (a kid or role gone, or no
 // longer listing read, counts as differing), or the key with its kid no
-// longer has the pub it had (§B.11.9 gs: a key "no longer accepted" as
+// longer has the pub it had (§7.9 gs: a key "no longer accepted" as
 // §C.4 judges a base's keys, "only while the base has it with the same
 // pub"; a record without one, from before migration 006, never does),
 // or where m has no such key recorded (from before migration 011);
@@ -321,7 +321,7 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *marker
 // f's block rules and principal, still digest to what the marker stands
 // for (holds: for a g: marker, the scope subject its subjects carry,
 // storedFview; for a scope marker, the marker's own digest,
-// scopeKeysHold). §B.11.9 gs ends a gs cookie so, and §A.4 a scope cookie
+// scopeKeysHold). §7.9 gs ends a gs cookie so, and §A.4 a scope cookie
 // "where a marker's key, rules or roles would end a gs cookie".
 func gsKeyHolds(cfg *grantcheck.Config, keys []grant.Key, f *grantcheck.ReadFilter, k gsKey, holds func(digest string) bool) bool {
 	i := slices.IndexFunc(keys, func(key grant.Key) bool { return key.Kid == k.kid })
@@ -344,7 +344,7 @@ func gsKeyHolds(cfg *grantcheck.Config, keys []grant.Key, f *grantcheck.ReadFilt
 	return ok && holds(d)
 }
 
-// gMarker is the marker of a partial reader of covered ns with §B.11.9
+// gMarker is the marker of a partial reader of covered ns with §7.9
 // subject set gs (§A.4).
 func gMarker(ns, gs string) string { return "reads:" + ns + ":g:" + gs }
 
@@ -418,7 +418,7 @@ func (ix *Index) mayBeCovered(ctx context.Context, ns string) (bool, error) {
 }
 
 // authReuse bounds how long a successful read of the core's root is
-// reused (§B.11.9 Where, v0.85: "reusing a successful read for at most a
+// reused (§7.9 Where, v0.85: "reusing a successful read for at most a
 // minute and none once a later read has failed").
 const authReuse = time.Minute
 

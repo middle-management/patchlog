@@ -81,7 +81,7 @@ func (t *tx) decorateNSEntry(r *nsLogRow, prev string) map[string]any {
 const filteredLogChunk = 256
 
 // filteredRange is a page of n's log after since up to toSeq as fv sees it
-// (§B.11.9 Log entries, Log ranges): Status 404 for a since not in the
+// (§7.9 Log entries, Log ranges): Status 404 for a since not in the
 // chain up to toSeq, as unfiltered (§7.1); otherwise 200 with the page's
 // visible entries, possibly none. A page counts a batch as its visible
 // items, a config-only batch and every other entry, hidden or dropped
@@ -154,7 +154,7 @@ func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit
 	return out
 }
 
-// filterEntry judges a log entry's body m for fv (§B.11.9 Log entries),
+// filterEntry judges a log entry's body m for fv (§7.9 Log entries),
 // narrowing a batch in place, and returns whether it is shown, the units it
 // counts for on a page (Log ranges) and, for a batch, its visible names,
 // which its gestures, metadata outside the body, are narrowed to:
@@ -165,7 +165,7 @@ func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit
 //     gestures and source.ids without hidden names; one with neither is
 //     dropped, and one with only its config entry kept as config-only;
 //   - branch never, as one answer serves its whole gs, nor any other
-//     kind, remote ones included.
+//     kind.
 func (t *tx) filterEntry(fv *fview, m map[string]any) (bool, int, map[string]bool) {
 	switch m["kind"] {
 	case "config", "purge-ns":
@@ -222,7 +222,7 @@ func narrowNames(parent map[string]any, key string, byName map[string]any, visib
 	parent[key] = out
 }
 
-// FilteredLog serves GET /ns/{ns}/g/{gs}/at/{at}/log?since= (§B.11.9 Log
+// FilteredLog serves GET /ns/{ns}/g/{gs}/at/{at}/log?since= (§7.9 Log
 // ranges): a page of the range after since up to {ns}'s ns_id in at, the
 // range's end, which answers carry as X-Namespace-Revision (info), filtered
 // as filteredRange says, limit units a page. A purged namespace's range

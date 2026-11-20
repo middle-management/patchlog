@@ -57,8 +57,7 @@ func (e *PrunedError) Is(target error) bool { return target == ErrPruned }
 //	head/tombstone/purge/prune: { resource, kind, target }
 //	config:                     { kind, target }
 //	batch:                      { kind, entries: [sub…], source? }
-//	branch (local):             { kind, name, at, target }
-//	branch (remote, §G.3):      { kind, remote, at }
+//	branch:                     { kind, name, at, target }
 //	purge-ns:                   { kind }
 func HashedForm(e client.NSEntry) (map[string]any, error) {
 	return hashedForm(e, false)
@@ -118,12 +117,6 @@ func hashedForm(e client.NSEntry, sub bool) (map[string]any, error) {
 		}
 		return m, nil
 	case "branch":
-		if e.Remote != nil {
-			if err := need("at", e.At); err != nil {
-				return nil, err
-			}
-			return map[string]any{"kind": "branch", "remote": e.Remote, "at": e.At}, nil
-		}
 		if err := errors.Join(need("name", e.Name), need("at", e.At), need("target", e.Target)); err != nil {
 			return nil, err
 		}

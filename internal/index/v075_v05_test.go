@@ -18,7 +18,7 @@ import (
 	"github.com/middle-management/patchlog/internal/index"
 )
 
-// V75-05 (v0.75): the index's answers for namespaces §B.11.9 covers
+// V75-05 (v0.75): the index's answers for namespaces §7.9 covers
 // (§A.4 Private namespaces, Across namespaces): a partial reader's marker
 // is reads:{ns}:g:{gs}, gs the origin's; its hits are filtered by
 // visibility; its answers are at the combined checkpoint of every
@@ -178,7 +178,7 @@ func v75Namespaces(t *testing.T, body map[string]any) map[string]string {
 }
 
 // TestV075IndexCheckpoint (MUST-11, SVC-4, §A.4 Private namespaces):
-// where §B.11.9 covers matches, a partial reader's answers are at the
+// where §7.9 covers matches, a partial reader's answers are at the
 // index's checkpoint of matches, which they list as namespaces, its hits,
 // facets and counts filtered by visibility; an unrestricted reader's
 // list no namespaces.
@@ -250,7 +250,7 @@ func TestV075IndexPagesFilled(t *testing.T) {
 	}
 }
 
-// TestV075IndexSubjectSets (SVC-5, §A.4, §B.11.9 gs): two partial readers
+// TestV075IndexSubjectSets (SVC-5, §A.4, §7.9 gs): two partial readers
 // with the same rules through the same key, whatever their groups, share
 // a subject set, the gs inside the marker reads:matches:g:{gs} being the
 // origin's own, at the index's checkpoint of matches; a reader with other
@@ -276,7 +276,7 @@ func TestV075IndexSubjectSets(t *testing.T) {
 		t.Errorf("narrow sees %v", got)
 	}
 	// The origin's own subject set for the same grant, which its exchange
-	// gives a partial reader as the prefix /ns/matches/g/{gs} (§B.11.9
+	// gives a partial reader as the prefix /ns/matches/g/{gs} (§7.9
 	// Edge grants): the gs inside the index's marker is the origin's.
 	req := must(http.NewRequestWithContext(ctx, "POST", w.s.URL+"/edge-grants", nil))
 	req.Header.Set("Authorization", "Bearer "+fan)
@@ -296,7 +296,7 @@ func TestV075IndexSubjectSets(t *testing.T) {
 	}
 }
 
-// TestV075IndexCookies (SVC-5, §B.11.9 gs, §B.11.5): the index's edge
+// TestV075IndexCookies (SVC-5, §7.9 gs, §B.11.5): the index's edge
 // grant for a partial reader stands for its marker reads:matches:g:{gs},
 // whose subjects and filter it records: a read under the cookie alone is
 // filtered by visibility as under the grant, after a restart too; once

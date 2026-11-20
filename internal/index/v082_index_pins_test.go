@@ -170,7 +170,7 @@ func (f *v82RootFails) wrap(h http.Handler) http.Handler {
 	})
 }
 
-// TestV082AuthModeNeverFromEarlierRead (SVC-16; §B.11.9 Where, v0.82: "a
+// TestV082AuthModeNeverFromEarlierRead (SVC-16; §7.9 Where, v0.82: "a
 // service learns whether authentication is on from the origin's GET /
 // (§7), never from an earlier read. While it can't, it answers a request
 // that coverage decides, once the reader's grant verifies, 503 (behind)
@@ -231,7 +231,7 @@ func TestV082AuthModeNeverFromEarlierRead(t *testing.T) {
 	}
 }
 
-// TestV082ExchangeReadsAuthMode (SVC-16; §B.11.9 Where, v0.82: "never
+// TestV082ExchangeReadsAuthMode (SVC-16; §7.9 Where, v0.82: "never
 // from an earlier read"; §C.5): the exchange is 404 not_offered while the
 // core runs with authentication disabled, as its root says now. An index
 // that minted edge grants while authentication was on mints none once

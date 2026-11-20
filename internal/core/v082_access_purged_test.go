@@ -8,7 +8,7 @@ import (
 
 // V82-02 (v0.82), ACC-8b: a purged covered namespace answers its filtered
 // URLs as §8.5 answers their unfiltered forms "once the URL's read check
-// passes, its gs included" (SERVICES §B.11.9 Purged namespaces;
+// passes, its gs included" (SERVICES §7.9 Purged namespaces;
 // conformance 124, second half).
 
 // v82accessPurgedHeads are the statuses of purged matches' filtered /heads
@@ -27,7 +27,7 @@ func v82accessPurgedHeads(w *v75World, gs, at string, cred Credentials) [3]int {
 // Conformance 124: covered matches is purged. li's grant in Authorization
 // at another subject set's /g/{gs}/heads is 403, not 410, with or without
 // at; at her own it is 410. An unrestricted reader's grant is 403 at every
-// gs, as at a live namespace's filtered URLs (§B.11.9 Partial reader),
+// gs, as at a live namespace's filtered URLs (§7.9 Partial reader),
 // where v0.27.0 answered 410; its 410 is at the unfiltered /heads. A
 // cookie is judged as its gs's: 410 at its own, 403 at another, and a
 // /ns/matches cookie as that gs's cookie would be.

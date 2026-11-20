@@ -203,8 +203,7 @@ func ParseKey(s string) (Key, error) {
 // fragment or user, and a port in decimal without leading zeros. A host
 // in Unicode isn't that serialisation (its A-label is), so any non-ASCII
 // byte refuses it. It is the one test for a deployment's own origin, a
-// batch's source.origin (§3.5), a remote base's (§G.3) and a bundle's
-// (§G.4.1).
+// batch's source.origin (§3.5) and a bundle's (§G.4.1).
 func CanonicalOrigin(s string) bool {
 	for i := 0; i < len(s); i++ {
 		if s[i] >= 0x80 {

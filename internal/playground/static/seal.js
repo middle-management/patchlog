@@ -782,7 +782,7 @@ async function selfTest(fx) {
  *
  * A branch is held at least at the level held for any base in its base chain (§7.1, v0.86): the chain is what the
  * namespace documents this page has read name as each namespace's local base (learnBase), kept beside the levels
- * under pl.bases. A remote base (base.origin) is another deployment's namespace, and is not followed. */
+ * under pl.bases. */
 const LEVEL_RANK = Object.freeze(Object.assign(Object.create(null), { '': 0, 'at-rest': 1, sealed: 2, e2e: 3 }));
 /* levelRank is level's place in the order, undefined for anything that is no level this page knows: a string it
  * doesn't list, such as the name of a member of Object.prototype, and whatever isn't a string (["e2e"] is no level,
@@ -830,10 +830,10 @@ function basesOf(ns) {
   return all;
 }
 /* learnBase takes doc, a namespace document of ns as read (in the clear, or a sealed one opened), and keeps the
- * local base it names. A remote base, one with an origin, is none. */
+ * base it names. */
 function learnBase(ns, doc) {
   const b = doc && typeof doc === 'object' && !Array.isArray(doc) ? doc.base : null;
-  if (!b || typeof b !== 'object' || Array.isArray(b) || b.origin !== undefined || !isNamespaceName(b.ns) || b.ns === ns) return;
+  if (!b || typeof b !== 'object' || Array.isArray(b) || !isNamespaceName(b.ns) || b.ns === ns) return;
   const all = basesOf(ns);
   if (all.has(b.ns)) return;
   all.add(b.ns);

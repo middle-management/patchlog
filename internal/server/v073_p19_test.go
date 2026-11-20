@@ -230,33 +230,6 @@ func TestV073SealedEntryCarriesVia(t *testing.T) {
 	}
 }
 
-// §7.1, §G.3 (RH-7): a remote branch mirrors its base's entries with their
-// via, and serves them as the base does.
-func TestV073RemoteMirrorCopiesVia(t *testing.T) {
-	t.Parallel()
-	a := newAuthFixture(t, map[string]any{"read": "public"}, withOrigin(originA)).tenv
-	rt := &route{url: a.srv.URL}
-	b := newEnv(t, withOrigin(originB), withRemote(rt))
-	issuer := newKey("issuer2")
-	expect(t, a.do(req{method: "PATCH", path: "/ns/n", ifNoneMatch: "*", bearer: a.operatorGrant("n"),
-		body: addRoot(map[string]any{"read": "public", "keys": []any{issuer.entry("read", "create", "append")}})}), 201)
-	dg := delegated(t, a, issuer, "user:bob", []string{"n"}, []string{"read", "create", "append"})
-	x1 := a.create("n", "x", map[string]any{"n": 1.0}, dg)
-	x2 := a.appendRev("n", "x", x1, ops(op("replace", "/n", 2.0)), a.grant(issuer, "user:bob", []string{"n"}, []string{"append"}))
-	at := a.nsHead("n")
-	expect(t, b.mkRemote("rel", remoteGenesis("n", at, nil)), 201)
-	lg := b.get("/r/rel/x/rev/" + x2 + "/log").Arr()
-	if len(lg) != 2 {
-		t.Fatalf("mirrored log %v", lg)
-	}
-	if got := viaOf(t, lg[0].(map[string]any)); !slices.Equal(got, []string{"svc:a", "svc:b"}) {
-		t.Errorf("mirrored delegated entry via %v", got)
-	}
-	if got := viaOf(t, lg[1].(map[string]any)); got != nil {
-		t.Errorf("mirrored undelegated entry via %v", got)
-	}
-}
-
 // §7.4, §7.1 Continuations (RH-10): /heads answers { heads, next? }, next
 // the following page's after, absent on the last.
 func TestV073HeadsShape(t *testing.T) {

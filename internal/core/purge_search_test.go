@@ -152,7 +152,7 @@ func TestPGPurgeSearchPlans(t *testing.T) {
 	lim := DefaultLimits()
 	lim.BranchesPerNamespace = 1000
 	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, Limits: lim, Purger: discardPurger{},
-		RetentionInterval: -1, BlobSweepInterval: -1, RepurgeInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
+		RetentionInterval: -1, BlobSweepInterval: -1, RepurgeInterval: -1})
 	if err != nil {
 		t.Fatal(err)
 	}

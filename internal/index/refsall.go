@@ -156,7 +156,7 @@ type refsReader struct {
 	public bool                         // reads no private namespace: the answer is public
 	nss    []string                     // the namespaces asked, sorted
 	allow  map[string]func(string) bool // namespaces it reads only in part
-	// covs are the namespaces §B.11.9 covers that it reads as a partial
+	// covs are the namespaces §7.9 covers that it reads as a partial
 	// reader, whose views decide allow there and whose combined
 	// checkpoints join at (§A.4 Across namespaces); markers, with a
 	// grant, its marker in each namespace, which gs is over, nil under a
@@ -176,7 +176,7 @@ type refsReader struct {
 }
 
 // covered reports whether ns is in the combined checkpoint of a namespace
-// §B.11.9 covers that rd reads in part (§A.4: min may name it too).
+// §7.9 covers that rd reads in part (§A.4: min may name it too).
 func (rd *refsReader) covered(ns string) bool {
 	for _, a := range rd.covs {
 		if _, ok := a.cov.cp.ids[ns]; ok {
@@ -186,7 +186,7 @@ func (rd *refsReader) covered(ns string) bool {
 	return false
 }
 
-// recover computes rd's views of the namespaces §B.11.9 covers again at
+// recover computes rd's views of the namespaces §7.9 covers again at
 // their committed checkpoints, after an apply moved one (errMoved), or,
 // with force, after a wait for min that may have moved the heads of the
 // namespaces they read; with a grant, its gs is over the markers they
@@ -214,7 +214,7 @@ func (ix *Index) recover(ctx context.Context, rd *refsReader, force bool) error 
 	return nil
 }
 
-// errMoved is a checkpoint of a namespace §B.11.9 covers that moved
+// errMoved is a checkpoint of a namespace §7.9 covers that moved
 // between computing a view of it and reading its rows (refsCompute).
 var errMoved = errors.New("a checkpoint moved")
 
@@ -470,7 +470,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	// follows, is 401, as §B.11.5 answers a request without a grant that
 	// verifies, and a query of one namespace does (§12.1). Only the
 	// pointer redirects into the reader's. The grant's gs as of an older at
-	// differs from its current one where its marker in a namespace §B.11.9
+	// differs from its current one where its marker in a namespace §7.9
 	// covers does (gMarker): where the URL is a kept answer at the gs the
 	// grant had there (refsOwnAt), it is the grant's own.
 	var oldURL string
@@ -517,7 +517,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		return
 	}
 	if len(rq.mins) > 0 && len(rd.covs) > 0 {
-		// A min may have moved what the views of namespaces §B.11.9
+		// A min may have moved what the views of namespaces §7.9
 		// covers read (waitMember): they are computed again.
 		if err := ix.recover(ctx, rd, true); err != nil {
 			ix.writeCoverErr(w, "_refs", err)
@@ -575,7 +575,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 
 // refsOwnAt reports whether url, a kept answer at gs, is rd's own though
 // rd's gs is not gs now: rd is a grant's (its markers known), and its
-// markers, those in the namespaces §B.11.9 covers that it reads in part
+// markers, those in the namespaces §7.9 covers that it reads in part
 // as of the checkpoints of them the answer was read at (keptCP, each one
 // the index still holds), make gs (§A.4, §B.11.5: a grant reads at
 // its own gs as of the URL's at). A namespace whose checkpoint there
@@ -753,11 +753,11 @@ func (ix *Index) refsStored(ctx context.Context, rd *refsReader, url string) (de
 // it, and returns it with that checkpoint and whether it is bound to its
 // URL. An answer read before a purge of what it shows, which is then not
 // kept, is never served (§A.1): it is computed again, the views of the
-// namespaces §B.11.9 covers first (recover), which read what the purge
+// namespaces §7.9 covers first (recover), which read what the purge
 // may have changed; one that keeps losing to purges is errPurgedSince
 // (503 behind).
 //
-// A partial reader's view of a namespace §B.11.9 covers is computed at
+// A partial reader's view of a namespace §7.9 covers is computed at
 // its checkpoint: where an apply moved it meanwhile, the views are
 // computed again (recover), and rd's gs may change with them.
 func (ix *Index) refsAnswer(ctx context.Context, rd *refsReader, rq *refsQuery, target func(string) string) (derived.Stored, string, bool, error) {
@@ -816,7 +816,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		return derived.Stored{}, "", false, err
 	}
 	// The namespaces whose hits the answer holds: those reached; and the
-	// combined checkpoint over them and, for those §B.11.9 covers that
+	// combined checkpoint over them and, for those §7.9 covers that
 	// the reader reads in part, every namespace visibility reads there,
 	// each view's checkpoint being the one this transaction holds (§A.4).
 	nss := make([]string, 0, len(cps))
@@ -1059,7 +1059,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 }
 
 // refsMerge is cps, the checkpoints of the namespaces an answer's hits
-// come from, checked against the checkpoint of each namespace §B.11.9
+// come from, checked against the checkpoint of each namespace §7.9
 // covers that rd reads in part (§A.4 Across namespaces): errMoved if a
 // view was computed at another checkpoint of one of them than cps holds.
 func refsMerge(cps map[string]string, rd *refsReader) (map[string]string, error) {

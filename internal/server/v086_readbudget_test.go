@@ -90,7 +90,7 @@ func TestV086KeyRequestOneBudget(t *testing.T) {
 	expectCode(t, r, 403, "forbidden")
 }
 
-// §6.6 Validation work, §B.11.9 Edge grants: an exchange whose budget is
+// §6.6 Validation work, §7.9 Edge grants: an exchange whose budget is
 // spent fails as a whole. A grant of a covered namespace whose only role
 // runs out on the check of unrestricted read gets no cookie for its
 // subject set either: 403, nothing set.

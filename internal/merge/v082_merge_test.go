@@ -180,7 +180,7 @@ func TestV082ReleaseBranchGrantFixedToBaseResources(t *testing.T) {
 		notFound(ns+"/nothing by revision", err)
 	}
 	// Nothing that lists the branch: no unrestricted read, and no filtered
-	// form of it either (§B.11.9, §F.8).
+	// form of it either (§7.9, §F.8).
 	at := must(owner.NSHead(ctx, "matches-r7")).ID
 	for what, err := range map[string]error{
 		"the branch's heads": func() error { _, err := fixed.Heads(ctx, "matches-r7", at); return err }(),

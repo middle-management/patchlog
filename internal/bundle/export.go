@@ -445,8 +445,7 @@ func (p *ExportPlan) need(ctx context.Context, from *PlannedDoc, t Target, force
 // baseHeads returns, for a branch ns, its foreign parents: each resource's
 // head as the branch's own /heads lists it at the branch's first ns_id
 // (§G.4.1, v0.86; §10), which is what the branch read through when it was
-// made, whatever its base is: a local namespace, another branch, or one
-// in another deployment (§G.3), whose shadow the branch is a branch of.
+// made, whatever its base is: a namespace or another branch.
 // Nothing is read in the base, so the exporter needs no access there. nil
 // if ns isn't a branch.
 func (p *ExportPlan) baseHeads(ctx context.Context, ns string) (map[string]client.HeadItem, error) {
@@ -463,7 +462,7 @@ func (p *ExportPlan) baseHeads(ctx context.Context, ns string) (map[string]clien
 		if err != nil {
 			return nil, fmt.Errorf("export: the namespace log of branch %s: %w", ns, err)
 		}
-		// The first entry is the branch's config genesis (§G.3, §10
+		// The first entry is the branch's config genesis (§10
 		// Branches), before any write of its own. A log that starts
 		// otherwise doesn't place the fork: a resource's own first write
 		// would pass for its foreign parent, and go unexported.

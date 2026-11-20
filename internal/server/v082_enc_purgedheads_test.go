@@ -8,7 +8,7 @@ import (
 
 // v82encFilteredLog is the gs and at a partial reader's unfiltered log of
 // matches redirects to. A purged namespace's log still redirects, where
-// its /heads no longer does (§B.11.9 Purged namespaces).
+// its /heads no longer does (§7.9 Purged namespaces).
 func v82encFilteredLog(w *v75s, bearer string) (gs, at string) {
 	w.t.Helper()
 	r := w.get("/ns/matches/rev/"+w.nsHead("matches", w.admin)+"/log", bearer)
@@ -21,7 +21,7 @@ func v82encFilteredLog(w *v75s, bearer string) (gs, at string) {
 	return parts[4], parts[6]
 }
 
-// ACC-8a (SERVICES §B.11.9 Purged namespaces, SPEC §8.5; scenario 124):
+// ACC-8a (SERVICES §7.9 Purged namespaces, SPEC §8.5; scenario 124):
 // a partial reader's unfiltered /heads of a covered namespace that is
 // purged is 410 purged, with head, at once: no 302 and no Location. The read check comes first: without a grant 401, and
 // a grant whose read is refused 403, neither with head. The unfiltered

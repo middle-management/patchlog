@@ -48,7 +48,7 @@ func v075Verified(t *testing.T, blockRules []any) *grant.Verified {
 
 var v075BlockRules = []any{map[string]any{"op": "test", "path": "/principal/id", "value": "user:li"}}
 
-// §A.4, §B.11.9: ReadsScope is the index's scope digest byte for byte
+// §A.4, §7.9: ReadsScope is the index's scope digest byte for byte
 // (the golden value is index.readsScope's for the same grant), and
 // ScopeDigest over ScopeInputOf gives it again.
 func TestV075ReadsScopeGolden(t *testing.T) {
@@ -92,7 +92,7 @@ func TestV075CombinedAt(t *testing.T) {
 	}
 }
 
-// §B.11.9 item 2: ReadFilter judges a read as the grant's read check does
+// §7.9 item 2: ReadFilter judges a read as the grant's read check does
 // (Allows, the index's semantics), and AllowsItem counts a role only if
 // its rules refer to nothing in /principal but groups and roles. Encode
 // and DecodeReadFilter round-trip.

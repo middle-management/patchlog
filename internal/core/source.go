@@ -32,7 +32,7 @@ func (t *tx) checkSource(req Request, v any) (any, *batchSource, *Error) {
 			// For any caller: it reveals nothing (§7.5, §12.1).
 			return nil, nil, apiErr(422, "source", "message", "source.origin is this deployment's own")
 		}
-		return m, nil, nil // another deployment's blobs are uploaded (§G.3)
+		return m, nil, nil // another deployment's blobs are uploaded
 	}
 	sn := t.nsByName(ns)
 	if sn == nil || sn.purged || !t.sourceUnrestricted(sn, req) {

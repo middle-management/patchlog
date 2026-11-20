@@ -302,23 +302,3 @@ func TestValidationByChangesRandom(t *testing.T) {
 		t.Errorf("the patches exercise too little: %d applied, %d refused, %d validated by changes", ok, refused, change)
 	}
 }
-
-// A remote branch mirrors typed revisions another deployment validated
-// (§G.3): this one stored them and never validated them, so the first
-// patch to one is validated in full, and the next by its changes.
-func TestValidationMirroredInFull(t *testing.T) {
-	t.Parallel()
-	a, b, _ := pair(t, nil, nil)
-	f := populateA(t, a)
-	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
-	f0, c0 := b.e.ValidationCounts()
-	head := b.appendRev("rel", "derby", f.d2, ops(op("replace", "/score", "2-0")))
-	if full, change := b.e.ValidationCounts(); full-f0 != 1 || change != c0 {
-		t.Fatalf("a patch to a mirrored revision: validated %d in full, %d by changes; want 1 and 0", full-f0, change-c0)
-	}
-	b.clock.Advance(1e9)
-	b.appendRev("rel", "derby", head, ops(op("replace", "/score", "3-0")))
-	if full, change := b.e.ValidationCounts(); full-f0 != 1 || change-c0 != 1 {
-		t.Fatalf("the next patch: validated %d in full, %d by changes; want 1 and 1", full-f0, change-c0)
-	}
-}

@@ -87,8 +87,7 @@ func (s *xrev2Sealer) nsDoc(ns, doc string) string {
 // of secret/derby as the item's file. It counts only where that
 // namespace's own document names the item's namespace as its base (§7.6:
 // base never changes), directly or through a branch of it (a stacked
-// release branch); a branch of another namespace, of a remote base, or
-// one whose document can't be read is refused, and so is its value. The
+// release branch); a branch of another namespace, or one whose document can't be read is refused, and so is its value. The
 // "branch" member is not read.
 func TestV082Xrev2BranchIsABranchOfTheItemsNamespace(t *testing.T) {
 	t.Parallel()
@@ -106,7 +105,7 @@ func TestV082Xrev2BranchIsABranchOfTheItemsNamespace(t *testing.T) {
 	body := map[string]any{"children": []any{
 		child("secret", "secret"),           // 0: a namespace with no document this reader gets
 		child("other-r7", "other-r7"),       // 1: a branch, of another namespace
-		child("matches-far", "matches-far"), // 2: a branch of a namespace of that name elsewhere
+		child("matches-far", "matches-far"), // 2: a branch of yet another namespace
 		child("matches-r7", "matches-r7"),   // 3: the item's namespace's branch
 		child("matches-r8", "matches-r8"),   // 4: the same, its document sealed
 		child("matches", "matches"),         // 5: the item's namespace itself
@@ -118,7 +117,7 @@ func TestV082Xrev2BranchIsABranchOfTheItemsNamespace(t *testing.T) {
 	}}
 	docs := map[string]any{
 		"other-r7":    map[string]any{"base": map[string]any{"ns": "other", "at": xrev2Head}},
-		"matches-far": map[string]any{"base": map[string]any{"origin": "https://far.example", "ns": "matches", "at": xrev2Head}},
+		"matches-far": map[string]any{"base": map[string]any{"ns": "elsewhere", "at": xrev2Head}},
 		"matches-r7":  map[string]any{"base": map[string]any{"ns": "matches", "at": xrev2Head}},
 		"matches-r9":  map[string]any{"base": map[string]any{"ns": "matches-r7", "at": xrev2Head}},
 		"matches-r8":  s.nsDoc("matches-r8", `{"base":{"ns":"matches","at":"`+xrev2Head+`"},"encryption":{"level":"sealed","epoch":1}}`),

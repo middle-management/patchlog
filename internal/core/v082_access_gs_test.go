@@ -8,7 +8,7 @@ import (
 
 // V82-02 (v0.82), ACC-14: a gs cookie ends when the key its key: string
 // names, or a key or role its rules came from, is gone or changes in any
-// member (SERVICES §B.11.9 gs).
+// member (SERVICES §7.9 gs).
 
 // v82accessCookie exchanges cred and returns the cookie of its /g/ prefix
 // in matches, with its gs. The cookie expires as the server's would
@@ -48,7 +48,7 @@ func v82accessOp(op, path string, value any) map[string]any {
 	return map[string]any{"op": op, "path": path, "value": value}
 }
 
-// §B.11.9 gs (v0.82): "A gs cookie is 403 at an at where those rules
+// §7.9 gs (v0.82): "A gs cookie is 403 at an at where those rules
 // differ, or the key its key: string names, or a key or role they came
 // from, is gone or changes in any member, until the reader exchanges
 // again." Each change below leaves the scope digest, the key's pub and
@@ -132,7 +132,7 @@ func TestV082AccessGSEntryAnyMember(t *testing.T) {
 	}
 }
 
-// §B.11.9 gs: the changes that ended a cookie before v0.82 still do, and
+// §7.9 gs: the changes that ended a cookie before v0.82 still do, and
 // are 403 too: a role gaining a rule (its scope digest differs, and her
 // next exchange gives another gs), the key or the role removed.
 func TestV082AccessGSEntryEarlierEndings(t *testing.T) {
@@ -158,7 +158,7 @@ func TestV082AccessGSEntryEarlierEndings(t *testing.T) {
 	}
 }
 
-// §B.11.9 gs: the answers at an at from before the change are the ones
+// §7.9 gs: the answers at an at from before the change are the ones
 // its document gave, so the old cookie still reads there, as a changed
 // rule leaves it (immutable answers, §B.5); once the reader has exchanged
 // again, her new cookie's record is the new document's and the earlier
@@ -198,7 +198,7 @@ func TestV082AccessGSEntryPerAt(t *testing.T) {
 // Stored data (stored.md, core migration 017): a record from before the
 // upgrade has entry ”, which never holds. Its cookie is 403 until the
 // reader exchanges again; a gs the origin keeps nothing for stays 401
-// (§B.11.9 gs). Since v0.86 the entry is in the cookie's own record
+// (§7.9 gs). Since v0.86 the entry is in the cookie's own record
 // (filtered_gs_exps).
 func TestV082AccessGSStoredWithoutEntry(t *testing.T) {
 	t.Parallel()
@@ -245,7 +245,7 @@ func TestV082AccessGSStoredWithoutEntry(t *testing.T) {
 
 // The window between a narrowing and the next exchange, for readers who
 // share a gs: bo and cy, both in editors through reader-01, have one gs
-// and so one filtered_gs row (§B.11.9 gs: "The origin keeps, per namespace
+// and so one filtered_gs row (§7.9 gs: "The origin keeps, per namespace
 // and gs ..."), and a cookie names its prefix and expiry alone (§C.5.3).
 // The key's attrs scope is narrowed to cy's alone (a sub scope would give
 // each her own gs, §B.11.5):

@@ -87,9 +87,9 @@ const minOther = "min names a namespace other than the one queried"
 // minted for the gs of its URL (Options.EdgeGrants), and is read as that
 // subject set; one with neither is 401.
 //
-// Where §B.11.9 covers a namespace (filtered.go), a partial reader's
+// Where §7.9 covers a namespace (filtered.go), a partial reader's
 // marker is reads:{ns}:g:{gs}, gs the origin's subject set; its hits are
-// those visible to it (§B.11.9 Visible); and at is the combined
+// those visible to it (§7.9 Visible); and at is the combined
 // checkpoint of every namespace visibility reads there, which its answers
 // list as namespaces and min may name ({ns}:{ns_id}). Its pages are filled
 // to limit, as every reader's are.
@@ -210,14 +210,14 @@ type access struct {
 	gs     string          // subject-set id over marker (private only)
 	// allow is the per-resource read check of a reader that isn't all:
 	// the grant's, or under an edge grant the filter its marker stands
-	// for (markerRec), or for a partial reader of a namespace §B.11.9
+	// for (markerRec), or for a partial reader of a namespace §7.9
 	// covers, visibility (cov).
 	allow func(resource string) bool
 	// filter is what a scope marker stands for, which an edge grant
 	// minted for it authorises from (markerRec).
 	filter *grantcheck.ReadFilter
 	cookie bool // read under one of the service's edge grants
-	// cov is a partial reader's view of a namespace §B.11.9 covers, at
+	// cov is a partial reader's view of a namespace §7.9 covers, at
 	// the checkpoint its answers are at (filtered.go), and derive computes
 	// it at another: from the grant, or from what a cookie's marker
 	// stands for. Both are nil for any other reader.
@@ -402,7 +402,7 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 	// allow, digest covering those rules, the /principal values they
 	// refer to (grantcheck.ReadsScope) and its key's key: string
 	// (scopeMarker), so readers limited alike through one key share them;
-	// and where §B.11.9 covers ns, reads:{ns}:g:{gs} for such a
+	// and where §7.9 covers ns, reads:{ns}:g:{gs} for such a
 	// partial reader, gs being the origin's, its hits filtered by
 	// visibility (filtered.go). Where those rules refer to /now the
 	// namespace counts as unreadable: a result at an at can't change with
@@ -537,7 +537,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		writeBehind(w, "the index cannot obtain the keys of the namespace yet")
 		return
 	}
-	// A partial reader of a namespace §B.11.9 covers reads at the combined
+	// A partial reader of a namespace §7.9 covers reads at the combined
 	// checkpoint with ns at its committed checkpoint (filtered.go): cur
 	// below is that at, the reader's gs that at's.
 	if a.cov != nil {
@@ -561,7 +561,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		}
 	}
 	// An older at whose checkpoint the index still holds is read at the
-	// reader's gs as of that at (§B.11.9, §B.11.5: a grant reads at its own
+	// reader's gs as of that at (§7.9, §B.11.5: a grant reads at its own
 	// gs as of the URL's at): where that is the URL's gs, old is the
 	// reader's view there, and the URL is the reader's own, answered as
 	// any older at is below: its kept result, else a redirect to the
@@ -898,7 +898,7 @@ func (ix *Index) afterPurge(w http.ResponseWriter, r *http.Request, ns string, v
 }
 
 // errMoving is a namespace whose checkpoint moved each time a partial
-// reader's view was computed for it (§B.11.9, answer): behind, for now.
+// reader's view was computed for it (§7.9, answer): behind, for now.
 var errMoving = errors.New("the index is applying the namespace's log: try again")
 
 // errVisibility wraps a failure to compute a partial reader's view
@@ -942,7 +942,7 @@ func (ix *Index) writeAccessErr(w http.ResponseWriter, what string, err error, m
 const msgRootBehind = "the index cannot read the core's configuration yet (§7.9)"
 
 // writeCoverErr answers a failure to compute a partial reader's view of a
-// namespace §B.11.9 covers (Index.cover): a refusal as such, no-store;
+// namespace §7.9 covers (Index.cover): a refusal as such, no-store;
 // one of a namespace not reached yet, or purged meanwhile, behind; and a
 // namespace whose state visibility reads the service can't read, 502, or
 // 503 behind while only the keys to open a sealed one's documents can't be
@@ -961,7 +961,7 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 	case errors.Is(err, errNotReached), errors.Is(err, errPurgedNS), errors.Is(err, errMoving):
 		writeBehind(w, "the index has not reached the namespace's checkpoint yet")
 	default:
-		ix.writeUpstreamErr(w, "visibility in "+ns, err, "cannot read a namespace visibility reads (§B.11.9)")
+		ix.writeUpstreamErr(w, "visibility in "+ns, err, "cannot read a namespace visibility reads (§7.9)")
 	}
 }
 
@@ -985,7 +985,7 @@ func upstreamBehind(err error) (msg string, behind bool) {
 
 // writeUpstreamErr answers err, a failure to read upstream what answering
 // needs, 502 upstream with msg, or msgGrantLacks where the index's own
-// grant can't read a namespace that decides §B.11.9 coverage
+// grant can't read a namespace that decides §7.9 coverage
 // (errGrantLacks); the log names it. A failure to fetch the key that opens
 // a sealed namespace's documents (client.ErrKeyFetch) that leaves the
 // service lacking it as configured (lacksKey: a 4xx from /keys other than
@@ -1128,7 +1128,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	if err != nil {
 		return derived.Stored{}, "", err
 	}
-	// A partial reader where §B.11.9 covers ns: the view must be at the
+	// A partial reader where §7.9 covers ns: the view must be at the
 	// checkpoint the read transaction held (an apply may have committed
 	// since it was computed), and the answer is at its combined at.
 	var cp *fcp
@@ -1461,7 +1461,7 @@ func (ix *Index) committed(ctx context.Context, ns string) (string, bool, error)
 // keeps results for, which redirects to the current checkpoint anyway
 // (§A.4), and a redirect to it would not be answered (bounded redirects).
 //
-// A partial reader's at where §B.11.9 covers ns is a combined checkpoint:
+// A partial reader's at where §7.9 covers ns is a combined checkpoint:
 // its kept result lists what it covers as namespaces, as /_refs' answers
 // do (refsIncludes).
 func (ix *Index) atIncludes(ctx context.Context, a *access, ns, at string, mins []MinRef, url string) bool {
@@ -1494,7 +1494,7 @@ func (ix *Index) atIncludes(ctx context.Context, a *access, ns, at string, mins 
 
 // judgeMins judges the mins of a query of ns (a bare one names ns, and is
 // set to) before any is waited for (§A.5): this URL's checkpoint covers ns
-// alone, or, for a partial reader where §B.11.9 covers ns, the namespaces
+// alone, or, for a partial reader where §7.9 covers ns, the namespaces
 // its combined checkpoint covers (judgeMinsIn, §A.4), so a min naming any
 // other namespace is refused, whether the service follows it, the reader
 // may see it, it is purged or its keys can't be had, before any of that
@@ -1519,7 +1519,7 @@ func judgeMinsIn(ns string, mins []MinRef, covers func(string) bool) (refused []
 }
 
 // covers reports whether a's answers are at a combined checkpoint that
-// covers ns (§A.4, §B.11.9), a partial reader's of a covered namespace.
+// covers ns (§A.4, §7.9), a partial reader's of a covered namespace.
 func (a *access) covers(ns string) bool {
 	if a == nil || a.cov == nil {
 		return false
@@ -1552,7 +1552,7 @@ func (ix *Index) waitMins(ctx context.Context, mins []MinRef) bool {
 }
 
 // waitMember is waitMin for a namespace a combined checkpoint covers that
-// the index doesn't follow (§A.4, §B.11.9, filtered.go): it is taken at
+// the index doesn't follow (§A.4, §7.9, filtered.go): it is taken at
 // its head, so min is reached once the head is min or the core's log
 // places min before it (since=min is accepted only if min is in the chain
 // up to it, §7.1). The head is read again while waiting, and the grant

@@ -329,7 +329,7 @@ func (t *tx) reserveWrite(n *nsRow, e int, revs map[string]int64, entries int64)
 // configuration configSeq, the sealing of each one's range under K_n of
 // that configuration's epoch, where it is sealed (§E.2.2).
 func (t *tx) reserveEntries(n *nsRow, configSeq int64, k int64) {
-	if c := t.config(configSeq); c.level == levelSealed && k > 0 && !n.isShadow() {
+	if c := t.config(configSeq); c.level == levelSealed && k > 0 {
 		t.countIn(sealKey{n.id, c.Epoch, ""}, k, true)
 	}
 }

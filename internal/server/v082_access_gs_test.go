@@ -9,9 +9,9 @@ import (
 
 // V82-02 (v0.82), ACC-14 over HTTP: a gs cookie ends when its key's entry
 // changes in any member, until the reader exchanges again; long-poll
-// judges it at the current checkpoint (SERVICES §B.11.9 gs).
+// judges it at the current checkpoint (SERVICES §7.9 gs).
 
-// §B.11.9 gs: "A gs cookie is 403 ... [where] the key its key: string
+// §7.9 gs: "A gs cookie is 403 ... [where] the key its key: string
 // names, or a key or role they came from, is gone or changes in any
 // member, until the reader exchanges again. Long-poll judges this at the
 // current checkpoint." li's cookie reads; her key's entry gains a rate,

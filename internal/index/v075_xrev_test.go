@@ -16,7 +16,7 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// Cross-package review of v0.75 (§B.11.9, §A.4): regressions.
+// Cross-package review of v0.75 (§7.9, §A.4): regressions.
 
 // logged collects what an index logs, for a test to look for.
 type logged struct {
@@ -57,7 +57,7 @@ func (s *svc) follow(path, token string) resp {
 }
 
 // wantGrantLacks checks r is the 502 of an index whose grant can't read a
-// namespace that decides §B.11.9 coverage, named in its log only.
+// namespace that decides §7.9 coverage, named in its log only.
 func wantGrantLacks(t *testing.T, what string, r resp, logs *logged, ns string) {
 	t.Helper()
 	msg, _ := r.body["message"].(string)
@@ -72,7 +72,7 @@ func wantGrantLacks(t *testing.T, what string, r resp, logs *logged, ns string) 
 	}
 }
 
-// TestV075XrevIndexCookieAfterRoleLosesRead (§B.11.9 gs, §A.4, §2.1): the
+// TestV075XrevIndexCookieAfterRoleLosesRead (§7.9 gs, §A.4, §2.1): the
 // index's cookie for reads:matches:g:{gs} is judged from what the exchange
 // recorded, and is 403 at an at where the rules its marker digests differ,
 // of each effective role that lists read among them. Folders give fans the

@@ -11,7 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
-// §2.1 Edge prefix, §B.11.9 Edge grants, §C.5.4: /ns/{ns}/g/{gs} is a core
+// §2.1 Edge prefix, §7.9 Edge grants, §C.5.4: /ns/{ns}/g/{gs} is a core
 // prefix, withdrawn like the others, with gs an id ("all" is a service's
 // and isn't one); its cookie authorises nothing outside its path, and
 // reaches the engine with GS set.
@@ -61,7 +61,7 @@ func TestV075EdgePrefixG(t *testing.T) {
 	if got := eg.Prefixes(); len(got) != 1 || got[0] != prefix {
 		t.Fatalf("Prefixes %v", got)
 	}
-	// The engine refuses it at the namespace's unfiltered URLs (§B.11.9:
+	// The engine refuses it at the namespace's unfiltered URLs (§7.9:
 	// only the filtered entry points admit it).
 	if _, err := e.e.NamespaceHeads(t.Context(), "demo", head, "", core.Credentials{Edge: eg}); !v075IsStatus(err, 403) {
 		t.Fatalf("NamespaceHeads under a GS edge grant: %v", err)

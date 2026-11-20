@@ -798,6 +798,7 @@ func TestParseKeysAndRoles(t *testing.T) {
 		{"kid": "a", "alg": "ed25519", "pub": "xx", "can": []any{"read"}},
 		{"kid": "a", "alg": "ed25519", "pub": pub},
 		{"kid": "a", "alg": "ed25519", "pub": pub, "can": []any{"fly"}},
+		{"kid": "a", "alg": "ed25519", "pub": pub, "can": []any{"export"}}, // no verb since v0.87
 		{"kid": "a", "alg": "ed25519", "pub": pub, "can": []any{"read"}, "maxTtl": "1h"},
 		{"kid": "a", "alg": "ed25519", "pub": pub, "can": []any{"read"}, "sub": "(a)\\1"},
 		{"kid": "a", "alg": "ed25519", "pub": pub, "can": []any{"read"}, "groups": map[string]any{"allow": []any{}, "deny": []any{}}},

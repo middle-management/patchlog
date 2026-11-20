@@ -101,7 +101,7 @@ func (w *v75World) open(adjust func(o *Options)) {
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	opt := Options{Path: w.path, BlobDir: w.t.TempDir(), OperatorKeys: ops, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	opt := Options{Path: w.path, BlobDir: w.t.TempDir(), OperatorKeys: ops, RetentionInterval: -1,
 		BlobSweepInterval: -1, Limits: lim, Purger: discardPurger{}, KeyStore: ks, Now: func() time.Time { return time.UnixMilli(w.clock.Load()) }}
 	opt.Maximums = lim
 	opt.Maximums.ExchangeRate = Rate{1e9, 1e9}
@@ -263,7 +263,7 @@ func v75Status(err error) int {
 	return 0
 }
 
-// §B.11.9 Where: what filteredScope covers.
+// §7.9 Where: what filteredScope covers.
 func TestV075FilteredScope(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -274,7 +274,7 @@ func TestV075FilteredScope(t *testing.T) {
 			}
 		}
 	})
-	// A local branch of matches isn't covered (v0.78, §B.11.9 Where).
+	// A local branch of matches isn't covered (v0.78, §7.9 Where).
 	if _, err := w.e.CreateBranch(context.Background(), Request{NS: "matches", Cred: w.admin}, BranchRequest{Name: "matches-r7", IfNoneMatch: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +311,7 @@ func TestV075FilteredScope(t *testing.T) {
 	})
 }
 
-// §B.11.9 Partial reader: nsAccess classifies; uncovered namespaces keep
+// §7.9 Partial reader: nsAccess classifies; uncovered namespaces keep
 // nsReader's answers; a GS edge grant reads nothing unfiltered.
 func TestV075NSAccess(t *testing.T) {
 	t.Parallel()
@@ -402,7 +402,7 @@ func v075Visible(t *testing.T, w *v75World, ns string, cred Credentials, names .
 	return out
 }
 
-// §B.11.9 Visible: a name is visible where the grant's rules allow
+// §7.9 Visible: a name is visible where the grant's rules allow
 // reading it, live, tombstoned or purged alike.
 func TestV075Visible(t *testing.T) {
 	t.Parallel()
@@ -450,7 +450,7 @@ func TestV075Visible(t *testing.T) {
 	})
 }
 
-// §B.11.9 Where (v0.78: "Filtered reads cover no branch"; conformance
+// §7.9 Where (v0.78: "Filtered reads cover no branch"; conformance
 // TDA 63): li, a partial reader of matches, isn't one of its branch: her
 // unfiltered read of matches-r7 is 403, with no redirect. Before v0.78 a
 // branch's document was visible when live in its base as of the branch's
@@ -487,7 +487,7 @@ func (w *v75World) catReader(sub string, groups ...any) Credentials {
 
 var _ = slices.Contains[[]string]
 
-// §B.11.9 gs: a partial reader's subjects are its scope digest and its
+// §7.9 gs: a partial reader's subjects are its scope digest and its
 // key subject alone: readers with the same rules through the same key
 // share a gs, whatever their sub or groups.
 func TestV075GS(t *testing.T) {
@@ -555,7 +555,7 @@ func v075GSRedirect(t *testing.T, w *v75World, cred Credentials) *FilteredRedire
 	return red
 }
 
-// §B.11.9 at, G: checkpoints are entries of {ns}'s chain; subject sets
+// §7.9 at, G: checkpoints are entries of {ns}'s chain; subject sets
 // are stored and survive a restart.
 func TestV075State(t *testing.T) {
 	t.Parallel()
@@ -623,7 +623,7 @@ func TestV075State(t *testing.T) {
 	})
 }
 
-// §B.11.9 URLs, design H: filteredAdmit (conformance 74, 76, 78).
+// §7.9 URLs, design H: filteredAdmit (conformance 74, 76, 78).
 func TestV075FilteredAdmit(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -741,7 +741,7 @@ func v075View0(t *testing.T, w *v75World, cred Credentials) *fview {
 	return fv
 }
 
-// §B.11.9 Edge grants (conformance 75, Grant scope 58, 59): a partial
+// §7.9 Edge grants (conformance 75, Grant scope 58, 59): a partial
 // reader whose grant doesn't fix /resource gets /ns/{ns}/g/{gs} alone.
 func TestV075Exchange(t *testing.T) {
 	t.Parallel()

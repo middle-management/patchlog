@@ -13,14 +13,14 @@ import (
 	"github.com/middle-management/patchlog/internal/lifecycle"
 )
 
-// Filtered namespace reads (§B.11.9): /heads, log ranges, long-poll and
+// Filtered namespace reads (§7.9): /heads, log ranges, long-poll and
 // events of a covered namespace at /ns/{ns}/g/{gs}/…, filtered to what the
 // subject set gs may see, and the redirects of partial readers to them.
 // None of it is read from or written to a cache of the origin's; every
 // redirect a grant or cookie decides is private, no-store.
 
 // privateNoStore marks a response no cache may keep, the edge included
-// (§9, §B.11.9 URLs): a redirect decided by a grant or cookie, or an
+// (§9, §7.9 URLs): a redirect decided by a grant or cookie, or an
 // answer filtered for one.
 func privateNoStore(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "private, no-store")
@@ -30,7 +30,7 @@ func privateNoStore(w http.ResponseWriter) {
 // writeFilteredRedirect answers err if it is a *core.FilteredRedirect: 302
 // to /ns/{ns}/g/{gs}/at/{at}{suffix}, or without /at/{at} for long-poll and
 // events, with q as its query, private, no-store and varying by
-// Authorization, which decided it for an unfiltered URL (§B.11.9 URLs).
+// Authorization, which decided it for an unfiltered URL (§7.9 URLs).
 // It returns false for any other error.
 func (s *Server) writeFilteredRedirect(w http.ResponseWriter, err error, suffix string, q url.Values) bool {
 	var fr *core.FilteredRedirect
@@ -78,17 +78,17 @@ func headsPrefix(q url.Values) (string, error) {
 }
 
 // filteredTags are the Cache-Tags of a filtered answer at an at: its
-// unfiltered form's (§B.11.9 URLs).
+// unfiltered form's (§7.9 URLs).
 func filteredTags(_ *core.FilteredInfo, tags ...string) []string { return tags }
 
 // filteredHeadsTags are a filtered /heads answer's tags: the unfiltered
-// /heads' (§B.11.9 URLs).
+// /heads' (§7.9 URLs).
 func filteredHeadsTags(info *core.FilteredInfo, ns string) []string {
 	return filteredTags(info, "ns:"+ns, "heads:"+ns)
 }
 
 // setFilteredAt sets X-Namespace-Revision, {ns}'s ns_id the answer is at
-// (§B.11.9 Log ranges).
+// (§7.9 Log ranges).
 func setFilteredAt(w http.ResponseWriter, info *core.FilteredInfo) {
 	if info != nil && info.At != "" {
 		w.Header().Set("X-Namespace-Revision", info.At)
@@ -96,7 +96,7 @@ func setFilteredAt(w http.ResponseWriter, info *core.FilteredInfo) {
 }
 
 // filteredCurrent answers a URL under /ns/{ns}/g/{gs} without at: 302 to
-// its form at the current at, with q (§B.11.9 URLs).
+// its form at the current at, with q (§7.9 URLs).
 func (s *Server) filteredCurrent(w http.ResponseWriter, r *http.Request, suffix string, q url.Values) {
 	ns, gs := r.PathValue("ns"), r.PathValue("gs")
 	if err := validNames(ns, ""); err != nil {
@@ -122,7 +122,7 @@ func (s *Server) gHeadsCurrent(w http.ResponseWriter, r *http.Request) {
 	s.filteredCurrent(w, r, "/heads", keep(q, "after", "prefix"))
 }
 
-// gHeads is GET /ns/{ns}/g/{gs}/at/{at}/heads?after&prefix (§B.11.9
+// gHeads is GET /ns/{ns}/g/{gs}/at/{at}/heads?after&prefix (§7.9
 // /heads): the visible rows, in pages filled to the log page size, next on
 // every full page. It is cached as the unfiltered /heads, immutable, with
 // its tags plus ns:{x} and heads:{x} for the rest of at, and carries
@@ -160,7 +160,7 @@ func (s *Server) gHeads(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-// gLog is GET /ns/{ns}/g/{gs}/at/{at}/log?since= (§B.11.9 Log ranges): a
+// gLog is GET /ns/{ns}/g/{gs}/at/{at}/log?since= (§7.9 Log ranges): a
 // page of the filtered range, possibly empty, X-Log-Next naming its last
 // entry scanned on every page but the last, cached as the unfiltered range
 // with X-Namespace-Revision, the range's end.
@@ -184,7 +184,7 @@ func (s *Server) gLog(w http.ResponseWriter, r *http.Request) {
 }
 
 // gLive is GET /ns/{ns}/g/{gs}/log: without live, 302 to the range at the
-// current at; with live=long-poll, a filtered long-poll (§B.11.9 Long-poll).
+// current at; with live=long-poll, a filtered long-poll (§7.9 Long-poll).
 func (s *Server) gLive(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	live, cursor, err := liveQuery(q)
@@ -204,7 +204,7 @@ func (s *Server) gLive(w http.ResponseWriter, r *http.Request) {
 	s.filteredLongPoll(w, r, ns, gs, cursor)
 }
 
-// filteredLongPoll is longPoll for a filtered log (§B.11.9 Long-poll):
+// filteredLongPoll is longPoll for a filtered log (§7.9 Long-poll):
 // only visible entries answer 200 or end a wait. A page with none moves
 // since past the entries it scanned and reads on, at once while the log
 // goes on, else after the next write, until the interval ends: 204, its
@@ -279,7 +279,7 @@ func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, gs
 	}
 }
 
-// gEvents is GET /ns/{ns}/g/{gs}/events (§B.11.9 Events, §7.3): an event
+// gEvents is GET /ns/{ns}/g/{gs}/events (§7.9 Events, §7.3): an event
 // stream of the visible entries, each page fetched, and each keep-alive
 // preceded by a fetch, admitted again and judged at the current
 // checkpoint, ending when admission fails or the credential it was

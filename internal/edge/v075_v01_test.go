@@ -7,7 +7,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
-// §2.1 Edge prefix, §B.11.9: ParseCorePrefix takes /ns/{ns}/g/{gs} with gs
+// §2.1 Edge prefix, §7.9: ParseCorePrefix takes /ns/{ns}/g/{gs} with gs
 // an id in its canonical text, the origin's key vouches for it, and
 // ParsePrefix keeps refusing it.
 func TestV075ParseCorePrefix(t *testing.T) {

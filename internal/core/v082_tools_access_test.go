@@ -19,8 +19,7 @@ func TestV082ToolsArchiveAccessOf(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
-		Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}, KeyStore: ks})
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1, Purger: discardPurger{}, KeyStore: ks})
 	if err != nil {
 		t.Fatal(err)
 	}

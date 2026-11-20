@@ -764,18 +764,6 @@ func TestSealedBranch(t *testing.T) {
 	expect(t, e.get("/r/b/a/rev/"+a), 410)
 }
 
-// A sealed namespace accepts remote branch registrations: that the branch
-// is sealed too is B's obligation, which A can't check (§G.5; see
-// remote_enc_test.go).
-func TestSealedRemoteRegistration(t *testing.T) {
-	t.Parallel()
-	e := newSealedEnv(t)
-	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
-	r := e.do(req{method: "POST", path: "/ns/s/branches", ifNoneMatch: "*", author: "admin",
-		body: map[string]any{"remote": map[string]any{"origin": "https://b.example", "ns": "x"}, "at": e.nsHead("s")}})
-	expect(t, r, 201)
-}
-
 // A prune drops the sealed copies of what it pruned; kept documents keep
 // their bytes.
 func TestSealedPrune(t *testing.T) {

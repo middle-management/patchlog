@@ -1,15 +1,9 @@
 package core
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
-	"errors"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/dbmigrate"
@@ -91,48 +85,6 @@ func TestV0261FilteredPurgedHeadsDifferential(t *testing.T) {
 				}
 			}
 		}
-	}
-}
-
-// C4, C-M, C2 (v0.26.1): rawGet follows no redirect, reads at most a small
-// error body and at most limit of a 200. (What B takes of the answers,
-// since v0.78 only a mirrored snapshot's: mirrorSnapshot.)
-func TestV0261RawGet(t *testing.T) {
-	ctx := context.Background()
-	var hit atomic.Int64
-	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hit.Add(1) }))
-	t.Cleanup(other.Close)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/redirect":
-			http.Redirect(w, r, other.URL+"/x", http.StatusFound)
-		case "/error":
-			w.WriteHeader(403)
-			w.Write(bytes.Repeat([]byte(" "), 1<<20))
-		case "/big":
-			w.Write(bytes.Repeat([]byte(" "), 1<<20))
-		case "/pruned":
-			w.WriteHeader(410)
-			io.WriteString(w, `{"code":"pruned"}`)
-		}
-	}))
-	t.Cleanup(srv.Close)
-	ep := RemoteEndpoint{BaseURL: srv.URL, HTTPClient: srv.Client(), Bearer: "grant"}
-	st, _, body, err := rawGet(ctx, ep, srv.URL, "/redirect", nil, 1<<20)
-	if err != nil || st != http.StatusFound || hit.Load() != 0 || len(body) > maxErrBody {
-		t.Fatalf("redirect: %d %v, target hit %d times", st, err, hit.Load())
-	}
-	for _, path := range []string{"/error", "/big"} {
-		st, _, body, err := rawGet(ctx, ep, srv.URL, path, nil, 64<<10)
-		if !errors.Is(err, errTooLarge) || body != nil {
-			t.Fatalf("%s: %d, %d bytes, %v", path, st, len(body), err)
-		}
-	}
-	if _, _, body, err := rawGet(ctx, ep, srv.URL, "/big", nil, 2<<20); err != nil || len(body) != 1<<20 {
-		t.Fatalf("a 200 within its cap: %d bytes, %v", len(body), err)
-	}
-	if st, _, body, err := rawGet(ctx, ep, srv.URL, "/pruned", nil, 1<<20); err != nil || st != 410 || string(body) != `{"code":"pruned"}` {
-		t.Fatalf("410: %d %s %v", st, body, err)
 	}
 }
 

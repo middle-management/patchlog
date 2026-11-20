@@ -8,88 +8,6 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// v0.47 §C.5 "The stream is metadata": /ns/{ns} and everything under it
-// but the gestures listing need unrestricted read, while a resource's own
-// URLs, its events included, need read on that resource only. Roles are
-// alternatives: one read role without /resource rules is enough, for
-// branching (§7.6) and remote registration (§G.3) too.
-func TestV047UnrestrictedRead(t *testing.T) {
-	t.Parallel()
-	onlyA := []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}
-	f := newAuthFixture(t, map[string]any{"roles": map[string]any{
-		"one":      map[string]any{"can": []any{"read"}, "rules": onlyA},
-		"all":      map[string]any{"can": []any{"read", "branch", "export"}},
-		"brancher": map[string]any{"can": []any{"branch", "export"}},
-	}}, noFilteredReads)
-	e := f.tenv
-	hdr := map[string]string{"Gesture": gA}
-	a0 := etagOf(e.do(req{method: "PATCH", path: "/r/sec/a", ifNoneMatch: "*", body: addRoot(map[string]any{"n": 0.0}), bearer: f.adminG, hdr: hdr}))
-	e.do(req{method: "PATCH", path: "/r/sec/b", ifNoneMatch: "*", body: addRoot(map[string]any{}), bearer: f.adminG, hdr: hdr})
-	head := e.nsHead("sec", f.adminG)
-	nsURLs := []string{"/ns/sec", "/ns/sec/rev/" + head, "/ns/sec/rev/" + head + "/log", "/ns/sec/rev/" + head + "/heads",
-		"/ns/sec/log", "/ns/sec/log?live=long-poll", "/ns/sec/events", "/ns/sec/branches", "/ns/sec/grants/" + grantIDOf(t, f.adminG)}
-
-	// A rule that hides b without fixing a used to pass on /ns/sec, which
-	// would list b; such a grant, and one fixed to a, read a alone.
-	hideB := e.grant(f.issuer, "user:h", []string{"sec"}, []string{"read"},
-		map[string]any{"rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/resource", "value": "b"}}}})
-	fixed := e.grant(f.issuer, "user:x", []string{"sec"}, []string{"read"}, map[string]any{"rules": onlyA})
-	oneRole := e.grant(f.admin, "user:o", []string{"sec"}, nil, map[string]any{"roles": []any{"one", "brancher"}})
-	status := func(p, g string) int {
-		if p != "/ns/sec/events" {
-			return e.get(p, g).Code
-		}
-		// A stream that stays open once admitted.
-		_, resp, cancel := e.openSSE(p, map[string]string{"Authorization": "Bearer " + g})
-		cancel()
-		return resp.StatusCode
-	}
-	for _, g := range []string{hideB, fixed, oneRole} {
-		expect(t, e.get("/r/sec/a", g), 302)
-		expect(t, e.get("/r/sec/b", g), 404)
-		for _, p := range nsURLs {
-			// A verified grant that may not read: 403 off resource URLs
-			// (§7, v0.74; CONFORMANCE Grant scope 2).
-			if c := status(p, g); c != 403 {
-				t.Errorf("%s: %d, want 403", p, c)
-			}
-		}
-		// The gestures listing answers it, filtered to what it reads.
-		if r := e.get("/ns/sec/gestures/"+gA, g); r.Code != 200 || len(r.Arr()) != 1 {
-			t.Fatalf("gestures: %d %s", r.Code, r.Body)
-		}
-	}
-	for _, p := range nsURLs {
-		expect(t, e.get(p), 401)
-	}
-
-	// The resource's own URLs, its events and long-poll included.
-	a1 := e.appendRev("sec", "a", a0, ops(op("replace", "/n", 1.0)), f.adminG)
-	expect(t, e.get("/r/sec/a/log?live=long-poll&since="+a0, fixed), 200)
-	ch, resp, _ := e.openSSE("/r/sec/a/events?since="+a0, map[string]string{"Authorization": "Bearer " + fixed})
-	if resp.StatusCode != 200 {
-		t.Fatalf("resource events %d", resp.StatusCode)
-	}
-	if ev := next(t, ch); ev.event != "revision" || ev.id != a1 {
-		t.Fatalf("event %v", ev)
-	}
-	expect(t, e.get("/r/sec/b/events", fixed), 404)
-
-	// Branching and registration: refused without unrestricted read…
-	at := e.nsHead("sec", f.adminG)
-	expectCode(t, e.branch("sec", map[string]any{"name": "sec-o"}, oneRole), 403, "forbidden")
-	expectCode(t, e.register("sec", "rel-o", at, "", oneRole), 403, "forbidden")
-	// …which one role listing read without /resource rules gives.
-	roles := e.grant(f.admin, "user:r", []string{"sec", "sec-r"}, nil, map[string]any{"roles": []any{"one", "all"}})
-	for _, p := range nsURLs {
-		if c := status(p, roles); c >= 400 {
-			t.Errorf("%s with a read role: %d", p, c)
-		}
-	}
-	expect(t, e.branch("sec", map[string]any{"name": "sec-r"}, roles), 201)
-	expect(t, e.register("sec", "rel-r", at, "", roles), 201)
-}
-
 // v0.47 §C.5, §E.2.3: only a grant that reads the namespace unrestricted
 // gets epoch keys. A read role whose rule refers to /resource but passes
 // without it (hiding b) doesn't count, even beside an unrestricted role
@@ -327,4 +245,83 @@ func TestV047KeysFallBack(t *testing.T) {
 	expect(t, e.get("/r/sec-b/a", issuerB), 302)
 	removeKey("issuer")
 	expect(t, e.get("/r/sec-b/a", issuerB), 401)
+}
+
+// v0.47 §C.5 "The stream is metadata": /ns/{ns} and everything under it
+// but the gestures listing need unrestricted read, while a resource's own
+// URLs, its events included, need read on that resource only. Roles are
+// alternatives: one read role without /resource rules is enough, for
+// branching (§7.6) and remote registration (§G.3) too.
+func TestV047UnrestrictedRead(t *testing.T) {
+	t.Parallel()
+	onlyA := []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}
+	f := newAuthFixture(t, map[string]any{"roles": map[string]any{
+		"one":      map[string]any{"can": []any{"read"}, "rules": onlyA},
+		"all":      map[string]any{"can": []any{"read", "branch"}},
+		"brancher": map[string]any{"can": []any{"branch"}},
+	}}, noFilteredReads)
+	e := f.tenv
+	hdr := map[string]string{"Gesture": gA}
+	a0 := etagOf(e.do(req{method: "PATCH", path: "/r/sec/a", ifNoneMatch: "*", body: addRoot(map[string]any{"n": 0.0}), bearer: f.adminG, hdr: hdr}))
+	e.do(req{method: "PATCH", path: "/r/sec/b", ifNoneMatch: "*", body: addRoot(map[string]any{}), bearer: f.adminG, hdr: hdr})
+	head := e.nsHead("sec", f.adminG)
+	nsURLs := []string{"/ns/sec", "/ns/sec/rev/" + head, "/ns/sec/rev/" + head + "/log", "/ns/sec/rev/" + head + "/heads",
+		"/ns/sec/log", "/ns/sec/log?live=long-poll", "/ns/sec/events", "/ns/sec/branches", "/ns/sec/grants/" + grantIDOf(t, f.adminG)}
+
+	// A rule that hides b without fixing a used to pass on /ns/sec, which
+	// would list b; such a grant, and one fixed to a, read a alone.
+	hideB := e.grant(f.issuer, "user:h", []string{"sec"}, []string{"read"},
+		map[string]any{"rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/resource", "value": "b"}}}})
+	fixed := e.grant(f.issuer, "user:x", []string{"sec"}, []string{"read"}, map[string]any{"rules": onlyA})
+	oneRole := e.grant(f.admin, "user:o", []string{"sec"}, nil, map[string]any{"roles": []any{"one", "brancher"}})
+	status := func(p, g string) int {
+		if p != "/ns/sec/events" {
+			return e.get(p, g).Code
+		}
+		// A stream that stays open once admitted.
+		_, resp, cancel := e.openSSE(p, map[string]string{"Authorization": "Bearer " + g})
+		cancel()
+		return resp.StatusCode
+	}
+	for _, g := range []string{hideB, fixed, oneRole} {
+		expect(t, e.get("/r/sec/a", g), 302)
+		expect(t, e.get("/r/sec/b", g), 404)
+		for _, p := range nsURLs {
+			// A verified grant that may not read: 403 off resource URLs
+			// (§7, v0.74; CONFORMANCE Grant scope 2).
+			if c := status(p, g); c != 403 {
+				t.Errorf("%s: %d, want 403", p, c)
+			}
+		}
+		// The gestures listing answers it, filtered to what it reads.
+		if r := e.get("/ns/sec/gestures/"+gA, g); r.Code != 200 || len(r.Arr()) != 1 {
+			t.Fatalf("gestures: %d %s", r.Code, r.Body)
+		}
+	}
+	for _, p := range nsURLs {
+		expect(t, e.get(p), 401)
+	}
+
+	// The resource's own URLs, its events and long-poll included.
+	a1 := e.appendRev("sec", "a", a0, ops(op("replace", "/n", 1.0)), f.adminG)
+	expect(t, e.get("/r/sec/a/log?live=long-poll&since="+a0, fixed), 200)
+	ch, resp, _ := e.openSSE("/r/sec/a/events?since="+a0, map[string]string{"Authorization": "Bearer " + fixed})
+	if resp.StatusCode != 200 {
+		t.Fatalf("resource events %d", resp.StatusCode)
+	}
+	if ev := next(t, ch); ev.event != "revision" || ev.id != a1 {
+		t.Fatalf("event %v", ev)
+	}
+	expect(t, e.get("/r/sec/b/events", fixed), 404)
+
+	// Branching: refused without unrestricted read…
+	expectCode(t, e.branch("sec", map[string]any{"name": "sec-o"}, oneRole), 403, "forbidden")
+	// …which one role listing read without /resource rules gives.
+	roles := e.grant(f.admin, "user:r", []string{"sec", "sec-r"}, nil, map[string]any{"roles": []any{"one", "all"}})
+	for _, p := range nsURLs {
+		if c := status(p, roles); c >= 400 {
+			t.Errorf("%s with a read role: %d", p, c)
+		}
+	}
+	expect(t, e.branch("sec", map[string]any{"name": "sec-r"}, roles), 201)
 }

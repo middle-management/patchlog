@@ -37,7 +37,7 @@ import (
 
 // Verbs are the actions a grant may carry (§C.1). "*" is valid only in a
 // key's can.
-var Verbs = []string{"read", "create", "append", "restore", "delete", "purge", "config", "branch", "purge-ns", "export", "prune"}
+var Verbs = []string{"read", "create", "append", "restore", "delete", "purge", "config", "branch", "purge-ns", "prune"}
 
 var verbSet = func() map[string]bool {
 	m := map[string]bool{}

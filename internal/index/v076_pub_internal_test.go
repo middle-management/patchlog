@@ -9,7 +9,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
-// TestV076PubKeysKept (§B.11.9 gs, §C.4): each exchange for a g: marker
+// TestV076PubKeysKept (§7.9 gs, §C.4): each exchange for a g: marker
 // adds the key its grant came from beside those of the marker's other
 // live cookies, never in their place, and one key's record lasts until
 // the last cookie minted under it expires; gsKeys reads them from the

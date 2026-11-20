@@ -134,7 +134,7 @@ func TestV075HeadsPrefix(t *testing.T) {
 }
 
 // v075Filtered is a fake origin filtering namespace m for a partial
-// reader (§B.11.9), in the shape of conformance scenarios 83 and 89: ranges
+// reader (§7.9), in the shape of conformance scenarios 83 and 89: ranges
 // at /ns/m/g/{gs}/at/{at}/…, reached by 302 from the unfiltered URLs.
 type v075Filtered struct {
 	gs, at, end string
@@ -194,7 +194,7 @@ func v075Entry(id, prev, kind, res string) map[string]any {
 	return m
 }
 
-// A filtered range (§B.11.9 Log ranges, §7.1): pages count hidden entries,
+// A filtered range (§7.9 Log ranges, §7.1): pages count hidden entries,
 // X-Log-Next names hidden ones, a page may be empty, and the range ends at
 // X-Namespace-Revision with the page that lacks X-Log-Next. FilteredLog
 // follows the redirects there and returns exactly the visible entries,
@@ -265,7 +265,7 @@ func TestV075FilteredLog(t *testing.T) {
 	}
 }
 
-// Filtered /heads (§B.11.9 /heads): a partial reader is redirected to the
+// Filtered /heads (§7.9 /heads): a partial reader is redirected to the
 // listing at the current at, whose pages are filled and carry next on
 // every full page, so the last may be empty (SVC-10).
 func TestV075FilteredHeads(t *testing.T) {
@@ -298,7 +298,7 @@ func TestV075FilteredHeads(t *testing.T) {
 	}
 }
 
-// Filtered long-poll (§B.11.9 Long-poll, §7.7): LongPoll doesn't follow
+// Filtered long-poll (§7.9 Long-poll, §7.7): LongPoll doesn't follow
 // the 302 into /ns/{ns}/g/{gs}/log, a log that isn't chain-verifiable
 // (§10), but names its gs in a *FilteredError; there an interval with only
 // hidden entries ends 204, whose X-Namespace-Revision, the newest hidden
@@ -359,7 +359,7 @@ func TestV075FilteredLongPoll(t *testing.T) {
 	}
 }
 
-// Filtered events (§B.11.9 Events, §7.3): NSEvents doesn't follow the 302
+// Filtered events (§7.9 Events, §7.3): NSEvents doesn't follow the 302
 // into /ns/{ns}/g/{gs}/events (§10) but names its gs in a *FilteredError;
 // FilteredNSEvents reads it with a since that may name a hidden entry
 // (SVC-11).
@@ -410,7 +410,7 @@ func TestV075FilteredEvents(t *testing.T) {
 }
 
 // A filtered /heads page carries next, its last row, on every full page
-// and no other (§B.11.9 /heads), its rows strictly after after (§7.4): an
+// and no other (§7.9 /heads), its rows strictly after after (§7.4): an
 // empty page naming next, a next that isn't the last row, or rows at or
 // before after are refused, so FilteredHeads can't repeat a page forever.
 func TestV075FilteredHeadsMalformedNext(t *testing.T) {

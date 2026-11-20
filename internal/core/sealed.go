@@ -1287,7 +1287,7 @@ func (e *Engine) rotateRetryLoop() {
 func (e *Engine) RotateDue(ctx context.Context, maxAge time.Duration) ([]string, error) {
 	var due []string
 	err := e.read(ctx, func(t *tx) error {
-		rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%' ORDER BY name`)
+		rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 ORDER BY name`)
 		t.must(err)
 		var all []*nsRow
 		for rows.Next() {

@@ -24,7 +24,7 @@ import (
 // checked in write mode, and each revision of a closure compiles under
 // current rules, a stored revision only an earlier version accepted being
 // an invalid schema (a write pinning it is 422 invalid). They are still
-// recorded and served, unchanged, so a database or a remote mirror keeps
+// recorded and served, unchanged, so a database keeps
 // the same rows either side of the upgrade:
 //
 // Each revision row records, in revisions.rules, the rules its document was
@@ -34,10 +34,7 @@ import (
 // part of the revision id.
 //
 // A schema revision read in the clear carries its marker in
-// schema.RulesHeader (Rev.SchemaRules). The rows a remote branch mirrors
-// from another deployment (§G.3) keep the marker the base serves each
-// schema revision with (fetchRules, F-S1), and are NULL where it serves
-// none.
+// schema.RulesHeader (Rev.SchemaRules).
 //
 // A revision whose document is a schema document and whose id other rows
 // already have is a content-addressed copy of them (§3.3): a fast-forward
@@ -76,8 +73,7 @@ func (t *tx) validateStep(step *stepState, sc *schemaCtx, pending map[string]any
 // validatedDocs remembers which revisions this engine, since it started,
 // has found valid against which schema revision: the proof that a patch
 // to one may be validated by its changes alone. That a revision is stored
-// is no such proof: a remote branch mirrors revisions another deployment
-// validated (§G.3), and those of an earlier version of this one were
+// is no such proof: those of an earlier version of this one were
 // validated as that version read schemas and formats. A revision id fixes
 // its document (§3.3) and a schema revision path its schema, so the fact
 // holds wherever and whenever the id is met again; the first patch to a
@@ -225,7 +221,7 @@ func (t *tx) docRules(id ids.ID, doc any, sc *schemaCtx) schema.Rules {
 }
 
 // rowRules is the rules marker revision row seq was stored with: NULL
-// (written before markers, or mirrored from a base that served none) is
+// (written before markers) is
 // Legacy. A row's marker never
 // changes, whoever resolves it: the transaction keeps it (t.schemas, by
 // seq), read ahead with the heads of a batch's pinned schemas
@@ -695,9 +691,7 @@ func (t *tx) prefetchSchemas(refs []schema.Ref) {
 		for rows.Next() {
 			n, err := scanNS(rows)
 			t.must(err)
-			if !n.isShadow() { // never a path's (nsByName)
-				t.memoSchemaNS(n)
-			}
+			t.memoSchemaNS(n)
 		}
 		t.must(rows.Err())
 		rows.Close()

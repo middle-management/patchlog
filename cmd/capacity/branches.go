@@ -51,7 +51,7 @@ func (r *runner) bw(nss ...string) *client.Client {
 		names[i] = n
 	}
 	return r.newClient(r.urls[0], r.mint(r.key, map[string]any{"kid": keyKid, "sub": loaderSub, "ns": names,
-		"can": []any{"read", "create", "append", "restore", "delete", "purge", "config", "branch", "purge-ns", "export", "prune"}}))
+		"can": []any{"read", "create", "append", "restore", "delete", "purge", "config", "branch", "purge-ns", "prune"}}))
 }
 
 // branchBase creates a namespace whose key may do everything and which

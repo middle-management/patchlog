@@ -22,7 +22,7 @@ import (
 func openBlobEngine(t *testing.T) *Engine {
 	t.Helper()
 	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1,
-		BlobSweepInterval: -1, Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}})
+		BlobSweepInterval: -1, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
 	}

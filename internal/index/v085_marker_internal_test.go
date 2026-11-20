@@ -6,7 +6,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
-// SERVICES §A.4 gs (v0.85): "reads:{ns}:{k}, k the key: string (§B.11.9
+// SERVICES §A.4 gs (v0.85): "reads:{ns}:{k}, k the key: string (§7.9
 // gs) of the key that verified the grant in {ns}". The marker and the gs
 // of its subject set are those the proposed vector C.4 computes
 // (docs/VECTORS-PROPOSED.md) for demo's key ops-2026.

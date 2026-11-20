@@ -17,7 +17,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
-// V75-03 (v0.75): filtered namespace reads at the origin (§B.11.9): the
+// V75-03 (v0.75): filtered namespace reads at the origin (§7.9): the
 // redirects of partial readers, the /ns/{ns}/g/{gs} routes, filtered
 // /heads, ranges, long-poll and events, /branches, the gestures listing,
 // and ?prefix= on /heads for every reader (§7.4).
@@ -234,7 +234,7 @@ func TestV075HeadsPrefix(t *testing.T) {
 	}
 }
 
-// §B.11.9 URLs, Answers (scenario 59): a partial reader's request at an
+// §7.9 URLs, Answers (scenario 59): a partial reader's request at an
 // unfiltered URL is 302 to its filtered form, ranges at the current at,
 // private, no-store, by the grant in Authorization; GET /ns/{ns} is the
 // head pointer, and /rev/{ns_id} stays 403. Uncovered, as before v0.75.
@@ -294,7 +294,7 @@ func TestV075PartialRedirects(t *testing.T) {
 	}
 }
 
-// §B.11.9 URLs (scenario 89): a URL under /ns/{ns}/g/{gs} without at is
+// §7.9 URLs (scenario 89): a URL under /ns/{ns}/g/{gs} without at is
 // 302 to its form at the current at, private, no-store, under the cookie;
 // an at the origin can't answer is too; gs and at are ids (400).
 func TestV075FilteredRoutes(t *testing.T) {
@@ -343,7 +343,7 @@ func TestV075FilteredRoutes(t *testing.T) {
 	expect(t, w.get(base+"/at/"+at+"/heads", w.admin), 403)
 }
 
-// §B.11.9 /heads, URLs (scenarios 66, 82): only visible rows, pages filled
+// §7.9 /heads, URLs (scenarios 66, 82): only visible rows, pages filled
 // to logPageSize, next on every full page and no other; tagged as the
 // unfiltered /heads plus ns:{x} for the rest of at, with
 // X-Namespace-Revision.
@@ -437,7 +437,7 @@ func (w *v75s) readRange(gs, at, since, bearer string) (entries []map[string]any
 	}
 }
 
-// §B.11.9 Log entries, Log ranges (scenarios 67, 73, 83): a batch shows its
+// §7.9 Log entries, Log ranges (scenarios 67, 73, 83): a batch shows its
 // visible entries, gestures and source.ids only; config-only where it
 // changed the document; dropped otherwise; a batch counts as its visible
 // items; branch entries never; the last page lacks X-Log-Next.
@@ -499,7 +499,7 @@ func TestV075FilteredLog(t *testing.T) {
 		t.Fatalf("%d pages", pages)
 	}
 	// Entries are the unrestricted range's, ids and prev included: prev
-	// names the entry before, hidden or not (§B.11.9 Log entries).
+	// names the entry before, hidden or not (§7.9 Log entries).
 	full := map[string]map[string]any{}
 	for since := from; since != ""; {
 		r := w.get("/ns/matches/rev/"+w.nsHead("matches", w.admin)+"/log?since="+since, w.admin)
@@ -541,7 +541,7 @@ func (w *v75s) longPoll(path, bearer string) longPollRes {
 	return longPollRes{r.Code, r.H.Get("X-Namespace-Revision"), r.Body, time.Since(start)}
 }
 
-// §B.11.9 Long-poll (scenario 72): only visible entries answer 200 or end
+// §7.9 Long-poll (scenario 72): only visible entries answer 200 or end
 // a wait; an interval with none ends 204, its X-Namespace-Revision the
 // newest entry scanned, which the next poll is accepted with.
 func TestV075FilteredLongPoll(t *testing.T) {
@@ -592,7 +592,7 @@ func TestV075FilteredLongPoll(t *testing.T) {
 	}
 }
 
-// §B.11.9 Cost: waiters of two subject sets on one since are answered
+// §7.9 Cost: waiters of two subject sets on one since are answered
 // apart: a write visible to one gs alone answers it 200 and the other 204.
 // Each gs's log has its own interval boundaries (§7.7), so each waiter
 // sends its own log's cursor, at an instant when both have 1.5 s left.
@@ -672,7 +672,7 @@ func nextEvent(ch <-chan v75Event, d time.Duration) (v75Event, bool) {
 	}
 }
 
-// §B.11.9 Events (scenario 81): only visible entries, judged again at the
+// §7.9 Events (scenario 81): only visible entries, judged again at the
 // current checkpoint with each read check: thirty hidden entries and one
 // visible yield one event; once derby's placement leaves li's view, its
 // later entries aren't sent.
@@ -735,7 +735,7 @@ func TestV075FilteredEvents(t *testing.T) {
 	r2.Body.Close()
 }
 
-// §B.11.9 Answers (TDA 68; v0.78: "a partial reader's /branches is 403"):
+// §7.9 Answers (TDA 68; v0.78: "a partial reader's /branches is 403"):
 // /branches to a partial reader is 403, a grant also naming the branch
 // included. Before v0.78 it listed, private, no-store, the local branches
 // its grant verified in. It passes once ACCESS-9's reads.go change is in
@@ -759,7 +759,7 @@ func TestV075BranchesPartial(t *testing.T) {
 	}
 }
 
-// §B.11.9 Purged namespaces, §8.5: filtered /heads are 410 after
+// §7.9 Purged namespaces, §8.5: filtered /heads are 410 after
 // admission; the range stays readable and ends with purge-ns; events and
 // long-poll from purge-ns are 410.
 func TestV075FilteredPurged(t *testing.T) {
@@ -793,7 +793,7 @@ func TestV075FilteredPurged(t *testing.T) {
 	expectCode(t, w.get("/ns/matches/g/"+gs+"/log?live=long-poll&since="+purgeNS, li), 410, "purged")
 }
 
-// §B.11.9 with the client of V75-02: a partial reader's FilteredHeads,
+// §7.9 with the client of V75-02: a partial reader's FilteredHeads,
 // FilteredLog and FilteredLongPoll follow this server's redirects and read
 // what is visible; LongPoll names the filtered form without following it.
 func TestV075ClientFiltered(t *testing.T) {

@@ -616,11 +616,7 @@ func (a *nsLsCmd) exec(ctx context.Context, out, errw io.Writer) error {
 		}
 		base := "-"
 		if it.Base != nil {
-			// ns@at, after its deployment's origin for a remote branch.
 			base = fmt.Sprintf("%v@%v", it.Base["ns"], it.Base["at"])
-			if o, ok := it.Base["origin"].(string); ok {
-				base = o + "/ns/" + base
-			}
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", it.Name, state, created, base)
 	}

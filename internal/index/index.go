@@ -25,7 +25,7 @@
 //	                                 grants for, until the last of them expires, and its
 //	                                 exchangeRate buckets (edgeStore, edgegrants.go)
 //	edge_filters(marker, filter, exp) what each scope or g: marker of those stands for (markerRec)
-//	edge_gs(marker, subjects, kid, roles, pub, exp)  and, for a g: marker (§B.11.9), its subjects;
+//	edge_gs(marker, subjects, kid, roles, pub, exp)  and, for a g: marker (§7.9), its subjects;
 //	                                      its kid, roles and pub are no longer read (edge_gs_keys)
 //	edge_gs_keys(marker, exp, kid, roles, pub, entry, pending, chain)  every key the cookie of a marker (reads:{ns}:{k}
 //	                                      included) that expires at exp came from, with its read
@@ -213,7 +213,7 @@ type Index struct {
 	filters map[string]keptFilter // scope or g: marker -> what it stands for (edge_filters, edge_gs)
 	copied  sync.Map              // a local branch -> the kids it copied from its base (copiedKids)
 
-	fs fstate // the state of namespaces §B.11.9 covers (filtered.go)
+	fs fstate // the state of namespaces §7.9 covers (filtered.go)
 	// auth is the core's authentication mode as last read (authOff),
 	// kept for CheckerTTL.
 	auth struct {
@@ -851,7 +851,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	}
 
 	// The cookies the batch's documents end, each judged in order, and
-	// all of them at a snapshot's start (cookieEnds; §B.11.9 gs, v0.86).
+	// all of them at a snapshot's start (cookieEnds; §7.9 gs, v0.86).
 	ends, err := ix.cookieEnds(ctx, b.NS, b, snapDoc)
 	if err != nil {
 		return err

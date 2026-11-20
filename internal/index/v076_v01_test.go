@@ -8,7 +8,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
 
-// TestV076V01IndexGSPerKey (§B.11.9 gs, §C.4): grants through two keys
+// TestV076V01IndexGSPerKey (§7.9 gs, §C.4): grants through two keys
 // with the same scope rules get different subject sets, each bound to its
 // key's kid and pub as the origin's are (grantcheck.KeySubject), so that no
 // stored row judges another key's cookies, and the index's gs stays the

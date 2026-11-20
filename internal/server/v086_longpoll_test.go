@@ -57,7 +57,7 @@ func TestV086LongPollPaths(t *testing.T) {
 	}
 }
 
-// §7.7 with §B.11.9 Long-poll: a filtered log's wait ends at the boundary
+// §7.7 with §7.9 Long-poll: a filtered log's wait ends at the boundary
 // of its own path, "/ns/{ns}/g/{gs}/log", and its 204 carries that log's
 // next cursor. The namespace's unfiltered log, polled by a full reader at
 // the same time, ends at its own. Not parallel: it times answers.
@@ -95,7 +95,7 @@ func TestV086FilteredLongPollPhase(t *testing.T) {
 	}
 }
 
-// §7.7 with §B.11.9 URLs: a partial reader's long-poll of "/ns/{ns}/log"
+// §7.7 with §7.9 URLs: a partial reader's long-poll of "/ns/{ns}/log"
 // is redirected to "/ns/{ns}/g/{gs}/log" with its cursor, which is then
 // read on the filtered log's clock. The two logs' cursors are one apart at
 // most, so the namespace log's cursor arrives one behind the filtered

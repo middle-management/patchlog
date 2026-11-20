@@ -157,11 +157,11 @@ var queryParams = map[string]map[string]string{
 	"GET /ns/{ns}/rev/{id}/heads":       {"after": "", "prefix": ""},             // §7.4 (headsPrefix checks prefix)
 	"GET /ns/{ns}/log":                  {"since": "", "live": "", "cursor": ""}, // §7.7
 	"GET /ns/{ns}/events":               {"since": ""},                           // §7.4
-	"GET /ns/{ns}/g/{gs}/at/{at}/heads": {"after": "", "prefix": ""},             // §B.11.9
-	"GET /ns/{ns}/g/{gs}/at/{at}/log":   {"since": ""},                           // §B.11.9
-	"GET /ns/{ns}/g/{gs}/heads":         {"after": "", "prefix": ""},             // §B.11.9
-	"GET /ns/{ns}/g/{gs}/log":           {"since": "", "live": "", "cursor": ""}, // §B.11.9, §7.7
-	"GET /ns/{ns}/g/{gs}/events":        {"since": ""},                           // §B.11.9, §7.3
+	"GET /ns/{ns}/g/{gs}/at/{at}/heads": {"after": "", "prefix": ""},             // §7.9
+	"GET /ns/{ns}/g/{gs}/at/{at}/log":   {"since": ""},                           // §7.9
+	"GET /ns/{ns}/g/{gs}/heads":         {"after": "", "prefix": ""},             // §7.9
+	"GET /ns/{ns}/g/{gs}/log":           {"since": "", "live": "", "cursor": ""}, // §7.9, §7.7
+	"GET /ns/{ns}/g/{gs}/events":        {"since": ""},                           // §7.9, §7.3
 	"GET /ns/{ns}/gestures/{gesture}":   {"after": ""},                           // §7.4
 	"POST /ns/{ns}/batch":               {"dry-run": flag},                       // §7.5
 	"POST /ns/{ns}/purge":               {"force": flag},                         // §8.5

@@ -44,7 +44,7 @@ type releaseVerbCmd struct {
 	StateNS     string   `arg:"--state-ns" placeholder:"NS" help:"namespace of the stored plan (default: the release document's)"`
 	DryRun      bool     `arg:"--dry-run" help:"plan: report only, store nothing"`
 	Suffix      string   `arg:"--suffix" help:"rebase: successor names are each branch's name plus this suffix"`
-	At          string   `arg:"--at" placeholder:"ID" help:"rebase: the new release document's combined checkpoint (§B.5), if known"`
+	At          string   `arg:"--at" placeholder:"ID" help:"rebase: the new release document's combined checkpoint (§F.9), if known"`
 	LeaveOut    bool     `arg:"--leave-out" help:"rebase: each branch's switch, although the replay leaves resources the old branch changed unrecorded in the successor (left out of an item, purged in the successor only), giving them up (§F.5): their changes stay only in the frozen old branch"`
 	Digest      string   `arg:"--digest" placeholder:"D" help:"approve: the plan digest you reviewed (plan prints it); approval fails unless planning again gives it (§F.9)"`
 	Identity    []string `arg:"--identity,separate" placeholder:"KEY.JWK" help:"rebase: file with an X25519 private key (a private JWK {kty, crv, x, d}, or base64url d) for e2e namespaces (Addendum E.3): the key the keyrings (and --bearer's enc) name, to read the branch and re-encrypt for the target (§F.8); repeatable when they name different keys"`

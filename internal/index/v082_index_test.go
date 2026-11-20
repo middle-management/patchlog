@@ -21,7 +21,7 @@ import (
 
 // V82-05 (v0.82), SVC-10: an index cookie ends on any change to the entry
 // of the key that verified its grant, or to a role it read through,
-// reads:{ns} markers included (SERVICES §A.4 gs, §B.11.9 gs; CONFORMANCE
+// reads:{ns} markers included (SERVICES §A.4 gs, §7.9 gs; CONFORMANCE
 // scenario 120).
 
 // newV82Whole is newV77Docs's setup with keys k1 and k2 that have no
@@ -92,9 +92,9 @@ const (
 )
 
 // TestV082ReadsCookieEndsOnKeyChange (SVC-10; §A.4 gs: a cookie is 403
-// "where a marker's key, rules or roles would end a gs cookie (§B.11.9
+// "where a marker's key, rules or roles would end a gs cookie (§7.9
 // gs), its key being the one that verified the grant in {ns}, reads:{ns}
-// markers included"; §B.11.9 gs: "gone or changes in any member";
+// markers included"; §7.9 gs: "gone or changes in any member";
 // scenario 120): li reads docs whole through k1, so her cookie's marker is
 // reads:docs. Once docs changes any member of k1 (its groups scope, its
 // sub scope, its maxTtl, its pub), removes it, or changes the role she
@@ -330,7 +330,7 @@ func TestV082ExchangeTwoKeysOneMarker(t *testing.T) {
 	}
 }
 
-// TestV082ScopeCookieEndsOnAnyMember (SVC-10; §B.11.9 gs, v0.82: "or a
+// TestV082ScopeCookieEndsOnAnyMember (SVC-10; §7.9 gs, v0.82: "or a
 // key or role they came from, is gone or changes in any member"): li's
 // cookie for a scope marker, through k1 with the role reader, is 403 once
 // docs changes a member of k1 that its scope digest doesn't read (its sub
@@ -374,7 +374,7 @@ func TestV082ScopeCookieEndsOnAnyMember(t *testing.T) {
 	}
 }
 
-// TestV082GCookieEndsOnAnyMember (SVC-10; §B.11.9 gs, v0.82): a partial
+// TestV082GCookieEndsOnAnyMember (SVC-10; §7.9 gs, v0.82): a partial
 // reader's cookie for reads:matches:g:{gs}, through reader-01 with the
 // role reader, is 403 once matches changes reader-01's maxTtl, which no
 // scope digest reads, or gives reader another verb, judged by matches's

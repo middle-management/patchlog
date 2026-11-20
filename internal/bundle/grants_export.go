@@ -74,7 +74,6 @@ type nsLink struct {
 type grantExporter struct {
 	p      *ExportPlan
 	sk     *sourceKeys
-	remote map[string]*sourceKeys // by origin: readers of other deployments
 	chains map[string][]nsLink
 	levels map[string]string
 	epochs map[string][]byte // kid → epoch key, for sealed grants
@@ -85,7 +84,7 @@ type grantExporter struct {
 
 func newGrantExporter(p *ExportPlan) *grantExporter {
 	return &grantExporter{p: p, sk: &sourceKeys{c: p.c, logs: map[string]*nsPositions{}, docs: map[string][]KeyEntry{}},
-		remote: map[string]*sourceKeys{}, chains: map[string][]nsLink{}, levels: map[string]string{},
+		chains: map[string][]nsLink{}, levels: map[string]string{},
 		epochs: map[string][]byte{}, state: map[string]bool{}, noted: map[string]bool{}}
 }
 
@@ -97,9 +96,7 @@ func (g *grantExporter) note(key, format string, args ...any) {
 	g.p.Notes = append(g.p.Notes, fmt.Sprintf(format, args...))
 }
 
-// chain is ns and its bases, as of the export (§7.6, §G.3). A remote base
-// is followed through base.chain, its own namespace and the bases it read
-// through, none of which this deployment has.
+// chain is ns and its bases, as of the export (§7.6).
 func (g *grantExporter) chain(ctx context.Context, ns string) []nsLink {
 	if c, ok := g.chains[ns]; ok {
 		return c
@@ -118,21 +115,6 @@ func (g *grantExporter) chain(ctx context.Context, ns string) []nsLink {
 		}
 		bns, _ := b["ns"].(string)
 		bat, _ := b["at"].(string)
-		if origin, _ := b["origin"].(string); origin != "" {
-			names := []string{bns}
-			if arr, ok := b["chain"].([]any); ok && len(arr) > 0 {
-				names = names[:0]
-				for _, x := range arr {
-					if s, ok := x.(string); ok {
-						names = append(names, s)
-					}
-				}
-			}
-			for _, n := range names {
-				links = append(links, nsLink{ref: NSRef{Origin: origin, NS: n}, at: bat})
-			}
-			break
-		}
 		links = append(links, nsLink{ref: NSRef{NS: bns}, at: bat})
 		cur, at = bns, bat
 	}
@@ -140,47 +122,14 @@ func (g *grantExporter) chain(ctx context.Context, ns string) []nsLink {
 	return links
 }
 
-// remoteKeys reads a deployment this one's branches are based on, without
-// credentials: only what is public there is readable.
-func (g *grantExporter) remoteKeys(origin string) *sourceKeys {
-	if sk, ok := g.remote[origin]; ok {
-		return sk
-	}
-	var sk *sourceKeys
-	if rc, err := client.New(origin); err == nil {
-		sk = &sourceKeys{c: rc, logs: map[string]*nsPositions{}, docs: map[string][]KeyEntry{}}
-	}
-	g.remote[origin] = sk
-	return sk
-}
-
 // writtenIn reports where the revision id of a line of ns was written (§G.4.1
 // `written`): the zero NSRef for the namespace itself. known is false if no
-// log of the chain has it. A remote base is the namespace that wrote what
-// the branch reads through when it is the only remote link (§G.3); where
-// it read through from bases of its own, their logs are read at the origin
-// without credentials, and a revision they don't show is not known.
+// log of the chain has it.
 func (g *grantExporter) writtenIn(ctx context.Context, ns, id string) (ref NSRef, known bool) {
 	links := g.chain(ctx, ns)
-	remotes := g.remoteChainLen(links)
 	for i, l := range links {
-		var p *nsPositions
-		if l.ref.Origin == "" {
-			p = g.sk.positions(ctx, l.ref.NS)
-		} else {
-			if remotes == 1 {
-				return l.ref, true
-			}
-			sk := g.remoteKeys(l.ref.Origin)
-			if sk == nil {
-				return l.ref, false
-			}
-			p = sk.positions(ctx, l.ref.NS)
-		}
+		p := g.sk.positions(ctx, l.ref.NS)
 		if p.err != nil {
-			if l.ref.Origin != "" {
-				return l.ref, false
-			}
 			continue
 		}
 		if _, ok := p.pos[id]; ok {
@@ -193,17 +142,6 @@ func (g *grantExporter) writtenIn(ctx context.Context, ns, id string) (ref NSRef
 	return NSRef{}, false
 }
 
-// remoteChainLen counts the remote links of a chain.
-func (g *grantExporter) remoteChainLen(links []nsLink) int {
-	n := 0
-	for _, l := range links {
-		if l.ref.Origin != "" {
-			n++
-		}
-	}
-	return n
-}
-
 // firstRecorded finds the namespace of the chain of ns whose log has the
 // first entry under grant gid, and that entry. A base counts only up to the
 // at its derived namespace reads it at (§C.3.1).
@@ -211,9 +149,6 @@ func (g *grantExporter) firstRecorded(ctx context.Context, ns, gid string) (ref 
 	links := g.chain(ctx, ns)
 	for i := len(links) - 1; i >= 0; i-- {
 		l := links[i]
-		if l.ref.Origin != "" {
-			continue
-		}
 		p := g.sk.positions(ctx, l.ref.NS)
 		if p.err != nil {
 			continue
@@ -256,20 +191,10 @@ type errUngettable struct{ why string }
 
 func (e *errUngettable) Error() string { return e.why }
 
-// fetch reads grant gid from ns of the source, or of another deployment.
+// fetch reads grant gid from ns of the source.
 func (g *grantExporter) fetch(ctx context.Context, ref NSRef, gid string) (*client.GrantDoc, error) {
-	var c *client.Client
-	sealed := false
-	if ref.Origin != "" {
-		sk := g.remoteKeys(ref.Origin)
-		if sk == nil {
-			return nil, &errUngettable{"the origin of the base can't be reached"}
-		}
-		c = sk.c
-	} else {
-		c = g.p.c
-		sealed = g.level(ctx, ref.NS) == AccessSealed
-	}
+	c := g.p.c
+	sealed := g.level(ctx, ref.NS) == AccessSealed
 	var rec *client.GrantDoc
 	var err error
 	if sealed {
@@ -505,11 +430,7 @@ func (g *grantExporter) findKey(ctx context.Context, lineRef NSRef, found bool, 
 	}
 	norm := func(k KeyEntry) foundKey { k.Alg = sig.Alg; return foundKey{entry: k, valid: true} }
 
-	sk := g.sk
-	if lineRef.Origin != "" {
-		sk = g.remoteKeys(lineRef.Origin)
-	}
-	if sk != nil {
+	if sk := g.sk; sk != nil {
 		// 1. The namespace document in force at the first entry that
 		// recorded the grant; where the log doesn't say, at the position
 		// of the line naming it.

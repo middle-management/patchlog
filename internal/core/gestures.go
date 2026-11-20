@@ -36,8 +36,8 @@ import (
 //   - It answers any reader, listing only the entries of resources its
 //     grant may read, so a reader limited to some documents finds its own
 //     gestures and learns nothing of others; a partial reader of a
-//     namespace §B.11.9 covers, only those visible to it at the current
-//     checkpoint (§B.11.9 Answers). It isn't offered in sealed or e2e
+//     namespace §7.9 covers, only those visible to it at the current
+//     checkpoint (§7.9 Answers). It isn't offered in sealed or e2e
 //     namespaces: 404 with code "not_offered", after authorisation, as a
 //     deployment without the endpoint answers 404. Their logs are the place to look (§11.2). A
 //     purged namespace answers 410 before it (§8.5).
@@ -86,9 +86,9 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 			return apiErr(404, "not_offered", "message", "gestures aren't listed in sealed or end-to-end namespaces: their logs carry them (§7.4)")
 		}
 		// A reader limited to some resources gets only theirs (§7.4), or,
-		// a partial reader of a namespace §B.11.9 covers, those visible to
+		// a partial reader of a namespace §7.9 covers, those visible to
 		// it at the current checkpoint, as its filtered reads would show
-		// them (§B.11.9 Answers): never an unplaced document. It is built
+		// them (§7.9 Answers): never an unplaced document. It is built
 		// after the 410 and not_offered answers, which come as soon as the
 		// read check passes (§8.5). A grant whose rules refer to /now never
 		// gets that far: the read check refuses it (anyReader, §C.2 item 5).

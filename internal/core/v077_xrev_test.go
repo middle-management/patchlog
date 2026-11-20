@@ -80,7 +80,7 @@ func TestV077XconfScenario112Key(t *testing.T) {
 // Tree-derived access 113 (origin half): after matches-r7 is created,
 // matches edits only reader-01's maxTtl -> a partial reader of the branch
 // -> filtered /heads 403; the exchange gives no /ns/matches-r7/g/{gs}.
-// Since v0.78 no branch is covered (§B.11.9 Where), before the edit too.
+// Since v0.78 no branch is covered (§7.9 Where), before the edit too.
 func TestV077XconfScenario113(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -175,7 +175,7 @@ func TestV077XconfScenario118(t *testing.T) {
 	}
 }
 
-// Cross-review (conformance lens), §B.11.9 gs: a gs's subjects carry "the
+// Cross-review (conformance lens), §7.9 gs: a gs's subjects carry "the
 // string scope:{digest} of §A.4's marker for {ns}", whose digest covers
 // the rules and the key's key: string (grantcheck.ScopeKeyDigest), not the
 // rules' digest alone.

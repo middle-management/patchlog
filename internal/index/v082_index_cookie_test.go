@@ -11,7 +11,7 @@ import (
 // V82-05 (v0.82), SVC-10 (SERVICES §A.4 gs: "A cookie is 403 until the
 // reader exchanges again ... where a marker's key, rules or roles would
 // end a gs cookie, its key being the one that verified the grant in
-// {ns}, reads:{ns} markers included"; §B.11.9 gs): a cookie carries its
+// {ns}, reads:{ns} markers included"; §7.9 gs): a cookie carries its
 // prefix and exp alone, so an exchange whose keys or entries differ from
 // those its marker's cookie of that exp came from mints one with another
 // exp. No exchange vouches again for a cookie that ended, and none is
@@ -150,7 +150,7 @@ func TestV082ScopeCookieRevivedByAnotherReader(t *testing.T) {
 }
 
 // TestV082GCookieNotRevivedByAnotherReader: the same for a g: marker
-// (§B.11.9 gs). al and bo, in the same groups through reader-01, share
+// (§7.9 gs). al and bo, in the same groups through reader-01, share
 // reads:matches:g:{gs} and, their grants expiring together, a cookie.
 // matches changes reader-01's maxTtl, which neither the gs nor the
 // scope digest reads: the cookie is 403, bo's exchange gives him another

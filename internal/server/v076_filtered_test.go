@@ -9,11 +9,11 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
-// V76-01 (v0.76): origin filtered reads over HTTP (§B.11.9): 401 at an
+// V76-01 (v0.76): origin filtered reads over HTTP (§7.9): 401 at an
 // uncovered namespace's filtered URLs without a grant that verifies there
 // or a cookie.
 
-// §B.11.9 Purged namespaces ("403, or 401 as §B.11.5 says"), §B.11.5: a
+// §7.9 Purged namespaces ("403, or 401 as §B.11.5 says"), §B.11.5: a
 // public namespace is never covered; its filtered URLs are 401 with no
 // credentials or a grant that doesn't verify there, 403 with one that
 // does.
@@ -47,7 +47,7 @@ func TestV076FilteredUncovered401(t *testing.T) {
 	}
 }
 
-// §B.11.9 Where (v0.78: "Filtered reads cover no branch"; TDA 63): a
+// §7.9 Where (v0.78: "Filtered reads cover no branch"; TDA 63): a
 // partial reader of matches-r7 in fan-club, through another key, gets 403
 // at the branch's unfiltered /heads, with no redirect, and at its filtered
 // /heads and log, 401 there without credentials, and its exchange no

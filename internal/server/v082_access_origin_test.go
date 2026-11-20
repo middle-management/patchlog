@@ -280,7 +280,7 @@ func TestV082AccessPurgedFilteredHeads(t *testing.T) {
 	expectCode(t, w.get("/ns/matches/rev/"+head+"/heads", w.admin), 410, "purged")
 }
 
-// Conformance 125 (§B.11.9 URLs, §6.2): /ns/matches/g/all/…, and a gs or
+// Conformance 125 (§7.9 URLs, §6.2): /ns/matches/g/all/…, and a gs or
 // at that isn't an id in text form, are 400 bad_input, a request-shape
 // error, before any 401 or 403: without credentials, with a grant the
 // read check refuses, with a partial reader's, and for a namespace that

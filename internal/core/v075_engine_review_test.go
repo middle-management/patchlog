@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// §B.11.9 gs: a grant reading two covered namespaces with the same key
+// §7.9 gs: a grant reading two covered namespaces with the same key
 // rules and role definitions gets the same gs in both (a gs names no
 // namespace), so filtered_gs keeps a row per (ns, gs): each namespace's
 // cookie is admitted, by its own row.

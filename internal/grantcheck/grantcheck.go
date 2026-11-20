@@ -120,9 +120,7 @@ type Config struct {
 	Keys    []grant.Key
 	Roles   grant.Roles
 	Revoked map[string]bool
-	// Base is the base namespace of a local branch, "" otherwise: a
-	// remote branch's base is in another deployment, and contributes no
-	// keys or revocations (§C.4, §10, §G.3).
+	// Base is the base namespace of a branch, "" otherwise (§C.4, §10).
 	Base   string
 	BaseAt string
 	Doc    map[string]any
@@ -149,13 +147,8 @@ func ParseConfig(ns, head string, doc map[string]any) (*Config, error) {
 		}
 	}
 	if b, ok := doc["base"].(map[string]any); ok {
-		// A base with an origin is a remote branch's, in another
-		// deployment: a namespace of the same name here is unrelated,
-		// so it is never loaded for its keys (§10, §G.3).
-		if _, remote := b["origin"]; !remote {
-			cfg.Base, _ = b["ns"].(string)
-			cfg.BaseAt, _ = b["at"].(string)
-		}
+		cfg.Base, _ = b["ns"].(string)
+		cfg.BaseAt, _ = b["at"].(string)
 	}
 	return cfg, nil
 }
@@ -357,7 +350,7 @@ func (ch *Checker) copiedKeys(ctx context.Context, ns string, cfg *Config) (map[
 	}
 	entryID := ""
 	for _, e := range entries {
-		if e.Kind == "branch" && e.Name == ns && e.Remote == nil {
+		if e.Kind == "branch" && e.Name == ns {
 			entryID = e.ID
 			break
 		}

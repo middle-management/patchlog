@@ -24,7 +24,7 @@ import (
 type keyChange struct {
 	at   time.Time
 	keys map[string]string // kid → "alg pub"
-	base string            // the local base, "" for none (or a remote one)
+	base string            // the base, "" for none
 }
 
 // keyHistory is a namespace's config writes as a token read them: its log
@@ -94,9 +94,6 @@ func keysOf(doc map[string]any) (map[string]string, string) {
 	}
 	bref, _ := doc["base"].(map[string]any)
 	base, _ := bref["ns"].(string)
-	if _, remote := bref["origin"]; remote {
-		base = ""
-	}
 	return out, base
 }
 

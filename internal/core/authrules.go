@@ -269,7 +269,7 @@ func rulesReferToNow(rs []any) bool {
 
 // scopeReferToNow reports whether a rule of a's blocks or key scope refers
 // to /now (rulesReferToNow): such a grant is refused every read (§C.2
-// item 5), and is no partial reader (§B.11.9).
+// item 5), and is no partial reader (§7.9).
 func scopeReferToNow(a *actor) bool {
 	return a.verified != nil && (rulesReferToNow(a.verified.KeyRules) || rulesReferToNow(a.verified.BlockRules))
 }
@@ -382,8 +382,8 @@ func (t *tx) checkGrantRules(a *actor, env map[string]any, unknown []string) *Er
 }
 
 // checkCreationRules is step 6 of a namespace's creation under the
-// operator grant that creates it, a remote branch's included, once the
-// genesis has been validated (§6.2 step 4, §7.4, §G.3). That grant passes
+// operator grant that creates it, once the
+// genesis has been validated (§6.2 step 4, §7.4). That grant passes
 // the *-key guard (§C.2), a creation has no in_use refusals, and namespace
 // rules don't judge it (§6.4.3), but its own key-scope and block rules all
 // do, those that read /doc, /writes or /patches included, against the
@@ -392,8 +392,7 @@ func (t *tx) checkCreationRules(a *actor, patches any) *Error {
 	if a.verified == nil {
 		return nil
 	}
-	// A remote branch's creation comes here in a later transaction than
-	// its step 1, with a meter of its own.
+	// With a meter of its own.
 	defer t.metered(func() bool { return true })()
 	ops, err := patch.Parse(patches)
 	if err != nil {

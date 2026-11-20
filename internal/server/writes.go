@@ -297,10 +297,6 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, badInput("body must be { name, at?, patches? }"))
 		return
 	}
-	if _, remote := m["remote"]; remote {
-		s.registerRemote(w, r, ns, p, m)
-		return
-	}
 	for k := range m {
 		if k != "name" && k != "at" && k != "patches" {
 			writeErr(w, badInput("unknown member "+k))
@@ -339,35 +335,6 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 		out["ns_id"] = res.NSID
 	}
 	writeJSON(w, res.Status, out)
-}
-
-// registerRemote registers or renews a remote branch (§G.3):
-// { "remote": { "origin", "ns" }, "at" } with If-None-Match: * or If-Match.
-func (s *Server) registerRemote(w http.ResponseWriter, r *http.Request, ns string, p precond, m map[string]any) {
-	rm, ok := m["remote"].(map[string]any)
-	origin, _ := rm["origin"].(string)
-	name, _ := rm["ns"].(string)
-	at, _ := m["at"].(string)
-	if !ok || len(rm) != 2 || origin == "" || name == "" || at == "" || len(m) != 2 {
-		writeErr(w, badInput("body must be { remote: { origin, ns }, at }"))
-		return
-	}
-	// at is the base's ns_id in text form, or 400 (§7); one that isn't in
-	// its chain is the core's 422 (§G.3).
-	if !validID(at) {
-		writeErr(w, badInput("at must be an ns_id in text form (§7, §G.3)"))
-		return
-	}
-	// The precondition is checked in the core, after authorisation (§G.3).
-	res, err := s.registerRemoteBranch(r.Context(), core.Request{NS: ns, Cred: creds(r)},
-		core.RemoteRegistration{Origin: origin, NS: name, At: at, IfNoneMatch: p.ifNoneMatch, IfMatch: p.ifMatch})
-	if err != nil {
-		writeErr(w, err)
-		return
-	}
-	w.Header().Set("X-Namespace-Revision", res.NSID)
-	w.Header().Set("ETag", quote(res.NSID))
-	writeJSON(w, res.Status, res.Value())
 }
 
 func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
