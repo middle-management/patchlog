@@ -161,14 +161,13 @@ func TestV082AccessGSEntryEarlierEndings(t *testing.T) {
 	}
 }
 
-// §7.9 view: the answers at an at from before the change are the ones
-// its document gave, so the old cookie still reads there, as a changed
-// rule leaves it (immutable answers, §B.5); once the reader has exchanged
-// again, her new cookie's record is the new document's and the earlier
-// at is 403 for it. The cookie from before keeps its own record (v0.86,
-// filtered_view_exps): it is 403 "from that entry on" and reads on at the
-// earlier at, whoever exchanged since. (Before v0.86 the exchange
-// replaced the one record, and every at was 403 for it from then on.)
+// §7.9 view (v0.87): a cookie a change ended is 403 at every URL, an at
+// from before the change included; one from an exchange after the change
+// isn't ended, and reads at every at, the earlier one included, each
+// revision judged by its own rules. The cookie from before keeps its own
+// record (v0.86, filtered_view_exps): no exchange revives it. (Before
+// v0.87 a cookie was judged at the URL's at, so the ended one read on at
+// the earlier at, and the new one was 403 there.)
 func TestV082AccessGSEntryPerAt(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -179,19 +178,19 @@ func TestV082AccessGSEntryPerAt(t *testing.T) {
 		t.Fatalf("before: %d", st)
 	}
 	w.patchConfig("matches", v82accessOp("add", "/keys/1/rate", map[string]any{"rate": 50.0, "burst": 50.0}))
-	if _, st := v76fHeads(t, w, "matches", vid, old.At, cookie); st != 0 {
-		t.Fatalf("the earlier at before a new exchange: %d", st)
+	if _, st := v76fHeads(t, w, "matches", vid, old.At, cookie); st != 403 {
+		t.Fatalf("the earlier at before a new exchange: %d, want 403", st)
 	}
 	v82accessLater(w, time.Second)
 	cookie2, _ := v82accessCookie(t, w, w.li())
 	if st := v82accessCookieReads(t, w, vid, cookie2); st != 0 {
 		t.Fatalf("the new cookie at the current checkpoint: %d", st)
 	}
-	if _, st := v76fHeads(t, w, "matches", vid, old.At, cookie2); st != 403 {
-		t.Fatalf("the earlier at under the new record: %d, want 403", st)
+	if _, st := v76fHeads(t, w, "matches", vid, old.At, cookie2); st != 0 {
+		t.Fatalf("the earlier at under the new cookie: %d, want it served", st)
 	}
-	if _, st := v76fHeads(t, w, "matches", vid, old.At, cookie); st != 0 {
-		t.Fatalf("the earlier at under the earlier cookie, after the new exchange: %d, want it served", st)
+	if _, st := v76fHeads(t, w, "matches", vid, old.At, cookie); st != 403 {
+		t.Fatalf("the earlier at under the earlier cookie, after the new exchange: %d, want 403", st)
 	}
 	if st := v82accessCookieReads(t, w, vid, cookie); st != 403 {
 		t.Fatalf("the current at under the earlier cookie: %d, want 403", st)

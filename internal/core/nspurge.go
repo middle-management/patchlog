@@ -54,6 +54,11 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		if v.state == Purged {
 			return gone()
 		}
+		// Step 2.2: a head the grant's read rules hide is 403 before the
+		// precondition, which would name it (§6.2, §C.2 item 5).
+		if err := t.readsWrittenHead(n, cfg, a, name); err != nil {
+			return err
+		}
 		if ifMatch == "" {
 			return apiErr(428, "precondition_required")
 		}

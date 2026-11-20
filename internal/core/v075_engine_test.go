@@ -698,8 +698,8 @@ func TestV075FilteredAdmit(t *testing.T) {
 	})
 	// Record the current at, then add a role that lists read: every
 	// cookie of the view is 403 from that entry on, even once a later one
-	// removes it (v0.87, §7.9 view), while the recorded at still admits
-	// it.
+	// removes it (v0.87, §7.9 view), at the recorded at too: "at every
+	// URL".
 	var oldCP *fcp
 	w.inTx(func(t2 *tx) { oldCP = t2.filteredCurrent(t2.filteredScope(t2.nsByName("matches"))) })
 	w.patchConfig("matches", map[string]any{"op": "add", "path": "/roles/auditor", "value": map[string]any{"can": []any{"read"},
@@ -722,8 +722,8 @@ func TestV075FilteredAdmit(t *testing.T) {
 		})
 		return st
 	}
-	if st := atOld(gCookie(liView, exp)); st != 0 {
-		t.Fatalf("at the recorded at: %d", st)
+	if st := atOld(gCookie(liView, exp)); st != 403 {
+		t.Fatalf("at the recorded at: %d, want 403", st)
 	}
 	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/roles/auditor"})
 	if _, st := admit(liView, gCookie(liView, exp)); st != 403 {

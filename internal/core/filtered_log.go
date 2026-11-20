@@ -331,7 +331,7 @@ func (e *Engine) FilteredLog(ctx context.Context, ns, view, at, since string, li
 // reads the range only where each entry passes and each entry's parent
 // too, as patches show it: ok is false otherwise, a read-rule failure.
 func (t *tx) judgeEntries(n *nsRow, a *actor, name string, entries []LogEntry) (out []map[string]any, ok bool) {
-	partial := a.view == "" && a.verified != nil && t.filteredScope(n) != nil && t.partialReader(a)
+	partial := t.readsPartially(n, a)
 	parentOf := func(r *revRow) (*revRow, bool) {
 		if !r.parentSeq.Valid {
 			return nil, false
@@ -361,6 +361,45 @@ func (t *tx) judgeEntries(n *nsRow, a *actor, name string, entries []LogEntry) (
 		}
 	}
 	return out, true
+}
+
+// seesKeptRange judges, for a whose reads of n are judged per revision,
+// the kept part of a pruned range of name ending at to (ResourceLog): the
+// revisions from to down to the first revision pruning left without its
+// patch set, the horizon, as judgeEntries judges a range. seen reports
+// whether a may read any of them, all whether it may read every one.
+func (t *tx) seesKeptRange(n *nsRow, a *actor, name string, to *revRow) (seen, all bool) {
+	all = true
+	for r := to; r != nil; {
+		if t.mayReadRow(a, n, name, r) {
+			seen = true
+		} else {
+			all = false
+		}
+		if r.kind == kindRev && !r.patches.Valid || !r.parentSeq.Valid {
+			break
+		}
+		r = t.rev(r.parentSeq.Int64)
+	}
+	return seen, all
+}
+
+// seesAnyEntry reports whether a, whose reads of n are judged per
+// revision, may read any of entries, revisions or tombstones of name.
+func (t *tx) seesAnyEntry(n *nsRow, a *actor, name string, entries []LogEntry) bool {
+	for _, e := range entries {
+		if t.mayReadRow(a, n, name, e.row) {
+			return true
+		}
+	}
+	return false
+}
+
+// readsPartially reports whether a reads n as a partial reader at a
+// resource's URLs (judgeEntries): hidden entries are left out of a range,
+// rather than refusing it.
+func (t *tx) readsPartially(n *nsRow, a *actor) bool {
+	return a.view == "" && a.verified != nil && t.filteredScope(n) != nil && t.partialReader(a)
 }
 
 // judgePruneEvents leaves out of a resource stream's events (resourceEvents)

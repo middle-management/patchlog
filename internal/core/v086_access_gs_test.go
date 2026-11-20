@@ -64,10 +64,9 @@ func TestV086AccessGSChangeUndone(t *testing.T) {
 	w.patchConfig("matches", v82accessOp("add", "/x-note", "later"))
 	w.put("matches", "later", map[string]any{"n": 1.0})
 	v86viewReads(t, w, "li's cookie, later entries after the undo", vid, cookie, 403)
-	// "From that entry on": at the at from before the change, which is
-	// before that entry, the cookie reads as it did.
-	if _, st := v76fHeads(t, w, "matches", vid, before.At, cookie); st != 0 {
-		t.Errorf("li's cookie at the at from before the change: status %d, want it served", st)
+	// "At every URL" (v0.87): at the at from before the change too.
+	if _, st := v76fHeads(t, w, "matches", vid, before.At, cookie); st != 403 {
+		t.Errorf("li's cookie at the at from before the change: status %d, want 403", st)
 	}
 
 	// She exchanges again: the new cookie reads, the old one stays ended.

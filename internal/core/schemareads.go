@@ -199,6 +199,12 @@ func (t *tx) refersIn(l *nsRow, g *grant.Grant, path string, closures map[string
 		if v.head == nil || v.state == Purged || v.state == NotFound {
 			continue
 		}
+		// A referrer the grant may read: its head, per revision where its
+		// read rules refer to /doc (§C.2 item 5), a tombstone's being the
+		// document it deleted. One it can't read opens nothing.
+		if a != nil && !t.mayReadRow(a, l, nm, v.head) {
+			continue
+		}
 		ll := t.lastLive(v.head)
 		var ref *string
 		t.must(t.QueryRow(`SELECT schema_ref FROM revisions WHERE seq = ?`, ll.seq).Scan(&ref))

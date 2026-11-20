@@ -381,7 +381,10 @@ func (e *Engine) resourceRev(ctx context.Context, ns, name, id string, cred Cred
 		v := t.resolve(n, name, nil)
 		if v.state == Purged {
 			if byDoc {
-				return notFound()
+				// Judged with a null document (§6.4.1), and answered as
+				// an id the resource doesn't have, headers included.
+				out.Status = 404
+				return nil
 			}
 			out.Status = 410
 			return nil
@@ -397,8 +400,12 @@ func (e *Engine) resourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		if byDoc && !t.mayReadRow(a, n, name, row) {
 			// That revision's read envelope (§C.2 item 5): a read-rule
-			// failure, 404 at a resource's URL (§7).
-			return notFound()
+			// failure, 404 at a resource's URL (§7), answered as an id
+			// the resource doesn't have, its cache headers and tags
+			// included, so they don't tell a hidden revision from one
+			// that doesn't exist.
+			out.Status = 404
+			return nil
 		}
 		if plain {
 			out.Created = time.UnixMilli(row.created)
@@ -646,17 +653,19 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 			out.Status = 410
 			return nil
 		}
-		if v.head == nil {
-			// A resource with no entries: from its head and genesis (a
-			// live read with an empty since), an empty range, which an
-			// event stream or long-poll waits on, once the read check
-			// above has passed (§7.3, §7.7). Any other range of it is
-			// unknown.
-			out.Status = 404
+		// A resource with no entries: from its head and genesis (a live
+		// read with an empty since), an empty range, which an event
+		// stream or long-poll waits on, once the read check above has
+		// passed (§7.3, §7.7). Any other range of it is unknown.
+		absent := func() error {
+			out.Status, out.Entries, out.More, out.Last = 404, nil, false, since
 			if id == "" && since == "" {
 				out.Status = 200
 			}
 			return nil
+		}
+		if v.head == nil {
+			return absent()
 		}
 		to := v.head
 		if id != "" {
@@ -702,6 +711,20 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 			var pe *prunedError
 			switch {
 			case errors.As(err, &pe):
+				// A reader whose read rules refer to /doc learns of the
+				// horizon only where the kept range would be answered it
+				// (judgeEntries): one that can read none of it is
+				// answered as for a name that doesn't exist, any other
+				// that can't read all of it, but a partial reader, as for
+				// a range with a revision it can't read (§C.2 item 5).
+				if byDoc {
+					switch seen, all := t.seesKeptRange(n, a, name, to); {
+					case !seen:
+						return absent()
+					case !all && !t.readsPartially(n, a):
+						return notFound()
+					}
+				}
 				out.Status = 410
 				out.Horizon, out.Archive = t.prunedInfo(pe)
 			case errors.Is(err, errNotAncestor):
@@ -720,6 +743,12 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 			// Each entry judged with its own read envelope (§C.2 item 5).
 			ms, ok := t.judgeEntries(n, a, name, entries)
 			if !ok {
+				// A range it can read nothing of from genesis is a
+				// resource it can read no revision of: answered as a name
+				// that doesn't exist (§C.2 item 5).
+				if since == "" && !t.seesAnyEntry(n, a, name, entries) {
+					return absent()
+				}
 				return notFound()
 			}
 			out.Entries = ms

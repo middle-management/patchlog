@@ -541,7 +541,7 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, int64, error) {
 		// Never into a branch (schema_ref), but that tells only a writer
 		// who can read the revision there: for any other the path doesn't
 		// resolve, as in a namespace that doesn't exist (§6.1).
-		if row := t.schemaRevRow(n, ref); row != nil && t.schemaReadable(n, ref.Name, sc) && t.schemaKeysOpen(n, ref.Name, row, sc) {
+		if row := t.schemaRevRow(n, ref); row != nil && t.schemaReadable(n, ref.Name, row, sc) && t.schemaKeysOpen(n, ref.Name, row, sc) {
 			return nil, 0, schema.ErrBranch
 		}
 		return nil, 0, schema.ErrUnavailable
@@ -554,11 +554,14 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, int64, error) {
 	// A namespace that opens its schemas with schemaReads lets writes to a
 	// listed namespace resolve them without read (§6.1); only schema
 	// documents, checked once loaded.
-	readable := t.schemaReadable(n, ref.Name, sc)
+	// Read is judged per revision (§C.2 item 5): a revision the writer's
+	// read rules hide is unreadable, refused as one in a namespace it
+	// can't read, its content never judged (§6.1 Read permission).
+	row := t.schemaRevRow(n, ref)
+	readable := t.schemaReadable(n, ref.Name, row, sc)
 	if !readable && (sc.target == nil || !t.schemaReadsServe(n, sc.target)) {
 		return nil, 0, schema.ErrForbidden
 	}
-	row := t.schemaRevRow(n, ref)
 	if row == nil {
 		return nil, 0, schema.ErrUnavailable
 	}
@@ -575,15 +578,23 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, int64, error) {
 	return d, row.seq, nil
 }
 
-// schemaReadable reports whether the writer of sc may read resource name
-// of n (§6.1 Read permission): in the namespace written, with the write's
-// own grant; in any other, by the rule for other namespaces (§7.5), with
-// it or a grant in Source-Authorization.
-func (t *tx) schemaReadable(n *nsRow, name string, sc *schemaCtx) bool {
+// schemaReadable reports whether the writer of sc may read revision row
+// of resource name of n (§6.1 Read permission): in the namespace written,
+// with the write's own grant; in any other, by the rule for other
+// namespaces (§7.5), with it or a grant in Source-Authorization. Read
+// rules referring to /doc are judged on row (§C.2 item 5); a nil row (no
+// such revision) is judged by name alone.
+func (t *tx) schemaReadable(n *nsRow, name string, row *revRow, sc *schemaCtx) bool {
 	if sc.target != nil && n.id == sc.target.id {
-		return t.canRead(n, t.config(n.configSeq), sc.a, name)
+		if !t.canRead(n, t.config(n.configSeq), sc.a, name) {
+			return false
+		}
+		return row == nil || t.mayReadRow(sc.a, n, name, row)
 	}
-	return t.credsRead(n, name, sc.creds)
+	if row == nil {
+		return t.credsRead(n, name, sc.creds)
+	}
+	return t.credsReadRow(n, name, row, sc.creds)
 }
 
 // schemaKeysOpen reports whether the writer of sc gets keys opening schema

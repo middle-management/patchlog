@@ -83,16 +83,18 @@ func viewRecordOf(fv *fview, exp int64) *viewRecord {
 //     where its unfiltered URLs serve it; a partial reader's reads at its
 //     own view as of cp, and any other view is 403;
 //   - a cookie for /ns/{ns}/view/{view}: its view must be urlView (403), and is
-//     judged from its filtered_views row alone (a miss is 401): 403 where the
+//     judged from its filtered_views row alone (a miss is 401), at the
+//     current checkpoint whatever cp is (an at before a change that ended
+//     it is 403 too): 403 where the
 //     scope digest of its stored kid's scope rules and stored roles'
-//     definitions, read from {ns}'s document at cp, with its stored block
+//     definitions, read from {ns}'s current document, with its stored block
 //     rules and principal, differs from the stored one (a kid or role
 //     gone, or no longer listing read, or the kid's key with another pub
 //     than the stored one, counts as differing), or where that key's
 //     entry or one of those roles' definitions differs there in any
 //     member from the one recorded at the exchange (viewEntryDigest,
 //     v0.82), or did under any document of {ns} between the exchange's
-//     and cp's, whatever a later one undoes (viewHeldSince, v0.86), the
+//     and the current one, whatever a later one undoes (viewHeldSince, v0.86), the
 //     entry and the exchange's document being those of the cookie's own
 //     exp (filtered_view_exps), so that another exchange revives none;
 //     otherwise visibility from the stored filter;
@@ -156,7 +158,12 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlView string, cp *fcp, cred C
 		slot, ok = t.loadViewSlot(n.name, urlView, eg.Exp.Unix())
 	}
 	rec.entry, rec.conf = slot.entry, slot.conf
-	if !ok || !t.viewDigestHolds(n, cp, rec) || !t.viewHeldSince(n, cp, rec) {
+	// Judged at the current checkpoint, whatever the URL's: a cookie is
+	// 403 at every URL once an entry after its exchange changes its
+	// rules, at an at from before that entry too (§7.9 view). cp decides
+	// only what it sees.
+	cur := t.filteredCurrent(fs)
+	if !ok || !t.viewDigestHolds(n, cur, rec) || !t.viewHeldSince(n, cur, rec) {
 		return nil, forbidden("the rules this view was issued under have changed: exchange the grant again (§7.9)")
 	}
 	filter, err := grantcheck.DecodeReadFilter(rec.filter)
@@ -174,9 +181,10 @@ func keyPub(k grant.Key) string {
 }
 
 // viewDigestHolds reports whether rec's scope digest is the same with its
-// kid's scope rules and its roles' definitions as of n's document at cp
-// (§7.9 view: "a view cookie is 403 at an at where those rules differ"),
-// its kid and each of its roles still listing read there, so that a
+// kid's scope rules and its roles' definitions as of n's document at cp,
+// which filteredAdmit passes as the current checkpoint whatever the URL's
+// (§7.9 view, v0.87: a cookie is 403 "at every URL" once its rules
+// change), its kid and each of its roles still listing read there, so that a
 // cookie never reads where its grant couldn't. Keys follow the base
 // (§C.4), and the key with rec's kid must still have rec's pub: a kid
 // whose pub was replaced is no longer the key the cookie came from
@@ -231,9 +239,10 @@ const viewWalk = 64
 
 // viewHeldSince reports whether rec has held under every document of n
 // after the one its exchange recorded it under (rec.conf), up to the one
-// at cp (§7.9 view, v0.86: "Once an entry after its exchange changes
-// one of them, the cookie is 403 from that entry on, even where a later
-// entry undoes the change"; CONFORMANCE Access 145). viewDigestHolds judges
+// at cp, the current checkpoint (filteredAdmit; §7.9 view, v0.87: "Every
+// cookie of a view is 403, at every URL, once an entry after its
+// exchange changes those rules ..., even where a later entry undoes the
+// change"; CONFORMANCE Access 145). viewDigestHolds judges
 // the document at cp alone, which a change made and undone gives back.
 // Each config entry is judged as a whole, so two changes in one batch,
 // which leave the key's entry as it was, end nothing. A checkpoint at or

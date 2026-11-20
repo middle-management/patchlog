@@ -204,6 +204,25 @@ func (t *tx) credsRead(n *nsRow, name string, creds []Credentials) bool {
 	return false
 }
 
+// credsReadRow is credsRead for one revision or tombstone, row, of name:
+// a grant that may read name and whose read rules allow reading row
+// (§C.2 item 5), as resolving a schema revision takes (§6.1 Read
+// permission).
+func (t *tx) credsReadRow(n *nsRow, name string, row *revRow, creds []Credentials) bool {
+	if t.e.opt.AuthDisabled || t.config(n.configSeq).Read == "public" {
+		return true
+	}
+	for _, c := range creds {
+		if c.Bearer == "" {
+			continue
+		}
+		if a, err := t.reader(n, c, name); err == nil && t.mayReadRow(a, n, name, row) {
+			return true
+		}
+	}
+	return false
+}
+
 // credsReadBlob reports whether any of creds may read blob bid of name in
 // n as its stored documents that reference it decide (mayReadBlob, §7.8):
 // a copy from it is 404 where only revisions a grant can't read do.
@@ -340,10 +359,10 @@ func (t *tx) loadDraft(ref schema.Ref, sc *schemaCtx) (any, int64, bool) {
 		if !t.isDraftCandidate(c, ref.NS, nil) || !t.draftsServe(c, t.config(c.configSeq), sc.target) {
 			continue
 		}
-		if !t.credsRead(c, ref.Name, sc.creds) {
+		row := t.rev(cr.seq)
+		if !t.credsReadRow(c, ref.Name, row, sc.creds) {
 			continue
 		}
-		row := t.rev(cr.seq)
 		if !t.schemaKeysOpen(c, ref.Name, row, sc) {
 			continue // a sealed candidate's draft takes keys (§6.1)
 		}

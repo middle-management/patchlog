@@ -79,6 +79,11 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		if v.state == Purged {
 			return gone()
 		}
+		// Step 2.2: a head the grant's read rules hide is 403, before the
+		// horizon is looked up in its ancestry (§6.2, §C.2 item 5).
+		if err := t.readsWrittenHead(n, cfg, a, name); err != nil {
+			return err
+		}
 		// A prune takes no precondition: one sent is 428 at step 2.5
 		// (§7.2, §8.6).
 		if pr.Precondition {

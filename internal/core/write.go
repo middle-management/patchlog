@@ -823,12 +823,15 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	// Settling the verb completes authorisation: a 403 here is reported
 	// like one of step 1, and a dry run answers it as a submit would
-	// (§6.2, §7.5). It runs for every item before anything else of step 2.
+	// (§6.2, §7.5). It runs for every item before anything else of step 2,
+	// after the read check of the head (step 2.2): settling tells a
+	// tombstone from a live head, which a head the grant can't read must
+	// not (§C.2 item 5).
 	var denied []itemErr
 	for _, s := range st {
-		err := t.settle(n, s)
+		err := t.readsWrittenHead(n, cfg, a, s.Resource)
 		if err == nil {
-			err = t.readsWrittenHead(n, cfg, a, s.Resource)
+			err = t.settle(n, s)
 		}
 		if err != nil {
 			if err.Status == 403 {

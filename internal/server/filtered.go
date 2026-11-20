@@ -332,6 +332,11 @@ func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, vi
 			cur = reqCursor + 1
 		}
 		s.setLive(w, r, false, "public, max-age=0, s-maxage=2", tags)
+		if info.Private {
+			// An unrestricted reader's /ns/{ns} cookie: no cache's, its
+			// 204 as much as its entries (§7.9 Partial reader).
+			privateNoStore(w)
+		}
 		if since != "" {
 			w.Header().Set("X-Namespace-Revision", since)
 		}
