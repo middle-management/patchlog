@@ -740,14 +740,13 @@ time only): the consumers read the revision each namespace entry names
   latencies (p99 258, 637 and 1,419 ms). RDS CPU stayed at 24–38%.
 - **Nor is storage.** RDS wrote 150–206 IOPS of the 3,000 gp3 gives 20 GiB, at 1–3 ms, its disk
   queue under 0.4 (CloudWatch, 1-minute averages).
-- **The likely limit is the writers' principal's rate bucket.** Every write draws on
-  `p\x00<principal>` in `rate_buckets` (`rate_draw`, `ratebuckets.go`), which locks that row
-  until the draw commits, and that bucket is the principal's across every namespace (§6.6). The
-  bench writes every namespace as one principal. Locally (Postgres 16, 4 vCPU), draws on one row
-  stop at 4,000–4,700 a second from 1 to 16 clients, and on a row per client reach about 8,000.
-  A run with a principal per namespace will tell. If it is the limit, one principal writing
-  many namespaces, such as an ingest service, has a ceiling of a few thousand writes a second
-  however high its rate is set; `--local-rate-buckets` lifts it for a single instance.
+- **Nor is the writers' principal's rate bucket.** Every write draws on `p\x00<principal>` in
+  `rate_buckets` (`rate_draw`, `ratebuckets.go`), locking that row until the draw commits, and
+  that bucket is the principal's across every namespace (§6.6). Locally (Postgres 16, 4 vCPU),
+  draws on one row stop at 4,000–4,700 a second however many clients there are. But with a
+  writer principal per namespace, writes stopped at 2,962–3,037 a second, as with one
+  (3,000–3,055). What caps them is not yet known; the next run samples Postgres's wait events
+  and patchlog's group commit sizes and lock waits.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
