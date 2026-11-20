@@ -1,7 +1,6 @@
 package merge
 
 import (
-	"context"
 	"strings"
 	"testing"
 
@@ -95,27 +94,31 @@ func TestV073DigestSteps(t *testing.T) {
 }
 
 // §F.9 plan shape: batches in submission order, a step with no items
-// isn't one, and a precondition on an earlier batch's item is
-// { "batch", "item" }, indices from 0.
+// isn't one, only step 3's batch has no source, and a precondition on an
+// earlier batch's item is { "batch", "item" }, indices from 0.
 func TestV073PlanObject(t *testing.T) {
 	branches := []*ReleaseBranch{{Key: "cat", NS: "cat-r7", Target: "cat", At: "1catat"}, {Key: "m", NS: "m-r7", Target: "m", At: "1mat"}}
-	s2 := &ReleaseStep{Step: 2, Key: "cat"}
-	s3 := &ReleaseStep{Step: 3, Key: "m"}
-	s3b := &ReleaseStep{Step: 3, Key: "x"}
-	s4 := &ReleaseStep{Step: 4, Key: "cat"}
+	s1 := &ReleaseStep{Step: StepSchemas, Key: "cat"}
+	s2 := &ReleaseStep{Step: StepContent, Key: "m"}
+	s2x := &ReleaseStep{Step: StepContent, Key: "x"}
+	s2c := &ReleaseStep{Step: StepContent, Key: "cat"}
+	s3 := &ReleaseStep{Step: StepPublish, Key: "cat", Resources: []string{"new"}}
+	pub := &Publish{Path: "/published", Value: true}
 	items := map[*ReleaseStep][]any{
-		s2: {digestItem("a", map[string]any{"ifMatch": "1a"}, nil), digestItem("node", map[string]any{"ifMatch": "1n"}, nil)},
-		s3: {},
-		s4: {digestItem("new", map[string]any{"ifNoneMatch": "*"}, nil), digestItem("node", map[string]any{"after": map[string]any{"step": 2, "key": "cat", "item": "node"}}, nil)},
+		s1:  {digestItem("a", map[string]any{"ifMatch": "1a"}, nil), digestItem("node", map[string]any{"ifMatch": "1n"}, nil)},
+		s2:  {},
+		s2c: {digestItem("new", map[string]any{"ifNoneMatch": "*"}, nil), digestItem("old", map[string]any{"ifMatch": "1o"}, nil)},
+		s3:  publishItems(s3, pub),
 	}
-	plan, err := PlanObject("/r/rel/r7/rev/1rev", branches, []*ReleaseStep{s2, s3, s3b, s4}, items)
+	plan, err := PlanObject("/r/rel/r7/rev/1rev", branches, []*ReleaseStep{s1, s2, s2x, s2c, s3}, items)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := string(jsonv.Canonical(jsonv.FromGo(plan)))
 	want := `{"batches":[` +
 		`{"items":[{"ifMatch":"1a","resource":"a","steps":[]},{"ifMatch":"1n","resource":"node","steps":[]}],"ns":"cat","source":{"at":"1catat","ns":"cat-r7"}},` +
-		`{"items":[{"ifNoneMatch":"*","resource":"new","steps":[]},{"ifMatch":{"batch":0,"item":1},"resource":"node","steps":[]}],"ns":"cat","source":{"at":"1catat","ns":"cat-r7"}}` +
+		`{"items":[{"ifNoneMatch":"*","resource":"new","steps":[]},{"ifMatch":"1o","resource":"old","steps":[]}],"ns":"cat","source":{"at":"1catat","ns":"cat-r7"}},` +
+		`{"items":[{"ifMatch":{"batch":1,"item":0},"resource":"new","steps":[[{"op":"add","path":"/published","value":true}]]}],"ns":"cat"}` +
 		`],"release":"/r/rel/r7/rev/1rev"}`
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
@@ -123,62 +126,13 @@ func TestV073PlanObject(t *testing.T) {
 	if PlanDigest(plan) != ids.Of([]byte(want)).String() {
 		t.Fatal("the digest isn't text(trunc160(sha256(canonical(plan))))")
 	}
-}
-
-// LegacyPlan rewrites rp as an earlier version stored it, for tests of a
-// merge that version stopped part-way: no format, no branch at, and the
-// step digests of the steps not done yet as that version rendered them.
-func LegacyPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan) error {
-	for _, st := range rp.Steps {
-		if st.Done != "" {
-			continue
+	// A published field must be a member below the root, not a reserved one.
+	for _, bad := range []string{"", "published", "/$nonce"} {
+		if err := (&Publish{Path: bad}).check(); err == nil {
+			t.Errorf("published field %q accepted", bad)
 		}
-		_, its, err := stepPlan(ctx, c, opt, rp, st, false)
-		if err != nil {
-			return err
-		}
-		st.Digest = stepDigest(st, legacyDigestItems(its))
 	}
-	rp.Format = 0
-	for _, b := range rp.Branches {
-		b.At = ""
-	}
-	return nil
-}
-
-// §F.9 "a merge that stops part-way resumes from that plan": a plan an
-// earlier version stored (format 0) has step digests over items rendered
-// as that version did ($nonce members and $nonce op values left out, items
-// by name); a step of such a plan is approved under either rendering, one
-// of the current format only under its own.
-func TestV073LegacyStepDigests(t *testing.T) {
-	fresh := "abcdefghijklmnopqrstuvwxyz"
-	items := []stepItem{
-		{"zeta", map[string]any{"ifMatch": "1z"}, []client.Step{client.PatchStep([]any{
-			map[string]any{"op": "add", "path": "/$nonce", "value": fresh},
-			map[string]any{"op": "add", "path": "/a", "value": map[string]any{"$nonce": fresh, "b": 1.0}},
-		})}},
-		{"alpha", map[string]any{"ifNoneMatch": "*"}, []client.Step{client.DeleteStep()}},
-	}
-	got := string(jsonv.Canonical(jsonv.FromGo(legacyDigestItems(items))))
-	want := `[{"ifNoneMatch":"*","resource":"alpha","steps":["delete"]},` +
-		`{"ifMatch":"1z","resource":"zeta","steps":[[{"op":"add","path":"/$nonce"},{"op":"add","path":"/a","value":{"b":1}}]]}]`
-	if got != want {
-		t.Fatalf("got  %s\nwant %s", got, want)
-	}
-	st := &ReleaseStep{Step: 1, Key: "schemas", Resources: []string{"zeta", "alpha"}}
-	legacy, current := stepDigest(st, legacyDigestItems(items)), stepDigest(st, digestItems(st, items))
-	if legacy == current {
-		t.Fatal("the renderings agree; the test shows nothing")
-	}
-	for _, c := range []struct {
-		format int
-		digest string
-		want   bool
-	}{{0, legacy, true}, {0, current, true}, {PlanFormat, current, true}, {PlanFormat, legacy, false}, {0, "1other", false}} {
-		st.Digest = c.digest
-		if got := approvedStep(&ReleasePlan{Format: c.format}, st, items); got != c.want {
-			t.Fatalf("format %d, digest %s: approved %v", c.format, c.digest, got)
-		}
+	if pb := (&Publish{Path: "/meta/published"}); pb.check() != nil || pb.Value != true {
+		t.Fatalf("default value %v", pb.Value)
 	}
 }

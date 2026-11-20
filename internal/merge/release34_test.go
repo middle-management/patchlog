@@ -66,15 +66,15 @@ func TestReleaseDigest(t *testing.T) {
 	if approved.Digest != rp.Digest {
 		t.Fatalf("approved %s, reviewed %s", approved.Digest, rp.Digest)
 	}
-	// The base moves again after the approval: step 3 differs, and the
-	// merge stops there for a new approval (steps 1 and 2 went in).
+	// The base moves again after the approval: step 2 differs, and the
+	// merge stops there for a new approval (step 1 went in).
 	w.appendTo("matches", "cup", op("replace", "/score", "4-2"))
 	_, err := merge.ApplyRelease(ctx, w.anna, o)
-	if !errors.Is(err, merge.ErrPlanChanged) || !strings.Contains(err.Error(), "step 3") {
+	if !errors.Is(err, merge.ErrPlanChanged) || !strings.Contains(err.Error(), "step 2") {
 		t.Fatalf("apply after the base moved: %v", err)
 	}
 	if w.live("matches", "final") {
-		t.Fatal("step 3 went in")
+		t.Fatal("step 2 went in")
 	}
 }
 

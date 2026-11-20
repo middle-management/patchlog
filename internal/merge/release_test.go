@@ -234,13 +234,13 @@ func testReleaseMerge(t *testing.T) {
 	}
 	want := []string{
 		"1 schemas match",
-		"3 cat-season locked matches.cup matches.derby matches.final",
-		"3 matches derby final",
+		"2 cat-season locked matches.cup matches.derby matches.final",
+		"2 matches derby final",
 	}
 	if got := stepsOf(rp); strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("steps\n got %q\nwant %q", got, want)
 	}
-	if rp.Digest == "" || rp.Steps[0].Digest == "" {
+	if rp.Digest == "" || rp.Plan == nil || merge.PlanDigest(rp.Plan) != rp.Digest {
 		t.Fatalf("no plan digest: %+v", rp)
 	}
 	noErr(t, merge.SaveReleasePlan(ctx, w.anna, w.opts("release-7"), rp))
@@ -278,7 +278,7 @@ func testReleaseMerge(t *testing.T) {
 		t.Fatalf("schemas/match is %s, want the draft's id %s (fast-forward)", h.ID, t1)
 	}
 	if w.live("matches", "final") || w.live("cat-season", "matches.final") {
-		t.Fatal("step 3 ran before the stop")
+		t.Fatal("step 2 ran before the stop")
 	}
 
 	// Resume.
