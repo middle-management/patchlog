@@ -330,3 +330,31 @@ func (w *v75s) sseFirst(path, bearer string) *resp {
 	body, _ := io.ReadAll(r.Body) // until the deadline ends the stream
 	return &resp{Code: r.StatusCode, H: r.Header, Body: body}
 }
+
+// §7.9 Content: under a view whose rules refer only to /resource, a
+// revision or blob of a name the rules refuse is a read-rule failure, by
+// grant and by cookie alike.
+func TestV087ViewContentByName(t *testing.T) {
+	t.Parallel()
+	w := newV75s(t, v75sOpts{})
+	w.seed(nil, nil, []string{"derby"})
+	data := []byte("s")
+	bid := w.upload("matches", "secret", "text/plain", data, w.admin)
+	sec := w.v87Doc("matches", "secret", map[string]any{"file": map[string]any{"$blob": bid, "type": "text/plain", "size": 1.0}, "mark": "HIDDEN"})
+	der := etagOf(w.get("/r/matches/derby", w.admin))
+	li := w.li()
+	c, view := w.cookie(li)
+	ck := cookieHdr(c)
+	base := "/ns/matches/view/" + view
+	for _, p := range []string{base + "/r/secret/rev/" + sec, base + "/r/secret/rev/" + sec + "/raw", base + "/r/secret/blob/" + bid} {
+		for who, q := range map[string]req{"grant": {method: "GET", path: p, bearer: li}, "cookie": {method: "GET", path: p, hdr: ck}} {
+			if r := w.do(q); r.Code != 404 || strings.Contains(string(r.Body), "HIDDEN") {
+				t.Errorf("%s by %s: %d %s, want 404", p, who, r.Code, r.Body)
+			}
+		}
+	}
+	for who, q := range map[string]req{"grant": {method: "GET", path: base + "/r/derby/rev/" + der, bearer: li}, "cookie": {method: "GET", path: base + "/r/derby/rev/" + der, hdr: ck}} {
+		expect(t, w.do(q), 200)
+		_ = who
+	}
+}

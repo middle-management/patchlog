@@ -640,6 +640,9 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 		out = &Log{Public: t.cachePublic(n), Until: t.admittedUntil(n, cred, a)}
 		v := t.resolve(n, name, nil)
 		if v.state == Purged {
+			if byDoc {
+				return notFound() // judged with null documents (§6.4.1)
+			}
 			out.Status = 410
 			return nil
 		}

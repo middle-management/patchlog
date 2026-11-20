@@ -453,3 +453,34 @@ func TestV087FilteredOracle(t *testing.T) {
 }
 
 var _ = grant.Principal{}
+
+// An unrestricted reader's /ns/{ns} cookie at a view's long-poll reads
+// unfiltered, and its page is never the view's readers': a partial reader
+// polling after it, at the same view, since and checkpoint, sees only its
+// own entries.
+func TestV087UnrestrictedCookieNotShared(t *testing.T) {
+	w := newV75World(t, v75Opts{})
+	w.seed()
+	ctx := context.Background()
+	li := w.li()
+	view := v075ViewID(t, w, li)
+	since := w.head("matches")
+	w.put("matches", "opener", map[string]any{"v": 2})
+	w.put("matches", "derby", map[string]any{"v": 2})
+	nsCookie := Credentials{Edge: &EdgeGrant{NS: "matches", Prefix: "/ns/matches", Exp: w.now().Add(10 * time.Minute)}}
+	names := func(lg *Log) []string {
+		var out []string
+		for _, e := range lg.Entries {
+			out = append(out, fmt.Sprint(e["resource"]))
+		}
+		return out
+	}
+	all, info, err := w.e.FilteredLiveLog(ctx, "matches", view, since, 100, nsCookie)
+	if err != nil || !info.Private || !reflect.DeepEqual(names(all), []string{"opener", "derby"}) {
+		t.Fatalf("the /ns cookie: %v %+v %v", names(all), info, err)
+	}
+	mine, info, err := w.e.FilteredLiveLog(ctx, "matches", view, since, 100, li)
+	if err != nil || info.Private || !reflect.DeepEqual(names(mine), []string{"derby"}) {
+		t.Fatalf("li after it: %v %+v %v", names(mine), info, err)
+	}
+}

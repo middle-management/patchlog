@@ -97,6 +97,25 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, view, since string, li
 	if err != nil {
 		return nil, nil, err
 	}
+	if fv.unrestricted {
+		// An unrestricted reader's /ns/{ns} cookie reads unfiltered: its
+		// pages are its own, never the view's readers' (no share, no
+		// keeping).
+		var lg *Log
+		err := e.read(ctx, func(t *tx) error {
+			n := t.nsByName(ns)
+			if n == nil || n.id != fv.fs.n.id {
+				return notFound()
+			}
+			lg = t.filteredRange(n, fv, since, fv.cp.seq, limit)
+			return nil
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		lg.Until = until
+		return lg, info, nil
+	}
 	fv = sharedView(e, fv)
 	key := filteredLiveKey(e, ns, fv.view, since, limit, fv.cp.at)
 	filteredLiveDone.Lock()

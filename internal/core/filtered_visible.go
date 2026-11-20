@@ -233,11 +233,13 @@ func (t *tx) mayReadRow(a *actor, n *nsRow, name string, row *revRow) bool {
 	return t.visibleRow(j, n, name, row)
 }
 
-// readsByDoc reports whether a's reads of n differ between revisions of a
-// resource, so that a read serving several is judged per entry.
+// readsByDoc reports whether a's reads of n are judged per revision
+// beyond its admission: its rules refer to /doc, so that a read serving
+// several revisions is judged per entry, or it reads at a view's URL,
+// whose admission judged no name (reader).
 func (t *tx) readsByDoc(n *nsRow, a *actor) bool {
 	j, all := t.rowJudge(n, a)
-	return !all && j != nil && j.doc
+	return !all && (j == nil || j.doc || a.view != "")
 }
 
 // mayReadBlob is the read check of blob bid of name in n under a (§7.8,

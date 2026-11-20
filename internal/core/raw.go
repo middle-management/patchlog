@@ -39,10 +39,10 @@ func (e *Engine) ResourceRaw(ctx context.Context, ns, name, id string, cred Cred
 		if err != nil {
 			return err
 		}
+		if t.readsByDoc(n, a) && (n.purged || t.nsLevel(n) >= levelSealed) {
+			return notFound() // judged with a null document (§6.4.1)
+		}
 		if n.purged {
-			if t.readsByDoc(n, a) {
-				return notFound() // judged with a null document (§6.4.1)
-			}
 			return t.purgedRead(n)
 		}
 		out.Public = t.cachePublic(n)
