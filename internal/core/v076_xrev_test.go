@@ -36,7 +36,7 @@ func TestV076Scenario95(t *testing.T) {
 	w := newV75World(t, v75Opts{})
 	w.seed()
 	gs := "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", GS: gs, Prefix: "/ns/matches/g/" + gs, Exp: w.now().Add(10 * time.Minute)}}
+	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: gs, Prefix: "/ns/matches/view/" + gs, Exp: w.now().Add(10 * time.Minute)}}
 	err := w.e.FilteredCurrent(context.Background(), "matches", gs, "/heads", cookie)
 	if v75Status(err) != 401 {
 		t.Fatalf("%v, want 401", err)
@@ -51,9 +51,9 @@ func TestV076Scenario95(t *testing.T) {
 	if err != nil || len(res.Grants) != 1 {
 		t.Fatal(res, err)
 	}
-	gs2 := res.Grants[0].GS
+	gs2 := res.Grants[0].View
 	w.mkNS("other", map[string]any{"read": "grant", "keys": []any{w.kEntry()}})
-	cookie2 := Credentials{Edge: &EdgeGrant{NS: "matches", GS: gs2, Prefix: "/ns/matches/g/" + gs2, Exp: w.now().Add(10 * time.Minute)}}
+	cookie2 := Credentials{Edge: &EdgeGrant{NS: "matches", View: gs2, Prefix: "/ns/matches/view/" + gs2, Exp: w.now().Add(10 * time.Minute)}}
 	if err := w.e.FilteredCurrent(context.Background(), "matches", gs2, "/heads", cookie2); err == nil {
 		t.Fatal("nil")
 	} else if _, ok := err.(*FilteredRedirect); !ok {
@@ -73,8 +73,8 @@ func TestV076Scenario96(t *testing.T) {
 	if err != nil || len(res.Grants) != 1 {
 		t.Fatal(res, err)
 	}
-	gs := res.Grants[0].GS
-	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", GS: gs, Prefix: "/ns/matches/g/" + gs, Exp: w.now().Add(10 * time.Minute)}}
+	gs := res.Grants[0].View
+	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: gs, Prefix: "/ns/matches/view/" + gs, Exp: w.now().Add(10 * time.Minute)}}
 	if red, st := v76fRedirect(t, w, "matches", gs, cookie); red == nil {
 		t.Fatalf("before: %d", st)
 	}
@@ -85,7 +85,7 @@ func TestV076Scenario96(t *testing.T) {
 	}
 }
 
-// Scenario 103: li at /ns/matches/g/{gs}/heads of a gs no exchange gave
+// Scenario 103: li at /ns/matches/view/{gs}/heads of a gs no exchange gave
 // her -> 403; without credentials 401.
 func TestV076Scenario103(t *testing.T) {
 	t.Parallel()
@@ -145,7 +145,7 @@ func TestV076Scenario109(t *testing.T) {
 	if red2 == nil {
 		t.Fatal("matches")
 	}
-	if names, st := v76fHeads(t, w, "matches", red2.GS, red2.At, lim); st != 0 || !v76fHas(names, "derby") {
+	if names, st := v76fHeads(t, w, "matches", red2.View, red2.At, lim); st != 0 || !v76fHas(names, "derby") {
 		t.Fatalf("matches heads %v %d", names, st)
 	}
 

@@ -826,7 +826,11 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// (§6.2, §7.5). It runs for every item before anything else of step 2.
 	var denied []itemErr
 	for _, s := range st {
-		if err := t.settle(n, s); err != nil {
+		err := t.settle(n, s)
+		if err == nil {
+			err = t.readsWrittenHead(n, cfg, a, s.Resource)
+		}
+		if err != nil {
 			if err.Status == 403 {
 				denied = append(denied, itemErr{s.index, err})
 			} else {
@@ -1207,6 +1211,31 @@ func (t *tx) settle(n *nsRow, s *itemState) *Error {
 	}
 	if !contains(s.cands, verb) {
 		return forbidden(fmt.Sprintf("the grant does not allow %s", verb))
+	}
+	return nil
+}
+
+// readsWrittenHead is the rest of §6.2 step 2.2: a write to a resource
+// with a head as the writer sees it (a branch's view, read through
+// included), a delete or create included, by a grant that may read but
+// whose read rules don't allow reading that head (§C.2 item 5: its
+// revision's read envelope, a tombstone's being the document it deleted)
+// is 403, so that steps 3–5 never judge a document it can't read. A grant
+// without read, through its verbs and a role that counts for read, isn't
+// judged here: it learns from steps 3–5 what §6.4.1 says it may.
+func (t *tx) readsWrittenHead(n *nsRow, cfg *Config, a *actor, name string) *Error {
+	if a == nil || a.verified == nil || t.e.opt.AuthDisabled || cfg.Read == "public" {
+		return nil
+	}
+	if _, ok := readRoles(a); !ok || scopeReferToNow(a) {
+		return nil
+	}
+	v := t.resolve(n, name, nil)
+	if v.head == nil || v.state == Purged {
+		return nil
+	}
+	if !t.canRead(n, cfg, a, name) || !t.mayReadRow(a, n, name, v.head) {
+		return forbidden("the grant may read but its read rules don't allow reading this resource's head (§6.2 step 2.2, §C.2 item 5)")
 	}
 	return nil
 }

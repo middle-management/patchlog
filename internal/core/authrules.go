@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 
+	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/rules"
@@ -220,7 +221,7 @@ func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []st
 				// included (§C.2 item 5, Unrestricted read).
 				return forbidden("a grant or key rule refers to /now, which no read passes (§C.2 item 5): a read's time window is its grant's nbf and exp")
 			}
-			if stepOne && !r.OnlyRefs(stepOneRefs...) {
+			if stepOne && !r.OnlyRefs(stepOneRefs...) || skipsDoc(env, r) {
 				continue
 			}
 			v := r.EvalMetered(env, m.rule(), unknown...)
@@ -238,6 +239,18 @@ func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []st
 		}
 	}
 	return nil
+}
+
+// skipsDoc reports whether r, a rule that refers to /doc, is left to the
+// per-revision check of a read whose envelope env names no revision yet
+// (judge, mayReadRow): a read's admission at a resource's URL passes it,
+// and the revision the read concerns decides (§C.2 item 5).
+func skipsDoc(env map[string]any, r *rules.Rule) bool {
+	if !forRead(env) || !grantcheck.RefersToDoc(r) || r.Refs()["*"] {
+		return false
+	}
+	_, has := env["doc"]
+	return !has
 }
 
 // forRead reports whether env is a read envelope (§6.4.1), which has no
@@ -315,7 +328,7 @@ func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any
 					ok = false
 					break
 				}
-				if stepOne && !r.OnlyRefs(stepOneRefs...) {
+				if stepOne && !r.OnlyRefs(stepOneRefs...) || skipsDoc(env, r) {
 					continue
 				}
 				v := r.EvalMetered(env, m.rule(), unknown...)

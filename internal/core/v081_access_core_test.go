@@ -20,7 +20,7 @@ func v081Heads(t *testing.T, w *v75World, cred Credentials) ([]string, *Filtered
 	if red == nil {
 		t.Fatalf("no redirect: %d", st)
 	}
-	names, st := v76fHeads(t, w, "matches", red.GS, red.At, cred)
+	names, st := v76fHeads(t, w, "matches", red.View, red.At, cred)
 	if st != 0 {
 		t.Fatalf("filtered heads: %d", st)
 	}
@@ -108,17 +108,17 @@ func TestV081AccessNowRoleDropsOut(t *testing.T) {
 		t.Fatalf("li's filtered heads %v, want pub-a alone", names)
 	}
 	res, err := w.e.IssueEdgeGrants(ctx, []string{li.Bearer})
-	if err != nil || len(res.Grants) != 1 || res.Grants[0].GS != red.GS {
+	if err != nil || len(res.Grants) != 1 || res.Grants[0].View != red.View {
 		t.Fatalf("exchange: %+v %v", res, err)
 	}
 	w.inTx(func(t2 *tx) {
-		r := t2.loadGS("matches", red.GS)
+		r := t2.loadView("matches", red.View)
 		if r == nil || !slices.Equal(r.roles, []string{"prefixed"}) {
 			t.Fatalf("stored row %+v, want roles [prefixed]", r)
 		}
 	})
-	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", GS: red.GS, Prefix: "/ns/matches/g/" + red.GS, Exp: w.now().Add(10 * time.Minute)}}
-	if names, st := v76fHeads(t, w, "matches", red.GS, red.At, cookie); st != 0 || !slices.Equal(names, []string{"pub-a"}) {
+	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: red.View, Prefix: "/ns/matches/view/" + red.View, Exp: w.now().Add(10 * time.Minute)}}
+	if names, st := v76fHeads(t, w, "matches", red.View, red.At, cookie); st != 0 || !slices.Equal(names, []string{"pub-a"}) {
 		t.Fatalf("cookie: %v %d", names, st)
 	}
 	// Only clock: no role counts, so no read.
@@ -127,7 +127,7 @@ func TestV081AccessNowRoleDropsOut(t *testing.T) {
 	}
 	w.patchConfig("matches", map[string]any{"op": "add", "path": "/roles/prefixed/rules/-",
 		"value": map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}})
-	if _, st := v76fRedirect(t, w, "matches", red.GS, cookie); st != 403 {
+	if _, st := v76fRedirect(t, w, "matches", red.View, cookie); st != 403 {
 		t.Fatalf("the old cookie after prefixed gained a /now rule: %d, want 403", st)
 	}
 	if _, st := v76fRedirect(t, w, "matches", "", li); st != 403 {

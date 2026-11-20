@@ -86,11 +86,14 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("GET /ns/{ns}/rev/{id}/heads", s.nsHeads)
 	m.HandleFunc("GET /ns/{ns}/log", s.nsLive)
 	m.HandleFunc("GET /ns/{ns}/events", s.nsEvents)
-	m.HandleFunc("GET /ns/{ns}/g/{gs}/at/{at}/heads", s.gHeads)
-	m.HandleFunc("GET /ns/{ns}/g/{gs}/at/{at}/log", s.gLog)
-	m.HandleFunc("GET /ns/{ns}/g/{gs}/heads", s.gHeadsCurrent)
-	m.HandleFunc("GET /ns/{ns}/g/{gs}/log", s.gLive)
-	m.HandleFunc("GET /ns/{ns}/g/{gs}/events", s.gEvents)
+	m.HandleFunc("GET /ns/{ns}/view/{view}/at/{at}/heads", s.viewHeads)
+	m.HandleFunc("GET /ns/{ns}/view/{view}/at/{at}/log", s.viewLog)
+	m.HandleFunc("GET /ns/{ns}/view/{view}/heads", s.viewHeadsCurrent)
+	m.HandleFunc("GET /ns/{ns}/view/{view}/log", s.viewLive)
+	m.HandleFunc("GET /ns/{ns}/view/{view}/events", s.viewEvents)
+	m.HandleFunc("GET /ns/{ns}/view/{view}/r/{name}/rev/{id}", s.viewContent(s.resourceRev))
+	m.HandleFunc("GET /ns/{ns}/view/{view}/r/{name}/rev/{id}/raw", s.viewContent(s.resourceRaw))
+	m.HandleFunc("GET /ns/{ns}/view/{view}/r/{name}/blob/{bid}", s.viewContent(s.blobGet))
 	m.HandleFunc("GET /ns/{ns}/gestures/{gesture}", s.nsGestures)
 	m.HandleFunc("GET /ns/{ns}/principal", s.nsPrincipal)
 	m.HandleFunc("GET /ns/{ns}/grants/{gid}", s.nsGrant)
@@ -147,26 +150,26 @@ const flag = "1"
 // Signed-URL grant parameters (§C.5) never reach the origin: the edge that
 // verifies them strips them before forwarding.
 var queryParams = map[string]map[string]string{
-	"GET /r/{ns}/{name}/rev/{id}/log":   {"since": ""},                           // §7.1
-	"GET /r/{ns}/{name}/log":            {"since": "", "live": "", "cursor": ""}, // §7.7 (longPoll checks live)
-	"GET /r/{ns}/{name}/events":         {"since": ""},                           // §7.3
-	"POST /r/{ns}/{name}/purge":         {"force": flag},                         // §6.1, §8.3
-	"GET /ns":                           {"after": "", "prefix": ""},             // §7.4 (nsList checks prefix)
-	"GET /ns/{ns}/branches":             {"after": ""},                           // §7.4
-	"GET /ns/{ns}/rev/{id}/log":         {"since": ""},                           // §7.4
-	"GET /ns/{ns}/rev/{id}/heads":       {"after": "", "prefix": ""},             // §7.4 (headsPrefix checks prefix)
-	"GET /ns/{ns}/log":                  {"since": "", "live": "", "cursor": ""}, // §7.7
-	"GET /ns/{ns}/events":               {"since": ""},                           // §7.4
-	"GET /ns/{ns}/g/{gs}/at/{at}/heads": {"after": "", "prefix": ""},             // §7.9
-	"GET /ns/{ns}/g/{gs}/at/{at}/log":   {"since": ""},                           // §7.9
-	"GET /ns/{ns}/g/{gs}/heads":         {"after": "", "prefix": ""},             // §7.9
-	"GET /ns/{ns}/g/{gs}/log":           {"since": "", "live": "", "cursor": ""}, // §7.9, §7.7
-	"GET /ns/{ns}/g/{gs}/events":        {"since": ""},                           // §7.9, §7.3
-	"GET /ns/{ns}/gestures/{gesture}":   {"after": ""},                           // §7.4
-	"POST /ns/{ns}/batch":               {"dry-run": flag},                       // §7.5
-	"POST /ns/{ns}/purge":               {"force": flag},                         // §8.5
-	"GET " + core.DefaultJWKSPath:       nil,                                     // §C.4: not checked
-	"DELETE /edge-grants":               nil,                                     // §C.5.4: prefix repeats; withdrawPrefixes checks it
+	"GET /r/{ns}/{name}/rev/{id}/log":        {"since": ""},                           // §7.1
+	"GET /r/{ns}/{name}/log":                 {"since": "", "live": "", "cursor": ""}, // §7.7 (longPoll checks live)
+	"GET /r/{ns}/{name}/events":              {"since": ""},                           // §7.3
+	"POST /r/{ns}/{name}/purge":              {"force": flag},                         // §6.1, §8.3
+	"GET /ns":                                {"after": "", "prefix": ""},             // §7.4 (nsList checks prefix)
+	"GET /ns/{ns}/branches":                  {"after": ""},                           // §7.4
+	"GET /ns/{ns}/rev/{id}/log":              {"since": ""},                           // §7.4
+	"GET /ns/{ns}/rev/{id}/heads":            {"after": "", "prefix": ""},             // §7.4 (headsPrefix checks prefix)
+	"GET /ns/{ns}/log":                       {"since": "", "live": "", "cursor": ""}, // §7.7
+	"GET /ns/{ns}/events":                    {"since": ""},                           // §7.4
+	"GET /ns/{ns}/view/{view}/at/{at}/heads": {"after": "", "prefix": ""},             // §7.9
+	"GET /ns/{ns}/view/{view}/at/{at}/log":   {"since": ""},                           // §7.9
+	"GET /ns/{ns}/view/{view}/heads":         {"after": "", "prefix": ""},             // §7.9
+	"GET /ns/{ns}/view/{view}/log":           {"since": "", "live": "", "cursor": ""}, // §7.9, §7.7
+	"GET /ns/{ns}/view/{view}/events":        {"since": ""},                           // §7.9, §7.3
+	"GET /ns/{ns}/gestures/{gesture}":        {"after": ""},                           // §7.4
+	"POST /ns/{ns}/batch":                    {"dry-run": flag},                       // §7.5
+	"POST /ns/{ns}/purge":                    {"force": flag},                         // §8.5
+	"GET " + core.DefaultJWKSPath:            nil,                                     // §C.4: not checked
+	"DELETE /edge-grants":                    nil,                                     // §C.5.4: prefix repeats; withdrawPrefixes checks it
 }
 
 // checkQuery answers 400 bad_input for a query parameter the route doesn't
@@ -327,6 +330,12 @@ const (
 // cache tags. A private response gets the edge directives of s.edge: edge
 // lifetimes for a read the verifying edge verified, no-store otherwise.
 func (s *Server) cache(w http.ResponseWriter, r *http.Request, class string, public bool, tags ...string) {
+	if v := viewedOf(r); v != nil && v.private {
+		// An unrestricted reader's /ns/{ns} cookie at a view's URL
+		// (viewContent): no cache keeps it for the view's readers.
+		privateNoStore(w)
+		return
+	}
 	h := w.Header()
 	if public {
 		h.Set("Cache-Control", class)

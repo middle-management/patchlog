@@ -93,34 +93,32 @@ func TestV075CombinedAt(t *testing.T) {
 }
 
 // §7.9 item 2: ReadFilter judges a read as the grant's read check does
-// (Allows, the index's semantics), and AllowsItem counts a role only if
-// its rules refer to nothing in /principal but groups and roles. Encode
-// and DecodeReadFilter round-trip.
+// (Allows). Encode and DecodeReadFilter round-trip.
 func TestV075ReadFilter(t *testing.T) {
 	t.Parallel()
 	v := v075Verified(t, nil)
 	f := grantcheck.FilterOf(v)
-	if !f.Allows("match1") || f.Allows("derby") || !f.AllowsItem("match1") || f.AllowsItem("derby") {
-		t.Fatalf("key-scope pattern: Allows %v %v, AllowsItem %v %v", f.Allows("match1"), f.Allows("derby"), f.AllowsItem("match1"), f.AllowsItem("derby"))
+	if !f.Allows("match1") || f.Allows("derby") || !f.Allows("match1") || f.Allows("derby") {
+		t.Fatalf("key-scope pattern: Allows %v %v, AllowsItem %v %v", f.Allows("match1"), f.Allows("derby"), f.Allows("match1"), f.Allows("derby"))
 	}
 	g, err := grantcheck.DecodeReadFilter(f.Encode())
 	if err != nil || g.Encode() != f.Encode() || !g.Allows("match1") || g.Allows("derby") {
 		t.Fatalf("round trip: %v %s", err, g.Encode())
 	}
-	// A role with a /principal/id rule allows for the read check, never
-	// for item 2.
+	// A role with a /principal/id rule counts as §C.2 item 5 counts it
+	// (v0.87: §B.11.5's restriction is gone).
 	sub := &grantcheck.ReadFilter{Roles: [][]any{{map[string]any{"op": "test", "path": "/principal/id", "value": "user:li"}}},
 		Principal: map[string]any{"id": "user:li", "groups": []any{}}}
-	if !sub.Allows("m") || sub.AllowsItem("m") {
-		t.Fatalf("sub role: Allows %v AllowsItem %v", sub.Allows("m"), sub.AllowsItem("m"))
+	if !sub.Allows("m") {
+		t.Fatalf("sub role: Allows %v", sub.Allows("m"))
 	}
 	// Roles carried, none listing read: nothing.
 	none := &grantcheck.ReadFilter{Roles: [][]any{}}
-	if none.Allows("m") || none.AllowsItem("m") {
+	if none.Allows("m") || none.Allows("m") {
 		t.Fatal("no role allows")
 	}
 	// No roles: blocks and key scope alone.
-	if !(&grantcheck.ReadFilter{}).AllowsItem("m") {
+	if !(&grantcheck.ReadFilter{}).Allows("m") {
 		t.Fatal("no roles carried")
 	}
 }

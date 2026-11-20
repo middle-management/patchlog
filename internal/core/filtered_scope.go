@@ -5,7 +5,7 @@ package core
 // grant verifies in a namespace and allows read there without reading it
 // unrestricted (§2.1), reads a covered namespace's /heads, log ranges,
 // long-poll and events filtered to what it may see, at URLs under
-// /ns/{ns}/g/{gs}, where gs is its subject set: scope:{digest} of its
+// /ns/{ns}/view/{view}, where view is its view: scope:{digest} of its
 // read rules (§A.4) and a subject binding it to its grant's key
 // (grantcheck.KeySubject; gsSubjects). A resource is visible to it where
 // its grant's blocks, key scope and roles allow reading it.
@@ -15,12 +15,12 @@ package core
 //   - filtered_scope.go: which namespaces are covered (fscope, §7.9
 //     Where);
 //   - filtered_state.go: the checkpoint a filtered answer is at (fcp, at),
-//     and the stored subject sets (filtered_gs);
+//     and the stored views (filtered_views);
 //   - filtered_visible.go: whether a name is visible (fview);
-//   - filtered_admit.go: a request's subject set, from a grant
+//   - filtered_admit.go: a request's view, from a grant
 //     (grantView) or a cookie (filteredAdmit);
 //   - filtered_exchange.go: POST /edge-grants for a partial reader, whose
-//     edge grant covers /ns/{ns}/g/{gs} alone.
+//     edge grant covers /ns/{ns}/view/{view} alone.
 //
 // Every path here is reached only through filteredScope. Branches are
 // never covered: their filtered URLs answer as any uncovered namespace's

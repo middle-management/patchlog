@@ -574,7 +574,7 @@ func (ch *Checker) CheckRead(ctx context.Context, ns, token, resource string) (*
 		d.Allowed = true
 		return d, nil
 	}
-	if ok, why := ch.allowsRead(v, resource); !ok {
+	if ok, why := ch.allowsRead(v, resource, nil, false); !ok {
 		d.Reason = why
 		return d, nil
 	}
@@ -609,25 +609,39 @@ func FailsRead(r *rules.Rule) bool {
 }
 
 // AllowsRead reports whether a verified grant may read resource ("" = the
-// whole namespace): the grant allows read, its key-scope and block rules
-// pass against the read envelope, none failing for a read (FailsRead:
-// such a grant is refused every read, §C.2 item 5), and, if it carries
-// roles, so do the rules of one that lists read, a role with a rule that
-// fails for a read not counting.
+// whole namespace) where the read concerns no stored document (doc null,
+// §6.4.1): the grant allows read, its key-scope and block rules pass
+// against the read envelope, none failing for a read (FailsRead: such a
+// grant is refused every read, §C.2 item 5) nor referring to /doc, and,
+// if it carries roles, so do the rules of one that lists read, a role
+// with a rule that fails for a read not counting.
 func (ch *Checker) AllowsRead(v *grant.Verified, resource string) bool {
-	ok, _ := ch.allowsRead(v, resource)
+	ok, _ := ch.allowsRead(v, resource, nil, false)
 	return ok
 }
 
-func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string) {
+// AllowsReadDoc is AllowsRead for a revision of resource whose document
+// is doc (§C.2 item 5: reads are judged per revision).
+func (ch *Checker) AllowsReadDoc(v *grant.Verified, resource string, doc any) bool {
+	ok, _ := ch.allowsRead(v, resource, doc, true)
+	return ok
+}
+
+func (ch *Checker) allowsRead(v *grant.Verified, resource string, doc any, hasDoc bool) (bool, string) {
 	ok, roles := v.Allows("read")
 	if !ok {
 		return false, "the grant does not allow read"
 	}
 	env := ReadEnvelope(v, resource, ch.now())
+	if hasDoc {
+		env["doc"] = doc
+	}
 	// The check's budget of validationSteps: a rule whose schema test
 	// runs out fails it, whatever role might have passed (§6.6).
 	m := rules.Budget(ch.steps)
+	passes := func(r *rules.Rule) bool {
+		return (hasDoc || !RefersToDoc(r)) && r.Passes(env, m)
+	}
 	for _, src := range [][]any{v.KeyRules, v.BlockRules} {
 		for _, rv := range src {
 			r, err := ch.compile(rv)
@@ -637,7 +651,7 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 			if FailsRead(r) {
 				return false, "a grant or key rule refers to /now, which no read passes (§C.2 item 5)"
 			}
-			if !r.Passes(env, m) {
+			if !passes(r) {
 				return false, "a grant or key rule refuses the read"
 			}
 		}
@@ -647,7 +661,7 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 			pass := true
 			for _, rv := range v.RoleRules(role) {
 				r, err := ch.compile(rv)
-				if err != nil || FailsRead(r) || !r.Passes(env, m) {
+				if err != nil || FailsRead(r) || !passes(r) {
 					pass = false
 					break
 				}
@@ -685,7 +699,7 @@ func (ch *Checker) ReadsPerResource(v *grant.Verified) bool {
 	for _, l := range lists {
 		for _, rv := range l {
 			r, err := ch.compile(rv)
-			if err != nil || r.Refs()["resource"] || r.Refs()["*"] {
+			if err != nil || r.Refs()["resource"] || r.Refs()["doc"] || r.Refs()["*"] {
 				return true
 			}
 		}
@@ -730,9 +744,10 @@ func (ch *Checker) ReadsUnrestricted(v *grant.Verified) bool {
 }
 
 // passWhole reports whether rules rs pass against env without referring to
-// /resource, or to /now (or the whole envelope), which fails any read.
+// /resource or /doc (§2.1 Unrestricted read), or to /now (or the whole
+// envelope), which fails any read.
 func (ch *Checker) passWhole(rs []any, env map[string]any, m *rules.Meter) bool {
-	return ch.passWholeRefs(rs, env, m, "resource", "now")
+	return ch.passWholeRefs(rs, env, m, "resource", "doc", "now")
 }
 
 // passWholeRefs reports whether rules rs pass against env, within what m
@@ -770,14 +785,14 @@ func (ch *Checker) NamespaceWide(v *grant.Verified) bool {
 	}
 	env := ReadEnvelope(v, "", ch.now())
 	m := rules.Budget(ch.steps) // the check's validationSteps (§6.6)
-	if !ch.passWholeRefs(v.KeyRules, env, m, "resource", "now") || !ch.passWholeRefs(v.BlockRules, env, m, "resource", "now") {
+	if !ch.passWholeRefs(v.KeyRules, env, m, "resource", "doc", "now") || !ch.passWholeRefs(v.BlockRules, env, m, "resource", "doc", "now") {
 		return false
 	}
 	if !v.HasRoles() {
 		return true
 	}
 	for _, role := range roles {
-		pass := ch.passWholeRefs(v.RoleRules(role), env, m, "resource", "now")
+		pass := ch.passWholeRefs(v.RoleRules(role), env, m, "resource", "doc", "now")
 		if m.Over {
 			// As ReadsUnrestricted: a spent budget fails the whole check.
 			return false
@@ -837,9 +852,9 @@ func SubjectSet(v *grant.Verified, includeSub bool) []string {
 	return out
 }
 
-// SubjectSetID is gs = text(trunc160(sha256(canonical(sorted subjects))))
-// (§B.11.5). subjects are sorted and de-duplicated first.
-func SubjectSetID(subjects []string) string {
+// ViewID is view = text(trunc160(sha256(canonical(sorted subjects))))
+// (§7.9 view, §A.4). subjects are sorted and de-duplicated first.
+func ViewID(subjects []string) string {
 	set := map[string]bool{}
 	for _, s := range subjects {
 		set[s] = true

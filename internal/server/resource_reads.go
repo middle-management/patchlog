@@ -80,6 +80,9 @@ func (s *Server) resourceRaw(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, err := s.e.ResourceRaw(r.Context(), ns, name, id, creds(r))
 	if err != nil {
+		if s.writeFilteredRedirect(w, err, "", nil) {
+			return
+		}
 		var ae *core.Error
 		if errors.As(err, &ae) && ae.Status == 404 && ae.Body["code"] == "not_offered" && ae.Public != nil {
 			s.cache(w, r, class, *ae.Public, resTags(ns, name)...)
@@ -116,7 +119,12 @@ func (s *Server) resourceRaw(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]any{"code": "not_found", "message": "not a raw document (§7.8)"})
 		return
 	}
-	w.Header().Set("Location", "/r/"+ns+"/"+name+"/blob/"+raw.Blob)
+	loc := "/r/" + ns + "/" + name + "/blob/" + raw.Blob
+	if viewedOf(r) != nil {
+		// Under the view, as the blob is read there (§7.9 Content).
+		loc = "/ns/" + ns + "/view/" + r.PathValue("view") + loc
+	}
+	w.Header().Set("Location", loc)
 	w.WriteHeader(302)
 }
 
@@ -128,6 +136,9 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 	}
 	rev, err := s.e.ResourceRev(r.Context(), ns, name, id, creds(r))
 	if err != nil {
+		if s.writeFilteredRedirect(w, err, "", nil) {
+			return
+		}
 		if s.writeErrShort(w, r, err, resTags(ns, name)...) {
 			return
 		}

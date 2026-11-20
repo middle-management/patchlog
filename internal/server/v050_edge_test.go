@@ -476,7 +476,8 @@ func TestV050EdgeGrantsKeyScopeSet(t *testing.T) {
 	}{
 		{"key scope", issue(ks), "/r/ks/a /r/ks/b"},
 		{"key scope and block", issue(ks, in("b", "c")), "/r/ks/b"},
-		{"key scope and a disjoint block", issue(ks, in("c")), ""},
+		// An empty set fixes nothing (§2.1): a partial reader's view.
+		{"key scope and a disjoint block", issue(ks, in("c")), "/ns/ks/view/*"},
 		{"readScope with a set", issue(kr, in("a", "b")), "/r/ks/a /r/ks/b"},
 		{"readScope unfixed", issue(kr), ""},
 	} {
@@ -487,7 +488,7 @@ func TestV050EdgeGrantsKeyScopeSet(t *testing.T) {
 			continue
 		}
 		expect(t, c.r, 200)
-		if got := prefixesOf(t, c.r); got != c.prefixes {
+		if got := prefixesOf(t, c.r); got != c.prefixes && !(strings.HasSuffix(c.prefixes, "*") && strings.HasPrefix(got, strings.TrimSuffix(c.prefixes, "*"))) {
 			t.Errorf("%s: prefixes %s", c.name, got)
 		}
 	}

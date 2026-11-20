@@ -182,10 +182,10 @@ async function nsInfo(ns) { return { level: 'e2e', doc: docs[ns] || null }; }
   out['not in the chain'] = await nsChainOK('r', 'x', at());
   // A partial reader's /heads is a redirect to its filtered listing, which api follows: it places no fork.
   nsChainOK.forks = new Map();
-  routes['/ns/r/rev/' + I.G + '/heads'] = Object.assign(heads(I.F1), { finalPath: '/ns/r/g/' + I.W + '/rev/' + I.G + '/heads' });
+  routes['/ns/r/rev/' + I.G + '/heads'] = Object.assign(heads(I.F1), { finalPath: '/ns/r/view/' + I.W + '/rev/' + I.G + '/heads' });
   out['filtered /heads'] = await nsChainOK('r', 'q', at());
   routes['/ns/r/rev/' + I.G + '/heads'] = heads(I.F1);
-  routes['/ns/r/log'] = { status: 200, json: [{ id: I.G, prev: '', kind: 'config' }], finalPath: '/ns/r/g/' + I.W + '/rev/' + I.X + '/log' };
+  routes['/ns/r/log'] = { status: 200, json: [{ id: I.G, prev: '', kind: 'config' }], finalPath: '/ns/r/view/' + I.W + '/rev/' + I.X + '/log' };
   out['filtered namespace log'] = await nsChainOK('r', 'q', at());
   routes['/ns/r/log'] = { status: 200, json: [{ id: I.G, prev: '', kind: 'config' }], finalPath: '/ns/r/rev/' + I.X + '/log' };
   out['the range at the head'] = await nsChainOK('r', 'q', at());

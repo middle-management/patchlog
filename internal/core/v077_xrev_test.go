@@ -16,11 +16,11 @@ import (
 func v077xCookie(t *testing.T, w *v75World, cred Credentials) (Credentials, string) {
 	t.Helper()
 	res, err := w.e.IssueEdgeGrants(context.Background(), []string{cred.Bearer})
-	if err != nil || len(res.Grants) != 1 || res.Grants[0].GS == "" {
+	if err != nil || len(res.Grants) != 1 || res.Grants[0].View == "" {
 		t.Fatalf("exchange: %+v %v", res, err)
 	}
 	g := res.Grants[0]
-	return Credentials{Edge: &EdgeGrant{NS: g.NS, GS: g.GS, Prefix: "/ns/" + g.NS + "/g/" + g.GS, Exp: w.now().Add(10 * time.Minute)}}, g.GS
+	return Credentials{Edge: &EdgeGrant{NS: g.NS, View: g.View, Prefix: "/ns/" + g.NS + "/view/" + g.View, Exp: w.now().Add(10 * time.Minute)}}, g.View
 }
 
 // Access 111: li through access-02, bo through reader-01,
@@ -79,7 +79,7 @@ func TestV077XconfScenario112Key(t *testing.T) {
 
 // Tree-derived access 113 (origin half): after matches-r7 is created,
 // matches edits only reader-01's maxTtl -> a partial reader of the branch
-// -> filtered /heads 403; the exchange gives no /ns/matches-r7/g/{gs}.
+// -> filtered /heads 403; the exchange gives no /ns/matches-r7/view/{gs}.
 // Since v0.78 no branch is covered (§7.9 Where), before the edit too.
 func TestV077XconfScenario113(t *testing.T) {
 	t.Parallel()
@@ -102,7 +102,7 @@ func TestV077XconfScenario113(t *testing.T) {
 	if err == nil {
 		for _, g := range res.Grants {
 			for _, p := range g.Prefixes() {
-				if len(p) > len("/ns/matches-r7/g/") && p[:len("/ns/matches-r7/g/")] == "/ns/matches-r7/g/" {
+				if len(p) > len("/ns/matches-r7/view/") && p[:len("/ns/matches-r7/view/")] == "/ns/matches-r7/view/" {
 					t.Errorf("exchange still gives %s", p)
 				}
 			}

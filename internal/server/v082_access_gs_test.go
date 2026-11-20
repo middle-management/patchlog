@@ -27,7 +27,7 @@ func TestV082AccessGSCookieEndsOnKeyChange(t *testing.T) {
 	li := w.li()
 	c, gs := w.cookie(li)
 	ck := cookieHdr(c)
-	base := "/ns/matches/g/" + gs
+	base := "/ns/matches/view/" + gs
 	r := w.do(req{method: "GET", path: base + "/heads", hdr: ck})
 	expect(t, r, 302)
 	at := r.H.Get("Location")

@@ -269,10 +269,15 @@ type Engine struct {
 	// refsCache is the $refs of schema revisions by path (schemaRefsOf).
 	refsMu    sync.Mutex
 	refsCache lru.Cache[string, []string]
-	// gsHeld is whether a gs cookie's record held under every document
-	// between its exchange's and a later one (gsHeldSince, gsHeldKey).
-	gsHeldMu    sync.Mutex
-	gsHeld      lru.Cache[[32]byte, bool]
+	// viewHeld is whether a view cookie's record held under every
+	// document between its exchange's and a later one (viewHeldSince,
+	// viewHeldKey).
+	viewHeldMu sync.Mutex
+	viewHeld   lru.Cache[[32]byte, bool]
+	// judgedMem keeps recent per-revision read answers (judge), which
+	// read_judged keeps for good.
+	judgedMu    sync.Mutex
+	judgedMem   lru.Cache[judgedKey, bool]
 	schemaScans atomic.Int64
 	cfgMu       sync.Mutex
 	cfgCache    map[int64]*Config
@@ -464,7 +469,7 @@ func Open(opt Options) (*Engine, error) {
 		started:    opt.Now().UTC(),
 	}
 	e.refsCache.MaxEntries = 65536
-	e.gsHeld.MaxEntries = 65536
+	e.viewHeld.MaxEntries = 65536
 	e.rc.maxBytes = opt.ReadCacheBytes
 	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
 	if err := e.checkKeyStore(); err != nil {
@@ -708,6 +713,9 @@ type tx struct {
 	// while it is set (readScope), nil outside one: every read check then
 	// gets a fresh budget.
 	readMeter *writeMeter
+	// judged are the per-revision read answers this transaction gave that
+	// read_judged doesn't hold yet (judge, flushJudged).
+	judged []judgedRow
 	// rateDrawn, when set, records that a write drew its rate-limit tokens,
 	// so a transaction run again (Postgres, pglock.go) doesn't draw them
 	// twice.
@@ -798,6 +806,17 @@ type docPut struct {
 
 // read runs f in a read transaction.
 func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
+	var judged []judgedRow
+	err = e.read1(ctx, func(t *tx) error {
+		defer func() { judged = t.judged }()
+		return f(t)
+	})
+	// Per-revision answers it gave are kept once it has ended (judge).
+	e.flushJudged(ctx, judged)
+	return err
+}
+
+func (e *Engine) read1(ctx context.Context, f func(t *tx) error) (err error) {
 	ctx, span := e.dbSpan(ctx, "core.db.read")
 	defer func() { endDBSpan(span, err) }()
 	e.stmts.prepare(e.db)

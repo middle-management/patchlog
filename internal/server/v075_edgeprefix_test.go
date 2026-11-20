@@ -11,7 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
-// §2.1 Edge prefix, §7.9 Edge grants, §C.5.4: /ns/{ns}/g/{gs} is a core
+// §2.1 Edge prefix, §7.9 Edge grants, §C.5.4: /ns/{ns}/view/{gs} is a core
 // prefix, withdrawn like the others, with gs an id ("all" is a service's
 // and isn't one); its cookie authorises nothing outside its path, and
 // reaches the engine with GS set.
@@ -24,7 +24,7 @@ func TestV075EdgePrefixG(t *testing.T) {
 	k := newKey("k")
 	head := e.mkNS("demo", map[string]any{"read": "grant", "keys": []any{k.entry("*")}})
 	gs := ids.Of([]byte("a subject set")).String()
-	prefix := "/ns/demo/g/" + gs
+	prefix := "/ns/demo/view/" + gs
 
 	r := e.do(req{method: "DELETE", path: "/edge-grants?prefix=" + prefix})
 	expect(t, r, 204)
@@ -32,10 +32,10 @@ func TestV075EdgePrefixG(t *testing.T) {
 	if len(gone) != 1 || gone[0].Path != prefix || gone[0].Name != edge.Name(prefix) || gone[0].MaxAge >= 0 {
 		t.Fatalf("Set-Cookie %v", r.H.Values("Set-Cookie"))
 	}
-	for _, p := range []string{"/ns/demo/g/all", "/ns/demo/g/xyz", "/ns/demo/g/" + gs + "/at", "/ns/demo/g/", "/ns/Demo/g/" + gs} {
+	for _, p := range []string{"/ns/demo/view/all", "/ns/demo/view/xyz", "/ns/demo/view/" + gs + "/at", "/ns/demo/view/", "/ns/Demo/view/" + gs} {
 		expectCode(t, e.do(req{method: "DELETE", path: "/edge-grants?prefix=" + p}), 400, "bad_input")
 	}
-	if p, ok := edge.ParseCorePrefix(prefix); !ok || p != (edge.Prefix{NS: "demo", GS: gs}) {
+	if p, ok := edge.ParseCorePrefix(prefix); !ok || p != (edge.Prefix{NS: "demo", View: gs}) {
 		t.Fatalf("ParseCorePrefix = %+v, %v", p, ok)
 	}
 	if _, _, ok := edge.ParsePrefix(prefix); ok {
@@ -55,7 +55,7 @@ func TestV075EdgePrefixG(t *testing.T) {
 	hr := httptest.NewRequest("GET", "https://cms.example"+prefix+"/heads", nil)
 	hr.AddCookie(c)
 	eg, _ := s.edgeCred(hr).Context().Value(edgeGrantKey{}).(*core.EdgeGrant)
-	if eg == nil || eg.NS != "demo" || eg.GS != gs || eg.Resource != "" || eg.Prefix != prefix {
+	if eg == nil || eg.NS != "demo" || eg.View != gs || eg.Resource != "" || eg.Prefix != prefix {
 		t.Fatalf("edge grant %+v", eg)
 	}
 	if got := eg.Prefixes(); len(got) != 1 || got[0] != prefix {

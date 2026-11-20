@@ -93,24 +93,17 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 		// read check passes (§8.5). A grant whose rules refer to /now never
 		// gets that far: the read check refuses it (anyReader, §C.2 item 5).
 		cfg := t.config(n.configSeq)
-		var visible func(name string) bool
+		var visible func(name string, seq int64) bool
 		if !t.readsNS(n, cfg, a, false) {
-			if fs := t.filteredScope(n); fs != nil && a != nil && a.verified != nil {
-				fv, err := t.grantView(fs, t.filteredCurrent(fs), a)
-				if err != nil {
-					return err
+			// Each revision with its own read envelope (§C.2 item 5).
+			seen := map[string]bool{}
+			visible = func(name string, seq int64) bool {
+				v, ok := seen[name]
+				if !ok {
+					v = t.canRead(n, cfg, a, name)
+					seen[name] = v
 				}
-				visible = func(name string) bool { return fv.visible(t, name) }
-			} else {
-				seen := map[string]bool{}
-				visible = func(name string) bool {
-					v, ok := seen[name]
-					if !ok {
-						v = t.canRead(n, cfg, a, name)
-						seen[name] = v
-					}
-					return v
-				}
+				return v && t.mayReadRow(a, n, name, t.rev(seq))
 			}
 		}
 		var after int64
@@ -120,11 +113,14 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 			// unpurged resource the reader may see; purge keeps the rows,
 			// not the listing.
 			r := t.resource(n.id, afterName)
-			if r == nil || r.state == statePurged || (visible != nil && !visible(afterName)) {
+			if r == nil || r.state == statePurged {
 				return notFound()
 			}
 			if err := t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND id = ? AND (gesture = ? OR undoes = ?)`,
 				r.id, afterID[:], gesture, gesture).Scan(&after); err != nil {
+				return notFound()
+			}
+			if visible != nil && !visible(afterName, after) {
 				return notFound()
 			}
 		}
@@ -156,7 +152,7 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 			// query at a time.
 			rows.Close()
 			for _, r := range batch {
-				if visible == nil || visible(r.name) {
+				if visible == nil || visible(r.name, r.seq) {
 					rs = append(rs, r)
 				}
 			}

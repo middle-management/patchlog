@@ -15,7 +15,7 @@ func v82encFilteredLog(w *v75s, bearer string) (gs, at string) {
 	expect(w.t, r, 302)
 	loc := r.H.Get("Location")
 	parts := strings.Split(strings.SplitN(loc, "?", 2)[0], "/")
-	if len(parts) != 8 || parts[3] != "g" || parts[5] != "at" || parts[7] != "log" {
+	if len(parts) != 8 || parts[3] != "view" || parts[5] != "at" || parts[7] != "log" {
 		w.t.Fatalf("Location %q", loc)
 	}
 	return parts[4], parts[6]
@@ -33,7 +33,7 @@ func TestV082PurgedHeadsPartialReader410(t *testing.T) {
 	li := w.li()
 	// Before the purge: the 302 to the filtered form, as ever.
 	before := w.nsHead("matches", w.admin)
-	if r := w.get("/ns/matches/rev/"+before+"/heads", li); r.Code != 302 || !strings.Contains(r.H.Get("Location"), "/ns/matches/g/") {
+	if r := w.get("/ns/matches/rev/"+before+"/heads", li); r.Code != 302 || !strings.Contains(r.H.Get("Location"), "/ns/matches/view/") {
 		t.Fatalf("before the purge: %d %v", r.Code, r.H)
 	}
 	opg := mint(t, w.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"matches"}, "can": []any{"purge-ns"},
@@ -72,5 +72,5 @@ func TestV082PurgedHeadsPartialReader410(t *testing.T) {
 	// The unfiltered log still redirects, and the filtered /heads it
 	// leads to answers the same 410.
 	gs, at := v82encFilteredLog(w, li)
-	expectCode(t, w.get("/ns/matches/g/"+gs+"/at/"+at+"/heads", li), 410, "purged")
+	expectCode(t, w.get("/ns/matches/view/"+gs+"/at/"+at+"/heads", li), 410, "purged")
 }

@@ -325,7 +325,9 @@ func TestV073QualifyingRolePerFixedName(t *testing.T) {
 		{"role passing for every name fixed", []any{"ab"}, fix("a", "b"), "/r/n/a /r/n/b"},
 		{"role failing for one name fixed", []any{"a-only"}, fix("a", "b"), ""},
 		{"one role of two qualifies", []any{"a-only", "ab"}, fix("a", "b"), "/r/n/a /r/n/b"},
-		{"role on /resource, nothing fixed", []any{"doc"}, nil, ""},
+		// A partial reader (§7.9), whose grant doesn't fix /resource: its
+		// view's prefix (v0.87).
+		{"role on /resource, nothing fixed", []any{"doc"}, nil, "/ns/n/view/*"},
 		{"role on /now", []any{"clock"}, nil, ""},
 		{"role on /now, a name fixed", []any{"clock"}, fix("doc"), ""},
 		{"role without rules", []any{"plain"}, nil, "/r/n /ns/n"},
@@ -345,7 +347,7 @@ func TestV073QualifyingRolePerFixedName(t *testing.T) {
 			t.Errorf("%s: %v", c.name, err)
 			continue
 		}
-		if got := strings.Join(v073Prefixes(eg), " "); got != c.want {
+		if got := strings.Join(v073Prefixes(eg), " "); got != c.want && !(strings.HasSuffix(c.want, "*") && strings.HasPrefix(got, strings.TrimSuffix(c.want, "*"))) {
 			t.Errorf("%s: prefixes %q, want %q", c.name, got, c.want)
 		}
 	}

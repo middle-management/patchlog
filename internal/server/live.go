@@ -53,11 +53,11 @@ type liveClock struct{ interval, phase time.Duration }
 // The path of a log's long-poll URL, without the query, which its phase
 // is drawn from (§7.7): built from the names, never from the request's
 // URL, so a prefix an edge adds or another spelling of the path can't
-// change it. Namespace and resource names (§3.6) and a gs need no
+// change it. Namespace and resource names (§3.6) and a view need no
 // escaping in a path.
 func resourceLogPath(ns, name string) string { return "/r/" + ns + "/" + name + "/log" }
 func nsLogPath(ns string) string             { return "/ns/" + ns + "/log" }
-func filteredLogPath(ns, gs string) string   { return "/ns/" + ns + "/g/" + gs + "/log" }
+func filteredLogPath(ns, view string) string { return "/ns/" + ns + "/view/" + view + "/log" }
 
 // clockOf is the long-poll clock of the log at path (resourceLogPath,
 // nsLogPath or filteredLogPath).
@@ -71,7 +71,7 @@ func newLiveClock(interval time.Duration, path string) liveClock {
 
 // LongPollPhase is a log's phase (§7.7, §I.25): the first 8 bytes of the
 // SHA-256 of its long-poll URL's path ("/ns/{ns}/log", "/r/{ns}/{name}/log"
-// or "/ns/{ns}/g/{gs}/log", no query), as an unsigned big-endian integer,
+// or "/ns/{ns}/view/{view}/log", no query), as an unsigned big-endian integer,
 // modulo the interval in milliseconds, in milliseconds: one phase for all
 // the log's followers, spread evenly over the interval across logs. An
 // interval is counted in whole milliseconds, and one under a millisecond

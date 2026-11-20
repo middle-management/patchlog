@@ -209,7 +209,7 @@ func (ix *Index) recover(ctx context.Context, rd *refsReader, force bool) error 
 		for _, m := range rd.markers {
 			ms = append(ms, m)
 		}
-		rd.gs = grantcheck.SubjectSetID(ms)
+		rd.gs = grantcheck.ViewID(ms)
 	}
 	return nil
 }
@@ -327,7 +327,7 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 	default:
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant reads no namespace the service follows"}
 	}
-	rd.gs = grantcheck.SubjectSetID(markers)
+	rd.gs = grantcheck.ViewID(markers)
 	rd.unverified = !verified
 	return rd, nil
 }
@@ -610,7 +610,7 @@ func (ix *Index) refsOwnAt(ctx context.Context, rd *refsReader, gs, url string) 
 	for _, m := range markers {
 		ms = append(ms, m)
 	}
-	return grantcheck.SubjectSetID(ms) == gs
+	return grantcheck.ViewID(ms) == gs
 }
 
 // refsBadMins answers a /_refs request with mins refused as given (bad,

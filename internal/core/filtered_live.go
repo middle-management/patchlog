@@ -15,18 +15,18 @@ import (
 // Each fetch of a waiter or a stream is admitted on its own, at the current
 // checkpoint (filteredAdmit), as §7.3 repeats an event stream's read check
 // before each page and keep-alive. The page it is then served is a
-// function of (namespace, gs, since, page size, at) alone, at pinning
-// every namespace visibility reads, so the waiters of one gs woken by the
+// function of (namespace, view, since, page size, at) alone, at pinning
+// every namespace visibility reads, so the waiters of one view woken by the
 // same commit share it: one read makes it (liveReads, under a key of its
 // own, never an unfiltered one's), recent ones are kept (filteredLiveDone),
-// and the view that judges its entries is one per (gs, at)
-// (filteredViews), so each new entry's visibility is judged once per gs
+// and the view that judges its entries is one per (view, at)
+// (filteredViews), so each new entry's visibility is judged once per view
 // per wake (Cost, SHOULD). None of it is the readcache's or the unfiltered
 // long-poll's: those answers are a namespace's whole log.
 
 // filteredViews keeps the views recent filtered live reads judged with, by
-// engine, namespace, gs and at: a view's answers are fixed by its gs and
-// checkpoint, so the waiters of one gs share its memo.
+// engine, namespace, view and at: a view's answers are fixed by its view and
+// checkpoint, so the waiters of one view share its memo.
 var filteredViews struct {
 	sync.Mutex
 	lru lru.Cache[string, *fview]
@@ -47,14 +47,14 @@ var testFilteredLiveRead func()
 
 // filteredLiveKey is the share key of a filtered live read: never an
 // unfiltered one's, whose keys start with a namespace name.
-func filteredLiveKey(e *Engine, ns, gs, since string, limit int, at string) string {
-	return fmt.Sprintf("\x01filtered\x00%p\x00%s\x00%s\x00%s\x00%s\x00%s", e, ns, gs, since, strconv.Itoa(limit), at)
+func filteredLiveKey(e *Engine, ns, view, since string, limit int, at string) string {
+	return fmt.Sprintf("\x01filtered\x00%p\x00%s\x00%s\x00%s\x00%s\x00%s", e, ns, view, since, strconv.Itoa(limit), at)
 }
 
-// sharedView is the view the waiters of fv's gs at fv's checkpoint share,
+// sharedView is the view the waiters of fv's view at fv's checkpoint share,
 // fv itself if it is the first.
 func sharedView(e *Engine, fv *fview) *fview {
-	k := fmt.Sprintf("%p\x00%s\x00%s\x00%s", e, fv.fs.n.name, fv.gs, fv.cp.at)
+	k := fmt.Sprintf("%p\x00%s\x00%s\x00%s", e, fv.fs.n.name, fv.view, fv.cp.at)
 	filteredViews.Lock()
 	defer filteredViews.Unlock()
 	if v, ok := filteredViews.lru.Get(k); ok {
@@ -67,15 +67,15 @@ func sharedView(e *Engine, fv *fview) *fview {
 	return fv
 }
 
-// FilteredLiveLog serves a fetch of GET /ns/{ns}/g/{gs}/log?live=long-poll
-// (§7.9 Long-poll) and of /ns/{ns}/g/{gs}/events (Events): the request
+// FilteredLiveLog serves a fetch of GET /ns/{ns}/view/{view}/log?live=long-poll
+// (§7.9 Long-poll) and of /ns/{ns}/view/{view}/events (Events): the request
 // is admitted at the current checkpoint, and answered with a page of the
-// log after since up to the head as its gs sees it there (filteredRange):
+// log after since up to the head as its view sees it there (filteredRange):
 // its visible entries, possibly none, Last the newest entry scanned, which
 // a follower moves past hidden entries with, and More whether the log goes
 // on. From a purged namespace's purge-ns entry it is 410 purged (§8.5).
-// The page is shared by the waiters of the same gs, since and at.
-func (e *Engine) FilteredLiveLog(ctx context.Context, ns, gs, since string, limit int, cred Credentials) (*Log, *FilteredInfo, error) {
+// The page is shared by the waiters of the same view, since and at.
+func (e *Engine) FilteredLiveLog(ctx context.Context, ns, view, since string, limit int, cred Credentials) (*Log, *FilteredInfo, error) {
 	var fv *fview
 	var info *FilteredInfo
 	var until time.Time
@@ -84,7 +84,7 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, gs, since string, limi
 		if err != nil {
 			return err
 		}
-		v, aerr := t.filteredAdmit(n, fs, gs, t.filteredCurrent(fs), cred)
+		v, aerr := t.filteredAdmit(n, fs, view, t.filteredCurrent(fs), cred)
 		if aerr != nil {
 			return aerr
 		}
@@ -98,7 +98,7 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, gs, since string, limi
 		return nil, nil, err
 	}
 	fv = sharedView(e, fv)
-	key := filteredLiveKey(e, ns, fv.gs, since, limit, fv.cp.at)
+	key := filteredLiveKey(e, ns, fv.view, since, limit, fv.cp.at)
 	filteredLiveDone.Lock()
 	lg, ok := filteredLiveDone.lru.Get(key)
 	filteredLiveDone.Unlock()

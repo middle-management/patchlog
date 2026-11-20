@@ -84,7 +84,7 @@ func TestV086AccessGSChangeUndone(t *testing.T) {
 // the undo: the row's entry digest is the one li's exchange recorded, so
 // its exchange can't share the record of li's cookie's second, a
 // document between the two not holding, and li's cookie from before the
-// change stays ended all the same (recordFilteredGS, gsShares).
+// change stays ended all the same (recordFilteredView, viewShares).
 func TestV086AccessGSChangeUndoneOtherExchanges(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -145,37 +145,37 @@ func TestV086AccessGSExchangeAcrossChange(t *testing.T) {
 	}
 	w.patchConfig("matches", v82accessOp("add", "/keys/1/groups", map[string]any{"deny": []any{"banned"}}))
 	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/1/groups"})
-	if err := w.e.recordFilteredGS(ctx, rec); err != nil {
+	if err := w.e.recordFilteredView(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
-	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", GS: rec.gs, Prefix: "/ns/matches/g/" + rec.gs, Exp: time.Unix(rec.exp, 0)}}
-	v86gsReads(t, w, "the cookie of an exchange that read before the change", rec.gs, cookie, 403)
+	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: rec.view, Prefix: "/ns/matches/view/" + rec.view, Exp: time.Unix(rec.exp, 0)}}
+	v86gsReads(t, w, "the cookie of an exchange that read before the change", rec.view, cookie, 403)
 	// A reader exchanging now gets a cookie that reads.
 	v82accessLater(w, time.Second)
 	fresh, _ := v82accessCookie(t, w, w.li())
-	v86gsReads(t, w, "a cookie from an exchange after the undo", rec.gs, fresh, 0)
-	v86gsReads(t, w, "the earlier cookie after that exchange", rec.gs, cookie, 403)
+	v86gsReads(t, w, "a cookie from an exchange after the undo", rec.view, fresh, 0)
+	v86gsReads(t, w, "the earlier cookie after that exchange", rec.view, cookie, 403)
 }
 
 // A cookie with no record of its own, one from before they were kept,
-// is refused, and so is one where more namespace documents than gsWalk
+// is refused, and so is one where more namespace documents than viewWalk
 // lie between its exchange and the checkpoint, whatever they changed.
 func TestV086AccessGSFailsClosed(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
 	w.seed()
 	cookie, gs := v82accessCookie(t, w, w.li())
-	for i := 0; i < gsWalk; i++ {
+	for i := 0; i < viewWalk; i++ {
 		w.patchConfig("matches", v82accessOp("add", "/x-n", float64(i)))
 	}
-	v86gsReads(t, w, "li's cookie, gsWalk documents later", gs, cookie, 0)
+	v86gsReads(t, w, "li's cookie, viewWalk documents later", gs, cookie, 0)
 	w.patchConfig("matches", v82accessOp("add", "/x-n", "one more"))
-	v86gsReads(t, w, "li's cookie, more than gsWalk documents later", gs, cookie, 403)
+	v86gsReads(t, w, "li's cookie, more than viewWalk documents later", gs, cookie, 403)
 	v82accessLater(w, time.Second)
 	again, _ := v82accessCookie(t, w, w.li())
 	v86gsReads(t, w, "li's cookie after exchanging again", gs, again, 0)
 	if err := w.e.update(context.Background(), func(t2 *tx) error {
-		_, err := t2.Exec(`DELETE FROM filtered_gs_exps`)
+		_, err := t2.Exec(`DELETE FROM filtered_view_exps`)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -258,10 +258,10 @@ func TestV086AccessGSNoSecondLeft(t *testing.T) {
 }
 
 // v86gsRead is what an exchange of cred reads of matches, without
-// recording it: the record recordFilteredGS is then given.
-func v86gsRead(t *testing.T, w *v75World, cred Credentials, exp time.Time) *gsRecord {
+// recording it: the record recordFilteredView is then given.
+func v86gsRead(t *testing.T, w *v75World, cred Credentials, exp time.Time) *viewRecord {
 	t.Helper()
-	var rec *gsRecord
+	var rec *viewRecord
 	if err := w.e.read(context.Background(), func(t2 *tx) error {
 		n := t2.nsByName("matches")
 		a, _, _, err := t2.nsAccess(n, cred)
@@ -293,11 +293,11 @@ func TestV086AccessGSStaleExchangeAfterNewer(t *testing.T) {
 	ctx := context.Background()
 	li := w.li()
 	exp := w.now().Truncate(time.Second).Add(10 * time.Minute)
-	cookieOf := func(rec *gsRecord) Credentials {
-		return Credentials{Edge: &EdgeGrant{NS: "matches", GS: rec.gs, Prefix: "/ns/matches/g/" + rec.gs, Exp: time.Unix(rec.exp, 0)}}
+	cookieOf := func(rec *viewRecord) Credentials {
+		return Credentials{Edge: &EdgeGrant{NS: "matches", View: rec.view, Prefix: "/ns/matches/view/" + rec.view, Exp: time.Unix(rec.exp, 0)}}
 	}
-	slot := func(rec *gsRecord) (s gsSlot) {
-		w.inTx(func(t2 *tx) { s, _ = t2.loadGSSlot("matches", rec.gs, rec.exp) })
+	slot := func(rec *viewRecord) (s viewSlot) {
+		w.inTx(func(t2 *tx) { s, _ = t2.loadViewSlot("matches", rec.view, rec.exp) })
 		return s
 	}
 	// Every document between holds: one record, at the later document.
@@ -307,15 +307,15 @@ func TestV086AccessGSStaleExchangeAfterNewer(t *testing.T) {
 	if newer.conf <= stale.conf {
 		t.Fatalf("documents: %d then %d", stale.conf, newer.conf)
 	}
-	for _, rec := range []*gsRecord{newer, stale} {
-		if err := w.e.recordFilteredGS(ctx, rec); err != nil {
+	for _, rec := range []*viewRecord{newer, stale} {
+		if err := w.e.recordFilteredView(ctx, rec); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if stale.exp != newer.exp || slot(newer).conf != newer.conf {
 		t.Fatalf("the stale exchange's cookie expires %d with record %+v, the newer one's %d at document %d: want one record, at the later document", stale.exp, slot(stale), newer.exp, newer.conf)
 	}
-	v86gsReads(t, w, "the newer cookie after the stale exchange's record", newer.gs, cookieOf(newer), 0)
+	v86gsReads(t, w, "the newer cookie after the stale exchange's record", newer.view, cookieOf(newer), 0)
 
 	// A change between them: the stale exchange takes its own second.
 	// (Cookies of another minute, clear of the record above.)
@@ -324,22 +324,22 @@ func TestV086AccessGSStaleExchangeAfterNewer(t *testing.T) {
 	w.patchConfig("matches", v82accessOp("add", "/keys/1/groups", map[string]any{"deny": []any{"banned"}}))
 	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/1/groups"})
 	newer = v86gsRead(t, w, li, exp)
-	for _, rec := range []*gsRecord{newer, stale} {
-		if err := w.e.recordFilteredGS(ctx, rec); err != nil {
+	for _, rec := range []*viewRecord{newer, stale} {
+		if err := w.e.recordFilteredView(ctx, rec); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if stale.exp >= newer.exp || slot(newer).conf != newer.conf || slot(stale).conf != stale.conf {
 		t.Fatalf("the stale exchange's cookie expires %d (record %+v), the newer one's %d (record %+v): want a second of its own, each with its document", stale.exp, slot(stale), newer.exp, slot(newer))
 	}
-	v86gsReads(t, w, "the newer cookie after the stale exchange's record", newer.gs, cookieOf(newer), 0)
-	v86gsReads(t, w, "the stale exchange's cookie", stale.gs, cookieOf(stale), 403)
+	v86gsReads(t, w, "the newer cookie after the stale exchange's record", newer.view, cookieOf(newer), 0)
+	v86gsReads(t, w, "the stale exchange's cookie", stale.view, cookieOf(stale), 403)
 }
 
 // v86gsRows are the seconds matches has a cookie record at for gs.
 func v86gsRows(w *v75World, gs string) (exps []int64) {
 	w.inTx(func(t2 *tx) {
-		rows, err := t2.Query(`SELECT exp FROM filtered_gs_exps WHERE ns = ? AND gs = ? ORDER BY exp`, "matches", gs)
+		rows, err := t2.Query(`SELECT exp FROM filtered_view_exps WHERE ns = ? AND view = ? ORDER BY exp`, "matches", gs)
 		t2.must(err)
 		defer rows.Close()
 		for rows.Next() {
@@ -375,16 +375,16 @@ func TestV086AccessGSTwoGrantsOneCookie(t *testing.T) {
 		if err != nil || len(res.Grants) != 2 {
 			t.Fatalf("%s: %+v %v", order, res, err)
 		}
-		gs := res.Grants[0].GS
+		gs := res.Grants[0].View
 		for _, g := range res.Grants {
-			if g.GS != gs || !g.Exp.Equal(long) {
+			if g.View != gs || !g.Exp.Equal(long) {
 				t.Errorf("%s: edge grant %+v, want gs %s until %v, the longer grant's exp", order, g, gs, long)
 			}
 		}
 		if rows := v86gsRows(w, gs); len(rows) != 1 || rows[0] != long.Unix() {
 			t.Errorf("%s: cookie records at %v, want one, at %d", order, rows, long.Unix())
 		}
-		cookie := Credentials{Edge: &EdgeGrant{NS: "matches", GS: gs, Prefix: "/ns/matches/g/" + gs, Exp: long}}
+		cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: gs, Prefix: "/ns/matches/view/" + gs, Exp: long}}
 		v86gsReads(t, w, order+": the cookie", gs, cookie, 0)
 	}
 }
@@ -404,7 +404,7 @@ func TestV086AccessGSSweepMargin(t *testing.T) {
 	if !has() {
 		t.Fatal("the record was swept within a minute of its exp")
 	}
-	v82accessLater(w, gsSweepMargin)
+	v82accessLater(w, viewSweepMargin)
 	v82accessCookie(t, w, w.li())
 	if has() {
 		t.Fatal("the record was kept past the margin")
@@ -412,7 +412,7 @@ func TestV086AccessGSSweepMargin(t *testing.T) {
 }
 
 // A read under a cookie past its exchange's document judges the
-// documents between once: the verdict is kept (gsHeldSince), and later
+// documents between once: the verdict is kept (viewHeldSince), and later
 // reads at that document read none of them again.
 func TestV086AccessGSVerdictKept(t *testing.T) {
 	t.Parallel()

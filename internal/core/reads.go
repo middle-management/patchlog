@@ -198,8 +198,17 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, name); err != nil {
+		a, err := t.reader(n, cred, name)
+		if err != nil {
 			return err
+		}
+		if t.readsByDoc(n, a) {
+			// Judged with the head's document (§C.2 item 5), a purged
+			// namespace's or resource's being null: answered as a read the
+			// reader may not make where the rules don't allow it (§7).
+			if n.purged || !t.mayReadRow(a, n, name, t.resolve(n, name, nil).head) {
+				return notFound()
+			}
 		}
 		// May read: the answer is the same for every reader (readcache.go).
 		if c, ok := e.rc.headFor(g, ns, name); ok {
@@ -303,8 +312,18 @@ type Rev struct {
 	SchemaRules string
 }
 
-// ResourceRev serves the document at a revision.
+// ResourceRev serves the document at a revision. A partial reader's
+// request with its grant in Authorization is a *FilteredRedirect to the
+// URL's form under its view (§7.9 Content).
 func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
+	return e.resourceRev(ctx, ns, name, id, cred, "/rev/"+id)
+}
+
+// resourceRev is ResourceRev, redirecting a partial reader to its view's
+// form of the URL ending in content after the resource's name, unless
+// content is "" (a read for another URL's answer, as ResourceRaw's of
+// /raw, which stays at its own URL).
+func (e *Engine) resourceRev(ctx context.Context, ns, name, id string, cred Credentials, content string) (*Rev, error) {
 	if c := e.rc.rev(ns, name, id); c != nil {
 		return c.answer(true), nil
 	}
@@ -320,15 +339,25 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		rid, perr := ids.Parse(id)
 		referrer := false
-		if _, err := t.reader(n, cred, name); err != nil {
+		a, aerr := t.reader(n, cred, name)
+		if aerr != nil {
 			// A schema revision n opens with schemaReads, to a reader of
 			// a document that pins it (§6.1, §7); nothing else of n.
 			if perr != nil || !t.schemaReadsRev(n, name, rid, cred, g) {
-				return err
+				return aerr
 			}
 			referrer = true
 		}
+		if !referrer && content != "" {
+			if err := t.contentRedirect(n, cred, a, name, content); err != nil {
+				return err
+			}
+		}
+		byDoc := !referrer && t.readsByDoc(n, a)
 		if n.purged {
+			if byDoc {
+				return notFound() // judged with a null document (§6.4.1)
+			}
 			return t.purgedRead(n)
 		}
 		out = &Rev{Public: t.cachePublic(n), Referrer: referrer}
@@ -342,7 +371,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		// May read: a plain document is the same for every reader
 		// (readcache.go). Sealed and e2e content is never cached.
-		if !t.isSealedNS(n) && !t.e2eContent(n, name) {
+		if !t.isSealedNS(n) && !t.e2eContent(n, name) && !byDoc {
 			if c := e.rc.revFor(g, ns, name, id); c != nil {
 				out, cached = c.answer(out.Public), true
 				out.Referrer = referrer
@@ -351,6 +380,9 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		v := t.resolve(n, name, nil)
 		if v.state == Purged {
+			if byDoc {
+				return notFound()
+			}
 			out.Status = 410
 			return nil
 		}
@@ -362,6 +394,11 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if row == nil {
 			out.Status = 404
 			return nil
+		}
+		if byDoc && !t.mayReadRow(a, n, name, row) {
+			// That revision's read envelope (§C.2 item 5): a read-rule
+			// failure, 404 at a resource's URL (§7).
+			return notFound()
 		}
 		if plain {
 			out.Created = time.UnixMilli(row.created)
@@ -586,11 +623,19 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 		if aerr != nil {
 			return aerr
 		}
+		byDoc := t.readsByDoc(n, a)
 		if n.purged {
+			if byDoc {
+				return notFound() // judged with null documents (§6.4.1)
+			}
 			return t.purgedRead(n)
 		}
 		if q != nil {
 			q.ok, q.anyone, q.until = standing(t, n, cred, a)
+			if byDoc {
+				// Its answers are judged per entry, never shared.
+				q.ok = false
+			}
 		}
 		out = &Log{Public: t.cachePublic(n), Until: t.admittedUntil(n, cred, a)}
 		v := t.resolve(n, name, nil)
@@ -668,6 +713,18 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 		// entries after it: the horizon's sealed snapshot is served as
 		// /rev/{H} (ResourceRev), never as a log entry (§7.1 Paging).
 		out.Last = since
+		if byDoc {
+			// Each entry judged with its own read envelope (§C.2 item 5).
+			ms, ok := t.judgeEntries(n, a, name, entries)
+			if !ok {
+				return notFound()
+			}
+			out.Entries = ms
+			if len(entries) > 0 {
+				out.Last = entries[len(entries)-1].ID
+			}
+			return nil
+		}
 		for _, e := range entries {
 			out.Entries = append(out.Entries, e.value())
 			out.Last = e.ID
@@ -946,6 +1003,9 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		if resource != "" {
 			// A resource stream's purge and prune events (eventseal.go).
 			out.Entries = resourceEvents(out.Entries, resource)
+			if t.readsByDoc(n, a) {
+				out.Entries = t.judgePruneEvents(n, a, resource, out.Entries)
+			}
 			if t.isSealedNS(n) {
 				out.Sealed, nsRowID = true, n.id
 				jobs = t.resourceEventJobs(n, resource, out.Entries)

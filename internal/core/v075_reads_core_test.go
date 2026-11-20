@@ -28,12 +28,16 @@ func TestV075FilteredLiveCost(t *testing.T) {
 	t.Cleanup(func() { testFilteredJudge = nil })
 	li, bo := w.li(), w.bo()
 	lgs, bgs := v075GS(t, w, li), v075GS(t, w, bo)
+	var lkey, bkey string
+	w.inTx(func(t2 *tx) {
+		lkey, bkey = v075View(t, t2, "matches", li).j.key, v075View(t, t2, "matches", bo).j.key
+	})
 	since := w.head("matches")
 	w.put("matches", "derby", map[string]any{"v": 2})
 	poll := func(cred Credentials, gs string) []string {
 		t.Helper()
 		lg, info, err := w.e.FilteredLiveLog(ctx, "matches", gs, since, 100, cred)
-		if err != nil || lg.Status != 200 || info.GS != gs || lg.Last != w.head("matches") {
+		if err != nil || lg.Status != 200 || info.View != gs || lg.Last != w.head("matches") {
 			t.Fatalf("FilteredLiveLog: %+v %+v %v", lg, info, err)
 		}
 		var names []string
@@ -56,7 +60,7 @@ func TestV075FilteredLiveCost(t *testing.T) {
 	if got := poll(bo, bgs); len(got) != 0 {
 		t.Fatalf("bo: %v", got)
 	}
-	if judged[lgs+"/derby"] != 1 || judged[bgs+"/derby"] != 1 {
+	if judged[lkey+"/derby"] != 1 || judged[bkey+"/derby"] != 1 {
 		t.Fatalf("judgements %v", judged)
 	}
 	// The next wake, with a new at: judged again, once.
@@ -65,7 +69,7 @@ func TestV075FilteredLiveCost(t *testing.T) {
 	w.put("matches", "derby", map[string]any{"v": 4})
 	poll(li, lgs)
 	poll(li, lgs)
-	if judged[lgs+"/derby"] != 2 {
+	if judged[lkey+"/derby"] != 2 {
 		t.Fatalf("judgements after the next wake %v", judged)
 	}
 }
@@ -110,7 +114,7 @@ func TestV075RedirectRecordsAt(t *testing.T) {
 	ctx := context.Background()
 	_, err := w.e.NamespaceHeads(ctx, "matches", w.head("matches"), "", w.li())
 	fr, ok := err.(*FilteredRedirect)
-	if !ok || fr.At == "" || fr.NS != "matches" || fr.GS != v075GS(t, w, w.li()) {
+	if !ok || fr.At == "" || fr.NS != "matches" || fr.View != v075GS(t, w, w.li()) {
 		t.Fatalf("redirect %v", err)
 	}
 	// Events and long-poll carry no at, and record none.
@@ -120,7 +124,7 @@ func TestV075RedirectRecordsAt(t *testing.T) {
 	}
 	// The filtered page at it, after a write moved the current at.
 	w.put("matches", "derby", map[string]any{"v": 2})
-	page, info, err := w.e.FilteredHeads(ctx, "matches", fr.GS, fr.At, "", "", w.li())
+	page, info, err := w.e.FilteredHeads(ctx, "matches", fr.View, fr.At, "", "", w.li())
 	if err != nil || info.At != fr.At || len(page.Items) != 2 {
 		t.Fatalf("at the recorded at: %+v %+v %v", page, info, err)
 	}

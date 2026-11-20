@@ -263,9 +263,10 @@ func TestV049BranchReadCheck(t *testing.T) {
 			expectCode(t, e.branch("sec", map[string]any{"name": "sec-b"}, g), 403, "forbidden")
 		}
 
-		// A /doc rule is the branch's to pass, at step 6.
+		// A block rule on /doc leaves the grant without unrestricted read
+		// (v0.87, §2.1): no branch, whatever the branch's document.
 		g := mk([]string{"read", "branch"}, team)
 		expectCode(t, e.branch("sec", map[string]any{"name": "sec-b"}, g), 403, "forbidden")
-		expect(t, e.branch("sec", map[string]any{"name": "sec-b", "patches": ops(op("add", "/x-team", "a"))}, g), 201)
+		expectCode(t, e.branch("sec", map[string]any{"name": "sec-b", "patches": ops(op("add", "/x-team", "a"))}, g), 403, "forbidden")
 	}
 }

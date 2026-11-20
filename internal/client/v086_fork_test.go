@@ -205,7 +205,7 @@ func TestV086FilteredHeadsDoNotPlaceAFork(t *testing.T) {
 		return roundTrip(func(req *http.Request) (*http.Response, error) {
 			if req.Method == "GET" && strings.HasSuffix(req.URL.Path, "/heads") && deny.MatchString(req.URL.Path) {
 				h := http.Header{}
-				h.Set("Location", strings.Replace(req.URL.Path, "/rev/", "/g/1"+strings.Repeat("a", 32)+"/rev/", 1))
+				h.Set("Location", strings.Replace(req.URL.Path, "/rev/", "/view/1"+strings.Repeat("a", 32)+"/rev/", 1))
 				return &http.Response{StatusCode: 302, Header: h, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
 			}
 			return next.RoundTrip(req)

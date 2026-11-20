@@ -69,9 +69,10 @@ func blobUpload(r *http.Request) core.BlobUpload {
 // blobHeaders: reads, and uploads and copies, which answer at the same URL
 // (§7.8).
 var blobRoutes = map[string]bool{
-	"GET /r/{ns}/{name}/blob/{bid}":       true,
-	"GET /r/{ns}/{name}/blob/{bid}/e/{e}": true,
-	"PUT /r/{ns}/{name}/blob/{bid}":       true,
+	"GET /r/{ns}/{name}/blob/{bid}":                true,
+	"GET /ns/{ns}/view/{view}/r/{name}/blob/{bid}": true,
+	"GET /r/{ns}/{name}/blob/{bid}/e/{e}":          true,
+	"PUT /r/{ns}/{name}/blob/{bid}":                true,
 }
 
 // blobHeaders sets what every blob response carries, errors and the
@@ -94,6 +95,9 @@ func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := s.e.OpenBlob(r.Context(), ns, name, bid, creds(r))
 	if err != nil {
+		if s.writeFilteredRedirect(w, err, "", nil) {
+			return
+		}
 		if s.writeErrShort(w, r, err, resTags(ns, name)...) {
 			return
 		}

@@ -951,7 +951,7 @@ func (t *tx) copySource(target *nsRow, req Request, ns, name string, bid ids.ID)
 	if sn == nil || sn.purged {
 		return nil
 	}
-	if !t.sourceReadable(sn, name, req) {
+	if !t.sourceReadable(sn, name, req) || !t.credsReadBlob(sn, name, bid, req.anyCreds()) {
 		return nil
 	}
 	if sn.id != target.id && localSourceRank(t.config(sn.configSeq)) > targetRank(t.config(target.configSeq)) {
@@ -1215,10 +1215,18 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, name); err != nil {
+		a, err := t.reader(n, cred, name)
+		if err != nil {
 			return err
 		}
+		if err := t.contentRedirect(n, cred, a, name, "/blob/"+bidText); err != nil {
+			return err
+		}
+		byDoc := t.readsByDoc(n, a)
 		if n.purged {
+			if byDoc {
+				return notFound() // judged with a null document (§6.4.1)
+			}
 			return t.purgedRead(n)
 		}
 		out = &Blob{Public: t.cachePublic(n)}
@@ -1226,6 +1234,10 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 		if perr != nil {
 			out.Status = 404
 			return nil
+		}
+		if byDoc && !t.mayReadBlob(a, n, name, bid) {
+			// Judged with the documents that reference it (§7.8, §6.4.1).
+			return notFound()
 		}
 		ans := t.servableBlob(n, name, bid)
 		out.Status = ans.status

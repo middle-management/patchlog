@@ -87,7 +87,7 @@ func TestV081SvcDecodedFilterNow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if g.Allows("a") || g.AllowsItem("a") {
+	if g.Allows("a") || g.Allows("a") {
 		t.Fatal("a block rule on /now allows")
 	}
 	key := &grantcheck.ReadFilter{KeyRules: []any{past}}
@@ -95,11 +95,11 @@ func TestV081SvcDecodedFilterNow(t *testing.T) {
 		t.Fatal("a key-scope rule on /now allows")
 	}
 	role := &grantcheck.ReadFilter{Roles: [][]any{{past}}}
-	if role.Allows("a") || role.AllowsItem("a") {
+	if role.Allows("a") || role.Allows("a") {
 		t.Fatal("a role on /now counts")
 	}
 	two := &grantcheck.ReadFilter{Roles: [][]any{{past}, {}}}
-	if !two.Allows("a") || !two.AllowsItem("a") {
+	if !two.Allows("a") || !two.Allows("a") {
 		t.Fatal("a role without /now beside one with it doesn't count")
 	}
 }

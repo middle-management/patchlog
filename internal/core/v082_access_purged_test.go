@@ -25,7 +25,7 @@ func v82accessPurgedHeads(w *v75World, gs, at string, cred Credentials) [3]int {
 }
 
 // Conformance 124: covered matches is purged. li's grant in Authorization
-// at another subject set's /g/{gs}/heads is 403, not 410, with or without
+// at another subject set's /view/{gs}/heads is 403, not 410, with or without
 // at; at her own it is 410. An unrestricted reader's grant is 403 at every
 // gs, as at a live namespace's filtered URLs (§7.9 Partial reader),
 // where v0.27.0 answered 410; its 410 is at the unfiltered /heads. A
@@ -53,7 +53,7 @@ func TestV082AccessPurgedFilteredHeadsReadCheck(t *testing.T) {
 	head := v077Purge(t, w, "matches")
 	exp := w.now().Add(10 * time.Minute)
 	nsCookie := Credentials{Edge: &EdgeGrant{NS: "matches", Prefix: "/ns/matches", Exp: exp}}
-	boCookie := Credentials{Edge: &EdgeGrant{NS: "matches", GS: boGS, Prefix: "/ns/matches/g/" + boGS, Exp: exp}}
+	boCookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: boGS, Prefix: "/ns/matches/view/" + boGS, Exp: exp}}
 	all := func(st int) [3]int { return [3]int{st, st, st} }
 	for name, c := range map[string]struct {
 		gs   string
@@ -69,7 +69,7 @@ func TestV082AccessPurgedFilteredHeadsReadCheck(t *testing.T) {
 		"li's cookie at another":                   {boGS, liCookie, 403},
 		"a cookie for a gs nothing is kept for":    {boGS, boCookie, 401},
 		"a /ns/matches cookie at li's gs":          {liGS, nsCookie, 410},
-		"a /ns/matches cookie at a gs without row": {boGS, nsCookie, 401},
+		"a /ns/matches cookie at a gs without row": {boGS, nsCookie, 410},
 		"no credentials":                           {liGS, Credentials{}, 401},
 	} {
 		if got := v82accessPurgedHeads(w, c.gs, red.At, c.cred); got != all(c.want) {

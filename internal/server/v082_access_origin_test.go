@@ -200,8 +200,8 @@ func TestV082AccessNowBeforePurged(t *testing.T) {
 		{"/r/matches/derby/rev/" + rev, 404, 410, false},
 		{"/ns/matches/rev/" + head + "/heads", 403, 410, true},
 		{"/ns/matches/gestures/" + gA, 403, 410, false},
-		{"/ns/matches/g/" + gs + "/heads", 403, 410, false},
-		{"/ns/matches/g/" + gs + "/at/" + at + "/heads", 403, 410, false},
+		{"/ns/matches/view/" + gs + "/heads", 403, 410, false},
+		{"/ns/matches/view/" + gs + "/at/" + at + "/heads", 403, 410, false},
 	} {
 		good := li
 		if c.admin {
@@ -239,7 +239,7 @@ func v82accessPurge(t *testing.T, w *v75s) string {
 }
 
 // Conformance 124, second half, over HTTP (ACC-8b): covered matches is
-// purged. li's grant at another subject set's /g/{gs}/heads is 403, not
+// purged. li's grant at another subject set's /view/{gs}/heads is 403, not
 // 410; at her own, 410. An unrestricted reader's grant is 403 at the
 // filtered URLs, as at a live namespace's, and 410 at the unfiltered
 // /heads. None of the 403s shows the purge.
@@ -265,7 +265,7 @@ func TestV082AccessPurgedFilteredHeads(t *testing.T) {
 		{"an unrestricted reader at bo's gs", w.admin, boGS, 403},
 		{"no credentials", "", liGS, 401},
 	} {
-		for _, path := range []string{"/ns/matches/g/" + c.gs + "/heads", "/ns/matches/g/" + c.gs + "/at/" + at + "/heads"} {
+		for _, path := range []string{"/ns/matches/view/" + c.gs + "/heads", "/ns/matches/view/" + c.gs + "/at/" + at + "/heads"} {
 			r := w.get(path, c.bearer)
 			if r.Code != c.want {
 				t.Errorf("%s, %s: %d %s, want %d", c.who, path, r.Code, r.Body, c.want)
@@ -280,7 +280,7 @@ func TestV082AccessPurgedFilteredHeads(t *testing.T) {
 	expectCode(t, w.get("/ns/matches/rev/"+head+"/heads", w.admin), 410, "purged")
 }
 
-// Conformance 125 (§7.9 URLs, §6.2): /ns/matches/g/all/…, and a gs or
+// Conformance 125 (§7.9 URLs, §6.2): /ns/matches/view/all/…, and a gs or
 // at that isn't an id in text form, are 400 bad_input, a request-shape
 // error, before any 401 or 403: without credentials, with a grant the
 // read check refuses, with a partial reader's, and for a namespace that
@@ -295,18 +295,18 @@ func TestV082AccessFilteredShapeFirst(t *testing.T) {
 	refused := w.grant(w.k, "user:x", []string{"cat-season"}, []string{"read"})
 	now := w.li(map[string]any{"rules": []any{v82accessNow}})
 	paths := []string{
-		"/ns/matches/g/all/heads",
-		"/ns/matches/g/all/at/" + at + "/heads",
-		"/ns/matches/g/all/at/" + at + "/log",
-		"/ns/matches/g/all/log?live=long-poll&since=" + since,
-		"/ns/matches/g/all/events",
-		"/ns/matches/g/" + strings.ToUpper(gs) + "/heads",
-		"/ns/matches/g/" + gs[:len(gs)-1] + "/heads",
-		"/ns/matches/g/" + gs + "/at/all/heads",
-		"/ns/matches/g/" + gs + "/at/" + at[:len(at)-1] + "/log",
-		"/ns/matches/g/" + gs + "/at/" + at + "x/heads",
-		"/ns/nowhere/g/all/heads",
-		"/ns/cat-season/g/all/heads",
+		"/ns/matches/view/all/heads",
+		"/ns/matches/view/all/at/" + at + "/heads",
+		"/ns/matches/view/all/at/" + at + "/log",
+		"/ns/matches/view/all/log?live=long-poll&since=" + since,
+		"/ns/matches/view/all/events",
+		"/ns/matches/view/" + strings.ToUpper(gs) + "/heads",
+		"/ns/matches/view/" + gs[:len(gs)-1] + "/heads",
+		"/ns/matches/view/" + gs + "/at/all/heads",
+		"/ns/matches/view/" + gs + "/at/" + at[:len(at)-1] + "/log",
+		"/ns/matches/view/" + gs + "/at/" + at + "x/heads",
+		"/ns/nowhere/view/all/heads",
+		"/ns/cat-season/view/all/heads",
 	}
 	for _, path := range paths {
 		for name, bearer := range map[string]string{"no credentials": "", "a malformed grant": "garbage", "a grant for another namespace": refused,
@@ -318,8 +318,8 @@ func TestV082AccessFilteredShapeFirst(t *testing.T) {
 		}
 	}
 	// Well-formed, the same requests get the read check's answers.
-	expect(t, w.get("/ns/matches/g/"+gs+"/heads", ""), 401)
-	expect(t, w.get("/ns/matches/g/"+gs+"/heads", now), 403)
-	expect(t, w.get("/ns/matches/g/"+gs+"/heads", w.admin), 403)
-	expect(t, w.get("/ns/matches/g/"+gs+"/heads", li), 302)
+	expect(t, w.get("/ns/matches/view/"+gs+"/heads", ""), 401)
+	expect(t, w.get("/ns/matches/view/"+gs+"/heads", now), 403)
+	expect(t, w.get("/ns/matches/view/"+gs+"/heads", w.admin), 403)
+	expect(t, w.get("/ns/matches/view/"+gs+"/heads", li), 302)
 }

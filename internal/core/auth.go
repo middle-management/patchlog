@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/rules"
@@ -24,7 +25,24 @@ type Credentials struct {
 	// Edge is a verified edge grant (§C.5), for GET and HEAD under its
 	// prefix only: the server sets it from a cookie, never for writes.
 	Edge *EdgeGrant
+	// viewed is set by ViewCredentials for a request at a view's content
+	// URL (§7.9 Content), once admitted there: the resource read paths
+	// then judge each revision by the view, as they judge a grant's.
+	viewed *viewedBy
 }
+
+// viewedBy is a request admitted at a view's content URL: of namespace
+// ns, judged by j, or reading unrestricted where j is nil (an
+// unrestricted reader's /ns/{ns} cookie).
+type viewedBy struct {
+	ns, view string
+	j        *judge
+	reader   *actor
+}
+
+// Viewed reports whether cred stands for a request at a view's content
+// URL (ViewCredentials).
+func (c Credentials) Viewed() bool { return c.viewed != nil }
 
 // actor is the authenticated principal of a request in one namespace.
 type actor struct {
@@ -37,10 +55,13 @@ type actor struct {
 	// noAuth: a request made while authentication is disabled (§1). The
 	// namespace entries written for it record "grant": null (§7.4).
 	noAuth bool
-	// gs is the subject set of a filtered read's edge grant (§7.9,
+	// view is the view of a filtered read's cookie (§7.9,
 	// filteredAdmit): such an actor never reads unrestricted (readsNS,
 	// canRead).
-	gs string
+	view string
+	// judge is the per-revision read check of the grant (grantJudge),
+	// once built.
+	judge *judge
 }
 
 func (a *actor) id() string { return a.principal.ID }
@@ -452,7 +473,7 @@ func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 	if cfg.Read == "public" || t.e.opt.AuthDisabled {
 		return true
 	}
-	if a == nil || a.verified == nil || a.gs != "" {
+	if a == nil || a.verified == nil || a.view != "" {
 		return false
 	}
 	if !a.verified.Can["read"] {
@@ -472,6 +493,14 @@ func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error
 	cfg := t.config(n.configSeq)
 	var a *actor
 	var err *Error
+	if v := cred.viewed; v != nil {
+		// Admitted at the view's URL (ViewCredentials): each revision is
+		// judged by the view (mayReadRow).
+		if v.ns != n.name {
+			return nil, notFound()
+		}
+		return &actor{principal: v.reader.principal, bucketKey: v.reader.bucketKey, view: v.view, judge: v.j}, nil
+	}
 	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
 		a, err = t.edgeReader(n, cred.Edge, resource)
 	} else {
@@ -688,7 +717,7 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 	if a.verified == nil {
 		// A namespace's edge grant (edgeReader), but not a filtered
 		// read's (§7.9).
-		return a.gs == ""
+		return a.view == ""
 	}
 	roles, ok := a.unrestrictedRoles()
 	if !ok {
@@ -701,18 +730,19 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 }
 
 // unrestrictedRoles reports whether a grant's rules leave every resource
-// readable (§2.1 Unrestricted read): its key has no readScope, no rule of
-// its blocks or key scope refers to /resource, and, if it carries roles,
-// some role listing read has no rule that refers to /resource or to /now.
-// Those roles are returned, nil for a grant without roles; roles are
-// alternatives (§C.1.1), so one is enough. A role with a rule on /now
-// doesn't count for read (§C.2 item 5), so it gives no unrestricted read
-// either: it is left out here, not only by the read envelope its callers
-// then evaluate (readsNS, the /keys relay of K_e), so that no caller can
-// take it for one (v0.82).
+// and revision readable (§2.1 Unrestricted read): its key has no
+// readScope, no rule of its blocks or key scope refers to /resource or
+// /doc, and, if it carries roles, some role listing read has no rule that
+// refers to /resource, /doc or /now. Those roles are returned, nil for a
+// grant without roles; roles are alternatives (§C.1.1), so one is enough.
+// A role with a rule on /now doesn't count for read (§C.2 item 5), so it
+// gives no unrestricted read either: it is left out here, not only by the
+// read envelope its callers then evaluate (readsNS, the /keys relay of
+// K_e), so that no caller can take it for one (v0.82).
 func (a *actor) unrestrictedRoles() ([]string, bool) {
 	v := a.verified
-	if v.Key.ReadScopeResource || refersToResource(v.KeyRules) || refersToResource(v.BlockRules) {
+	if v.Key.ReadScopeResource || refersToResource(v.KeyRules) || refersToResource(v.BlockRules) ||
+		refersToDoc(v.KeyRules) || refersToDoc(v.BlockRules) {
 		return nil, false
 	}
 	ok, roles := v.Allows("read")
@@ -721,7 +751,7 @@ func (a *actor) unrestrictedRoles() ([]string, bool) {
 	}
 	var out []string
 	for _, r := range roles {
-		if rs := v.RoleRules(r); !refersToResource(rs) && !rulesReferToNow(rs) {
+		if rs := v.RoleRules(r); !refersToResource(rs) && !refersToDoc(rs) && !rulesReferToNow(rs) {
 			out = append(out, r)
 		}
 	}
@@ -734,6 +764,19 @@ func refersToResource(rs []any) bool {
 	for _, rv := range rs {
 		r, err := compileCached(rv)
 		if err != nil || r.Refs()["resource"] || r.Refs()["*"] {
+			return true
+		}
+	}
+	return false
+}
+
+// refersToDoc reports whether a rule of rs refers to /doc, or to the
+// whole envelope (grantcheck.RefersToDoc). A rule that doesn't compile
+// counts.
+func refersToDoc(rs []any) bool {
+	for _, rv := range rs {
+		r, err := compileCached(rv)
+		if err != nil || grantcheck.RefersToDoc(r) {
 			return true
 		}
 	}

@@ -20,7 +20,7 @@ func v75sLoseRead(t *testing.T, w *v75s) (li string, ck map[string]string, gs st
 	c, gs := w.cookie(li)
 	ck = cookieHdr(c)
 	_, at := w.filtered(li)
-	r := w.do(req{method: "GET", path: "/ns/matches/g/" + gs + "/at/" + at + "/heads", hdr: ck})
+	r := w.do(req{method: "GET", path: "/ns/matches/view/" + gs + "/at/" + at + "/heads", hdr: ck})
 	expect(t, r, 200)
 	if names := headNames(t, r); !reflect.DeepEqual(names, []string{"derby"}) {
 		t.Fatalf("before: %v", names)
@@ -35,7 +35,7 @@ func wantCookieRefused(t *testing.T, w *v75s, li string, ck map[string]string, g
 	if r := w.get("/ns/matches/rev/"+w.nsHead("matches", w.admin)+"/heads", li); r.Code != 403 {
 		t.Fatalf("the grant: %d %v", r.Code, r.H.Get("Location"))
 	}
-	r := w.do(req{method: "GET", path: "/ns/matches/g/" + gs + "/heads", hdr: ck})
+	r := w.do(req{method: "GET", path: "/ns/matches/view/" + gs + "/heads", hdr: ck})
 	if r.Code == 302 {
 		r = w.do(req{method: "GET", path: r.H.Get("Location"), hdr: ck})
 	}
@@ -95,13 +95,13 @@ func TestV075XrevFilteredHeadsPurgedUnknownAt(t *testing.T) {
 	gs, at := v82encFilteredLog(w, li)
 	bogus := "1nyv2d2ibcop4nnp4k5niguadz7lvyjad"
 	expectCode(t, w.get("/ns/matches/rev/"+bogus+"/heads", w.admin), 410, "purged")
-	expectCode(t, w.get("/ns/matches/g/"+gs+"/at/"+bogus+"/heads", li), 410, "purged")
-	expectCode(t, w.get("/ns/matches/g/"+gs+"/at/"+at+"/heads", li), 410, "purged")
-	if r := w.get("/ns/matches/g/"+gs+"/at/"+bogus+"/log", li); r.Code != 302 {
+	expectCode(t, w.get("/ns/matches/view/"+gs+"/at/"+bogus+"/heads", li), 410, "purged")
+	expectCode(t, w.get("/ns/matches/view/"+gs+"/at/"+at+"/heads", li), 410, "purged")
+	if r := w.get("/ns/matches/view/"+gs+"/at/"+bogus+"/log", li); r.Code != 302 {
 		t.Errorf("filtered log of a purged namespace at an unknown at: %d", r.Code)
 	}
 	// The read check still comes first.
-	if r := w.get("/ns/matches/g/"+gs+"/at/"+bogus+"/heads", ""); r.Code != 401 {
+	if r := w.get("/ns/matches/view/"+gs+"/at/"+bogus+"/heads", ""); r.Code != 401 {
 		t.Errorf("without a grant: %d", r.Code)
 	}
 }

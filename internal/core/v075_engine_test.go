@@ -344,11 +344,11 @@ func TestV075NSAccess(t *testing.T) {
 		}
 	})
 	gs := v075GS(t, w, li)
-	if _, err := w.e.NamespaceHeads(context.Background(), "matches", w.head("matches"), "", Credentials{Edge: &EdgeGrant{NS: "matches", GS: gs, Prefix: "/ns/matches/g/" + gs}}); v75Status(err) != 403 {
+	if _, err := w.e.NamespaceHeads(context.Background(), "matches", w.head("matches"), "", Credentials{Edge: &EdgeGrant{NS: "matches", View: gs, Prefix: "/ns/matches/view/" + gs}}); v75Status(err) != 403 {
 		t.Fatalf("NamespaceHeads under a GS edge grant: %v", err)
 	}
 	w.inTx(func(t2 *tx) {
-		a := &actor{principal: grant.Principal{ID: "edge:x"}, gs: gs}
+		a := &actor{principal: grant.Principal{ID: "edge:x"}, view: gs}
 		n := t2.nsByName("matches")
 		if t2.readsNS(n, t2.config(n.configSeq), a, false) || t2.canRead(n, t2.config(n.configSeq), a, "derby") {
 			t.Fatal("a GS actor reads unrestricted")
@@ -370,7 +370,7 @@ func v075GS(t *testing.T, w *v75World, cred Credentials) string {
 		if err != nil {
 			t.Fatal(err)
 		}
-		gs = fv.GS()
+		gs = fv.View()
 	})
 	return gs
 }
@@ -396,7 +396,7 @@ func v075Visible(t *testing.T, w *v75World, ns string, cred Credentials, names .
 	w.inTx(func(t2 *tx) {
 		fv := v075View(t, t2, ns, cred)
 		for _, n := range names {
-			out[n] = fv.visible(t2, n)
+			out[n] = fv.visibleHead(t2, n)
 		}
 	})
 	return out
@@ -500,7 +500,7 @@ func TestV075GS(t *testing.T) {
 		var gs string
 		w.inTx(func(t2 *tx) {
 			fv := v075View(t, t2, "matches", cred)
-			subs, gs = fv.subjects, fv.GS()
+			subs, gs = fv.subjects, fv.View()
 		})
 		return subs, gs
 	}
@@ -514,7 +514,7 @@ func TestV075GS(t *testing.T) {
 	if want := []string{grantcheck.KeySubject("reader-01", w.catPub), "scope:" + digest}; digest == "" || !reflect.DeepEqual(liSubs, want) {
 		t.Fatalf("li's subjects %v, want %v", liSubs, want)
 	}
-	if liGS != grantcheck.SubjectSetID(liSubs) {
+	if liGS != grantcheck.ViewID(liSubs) {
 		t.Fatalf("gs %s", liGS)
 	}
 	// bo, in other groups: the same gs.
@@ -588,36 +588,36 @@ func TestV075State(t *testing.T) {
 		}
 	})
 	// A subject set, recorded, survives a restart on the same database.
-	var rec *gsRecord
-	w.inTx(func(t2 *tx) { rec = gsRecordOf(v075View(t, t2, "matches", li), w.now().Add(10*time.Minute).Unix()) })
-	if err := w.e.recordFilteredGS(ctx, rec); err != nil {
+	var rec *viewRecord
+	w.inTx(func(t2 *tx) { rec = viewRecordOf(v075View(t, t2, "matches", li), w.now().Add(10*time.Minute).Unix()) })
+	if err := w.e.recordFilteredView(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 	// A second record keeps the later exp.
 	short := *rec
 	short.exp = w.now().Add(time.Minute).Unix()
-	if err := w.e.recordFilteredGS(ctx, &short); err != nil {
+	if err := w.e.recordFilteredView(ctx, &short); err != nil {
 		t.Fatal(err)
 	}
 	w.e.Close()
 	w.open(nil)
 	w.inTx(func(t2 *tx) {
-		got := t2.loadGS("matches", rec.gs)
+		got := t2.loadView("matches", rec.view)
 		if got == nil || got.exp != rec.exp || !reflect.DeepEqual(got.subjects, rec.subjects) || got.kid != "reader-01" ||
 			!reflect.DeepEqual(got.roles, []string{"reader"}) || got.digest != rec.digest || got.filter != rec.filter {
 			t.Fatalf("after a restart: %+v, want %+v", got, rec)
 		}
-		if t2.loadGS("matches", grantcheck.SubjectSetID([]string{"x"})) != nil {
+		if t2.loadView("matches", grantcheck.ViewID([]string{"x"})) != nil {
 			t.Fatal("a gs never recorded")
 		}
-		if t2.loadGS("cat-season", rec.gs) != nil {
+		if t2.loadView("cat-season", rec.view) != nil {
 			t.Fatal("a gs recorded in another namespace")
 		}
 	})
 	// Past its exp the row is a miss.
 	w.clock.Add((11 * time.Minute).Milliseconds())
 	w.inTx(func(t2 *tx) {
-		if t2.loadGS("matches", rec.gs) != nil {
+		if t2.loadView("matches", rec.view) != nil {
 			t.Fatal("an expired row")
 		}
 	})
@@ -631,11 +631,11 @@ func TestV075FilteredAdmit(t *testing.T) {
 	ctx := context.Background()
 	li := w.li()
 	liGS := v075GS(t, w, li)
-	other := grantcheck.SubjectSetID([]string{"group:editors"})
+	other := grantcheck.ViewID([]string{"group:editors"})
 	exp := w.now().Add(10 * time.Minute)
 	nsCookie := Credentials{Edge: &EdgeGrant{NS: "matches", Prefix: "/ns/matches", Exp: exp}}
 	gCookie := func(gs string, exp time.Time) Credentials {
-		return Credentials{Edge: &EdgeGrant{NS: "matches", GS: gs, Prefix: "/ns/matches/g/" + gs, Exp: exp}}
+		return Credentials{Edge: &EdgeGrant{NS: "matches", View: gs, Prefix: "/ns/matches/view/" + gs, Exp: exp}}
 	}
 	admit := func(gs string, cred Credentials) (*fview, int) {
 		t.Helper()
@@ -650,13 +650,13 @@ func TestV075FilteredAdmit(t *testing.T) {
 				return
 			}
 			fv = v
-			if !v.visible(t2, "shared") || v.visible(t2, "opener") {
+			if !v.visibleHead(t2, "shared") || v.visibleHead(t2, "opener") {
 				t.Errorf("admitted at %s: wrong visibility", gs)
 			}
 		})
 		return fv, st
 	}
-	if fv, st := admit(liGS, li); fv == nil || fv.GS() != liGS {
+	if fv, st := admit(liGS, li); fv == nil || fv.View() != liGS {
 		t.Fatalf("li at her gs: %d", st)
 	}
 	for name, c := range map[string]struct {
@@ -668,7 +668,6 @@ func TestV075FilteredAdmit(t *testing.T) {
 		"no credentials":                 {liGS, Credentials{}, 401},
 		"an unrestricted grant":          {liGS, w.admin, 403},
 		"a cookie before any exchange":   {liGS, gCookie(liGS, exp), 401},
-		"a /ns cookie before any record": {liGS, nsCookie, 401},
 		"a cookie for another gs":        {liGS, gCookie(other, exp), 403},
 		"an expired cookie":              {liGS, gCookie(liGS, w.now()), 401},
 		"a cookie of another namespace":  {liGS, Credentials{Edge: &EdgeGrant{NS: "cat-season", Prefix: "/ns/cat-season", Exp: exp}}, 403},
@@ -680,25 +679,33 @@ func TestV075FilteredAdmit(t *testing.T) {
 	// Exchanged: the cookie, and the unrestricted reader's /ns cookie,
 	// read at the stored gs.
 	res, err := w.e.IssueEdgeGrants(ctx, []string{li.Bearer})
-	if err != nil || len(res.Grants) != 1 || res.Grants[0].GS != liGS {
+	if err != nil || len(res.Grants) != 1 || res.Grants[0].View != liGS {
 		t.Fatalf("exchange: %+v %v", res, err)
 	}
-	for name, cred := range map[string]Credentials{"g cookie": gCookie(liGS, exp), "/ns cookie": nsCookie} {
-		fv, st := admit(liGS, cred)
-		if fv == nil || fv.GS() != liGS || !reflect.DeepEqual(fv.subjects, v075View0(t, w, li).subjects) || fv.a.gs != liGS {
-			t.Fatalf("%s: %d", name, st)
-		}
+	fv, st := admit(liGS, gCookie(liGS, exp))
+	if fv == nil || fv.View() != liGS || !reflect.DeepEqual(fv.subjects, v075View0(t, w, li).subjects) || fv.a.view != liGS {
+		t.Fatalf("view cookie: %d", st)
 	}
-	// Record the current at, then add a role whose rule refers to the
-	// groups negatively: the cookie's gs holds every group, so it is still
-	// admitted at the new at (v0.78; before, a "partial" cookie was 403
-	// there), and at the recorded one.
+	// An unrestricted reader's /ns cookie counts as the view's cookie
+	// and reads there unrestricted, record or not (§7.9 Partial reader).
+	w.inTx(func(t2 *tx) {
+		n := t2.nsByName("matches")
+		fs := t2.filteredScope(n)
+		v, err := t2.filteredAdmit(n, fs, liGS, t2.filteredCurrent(fs), nsCookie)
+		if err != nil || !v.unrestricted || !v.visibleHead(t2, "opener") {
+			t.Fatalf("/ns cookie: %v", err)
+		}
+	})
+	// Record the current at, then add a role that lists read: every
+	// cookie of the view is 403 from that entry on, even once a later one
+	// removes it (v0.87, §7.9 view), while the recorded at still admits
+	// it.
 	var oldCP *fcp
 	w.inTx(func(t2 *tx) { oldCP = t2.filteredCurrent(t2.filteredScope(t2.nsByName("matches"))) })
 	w.patchConfig("matches", map[string]any{"op": "add", "path": "/roles/auditor", "value": map[string]any{"can": []any{"read"},
 		"rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/principal/groups", "schema": map[string]any{"contains": map[string]any{"const": "contractors"}}}}}}})
-	if _, st := admit(liGS, gCookie(liGS, exp)); st != 0 {
-		t.Fatalf("a cookie of every group where every group decides: %d", st)
+	if _, st := admit(liGS, gCookie(liGS, exp)); st != 403 {
+		t.Fatalf("a cookie after a role listing read was added: %d, want 403", st)
 	}
 	atOld := func(cred Credentials) int {
 		var st int
@@ -719,18 +726,8 @@ func TestV075FilteredAdmit(t *testing.T) {
 		t.Fatalf("at the recorded at: %d", st)
 	}
 	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/roles/auditor"})
-	if _, st := admit(liGS, gCookie(liGS, exp)); st != 0 {
-		t.Fatalf("after removing auditor: %d", st)
-	}
-	// Changing reader's rules changes the digest: 403 at the new at, as
-	// for a removed kid; the recorded at still admits it.
-	w.patchConfig("matches", map[string]any{"op": "add", "path": "/roles/reader/rules",
-		"value": []any{map[string]any{"op": "test", "path": "/action", "value": "read"}}})
 	if _, st := admit(liGS, gCookie(liGS, exp)); st != 403 {
-		t.Fatalf("after reader's rules changed: %d", st)
-	}
-	if st := atOld(gCookie(liGS, exp)); st != 0 {
-		t.Fatalf("at the recorded at after reader's rules changed: %d", st)
+		t.Fatalf("after removing auditor: %d, want 403", st)
 	}
 }
 
@@ -742,7 +739,7 @@ func v075View0(t *testing.T, w *v75World, cred Credentials) *fview {
 }
 
 // §7.9 Edge grants (conformance 75, Grant scope 58, 59): a partial
-// reader whose grant doesn't fix /resource gets /ns/{ns}/g/{gs} alone.
+// reader whose grant doesn't fix /resource gets /ns/{ns}/view/{gs} alone.
 func TestV075Exchange(t *testing.T) {
 	t.Parallel()
 	// A role that tests /resource by pattern, and a key without rules.
@@ -759,12 +756,12 @@ func TestV075Exchange(t *testing.T) {
 	if err != nil || len(res.Grants) != 1 {
 		t.Fatalf("exchange: %+v %v", res, err)
 	}
-	if got := res.Grants[0].Prefixes(); !reflect.DeepEqual(got, []string{"/ns/matches/g/" + gs}) {
+	if got := res.Grants[0].Prefixes(); !reflect.DeepEqual(got, []string{"/ns/matches/view/" + gs}) {
 		t.Fatalf("prefixes %v", got)
 	}
 	w.inTx(func(t2 *tx) {
-		if r := t2.loadGS("matches", gs); r == nil || r.ns != "matches" || r.exp > w.now().Add(10*time.Minute).Unix() {
-			t.Fatalf("filtered_gs row %+v", r)
+		if r := t2.loadView("matches", gs); r == nil || r.ns != "matches" || r.exp > w.now().Add(10*time.Minute).Unix() {
+			t.Fatalf("filtered_views row %+v", r)
 		}
 	})
 	// A /now block rule: 403.
@@ -788,14 +785,14 @@ func TestV075Exchange(t *testing.T) {
 		t.Fatalf("fixed names: %+v %v", res, err)
 	}
 	for _, g := range res.Grants {
-		if g.GS != "" || g.Resource == "" || !strings.HasPrefix(g.Prefixes()[0], "/r/matches/") {
+		if g.View != "" || g.Resource == "" || !strings.HasPrefix(g.Prefixes()[0], "/r/matches/") {
 			t.Fatalf("fixed names gave %+v", g)
 		}
 	}
 	// An unrestricted grant: /r and /ns, as before.
 	reader := w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:r", "ns": []any{"matches"}, "can": []any{"read"}})
 	res, err = w.e.IssueEdgeGrants(ctx, []string{reader.Bearer})
-	if err != nil || len(res.Grants) != 1 || res.Grants[0].GS != "" || len(res.Grants[0].Prefixes()) != 2 {
+	if err != nil || len(res.Grants) != 1 || res.Grants[0].View != "" || len(res.Grants[0].Prefixes()) != 2 {
 		t.Fatalf("unrestricted: %+v %v", res, err)
 	}
 	// NoFilteredReads: the partial reader is refused as before v0.75.

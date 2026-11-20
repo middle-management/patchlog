@@ -64,7 +64,7 @@ func v76fRedirect(t *testing.T, w *v75World, ns, gs string, cred Credentials) (*
 	if gs == "" {
 		_, err := v76fUnfiltered(ctx, w.e, ns, cred)
 		if r, ok := err.(*FilteredRedirect); ok {
-			gs = r.GS
+			gs = r.View
 		} else {
 			return nil, v75Status(err)
 		}
@@ -88,7 +88,7 @@ func v76fUnfiltered(ctx context.Context, e *Engine, ns string, cred Credentials)
 	return a, err
 }
 
-// v76fHeads are the names FilteredHeads lists for cred at ns/g/gs/at/at,
+// v76fHeads are the names FilteredHeads lists for cred at ns/view/gs/at/at,
 // and its status (0 for 200; -1 for a redirect).
 func v76fHeads(t *testing.T, w *v75World, ns, gs, at string, cred Credentials) ([]string, int) {
 	t.Helper()
@@ -128,7 +128,7 @@ func TestV076OriginBranchUncovered(t *testing.T) {
 	ctx := context.Background()
 	fan := w.fan("matches-r7", w.fanPriv)
 	li := w.li(map[string]any{"ns": []any{"matches-r7"}})
-	gs := grantcheck.SubjectSetID([]string{"group:fan-club"})
+	gs := grantcheck.ViewID([]string{"group:fan-club"})
 	at := grantcheck.CombinedAt(map[string]string{"matches-r7": w.head("matches-r7")})
 	for name, cred := range map[string]Credentials{"fan": fan, "li": li} {
 		if _, err := v76fUnfiltered(ctx, w.e, "matches-r7", cred); v75Status(err) != 403 {
@@ -150,7 +150,7 @@ func TestV076OriginBranchUncovered(t *testing.T) {
 	if _, st := v76fHeads(t, w.v75World, "matches-r7", gs, at, Credentials{}); st != 401 {
 		t.Errorf("no credentials: %d, want 401", st)
 	}
-	cookie := Credentials{Edge: &EdgeGrant{NS: "matches-r7", GS: gs, Prefix: "/ns/matches-r7/g/" + gs, Exp: w.now().Add(10 * time.Minute)}}
+	cookie := Credentials{Edge: &EdgeGrant{NS: "matches-r7", View: gs, Prefix: "/ns/matches-r7/view/" + gs, Exp: w.now().Add(10 * time.Minute)}}
 	if _, st := v76fRedirect(t, w.v75World, "matches-r7", gs, cookie); st != 403 {
 		t.Errorf("a g cookie: %d, want 403", st)
 	}
@@ -170,11 +170,11 @@ func TestV076OriginGSKeyRemoved(t *testing.T) {
 	ctx := context.Background()
 	fan := w.fan("matches", w.fanPriv)
 	res, err := w.e.IssueEdgeGrants(ctx, []string{fan.Bearer})
-	if err != nil || len(res.Grants) != 1 || res.Grants[0].GS == "" {
+	if err != nil || len(res.Grants) != 1 || res.Grants[0].View == "" {
 		t.Fatalf("exchange: %+v %v", res, err)
 	}
-	gs := res.Grants[0].GS
-	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", GS: gs, Prefix: "/ns/matches/g/" + gs, Exp: w.now().Add(10 * time.Minute)}}
+	gs := res.Grants[0].View
+	cookie := Credentials{Edge: &EdgeGrant{NS: "matches", View: gs, Prefix: "/ns/matches/view/" + gs, Exp: w.now().Add(10 * time.Minute)}}
 	red, st := v76fRedirect(t, w.v75World, "matches", gs, cookie)
 	if red == nil {
 		t.Fatalf("cookie before: %d", st)
@@ -215,17 +215,17 @@ func TestV076OriginGSBoundToPub(t *testing.T) {
 			}
 			cred := grantOf(w.fanPriv)
 			res, err := w.e.IssueEdgeGrants(ctx, []string{cred.Bearer})
-			if err != nil || len(res.Grants) != 1 || res.Grants[0].GS == "" {
+			if err != nil || len(res.Grants) != 1 || res.Grants[0].View == "" {
 				t.Fatalf("exchange: %+v %v", res, err)
 			}
-			gs := res.Grants[0].GS
-			cookie := Credentials{Edge: &EdgeGrant{NS: c.ns, GS: gs, Prefix: "/ns/" + c.ns + "/g/" + gs, Exp: w.now().Add(10 * time.Minute)}}
+			gs := res.Grants[0].View
+			cookie := Credentials{Edge: &EdgeGrant{NS: c.ns, View: gs, Prefix: "/ns/" + c.ns + "/view/" + gs, Exp: w.now().Add(10 * time.Minute)}}
 			wantPub := w.catPub
 			if c.kid == 2 {
 				wantPub = w.fanPub
 			}
 			w.inTx(func(t2 *tx) {
-				if r := t2.loadGS(c.ns, gs); r == nil || r.pub != wantPub {
+				if r := t2.loadView(c.ns, gs); r == nil || r.pub != wantPub {
 					t.Fatalf("stored row %+v, want pub %s", r, wantPub)
 				}
 			})
@@ -238,7 +238,7 @@ func TestV076OriginGSBoundToPub(t *testing.T) {
 			}
 			// An empty stored pub, as a row from before the migration has.
 			if err := w.e.update(ctx, func(t2 *tx) error {
-				_, err := t2.Exec(`UPDATE filtered_gs SET pub = '' WHERE ns = ? AND gs = ?`, c.ns, gs)
+				_, err := t2.Exec(`UPDATE filtered_views SET pub = '' WHERE ns = ? AND view = ?`, c.ns, gs)
 				return err
 			}); err != nil {
 				t.Fatal(err)
@@ -268,14 +268,14 @@ func TestV076OriginGSBoundToPub(t *testing.T) {
 			// to the new pub (grantcheck.KeySubject); the old gs stays 403.
 			fresh := grantOf(newPriv)
 			res, err = w.e.IssueEdgeGrants(ctx, []string{fresh.Bearer})
-			if err != nil || len(res.Grants) != 1 || res.Grants[0].GS == "" || res.Grants[0].GS == gs {
+			if err != nil || len(res.Grants) != 1 || res.Grants[0].View == "" || res.Grants[0].View == gs {
 				t.Fatalf("exchange with the new key: %+v %v (old gs %s)", res, err, gs)
 			}
 			if _, st := v76fRedirect(t, w.v75World, c.ns, gs, cookie); st != 403 {
 				t.Fatalf("the old cookie after exchanging again: %d, want 403", st)
 			}
-			gs2 := res.Grants[0].GS
-			cookie2 := Credentials{Edge: &EdgeGrant{NS: c.ns, GS: gs2, Prefix: "/ns/" + c.ns + "/g/" + gs2, Exp: w.now().Add(10 * time.Minute)}}
+			gs2 := res.Grants[0].View
+			cookie2 := Credentials{Edge: &EdgeGrant{NS: c.ns, View: gs2, Prefix: "/ns/" + c.ns + "/view/" + gs2, Exp: w.now().Add(10 * time.Minute)}}
 			red3, st := v76fRedirect(t, w.v75World, c.ns, gs2, cookie2)
 			if red3 == nil {
 				t.Fatalf("cookie after exchanging again: %d", st)
@@ -296,7 +296,7 @@ func TestV076OriginUncoveredFiltered401(t *testing.T) {
 	w.mkNS("pub", map[string]any{"read": "public", "keys": []any{w.kEntry()}})
 	w.mkNS("priv", map[string]any{"read": "grant", "keys": []any{w.kEntry()}})
 	ctx := context.Background()
-	gs := grantcheck.SubjectSetID([]string{"group:editors"})
+	gs := grantcheck.ViewID([]string{"group:editors"})
 	at := grantcheck.CombinedAt(map[string]string{"pub": w.head("pub")})
 	k := func(ns string, can ...any) Credentials {
 		return w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:r", "ns": []any{ns}, "can": can})
@@ -358,7 +358,7 @@ func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	gs := grantcheck.SubjectSetID([]string{"group:editors"})
+	gs := grantcheck.ViewID([]string{"group:editors"})
 	reader := func(ns string) Credentials {
 		return w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:r", "ns": []any{ns}, "can": []any{"read"}})
 	}
@@ -395,7 +395,7 @@ func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
 }
 
 // §7.9 gs, §C.4: readers whose grants come from two keys with the same
-// scope rules never share a gs, so neither's filtered_gs row judges the
+// scope rules never share a gs, so neither's filtered_views row judges the
 // other's cookies: once fan's pub is replaced, a cookie from fan's grant
 // is 403 whatever is exchanged through fan2, before or after, and fan2's
 // cookie reads on. Before grantcheck.KeySubject both got one gs, whose row
@@ -417,11 +417,11 @@ func TestV076OriginGSPerKey(t *testing.T) {
 			exchange := func(c Credentials) (string, Credentials) {
 				t.Helper()
 				res, err := w.e.IssueEdgeGrants(ctx, []string{c.Bearer})
-				if err != nil || len(res.Grants) != 1 || res.Grants[0].GS == "" {
+				if err != nil || len(res.Grants) != 1 || res.Grants[0].View == "" {
 					t.Fatalf("exchange: %+v %v", res, err)
 				}
-				gs := res.Grants[0].GS
-				return gs, Credentials{Edge: &EdgeGrant{NS: "matches", GS: gs, Prefix: "/ns/matches/g/" + gs, Exp: w.now().Add(10 * time.Minute)}}
+				gs := res.Grants[0].View
+				return gs, Credentials{Edge: &EdgeGrant{NS: "matches", View: gs, Prefix: "/ns/matches/view/" + gs, Exp: w.now().Add(10 * time.Minute)}}
 			}
 			rotate := func() {
 				np, _ := grant.GenerateKey()
@@ -439,10 +439,10 @@ func TestV076OriginGSPerKey(t *testing.T) {
 				t.Fatalf("grants of fan and fan2 share gs %s", gsA)
 			}
 			w.inTx(func(t2 *tx) {
-				if r := t2.loadGS("matches", gsA); r == nil || r.kid != "fan" || r.pub != w.fanPub {
+				if r := t2.loadView("matches", gsA); r == nil || r.kid != "fan" || r.pub != w.fanPub {
 					t.Fatalf("fan's row %+v", r)
 				}
-				if r := t2.loadGS("matches", gsB); r == nil || r.kid != "fan2" || r.pub != pub2 {
+				if r := t2.loadView("matches", gsB); r == nil || r.kid != "fan2" || r.pub != pub2 {
 					t.Fatalf("fan2's row %+v", r)
 				}
 			})

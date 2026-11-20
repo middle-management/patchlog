@@ -17,7 +17,7 @@ func TestV086FilteredCookieStaysEnded(t *testing.T) {
 	w.seed([]string{"derby"}, nil, []string{"derby"})
 	g := w.li()
 	c, gs := w.cookie(g)
-	base := "/ns/matches/g/" + gs
+	base := "/ns/matches/view/" + gs
 	// paths are the reads at the current at, which li's grant names.
 	paths := func() []string {
 		_, at := w.filtered(w.li())

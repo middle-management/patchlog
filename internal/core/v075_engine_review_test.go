@@ -8,7 +8,7 @@ import (
 
 // §7.9 gs: a grant reading two covered namespaces with the same key
 // rules and role definitions gets the same gs in both (a gs names no
-// namespace), so filtered_gs keeps a row per (ns, gs): each namespace's
+// namespace), so filtered_views keeps a row per (ns, gs): each namespace's
 // cookie is admitted, by its own row.
 func TestV075EngineGSPerNamespace(t *testing.T) {
 	t.Parallel()
@@ -30,20 +30,20 @@ func TestV075EngineGSPerNamespace(t *testing.T) {
 	if err != nil || len(res.Grants) != 2 {
 		t.Fatalf("exchange: %+v %v", res, err)
 	}
-	if res.Grants[0].GS != res.Grants[1].GS {
-		t.Fatalf("gs matches=%s results=%s: the case needs them equal", res.Grants[0].GS, res.Grants[1].GS)
+	if res.Grants[0].View != res.Grants[1].View {
+		t.Fatalf("gs matches=%s results=%s: the case needs them equal", res.Grants[0].View, res.Grants[1].View)
 	}
 	exp := w.now().Add(10 * time.Minute)
 	for _, g := range res.Grants {
-		cred := Credentials{Edge: &EdgeGrant{NS: g.NS, GS: g.GS, Prefix: "/ns/" + g.NS + "/g/" + g.GS, Exp: exp}}
+		cred := Credentials{Edge: &EdgeGrant{NS: g.NS, View: g.View, Prefix: "/ns/" + g.NS + "/view/" + g.View, Exp: exp}}
 		w.inTx(func(t2 *tx) {
 			n := t2.nsByName(g.NS)
 			fs := t2.filteredScope(n)
-			if _, err := t2.filteredAdmit(n, fs, g.GS, t2.filteredCurrent(fs), cred); err != nil {
-				t.Errorf("%s: the cookie just issued for /ns/%s/g/%s is refused: %d %v", g.NS, g.NS, g.GS, err.Status, err.Body)
+			if _, err := t2.filteredAdmit(n, fs, g.View, t2.filteredCurrent(fs), cred); err != nil {
+				t.Errorf("%s: the cookie just issued for /ns/%s/view/%s is refused: %d %v", g.NS, g.NS, g.View, err.Status, err.Body)
 			}
-			if r := t2.loadGS(g.NS, g.GS); r == nil || r.ns != g.NS {
-				t.Errorf("%s: filtered_gs row %+v", g.NS, r)
+			if r := t2.loadView(g.NS, g.View); r == nil || r.ns != g.NS {
+				t.Errorf("%s: filtered_views row %+v", g.NS, r)
 			}
 		})
 	}

@@ -14,9 +14,9 @@ import (
 // Where an origin filters a namespace by the grant's read rules, a partial
 // reader (one whose grant allows read there without unrestricted read,
 // §2.1) is redirected from the unfiltered URLs to filtered ones under
-// /ns/{ns}/g/{gs}: ranges at /ns/{ns}/g/{gs}/at/{at}/heads and …/log,
-// long-poll at /ns/{ns}/g/{gs}/log and events at /ns/{ns}/g/{gs}/events.
-// gs stands for the reader's subject set and grant, at for the ns_id of
+// /ns/{ns}/view/{view}: ranges at /ns/{ns}/view/{view}/at/{at}/heads and …/log,
+// long-poll at /ns/{ns}/view/{view}/log and events at /ns/{ns}/view/{view}/events.
+// view stands for the reader's subject set and grant, at for the ns_id of
 // {ns} the answer is at. The answers keep their
 // shapes; only the set changes. A range ends at the ns_id its answers
 // name in X-Namespace-Revision, pages may be empty, and X-Log-Next may
@@ -26,20 +26,20 @@ import (
 // again (§10).
 
 // FilteredAt names a filtered answer (§7.9 URLs): the namespace, the
-// gs and at of its URL, and End, the ns_id of NS at at, which answers at
-// an at carry as X-Namespace-Revision. GS and At are "" for an answer
+// view and at of its URL, and End, the ns_id of NS at at, which answers at
+// an at carry as X-Namespace-Revision. View and At are "" for an answer
 // that wasn't filtered, as for an unrestricted reader, whose End is the
 // ns_id of the unfiltered URL.
 type FilteredAt struct {
-	NS, GS, At, End string
+	NS, View, At, End string
 }
 
 // Filtered reports whether fa names a filtered answer.
-func (fa FilteredAt) Filtered() bool { return fa.GS != "" }
+func (fa FilteredAt) Filtered() bool { return fa.View != "" }
 
-// filteredPathRe is a path under §7.9's prefix /ns/{ns}/g/{gs}: with
+// filteredPathRe is a path under §7.9's prefix /ns/{ns}/view/{view}: with
 // /at/{at} for heads and log ranges, without for long-poll and events.
-var filteredPathRe = regexp.MustCompile(`^/ns/([a-z0-9][a-z0-9_-]{0,63})/g/(1[a-z2-7]{32})(?:/at/(1[a-z2-7]{32}))?/(heads|log|events)$`)
+var filteredPathRe = regexp.MustCompile(`^/ns/([a-z0-9][a-z0-9_-]{0,63})/view/(1[a-z2-7]{32})(?:/at/(1[a-z2-7]{32}))?/(heads|log|events)$`)
 
 // unfilteredLogRe is an unfiltered range, /ns/{ns}/rev/{ns_id}/log.
 var unfilteredLogRe = regexp.MustCompile(`^/ns/([a-z0-9][a-z0-9_-]{0,63})/rev/(1[a-z2-7]{32})/log$`)
@@ -66,9 +66,9 @@ func (c *Client) location(r *response) string {
 }
 
 // filteredRedirect reads a 302 into a filtered URL of namespace ns ending
-// in tail (heads, log or events): its gs, and at ("" for long-poll and
+// in tail (heads, log or events): its view, and at ("" for long-poll and
 // events, which have none). withAt says whether the URL must carry an at.
-func (c *Client) filteredRedirect(r *response, ns, tail string, withAt bool) (gs, at string, err error) {
+func (c *Client) filteredRedirect(r *response, ns, tail string, withAt bool) (view, at string, err error) {
 	m := filteredPathRe.FindStringSubmatch(c.location(r))
 	if r.status != 302 || m == nil || m[1] != ns || m[4] != tail || (m[3] != "") != withAt {
 		return "", "", fmt.Errorf("client: %s redirects to %q, not a filtered %s of %s (§7.9)", r.path, r.header.Get("Location"), tail, ns)
@@ -77,19 +77,19 @@ func (c *Client) filteredRedirect(r *response, ns, tail string, withAt bool) (gs
 }
 
 // FilteredError is the 302 by which an origin sends a partial reader from
-// a namespace's unfiltered long-poll or events to the filtered log of GS
+// a namespace's unfiltered long-poll or events to the filtered log of View
 // (§7.9 URLs), which LongPoll and NSEvents don't follow: it isn't
 // chain-verifiable, and its batches hold only visible items (§10). A
 // caller that accepts that reads it with FilteredLongPoll or
 // FilteredNSEvents. It unwraps to the 302's *APIError, so a caller that
 // doesn't is stopped as by any other redirect.
 type FilteredError struct {
-	NS, GS string
+	NS, View string
 	Err    *APIError
 }
 
 func (e *FilteredError) Error() string {
-	return fmt.Sprintf("%v: the filtered log of gs %s (§7.9)", e.Err, e.GS)
+	return fmt.Sprintf("%v: the filtered log of view %s (§7.9)", e.Err, e.View)
 }
 
 func (e *FilteredError) Unwrap() error { return e.Err }
@@ -105,17 +105,17 @@ func AsFiltered(err error) (*FilteredError, bool) {
 // events of ns: a *FilteredError when it names their filtered form, tail
 // being log or events, else the API error it was before v0.75.
 func (c *Client) filteredError(r *response, ns, tail string) error {
-	gs, _, err := c.filteredRedirect(r, ns, tail, false)
+	view, _, err := c.filteredRedirect(r, ns, tail, false)
 	if err != nil {
 		return r.apiError()
 	}
-	return &FilteredError{NS: ns, GS: gs, Err: r.apiError()}
+	return &FilteredError{NS: ns, View: view, Err: r.apiError()}
 }
 
 // filteredPath is the filtered URL of fa ending in tail (§7.9 URLs):
 // with /at/{at} when fa has one.
 func filteredPath(fa FilteredAt, tail string) string {
-	p := "/ns/" + fa.NS + "/g/" + fa.GS
+	p := "/ns/" + fa.NS + "/view/" + fa.View
 	if fa.At != "" {
 		p += "/at/" + fa.At
 	}
@@ -126,7 +126,7 @@ func checkFilteredAt(fa FilteredAt) error {
 	if err := checkNS(fa.NS); err != nil {
 		return err
 	}
-	if err := checkID("gs", fa.GS); err != nil {
+	if err := checkID("view", fa.View); err != nil {
 		return err
 	}
 	return checkOptID("at", fa.At)
@@ -151,7 +151,7 @@ func endOf(r *response) (string, error) {
 // last full one may be empty; a filtered page whose next isn't its last
 // row is an error. fa names the answer; read further pages
 // with FilteredHeadsAt(fa, …). An unrestricted reader gets the unfiltered
-// page, next absent on the last, and fa without GS and At.
+// page, next absent on the last, and fa without View and At.
 func (c *Client) FilteredHeadsPage(ctx context.Context, ns, nsID, prefix, after string) (items []HeadItem, next string, fa FilteredAt, err error) {
 	if err := checkNS(ns); err != nil {
 		return nil, "", fa, err
@@ -171,17 +171,17 @@ func (c *Client) FilteredHeadsPage(ctx context.Context, ns, nsID, prefix, after 
 		items, next, err = parseHeads(r, prefix)
 		return items, next, FilteredAt{NS: ns, End: nsID}, err
 	case 302:
-		gs, at, err := c.filteredRedirect(r, ns, "heads", true)
+		view, at, err := c.filteredRedirect(r, ns, "heads", true)
 		if err != nil {
 			return nil, "", fa, err
 		}
-		return c.filteredHeads(ctx, FilteredAt{NS: ns, GS: gs, At: at}, prefix, after)
+		return c.filteredHeads(ctx, FilteredAt{NS: ns, View: view, At: at}, prefix, after)
 	}
 	return nil, "", fa, r.apiError()
 }
 
 // FilteredHeadsAt fetches one page of the filtered /heads fa names
-// (§7.9), as one under a cookie for /ns/{ns}/g/{gs} reads it: at fa.At,
+// (§7.9), as one under a cookie for /ns/{ns}/view/{view} reads it: at fa.At,
 // or, without one, at the current at, to which the origin redirects. A
 // redirect from an at the origin no longer answers is followed once, to
 // the current at, so the returned fa may name another at than the one
@@ -194,11 +194,11 @@ func (c *Client) FilteredHeadsAt(ctx context.Context, fa FilteredAt, prefix, aft
 	if err := checkPrefix(fa.NS, prefix); err != nil {
 		return nil, "", got, err
 	}
-	return c.filteredHeads(ctx, FilteredAt{NS: fa.NS, GS: fa.GS, At: fa.At}, prefix, after)
+	return c.filteredHeads(ctx, FilteredAt{NS: fa.NS, View: fa.View, At: fa.At}, prefix, after)
 }
 
 // filteredHeads reads the filtered /heads page of fa, following one
-// redirect to the current at of the same gs.
+// redirect to the current at of the same view.
 func (c *Client) filteredHeads(ctx context.Context, fa FilteredAt, prefix, after string) ([]HeadItem, string, FilteredAt, error) {
 	for hop := 0; ; hop++ {
 		r, err := c.do(ctx, "GET", filteredPath(fa, "heads"), headsQuery(prefix, after), nil)
@@ -219,12 +219,12 @@ func (c *Client) filteredHeads(ctx context.Context, fa FilteredAt, prefix, after
 			}
 			return items, next, fa, nil
 		case r.status == 302 && hop == 0:
-			gs, at, err := c.filteredRedirect(r, fa.NS, "heads", true)
+			view, at, err := c.filteredRedirect(r, fa.NS, "heads", true)
 			if err != nil {
 				return nil, "", FilteredAt{}, err
 			}
-			if gs != fa.GS {
-				return nil, "", FilteredAt{}, fmt.Errorf("client: %s redirects to gs %s, not %s (§7.9)", r.path, gs, fa.GS)
+			if view != fa.View {
+				return nil, "", FilteredAt{}, fmt.Errorf("client: %s redirects to view %s, not %s (§7.9)", r.path, view, fa.View)
 			}
 			fa.At = at
 			continue
@@ -277,7 +277,7 @@ func (c *Client) FilteredHeads(ctx context.Context, ns, nsID, prefix string) ([]
 		}
 		if got.At != fa.At {
 			if restarts++; restarts > 3 {
-				return nil, FilteredAt{}, fmt.Errorf("client: /ns/%s/g/%s/heads keeps moving to another at (§7.9)", ns, fa.GS)
+				return nil, FilteredAt{}, fmt.Errorf("client: /ns/%s/g/%s/heads keeps moving to another at (§7.9)", ns, fa.View)
 			}
 			if page, n, got, err = c.FilteredHeadsAt(ctx, got, prefix, ""); err != nil {
 				return nil, FilteredAt{}, err
@@ -310,7 +310,7 @@ func (c *Client) headsFrom(ctx context.Context, ns, nsID, prefix, after string) 
 // the visible entries, oldest first, batches with only their visible
 // items, and fa, whose End is the range's end. An unrestricted reader,
 // whom the unfiltered range answers, gets that range as NSLog reads it,
-// and fa without GS and At.
+// and fa without View and At.
 func (c *Client) FilteredLog(ctx context.Context, ns, since string) ([]NSEntry, FilteredAt, error) {
 	if err := checkNS(ns); err != nil {
 		return nil, FilteredAt{}, err
@@ -340,18 +340,18 @@ func (c *Client) FilteredLog(ctx context.Context, ns, since string) ([]NSEntry, 
 			path, end = loc, m[2]
 			continue
 		}
-		gs, at, err := c.filteredRedirect(r, ns, "log", true)
+		view, at, err := c.filteredRedirect(r, ns, "log", true)
 		if err != nil {
 			return nil, FilteredAt{}, err
 		}
-		return c.FilteredLogAt(ctx, FilteredAt{NS: ns, GS: gs, At: at}, since)
+		return c.FilteredLogAt(ctx, FilteredAt{NS: ns, View: view, At: at}, since)
 	}
 }
 
 // FilteredLogAt reads the filtered range fa names after since, every page
 // (§7.9 Log ranges), as FilteredLog does once redirected. Without
-// fa.At it starts at …/g/{gs}/log, which the origin redirects to the
-// current at, as under a cookie for /ns/{ns}/g/{gs}.
+// fa.At it starts at …/view/{view}/log, which the origin redirects to the
+// current at, as under a cookie for /ns/{ns}/view/{view}.
 func (c *Client) FilteredLogAt(ctx context.Context, fa FilteredAt, since string) ([]NSEntry, FilteredAt, error) {
 	if err := checkFilteredAt(fa); err != nil {
 		return nil, FilteredAt{}, err
@@ -372,12 +372,12 @@ func (c *Client) FilteredLogAt(ctx context.Context, fa FilteredAt, since string)
 		if r.status != 302 {
 			return nil, FilteredAt{}, r.apiError()
 		}
-		gs, at, err := c.filteredRedirect(r, fa.NS, "log", true)
+		view, at, err := c.filteredRedirect(r, fa.NS, "log", true)
 		if err != nil {
 			return nil, FilteredAt{}, err
 		}
-		if gs != fa.GS {
-			return nil, FilteredAt{}, fmt.Errorf("client: %s redirects to gs %s, not %s (§7.9)", r.path, gs, fa.GS)
+		if view != fa.View {
+			return nil, FilteredAt{}, fmt.Errorf("client: %s redirects to view %s, not %s (§7.9)", r.path, view, fa.View)
 		}
 		fa.At = at
 	}
@@ -420,7 +420,7 @@ func (c *Client) FilteredLogPage(ctx context.Context, fa FilteredAt, since strin
 	if err := checkOptID("since", since); err != nil {
 		return nil, "", got, err
 	}
-	got = FilteredAt{NS: fa.NS, GS: fa.GS, At: fa.At}
+	got = FilteredAt{NS: fa.NS, View: fa.View, At: fa.At}
 	next, err = c.filteredLogPage(ctx, filteredPath(fa, "log"), since, func(r *response, _ string) (string, error) {
 		if isJOSE(r) {
 			// Only namespaces that are neither sealed nor end-to-end

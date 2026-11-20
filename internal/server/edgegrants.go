@@ -29,7 +29,7 @@ type edgeGrantKey struct{}
 // its path, checked as an edge checks it (edge.Cookies.Check), when it
 // carries no Authorization, not even an empty one (§C.5.3). Writes, POST /edge-grants included,
 // never get one. Its namespace and resource are those of its prefix, and
-// for a filtered namespace's prefix /ns/{ns}/g/{gs} its GS (§7.9); a
+// for a partial reader's prefix /ns/{ns}/view/{view} its view (§7.9); a
 // cookie for a prefix the origin doesn't issue is ignored.
 func (s *Server) edgeCred(r *http.Request) *http.Request {
 	if s.cookies == nil || len(r.Header.Values("Authorization")) > 0 {
@@ -43,7 +43,7 @@ func (s *Server) edgeCred(r *http.Request) *http.Request {
 	if !ok {
 		return r
 	}
-	eg := &core.EdgeGrant{NS: p.NS, Resource: p.Resource, GS: p.GS, Prefix: cl.Prefix, Exp: time.Unix(cl.Exp, 0)}
+	eg := &core.EdgeGrant{NS: p.NS, Resource: p.Resource, View: p.View, Prefix: cl.Prefix, Exp: time.Unix(cl.Exp, 0)}
 	return r.WithContext(context.WithValue(r.Context(), edgeGrantKey{}, eg))
 }
 
@@ -147,12 +147,12 @@ func (s *Server) edgeGrantBearers(r *http.Request) ([]string, error) {
 		return nil, err
 	}
 	m, _ := v.(map[string]any)
-	gs, ok := m["grants"].([]any)
-	if !ok || len(m) != 1 || len(gs) < 1 || len(gs) > core.MaxEdgeGrants {
+	grants, ok := m["grants"].([]any)
+	if !ok || len(m) != 1 || len(grants) < 1 || len(grants) > core.MaxEdgeGrants {
 		return nil, badInput(fmt.Sprintf("body must be { grants: [ … ] }, 1 to %d grants (§C.5.2)", core.MaxEdgeGrants))
 	}
-	out := make([]string, len(gs))
-	for i, g := range gs {
+	out := make([]string, len(grants))
+	for i, g := range grants {
 		if out[i], ok = g.(string); !ok {
 			return nil, badInput("each grant is a string: the token as it would follow \"Bearer \" (§C.5.2)")
 		}

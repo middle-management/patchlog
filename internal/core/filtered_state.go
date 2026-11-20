@@ -40,11 +40,11 @@ func (t *tx) filteredAt(fs *fscope, at string) (*fcp, bool) {
 	return &fcp{at: at, seq: seq}, true
 }
 
-// gsRecord is a filtered_gs row (§7.9 gs): what a subject set stands
+// viewRecord is a filtered_views row (§7.9 view): what a view stands
 // for, from which cookies for it are judged, never from a grant the
 // request doesn't carry.
-type gsRecord struct {
-	gs       string
+type viewRecord struct {
+	view     string
 	ns       string
 	subjects []string
 	// kid, roles (the grant's effective roles that list read), blockRules,
@@ -52,7 +52,7 @@ type gsRecord struct {
 	kid string
 	// pub is the pub member of kid's key entry as the grant was verified
 	// against it: a cookie is accepted only while the key with that kid
-	// has the same pub (§7.9 gs, §C.4). "" (a row from before it was
+	// has the same pub (§7.9 view, §C.4). "" (a row from before it was
 	// kept) never matches.
 	pub        string
 	roles      []string
@@ -60,53 +60,53 @@ type gsRecord struct {
 	readScope  bool
 	principal  map[string]any
 	digest     string
-	// entry is EntryDigest (gsEntryDigest) over kid's whole key entry and
+	// entry is EntryDigest (viewEntryDigest) over kid's whole key entry and
 	// the whole definition of each of roles, as {ns}'s document had them
 	// at the exchange: a cookie is accepted only while it is the same
-	// (§7.9 gs, "gone or changes in any member"). "" never holds.
+	// (§7.9 view, "gone or changes in any member"). "" never holds.
 	// conf is the ns_config seq of that document, of the exchange's read
 	// snapshot: a cookie is held to every document of {ns} after it up to
-	// the one at the answer's checkpoint (§7.9 gs, v0.86: "Once an
+	// the one at the answer's checkpoint (§7.9 view, v0.86: "Once an
 	// entry after its exchange changes one of them, the cookie is 403
 	// from that entry on, even where a later entry undoes the change";
-	// gsHeldSince). 0 never holds.
+	// viewHeldSince). 0 never holds.
 	//
 	// Both are a cookie's own: filteredAdmit reads them from the
-	// filtered_gs_exps row of the cookie's exp (loadGSSlot). The
-	// filtered_gs row keeps those of its latest exchange.
+	// filtered_view_exps row of the cookie's exp (loadViewSlot). The
+	// filtered_views row keeps those of its latest exchange.
 	entry  string
 	conf   int64
 	filter string // grantcheck.ReadFilter.Encode
 	// exp, Unix seconds: for an exchange, the latest its cookie may
-	// expire, which recordFilteredGS sets to the second it took; in a
-	// filtered_gs row, the latest expiry of its cookies.
+	// expire, which recordFilteredView sets to the second it took; in a
+	// filtered_views row, the latest expiry of its cookies.
 	exp int64
 }
 
 // errNoSecond is the 503 of an exchange whose cookie must differ in exp
 // from those minted for its prefix and has no whole second left to do so
-// before it would expire (§C.5.2 Answer, SERVICES §A.4 gs, §12.1 behind).
+// before it would expire (§C.5.2 Answer, SERVICES §A.4 view, §12.1 behind).
 func errNoSecond() *Error {
 	err := apiErr(503, "behind", "message", "no second is left before this edge grant would expire to tell it from those already minted: exchange a grant that lasts longer (§C.5.2)")
 	err.Header = http.Header{"Retry-After": []string{"1"}}
 	return err
 }
 
-// recordFilteredGS records r in filtered_gs and takes the second its
+// recordFilteredView records r in filtered_views and takes the second its
 // cookie expires at, which it sets r.exp to, in a short write transaction
 // of its own; it sweeps rows past their exp and those of purged
-// namespaces (§7.9 gs). Rows are per (ns, gs): a gs names no
-// namespace, so one grant's gs can be the same in two covered
+// namespaces (§7.9 view). Rows are per (ns, view): a view names no
+// namespace, so one grant's view can be the same in two covered
 // namespaces, and each keeps its own kid and rules.
 //
-// Readers who share a gs share its row, and a cookie carries its prefix
-// and expiry alone (§C.5.3): the cookies of a gs that expire at the same
-// second are one cookie. Each has a filtered_gs_exps row, with the entry
+// Readers who share a view share its row, and a cookie carries its prefix
+// and expiry alone (§C.5.3): the cookies of a view that expire at the same
+// second are one cookie. Each has a filtered_view_exps row, with the entry
 // digest and the document (conf) its exchanges recorded, from which a
 // read under it is judged (filteredAdmit). An exchange shares the row of
 // the second its cookie would expire at only where that changes no
 // verdict: the same entry digest, and the record holding under every
-// document of {ns} between the row's and its own (gsShares). Otherwise
+// document of {ns} between the row's and its own (viewShares). Otherwise
 // its cookie must be told apart from that one, and it takes whole seconds
 // off, down to the first second that is free or that it can share
 // (§C.5.2: "less any whole seconds a minter MAY take off so that cookies
@@ -130,10 +130,10 @@ func errNoSecond() *Error {
 // it can't share the row of one made after the change: it takes its own
 // second, with the document it read, and is ended by the change.
 //
-// Readers of one gs record one entry at one document: its scope: subject
+// Readers of one view record one entry at one document: its scope: subject
 // digests their kid, pub and read roles by name (grantcheck.ScopeDigest),
 // which are what the entry digest is over.
-func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
+func (e *Engine) recordFilteredView(ctx context.Context, r *viewRecord) error {
 	subjects := make([]any, len(r.subjects))
 	for i, s := range r.subjects {
 		subjects[i] = s
@@ -143,13 +143,13 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 		roles[i] = s
 	}
 	enc := func(v any) string { return string(jsonv.Canonical(jsonv.FromGo(v))) }
-	q := `INSERT INTO filtered_gs (gs, ns, subjects, kid, pub, roles, block_rules, read_scope, principal, digest, entry, conf, filter, exp)
+	q := `INSERT INTO filtered_views (view, ns, subjects, kid, pub, roles, block_rules, read_scope, principal, digest, entry, conf, filter, exp)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT (ns, gs) DO UPDATE SET subjects = excluded.subjects,
+		ON CONFLICT (ns, view) DO UPDATE SET subjects = excluded.subjects,
 			kid = excluded.kid, pub = excluded.pub, roles = excluded.roles, block_rules = excluded.block_rules, read_scope = excluded.read_scope,
 			principal = excluded.principal, digest = excluded.digest, entry = excluded.entry, conf = excluded.conf, filter = excluded.filter,
-			exp = GRT(filtered_gs.exp, excluded.exp)`
-	raise := `UPDATE filtered_gs_exps SET conf = GRT(conf, ?) WHERE ns = ? AND gs = ? AND exp = ?`
+			exp = GRT(filtered_views.exp, excluded.exp)`
+	raise := `UPDATE filtered_view_exps SET conf = GRT(conf, ?) WHERE ns = ? AND view = ? AND exp = ?`
 	grt := "max("
 	if e.pg {
 		grt = "GREATEST("
@@ -164,10 +164,10 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 		// an exchange at one that is behind, whose row an ended cookie
 		// of the same exp would then read under until it expires.
 		for _, sweep := range []string{
-			`DELETE FROM filtered_gs WHERE exp <= ? OR ns IN (SELECT name FROM namespaces WHERE purged <> 0)`,
-			`DELETE FROM filtered_gs_exps WHERE exp <= ? OR ns IN (SELECT name FROM namespaces WHERE purged <> 0)`,
+			`DELETE FROM filtered_views WHERE exp <= ? OR ns IN (SELECT name FROM namespaces WHERE purged <> 0)`,
+			`DELETE FROM filtered_view_exps WHERE exp <= ? OR ns IN (SELECT name FROM namespaces WHERE purged <> 0)`,
 		} {
-			if _, err := t.Exec(sweep, now-int64(gsSweepMargin/time.Second)); err != nil {
+			if _, err := t.Exec(sweep, now-int64(viewSweepMargin/time.Second)); err != nil {
 				return err
 			}
 		}
@@ -175,19 +175,19 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 		t.noLock++
 		n := t.nsByName(r.ns)
 		t.noLock--
-		shares := t.gsShares(n, r)
+		shares := t.viewShares(n, r)
 		// The latest second at or before r.exp that is free, or whose
 		// row this exchange can share. Another instance may take a free
 		// one first: then the seconds are read again.
 		for taken = 0; taken == 0; {
-			slots := map[int64]gsSlot{}
-			rows, err := t.Query(`SELECT exp, entry, conf FROM filtered_gs_exps WHERE ns = ? AND gs = ? AND exp > ? AND exp <= ?`, r.ns, r.gs, now, r.exp)
+			slots := map[int64]viewSlot{}
+			rows, err := t.Query(`SELECT exp, entry, conf FROM filtered_view_exps WHERE ns = ? AND view = ? AND exp > ? AND exp <= ?`, r.ns, r.view, now, r.exp)
 			if err != nil {
 				return err
 			}
 			for rows.Next() {
 				var exp int64
-				var s gsSlot
+				var s viewSlot
 				if err := rows.Scan(&exp, &s.entry, &s.conf); err != nil {
 					rows.Close()
 					return err
@@ -203,7 +203,7 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 				s, held := slots[exp]
 				switch {
 				case !held:
-					res, err := t.Exec(`INSERT INTO filtered_gs_exps (ns, gs, exp, entry, conf) VALUES (?, ?, ?, ?, ?) ON CONFLICT (ns, gs, exp) DO NOTHING`, r.ns, r.gs, exp, r.entry, r.conf)
+					res, err := t.Exec(`INSERT INTO filtered_view_exps (ns, view, exp, entry, conf) VALUES (?, ?, ?, ?, ?) ON CONFLICT (ns, view, exp) DO NOTHING`, r.ns, r.view, exp, r.entry, r.conf)
 					if err != nil {
 						return err
 					}
@@ -215,7 +215,7 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 					}
 					taken = exp
 				case shares(s):
-					res, err := t.Exec(raise, r.conf, r.ns, r.gs, exp)
+					res, err := t.Exec(raise, r.conf, r.ns, r.view, exp)
 					if err != nil {
 						return err
 					}
@@ -234,7 +234,7 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 				return errNoSecond()
 			}
 		}
-		_, err := t.Exec(q, r.gs, r.ns, enc(subjects), r.kid, r.pub, enc(roles), enc(nonNilRules(r.blockRules)),
+		_, err := t.Exec(q, r.view, r.ns, enc(subjects), r.kid, r.pub, enc(roles), enc(nonNilRules(r.blockRules)),
 			boolInt(r.readScope), enc(r.principal), r.digest, r.entry, r.conf, r.filter, taken)
 		return err
 	})
@@ -244,22 +244,22 @@ func (e *Engine) recordFilteredGS(ctx context.Context, r *gsRecord) error {
 	return err
 }
 
-// gsSweepMargin is how long past their exp filtered_gs and
-// filtered_gs_exps rows are kept (recordFilteredGS): more than the
+// viewSweepMargin is how long past their exp filtered_views and
+// filtered_view_exps rows are kept (recordFilteredView): more than the
 // clocks of instances sharing a database differ by.
-const gsSweepMargin = time.Minute
+const viewSweepMargin = time.Minute
 
-// gsSlot is a filtered_gs_exps row: the entry digest and document the
-// exchanges of the cookies of one gs expiring at one second recorded.
-type gsSlot struct {
+// viewSlot is a filtered_view_exps row: the entry digest and document the
+// exchanges of the cookies of one view expiring at one second recorded.
+type viewSlot struct {
 	entry string
 	conf  int64
 }
 
-// loadGSSlot is the filtered_gs_exps row of the cookies of gs in ns that
+// loadViewSlot is the filtered_view_exps row of the cookies of view in ns that
 // expire at exp, as the read snapshot has it; ok is false for none.
-func (t *tx) loadGSSlot(ns, gs string, exp int64) (s gsSlot, ok bool) {
-	err := t.QueryRow(`SELECT entry, conf FROM filtered_gs_exps WHERE ns = ? AND gs = ? AND exp = ?`, ns, gs, exp).Scan(&s.entry, &s.conf)
+func (t *tx) loadViewSlot(ns, view string, exp int64) (s viewSlot, ok bool) {
+	err := t.QueryRow(`SELECT entry, conf FROM filtered_view_exps WHERE ns = ? AND view = ? AND exp = ?`, ns, view, exp).Scan(&s.entry, &s.conf)
 	if errors.Is(err, sql.ErrNoRows) {
 		return s, false
 	}
@@ -281,15 +281,15 @@ func nonNilRules(rs []any) []any {
 	return rs
 }
 
-// loadGS is gs's filtered_gs row in ns as the read snapshot has it, nil
+// loadView is view's filtered_views row in ns as the read snapshot has it, nil
 // if there is none or it has expired. It is read from the database each
 // time, so every instance sharing it judges a cookie alike, and a row
 // swept or deleted with its namespace is a miss at once.
-func (t *tx) loadGS(ns, gs string) *gsRecord {
-	r := &gsRecord{gs: gs}
+func (t *tx) loadView(ns, view string) *viewRecord {
+	r := &viewRecord{view: view}
 	var subjects, roles, blockRules, principal string
 	var readScope int64
-	err := t.QueryRow(`SELECT ns, subjects, kid, pub, roles, block_rules, read_scope, principal, digest, entry, conf, filter, exp FROM filtered_gs WHERE ns = ? AND gs = ?`, ns, gs).
+	err := t.QueryRow(`SELECT ns, subjects, kid, pub, roles, block_rules, read_scope, principal, digest, entry, conf, filter, exp FROM filtered_views WHERE ns = ? AND view = ?`, ns, view).
 		Scan(&r.ns, &subjects, &r.kid, &r.pub, &roles, &blockRules, &readScope, &principal, &r.digest, &r.entry, &r.conf, &r.filter, &r.exp)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil

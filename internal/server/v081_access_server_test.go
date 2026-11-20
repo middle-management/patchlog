@@ -227,7 +227,7 @@ func TestV081AccessNowNoPartialReader(t *testing.T) {
 // TDA 63 (§7.9 Where, §C.5.2; v0.78): li's grant names matches-r7, a
 // branch of covered matches: its filtered URLs are 403, and 401 with
 // neither a grant nor a cookie; POST /edge-grants naming only matches-r7
-// is 403 with no /ns/matches-r7/g/ prefix. An unrestricted reader of
+// is 403 with no /ns/matches-r7/view/ prefix. An unrestricted reader of
 // matches-r7 reads final, unfiltered.
 func TestV081AccessBranchUncovered(t *testing.T) {
 	t.Parallel()
@@ -240,7 +240,7 @@ func TestV081AccessBranchUncovered(t *testing.T) {
 	li := w.grant(w.cat, "user:li", []string{"matches-r7"}, []string{"read"}, map[string]any{"groups": []any{"editors", "interns"},
 		"roles": []any{"reader"},
 		"exp":   w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)})
-	base := "/ns/matches-r7/g/" + gs
+	base := "/ns/matches-r7/view/" + gs
 	for _, path := range []string{base + "/heads", base + "/at/" + at + "/heads", base + "/at/" + at + "/log"} {
 		expect(t, w.get(path, li), 403)
 		expect(t, w.get(path), 401)
@@ -249,7 +249,7 @@ func TestV081AccessBranchUncovered(t *testing.T) {
 	r := w.do(req{method: "POST", path: "/edge-grants", bearer: li})
 	expect(t, r, 403)
 	for _, c := range r.H.Values("Set-Cookie") {
-		if strings.Contains(c, "/ns/matches-r7/g/") {
+		if strings.Contains(c, "/ns/matches-r7/view/") {
 			t.Fatalf("a g cookie: %s", c)
 		}
 	}
@@ -284,7 +284,7 @@ func TestV081AccessFirstPrev(t *testing.T) {
 	}
 	li := w.li()
 	gs, at := w.filtered(li)
-	fm := first(w.get("/ns/matches/g/"+gs+"/at/"+at+"/log", li))
+	fm := first(w.get("/ns/matches/view/"+gs+"/at/"+at+"/log", li))
 	if p, ok := fm["prev"]; !ok || p != "" {
 		t.Fatalf("first filtered entry %v: prev %v %v, want \"\"", fm, p, ok)
 	}

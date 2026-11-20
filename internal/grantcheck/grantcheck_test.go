@@ -307,7 +307,7 @@ func TestPublicAndSubjectSets(t *testing.T) {
 	}
 	sum := sha256.Sum256([]byte(`["group:desk","group:ops","user:bob"]`))
 	gs := ids.FromBytes(sum[:20]).String()
-	if got := grantcheck.SubjectSetID([]string{"user:bob", "group:ops", "group:desk"}); got != gs {
+	if got := grantcheck.ViewID([]string{"user:bob", "group:ops", "group:desk"}); got != gs {
 		t.Fatalf("gs %s want %s", got, gs)
 	}
 	if string(jsonv.Canonical([]any{"b", "a"})) != `["b","a"]` {

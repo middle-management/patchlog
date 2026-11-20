@@ -40,9 +40,6 @@ func TestV086ReadFilterItemBudget(t *testing.T) {
 	} {
 		for _, item := range []string{"a", "b", "c"} {
 			want := item != "b"
-			if got := f.AllowsItem(item); got != want {
-				t.Errorf("%s: AllowsItem(%q) = %v", name, item, got)
-			}
 			if got := f.Allows(item); got != want {
 				t.Errorf("%s: Allows(%q) = %v", name, item, got)
 			}
@@ -52,10 +49,10 @@ func TestV086ReadFilterItemBudget(t *testing.T) {
 	// Within the budget the same rules decide as ever.
 	fast := map[string]any{"op": "test", "path": "/resource", "schema": doublingSchema(4)}
 	f := &ReadFilter{BlockRules: []any{onB(fast)}, Principal: principal, Steps: 2000}
-	if !f.AllowsItem("b") {
+	if !f.Allows("b") {
 		t.Error("a rule within the budget refused")
 	}
-	if f = (&ReadFilter{BlockRules: []any{onB(map[string]any{"not": fast})}, Principal: principal, Steps: 2000}); f.AllowsItem("b") {
+	if f = (&ReadFilter{BlockRules: []any{onB(map[string]any{"not": fast})}, Principal: principal, Steps: 2000}); f.Allows("b") {
 		t.Error("a not within the budget allowed")
 	}
 }

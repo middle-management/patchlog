@@ -204,6 +204,24 @@ func (t *tx) credsRead(n *nsRow, name string, creds []Credentials) bool {
 	return false
 }
 
+// credsReadBlob reports whether any of creds may read blob bid of name in
+// n as its stored documents that reference it decide (mayReadBlob, §7.8):
+// a copy from it is 404 where only revisions a grant can't read do.
+func (t *tx) credsReadBlob(n *nsRow, name string, bid ids.ID, creds []Credentials) bool {
+	if t.e.opt.AuthDisabled || t.config(n.configSeq).Read == "public" {
+		return true
+	}
+	for _, c := range creds {
+		if c.Bearer == "" {
+			continue
+		}
+		if a, err := t.reader(n, c, name); err == nil && t.mayReadBlob(a, n, name, bid) {
+			return true
+		}
+	}
+	return false
+}
+
 // credsReadAny reports whether any of creds may read anything in m: some
 // resource of it (the rule for other namespaces, §7.5), for the
 // referencing namespaces an in_use answer lists (§6.1).

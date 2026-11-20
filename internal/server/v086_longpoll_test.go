@@ -13,13 +13,13 @@ import (
 // URLs, and no deployment counts them from the epoch alone.
 
 // The hashed path is the long-poll URL's, without the query, built from
-// the names: "/ns/{ns}/log", "/r/{ns}/{name}/log" and "/ns/{ns}/g/{gs}/log"
+// the names: "/ns/{ns}/log", "/r/{ns}/{name}/log" and "/ns/{ns}/view/{view}/log"
 // (§I.25's four rows, of which the last is a filtered log's), and the
 // clock of each starts interval n at epoch + phase + n × interval.
 func TestV086LongPollPaths(t *testing.T) {
 	t.Parallel()
 	const interval = 20 * time.Second
-	const gs = "17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm" // I.8's
+	const view = "17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm" // I.8's
 	for _, c := range []struct {
 		path, want string
 		phase      time.Duration
@@ -27,7 +27,7 @@ func TestV086LongPollPaths(t *testing.T) {
 		{resourceLogPath("docs", "a"), "/r/docs/a/log", 15777 * time.Millisecond},
 		{resourceLogPath("docs", "b"), "/r/docs/b/log", 1327 * time.Millisecond},
 		{nsLogPath("docs"), "/ns/docs/log", 18318 * time.Millisecond},
-		{filteredLogPath("matches", gs), "/ns/matches/g/" + gs + "/log", 15523 * time.Millisecond},
+		{filteredLogPath("matches", view), "/ns/matches/view/" + view + "/log", 12058 * time.Millisecond}, // §I.25
 	} {
 		if c.path != c.want {
 			t.Errorf("path %q, want %q", c.path, c.want)
@@ -58,7 +58,7 @@ func TestV086LongPollPaths(t *testing.T) {
 }
 
 // §7.7 with §7.9 Long-poll: a filtered log's wait ends at the boundary
-// of its own path, "/ns/{ns}/g/{gs}/log", and its 204 carries that log's
+// of its own path, "/ns/{ns}/view/{view}/log", and its 204 carries that log's
 // next cursor. The namespace's unfiltered log, polled by a full reader at
 // the same time, ends at its own. Not parallel: it times answers.
 func TestV086FilteredLongPollPhase(t *testing.T) {
@@ -96,7 +96,7 @@ func TestV086FilteredLongPollPhase(t *testing.T) {
 }
 
 // §7.7 with §7.9 URLs: a partial reader's long-poll of "/ns/{ns}/log"
-// is redirected to "/ns/{ns}/g/{gs}/log" with its cursor, which is then
+// is redirected to "/ns/{ns}/view/{view}/log" with its cursor, which is then
 // read on the filtered log's clock. The two logs' cursors are one apart at
 // most, so the namespace log's cursor arrives one behind the filtered
 // log's, current or one ahead: each is sent here. None is 400; the one
@@ -123,7 +123,7 @@ func TestV086FilteredRedirectCarriesCursor(t *testing.T) {
 		r := w.get("/ns/matches/log?live=long-poll&since="+since+"&cursor="+strconv.FormatInt(sent, 10), li)
 		expect(t, r, 302)
 		loc := r.H.Get("Location")
-		if !strings.HasPrefix(loc, "/ns/matches/g/"+gs+"/log?") || !strings.Contains(loc, "cursor="+strconv.FormatInt(sent, 10)) ||
+		if !strings.HasPrefix(loc, "/ns/matches/view/"+gs+"/log?") || !strings.Contains(loc, "cursor="+strconv.FormatInt(sent, 10)) ||
 			!strings.Contains(loc, "live=long-poll") || !strings.Contains(loc, "since="+since) {
 			t.Fatalf("Location %q", loc)
 		}

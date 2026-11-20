@@ -104,17 +104,17 @@ func v077PurgedHeads(t *testing.T, w *v75World, ns, gs, at, head string, cred Cr
 		// URL's read check comes first, and an unrestricted reader's
 		// grant in Authorization is 403 there, as at a live namespace's.
 		if err := w.e.FilteredCurrent(ctx, ns, gs, "/heads", cred); v75Status(err) != 403 {
-			t.Fatalf("/g/{gs}/heads of purged %s for an unrestricted grant: %v, want 403", ns, err)
+			t.Fatalf("/view/{gs}/heads of purged %s for an unrestricted grant: %v, want 403", ns, err)
 		}
 		if _, _, err := w.e.FilteredHeads(ctx, ns, gs, at, "", "", cred); v75Status(err) != 403 {
-			t.Fatalf("/g/{gs}/at/{at}/heads of purged %s for an unrestricted grant: %v, want 403", ns, err)
+			t.Fatalf("/view/{gs}/at/{at}/heads of purged %s for an unrestricted grant: %v, want 403", ns, err)
 		}
 		return
 	}
-	purged("/g/{gs}/heads", w.e.FilteredCurrent(ctx, ns, gs, "/heads", cred))
+	purged("/view/{gs}/heads", w.e.FilteredCurrent(ctx, ns, gs, "/heads", cred))
 	_, info, err := w.e.FilteredHeads(ctx, ns, gs, at, "", "", cred)
-	purged("/g/{gs}/at/{at}/heads", err)
-	if info == nil || info.GS != gs || info.At == "" {
-		t.Fatalf("/g/{gs}/at/{at}/heads of purged %s: info %+v, want the checkpoint", ns, info)
+	purged("/view/{gs}/at/{at}/heads", err)
+	if info == nil || info.View != gs || info.At == "" {
+		t.Fatalf("/view/{gs}/at/{at}/heads of purged %s: info %+v, want the checkpoint", ns, info)
 	}
 }

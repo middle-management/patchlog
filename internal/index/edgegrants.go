@@ -1917,7 +1917,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		return nil, nil, upErr
 	}
 	if len(markers) > 0 {
-		gs := grantcheck.SubjectSetID(markers)
+		gs := grantcheck.ViewID(markers)
 		slices.Sort(markers)
 		ex.issues = append(ex.issues, svcIssue{Prefix: refsPrefix(gs), Exp: refsExp})
 		ex.subjects[gs] = markers

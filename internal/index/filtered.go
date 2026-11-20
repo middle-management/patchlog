@@ -210,7 +210,7 @@ type fview struct {
 }
 
 func newFview(cp *fcp, subjects []string, filter *grantcheck.ReadFilter) *fview {
-	return &fview{cp: cp, gs: grantcheck.SubjectSetID(subjects), subjects: subjects, filter: filter, memo: map[string]bool{}}
+	return &fview{cp: cp, gs: grantcheck.ViewID(subjects), subjects: subjects, filter: filter, memo: map[string]bool{}}
 }
 
 // visible reports whether name is visible to the view, as the origin
@@ -223,7 +223,7 @@ func (fv *fview) visible(name string) bool {
 	if ok {
 		return v
 	}
-	v = fv.filter.AllowsItem(name)
+	v = fv.filter.Allows(name)
 	fv.mu.Lock()
 	fv.memo[name] = v
 	fv.mu.Unlock()
@@ -243,7 +243,7 @@ func grantFview(cp *fcp, v *grant.Verified, steps int) (*fview, error) {
 	pub, _ := v.Key.Raw["pub"].(string)
 	f := grantcheck.FilterOf(v)
 	f.Steps = steps
-	return newFview(cp, grantcheck.FilteredSubjects(digest, v.Key.Kid, pub), f), nil
+	return newFview(cp, grantcheck.ViewSubjects(digest, v.Key.Kid, pub, true), f), nil
 }
 
 // errRulesChanged refuses a cookie for a marker reads:{ns}:g:{gs} at a

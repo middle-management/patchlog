@@ -450,7 +450,7 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 
 // marked sets a's gs, the subject set of its marker alone.
 func marked(a *access) *access {
-	a.gs = grantcheck.SubjectSetID([]string{a.marker})
+	a.gs = grantcheck.ViewID([]string{a.marker})
 	return a
 }
 
