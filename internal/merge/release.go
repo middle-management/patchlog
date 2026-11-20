@@ -198,7 +198,13 @@ func samePublish(a, b *Publish) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
 	}
-	return a.Path == b.Path && jsonv.Equal(jsonv.FromGo(a.Value), jsonv.FromGo(b.Value))
+	val := func(p *Publish) any {
+		if p.Value == nil {
+			return true
+		}
+		return jsonv.FromGo(p.Value)
+	}
+	return a.Path == b.Path && jsonv.Equal(val(a), val(b))
 }
 
 // PlanFormat is the stored plan's format: 3, the three steps of v0.87
@@ -316,8 +322,10 @@ type relCtx struct {
 	// per key
 	docs    map[string]map[string]any // key -> resource -> branch head doc (nil = deleted)
 	plans   map[string]*Plan          // "step/key" -> plan used for classification
-	listed  map[string]bool           // branch namespaces listed
+	listed  map[string]bool           // branch namespaces listed, by this release or one it builds on
 	ownCfgs map[string]string         // branch -> config id our approval left (resume)
+	// onBranches are the branches of the releases this one builds on.
+	onBranches []string
 }
 
 // PlanRelease classifies a release and reports its conflicts, without
@@ -423,6 +431,22 @@ func (x *relCtx) targets(ctx context.Context) (map[string]string, error) {
 	for k, b := range on.Doc.Branches {
 		if _, ok := out[k]; ok {
 			out[k] = b.NS
+		}
+	}
+	// Its documents resolve drafts from the releases it builds on too
+	// (§F.9, §6.1), so their branches count as listed for drafts.
+	for depth, r := 0, on; r != nil && depth < 8; depth++ {
+		for _, n := range r.Doc.BranchNames() {
+			if !x.listed[n] {
+				x.listed[n] = true
+				x.onBranches = append(x.onBranches, n)
+			}
+		}
+		if r.Doc.On == "" {
+			break
+		}
+		if r, err = release.Load(ctx, x.c, r.Doc.On); err != nil {
+			return nil, fmt.Errorf("merge: a release this one builds on: %w", err)
 		}
 	}
 	return out, nil
@@ -870,7 +894,7 @@ func pinnedLinks(d any) []string {
 // as clients do (§6.1): the path's namespace, then the release's branches,
 // then the others.
 func (x *relCtx) drafts(ctx context.Context) error {
-	prefer := x.rel.Doc.BranchNames()
+	prefer := append(x.rel.Doc.BranchNames(), x.onBranches...)
 	checked := map[string]bool{}
 	var check func(b *ReleaseBranch, name, path string, depth int) error
 	check = func(b *ReleaseBranch, name, path string, depth int) error {

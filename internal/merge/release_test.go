@@ -51,7 +51,7 @@ type relWorld struct {
 // and the branches the tests create.
 var relNS = []string{"schemas", "matches", "cat-season", "releases",
 	"schemas-r7", "matches-r7", "cat-season-r7", "schemas-x", "cat-season-r8",
-	"schemas-r7-b", "matches-r7-b", "cat-season-r7-b"}
+	"schemas-r7-b", "matches-r7-b", "cat-season-r7-b", "schemas-r6", "matches-r6", "matches-x"}
 
 func matchSchema(extra ...string) map[string]any {
 	props := map[string]any{"home": map[string]any{"type": "string"}, "away": map[string]any{"type": "string"}}
@@ -83,7 +83,7 @@ func newRelWorld(t *testing.T) *relWorld {
 	long := map[string]any{"exp": s.Now().Add(24 * time.Hour).Format(time.RFC3339)}
 	w.ops = s.Client(t, client.WithBearer(w.opsKey.Grant(t, s.Now(), "user:ops", relNS, all, long)))
 	w.anna = s.Client(t, client.WithBearer(w.idp.Grant(t, s.Now(), "user:anna", relNS, all,
-		map[string]any{"groups": sAny("match-desk"), "exp": s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))
+		map[string]any{"groups": sAny("match-desk", "publishers"), "exp": s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))
 
 	// The bases.
 	w.T0 = must(w.ops.CreateDoc(ctx, "schemas", "match", matchSchema())).ID
