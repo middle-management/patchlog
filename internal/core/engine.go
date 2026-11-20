@@ -357,6 +357,9 @@ type Engine struct {
 	// arguments (tests that count statements). It is set right after Open,
 	// with no background loop running.
 	onStatement func(q string, args []any)
+	// purgeHoldersMax, if not 0, replaces the constant of that name for a
+	// test: negative, every purge searches level by level (purgeLevels).
+	purgeHoldersMax int
 	// Group commit (groupcommit.go): the queues, and for tests, noSolo
 	// queues even a write that finds its namespace idle, groupStart is
 	// called in a group's transaction once it holds its locks, and

@@ -35,6 +35,10 @@ func TestPurgeReach(t *testing.T) {
 	// A document of the same name below a branch that sees none, and a
 	// branch reading that one through.
 	own := e.create("old-own", "x", map[string]any{"mine": true})
+	// And one three branches down that see nothing.
+	branch("old-kid", "old-kid2")
+	branch("old-kid2", "deep-own")
+	deep := e.create("deep-own", "x", map[string]any{"deep": true})
 	branch("old-own", "old-own-late")
 	// Made now, at a position before x existed.
 	expect(t, e.branch("p", map[string]any{"name": "early", "at": before}, "alice"), 201)
@@ -73,6 +77,7 @@ func TestPurgeReach(t *testing.T) {
 	}{
 		{"old", "", 404}, {"old-kid", "", 404}, {"early", "", 404}, {"old-own-kid", "", 404},
 		{"old-own", own, 410}, {"old-own-late", own, 410},
+		{"old-kid2", "", 404}, {"deep-own", deep, 410},
 		{"rt", x2, 410}, {"rt-kid", x2, 410},
 		{"top", t1, 410}, {"top-kid", x2, 410}, {"top-late", t1, 410},
 		{"dead", tomb, 410},
