@@ -527,11 +527,41 @@ const purgeHoldersMax = 1000
 // them (a test explains them): the namespaces with a row for a name, by
 // resources_name, and (Postgres) the branches of some bases made at or
 // after a position each, by namespaces_base_at.
+//
+// sealed and blob_epochs hold many rows per namespace and name (a sealed
+// copy per revision and kind, a sealing per blob and epoch), so their
+// namespaces are read one index seek each, the least ns above the one
+// before: a DISTINCT over the name's rows would read them all, however few
+// the namespaces, before it could tell whether there are too many.
 const (
-	purgeHoldersByRow = `SELECT r.ns, (SELECT MIN(h.ns_seq) FROM head_history h WHERE h.res = r.res) FROM resources r WHERE r.name = ? LIMIT ?`
+	purgeHoldersByRow  = `SELECT r.ns, (SELECT MIN(h.ns_seq) FROM head_history h WHERE h.res = r.res) FROM resources r WHERE r.name = ? LIMIT ?`
+	purgeHoldersSealed = `WITH RECURSIVE h(ns) AS (
+			SELECT MIN(ns) FROM sealed WHERE name = ?
+			UNION ALL
+			SELECT (SELECT MIN(x.ns) FROM sealed x WHERE x.name = ? AND x.ns > h.ns) FROM h WHERE h.ns IS NOT NULL)
+		SELECT ns, CAST(NULL AS bigint) FROM h WHERE ns IS NOT NULL LIMIT ?`
+	purgeHoldersEpochs = `WITH RECURSIVE h(ns) AS (
+			SELECT MIN(ns) FROM blob_epochs WHERE name = ?
+			UNION ALL
+			SELECT (SELECT MIN(x.ns) FROM blob_epochs x WHERE x.name = ? AND x.ns > h.ns) FROM h WHERE h.ns IS NOT NULL)
+		SELECT ns, CAST(NULL AS bigint) FROM h WHERE ns IS NOT NULL LIMIT ?`
 	purgeBranchesFrom = `SELECT c.ns, c.name, c.base FROM unnest(?::bigint[], ?::bigint[]) AS v(base, lo) CROSS JOIN LATERAL
 			(SELECT ns, name, base FROM namespaces WHERE base = v.base AND base_at >= v.lo AND purged = 0 OFFSET 0) c`
 )
+
+// purgeChains is the statement that reads the chains of bases of the
+// namespaces that hold rows for a name, each up to the purged namespace or
+// to its root: one for all of them, each base found by its key. A holder
+// in another tree is read up to its own root, which is how it is known
+// not to be below the purged namespace; there are at most purgeHoldersMax
+// holders, and a chain is as short as branches are deep.
+func (e *Engine) purgeChains() string {
+	return `WITH RECURSIVE c(ns, name, base, base_at, purged) AS (
+			SELECT ns, name, base, base_at, purged FROM namespaces WHERE ` + e.inArray("ns", "bigint") + `
+			UNION
+			SELECT b.ns, b.name, b.base, b.base_at, b.purged FROM c JOIN namespaces b ON b.ns = c.base WHERE c.ns <> ?)
+		SELECT ns, name, base, base_at, purged FROM c`
+}
 
 // holdersMax is purgeHoldersMax, or what a test set instead.
 func (e *Engine) holdersMax() int {
@@ -545,7 +575,7 @@ func (e *Engine) holdersMax() int {
 // the name, without reading a row of a branch it has nothing to do in: n,
 // whose branches may see the name from rootLo, is not purged. It reports
 // false, having found nothing, if more than purgeHoldersMax namespaces
-// hold rows for the name.
+// hold rows for the name, in the three tables together.
 //
 //   - The holders: the namespaces with a resources row, sealed copies or
 //     blob sealings for the name, by the indexes on (name, ns) of the
@@ -566,15 +596,19 @@ func (e *Engine) holdersMax() int {
 //     never, and whatever holds a row below it was found by name.
 func (t *tx) purgeHolders(n *nsRow, name string, rootLo int64) ([]purgeCand, bool) {
 	first := map[int64]sql.NullInt64{} // holders, with their rows' first entries
-	limit := t.e.holdersMax() + 1
-	for i, q := range []string{
-		purgeHoldersByRow,
-		`SELECT DISTINCT ns, CAST(NULL AS bigint) FROM sealed WHERE name = ? LIMIT ?`,
-		`SELECT DISTINCT ns, CAST(NULL AS bigint) FROM blob_epochs WHERE name = ? LIMIT ?`,
-	} {
-		rows, err := t.Query(q, name, limit)
+	most := t.e.holdersMax()
+	if most < 0 {
+		return nil, false
+	}
+	// The bound is on the holders of all three tables together, and each
+	// statement stops one past it.
+	for i, q := range []string{purgeHoldersByRow, purgeHoldersSealed, purgeHoldersEpochs} {
+		args := []any{name, most + 1}
+		if i > 0 {
+			args = []any{name, name, most + 1}
+		}
+		rows, err := t.Query(q, args...)
 		t.must(err)
-		k := 0
 		for rows.Next() {
 			var ns int64
 			var at sql.NullInt64
@@ -582,11 +616,10 @@ func (t *tx) purgeHolders(n *nsRow, name string, rootLo int64) ([]purgeCand, boo
 			if i == 0 || !first[ns].Valid {
 				first[ns] = at
 			}
-			k++
 		}
 		t.must(rows.Err())
 		rows.Close()
-		if k > t.e.holdersMax() {
+		if len(first) > most {
 			return nil, false
 		}
 	}
@@ -596,7 +629,7 @@ func (t *tx) purgeHolders(n *nsRow, name string, rootLo int64) ([]purgeCand, boo
 		at     int64
 		purged bool
 	}
-	nodes := map[int64]node{}
+	nodes, names := map[int64]node{}, map[int64]string{}
 	var ids []int64
 	for id := range first {
 		if id != n.id {
@@ -608,11 +641,7 @@ func (t *tx) purgeHolders(n *nsRow, name string, rootLo int64) ([]purgeCand, boo
 	}
 	if len(ids) > 0 {
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		rows, err := t.Query(`WITH RECURSIVE c(ns, name, base, base_at, purged) AS (
-				SELECT ns, name, base, base_at, purged FROM namespaces WHERE `+t.e.inArray("ns", "bigint")+`
-				UNION
-				SELECT b.ns, b.name, b.base, b.base_at, b.purged FROM c JOIN namespaces b ON b.ns = c.base WHERE c.ns <> ?)
-			SELECT ns, name, base, base_at, purged FROM c`, t.e.arrayArg(ids), n.id)
+		rows, err := t.Query(t.e.purgeChains(), t.e.arrayArg(ids), n.id)
 		t.must(err)
 		for rows.Next() {
 			var l nsLink
@@ -620,7 +649,7 @@ func (t *tx) purgeHolders(n *nsRow, name string, rootLo int64) ([]purgeCand, boo
 			var at sql.NullInt64
 			t.must(rows.Scan(&l.id, &l.name, &l.base, &at, &x.purged))
 			x.base, x.at = l.base, at.Int64
-			nodes[l.id], t.links[l.id] = x, l
+			nodes[l.id], names[l.id] = x, l.name
 		}
 		t.must(rows.Err())
 		rows.Close()
@@ -638,6 +667,10 @@ func (t *tx) purgeHolders(n *nsRow, name string, rootLo int64) ([]purgeCand, boo
 			return false
 		}
 		below[id] = true
+		// Kept for the rest of the transaction, as a chain read by link
+		// is: only of the namespaces below n, not of the name's holders
+		// elsewhere, whose chains were read to find that out.
+		t.links[id] = nsLink{id, names[id], x.base}
 		switch at := first[id]; {
 		case x.at >= los[x.base.Int64]:
 			// Made at or after the position its base's branches may see

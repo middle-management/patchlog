@@ -23,7 +23,7 @@ func TestPurgeSearch(t *testing.T) {
 	for _, mode := range []struct {
 		name string
 		max  int
-	}{{"by name", 0}, {"by level", -1}} {
+	}{{"by name", 0}, {"by level", -1}, {"by level, any negative bound", -5}, {"over the bound", 3}} {
 		t.Run(mode.name, func(t *testing.T) {
 			t.Parallel()
 			e := openInstance(t, pgtest.DB(t), t.TempDir())
@@ -141,6 +141,9 @@ func TestPurgeSearch(t *testing.T) {
 // branch they have nothing to say about: with 40 branches made before the
 // document, 2 after and 30 frozen, the search's statement returns the 2
 // and filters nothing out, and the count reads the live branches' index.
+// The namespaces with sealed copies or blob sealings of a name are read
+// one index seek each, however many rows each has, and the holders' chains
+// of bases by key.
 func TestPGPurgeSearchPlans(t *testing.T) {
 	if !pgtest.Enabled() {
 		t.Skip("PATCHLOG_TEST_PG is not set")
@@ -193,6 +196,18 @@ func TestPGPurgeSearchPlans(t *testing.T) {
 		n := tx.nsByName("n")
 		var lo int64
 		tx.must(tx.QueryRow(`SELECT MIN(h.ns_seq) FROM resources r JOIN head_history h ON h.res = r.res WHERE r.ns = ? AND r.name = 'x'`, n.id).Scan(&lo))
+		// Many rows per namespace and name, as sealed copies and blob
+		// sealings come: 500 each in three namespaces.
+		post0 := tx.nsByName("post0").id
+		for _, q := range []string{
+			`INSERT INTO sealed (ns, kind, key, name, jwe, created, kver) SELECT b.ns, 'doc', 'k' || g, 'x', 'j', 0, 1
+				FROM namespaces b, generate_series(1, 500) g WHERE b.name IN ('pre0', 'pre1', 'post0')`,
+			`INSERT INTO blob_epochs (ns, name, bid, epoch, created) SELECT b.ns, 'x', decode(lpad(to_hex(g), 40, '0'), 'hex'), 1, 0
+				FROM namespaces b, generate_series(1, 500) g WHERE b.name IN ('pre0', 'pre1', 'post0')`,
+		} {
+			_, err := tx.Tx.Exec(q)
+			tx.must(err)
+		}
 		restore := tx.planByIndex()
 		defer restore()
 		for _, c := range []struct {
@@ -201,9 +216,16 @@ func TestPGPurgeSearchPlans(t *testing.T) {
 			{"the branches made at or after the document", explain(tx, purgeBranchesFrom, []int64{n.id}, []int64{lo}), "namespaces_base_at", "rows=2 "},
 			{"the namespaces with a row for the name", explain(tx, purgeHoldersByRow, "x", 1001), "resources_name", "rows=1 "},
 			{"the live branches", explain(tx, liveBranchesCount, n.id, 0), "namespaces_live", "rows=12 "},
+			// One index seek per namespace, not the 1,500 rows.
+			{"the namespaces with sealed copies of the name", explain(tx, purgeHoldersSealed, "x", "x", 1001), "sealed_by_name", "rows=3 "},
+			{"the namespaces with blob sealings of the name", explain(tx, purgeHoldersEpochs, "x", "x", 1001), "blob_epochs_name", "rows=3 "},
+			{"the holders' chains of bases", explain(tx, tx.e.purgeChains(), []int64{post0}, n.id), "namespaces_pkey", "rows=2 "},
 		} {
-			if !strings.Contains(c.plan, c.index) || !strings.Contains(c.plan, c.rows) ||
-				strings.Contains(c.plan, "Seq Scan") || strings.Contains(c.plan, "Rows Removed by Filter") {
+			// The recursive statements filter their own working rows (the
+			// row that ends the recursion), never a table's.
+			plan := strings.NewReplacer("Rows Removed by Filter: 0", "", "Rows Removed by Filter: 1\n", "\n").Replace(c.plan + "\n")
+			if !strings.Contains(plan, c.index) || !strings.Contains(plan, c.rows) || strings.Contains(plan, "Seq Scan") ||
+				strings.Contains(plan, "Rows Removed by Filter") || strings.Contains(plan, "rows=500 ") || strings.Contains(plan, "rows=1500 ") {
 				t.Errorf("%s: want an index scan of %s with %s and nothing filtered out, got\n%s", c.what, c.index, c.rows, c.plan)
 			}
 		}
