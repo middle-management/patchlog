@@ -161,7 +161,7 @@ func TestV082EndedCookieSealedPurged(t *testing.T) {
 			}
 			var path string
 			for _, p := range r.body["prefixes"].([]any) {
-				if strings.HasPrefix(p.(string), "/sec/g/") {
+				if strings.HasPrefix(p.(string), "/sec/view/") {
 					path = p.(string) + "?q=secret"
 				}
 			}

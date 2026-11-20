@@ -196,38 +196,18 @@ func (ix *Index) keptCP(ns, at string) *fcp {
 	return nil
 }
 
-// fview is one subject set's view of a covered namespace at a checkpoint
-// (§7.9 Visible): its read filter decides. It memoises each name's
-// answer and is safe for concurrent use.
+// fview is one view's reading of a covered namespace at a checkpoint
+// (§7.9 Visible): its read filter decides, per revision (revAllow).
 type fview struct {
 	cp       *fcp
-	gs       string // the §7.9 gs of subjects, which the marker names
+	gs       string // the §7.9 view of subjects
 	subjects []string
 	filter   *grantcheck.ReadFilter
-
-	mu   sync.Mutex
-	memo map[string]bool
+	visible  allowFunc
 }
 
-func newFview(cp *fcp, subjects []string, filter *grantcheck.ReadFilter) *fview {
-	return &fview{cp: cp, gs: grantcheck.ViewID(subjects), subjects: subjects, filter: filter, memo: map[string]bool{}}
-}
-
-// visible reports whether name is visible to the view, as the origin
-// judges it: the filter allows reading it, roles counting as §C.2 item 5
-// counts them (ReadFilter.AllowsItem).
-func (fv *fview) visible(name string) bool {
-	fv.mu.Lock()
-	v, ok := fv.memo[name]
-	fv.mu.Unlock()
-	if ok {
-		return v
-	}
-	v = fv.filter.Allows(name)
-	fv.mu.Lock()
-	fv.memo[name] = v
-	fv.mu.Unlock()
-	return v
+func (ix *Index) newFview(cp *fcp, subjects []string, filter *grantcheck.ReadFilter) *fview {
+	return &fview{cp: cp, gs: grantcheck.ViewID(subjects), subjects: subjects, filter: filter, visible: ix.revAllow(cp.ns, filter)}
 }
 
 // grantFview is a partial reader's view at cp (§7.9 gs): its subjects
@@ -235,7 +215,7 @@ func (fv *fview) visible(name string) bool {
 // the origin's; its filter the grant's (grantcheck.FilterOf). A grant
 // whose key-scope or block rules refer to /now, or whose roles all do,
 // can't read this way: 403 (§C.2 item 5).
-func grantFview(cp *fcp, v *grant.Verified, steps int) (*fview, error) {
+func (ix *Index) grantFview(cp *fcp, v *grant.Verified, steps int) (*fview, error) {
 	digest, ok := grantcheck.ReadsScope(v)
 	if !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "a rule limiting the grant's reads refers to /now"}
@@ -243,7 +223,7 @@ func grantFview(cp *fcp, v *grant.Verified, steps int) (*fview, error) {
 	pub, _ := v.Key.Raw["pub"].(string)
 	f := grantcheck.FilterOf(v)
 	f.Steps = steps
-	return newFview(cp, grantcheck.ViewSubjects(digest, v.Key.Kid, pub, true), f), nil
+	return ix.newFview(cp, grantcheck.ViewSubjects(digest, v.Key.Kid, pub, true), f), nil
 }
 
 // errRulesChanged refuses a cookie for a marker reads:{ns}:g:{gs} at a
@@ -311,7 +291,7 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *marker
 			return nil, errRulesChanged
 		}
 	}
-	return newFview(cp, rec.subjects, rec.f), nil
+	return ix.newFview(cp, rec.subjects, rec.f), nil
 }
 
 // gsKeyHolds reports whether k, a key a cookie of a marker came from, is

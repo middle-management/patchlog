@@ -36,7 +36,7 @@ func (s *svc) refsPointer(query, token string) (at, gs, loc string) {
 	r := s.raw("/_refs"+query, token)
 	loc = r.header.Get("Location")
 	p := strings.Split(strings.SplitN(loc, "?", 2)[0], "/")
-	if r.status != 302 || len(p) != 6 || p[1] != "_refs" || p[2] != "g" || p[4] != "at" {
+	if r.status != 302 || len(p) != 6 || p[1] != "_refs" || p[2] != "view" || p[4] != "at" {
 		s.t.Fatalf("GET /_refs%s: %d %q %v", query, r.status, loc, r.body)
 	}
 	return p[5], p[3], loc
@@ -106,7 +106,7 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 
 	// amy reads pa and the public namespace: a private pointer and answer.
 	amyAt, amyGs, amyLoc := idx.refsPointer(q, amy)
-	// A redirect that adds a private /g/{gs} is private, no-store (§A.4,
+	// A redirect that adds a private /view/{gs} is private, no-store (§A.4,
 	// v0.73).
 	if r := idx.raw("/_refs"+q, amy); r.header.Get("Cache-Control") != "private, no-store" || r.header.Get("Vary") != "Authorization" || !strings.HasSuffix(amyLoc, q) {
 		t.Errorf("pointer %s %v", amyLoc, r.header)
@@ -255,8 +255,8 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 		}
 	}
 	for _, p := range []string{
-		"/_refs/g/" + amyGs + "/at/" + idx.ix.Checkpoint("pa") + q, // never computed
-		"/_refs/g/" + amyGs + "/at/" + amyAt + q + "&min=pa:" + idx.ix.Checkpoint("pa"),
+		"/_refs/view/" + amyGs + "/at/" + idx.ix.Checkpoint("pa") + q, // never computed
+		"/_refs/view/" + amyGs + "/at/" + amyAt + q + "&min=pa:" + idx.ix.Checkpoint("pa"),
 	} {
 		if r := idx.raw(p, amy); r.status != 302 || r.header.Get("Location") != newLoc {
 			t.Errorf("%s: %d %s", p, r.status, r.header.Get("Location"))
@@ -264,13 +264,13 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	}
 	// The query in another form redirects to the canonical one, at the
 	// same at (§A.5).
-	if r := idx.raw("/_refs/g/"+amyGs+"/at/"+amyAt+"?to="+x, amy); r.status != 302 || r.header.Get("Location") != amyLoc {
+	if r := idx.raw("/_refs/view/"+amyGs+"/at/"+amyAt+"?to="+x, amy); r.status != 302 || r.header.Get("Location") != amyLoc {
 		t.Errorf("not canonical: %d %s", r.status, r.header.Get("Location"))
 	}
 	// A grant reads only at its own subject set (§A.4, §B.11.5, v0.73):
 	// someone else's is 403, no-store, with or without min, never
 	// redirected; without a grant it is 401.
-	for _, p := range []string{bobLoc, "/_refs/g/" + bobGs + "/at/" + amyAt + q + "&min=pa:" + a1, bobLoc + "&min=pa:" + a1} {
+	for _, p := range []string{bobLoc, "/_refs/view/" + bobGs + "/at/" + amyAt + q + "&min=pa:" + a1, bobLoc + "&min=pa:" + a1} {
 		if r := idx.raw(p, amy); r.status != 403 || r.body["code"] != "forbidden" || r.header.Get("Cache-Control") != "no-store" || r.header.Get("Location") != "" {
 			t.Errorf("foreign gs %s: %d %v %v", p, r.status, r.body, r.header)
 		}
@@ -336,26 +336,22 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	// Bad input.
 	for _, p := range []string{
 		"/_refs", "/_refs?to=garbage", "/_refs" + q + "&to=" + url.QueryEscape("/r/target/y"), "/_refs" + q + "&q=x",
-		"/_refs" + q + "&limit=0", "/_refs" + q + "&limit=101", "/_refs/g/" + amyGs + "/at/zzz" + q,
+		"/_refs" + q + "&limit=0", "/_refs" + q + "&limit=101", "/_refs/view/" + amyGs + "/at/zzz" + q,
 		"/_refs" + q + "&after=pa", "/_refs" + q + "&after=pa/a1&after=pa/a2",
 	} {
 		if r := idx.raw(p, amy); r.status != 400 {
 			t.Errorf("%s: %d", p, r.status)
 		}
 	}
-	for _, p := range []string{"/_refs/x", "/_refs/at/" + amyAt + q, "/_refs/g/zzz/at/" + amyAt + q, "/_refs/at/" + amyAt + "/g/zzz" + q} {
+	for _, p := range []string{"/_refs/x", "/_refs/at/" + amyAt + q, "/_refs/view/zzz/at/" + amyAt + q, "/_refs/at/" + amyAt + "/view/zzz" + q} {
 		if r := idx.raw(p, amy); r.status != 404 {
 			t.Errorf("%s: %d", p, r.status)
 		}
 	}
 	// The head pointer under the subject set's prefix, which its edge
 	// grants cover (§B.11.5), redirects to its current at.
-	if r := idx.raw("/_refs/g/"+amyGs+q, amy); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/_refs/g/"+amyGs+"/at/") {
+	if r := idx.raw("/_refs/view/"+amyGs+q, amy); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/_refs/view/"+amyGs+"/at/") {
 		t.Errorf("pointer under the prefix: %d %s", r.status, r.header.Get("Location"))
-	}
-	// The form before v0.51 is moved to the subject set first (§A.4).
-	if r := idx.raw("/_refs/at/"+amyAt+"/g/"+amyGs+q, ""); r.status != 301 || r.header.Get("Location") != amyLoc {
-		t.Errorf("old form: %d %s", r.status, r.header.Get("Location"))
 	}
 
 	// A purge drops the kept answers that show the resource.

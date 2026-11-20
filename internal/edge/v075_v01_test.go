@@ -14,9 +14,9 @@ func TestV075ParseCorePrefix(t *testing.T) {
 	t.Parallel()
 	gs := ids.Of([]byte("x")).String()
 	for p, want := range map[string]Prefix{
-		"/r/demo/a":        {NS: "demo", Resource: "a"},
-		"/r/demo":          {NS: "demo"},
-		"/ns/demo":         {NS: "demo"},
+		"/r/demo/a":           {NS: "demo", Resource: "a"},
+		"/r/demo":             {NS: "demo"},
+		"/ns/demo":            {NS: "demo"},
 		"/ns/demo/view/" + gs: {NS: "demo", View: gs},
 	} {
 		if got, ok := ParseCorePrefix(p); !ok || got != want {

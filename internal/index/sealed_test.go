@@ -153,7 +153,7 @@ func TestSealedNamespace(t *testing.T) {
 	}
 	h := must(seal.ParseHeader(string(f.body)))
 	at := x.ix.Checkpoint("sec")
-	if h.Kid != "sec#1" || h.Zip != "" || fmt.Sprint(h.PL) != fmt.Sprint(map[string]any{"ns": "sec", "view": "/sec/g/" + gs + "/at/" + at + "?counts=%2Ftag&q=secret"}) {
+	if h.Kid != "sec#1" || h.Zip != "" || fmt.Sprint(h.PL) != fmt.Sprint(map[string]any{"ns": "sec", "view": "/sec/view/" + gs + "/at/" + at + "?counts=%2Ftag&q=secret"}) {
 		t.Fatalf("header %+v", h)
 	}
 	keys := epochKeys(t, w, "sec")
@@ -195,7 +195,7 @@ func TestSealedNamespace(t *testing.T) {
 	if again := x.fetch(f.path, rd); string(again.body) != string(f.body) || !strings.Contains(again.header.Get("Cache-Tag"), "r:sec/a") {
 		t.Fatalf("resealed after a restart (tags %q)", again.header.Get("Cache-Tag"))
 	}
-	if r := x.raw("/sec/g/"+gs+"/at/"+at+"?q=secret&counts=/tag", rd); r.status != 302 || r.header.Get("Location") != f.path {
+	if r := x.raw("/sec/view/"+gs+"/at/"+at+"?q=secret&counts=/tag", rd); r.status != 302 || r.header.Get("Location") != f.path {
 		t.Fatalf("non-canonical: %d %s", r.status, r.header.Get("Location"))
 	}
 
@@ -222,7 +222,7 @@ func TestSealedNamespace(t *testing.T) {
 	if again := x.fetch(f.path, rd); again.path != f.path || string(again.body) != string(f.body) {
 		t.Fatalf("kept result: %s, changed %v", again.path, string(again.body) != string(f.body))
 	}
-	if r := x.raw("/sec/g/"+gs+"/at/"+at+"?q=secret&counts=/tag", rd); r.status != 302 || r.header.Get("Location") != f.path {
+	if r := x.raw("/sec/view/"+gs+"/at/"+at+"?q=secret&counts=/tag", rd); r.status != 302 || r.header.Get("Location") != f.path {
 		t.Fatalf("non-canonical, kept: %d %s", r.status, r.header.Get("Location"))
 	}
 

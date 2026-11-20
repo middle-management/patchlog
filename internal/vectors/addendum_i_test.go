@@ -543,8 +543,8 @@ func TestI8SubjectSetAndCheckpoint(t *testing.T) {
 		{"user:anna", "group:match-desk"}, // sorted first
 		{"user:anna", "group:match-desk", "user:anna"},
 	} {
-		if got := grantcheck.SubjectSetID(subjects); got != gs {
-			t.Errorf("SubjectSetID(%q) = %s, want %s", subjects, got, gs)
+		if got := grantcheck.ViewID(subjects); got != gs {
+			t.Errorf("ViewID(%q) = %s, want %s", subjects, got, gs)
 		}
 	}
 	if at := grantcheck.CombinedAt(map[string]string{"cat": nsID1, "matches": nsID2}); at != "1vwnfnoyshruyx4lul4a25rtctooiph5v" {

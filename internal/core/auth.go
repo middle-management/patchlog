@@ -548,7 +548,7 @@ const (
 // or key scope refer to /now is refused in the read check itself
 // (readerCheckURL), before any redirect. Anything else is nsReader's
 // refusal. An edge grant for a
-// filtered read (GS) is none: filteredAdmit judges it at filtered URLs.
+// filtered read (a view's) is none: filteredAdmit judges it at filtered URLs.
 func (t *tx) nsAccess(n *nsRow, cred Credentials) (*actor, accessKind, *fscope, *Error) {
 	cfg := t.config(n.configSeq)
 	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {

@@ -62,7 +62,7 @@ func (q *Query) pathChecks() []pathCheck {
 // schemas, not from the rows, so whether a query fails never depends on
 // whether a document has values at the path: each schema is walked alone,
 // along the path.
-func (ix *Index) checkFields(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow func(string) bool) error {
+func (ix *Index) checkFields(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow allowFunc) error {
 	checks := q.pathChecks()
 	if len(checks) == 0 {
 		return nil
@@ -120,18 +120,18 @@ func (ix *Index) checkFields(ctx context.Context, tx *sql.Tx, ns string, q *Quer
 // schemaSeen reports whether a document of ns typed by schema s is one
 // allow lets the reader see: its documents on docs_q, until the first that
 // is.
-func (ix *Index) schemaSeen(ctx context.Context, tx *sql.Tx, ns, s string, allow func(string) bool) (bool, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT resource FROM docs WHERE ns = ? AND schema = ?`, ns, s)
+func (ix *Index) schemaSeen(ctx context.Context, tx *sql.Tx, ns, s string, allow allowFunc) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT resource, head FROM docs WHERE ns = ? AND schema = ?`, ns, s)
 	if err != nil {
 		return false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var r string
-		if err := rows.Scan(&r); err != nil {
+		var r, head string
+		if err := rows.Scan(&r, &head); err != nil {
 			return false, err
 		}
-		if allow(r) {
+		if allow(r, head) {
 			return true, nil
 		}
 	}

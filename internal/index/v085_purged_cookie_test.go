@@ -54,7 +54,7 @@ func TestV085EndedCookieSealedPurged(t *testing.T) {
 			t.Fatalf("exchange: %d %v", r.status, r.body)
 		}
 		for _, p := range r.body["prefixes"].([]any) {
-			if strings.HasPrefix(p.(string), "/sec/g/") {
+			if strings.HasPrefix(p.(string), "/sec/view/") {
 				return p.(string) + "?q=secret", r.cookies
 			}
 		}

@@ -14,7 +14,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
-	"github.com/middle-management/patchlog/internal/grantcheck"
+
 	"github.com/middle-management/patchlog/internal/index"
 )
 
@@ -158,7 +158,7 @@ func (w *v75x) pointer(path, token string) (loc, gs, at string) {
 	r := w.x.raw(path, token)
 	loc = r.header.Get("Location")
 	p := strings.Split(strings.SplitN(loc, "?", 2)[0], "/")
-	if r.status != 302 || len(p) != 6 || p[2] != "g" || p[4] != "at" || r.header.Get("Cache-Control") != "private, no-store" {
+	if r.status != 302 || len(p) != 6 || p[2] != "view" || p[4] != "at" || r.header.Get("Cache-Control") != "private, no-store" {
 		w.t.Fatalf("GET %s: %d %q %v %v", path, r.status, loc, r.body, r.header)
 	}
 	return loc, p[3], p[5]
@@ -276,7 +276,7 @@ func TestV075IndexSubjectSets(t *testing.T) {
 		t.Errorf("narrow sees %v", got)
 	}
 	// The origin's own subject set for the same grant, which its exchange
-	// gives a partial reader as the prefix /ns/matches/g/{gs} (§7.9
+	// gives a partial reader as the prefix /ns/matches/view/{gs} (§7.9
 	// Edge grants): the gs inside the index's marker is the origin's.
 	req := must(http.NewRequestWithContext(ctx, "POST", w.s.URL+"/edge-grants", nil))
 	req.Header.Set("Authorization", "Bearer "+fan)
@@ -284,12 +284,13 @@ func TestV075IndexSubjectSets(t *testing.T) {
 	var body struct{ Prefixes []string }
 	err := json.NewDecoder(res.Body).Decode(&body)
 	res.Body.Close()
-	if err != nil || res.StatusCode != 200 || len(body.Prefixes) != 1 || !strings.HasPrefix(body.Prefixes[0], "/ns/matches/g/") {
+	if err != nil || res.StatusCode != 200 || len(body.Prefixes) != 1 || !strings.HasPrefix(body.Prefixes[0], "/ns/matches/view/") {
 		t.Fatalf("the origin's exchange: %d %v %v", res.StatusCode, err, body)
 	}
-	ogs := strings.TrimPrefix(body.Prefixes[0], "/ns/matches/g/")
-	if want := grantcheck.SubjectSetID([]string{"reads:matches:g:" + ogs}); fgs != want {
-		t.Errorf("index gs %s, want that of reads:matches:g:%s (%s)", fgs, ogs, want)
+	ogs := strings.TrimPrefix(body.Prefixes[0], "/ns/matches/view/")
+	// v0.87 (§A.4): the reader's §7.9 view, as the origin computes it.
+	if fgs != ogs {
+		t.Errorf("index view %s, want the origin's %s", fgs, ogs)
 	}
 	if want := w.x.ix.Checkpoint("matches"); fat != want {
 		t.Errorf("index at %s, want %s", fat, want)
@@ -318,8 +319,8 @@ func TestV075IndexCookies(t *testing.T) {
 			prefix = p.(string)
 		}
 	}
-	if prefix != "/matches/g/"+gs {
-		t.Fatalf("prefixes %v, want /matches/g/%s", r.body["prefixes"], gs)
+	if prefix != "/matches/view/"+gs {
+		t.Fatalf("prefixes %v, want /matches/view/%s", r.body["prefixes"], gs)
 	}
 	got, _ := p37Follow(t, w.x, prefix, r.cookies, "")
 	if got.status != 200 || strings.Join(p37Hits(got.body), ",") != "derby,shared" {

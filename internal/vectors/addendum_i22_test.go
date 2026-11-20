@@ -287,7 +287,7 @@ func TestI22SealedEventsServed(t *testing.T) {
 func TestI23ViewKey(t *testing.T) {
 	t.Parallel()
 	p := loadAddendumI(t).I23
-	gs := grantcheck.SubjectSetID([]string{"group:match-desk", "user:anna"}) // I.8's
+	gs := grantcheck.ViewID([]string{"group:match-desk", "user:anna"}) // I.8's
 	// The premise is illustrative, like §I.19's plaintexts: I.8's gs is a
 	// set of two principals, and the reference serves a response sealed
 	// whole only at a gs every reader of which reads the namespace whole,
@@ -299,7 +299,7 @@ func TestI23ViewKey(t *testing.T) {
 	if cq != "?"+p.CanonicalQuery {
 		t.Errorf("the canonical query is %s, want ?%s", cq, p.CanonicalQuery)
 	}
-	view := "/demo/g/" + gs + "/at/" + nsID2 + cq
+	view := "/demo/view/" + gs + "/at/" + nsID2 + cq
 	if view != p.View {
 		t.Fatalf("view\n%s\nwant\n%s", view, p.View)
 	}

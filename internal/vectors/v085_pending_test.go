@@ -58,7 +58,7 @@ func TestV085C5GrantLineKeyRejected(t *testing.T) {
 // C.4, served (SERVICES §A.4 gs, §E.2.6 Whole-response sealing): an index
 // of private, sealed demo at epoch 3, whose key ops-2026 has I.14's pub,
 // answers bob, whom that key's grant lets read demo whole, at the
-// candidate's gs, the one over the marker reads:demo:{key: string}, and
+// candidate's view, the one over its key: string alone, and
 // seals the whole response under the view key of K_n with kid demo#3 and
 // pl { ns, view }, view the URL it is served at.
 func TestV085C4IndexServesWhole(t *testing.T) {
@@ -120,8 +120,8 @@ func TestV085C4IndexServesWhole(t *testing.T) {
 			t.Fatalf("GET /demo?limit=5: %d %s", res.StatusCode, b)
 		}
 	}
-	if !strings.HasPrefix(loc, "/demo/g/"+p.GS+"/at/") {
-		t.Fatalf("bob, reading demo whole through %s, is served at %s, want the candidate's gs %s (the marker %s)", p.Kid, loc, p.GS, p.Marker)
+	if !strings.HasPrefix(loc, "/demo/view/"+p.ViewID+"/at/") {
+		t.Fatalf("bob, reading demo whole through %s, is served at %s, want the candidate's view %s", p.Kid, loc, p.ViewID)
 	}
 	var res *http.Response
 	var body []byte
@@ -134,7 +134,7 @@ func TestV085C4IndexServesWhole(t *testing.T) {
 	if res.StatusCode != 200 || !strings.HasPrefix(res.Header.Get("Content-Type"), seal.ContentType) {
 		t.Fatalf("GET %s: %d %s %s, want one JWE", loc, res.StatusCode, res.Header.Get("Content-Type"), body)
 	}
-	if !strings.HasPrefix(loc, "/demo/g/"+p.GS+"/at/") {
+	if !strings.HasPrefix(loc, "/demo/view/"+p.ViewID+"/at/") {
 		t.Fatalf("served at %s", loc)
 	}
 	h, err := seal.ParseHeader(string(body))

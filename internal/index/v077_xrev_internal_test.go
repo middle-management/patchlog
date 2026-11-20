@@ -17,7 +17,7 @@ func TestV077XrevGSScopeSubjectIsMarkerDigest(t *testing.T) {
 	t.Parallel()
 	v := &grant.Verified{Grant: &grant.Grant{}, Key: &grant.Key{Kid: "fan", Raw: map[string]any{"kid": "fan", "pub": "pubA"}},
 		Principal: grant.Principal{ID: "user:li", Groups: []string{"fans"}}, Can: map[string]bool{"read": true}}
-	fv, err := grantFview(&fcp{}, v, 0)
+	fv, err := (&Index{}).grantFview(&fcp{}, v, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

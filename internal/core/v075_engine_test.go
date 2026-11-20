@@ -664,13 +664,13 @@ func TestV075FilteredAdmit(t *testing.T) {
 		cred Credentials
 		want int
 	}{
-		"li at another gs":               {other, li, 403},
-		"no credentials":                 {liGS, Credentials{}, 401},
-		"an unrestricted grant":          {liGS, w.admin, 403},
-		"a cookie before any exchange":   {liGS, gCookie(liGS, exp), 401},
-		"a cookie for another gs":        {liGS, gCookie(other, exp), 403},
-		"an expired cookie":              {liGS, gCookie(liGS, w.now()), 401},
-		"a cookie of another namespace":  {liGS, Credentials{Edge: &EdgeGrant{NS: "cat-season", Prefix: "/ns/cat-season", Exp: exp}}, 403},
+		"li at another gs":              {other, li, 403},
+		"no credentials":                {liGS, Credentials{}, 401},
+		"an unrestricted grant":         {liGS, w.admin, 403},
+		"a cookie before any exchange":  {liGS, gCookie(liGS, exp), 401},
+		"a cookie for another gs":       {liGS, gCookie(other, exp), 403},
+		"an expired cookie":             {liGS, gCookie(liGS, w.now()), 401},
+		"a cookie of another namespace": {liGS, Credentials{Edge: &EdgeGrant{NS: "cat-season", Prefix: "/ns/cat-season", Exp: exp}}, 403},
 	} {
 		if _, st := admit(c.gs, c.cred); st != c.want {
 			t.Errorf("%s: %d, want %d", name, st, c.want)

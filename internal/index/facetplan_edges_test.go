@@ -159,9 +159,9 @@ func TestPlansMatchScanOrphans(t *testing.T) {
 						q.Facets["/zz"] = []string{"x"} // a path no doc has
 						desc += " +facet[/zz]=x"
 					}
-					var allow func(string) bool
+					var allow allowFunc
 					if r.IntN(4) == 0 {
-						allow = func(res string) bool { h := fnv.New32a(); h.Write([]byte(res)); return h.Sum32()%3 != 0 }
+						allow = func(res, _ string) bool { h := fnv.New32a(); h.Write([]byte(res)); return h.Sum32()%3 != 0 }
 					}
 					ns := []string{"a", "a", "b", "c", "e", "o"}[r.IntN(6)]
 					tx, err := ix.db.BeginTx(ctx, nil)

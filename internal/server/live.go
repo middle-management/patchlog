@@ -529,12 +529,19 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 	emit := func(lg *core.Log) {
 		for i, e := range lg.Entries {
 			ev := "revision"
-			if e["kind"] == "tombstone" {
+			switch e["kind"] {
+			case "tombstone":
 				ev = "tombstone"
+			case "hidden":
+				// A hidden revision whose parent is visible (§7.9).
+				ev = "hidden"
 			}
 			sseEntry(w, ev, lg, i)
-			since = e["id"].(string)
 			sent = true
+		}
+		// Past every entry scanned, those a filtered page drops too.
+		if lg.Last != "" {
+			since = lg.Last
 		}
 	}
 	// nsEntries emits this resource's purge and prune events after

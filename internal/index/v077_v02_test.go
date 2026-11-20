@@ -130,14 +130,14 @@ func (d *v77docs) exchange(token string) (map[string]string, []*http.Cookie) {
 // marker's "digest covering the rules that limit it there ..., the
 // /principal values they refer to and its key's key: string (§7.9
 // gs)"; CONFORMANCE Grant scope 66): grants through k1 and k2, whose
-// rules are the same, are redirected to different /docs/g/{gs}, and the
+// rules are the same, are redirected to different /docs/view/{gs}, and the
 // exchange gives them different prefixes. Before v0.77 both shared one.
 func TestV077ScopeMarkerKey(t *testing.T) {
 	t.Parallel()
 	d := newV77Docs(t)
 	g1, g2 := d.reader(d.k1), d.reader(d.k2)
 	loc1, loc2 := d.x.raw("/docs?q=word", g1).header.Get("Location"), d.x.raw("/docs?q=word", g2).header.Get("Location")
-	if !strings.HasPrefix(loc1, "/docs/g/") || !strings.HasPrefix(loc2, "/docs/g/") || strings.Split(loc1, "/")[3] == strings.Split(loc2, "/")[3] {
+	if !strings.HasPrefix(loc1, "/docs/view/") || !strings.HasPrefix(loc2, "/docs/view/") || strings.Split(loc1, "/")[3] == strings.Split(loc2, "/")[3] {
 		t.Errorf("k1's and k2's readers: %s and %s, want different gs", loc1, loc2)
 	}
 	for _, g := range []string{g1, g2} {
@@ -156,7 +156,7 @@ func TestV077ScopeMarkerKey(t *testing.T) {
 // reader exchanges again ... where a marker's key, rules or roles would
 // end a gs cookie (§7.9 gs)"; scenarios 66 and 121): li's cookie for
 // its scope marker in docs, through k1 with the role reader, is 403 at
-// /docs/g/{gs} and at /_refs once docs (a) removes k1, (b) changes k1's
+// /docs/view/{gs} and at /_refs once docs (a) removes k1, (b) changes k1's
 // pub, (c) narrows reader's rules, or (d) drops read from reader; a
 // change to an unrelated role leaves it read. Before v0.77 it read on
 // under the old rules until it expired.
@@ -226,14 +226,16 @@ func TestV077AuthDisabledUncovers(t *testing.T) {
 	}}))
 	w.x = w.start(false, "matches")
 	li := w.reader("user:li", []any{"fans"})
-	if r := w.x.raw("/matches", li); r.status != 302 || !strings.Contains(r.header.Get("Location"), "/g/") {
+	if r := w.x.raw("/matches", li); r.status != 302 || !strings.Contains(r.header.Get("Location"), "/view/") {
 		t.Fatalf("li with authentication on: %d %s %v", r.status, r.header.Get("Location"), r.body)
 	}
 	_, gs, _ := w.pointer("/matches", li)
 	off.Store(true)
 	time.Sleep(5 * time.Millisecond) // the index's CheckerTTL
-	if _, off, _ := w.pointer("/matches", li); off == gs {
-		t.Errorf("li with authentication disabled: gs %s, the covered one", off)
+	// The view doesn't depend on coverage (v0.87, §A.4: "at every level
+	// and whether or not the origin serves §7.9").
+	if _, off, _ := w.pointer("/matches", li); off != gs {
+		t.Errorf("li with authentication disabled: view %s, not the covered one %s", off, gs)
 	}
 	off.Store(false)
 	time.Sleep(5 * time.Millisecond)
@@ -311,7 +313,7 @@ func TestV077PurgeBeforeServe(t *testing.T) {
 			w.x.caughtUp("matches")
 		}
 	})
-	old := "/matches/g/" + gs + "/at/" + at + "?q=derby"
+	old := "/matches/view/" + gs + "/at/" + at + "?q=derby"
 	r := w.x.raw(old, whole)
 	if !once.Load() {
 		t.Fatal("the answer was never computed")
@@ -495,7 +497,7 @@ func TestV077RootFailureCovered(t *testing.T) {
 	}}))
 	w.x = w.start(false, "matches")
 	li := w.reader("user:li", []any{"fans"})
-	if r := w.x.raw("/matches", li); r.status != 302 || !strings.Contains(r.header.Get("Location"), "/g/") {
+	if r := w.x.raw("/matches", li); r.status != 302 || !strings.Contains(r.header.Get("Location"), "/view/") {
 		t.Fatalf("li: %d %s %v", r.status, r.header.Get("Location"), r.body)
 	}
 	for _, c := range []struct {

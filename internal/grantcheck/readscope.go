@@ -86,7 +86,7 @@ func ReadsScope(v *grant.Verified) (digest string, ok bool) {
 }
 
 // ScopeDigest is ReadsScope over its inputs, so that the origin can digest
-// a stored gs's rules again as of another checkpoint (§7.9: a gs cookie
+// a stored view's rules again as of another checkpoint (§7.9: a view cookie
 // is 403 at an at where those rules differ). It reports false where any
 // rule, a role's included, refers to /now or the whole envelope: a stored
 // role that has gained one since doesn't count for read any more (§C.2

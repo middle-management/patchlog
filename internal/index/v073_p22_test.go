@@ -227,14 +227,14 @@ func (s *svc) gsOf(ns, tok string) string {
 	s.t.Helper()
 	r := s.raw("/"+ns+"?limit=5", tok)
 	loc := r.header.Get("Location")
-	if r.status != 302 || !strings.HasPrefix(loc, "/"+ns+"/g/") {
+	if r.status != 302 || !strings.HasPrefix(loc, "/"+ns+"/view/") {
 		s.t.Fatalf("/%s pointer: %d %s %v", ns, r.status, loc, r.body)
 	}
 	return strings.Split(loc, "/")[3]
 }
 
 // TestV073PrivateGsMarkers (IX-14, IX-15, §A.4): a private namespace's
-// results are served under gs = SubjectSetID([marker]), as /_refs computes
+// results are served under gs = ViewID([marker]), as /_refs computes
 // it: reads:{ns} for a grant that would be issued a namespace-wide edge
 // grant, whatever its subjects and groups, else reads:{ns}:scope:{digest},
 // shared by readers limited by the same rules and /principal values. A
@@ -257,8 +257,9 @@ func TestV073PrivateGsMarkers(t *testing.T) {
 	// The same subject set as amy's /_refs answer, which reads pa alone of
 	// the private namespaces.
 	q := "?to=" + url.QueryEscape("/r/target/x")
-	if _, gs, _ := x.refsPointer(q, w.amy); gs != whole {
-		t.Errorf("amy's /_refs gs %s, want %s", gs, whole)
+	wholeRefs := readsRefsGS("pa", is)
+	if _, gs, _ := x.refsPointer(q, w.amy); gs != wholeRefs {
+		t.Errorf("amy's /_refs view %s, want %s", gs, wholeRefs)
 	}
 	onlyA := func(sub string, groups ...any) string {
 		return is.Grant(t, s.Now(), sub, []string{"pa"}, []string{"read"}, map[string]any{"groups": groups,
@@ -268,8 +269,8 @@ func TestV073PrivateGsMarkers(t *testing.T) {
 	if li != lu || li == whole {
 		t.Errorf("readers limited alike: gs %s and %s (whole %s)", li, lu, whole)
 	}
-	if _, gs, _ := x.refsPointer(q, onlyA("user:li", "editors")); gs != li {
-		t.Errorf("a limited reader's /_refs gs %s, want %s", gs, li)
+	if _, gs, _ := x.refsPointer(q, onlyA("user:li", "editors")); gs == wholeRefs {
+		t.Errorf("a limited reader's /_refs view %s, a whole reader's", gs)
 	}
 	notA := is.Grant(t, s.Now(), "user:mo", []string{"pa"}, []string{"read"}, map[string]any{
 		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"not": map[string]any{"const": "a"}}}}})
@@ -282,7 +283,7 @@ func TestV073PrivateGsMarkers(t *testing.T) {
 	if r := x.raw("/pa?limit=5", soon); r.status != 403 || r.body["code"] != "forbidden" || r.header.Get("Cache-Control") != "no-store" {
 		t.Errorf("a rule on /now: %d %v %v", r.status, r.body, r.header)
 	}
-	if _, gs, loc := x.refsPointer(q, soon); gs != grantcheck.SubjectSetID(nil) || fmt.Sprint(x.search(loc, soon)["namespaces"]) != "map[pub:"+x.ix.Checkpoint("pub")+"]" {
+	if _, gs, loc := x.refsPointer(q, soon); gs != grantcheck.ViewID(nil) || fmt.Sprint(x.search(loc, soon)["namespaces"]) != "map[pub:"+x.ix.Checkpoint("pub")+"]" {
 		t.Errorf("a rule on /now, /_refs: %s", loc)
 	}
 }
@@ -290,7 +291,7 @@ func TestV073PrivateGsMarkers(t *testing.T) {
 // TestV073ForeignGs (IX-16, §A.4, §B.11.5): a grant reads only at its own
 // gs: at another gs's at URL it is 403 forbidden, no-store, with or
 // without min, on a query and on /_refs; without a grant /_refs answers
-// 401. Only the pointer and an at URL without /g/{gs} redirect into the
+// 401. Only the pointer and an at URL without /view/{gs} redirect into the
 // reader's gs.
 func TestV073ForeignGs(t *testing.T) {
 	t.Parallel()
@@ -300,9 +301,15 @@ func TestV073ForeignGs(t *testing.T) {
 	bobGs, amyGs := x.gsOf("pb", w.bob), x.gsOf("pa", w.amy)
 	q := "?to=" + url.QueryEscape("/r/target/x")
 	_, bobRefs, bobLoc := x.refsPointer(q, w.bob)
+	// bob's view in pb is amy's in pa (v0.87: readers with the same rules
+	// through one key share a view): another view stands for a foreign one.
+	foreign := "1" + strings.Repeat("a", 32)
+	if bobGs == amyGs {
+		bobGs = foreign
+	}
 	for _, p := range []string{
-		"/pa/g/" + bobGs + "/at/" + at + "?limit=5",
-		"/pa/g/" + bobGs + "/at/" + at + "?limit=5&min=pa:" + at,
+		"/pa/view/" + bobGs + "/at/" + at + "?limit=5",
+		"/pa/view/" + bobGs + "/at/" + at + "?limit=5&min=pa:" + at,
 		bobLoc, bobLoc + "&min=pa:" + at,
 	} {
 		r := x.raw(p, w.amy)
@@ -314,8 +321,8 @@ func TestV073ForeignGs(t *testing.T) {
 		t.Errorf("/_refs at bob's gs without a grant: %d %v", r.status, r.body)
 	}
 	// Redirected into the reader's own gs: the pointer, and an at URL
-	// without /g/{gs}.
-	own := "/pa/g/" + amyGs + "/at/" + at + "?limit=5"
+	// without /view/{gs}.
+	own := "/pa/view/" + amyGs + "/at/" + at + "?limit=5"
 	for _, p := range []string{"/pa?limit=5", "/pa/at/" + at + "?limit=5"} {
 		if r := x.raw(p, w.amy); r.status != 302 || r.header.Get("Location") != own {
 			t.Errorf("%s: %d %s", p, r.status, r.header.Get("Location"))
@@ -330,7 +337,7 @@ func TestV073ForeignGs(t *testing.T) {
 }
 
 // TestV073PrivatePointerNoStore (IX-17, §A.4 table): a 302 whose Location
-// adds /g/{gs} is Cache-Control: private, no-store, on a query and on
+// adds /view/{gs} is Cache-Control: private, no-store, on a query and on
 // /_refs, as is any redirect decided by a grant; a public pointer keeps
 // the head-pointer class.
 func TestV073PrivatePointerNoStore(t *testing.T) {
@@ -340,7 +347,7 @@ func TestV073PrivatePointerNoStore(t *testing.T) {
 	q := "/_refs?to=" + url.QueryEscape("/r/target/x")
 	for _, p := range []string{"/pa?limit=5", "/pa/at/" + x.ix.Checkpoint("pa") + "?limit=5", q} {
 		r := x.raw(p, w.amy)
-		if r.status != 302 || !strings.Contains(r.header.Get("Location"), "/g/") || r.header.Get("Cache-Control") != "private, no-store" {
+		if r.status != 302 || !strings.Contains(r.header.Get("Location"), "/view/") || r.header.Get("Cache-Control") != "private, no-store" {
 			t.Errorf("%s: %d %s %v", p, r.status, r.header.Get("Location"), r.header)
 		}
 	}

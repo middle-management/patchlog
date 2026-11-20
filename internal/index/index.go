@@ -151,7 +151,7 @@ type Options struct {
 	Edge *edge.Verifier
 	// EdgeGrants, if set, mints and verifies the service's own edge
 	// grants (§A.4, §B.11.5, §C.5; edgegrants.go): cookies for
-	// /{ns}/g/{gs} and /_refs/g/{gs}, under a key and kid of the
+	// /{ns}/view/{view} and /_refs/view/{view}, under a key and kid of the
 	// service's own, never the origin's. Open sets its Vouches to those
 	// prefixes. Without it, POST and DELETE /edge-grants are 404
 	// not_offered.
@@ -194,6 +194,7 @@ const keepBytes = 64 << 20
 // Index is a running indexing service.
 type Index struct {
 	opt     Options
+	judged  revJudged // per-revision read answers (revjudge.go)
 	c       *client.Client
 	db      *sql.DB
 	cps     follow.SQLCheckpoints
@@ -499,7 +500,7 @@ func (ix *Index) initSchema(ctx context.Context) error {
 // checkpoint, which retires them, may not move for long. A database of an
 // older format is rebuilt anyway (indexFormat); this covers one written
 // since. No URL of the shapes of v0.73 matches: a public URL's results are
-// JSON, and a whole JWE's URL has /g/{gs}.
+// JSON, and a whole JWE's URL has /view/{view}.
 func (ix *Index) dropWholePublic(ctx context.Context) error {
 	return ix.sealed.Drop(ctx, func(view, scope string, json bool) bool {
 		return !json && strings.HasPrefix(view, "/"+scope+"/at/")

@@ -6,7 +6,7 @@ package main
 // internal/client. A query is answered by a redirect from the head pointer
 // to a result pinned at a checkpoint (§A.4, §A.5), which the client
 // follows, keeping the grant: private namespaces redirect into the reader's
-// own subject set, /{ns}/g/{gs}/at/{at}.
+// own subject set, /{ns}/view/{view}/at/{at}.
 //
 // Results of sealed and end-to-end namespaces are served sealed and are
 // printed as served, without their keys.

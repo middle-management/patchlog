@@ -167,11 +167,11 @@ func TestV082GCookieNotRevivedByAnotherReader(t *testing.T) {
 			t.Fatalf("exchange: %d %v", r.status, r.body)
 		}
 		for _, p := range r.body["prefixes"].([]any) {
-			if strings.HasPrefix(p.(string), "/matches/g/") {
+			if strings.HasPrefix(p.(string), "/matches/view/") {
 				return p.(string) + "?q=derby", r.cookies
 			}
 		}
-		t.Fatalf("no /matches/g/ prefix: %v", r.body)
+		t.Fatalf("no /matches/view/ prefix: %v", r.body)
 		return "", nil
 	}
 	status := func(path string, c []*http.Cookie) int {

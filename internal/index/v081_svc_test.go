@@ -103,7 +103,7 @@ func TestV081SvcIndexNowRoles(t *testing.T) {
 	if got, _ := p37Follow(t, x, dprefix, dcks, ""); got.status != 403 {
 		t.Errorf("the old cookie on docs: %d %v", got.status, got.body)
 	}
-	if got, _ := p37Follow(t, x, "/_refs/g/"+gs+q, cks, ""); got.status != 403 {
+	if got, _ := p37Follow(t, x, "/_refs/view/"+gs+q, cks, ""); got.status != 403 {
 		t.Errorf("the old cookie on /_refs: %d %v", got.status, got.body)
 	}
 	if r := x.raw("/docs", tok); r.status != 403 {

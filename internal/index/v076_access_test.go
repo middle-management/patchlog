@@ -21,7 +21,7 @@ import (
 // "the service's exchange refusing only as Coverage says", Coverage: "Only
 // a reader who may see none of the namespaces gets 401 or 403"): a grant
 // naming pa, which it reads, and pb, where it verifies but its key doesn't
-// sign read, is exchanged for /pa/g/{gs} and /_refs/g/{gs over pa's
+// sign read, is exchanged for /pa/view/{gs} and /_refs/view/{gs over pa's
 // marker} alone, the gs a query of /_refs redirects it to. Before v0.76
 // the 403 in pb refused the whole exchange.
 func TestV076AccessExchangePerNamespace(t *testing.T) {
@@ -37,12 +37,12 @@ func TestV076AccessExchangePerNamespace(t *testing.T) {
 		t.Fatalf("a query of pb, which amy's grant doesn't read: %d %v", r.status, r.body)
 	}
 	prefixes, cookies := w.exchange(t, w.x, amy)
-	if _, ok := prefixes["pb"]; ok || prefixes["pa"] != "/pa/g/"+w.x.gsOf("pa", amy) || len(prefixes) != 2 {
-		t.Fatalf("prefixes %v, want /pa/g/%s and /_refs/g/… alone", prefixes, w.x.gsOf("pa", amy))
+	if _, ok := prefixes["pb"]; ok || prefixes["pa"] != "/pa/view/"+w.x.gsOf("pa", amy) || len(prefixes) != 2 {
+		t.Fatalf("prefixes %v, want /pa/view/%s and /_refs/view/… alone", prefixes, w.x.gsOf("pa", amy))
 	}
 	_, gs, _ := w.x.refsPointer("?to="+url.QueryEscape("/r/target/x"), amy)
-	if prefixes["_refs"] != "/_refs/g/"+gs || gs != readsGS("pa", w.issuer) {
-		t.Errorf("/_refs prefix %s, want /_refs/g/%s, over pa's marker alone", prefixes["_refs"], gs)
+	if prefixes["_refs"] != "/_refs/view/"+gs || gs != readsRefsGS("pa", w.issuer) {
+		t.Errorf("/_refs prefix %s, want /_refs/view/%s, over pa's marker alone", prefixes["_refs"], gs)
 	}
 	if got, _ := p37Follow(t, w.x, prefixes["pa"], cookies, ""); got.status != 200 || strings.Join(p37Hits(got.body), ",") != "a,b" {
 		t.Errorf("pa under the cookie: %d %v", got.status, got.body)
@@ -149,10 +149,10 @@ func TestV076AccessExchangePurged(t *testing.T) {
 		return w.x.raw("/pb?limit=5", amy).status == 410
 	})
 	prefixes, cookies := w.exchange(t, w.x, amy)
-	if _, ok := prefixes["pb"]; ok || prefixes["pa"] != "/pa/g/"+w.x.gsOf("pa", amy) || len(prefixes) != 2 {
-		t.Fatalf("prefixes %v, want /pa/g/%s and /_refs/g/… alone", prefixes, w.x.gsOf("pa", amy))
+	if _, ok := prefixes["pb"]; ok || prefixes["pa"] != "/pa/view/"+w.x.gsOf("pa", amy) || len(prefixes) != 2 {
+		t.Fatalf("prefixes %v, want /pa/view/%s and /_refs/view/… alone", prefixes, w.x.gsOf("pa", amy))
 	}
-	if prefixes["_refs"] != "/_refs/g/"+readsGS("pa", w.issuer) {
+	if prefixes["_refs"] != "/_refs/view/"+readsRefsGS("pa", w.issuer) {
 		t.Errorf("/_refs prefix %s, want the gs over pa's marker alone", prefixes["_refs"])
 	}
 	if got, _ := p37Follow(t, w.x, prefixes["pa"], cookies, ""); got.status != 200 || strings.Join(p37Hits(got.body), ",") != "a,b" {

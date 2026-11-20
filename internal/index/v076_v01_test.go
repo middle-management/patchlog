@@ -19,7 +19,7 @@ func TestV076V01IndexGSPerKey(t *testing.T) {
 		t.Helper()
 		v := &grant.Verified{Grant: &grant.Grant{}, Key: &grant.Key{Kid: kid, Raw: map[string]any{"kid": kid, "pub": pub}},
 			Principal: grant.Principal{ID: "user:li", Groups: []string{"fans"}}, Can: map[string]bool{"read": true}}
-		fv, err := grantFview(&fcp{}, v, 0)
+		fv, err := (&Index{}).grantFview(&fcp{}, v, 0)
 		if err != nil {
 			t.Fatal(err)
 		}

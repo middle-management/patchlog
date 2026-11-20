@@ -26,7 +26,7 @@ import (
 //
 //	patchlog index --ns matches,docs [--api http://localhost:8080] [--db index.db] [--addr :8081] …
 //
-// Results at /{ns}/at/{ns_id}, or /{ns}/g/{gs}/at/{ns_id} for a private
+// Results at /{ns}/at/{ns_id}, or /{ns}/view/{view}/at/{ns_id} for a private
 // namespace (§A.4), are immutable and tagged idx:{ns} and r:{ns}/{name} per
 // hit; only the current checkpoint's results are kept.
 // Read-your-writes: ?min={ns_id} or ?min={ns}:{ns_id}, repeatable, which
@@ -46,8 +46,8 @@ import (
 // namespaces.
 //
 // Edge grants of its own (§A.4, §C.5): POST /edge-grants
-// exchanges a caller's grants for cookies for /{ns}/g/{gs} of each private
-// namespace it follows that they name and /_refs/g/{gs} of the caller's
+// exchanges a caller's grants for cookies for /{ns}/view/{view} of each private
+// namespace it follows that they name and /_refs/view/{view} of the caller's
 // subject set, under which a verifying edge may cache those results for
 // every reader of the subject set, and DELETE /edge-grants?prefix=…
 // withdraws them. They are signed with the last --edge-grant-key
@@ -78,7 +78,7 @@ type indexCmd struct {
 	purgeArgs
 	edgeArgs
 	EdgeGrantKey       []string `arg:"--edge-grant-key,separate" placeholder:"[KID=]FILE" help:"a file holding a key the index signs its own edge-grant cookies with (§A.4, §C.5), named KID (a plain FILE takes --edge-grant-kid): a key of its own that the origin never holds, so neither one of the origin's --edge-grant-key files nor the key derived from --edge-secret (at least 16 bytes); repeatable, to rotate keys as the origin's rotate: cookies under any are accepted, and the last given signs new ones. Without it, a random one per process, so cookies don't survive a restart or reach another instance"`
-	EdgeGrantKid       string   `arg:"--edge-grant-kid" default:"index" placeholder:"KID" help:"the name (kid) of the index's edge-grant key given as a plain --edge-grant-key FILE, or of the random one, which its cookies carry and a verifying edge looks the key up by (§C.5.3). No kid of the index's may be one of the origin's (--origin-edge-grant-kid): each key vouches only for its own prefixes, the index's for /{ns}/g/{gs} and /_refs/g/{gs}"`
+	EdgeGrantKid       string   `arg:"--edge-grant-kid" default:"index" placeholder:"KID" help:"the name (kid) of the index's edge-grant key given as a plain --edge-grant-key FILE, or of the random one, which its cookies carry and a verifying edge looks the key up by (§C.5.3). No kid of the index's may be one of the origin's (--origin-edge-grant-kid): each key vouches only for its own prefixes, the index's for /{ns}/view/{view} and /_refs/view/{view}"`
 	OriginEdgeGrantKid []string `arg:"--origin-edge-grant-kid,separate" placeholder:"KID[,KID]" help:"the origin's edge-grant kids, which no kid of the index's may be (repeatable or comma-separated; default origin). Keep the list in step with the origin's key rotation"`
 	ExchangeRate       string   `arg:"--exchange-rate" placeholder:"RATE,BURST" help:"exchangeRate (§6.6, §C.5): edge-grant exchanges each principal may make at the index's POST /edge-grants, e.g. 10,100 (the default); the buckets are shared by the instances on one --db (§A.4)"`
 	corsArgs

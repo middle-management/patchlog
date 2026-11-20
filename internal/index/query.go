@@ -845,7 +845,7 @@ func (ix *Index) ftsTokens(ctx context.Context, tx *sql.Tx, q *Query) error {
 }
 
 // run executes q against ns inside tx. allow filters hits (nil = all).
-func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow func(resource string) bool) (*Result, error) {
+func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow allowFunc) (*Result, error) {
 	if err := ix.ftsTokens(ctx, tx, q); err != nil {
 		return nil, err
 	}
@@ -869,7 +869,7 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 			rows.Close()
 			return nil, err
 		}
-		if allow != nil && !allow(h.Resource) {
+		if allow != nil && !allow(h.Resource, h.ID) {
 			continue
 		}
 		if len(q.Counts) > 0 {

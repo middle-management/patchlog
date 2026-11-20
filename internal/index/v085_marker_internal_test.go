@@ -15,7 +15,7 @@ func TestV085ReadsMarkerVector(t *testing.T) {
 	if m != "reads:demo:key:1gorsoawpfk76fdd6bdqtgqkial3qgvl4" {
 		t.Errorf("marker %s", m)
 	}
-	if gs := grantcheck.SubjectSetID([]string{m}); gs != "1qt3t7wcs3jfhqrrkkunh3mvoi4tyjsrt" {
+	if gs := grantcheck.ViewID([]string{m}); gs != "1qt3t7wcs3jfhqrrkkunh3mvoi4tyjsrt" {
 		t.Errorf("gs %s", gs)
 	}
 	if isGMarker(m) {

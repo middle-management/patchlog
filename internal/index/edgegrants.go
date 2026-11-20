@@ -32,8 +32,8 @@ import (
 // cache it for every reader of that subject set, given a cookie it can
 // verify that says so. The service mints such cookies itself, with a key
 // and kid of its own that the origin never holds, for the prefixes of a
-// subject set's URLs: /{ns}/g/{gs} for a private namespace's results, gs
-// over the reader's marker there, and /_refs/g/{gs} for the answers
+// subject set's URLs: /{ns}/view/{view} for a private namespace's results, gs
+// over the reader's marker there, and /_refs/view/{view} for the answers
 // across namespaces, gs over its markers in every namespace it may see
 // that the service has reached (refsReader). The default format is the
 // core's (edge.Cookies), so an edge in front of the service makes the
@@ -848,16 +848,16 @@ func isGMarker(m string) bool {
 // nsPrefix is the prefix of a subject set's results of ns, refsPrefix of
 // its answers across namespaces: every at, and the head pointer under the
 // prefix (§B.11.5).
-func nsPrefix(ns, gs string) string { return "/" + ns + "/g/" + gs }
-func refsPrefix(gs string) string   { return "/_refs/g/" + gs }
+func nsPrefix(ns, view string) string { return "/" + ns + "/view/" + view }
+func refsPrefix(view string) string   { return "/_refs/view/" + view }
 
-// edgeGS parses one of the service's prefixes, /{ns}/g/{gs} or (ns "")
-// /_refs/g/{gs}: the only prefixes its key vouches for (§C.5.3). A
+// edgeGS parses one of the service's prefixes, /{ns}/view/{view} or (ns "")
+// /_refs/view/{view}: the only prefixes its key vouches for (§C.5.3). A
 // namespace named r or ns has none, since its prefix would lie under the
 // core's.
 func edgeGS(p string) (ns, gs string, ok bool) {
 	segs := strings.Split(p, "/")
-	if len(segs) != 4 || segs[0] != "" || segs[2] != "g" {
+	if len(segs) != 4 || segs[0] != "" || segs[2] != "view" {
 		return "", "", false
 	}
 	if _, err := ids.Parse(segs[3]); err != nil {
@@ -888,7 +888,7 @@ func (ix *Index) edgeClaims(r *http.Request) *edge.Claims {
 var errUnknownSet = &grant.AuthError{Status: 401, Msg: "an edge grant for a subject set this service doesn't know: exchange the grant again"}
 
 // cookieAccess is access to private namespace ns under one of the
-// service's edge grants for /{ns}/g/{gs} (ok false without one): the
+// service's edge grants for /{ns}/view/{view} (ok false without one): the
 // marker its gs stands for, read as a grant with that marker would be.
 func (ix *Index) cookieAccess(ctx context.Context, ns string, r *http.Request) (*access, bool, error) {
 	cl := ix.edgeClaims(r)
@@ -899,7 +899,7 @@ func (ix *Index) cookieAccess(ctx context.Context, ns string, r *http.Request) (
 	if !ok || cns != ns {
 		return nil, false, nil
 	}
-	subs, ok := ix.edge.Subjects(ctx, gs)
+	subs, ok := ix.edge.Subjects(ctx, cl.Prefix)
 	if !ok || len(subs) != 1 {
 		return nil, true, errUnknownSet
 	}
@@ -937,7 +937,7 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string, exp int64) (*ac
 		if err := ix.scopeKeysHold(ctx, ns, m, f, exp); err != nil {
 			return nil, err
 		}
-		return &access{marker: m, filter: f.f, allow: f.f.Allows, cookie: true}, nil
+		return &access{marker: m, filter: f.f, allow: ix.revAllow(ns, f.f), cookie: true}, nil
 	case strings.HasPrefix(m, "reads:"+ns+":g:"):
 		f, ok := ix.filter(ctx, m)
 		if !ok {
@@ -952,7 +952,7 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string, exp int64) (*ac
 			if err := ix.purgedGKeysHold(ctx, ns, m, f, exp); err != nil {
 				return nil, err
 			}
-			a.derive, a.allow = nil, func(string) bool { return false }
+			a.derive, a.allow = nil, func(string, string) bool { return false }
 		case err != nil:
 			return nil, err
 		}
@@ -1447,7 +1447,7 @@ func (ix *Index) stillUncovered(ctx context.Context, ns string) error {
 }
 
 // refsCookieReader is the reader of /_refs under one of the service's
-// edge grants for /_refs/g/{gs} (ok false without one): its subject set,
+// edge grants for /_refs/view/{view} (ok false without one): its subject set,
 // whose markers decide which private namespaces it sees and how
 // (markerAccess); every public one is seen too. A namespace a marker
 // names whose document the service can't read is 502, as one a grant
@@ -1461,11 +1461,11 @@ func (ix *Index) refsCookieReader(ctx context.Context, r *http.Request, reached 
 	if !ok || cns != "" {
 		return nil, false, nil
 	}
-	subs, ok := ix.edge.Subjects(ctx, gs)
+	subs, ok := ix.edge.Subjects(ctx, cl.Prefix)
 	if !ok {
 		return nil, true, errUnknownSet
 	}
-	rd := &refsReader{gs: gs, public: true, allow: map[string]func(string) bool{}, covs: map[string]*access{}}
+	rd := &refsReader{gs: gs, public: true, allow: map[string]allowFunc{}, covs: map[string]*access{}}
 	for _, ns := range ix.refsNamespaces() {
 		if _, ok := reached[ns]; !ok || ix.keys.Skipped(ns) != "" {
 			continue
@@ -1511,8 +1511,8 @@ func (ix *Index) refsCookieReader(ctx context.Context, r *http.Request, reached 
 // the head is cfgErr's (§8.5).
 func (ix *Index) purgedRead(ctx context.Context, ns string, r *http.Request, cfgErr error) (string, error) {
 	if cl := ix.edgeClaims(r); cl != nil {
-		if cns, gs, ok := edgeGS(cl.Prefix); ok && cns == ns {
-			subs, known := ix.edge.Subjects(ctx, gs)
+		if cns, _, ok := edgeGS(cl.Prefix); ok && cns == ns {
+			subs, known := ix.edge.Subjects(ctx, cl.Prefix)
 			if !known || len(subs) != 1 {
 				return "", errUnknownSet
 			}
@@ -1549,7 +1549,7 @@ func (ix *Index) serveEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		// The core's DELETE /edge-grants takes only core prefixes, so the
 		// service withdraws its own (§C.5.3, §C.5.4).
 		svcWithdraw(w, r, ix.opt.EdgeGrants, func(p string) bool { _, _, ok := edgeGS(p); return ok },
-			"/{ns}/g/{gs} or /_refs/g/{gs} (§A.4, §B.11.5)")
+			"/{ns}/view/{view} or /_refs/view/{view} (§A.4)")
 	default:
 		ix.issueEdgeGrants(w, r)
 	}
@@ -1575,8 +1575,8 @@ type exchanged struct {
 // grants as { "grants": [ … ] } in an application/json body (415
 // otherwise, svcBearers), it answers 200 { prefixes, exp } and one
 // Set-Cookie per prefix. Each grant gives, for every private namespace
-// the service follows that it names, /{ns}/g/{gs} of the reader's
-// marker there (exchangeGrant), and /_refs/g/{gs} of its markers in those
+// the service follows that it names, /{ns}/view/{view} of the reader's
+// marker there (exchangeGrant), and /_refs/view/{view} of its markers in those
 // the service has reached, each lasting until the grant's exp or the
 // cookies' TTL (15 minutes at most), whichever is sooner. A prefix
 // several grants give gets one cookie, lasting as long as the longest,
@@ -1728,9 +1728,8 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	// carry.
 	recs := make([]*cookieRec, len(issues))
 	for i, is := range issues {
-		_, gs, _ := edgeGS(is.Prefix)
 		recs[i] = &cookieRec{filters: map[string]*markerRec{}, exp: is.Exp}
-		for _, m := range subjects[gs] {
+		for _, m := range subjects[is.Prefix] {
 			if f, ok := filters[m]; ok {
 				recs[i].filters[m] = f
 			}
@@ -1751,8 +1750,8 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	}
 	for i := range issues {
 		issues[i].Exp = recs[i].exp
-		_, gs, _ := edgeGS(issues[i].Prefix)
-		if err := ix.edge.Record(ctx, gs, subjects[gs], issues[i].Exp, now); err != nil {
+		p := issues[i].Prefix
+		if err := ix.edge.Record(ctx, p, subjects[p], issues[i].Exp, now); err != nil {
 			ix.opt.Logf("index: recording a subject set: %v", err)
 			writeErr(w, http.StatusInternalServerError, "internal", "cannot record the subject set")
 			return
@@ -1786,8 +1785,8 @@ type purgedNS struct{ ns, head string }
 // every namespace the service follows that the grant names, and whose
 // keys the service doesn't lack, the read check of a query of it
 // (Index.access, grantAccess): a private one where the grant gets a
-// marker gives /{ns}/g/{gs} of the reader's marker there, and the markers
-// of those reached and not skipped give /_refs/g/{gs} over them, as
+// marker gives /{ns}/view/{view} of the reader's marker there, and the markers
+// of those reached and not skipped give /_refs/view/{view} over them, as
 // refsReader computes it. A public namespace needs no edge grant. Each
 // namespace is judged alone (§A.4 Across namespaces: "the service's
 // exchange refusing only as Coverage says"): one the grant gets no marker
@@ -1904,7 +1903,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		ex.filters[a.marker] = rec
 		if _, _, ok := edgeGS(nsPrefix(ns, a.gs)); ok {
 			ex.issues = append(ex.issues, svcIssue{Prefix: nsPrefix(ns, a.gs), Exp: exp})
-			ex.subjects[a.gs] = []string{a.marker}
+			ex.subjects[nsPrefix(ns, a.gs)] = []string{a.marker}
 		}
 		if _, ok := reached[ns]; ok && ix.keys.Skipped(ns) == "" {
 			markers = append(markers, a.marker)
@@ -1920,7 +1919,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		gs := grantcheck.ViewID(markers)
 		slices.Sort(markers)
 		ex.issues = append(ex.issues, svcIssue{Prefix: refsPrefix(gs), Exp: refsExp})
-		ex.subjects[gs] = markers
+		ex.subjects[refsPrefix(gs)] = markers
 	}
 	switch {
 	case len(ex.issues) > 0:

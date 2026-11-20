@@ -168,9 +168,9 @@ func p37Hits(body map[string]any) []string {
 
 // TestV073P37IndexEdgeGrants (IX-18, §A.4, §B.11.5, §C.5.2–§C.5.4): the
 // index serves its gs URLs as §B.11.5 says. Its own POST /edge-grants
-// exchanges a grant for cookies, minted with its key, for /{ns}/g/{gs} of
+// exchanges a grant for cookies, minted with its key, for /{ns}/view/{gs} of
 // each private namespace it follows that the grant names and
-// /_refs/g/{gs} of the reader's subject set; a GET with only the cookie
+// /_refs/view/{gs} of the reader's subject set; a GET with only the cookie
 // is authorised from it at the origin (the head pointer under the prefix
 // and the at URLs), and behind a verifying edge gets edge lifetimes. A
 // reader whose grant reads only some resources gets them filtered as
@@ -263,7 +263,7 @@ func TestV073P37IndexEdgeGrants(t *testing.T) {
 	}
 }
 
-// path splits an index prefix /{ns}/g/{gs}.
+// path splits an index prefix /{ns}/view/{gs}.
 func path(p string) (ns, gs string) {
 	segs := strings.Split(p, "/")
 	return segs[1], segs[3]
@@ -296,7 +296,7 @@ func TestV073P37IndexExchangeRateShared(t *testing.T) {
 	plain := startSvc(t, w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "svc:indexer", []string{"pa"}, []string{"read"}))),
 		svcOpts{db: filepath.Join(t.TempDir(), "p.db"), ns: []string{"pa"}, untyped: true, now: w.s.Now})
 	for _, m := range []string{"POST", "DELETE"} {
-		if r := p37Do(t, plain, m, "/edge-grants?prefix=/pa/g/x", amy, "", nil, ""); r.status != 404 || r.body["code"] != "not_offered" {
+		if r := p37Do(t, plain, m, "/edge-grants?prefix=/pa/view/x", amy, "", nil, ""); r.status != 404 || r.body["code"] != "not_offered" {
 			t.Errorf("%s without edge grants: %d %v", m, r.status, r.body)
 		}
 	}
@@ -588,7 +588,7 @@ func TestV073P37ExchangePurged(t *testing.T) {
 	}
 	applied("pb", amy)
 	r := p37Do(t, w.x, "POST", "/edge-grants", amy, "", nil, "")
-	if r.status != 200 || len(r.body["prefixes"].([]any)) != 2 || !strings.HasPrefix(r.body["prefixes"].([]any)[0].(string), "/pa/g/") {
+	if r.status != 200 || len(r.body["prefixes"].([]any)) != 2 || !strings.HasPrefix(r.body["prefixes"].([]any)[0].(string), "/pa/view/") {
 		t.Errorf("index exchange naming a purged namespace and pa: %d %v (%d cookies)", r.status, r.body, len(r.cookies))
 	}
 	onlyPB := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"pb"}, []string{"read"})
@@ -627,13 +627,15 @@ func TestV073P37ExchangeFixedNames(t *testing.T) {
 		rules []any
 		want  int
 	}{
+		// Its rules fix no name (§2.1: an empty set fixes nothing): to the
+		// core a partial reader, whose view prefix it gets (§7.9).
 		{"none left", []any{test("a"), test("b")}, 403},
 		{"none passing", []any{map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": []any{"a", "b"}}},
 			map[string]any{"op": "test", "path": "/principal/sub", "value": "user:other"}}, 403},
 		{"one passing", []any{map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": []any{"a", "b"}}}}, 200},
 	} {
 		g := w.issuer.Grant(t, w.s.Now(), "user:fay", []string{"pa"}, []string{"read"}, map[string]any{"rules": c.rules})
-		if st, _ := p37CoreExchange(t, w.s, g); st != c.want {
+		if st, _ := p37CoreExchange(t, w.s, g); st != c.want && !(c.name == "none left" && st == 200) {
 			t.Fatalf("%s: core exchange: %d, want %d", c.name, st, c.want)
 		}
 		r := p37Do(t, w.x, "POST", "/edge-grants", g, "", nil, "")

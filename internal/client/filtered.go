@@ -85,7 +85,7 @@ func (c *Client) filteredRedirect(r *response, ns, tail string, withAt bool) (vi
 // doesn't is stopped as by any other redirect.
 type FilteredError struct {
 	NS, View string
-	Err    *APIError
+	Err      *APIError
 }
 
 func (e *FilteredError) Error() string {
@@ -277,7 +277,7 @@ func (c *Client) FilteredHeads(ctx context.Context, ns, nsID, prefix string) ([]
 		}
 		if got.At != fa.At {
 			if restarts++; restarts > 3 {
-				return nil, FilteredAt{}, fmt.Errorf("client: /ns/%s/g/%s/heads keeps moving to another at (§7.9)", ns, fa.View)
+				return nil, FilteredAt{}, fmt.Errorf("client: /ns/%s/view/%s/heads keeps moving to another at (§7.9)", ns, fa.View)
 			}
 			if page, n, got, err = c.FilteredHeadsAt(ctx, got, prefix, ""); err != nil {
 				return nil, FilteredAt{}, err

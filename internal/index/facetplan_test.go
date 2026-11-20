@@ -66,9 +66,9 @@ func testPlansMatchScan(t *testing.T, driven, scanned, hits *atomic.Int64) {
 				if err != nil {
 					t.Fatalf("%s: %v", v.Encode(), err)
 				}
-				var allow func(string) bool
+				var allow allowFunc
 				if r.IntN(4) == 0 {
-					allow = func(res string) bool { h := fnv.New32a(); h.Write([]byte(res)); return h.Sum32()%3 != 0 }
+					allow = func(res, _ string) bool { h := fnv.New32a(); h.Write([]byte(res)); return h.Sum32()%3 != 0 }
 				}
 				ns := []string{"a", "a", "a", "b", "c"}[r.IntN(5)]
 				tx, err := ix.db.BeginTx(ctx, nil)
@@ -605,7 +605,7 @@ func oldCandidateSQL(fts bool, ns string, q *Query) (string, []any) {
 
 // oldRun is run of v0.15.2, less its check of fields, which reads the
 // schemas now (checkFields, in query).
-func (ix *Index) oldRun(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow func(resource string) bool) (*Result, error) {
+func (ix *Index) oldRun(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow allowFunc) (*Result, error) {
 	stmt, args := oldCandidateSQL(ix.fts, ns, q)
 	rows, err := tx.QueryContext(ctx, stmt, args...)
 	if err != nil {
@@ -620,7 +620,7 @@ func (ix *Index) oldRun(ctx context.Context, tx *sql.Tx, ns string, q *Query, al
 			rows.Close()
 			return nil, err
 		}
-		if allow != nil && !allow(h.Resource) {
+		if allow != nil && !allow(h.Resource, h.ID) {
 			continue
 		}
 		if len(q.Counts) > 0 {

@@ -103,7 +103,7 @@ func TestV085ExchangeBehindKeyChange(t *testing.T) {
 				t.Fatalf("her exchange once the index caught up: %d %v", r.status, r.body)
 			}
 			for _, p := range r.body["prefixes"].([]any) {
-				if strings.HasPrefix(p.(string), "/matches/g/") {
+				if strings.HasPrefix(p.(string), "/matches/view/") {
 					if got, _ := p37Follow(t, x, p.(string)+"?q=derby", r.cookies, ""); got.status != 200 {
 						t.Errorf("under the cookie: %d %v", got.status, got.body)
 					}

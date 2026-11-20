@@ -14,7 +14,7 @@ import (
 )
 
 // pub76Cookie exchanges a partial reader's grant of matches at w's index
-// and returns its /matches/g/{gs} prefix and cookies, read once under them.
+// and returns its /matches/view/{gs} prefix and cookies, read once under them.
 func pub76Cookie(t *testing.T, w *v75x) (string, []*http.Cookie) {
 	t.Helper()
 	fan := w.reader("user:fan", []any{"fans"})
@@ -152,12 +152,12 @@ func TestV076PubSharedMarker(t *testing.T) {
 	}
 	var bp string
 	for _, p := range r.body["prefixes"].([]any) {
-		if strings.HasPrefix(p.(string), "/matches/g/") {
+		if strings.HasPrefix(p.(string), "/matches/view/") {
 			bp = p.(string)
 		}
 	}
 	if bp == "" || bp == prefix {
-		t.Fatalf("B's prefixes %v: want a /matches/g/ prefix other than A's %s", r.body["prefixes"], prefix)
+		t.Fatalf("B's prefixes %v: want a /matches/view/ prefix other than A's %s", r.body["prefixes"], prefix)
 	}
 	if got, _ := p37Follow(t, w.x, prefix, cookies, ""); got.status != 403 || !strings.Contains(got.body["message"].(string), "exchange the grant again") {
 		t.Errorf("A under its cookie (from the replaced pub) after B exchanged: %d %v", got.status, got.body)

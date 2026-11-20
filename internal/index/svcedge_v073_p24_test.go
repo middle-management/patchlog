@@ -195,27 +195,27 @@ func TestV073MintAndWithdraw(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
 	c := edge.NewCookies("svc", nil)
-	c.Vouches = func(p string) bool { return strings.HasPrefix(p, "/cat/g/") }
-	merged := svcMerge([]svcIssue{{"/cat/g/a", now.Add(5 * time.Minute)}, {"/cat/g/b", now.Add(2 * time.Minute)}, {"/cat/g/a", now.Add(9 * time.Minute)}})
-	if len(merged) != 2 || merged[0].Prefix != "/cat/g/a" || !merged[0].Exp.Equal(now.Add(9*time.Minute)) || merged[1].Prefix != "/cat/g/b" {
+	c.Vouches = func(p string) bool { return strings.HasPrefix(p, "/cat/view/") }
+	merged := svcMerge([]svcIssue{{"/cat/view/a", now.Add(5 * time.Minute)}, {"/cat/view/b", now.Add(2 * time.Minute)}, {"/cat/view/a", now.Add(9 * time.Minute)}})
+	if len(merged) != 2 || merged[0].Prefix != "/cat/view/a" || !merged[0].Exp.Equal(now.Add(9*time.Minute)) || merged[1].Prefix != "/cat/view/b" {
 		t.Fatalf("merged %v", merged)
 	}
 	w := httptest.NewRecorder()
 	svcMint(w, c, now, merged)
 	b := svcDecodeBody(t, w)
 	if w.Code != 200 || len(w.Result().Cookies()) != 2 || b["exp"] != now.Add(2*time.Minute).Format(time.RFC3339) ||
-		strings.Join(toStrings(b["prefixes"]), " ") != "/cat/g/a /cat/g/b" || w.Header().Get("Cache-Control") != "no-store" {
+		strings.Join(toStrings(b["prefixes"]), " ") != "/cat/view/a /cat/view/b" || w.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("mint: %d %v %v", w.Code, b, w.Header())
 	}
-	ours := func(p string) bool { return strings.HasPrefix(p, "/cat/g/") }
+	ours := func(p string) bool { return strings.HasPrefix(p, "/cat/view/") }
 	w = httptest.NewRecorder()
-	svcWithdraw(w, httptest.NewRequest("DELETE", "/edge-grants?prefix=/cat/g/a&prefix=/cat/g/a&prefix=/cat/g/b", nil), c, ours, "/cat/g/{gs}")
+	svcWithdraw(w, httptest.NewRequest("DELETE", "/edge-grants?prefix=/cat/view/a&prefix=/cat/view/a&prefix=/cat/view/b", nil), c, ours, "/cat/view/{gs}")
 	if w.Code != http.StatusNoContent || len(w.Result().Cookies()) != 2 {
 		t.Fatalf("withdraw: %d %v", w.Code, w.Result().Cookies())
 	}
 	for _, q := range []string{"", "?prefix=/r/x", "?other=1"} {
 		w = httptest.NewRecorder()
-		svcWithdraw(w, httptest.NewRequest("DELETE", "/edge-grants"+q, nil), c, ours, "/cat/g/{gs}")
+		svcWithdraw(w, httptest.NewRequest("DELETE", "/edge-grants"+q, nil), c, ours, "/cat/view/{gs}")
 		if w.Code != 400 || svcDecodeBody(t, w)["code"] != "bad_input" {
 			t.Errorf("withdraw %q: %d", q, w.Code)
 		}

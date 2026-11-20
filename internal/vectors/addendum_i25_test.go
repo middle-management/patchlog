@@ -75,8 +75,8 @@ func TestI25LongPollPhases(t *testing.T) {
 			}
 		}
 	}
-	gs := grantcheck.SubjectSetID([]string{"group:match-desk", "user:anna"}) // I.8's
-	if want := "/ns/matches/g/" + gs + "/log"; rows[3].Path != want {
+	gs := grantcheck.ViewID([]string{"group:match-desk", "user:anna"}) // I.8's
+	if want := "/ns/matches/view/" + gs + "/log"; rows[3].Path != want {
 		t.Errorf("the last path %s, want I.8's gs: %s", rows[3].Path, want)
 	}
 }

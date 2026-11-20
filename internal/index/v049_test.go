@@ -28,7 +28,7 @@ func TestPurgedAfterReadCheck(t *testing.T) {
 		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, untyped: true, now: s.Now})
 	x.caughtUp("sec")
 	bob := issuer.Grant(t, s.Now(), "user:bob", []string{"sec"}, []string{"read"})
-	ptr := x.raw("/sec", bob).header.Get("Location") // /sec/g/{gs}/at/{ns_id}
+	ptr := x.raw("/sec", bob).header.Get("Location") // /sec/view/{gs}/at/{ns_id}
 	gs := strings.Split(ptr, "/")[3]
 
 	must(root.PatchConfig(ctx, "sec", must(root.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
@@ -42,7 +42,7 @@ func TestPurgedAfterReadCheck(t *testing.T) {
 			t.Errorf("token %.10q: %d %v, want %d", tok, r.status, r.body, want)
 		}
 	}
-	for _, u := range []string{"/sec?q=x", ptr, "/sec/g/" + gs + "/at/" + purged} {
+	for _, u := range []string{"/sec?q=x", ptr, "/sec/view/" + gs + "/at/" + purged} {
 		if r := x.raw(u, bob); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != purged || r.header.Get("Cache-Control") != "no-store" {
 			t.Errorf("%s: %d %v %v", u, r.status, r.body, r.header)
 		}
@@ -88,7 +88,7 @@ func TestReadsUnrestrictedRoles(t *testing.T) {
 		t.Helper()
 		r := x.raw("/sec?q=secret", tok)
 		loc := r.header.Get("Location")
-		if r.status != 302 || !strings.HasPrefix(loc, "/sec/g/") {
+		if r.status != 302 || !strings.HasPrefix(loc, "/sec/view/") {
 			t.Fatalf("pointer: %d %s %v", r.status, loc, r.body)
 		}
 		return strings.Split(loc, "/")[3]

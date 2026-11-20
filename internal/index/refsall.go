@@ -26,8 +26,8 @@ import (
 
 // References across namespaces (§A.4 "Across namespaces"):
 //
-//	GET /_refs?to=<reference>             302 → /_refs/g/{gs}/at/{at}?to=…      (head pointer)
-//	GET /_refs/g/{gs}/at/{at}?to=…        200 { at, namespaces, hits, next? }  (immutable,
+//	GET /_refs?to=<reference>             302 → /_refs/view/{view}/at/{at}?to=…      (head pointer)
+//	GET /_refs/view/{view}/at/{at}?to=…        200 { at, namespaces, hits, next? }  (immutable,
 //	                                      tagged idx:{ns} per namespace in at and
 //	                                      r:{ns}/{name} per hit)
 //	                                      302 → the current at if this one is neither
@@ -153,9 +153,9 @@ func parseRefsQuery(v url.Values) (*refsQuery, error) {
 // refsReader is who asks: the namespaces its subject set may see and how.
 type refsReader struct {
 	gs     string
-	public bool                         // reads no private namespace: the answer is public
-	nss    []string                     // the namespaces asked, sorted
-	allow  map[string]func(string) bool // namespaces it reads only in part
+	public bool                 // reads no private namespace: the answer is public
+	nss    []string             // the namespaces asked, sorted
+	allow  map[string]allowFunc // namespaces it reads only in part
 	// covs are the namespaces §7.9 covers that it reads as a partial
 	// reader, whose views decide allow there and whose combined
 	// checkpoints join at (§A.4 Across namespaces); markers, with a
@@ -248,13 +248,13 @@ func (ix *Index) refsNamespaces() []string {
 // verified (unverified), which decides the refusal at another gs's URL.
 func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[string]string) (*refsReader, error) {
 	if bearer(r) == "" {
-		// One of the service's edge grants for /_refs/g/{gs}, on a
+		// One of the service's edge grants for /_refs/view/{view}, on a
 		// request without Authorization (edgegrants.go).
 		if rd, ok, err := ix.refsCookieReader(ctx, r, reached); ok || err != nil {
 			return rd, err
 		}
 	}
-	rd := &refsReader{public: true, allow: map[string]func(string) bool{}, covs: map[string]*access{}, markers: map[string]string{}}
+	rd := &refsReader{public: true, allow: map[string]allowFunc{}, covs: map[string]*access{}, markers: map[string]string{}}
 	var (
 		markers  []string
 		refused  int
@@ -383,36 +383,31 @@ func (ix *Index) refsAccess(ctx context.Context, ns string, r *http.Request, g *
 // combinedAt is the combined checkpoint of §B.5 over cps (ns → ns_id).
 var combinedAt = grantcheck.CombinedAt
 
-// serveRefs answers /_refs and /_refs/g/{gs}/at/{at} (segs, from "_refs"),
-// the subject set before the checkpoint (§A.4). The form before v0.51,
-// /_refs/at/{at}/g/{gs}, is moved permanently to it.
+// serveRefs answers /_refs and /_refs/view/{view}/at/{at} (segs, from
+// "_refs"), the view before the checkpoint (§A.4).
 func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string) {
 	var at, gs string
 	switch {
 	case len(segs) == 1:
 		telemetry.SetRoute(r, "/_refs")
-	case len(segs) == 5 && segs[1] == "at" && segs[3] == "g" && oldForm(segs[4], segs[2]):
-		telemetry.SetRoute(r, "/_refs/at/{at}/g/{gs}")
-		moved(w, r, "/_refs/g/"+segs[4]+"/at/"+segs[2])
-		return
-	case len(segs) == 5 && segs[1] == "g" && segs[3] == "at":
+	case len(segs) == 5 && segs[1] == "view" && segs[3] == "at":
 		gs, at = segs[2], segs[4]
-		telemetry.SetRoute(r, "/_refs/g/{gs}/at/{at}")
+		telemetry.SetRoute(r, "/_refs/view/{view}/at/{at}")
 		if _, err := ids.Parse(at); err != nil {
 			writeErr(w, http.StatusBadRequest, "bad_input", "malformed at")
 			return
 		}
 		if _, err := ids.Parse(gs); err != nil {
-			writeErr(w, http.StatusNotFound, "not_found", "malformed subject set")
+			writeErr(w, http.StatusNotFound, "not_found", "malformed view")
 			return
 		}
-	case len(segs) == 3 && segs[1] == "g":
+	case len(segs) == 3 && segs[1] == "view":
 		// The head pointer under a subject set's prefix, which its edge
 		// grants cover (§B.11.5).
 		gs = segs[2]
-		telemetry.SetRoute(r, "/_refs/g/{gs}")
+		telemetry.SetRoute(r, "/_refs/view/{view}")
 		if _, err := ids.Parse(gs); err != nil {
-			writeErr(w, http.StatusNotFound, "not_found", "malformed subject set")
+			writeErr(w, http.StatusNotFound, "not_found", "malformed view")
 			return
 		}
 	default:
@@ -475,7 +470,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	// grant had there (refsOwnAt), it is the grant's own.
 	var oldURL string
 	if gs != "" && gs != rd.gs && at != "" {
-		if url := "/_refs/g/" + gs + "/at/" + at + derived.CanonicalQuery(vals, "min"); ix.refsOwnAt(ctx, rd, gs, url) {
+		if url := "/_refs/view/" + gs + "/at/" + at + derived.CanonicalQuery(vals, "min"); ix.refsOwnAt(ctx, rd, gs, url) {
 			oldURL = url
 		}
 	}
@@ -507,7 +502,9 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	// redirects name, what answers are kept under, and the view a sealed
 	// hit is bound to (§E.2.6). Only it is answered 200: another form of
 	// it, or one with min, is redirected.
-	target := func(at string) string { return "/_refs/g/" + rd.gs + "/at/" + at + derived.CanonicalQuery(vals, "min") }
+	target := func(at string) string {
+		return "/_refs/view/" + rd.gs + "/at/" + at + derived.CanonicalQuery(vals, "min")
+	}
 	// min is waited for first, so no min is judged against the core's log
 	// before the index has reached it.
 	if !ix.waitMins(ctx, rq.mins) {
@@ -859,7 +856,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 				rows.Close()
 				return derived.Stored{}, "", false, err
 			}
-			if allow != nil && !allow(h.Resource) {
+			if allow != nil && !allow(h.Resource, h.ID) {
 				continue
 			}
 			if len(hits) == rq.limit {
@@ -1041,7 +1038,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		// bound to its URL.
 		// Sealed once (§E.2.6): stored while at is current, as sealed
 		// results of one namespace are.
-		scope := "/_refs/g/" + rd.gs
+		scope := "/_refs/view/" + rd.gs
 		if st, err = ix.sealed.PutSince(ctx, view, scope, at, sgen, st); err != nil {
 			ix.opt.Logf("index: storing a sealed result: %v", err)
 		}

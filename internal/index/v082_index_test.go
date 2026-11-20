@@ -55,7 +55,13 @@ func newV82Whole(t *testing.T) *v77docs {
 // subject set of its one marker, reads:{ns}:{k}, k's key: string by kid
 // and pub (§A.4 gs, v0.85).
 func readsGS(ns string, k clienttest.Key) string {
-	return grantcheck.SubjectSetID([]string{"reads:" + ns + ":" + grantcheck.KeySubject(k.Kid, k.Pub)})
+	return grantcheck.ViewID([]string{grantcheck.KeySubject(k.Kid, k.Pub)})
+}
+
+// readsRefsGS is the /_refs view of a reader of ns whole through k
+// alone, over its marker there.
+func readsRefsGS(ns string, k clienttest.Key) string {
+	return grantcheck.ViewID([]string{"reads:" + ns + ":" + grantcheck.KeySubject(k.Kid, k.Pub)})
 }
 
 // v82Grant is k's grant for sub with the role reader, expiring exp from
@@ -98,7 +104,7 @@ const (
 // scenario 120): li reads docs whole through k1, so her cookie's marker is
 // reads:docs. Once docs changes any member of k1 (its groups scope, its
 // sub scope, its maxTtl, its pub), removes it, or changes the role she
-// read through, her cookie is 403 at /docs/g/{gs}, at the at URL it was
+// read through, her cookie is 403 at /docs/view/{gs}, at the at URL it was
 // answered at, and at /_refs, until she exchanges again; a change to
 // another key or role leaves it read. Before v0.82 a reads:{ns} cookie
 // was never checked and read the namespace whole until it expired.
@@ -236,8 +242,7 @@ func TestV082CookieWindowOtherReaders(t *testing.T) {
 	p2, cyC := d.exchange(cy)
 	pDi, diC := d.exchange(di)
 	for ns, k := range map[string]clienttest.Key{"docs": d.k1, "_refs": d.k1} {
-		gs := readsGS("docs", k)
-		if want := map[string]string{"docs": "/docs/g/" + gs, "_refs": "/_refs/g/" + gs}[ns]; p1[ns] != want || pBo[ns] != want {
+		if want := map[string]string{"docs": "/docs/view/" + readsGS("docs", k), "_refs": "/_refs/view/" + readsRefsGS("docs", k)}[ns]; p1[ns] != want || pBo[ns] != want {
 			t.Fatalf("al's and bo's %s prefixes, through k1: %s, %s, want %s", ns, p1[ns], pBo[ns], want)
 		}
 	}
@@ -313,8 +318,7 @@ func TestV082ExchangeTwoKeysOneMarker(t *testing.T) {
 			}
 			var paths [2][]string
 			for j, k := range []clienttest.Key{d.k1, d.k2} {
-				gs := readsGS("docs", k)
-				paths[j] = v82Paths(map[string]string{"docs": "/docs/g/" + gs, "_refs": "/_refs/g/" + gs})
+				paths[j] = v82Paths(map[string]string{"docs": "/docs/view/" + readsGS("docs", k), "_refs": "/_refs/view/" + readsRefsGS("docs", k)})
 				if got := v82Status(t, d.x, paths[j], r.cookies); got != v82Reads {
 					t.Fatalf("under k%d's cookies: %s", j+1, got)
 				}
@@ -352,7 +356,7 @@ func TestV082ScopeCookieEndsOnAnyMember(t *testing.T) {
 			d := newV77Docs(t)
 			li := d.reader(d.k1)
 			prefixes, cookies := d.exchange(li)
-			if !strings.HasPrefix(prefixes["docs"], "/docs/g/") {
+			if !strings.HasPrefix(prefixes["docs"], "/docs/view/") {
 				t.Fatalf("prefixes %v", prefixes)
 			}
 			paths := v82Paths(prefixes)
