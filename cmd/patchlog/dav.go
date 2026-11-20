@@ -19,7 +19,11 @@ import (
 
 // davCmd serves namespaces over WebDAV (a prototype, internal/dav):
 //
-//	patchlog dav --api URL --ns NS[,NS…] [--gateway [--insecure]] [--tls-cert FILE --tls-key FILE] …
+//	patchlog dav --api URL [--ns NS[,NS…]] [--tree NS[,NS…] --index URL] [--gateway [--insecure]] [--tls-cert FILE --tls-key FILE] …
+//
+// --ns serves flat namespaces (TOOLS §H.2 "Flat view"), --tree file
+// trees: documents of the file schema placed by their folder and name,
+// listed through the index service (§H.3, patchlog index, following them).
 //
 // Local mode (the default) sends --bearer's grant with every request to the
 // core; WebDAV clients log in with HTTP Basic, any user name and the
@@ -31,6 +35,10 @@ type davCmd struct {
 	API              string   `arg:"--api,env:PATCHLOG_API" default:"http://localhost:8080" placeholder:"URL" help:"base URL of the patch-log API"`
 	Addr             string   `arg:"--addr" default:"127.0.0.1:8090" help:"listen address of the WebDAV server"`
 	NS               []string `arg:"--ns,separate" placeholder:"NS[,NS]" help:"flat namespace to serve, a directory of its files: raw ones by name, JSON documents as {name}.json (repeatable or comma-separated)"`
+	Tree             []string `arg:"--tree,separate" placeholder:"NS[,NS]" help:"namespace to serve as a file tree (TOOLS §H.2): documents { $schema, folder, name, content } of the file schema, in folders listed through --index (repeatable or comma-separated)"`
+	Index            string   `arg:"--index,env:PATCHLOG_INDEX" default:"http://localhost:8081" placeholder:"URL" help:"the index service (patchlog index) that follows the --tree namespaces and lists their folders (§H.3)"`
+	FileSchema       string   `arg:"--file-schema" default:"/r/schemas/file" placeholder:"/r/NS/NAME" help:"the file schema's resource (patchlog schema file --create): folders are listed by it, and new files and folders pinned to its head revision"`
+	CaseSensitive    bool     `arg:"--case-sensitive" help:"compare names in a tree's folder as they are (after NFC); by default case-insensitively, as Finder and Explorer do (§H.2 Siblings)"`
 	InlinePDF        bool     `arg:"--inline-pdf" help:"serve PDFs for display in the browser rather than as attachments (Content-Disposition: attachment); either way without the sandbox (§7.8, §H.6)"`
 	Bearer           string   `arg:"--bearer,env:PATCHLOG_BEARER" placeholder:"GRANT" help:"local mode: the grant every request is sent with (Authorization: Bearer)"`
 	BearerFile       string   `arg:"--bearer-file,env:PATCHLOG_BEARER_FILE" placeholder:"FILE" help:"local mode: file holding --bearer (a profile's bearer_file too)"`
@@ -48,16 +56,16 @@ type davCmd struct {
 }
 
 func (a *davCmd) run(string) {
-	flat := splitList(a.NS...)
-	if len(flat) == 0 {
-		log.Fatal("dav: --ns is required")
+	flat, trees := splitList(a.NS...), splitList(a.Tree...)
+	if len(flat) == 0 && len(trees) == 0 {
+		log.Fatal("dav: --ns or --tree is required")
 	}
 	if (a.TLSCert == "") != (a.TLSKey == "") {
 		log.Fatal("dav: --tls-cert and --tls-key go together")
 	}
 	tls := a.TLSCert != ""
 	var err error
-	opt := dav.Options{Namespaces: flat, InlinePDF: a.InlinePDF, Gateway: a.Gateway, FetchConcurrency: a.FetchConcurrency,
+	opt := dav.Options{Namespaces: flat, InlinePDF: a.InlinePDF, CaseSensitive: a.CaseSensitive, Gateway: a.Gateway, FetchConcurrency: a.FetchConcurrency,
 		CacheBytes: int(a.CacheSize), MaxFileSize: int(a.MaxFileSize), MaxRawSize: int(a.MaxRawSize), Logf: log.Printf}
 	copts := []client.Option{client.WithIdleConns(a.FetchConcurrency)}
 	if a.Gateway {
@@ -93,6 +101,9 @@ func (a *davCmd) run(string) {
 	if opt.Client, err = client.New(a.API, copts...); err != nil {
 		log.Fatal(err)
 	}
+	if len(trees) > 0 {
+		opt.Trees, opt.Index, opt.FileSchema = trees, serviceURL(a.Index), a.FileSchema
+	}
 	srv, err := dav.New(opt)
 	if err != nil {
 		log.Fatal(err)
@@ -113,7 +124,8 @@ func (a *davCmd) run(string) {
 	if tls {
 		scheme = "https"
 	}
-	log.Printf("patchlog dav: %s mode, serving %s of %s at %s://%s/", mode, strings.Join(flat, ","), a.API, scheme, ln.Addr())
+	served := strings.Join(append(append([]string{}, flat...), trees...), ",")
+	log.Printf("patchlog dav: %s mode, serving %s of %s at %s://%s/", mode, served, a.API, scheme, ln.Addr())
 	go func() {
 		var err error
 		if tls {

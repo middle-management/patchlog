@@ -7,8 +7,9 @@
 // namespace, but sealed and end-to-end ones, which need keys it doesn't
 // hold (§H.7). A flat namespace's directory is the flat view (§H.2): a raw
 // document (its root a blob reference, §7.8) as its resource name, any
-// other as {name}.json. (File trees, folders and names kept as document
-// fields, TOOLS Addendum H, are not served yet.)
+// other as {name}.json. A tree namespace's directory is a file tree
+// (§H.2, tree.go): documents { $schema, folder, name, content? } of the
+// file schema, in folders listed through the index service (§H.3).
 //
 // A raw file reads as its blob's bytes, typed by its name (§H.1); a JSON
 // file as its rendering, the document's canonical JSON (§3.1) laid out,

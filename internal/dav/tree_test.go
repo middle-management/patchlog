@@ -427,3 +427,97 @@ func TestTreeIndexLag(t *testing.T) {
 	}
 	e.want(e.do("DELETE", "/files/docs", ""), http.StatusConflict)
 }
+
+// FILE-23: read rules on /doc/folder give a grant a subtree, its own
+// folder document included (§H.7 "Folders as access"): through a gateway
+// passing the user's grant on, the reader under H.7's team-a rule sees
+// /team-a and what is under it, and nothing else.
+func TestTreeFolderAccess(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true, LongPoll: 100 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for _, ns := range []string{"schemas", "files"} {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+		if ns == "files" {
+			doc["read"] = "grant"
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	admin := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{"files", "schemas"}, []string{"read", "create", "append", "delete"})))
+	sch := must(admin.CreateDoc(ctx, "schemas", "file", files.Schema()))
+	ref := "/r/schemas/file/rev/" + sch.ID
+	for _, d := range []struct{ res, folder, name string }{
+		{"ta", "/", "team-a"}, {"tb", "/", "team-b"}, {"top", "/", "top.txt"},
+		{"ax", "/team-a", "x.txt"}, {"as", "/team-a", "sub"}, {"az", "/team-a/sub", "z.txt"}, {"by", "/team-b", "y.txt"},
+	} {
+		doc := map[string]any{"$schema": ref, "folder": d.folder, "name": d.name}
+		if strings.Contains(d.name, ".") {
+			doc["content"] = map[string]any{"in": d.folder}
+		}
+		must(admin.CreateDoc(ctx, "files", d.res, doc))
+	}
+	rule := map[string]any{"any": []any{
+		map[string]any{"op": "test", "path": "/doc/folder", "schema": map[string]any{"pattern": "^/team-a(/|$)"}},
+		map[string]any{"all": []any{
+			map[string]any{"op": "test", "path": "/doc/folder", "value": "/"},
+			map[string]any{"op": "test", "path": "/doc/name", "value": "team-a"},
+		}},
+	}}
+	svc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:index", []string{"files", "schemas"}, []string{"read"})))
+	ix := must(index.Open(ctx, index.Options{Client: svc, DB: filepath.Join(t.TempDir(), "i.db"), Namespaces: []string{"files"},
+		CheckerTTL: time.Millisecond, MinWait: time.Second, RepurgeInterval: -1, Logf: func(string, ...any) {}}))
+	ihs := httptest.NewServer(ix.Handler())
+	rctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { ix.Run(rctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done; ihs.Close(); ix.Close() })
+
+	srv := must(dav.New(dav.Options{Client: s.Client(t), Gateway: true, Trees: []string{"files"}, Index: ihs.URL, Logf: t.Logf}))
+	// A reader of everything, through the gateway, which passes its
+	// grant on to the core and the index, sees the whole tree.
+	all := k.Grant(t, s.Now(), "user:all", []string{"files", "schemas"}, []string{"read"})
+	e := &treeEnv{env: &env{t: t, ctx: ctx, s: s, c: admin, pw: all, dav: newTestServer(t, srv)}}
+	var top []string
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		r := e.do("PROPFIND", "/files/", "", "Depth", "1")
+		if r.status == http.StatusMultiStatus {
+			if top = e.ls("/files/"); len(top) == 3 {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the index never listed /files: %d %s (%v)", r.status, r.body, top)
+		}
+	}
+	if strings.Join(top, ",") != "team-a/,team-b/,top.txt" {
+		t.Errorf("top for a reader of everything: %v", top)
+	}
+	if r := e.do("GET", "/files/team-b/y.txt", ""); r.status != 200 || !strings.Contains(r.body, "/team-b") {
+		t.Errorf("GET /team-b/y.txt: %d %s", r.status, r.body)
+	}
+	// A reader without the file schema's grant is refused the write
+	// (it reads only).
+	e.want(e.do("PUT", "/files/team-a/new.txt", "x"), http.StatusForbidden)
+
+	teamA := k.Grant(t, s.Now(), "user:a", []string{"files", "schemas"}, []string{"read"}, map[string]any{"rules": []any{rule}})
+	ta := s.Client(t, client.WithBearer(teamA))
+	if h, err := ta.Head(ctx, "files", "ax"); err != nil || h.State != client.Live {
+		t.Skipf("the core doesn't serve a /doc/folder read rule's subtree yet (§7.9 filtered reads by document): head of /team-a/x.txt: %+v %v", h, err)
+	}
+	e.pw = teamA
+	if top = e.ls("/files/"); strings.Join(top, ",") != "team-a/" {
+		t.Errorf("top for team-a: %v", top)
+	}
+	if got := e.ls("/files/team-a/"); strings.Join(got, ",") != "sub/,x.txt" {
+		t.Errorf("/team-a: %v", got)
+	}
+	if got := e.ls("/files/team-a/sub/"); strings.Join(got, ",") != "z.txt" {
+		t.Errorf("/team-a/sub: %v", got)
+	}
+	if r := e.do("GET", "/files/team-a/sub/z.txt", ""); r.status != 200 || !strings.Contains(r.body, "/team-a/sub") {
+		t.Errorf("GET in the subtree: %d %s", r.status, r.body)
+	}
+	e.want(e.do("GET", "/files/team-b/y.txt", ""), http.StatusNotFound)
+	e.want(e.do("GET", "/files/top.txt", ""), http.StatusNotFound)
+}

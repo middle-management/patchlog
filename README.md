@@ -2256,13 +2256,22 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
 `patchlog dav` serves namespaces as a network drive, for file managers and editors, following
 Addendum H (files): a file other than a JSON file is a raw document, its bytes a blob (§7.8), and a
 JSON file is a document, read as its rendering. A namespace (`--ns`) is a flat directory of its
-resources. It is an API consumer like the index: it reads and writes the core only through its
-public API, and keeps nothing but memory caches.
+resources; one given with `--tree` is a file tree (§H.2, v0.87): its documents carry their place
+as data, `{ $schema, folder, name, content }` under opaque resource names, a folder being a
+document without `content`, and its folders are listed through the index service (`--index`,
+§H.3), which must follow the namespace. It is an API consumer like the index: it reads and writes
+the core only through its public API, and keeps nothing but memory caches.
 
 ```sh
 # Local mode: one grant for every request; WebDAV clients log in with any user name and the password.
 ./patchlog dav --api http://localhost:8080 --ns docs,matches \
   --bearer-file editor.grant --password-file dav.password      # http://127.0.0.1:8090/
+
+# A file tree: the file schema created once, the namespace followed by the index.
+./patchlog schema file --create --api http://localhost:8080 --bearer-file admin.grant   # /r/schemas/file
+./patchlog index --ns files &                                   # http://localhost:8081
+./patchlog dav --api http://localhost:8080 --tree files --index http://localhost:8081 \
+  --bearer-file editor.grant --password-file dav.password
 
 # Gateway mode: each request's Basic password is the user's own grant, sent upstream.
 ./patchlog dav --api https://cms.example --ns docs --gateway \

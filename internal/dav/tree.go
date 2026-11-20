@@ -10,7 +10,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -1159,6 +1158,3 @@ func (st *reqState) treeCopyDir(ctx context.Context, src, t target) error {
 	}
 	return fail(http.StatusForbidden, "%s can't be copied to %s", src.path, t.path)
 }
-
-// isNotExist reports errNotExist.
-func isNotExist(err error) bool { return errors.Is(err, os.ErrNotExist) }
