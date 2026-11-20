@@ -99,6 +99,46 @@ func TestVectorPlanDigest(t *testing.T) {
 		t.Fatal("another published value kept the digest")
 	}
 
+	// The vector as v0.86 kept it, two batches of one branch with one
+	// source (now steps 1 and 2, as a branch holding schemas and content
+	// merges), the second's precondition { batch, item } on the first's
+	// result: its plan and digest are unchanged.
+	const oldPlan = `{"batches":[{"items":[{"ifMatch":"1sywh54kpo3c4ezn2znktvl3avge4zl5d","resource":"matches.cup","steps":[[{"op":"replace","path":"/parents","value":[{"href":"/r/cat-season/vault"}]}]]},{"ifMatch":"1idx6u2b3z42obqmwsgmlzvrfuutks2bq","resource":"matches.old","steps":["delete"]},{"ifMatch":"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll","resource":"season","steps":[[{"op":"remove","path":"/$access/group:fans"}]]}],"ns":"cat-season","source":{"at":"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm","ns":"cat-season-r7"}},{"items":[{"ifMatch":{"batch":0,"item":0},"resource":"matches.cup","steps":[[{"op":"replace","path":"/parents","value":[{"href":"/r/cat-season/embargo"}]},{"op":"add","path":"/$nonce","value":"not-fresh"}]]},{"ifNoneMatch":"*","resource":"matches.newbie","steps":[[{"op":"add","path":"","value":{"parents":[{"href":"/r/cat-season/season"}]}}]]}],"ns":"cat-season","source":{"at":"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm","ns":"cat-season-r7"}}],"release":"/r/releases/release-7/rev/1vmctae4vewju6nvxi374rkrkmyzpdrif"}`
+	const oldDigest = "1rvfmashxuxn5rbmma7dupfj55l74r3jb"
+	parents := func(p string) []any { return []any{map[string]any{"href": "/r/cat-season/" + p}} }
+	ob := []*ReleaseBranch{{Key: "cat-season", NS: "cat-season-r7", Target: "cat-season", At: branchAt}}
+	o1 := &ReleaseStep{Step: StepSchemas, Key: "cat-season", Resources: []string{"matches.cup", "matches.old", "season"}}
+	o2 := &ReleaseStep{Step: StepContent, Key: "cat-season", Resources: []string{"matches.cup", "matches.newbie"}}
+	oldSent := map[*ReleaseStep][]stepItem{
+		o1: {
+			{"season", map[string]any{"ifMatch": headSeason}, []client.Step{client.PatchStep([]any{
+				op("remove", "/$access/group:fans", nil), op("add", "/$nonce", fresh)})}},
+			{"matches.cup", map[string]any{"ifMatch": headCup}, []client.Step{client.PatchStep([]any{
+				op("replace", "/parents", parents("vault")), op("replace", "/$nonce", fresh2)})}},
+			{"matches.old", map[string]any{"ifMatch": headOld}, []client.Step{client.DeleteStep()}},
+		},
+		o2: {
+			{"matches.newbie", map[string]any{"ifNoneMatch": "*"}, []client.Step{client.PatchStep([]any{
+				op("add", "", map[string]any{"$nonce": fresh, "parents": parents("season")})})}},
+			{"matches.cup", map[string]any{"after": map[string]any{"step": StepSchemas, "key": "cat-season", "item": "matches.cup"}}, []client.Step{client.PatchStep([]any{
+				op("replace", "/parents", parents("embargo")), op("add", "/$nonce", "not-fresh")})}},
+		},
+	}
+	op1, err := PlanObject(release, ob, []*ReleaseStep{o1, o2}, map[*ReleaseStep][]any{o1: digestItems(o1, oldSent[o1]), o2: digestItems(o2, oldSent[o2])})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(jsonv.Canonical(jsonv.FromGo(op1))); got != oldPlan || PlanDigest(op1) != oldDigest {
+		t.Fatalf("the earlier vector's plan is\n%s\n(digest %s), want\n%s\n(digest %s)", got, PlanDigest(op1), oldPlan, oldDigest)
+	}
+	var oldJSON []any
+	for _, st := range []*ReleaseStep{o1, o2} {
+		for _, it := range oldSent[st] {
+			oldJSON = append(oldJSON, golden.Obj{{Key: "step", Value: st.Step}, {Key: "resource", Value: it.name},
+				{Key: "steps as sent", Value: string(jsonv.Canonical(jsonv.FromGo(StepsJSON(it.steps))))}})
+		}
+	}
+
 	var sentJSON []any
 	for _, it := range sent {
 		sentJSON = append(sentJSON, golden.Obj{{Key: "step", Value: StepContent}, {Key: "resource", Value: it.name},
@@ -108,8 +148,14 @@ func TestVectorPlanDigest(t *testing.T) {
 		{Key: "steps as sent", Value: string(jsonv.Canonical(jsonv.FromGo(StepsJSON(publish))))}})
 	golden.Check(t, "plandigest", golden.Obj{
 		{Key: "section", Value: "§F.9"},
-		{Key: "about", Value: "a release's plan digest, text(trunc160(sha256(canonical(plan)))): a content branch's step-2 batch, which creates matches.newbie, and step 3's batch without source, which publishes it, its precondition { batch, item } on step 2's result (items in each batch by resource name, as the reference orders them); fresh $nonce ops, and a fresh top-level $nonce in a root operation's value, are left out of the steps"},
+		{Key: "about", Value: "a release's plan digest, text(trunc160(sha256(canonical(plan)))), a precondition on an earlier batch's result { batch, item } (items in each batch by resource name, as the reference orders them); fresh $nonce ops, and a fresh top-level $nonce in a root operation's value, are left out of the steps"},
 		{Key: "vectors", Value: []any{golden.Obj{
+			{Key: "name", Value: "two batches of one branch with one source (steps 1 and 2), the second naming the first's result; the plan and digest of v0.86's vector"},
+			{Key: "fn", Value: "merge.digestItems (digestSteps), merge.PlanObject, merge.PlanDigest"},
+			{Key: "items", Value: oldJSON},
+			{Key: "plan", Value: oldPlan},
+			{Key: "digest", Value: oldDigest},
+		}, golden.Obj{
 			{Key: "name", Value: "content and publishing with nonce'd steps"},
 			{Key: "fn", Value: "merge.digestItems, merge.publishItems (digestSteps), merge.PlanObject, merge.PlanDigest"},
 			{Key: "items", Value: sentJSON},

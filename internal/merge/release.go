@@ -1794,7 +1794,9 @@ func runPublish(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *R
 		return "", nil, fmt.Errorf("%s is an e2e namespace, whose readers aren't filtered by its documents (§7.9): it has no step 3", b.Target)
 	}
 	ptr := pub.ptr()
-	req := client.BatchRequest{SourceAuthorizations: opt.SourceAuthorizations}
+	// No source, so no Source-Authorization: step 3 reads nothing of the
+	// branches, and the schemas its documents name are in the bases.
+	req := client.BatchRequest{}
 	got := map[string]string{}
 	var gone []string // items that went in before they were recorded
 	for i, it := range want {
