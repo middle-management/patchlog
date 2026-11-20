@@ -284,6 +284,7 @@ type serveCmd struct {
 	EdgeGrantKey       []string      `arg:"--edge-grant-key,separate" placeholder:"[KID=]FILE" help:"a file holding a key edge-grant cookies of POST /edge-grants are signed with, named KID (a plain FILE takes --edge-grant-kid) (§C.5); a FILE with '=' before any '/' is given as KID=FILE or ./FILE; repeatable, to rotate keys: cookies under any are accepted, and the last given signs new ones. Without it, a random key per process, so cookies don't survive a restart, reach another instance or verify at an edge: an edge verifying cookies needs key files. FILE edge-secret is the key derived from --edge-secret, for migrating to key files only: every holder of the edge secret, services included, can derive it and mint cookies with it"`
 	EdgeGrantKid       string        `arg:"--edge-grant-kid" default:"origin" placeholder:"KID" help:"the name (kid) of the edge-grant key given as a plain --edge-grant-key FILE, or of the random one without --edge-grant-key, which the cookies carry and a verifying edge looks the key up by (§C.5.3)"`
 	purgeArgs
+	followPurgesArgs
 	edgeArgs
 	corsArgs
 	shutdownArgs
@@ -430,6 +431,9 @@ func (a *serveCmd) run(string) {
 	purger := cdnPurger(a.PurgeURL)
 	if purger != nil {
 		opt.Purger = purger
+	}
+	if opt.FollowPurges, err = a.followPurgesArgs.options(a.Origin); err != nil {
+		log.Fatal(err)
 	}
 	e, err := core.Open(opt)
 	if err != nil {

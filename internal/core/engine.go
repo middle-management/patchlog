@@ -183,6 +183,9 @@ type Options struct {
 	// are due. Zero means ten seconds; negative disables the loop
 	// (Repurge still sends them).
 	RepurgeInterval time.Duration
+	// FollowPurges follows the purges of trusted origins after imports
+	// (§G.1, purgefollow.go).
+	FollowPurges FollowPurgesOptions
 	// StoreCompression is "zstd" to store the patch sets of namespaces
 	// without encryption compressed (compress.go), or "" or "off" (the
 	// default) to store canonical JSON. SQLite only: Open refuses it on
@@ -552,6 +555,13 @@ func Open(opt Options) (*Engine, error) {
 	if e.opt.RepurgeDelay > 0 && e.opt.RepurgeInterval > 0 {
 		e.bg.Add(1)
 		go e.repurgeLoop(e.opt.RepurgeInterval)
+	}
+	if e.opt.FollowPurges.Interval == 0 {
+		e.opt.FollowPurges.Interval = 5 * time.Minute
+	}
+	if len(e.opt.FollowPurges.Origins) > 0 && e.opt.FollowPurges.Interval > 0 {
+		e.bg.Add(1)
+		go e.purgeFollowLoop(e.opt.FollowPurges.Interval)
 	}
 	return e, nil
 }
