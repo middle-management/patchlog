@@ -334,10 +334,13 @@ func (st *reqState) indexFolder(ctx context.Context, ns, fpath string) ([]ixHit,
 	for _, m := range st.mins(ns) {
 		q.Add("min", ns+":"+m)
 	}
-	u := strings.TrimRight(st.s.opt.Index, "/") + "/" + ns + "?" + q.Encode()
+	first := strings.TrimRight(st.s.opt.Index, "/") + "/" + ns + "?" + q.Encode()
+	u := first
 	var out []ixHit
+	at, restarts := "", 0
 	for u != "" {
 		var page struct {
+			At   string  `json:"at"`
 			Hits []ixHit `json:"hits"`
 			Next string  `json:"next"`
 		}
@@ -347,6 +350,18 @@ func (st *reqState) indexFolder(ctx context.Context, ns, fpath string) ([]ixHit,
 				return nil, nil
 			}
 			return nil, err
+		}
+		if at == "" {
+			at = page.At
+		} else if page.At != at {
+			// The result the pages were of is gone (the index no longer
+			// keeps it, and redirected to its current one, where an
+			// opaque position means nothing): listed again from the start.
+			if restarts++; restarts > 3 {
+				return nil, upBusy(theIndex, fmt.Errorf("folder %s of %s: the listing kept moving while it was paged", fpath, ns))
+			}
+			u, out, at = first, nil, ""
+			continue
 		}
 		out = append(out, page.Hits...)
 		if len(out) > st.s.opt.MaxListing {
@@ -560,7 +575,7 @@ func (st *reqState) resolveTree(ctx context.Context, t target, segs []string) (t
 	base := norm.NFC.String(t.base)
 	if ent := l.tree[t.base]; ent != nil || l.tree[base] != nil {
 		if ent == nil {
-			ent = l.tree[base]
+			ent, t.shown = l.tree[base], base
 		}
 		t.title = ent.title
 		if ent.dir {
@@ -574,7 +589,7 @@ func (st *reqState) resolveTree(ctx context.Context, t target, segs []string) (t
 		}
 		return t, nil
 	}
-	if _, ok := st.scratchPeek(t.path); ok || scratchName(t.base) || appDir(t.base) && st.isScratchDir(t.path) {
+	if _, ok := st.scratchPeek(t.path); ok || scratchName(t.base) || appDir(t.base) {
 		return st.scratchAt(t, false), nil
 	}
 	t.kind, t.title = kNew, base
@@ -600,10 +615,7 @@ func pathBase(p string) string { return p[strings.LastIndexByte(p, '/')+1:] }
 // entAt is the listing entry of resolved tree path t.
 func (st *reqState) entAt(t target) *treeEnt {
 	if l := st.lists[t.dir]; l != nil && l.tree != nil {
-		if e := l.tree[t.base]; e != nil {
-			return e
-		}
-		return l.tree[norm.NFC.String(t.base)]
+		return l.tree[t.shownAs()]
 	}
 	return nil
 }

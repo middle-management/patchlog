@@ -43,6 +43,7 @@ func (st *reqState) moveOnto(ctx context.Context, src, dst target) error {
 	if rev == "" {
 		return notMoved(src, dst)
 	}
+	src.docName = hd.name
 	return st.deleteSource(ctx, src, dst, hd.rev, "")
 }
 
@@ -91,6 +92,7 @@ func (st *reqState) moveAcross(ctx context.Context, src, dst target) error {
 			succ = name
 		}
 	}
+	src.docName = hd.name
 	return st.deleteSource(ctx, src, dst, hd.rev, succ)
 }
 

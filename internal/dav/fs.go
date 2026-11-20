@@ -62,6 +62,9 @@ type target struct {
 	// sibling a new name matches only under another case (§H.2)
 	tree                          bool
 	fpath, folder, title, variant string
+	// shown is the name the path's last segment matched in its folder's
+	// listing, where that differs from base (a name sent in NFD)
+	shown string
 }
 
 func (t target) isDir() bool {
@@ -69,7 +72,12 @@ func (t target) isDir() bool {
 }
 
 // shownAs is the name t's file or folder has in its directory's listing.
-func (t target) shownAs() string { return t.base }
+func (t target) shownAs() string {
+	if t.shown != "" {
+		return t.shown
+	}
+	return t.base
+}
 
 // isDoc: the path names a document's file (which may not be live).
 func (t target) isDoc() bool { return t.kind == kDoc || t.kind == kRaw }
@@ -762,6 +770,14 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 	if !live {
 		return nil, errNotExist
 	}
+	if hd.rev != fi.rev {
+		// A tree's file read at its head, which the index's listing
+		// (stat) may lag: served under the head's tag and size.
+		fi = st.docInfo(t.shownAs(), hd)
+		if served && st.resp != nil {
+			st.resp.Set("Content-Type", fi.ctype)
+		}
+	}
 	if served {
 		if err := st.ifMatchGet(t, hd.rev); err != nil {
 			return nil, err
@@ -978,7 +994,7 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 			if match == "" {
 				match = hd.rev
 			}
-			_, err := st.deleteDoc(ctx, t.docNS, t.docName, match)
+			_, err := st.deleteDoc(ctx, t.docNS, hd.name, match)
 			if de, ok := err.(*davError); ok && de.status == http.StatusPreconditionFailed && st.ifMatch == "" {
 				err = movedSinceRead(t)
 			}
@@ -1435,10 +1451,14 @@ func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (strin
 		if err != nil {
 			return "", false, err
 		}
-		if !live && nt.isDoc() {
+		switch {
+		case !live && nt.isDoc():
 			return "", false, treeGone(t.path)
-		}
-		if nt.kind == kNew {
+		case !nt.isDoc() && nt.kind != kNew:
+			return "", false, fail(http.StatusConflict, "%s names no file now (moved, renamed or deleted since it was listed); reload the folder", t.path)
+		case nt.kind == kNew || nt.docName != t.docName:
+			// The path names another document now, or none: a save
+			// without a tag isn't written over it (§H.4 "Records").
 			if err := st.replaced(ctx, nt); err != nil {
 				return "", false, err
 			}

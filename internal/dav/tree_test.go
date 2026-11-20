@@ -2,9 +2,11 @@ package dav_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -81,6 +83,22 @@ type treeEnv struct {
 // following them, and a local-mode WebDAV server serving them as trees.
 func newTreeEnv(t *testing.T, trees ...string) *treeEnv {
 	t.Helper()
+	return newTreeEnvWith(t, treeOpts{}, trees...)
+}
+
+// treeOpts adjust newTreeEnvWith: how long the index waits for a ?min
+// (default 5s; the lag tests' short, so an index behind answers soon)
+// and the gateway's MaxListing.
+type treeOpts struct {
+	minWait    time.Duration
+	maxListing int
+}
+
+func newTreeEnvWith(t *testing.T, o treeOpts, trees ...string) *treeEnv {
+	t.Helper()
+	if o.minWait == 0 {
+		o.minWait = 5 * time.Second
+	}
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LongPoll: 100 * time.Millisecond})
 	e := &env{t: t, ctx: ctx, s: s, c: s.Client(t, client.WithAuthor("other")), pw: "secret"}
@@ -92,7 +110,7 @@ func newTreeEnv(t *testing.T, trees ...string) *treeEnv {
 	g := &gate{}
 	ixc := s.Client(t, client.WithHTTPClient(&http.Client{Transport: g}))
 	ix := must(index.Open(ctx, index.Options{Client: ixc, DB: filepath.Join(t.TempDir(), "i.db"), Namespaces: trees,
-		Now: s.Now, CheckerTTL: time.Millisecond, MinWait: 400 * time.Millisecond, RepurgeInterval: -1,
+		Now: s.Now, CheckerTTL: time.Millisecond, MinWait: o.minWait, RepurgeInterval: -1,
 		Logf: func(string, ...any) {}}))
 	ihs := httptest.NewServer(ix.Handler())
 	rctx, cancel := context.WithCancel(ctx)
@@ -114,7 +132,7 @@ func newTreeEnv(t *testing.T, trees ...string) *treeEnv {
 			}
 		}
 	}
-	opt := dav.Options{Client: s.Client(t, client.WithAuthor("dav")), Trees: trees, Index: ihs.URL, Password: e.pw, Logf: t.Logf}
+	opt := dav.Options{Client: s.Client(t, client.WithAuthor("dav")), Trees: trees, Index: ihs.URL, Password: e.pw, MaxListing: o.maxListing, Logf: t.Logf}
 	srv := must(dav.New(opt))
 	e.dav = newTestServer(t, srv)
 	e.opt = opt
@@ -381,19 +399,29 @@ func must2[A, B any](a A, _ B) A { return a }
 // behind answers 503, and nothing is written meanwhile.
 func TestTreeIndexLag(t *testing.T) {
 	t.Parallel()
-	e := newTreeEnv(t, "files")
+	e := newTreeEnvWith(t, treeOpts{minWait: 400 * time.Millisecond}, "files")
 	e.want(e.do("PUT", "/files/a.txt", "a"), http.StatusCreated)
+	e.want(e.do("PUT", "/files/j.json", `{"v":1}`), http.StatusCreated)
 	e.want(e.do("MKCOL", "/files/docs", ""), http.StatusCreated)
-	if got := e.ls("/files/"); strings.Join(got, ",") != "a.txt,docs/" {
+	if got := e.ls("/files/"); strings.Join(got, ",") != "a.txt,docs/,j.json" {
 		t.Fatalf("top: %v", got)
 	}
 	res, _ := e.placed("files", "/", "a.txt")
+	jres, _ := e.placed("files", "/", "j.json")
+	other := e.another()
+	other.expect(other.do("GET", "/files/j.json", ""), http.StatusOK, "GET j.json")
 
 	e.gate.hold()
+	// A file read while the index lags is read at its head, under its tag.
+	jh := must(e.c.Head(e.ctx, "files", jres))
+	jw := must(e.c.Append(e.ctx, "files", jres, jh.ID, []any{map[string]any{"op": "replace", "path": "/content/v", "value": 2.0}}))
+	if r := other.do("GET", "/files/j.json", ""); r.status != 200 || r.header.Get("ETag") != `"`+jw.ID+`"` || !strings.Contains(r.body, "2") {
+		t.Errorf("GET of a file the index lags: %d %s %q, want the head %s", r.status, r.header.Get("ETag"), r.body, jw.ID)
+	}
 	// Someone renames a.txt at the core; the index doesn't see it.
 	h := must(e.c.Head(e.ctx, "files", res))
 	must(e.c.Append(e.ctx, "files", res, h.ID, []any{map[string]any{"op": "replace", "path": "/name", "value": "b.txt"}}))
-	if got := e.ls("/files/"); strings.Join(got, ",") != "a.txt,docs/" {
+	if got := e.ls("/files/"); strings.Join(got, ",") != "a.txt,docs/,j.json" {
 		t.Fatalf("the index isn't held: %v", got)
 	}
 	r := e.do("DELETE", "/files/a.txt", "")
@@ -412,6 +440,7 @@ func TestTreeIndexLag(t *testing.T) {
 	// A folder is empty only when a listing at or past the gateway's last
 	// write in the namespace has nothing in it.
 	e.gate.release()
+	e.settle("/files/docs/")
 	if got := e.ls("/files/docs/"); len(got) != 0 {
 		t.Fatalf("docs: %v", got)
 	}
@@ -421,11 +450,126 @@ func TestTreeIndexLag(t *testing.T) {
 	e.placed("files", "/", "docs")
 
 	e.gate.release()
+	e.settle("/files/")
 	e.want(e.do("DELETE", "/files/a.txt", ""), http.StatusNotFound)
-	if got := e.ls("/files/"); strings.Join(got, ",") != "b.txt,docs/" {
+	if got := e.ls("/files/"); strings.Join(got, ",") != "b.txt,docs/,j.json" {
 		t.Errorf("top once the index caught up: %v", got)
 	}
 	e.want(e.do("DELETE", "/files/docs", ""), http.StatusConflict)
+
+	// The name the user wrote names another document now: a save without
+	// a tag isn't written over it (§H.4 "Records"), and a GET reloads it.
+	e.otherDoc("files", "newa", map[string]any{"folder": "/", "name": "a.txt", "content": map[string]any{"theirs": true}})
+	for deadline := time.Now().Add(10 * time.Second); !slices.Contains(e.ls("/files/"), "a.txt"); time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the index never listed the new a.txt")
+		}
+	}
+	if r := e.do("PUT", "/files/a.txt", "mine"); r.status != http.StatusConflict {
+		t.Errorf("tagless PUT over another document now at the path: %d %s, want 409", r.status, r.body)
+	}
+	if _, d := e.placed("files", "/", "a.txt"); !jsonv.Equal(d["content"], map[string]any{"theirs": true}) {
+		t.Errorf("the other document was written: %v", d)
+	}
+	e.want(e.do("GET", "/files/a.txt", ""), http.StatusOK)
+	e.want(e.do("PUT", "/files/a.txt", `{"mine":true}`), http.StatusCreated)
+}
+
+// settle waits until folder p lists, past an index's 503 behind.
+func (e *treeEnv) settle(p string) {
+	e.t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		r := e.do("PROPFIND", p, "", "Depth", "1")
+		if r.status == http.StatusMultiStatus {
+			return
+		}
+		if r.status != http.StatusServiceUnavailable || time.Now().After(deadline) {
+			e.t.Fatalf("PROPFIND %s: %d %s", p, r.status, r.body)
+		}
+	}
+}
+
+// Names arrive in NFC or NFD (macOS); titles are NFC (§H.2 "Titles"),
+// and either form names the file.
+func TestTreeNFD(t *testing.T) {
+	t.Parallel()
+	e := newTreeEnv(t, "files")
+	nfd, nfc := "été.txt", "été.txt"
+	e.want(e.do("PUT", "/files/"+nfd, "summer"), http.StatusCreated)
+	e.placed("files", "/", nfc)
+	for _, n := range []string{nfd, nfc} {
+		if r := e.do("GET", "/files/"+n, ""); r.status != 200 || r.body != "summer" {
+			t.Errorf("GET %q: %d %q", n, r.status, r.body)
+		}
+	}
+	e.want(e.do("PUT", "/files/"+nfd, "winter"), http.StatusCreated)
+	if got := e.find("files", "/", nfc); len(got) != 1 {
+		t.Errorf("%d documents named %q, want 1", len(got), nfc)
+	}
+	if got := e.ls("/files/"); strings.Join(got, ",") != nfc {
+		t.Errorf("listing %q", got)
+	}
+}
+
+// FILE-13: a folder is listed through every page of the index's
+// listing; one larger than the gateway lists is refused, never listed
+// cut short.
+func TestTreePaging(t *testing.T) {
+	t.Parallel()
+	e := newTreeEnvWith(t, treeOpts{maxListing: 115}, "files")
+	e.want(e.do("MKCOL", "/files/big", ""), http.StatusCreated)
+	e.want(e.do("MKCOL", "/files/huge", ""), http.StatusCreated)
+	ref := "/r/schemas/file/rev/" + must(e.c.Head(e.ctx, "schemas", "file")).ID
+	var items []client.BatchItem
+	for i := range 230 {
+		folder := "/big"
+		if i >= 105 {
+			folder = "/huge"
+		}
+		doc := map[string]any{"$schema": ref, "folder": folder, "name": fmt.Sprintf("f%03d.json", i), "content": float64(i)}
+		items = append(items, client.BatchItem{Resource: fmt.Sprintf("d%03d", i), IfNoneMatch: true,
+			Steps: []client.Step{client.PatchStep(client.GenesisPatches(doc))}})
+		if len(items) == 50 || i == 229 {
+			// One writer per batch: each has its own rate bucket (§6.6).
+			w := e.s.Client(t, client.WithAuthor(fmt.Sprintf("bulk%d", i)))
+			must(w.Batch(e.ctx, "files", client.BatchRequest{Items: items}, false))
+			items = nil
+		}
+	}
+	e.want(e.do("PUT", "/files/marker.txt", "m"), http.StatusCreated)
+	got := e.ls("/files/big/")
+	if len(got) != 105 || got[0] != "f000.json" || got[104] != "f104.json" {
+		t.Errorf("a folder of 105 lists %d: %v…", len(got), got[:min(3, len(got))])
+	}
+	if r := e.do("PROPFIND", "/files/huge/", "", "Depth", "1"); r.status != http.StatusForbidden {
+		t.Errorf("a folder over MaxListing: %d %s, want 403", r.status, r.body)
+	}
+}
+
+// FILE-16: a save from an older version is merged with others' edits of
+// the content since; the place and the document's other members aren't
+// the file's, so others' writes there never conflict with a save, and
+// stay.
+func TestTreeMergeContent(t *testing.T) {
+	t.Parallel()
+	e := newTreeEnv(t, "files")
+	r := e.want(e.do("PUT", "/files/doc.json", `{"a":1,"b":1}`), http.StatusCreated)
+	base := r.header.Get("ETag")
+	res, _ := e.placed("files", "/", "doc.json")
+	h := must(e.c.Head(e.ctx, "files", res))
+	h2 := must(e.c.Append(e.ctx, "files", res, h.ID, []any{map[string]any{"op": "replace", "path": "/content/a", "value": 2.0}}))
+	must(e.c.Append(e.ctx, "files", res, h2.ID, []any{map[string]any{"op": "add", "path": "/tag", "value": "x"}}))
+	e.want(e.do("PUT", "/files/doc.json", `{"a":1,"b":3}`, "If-Match", base), http.StatusCreated)
+	_, d := e.placed("files", "/", "doc.json")
+	if !jsonv.Equal(d["content"], map[string]any{"a": 2.0, "b": 3.0}) || d["tag"] != "x" {
+		t.Errorf("merged save: %v", d)
+	}
+	// An overlapping edit is a 409.
+	h3 := must(e.c.Head(e.ctx, "files", res))
+	must(e.c.Append(e.ctx, "files", res, h3.ID, []any{map[string]any{"op": "replace", "path": "/content/b", "value": 9.0}}))
+	if r := e.do("PUT", "/files/doc.json", `{"a":2,"b":4}`, "If-Match", `"`+h3.ID+`"`); r.status != http.StatusConflict {
+		t.Errorf("overlapping save: %d %s", r.status, r.body)
+	}
 }
 
 // FILE-23: read rules on /doc/folder give a grant a subtree, its own
@@ -499,6 +643,23 @@ func TestTreeFolderAccess(t *testing.T) {
 	// A reader without the file schema's grant is refused the write
 	// (it reads only).
 	e.want(e.do("PUT", "/files/team-a/new.txt", "x"), http.StatusForbidden)
+
+	// A partial reader whose rules name the subtree's resources: the
+	// index's hits and the core's reads are filtered alike (§A.4, §7.9).
+	byName := k.Grant(t, s.Now(), "user:n", []string{"files", "schemas"}, []string{"read"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": "^(ta|ax|as|az)$"}}}})
+	e.pw = byName
+	if r := e.do("PROPFIND", "/files/", "", "Depth", "1"); r.status != http.StatusMultiStatus {
+		t.Fatalf("a partial reader's listing: %d %s", r.status, r.body)
+	}
+	if got := e.ls("/files/"); strings.Join(got, ",") != "team-a/" {
+		t.Errorf("top for a partial reader: %v", got)
+	}
+	if got := e.ls("/files/team-a/"); strings.Join(got, ",") != "sub/,x.txt" {
+		t.Errorf("/team-a for a partial reader: %v", got)
+	}
+	e.want(e.do("GET", "/files/team-b/y.txt", ""), http.StatusNotFound)
+	e.want(e.do("GET", "/files/team-a/sub/z.txt", ""), http.StatusOK)
 
 	teamA := k.Grant(t, s.Now(), "user:a", []string{"files", "schemas"}, []string{"read"}, map[string]any{"rules": []any{rule}})
 	ta := s.Client(t, client.WithBearer(teamA))
