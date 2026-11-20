@@ -58,7 +58,7 @@ func TestV087BranchGrantWithBaseRules(t *testing.T) {
 			t.Fatalf("the branch's %s for li: %v, want 403", what, err)
 		}
 	}
-	for _, path := range []string{"/ns/matches-r7/view/x/heads", "/ns/matches-r7/view/x"} {
+	for _, path := range []string{"/ns/matches-r7/view/1h3svqdgo2zzbsi4ue4judyzylpexfd6q/heads", "/ns/matches-r7/view/1h3svqdgo2zzbsi4ue4judyzylpexfd6q/log"} {
 		req, _ := http.NewRequestWithContext(ctx, "GET", s.URL+path, nil)
 		req.Header.Set("Authorization", "Bearer "+liGrant)
 		res, err := http.DefaultClient.Do(req)
