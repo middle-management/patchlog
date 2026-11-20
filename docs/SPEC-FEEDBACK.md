@@ -409,13 +409,7 @@ close.
    `{ns}:{v}`, one for each followed non-public namespace where the reader has a view `v`. The
    reference's index still computes it as the digest of its internal markers, so its `view`
    strings differ from the text's.
-3. **A cookie at an earlier `at`** (§7.9 `view`, Filtered reads scenarios 13, 14). The text ends
-   a cookie at every URL once an entry after its exchange changes the rules, and a cookie from an
-   exchange after the change isn't ended by it. The reference judges each cookie by the namespace
-   document at its URL's `at` (`TestV082AccessGSEntryPerAt`): a cookie from before a change still
-   reads at an `at` before it, and one from a later exchange is `403` there. Found while settling
-   v0.86 Open 17.
-4. **Trees** (TOOLS §H.2, §H.5, §H.6, §H.7; the rest of Addendum H is v0.87 Open 35). The
+3. **Trees** (TOOLS §H.2, §H.5, §H.6, §H.7; the rest of Addendum H is v0.87 Open 35). The
    reference doesn't do what the text says in four places: the delete-then-write restore (§H.6)
    in trees creates a new document, where it restores in the flat view; a folder moved to another
    namespace (§H.5) is `403`; the case-variant exceptions of §H.2 Siblings are not implemented;
@@ -448,8 +442,8 @@ the text are gone from the reference too. Carried, as v0.86 → v0.87: 1–4 →
   change, reads at every `at`. Which document's entry counts for a branch is §C.4's (Keys follow
   the base): the base's current entry for a `kid` the branch shares, and a `kid` copied at
   creation never falls back. The origin has no view for a branch (§7.9 Where); the index's, which
-  §A.4 gives "at every level", is v0.87 Open 20's "what of the base". The reference doesn't judge
-  cookies so yet: Reference gaps 3.
+  §A.4 gives "at every level", is v0.87 Open 20's "what of the base".
+  The reference judges cookies so (`TestV087EndedCookieAtOldAt`).
 - **22, 23** (a purged sealed catalog; a grant that verifies only in a content namespace at a
   listing): moot: catalogs, `catalog.trust` and the catalog's listings are removed (SERVICES
   Addendum B).
