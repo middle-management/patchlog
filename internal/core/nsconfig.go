@@ -593,17 +593,18 @@ func (t *tx) publicDependents(n *nsRow) []string {
 // liveBranches counts n's direct branches that are live (§6.6): neither
 // frozen nor purged, leaving out except.
 //
-// It counts by the frozen and purged columns, through the index on base,
-// without loading the rows of every branch n ever had: frozen mirrors the
-// branch's namespace document, written with it at creation and by every
-// config write (insertConfig).
+// It counts by the frozen and purged columns, through the index of live
+// branches by base (namespaces_live), so what it reads is in proportion to
+// the live branches, however many frozen and purged ones n has: frozen
+// mirrors the branch's namespace document, written with it at creation and
+// by every config write (insertConfig).
 func (t *tx) liveBranches(n, except *nsRow) int {
 	var skip int64 // no namespace's id
 	if except != nil {
 		skip = except.id
 	}
 	var live int
-	t.must(t.QueryRow(`SELECT COUNT(*) FROM namespaces WHERE base = ? AND purged = 0 AND frozen = 0 AND ns <> ?`, n.id, skip).Scan(&live))
+	t.must(t.QueryRow(liveBranchesCount, n.id, skip).Scan(&live))
 	if validateBoth {
 		// The oracle: the branches' documents, one by one.
 		byDoc := 0
@@ -620,6 +621,10 @@ func (t *tx) liveBranches(n, except *nsRow) int {
 	}
 	return live
 }
+
+// liveBranchesCount counts a base's live branches but one, by
+// namespaces_live.
+const liveBranchesCount = `SELECT COUNT(*) FROM namespaces WHERE base = ? AND purged = 0 AND frozen = 0 AND ns <> ?`
 
 func (t *tx) branchesOf(n *nsRow) []*nsRow {
 	rows, err := t.Query(`SELECT `+nsCols+` FROM namespaces WHERE base = ? ORDER BY name`, n.id)

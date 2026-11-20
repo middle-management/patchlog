@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- **A purge doesn't read the branches it has no work in.** A purge in a base looked every
+  branch below it up by key, to learn whether it held the purged document or might read it
+  through: about 0.005 ms a branch, 54 ms on Postgres with 10,000 branches that didn't see
+  it. Now the search starts from the document's name: the namespaces that hold a row for it,
+  by new indexes, and under each namespace whose branches may see it, only the branches made
+  since it first existed there. A branch made before that, holding nothing, is never read,
+  frozen or live: with 10,000 of them a purge takes 8 ms on Postgres and 1.5 ms on SQLite,
+  what a purge costs with no branches. Purges the branches do see are 15 to 30 % faster (0.7 s
+  where 10,000 read the document through). For a name that more than 1,000 namespaces of the
+  deployment hold (a row, sealed copies or blob sealings, counted together), the purge walks
+  the branches below its namespace as before. What is written
+  and purged is unchanged, and `PATCHLOG_TEST_VALIDATE_BOTH=1` still makes the full walk and
+  panics if the two disagree.
+- **Frozen branches don't slow the creation of a branch.** The count of a namespace's live
+  branches (§6.6), made when a branch is created or unfrozen, read every branch of the base. It
+  now reads the live ones, by an index of their own: creating a branch beside 10,000 frozen
+  ones takes 3.0 ms on Postgres (was 5.1 ms) and 0.9 ms on SQLite (was 3.4 ms), what it takes
+  beside none.
+- **Migration** `025_purge_by_name_live_branches` on Postgres, `024_…` on SQLite, adds five
+  indexes: `resources (name, ns)`, `sealed (name, ns)`, `blob_epochs (name, ns)`,
+  `namespaces (base, base_at)` and `namespaces (base, ns)` over live branches. They are built
+  at the first start, and on Postgres writes to those tables wait while each is built.
+
 ## v0.33.0
 
 - **A long-poll of a quiet resource from its head costs no transaction** (§7.7). A device

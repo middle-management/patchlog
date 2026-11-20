@@ -345,14 +345,23 @@ scenario number, all above 100, one under "Tree-derived access".
     docs/capacity/branches/report.md, question 2). Not answered. The limit bounds each
     namespace's direct live branches, so at the defaults a base may have 100 branches, each 100
     of its own, to depth 8, and a purge in the root reaches all of them: 100 branches with 100
-    each cost a purge 25.0 s on Postgres, the same as 10,000 direct ones. *Question:* is the
+    each cost a purge 25.0 s on Postgres in the report, the same as 10,000 direct ones (0.6 s
+    now, where they all read the document through). *Question:* is the
     product intended? A limit meant to bound a purge's work would bound the namespaces a purge
     reaches.
 63. **What a purge owes a frozen branch** (§8.3, Changes; the report's question 1). "Frozen
-    branches are free" is in the summary alone, and nothing bounds how many a base collects: 100
-    live and 10,000 frozen cost a purge 25.4 s in the report. A refused purge's search for
+    branches are free" is in the summary alone, and nothing bounds how many a base collects.
+    The reference now pays nothing for a branch, frozen or live, that neither holds the purged
+    name nor may read it through: it searches from the name and never reads such a branch. One
+    that sees the name still gets what §8.3 gives a live one, a `purge` entry in its own log
+    and its own cache tags: with 100 live and 10,000 frozen branches that read the document
+    through, 0.7 s on Postgres and 20,212 tags. Nobody can write to a frozen branch, and what
+    it serves for the name is `410` from the base's purge on either way. *Question:* does a
+    frozen branch need its own `purge` entry at the time of the purge, or may the server write
+    it when the branch is next unfrozen (or never, for one that is purged while frozen), with
+    readers of the branch's log told of the purge by the base's? A refused purge's search for
     references now stops at a page, but the reference still plans the purge over every branch
-    before it answers `409`. *Question:* should §8.3 say what a purge owes a frozen branch?
+    that sees the name before it answers `409`.
 64. **Base cache tags** (§9 Branches, §8.3, CACHE-6, Grant scope scenarios 95, 96). The
     reference adds none and purges each branch's own tags as before, which the text keeps as the
     default. Left unsaid for a deployment that adds them: `heads:{branch}` of a branch with its
