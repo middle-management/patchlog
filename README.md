@@ -1746,13 +1746,13 @@ branches (package `internal/release`):
   "owners": ["user:anna"] }
 ```
 
-Keys are the namespaces paths name; `at` (top level, a combined checkpoint) and `on` are optional.
-Each branch's own `at` is authoritative; the top-level one is dropped by a rebase.
-The core never reads it; every tool checks for itself what it is about to do.
+Keys are the namespaces paths name; `on` is optional. Each branch's own `at` is authoritative.
+The core never reads it, and it authorises nothing: every tool checks for itself what it is
+about to do.
 
 ```sh
 R=/r/releases/release-7
-patchlog merge release plan    --api URL --bearer $ANNA $R                                     # classify, report conflicts, store the plan and its digest
+patchlog merge release plan    --api URL --bearer $ANNA [--publish /published] $R              # classify, report conflicts, store the plan and its digest
 patchlog merge release approve --api URL --bearer $ANNA --digest $DIGEST $R                     # plan again, require the same digest, freeze every branch
 patchlog merge release apply   --api URL --bearer $ANNA $R                                     # the steps; run again to resume
 patchlog merge release abandon --api URL --bearer $ADMIN $R                                    # freeze every branch with abandoned: true
@@ -1763,10 +1763,22 @@ patchlog janitor --ns schemas,matches,media --release $R                        
 
 - **The steps** (one batch per branch and step, each classified again with a dry run right
   before it is submitted): (1) schema resources (documents whose `$schema` is the dialect URL) by
-  fast-forward only, in `$ref` order; (3) the content branches, which publishes the release.
-  (Steps 2 and 4 merged catalog changes, which v0.87 removed; the numbers are kept, as stored
-  plans and their digests name them.) Tombstoned schema resources still merge in step 1.
-  A branch with schemas and content merges its schemas in step 1 and the rest in step 3.
+  fast-forward only, in `$ref` order; (2) the content, in any order; (3) with `--publish PTR`
+  (and `--publish-value JSON`, default `true`), where readers' rules test a field that marks
+  documents published (§7.9), one batch per content base, without `source`, setting it on the
+  documents step 2 created or restored, each item's `If-Match` the id step 2 left it at
+  (`{ "batch", "item" }` in the plan). Tombstoned schema resources still merge in step 1.
+  A branch with schemas and content merges its schemas in step 1 and the rest in step 2. A
+  release built on another merges into that release's branches and has no step 3: what it adds
+  is created in the earlier release's branch, whose own step 3 publishes it.
+- **The published field and the merge service's grant.** The content base guards the field as
+  §6.4.4 guards fields read rules test: writers outside a group (say `publishers`) may neither
+  write it nor create a document with it, and the grant the merge service submits under carries
+  that group (a role the base defines works too, but also grants its verbs). Branches start with
+  a copy of the rules but own them from then on, and one grant submits steps 2 and 3, so the
+  planner keeps the field out of steps 1 and 2: an item whose resulting document has another
+  value there than the base's live document (none for a document it creates or restores) is a
+  `published` conflict. The package documentation of `internal/merge` has the rules.
 - **Conflicts reported before anything is submitted** (`plan` exits 1): a schema resource the
   base changed (`schema_changed`: rebase the release, then migrate documents with
   `replace /$schema`); a pinned link
@@ -1776,34 +1788,33 @@ patchlog janitor --ns schemas,matches,media --release $R                        
   release doesn't list (`foreign_draft`), found with `client.ResolveSchema` preferring the
   listed branches; one the merger can't resolve at all (`schema_unavailable`); every §F.3
   merge conflict of a content resource (`merge`, resolved with
-  `--resolve KEY/NAME=file.json`). The pre-approval checks report `base_chain` (a branch whose
-  base chain doesn't reach its listed base, or for a release with `on`, the earlier release's
-  branch), `frozen` and `purged`.
+  `--resolve KEY/NAME=file.json`); a change to the published field in steps 1 and 2
+  (`published`). The pre-approval checks report `base_chain` (a branch whose base isn't its
+  listed base, or for a release with `on`, the earlier release's branch for the key), `frozen`
+  and `purged`. Drafts in the branches of the releases a release builds on count as listed.
 - **The stored plan** is the resource `{release}.merge` in the release document's namespace (or
-  `--state-ns`), with the release document's revision and the plan's **digest**
-  (`merge.PlanDigest`): `text(trunc160(sha256(canonical(plan))))` over the spec's plan,
-  `{ "release": <revision>, "batches": [ { "ns", "source": { "ns", "at" }, "items": [ {
-  "resource", "ifMatch" | "ifNoneMatch", "steps" } ] } ] }` (`merge.PlanObject`, v0.63), the
-  batches in the order they are submitted, one per step with items, steps as plaintext before
-  any sealing, without gesture, undoes, signatures or a fresh `$nonce` (F-F1 defaults);
-  `source.at` is each branch's `ns_id` before the approval's
-  freeze, and each branch's `base` must be the namespace it is keyed by, or the earlier
-  release's branch for that key. Each step also stores its own part's digest. Plans stored or
-  approved by a version before v0.73 are planned and approved again, but a merge one started
-  resumes under the step digests it was approved with. `plan` prints the digest; `approve` (the
+  `--state-ns`), holding the plan itself, `{ "release": <revision path>, "batches": [ { "ns",
+  "source"?: { "ns", "at" }, "items": [ { "resource", "ifMatch" | "ifNoneMatch", "steps" } ] }
+  ] }` (`merge.PlanObject`), and its **digest** (`merge.PlanDigest`):
+  `text(trunc160(sha256(canonical(plan))))`, the batches in the order they are submitted, one
+  per step with items, only step 3's without `source`, steps as plaintext before any sealing,
+  without gesture, undoes, signatures or a fresh `$nonce`; `source.at` is each branch's `ns_id`
+  before the approval's freeze, and each branch's `base` must be the namespace it is keyed by,
+  or the earlier release's branch for that key. A plan stored in another format is planned and
+  approved again. `plan` prints the digest; `approve` (the
   approving person's grant) plans again with the stored resolutions, requires it
   clean, for the same revision and with the same digest (and the one given with `--digest`, if
   any), freezes every listed branch (§8.4) and records each branch's config id, step by step,
   so a stopped approval resumes. `apply` refuses a plan without a digest or whose release document
   moved or whose branches' config ids changed (unfreezing invalidates the plan: plan and
   approve again; already merged steps then classify as merged), rebuilds each step right
-  before submitting it and stops (`merge.ErrPlanChanged`) if its items differ from the
-  approved ones, records each step's batch as it completes, resumes from there, never reverts,
-  and has every branch record `merged` (config write `frozen` + `merged.at`) only after the
-  last step, with `at` the target's `ns_id` after the last batch into it. A resumed step whose
-  batch went in before the stop has nothing left to do (fast-forwards by id, replays through
-  merge points, which need the merger in the base's `merge.authors`), and the stored plan
-  decides what is left. Two runs of the same release serialise on the stored plan's `If-Match`.
+  before submitting it and stops (`merge.ErrPlanChanged`) if its items differ from the stored
+  plan's batch, or on a `412`, records each step's batch and the ids it left as it completes,
+  resumes from there, never reverts, and has every branch record `merged` (config write
+  `frozen` + `merged.at`) only after the last step, with `at` the target's `ns_id` after the
+  last batch into it. A step whose batch went in before it was recorded is found in the
+  target's log (step 1 and 2 by `source`, step 3 by its items), so it is never submitted twice.
+  Two runs of the same release serialise on the stored plan's `If-Match`.
 - **Abandoning** (`abandon`, `merge.AbandonRelease`) freezes every listed branch with
   `"abandoned": true` and marks a stored plan `abandoned`. Run it
   with a `*` key of the branches (an administrator's): the janitor accepts the claim only then
@@ -1814,8 +1825,8 @@ patchlog janitor --ns schemas,matches,media --release $R                        
   patches. A draft that has to be replayed gets a new id; a resource whose entries reference it
   is squashed (one resolution set against its new base, reaching the branch's document with
   `$schema` moved to the draft's new revision). Old branches are switched (`frozen`,
-  `successor`), and the release document gets a new revision listing the successors (`at` is
-  dropped unless given with `--at`). It stops on conflicts and resumes.
+  `successor`), and the release document gets a new revision listing the successors. It stops
+  on conflicts and resumes.
 - **The janitor** (`--release LINK`, repeatable) purges a release's non-draft branches before its
   draft branches (those with `drafts`, or holding schema documents). A purge refused with
   `in_use` is retried at the end of the sweep and otherwise reported as `retry` for the next
