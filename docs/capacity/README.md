@@ -55,3 +55,9 @@ and `summary.txt` (`deploy/devices-summary.py`).
 on a `c7g.xlarge`, with 1, 2, 4, 8 and 16 busy namespaces and with a quiet one beside busy ones.
 It holds `summary.md` (the tables of the run, the host CPU lines, and fan-out results that
 [CAPACITY.md](../CAPACITY.md) doesn't use), `settings.txt` and RDS CPU (`rds-cpu.json`).
+
+[`sources-aws-2026-11-20-rds2x/`](sources-aws-2026-11-20-rds2x/) is the same run on 2026-11-20
+with an RDS `db.m7g.2xlarge` (8 vCPU, 32 GiB), consumers reading 8 at a time only, each reading
+the revision its namespace entry names. It holds `summary.md` (the tables of the run and host CPU
+lines; the fan-out settings in `settings.txt` were not run in this mode), `settings.txt` and RDS CPU
+(`rds-cpu.json`).
