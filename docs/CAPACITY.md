@@ -1,6 +1,6 @@
 # Capacity
 
-What this implementation is known to handle, as of 2026-11-19: what was measured, on what, and
+What this implementation is known to handle, as of 2026-11-20: what was measured, on what, and
 what limits it. Each limit is **by design** (the spec's model; changing it means changing how
 data is laid out), a **gap** (this implementation; fixable without changing the spec) or
 **deployment** (hardware and configuration; buy or tune your way past it).
@@ -41,6 +41,10 @@ Each section names the setup its figures come from:
 - **Waiting devices cost the database nothing.** Each long-polling its own resource, 120,000
   devices on three `c7g.xlarge` cores and a 2-vCPU RDS were answered from memory, with
   delivery and database CPU the same as at 15,000. See [Resource followers](#resource-followers).
+- **Namespaces share the database.** On an RDS `db.m7g.large` the writes of all namespaces
+  together top out at about 1,600 a second, one namespace alone takes about 1,000, and a quiet
+  namespace slows down with the busy ones. See
+  [Several namespaces on one database](#several-namespaces-on-one-database).
 
 ## Contents
 
@@ -56,17 +60,19 @@ Each section names the setup its figures come from:
   - [Fairness between writers](#fairness-between-writers)
   - [Batches](#batches)
   - [Long histories](#long-histories)
+  - [Several namespaces on one database](#several-namespaces-on-one-database)
 - [Limits, by kind](#limits-by-kind)
 - [Settings](#settings)
 - [Rerunning](#rerunning)
 
 ## What was measured, and on what
 
-The numbers come from `cmd/capacity`, `cmd/devicebench` and `deploy/ec2-devices.sh` (see
-[Rerunning](#rerunning)). They are taken over HTTP, so they include the HTTP stack. The raw
-results are in [`capacity/`](capacity/), whose README says which run each file is.
+The numbers come from `cmd/capacity`, `cmd/devicebench`, `deploy/ec2-devices.sh` and doors'
+`apps/ouroboros/bench/aws/ec2-sources.sh` (see [Rerunning](#rerunning)). They are taken over
+HTTP, so they include the HTTP stack. The raw results are in [`capacity/`](capacity/), whose
+README says which run each file is.
 
-Three setups were measured:
+Four setups were measured:
 
 - **One 4-vCPU / 15 GB host** (2026-11-13 and 14, spec 0.82): server X and SQLite, below. All
   sections but the two on resource followers.
@@ -74,6 +80,9 @@ Three setups were measured:
   sharing the host, with resource followers ([Resource followers](#resource-followers)).
 - **AWS** (2026-11-19, eu-west-1): three `c7g.xlarge` cores on an RDS `db.m7g.large`, with load
   generators of their own ([Resource followers](#resource-followers)).
+- **AWS, namespaces on one database** (2026-11-20, eu-west-1): one `c7g.xlarge` core on an RDS
+  `db.m7g.large`, writers on a `c7g.2xlarge`, consumers on a `c7g.xlarge`
+  ([Several namespaces on one database](#several-namespaces-on-one-database)).
 
 On the host, two databases were measured:
 
@@ -172,7 +181,9 @@ What the table shows:
   this test.
 - **These runs don't show whether Postgres is the limit:** its CPU wasn't recorded. On AWS a
   2-vCPU RDS ran at 68–70% for 450 writes a second ([Resource followers](#resource-followers)),
-  so size Postgres for the writes first.
+  so size Postgres for the writes first. With writes spread over several namespaces a
+  `db.m7g.large` ran at 70–86% for about 1,600 writes a second
+  ([Several namespaces on one database](#several-namespaces-on-one-database)).
 - **More core instances pay off once the core's own CPU is the limit.** That happens with grant
   checks at fleet scale, with large documents, and with followers that reach the origin.
 - **Grants cost 20–30% of read throughput when the grant isn't cached** (2,540–2,860/s against
@@ -664,6 +675,78 @@ caches, 20 samples each. They show that nothing scans the history. They do not s
 read of an old revision costs; the "cold reads of old revisions" row of
 [the envelope](#the-envelope) does.
 
+### Several namespaces on one database
+
+**On an RDS `db.m7g.large`, the writes of all namespaces together top out at about 1,600 a
+second. One namespace alone takes about 1,000. From two busy namespaces on they share that total
+evenly, and each one's write latency rises in proportion.** The limit is RDS CPU, not the core.
+Size Postgres for the total write rate of all namespaces. Larger RDS classes are not yet
+measured.
+
+**Setup** (`apps/ouroboros/bench/aws/ec2-sources.sh` in doors, eu-west-1, 2026-11-20, patchlog
+`0b017f31`, the v0.33.0 release tree plus later main):
+
+- **Core:** one `c7g.xlarge` on an RDS Postgres `db.m7g.large` (2 vCPU, 8 GiB, single-AZ gp3).
+- **Writers and followers:** a `c7g.2xlarge`. **Consumers:** a `c7g.xlarge`, one namespace
+  follower for each data namespace, reading each changed document back from the core.
+- **Load:** each namespace has 100 small documents (about 80 bytes of JSON), each written 10
+  times a second, so 1,000 writes a second are asked of each. One principal writes. Each write
+  is a single-document JSON Patch with `If-Match` (an append). A writer waits for a write's
+  acknowledgement before the next write to that document (a closed loop). 30 s a row.
+- **Limits:** `ratePerResource`, `ratePerPrincipal` and `ratePerNamespace` raised in the
+  namespaces, and the deployment maximums with `--max-rate-per-*`.
+
+| Busy namespaces | Written/s, consumers read 1 at a time | Write p50 / p99 | Written/s, consumers read 8 at a time | Write p50 / p99 |
+|---|---|---|---|---|
+| 1 | 993 | 33 / 131 ms | 987 | 40 / 144 ms |
+| 2 | 1,634 | 109 / 261 ms | 1,467 | 123 / 279 ms |
+| 4 | 1,638 | 224 / 595 ms | 1,533 | 243 / 601 ms |
+| 8 | 1,618 | 452 / 1,255 ms | 1,420 | 505 / 1,438 ms |
+| 16 | 1,609 | 886 / 2,655 ms | 1,466 | 991 / 2,757 ms |
+
+- **One namespace takes about 1,000 writes a second.** Its writers are closed-loop and every
+  write extends the namespace's chain. That agrees with the host's 930–1,000 a second on server
+  X (see "One log per namespace" under [By design](#by-design)).
+- **Two namespaces reach the limit.** More share it out evenly: about 800 a namespace at 2,
+  400 at 4, 200 at 8 and 100 at 16, with write latency rising in proportion. No write failed.
+- **RDS CPU is the limit** (CloudWatch, 1-minute averages): 70–86% while namespaces were busy.
+  The core's instance was at 14–23% CPU throughout, the consumers' at most 13% and the writers'
+  at most 5%.
+
+**Namespace followers that read documents back** (consumers, one for each data namespace) go to
+the same database as the writes:
+
+- **Reading one changed document at a time** (`GET /r/{ns}/{name}`, a redirect to the head
+  revision, then that revision), one consumer applied 129 changes a second of the 993 written in
+  its namespace. Each read waits on a round trip through the core to RDS (about 8 ms).
+- **Reading 8 at once** it applied 741 of 987. With several busy namespaces each consumer
+  applied fewer (348, 269, 230 and 252 a second in all at 2, 4, 8 and 16 namespaces), because
+  its reads queue at the saturated RDS too.
+- **Reading 8 at once cost 6–12% of the writes at saturation**: 1,634 against 1,467 at 2
+  namespaces, 1,638 against 1,533 at 4, 1,618 against 1,420 at 8 and 1,609 against 1,466 at 16.
+  Read in parallel, as patchlog's own index consumer does, and expect 6–12% of write
+  capacity to go to followers at saturation.
+
+**Nothing isolates namespaces from each other once the database is saturated.** One quiet
+namespace (100 documents, each written once a second, so 100 writes a second) was run beside
+busy ones:
+
+| Busy namespaces beside it | Busy written/s (read 1 / read 8) | Quiet write p50 / p99, read 1 | Quiet write p50 / p99, read 8 |
+|---|---|---|---|
+| 0 | 0 / 0 | 8 / 18 ms | 8 / 19 ms |
+| 1 | 986 / 967 | 18 / 102 ms | 32 / 143 ms |
+| 3 | 1,479 / 1,316 | 128 / 371 ms | 151 / 419 ms |
+| 7 | 1,584 / 1,329 | 357 / 1,086 ms | 371 / 980 ms |
+| 15 | 1,595 / 1,385 | 725 / 2,569 ms | 875 / 2,847 ms |
+
+- **A quiet namespace's write latency follows the busy ones'**: p99 18 ms alone, 2.6 s beside
+  fifteen busy namespaces. Beside fifteen, it wrote 87 a second of its 100 (77 with 8 reads at
+  a time).
+- **The lever today is the per-namespace rate limit** (`ratePerNamespace`, §6.6): keep the total
+  of all namespaces under what the database takes. Nothing yet gives a quiet namespace a share.
+
+The files are in `docs/capacity/sources-aws-2026-11-20/`.
+
 ## Limits, by kind
 
 Each limit is one of three kinds:
@@ -680,7 +763,9 @@ Each limit is one of three kinds:
 - *Limit:* every write appends to its namespace's hash chain (§3.5). So writes to one namespace
   commit one at a time. On Postgres they commit one group of up to 32 at a time.
 - *Measured:* one namespace takes 930–1,000 single writes/s on server X from 32 writers, and
-  1,500/s on SQLite (4 vCPU).
+  1,500/s on SQLite (4 vCPU). On an RDS `db.m7g.large` one namespace took about 993 a second,
+  and all namespaces together about 1,600
+  ([Several namespaces on one database](#several-namespaces-on-one-database)).
 - *Lever:* spread write-heavy data over namespaces. Writes to different namespaces run in
   parallel, across instances too. A sign-in storm writing per-user items belongs in many
   namespaces, not one.
@@ -736,6 +821,10 @@ Each limit is one of three kinds:
 - *Limit:* a consumer catches up from the log and fetches each changed document (§10).
 - *Measured:* catch-up of 4M entries takes 1.7 min. Bootstrap of 1M documents takes 6–7 min on
   server X.
+- *Read-back:* a namespace follower that reads each changed document back is limited by its
+  reads: 129 changes a second of 993 reading one at a time, 741 reading 8 at a time, each read
+  about 8 ms through the core to RDS. Reading 8 at a time cost 6–12% of the writes at
+  saturation ([Several namespaces on one database](#several-namespaces-on-one-database)).
 - *Lever:* consumer throughput is the consumer's (see the gaps below). The origin side scales
   with instances.
 
@@ -756,7 +845,7 @@ Each limit is one of three kinds:
 |---|---|---|
 | **Core CPU** | Grant checks, canonicalisation, validation, folds and page serialisation are core CPU. On server X a 1-vCPU core kept up with the reads, writes and scans measured. | Scales with instances once it is the limit (it wasn't on server X). |
 | **Postgres round trips** | A single write is ~13 statements; on server X one writer did 200–240 writes/s (about 4 ms each). | Keep the core near Postgres (sub-millisecond); concurrency, not speed, is what instances add. |
-| **Postgres CPU and memory** | Server X: 3.3 of 4 GB at the end of the runs, CPU not recorded, and a smaller core was no slower. AWS: a 2-vCPU RDS at 68–70% for 450 writes a second, unmoved by 120,000 waiting followers. | Size Postgres for the writes first; a read replica takes bulk reads and private followers' log reads (a gap, above). |
+| **Postgres CPU and memory** | Server X: 3.3 of 4 GB at the end of the runs, CPU not recorded, and a smaller core was no slower. AWS, devices run: a 2-vCPU RDS at 68–70% for 450 writes a second, unmoved by 120,000 waiting followers. AWS, namespaces run: a `db.m7g.large` at 70–86% for about 1,600 writes a second of small documents across several namespaces, with the core at 14–23%. Larger classes are not yet measured. | Size Postgres for the writes first; a read replica takes bulk reads and private followers' log reads (a gap, above). |
 | **Storage** | 6.8 GB on Postgres, 3.7 GB on SQLite for 5M revisions of ~500-byte documents. | Linear in revisions; pruning (§8.6) bounds it. |
 | **Memory** | Core: 0.2–0.3 GB through scans, reads and small writes, 0.4–0.6 GB after a whole run, 1.0 GB peak (1.4 GB on SQLite) with 3.5 MiB documents and 5,000 followers; about 60 KB more a waiting resource follower (2.3–2.6 GB at 40,000). The caches are bounded: up to 256 MiB of documents, 64 MiB of read-cache revisions and 65,536 grants (a few hundred MB at most) by default. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves large documents or many followers; size the caches with `serve --doc-cache-size`, `--read-cache-size` and `--grant-cache`. |
 | **Open files** | One socket a follower. | A `nofile` limit above the followers a core holds. |
@@ -829,5 +918,10 @@ Options:
   first step that looks broken. The script's header lists its settings and what it makes;
   `./deploy/ec2-devices.sh cleanup` deletes the RDS instance and the IAM role. `devicebench`
   also runs on its own against any core (`-help`).
+- **Several namespaces on one database, across machines**: doors'
+  `apps/ouroboros/bench/aws/ec2-sources.sh` (doors-live/doors) runs its source-consumer benches
+  with the core, the database, the writers and the consumers each on their own instance. The
+  run in [Several namespaces on one database](#several-namespaces-on-one-database) used
+  `NAMESPACES 1,2,4,8,16 RATE 10 DURATION 30000 FETCHES 1 8`.
 - **Sizes**: `-docs`, `-revs`, `-namespaces`, `-doc-size`, `-append-batch`. `-help` lists the
   rest.
