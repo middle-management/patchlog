@@ -3070,6 +3070,20 @@ patchlog import -i all.jsonl --atomic --ns demo-schemas=demo2-schemas,demo=demo2
   line carries no document, and an upstream import appends only a tombstone, so a moved
   resource's `$successor` (§8.1) travels in history bundles, where it is content like any
   other, and not in snapshots.
+- **Purges follow imports** (§G.1, v0.87). An import batch from another deployment (a `source`
+  with a `bundle` and an `origin`) starts, as it commits, a follow of that origin's namespace
+  log from its `source.at`, recording the names the batch wrote. For an origin the operator
+  trusts, `serve --follow-purges-from ORIGIN` (repeatable, as `source.origin` records it, with
+  `--follow-purges-bearer ORIGIN=GRANT` and `--follow-purges-url ORIGIN=URL` to reach it, every
+  `--follow-purges-interval`, default 5m), the leader applies each later `purge` there of a
+  name imported, and each `purge-ns` to every such name, as `system:purge-follow`, without
+  `grant` or `via`: in the namespace and its branches with their cache tags, and in the upstream
+  namespace, whose import batches carry the same `source`. A purge refused as `in_use` (§6.1)
+  waits for an operator, who removes the references or purges the name with `?force=1`, and
+  is retried at each follow without holding up later ones (`Engine.FollowedPurgesWaiting`
+  lists them). A name an older bundle brings after the follow passed its purge is read for
+  once more from that bundle's `source.at`. A `source` naming an origin not listed purges
+  nothing. Imports committed before this version started no follow.
 - **`--atomic`** lands each namespace as one batch, which needs an allowance for large imports
   (§6.6), within the deployment maximums (1,000 items and 16 MiB unless raised with
   `serve --max-items-per-batch` and `--max-batch-size`). **`--pace`** splits batches to fit the
