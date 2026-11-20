@@ -1,7 +1,7 @@
 -- Migration: purge follows
--- Created: 2026-11-20T15:57:40Z
--- Checksum: 64224970bc0ca31f079eeced614ed3d154ce0c46c59e2a8f6bb1ade0a7de700e
--- Chain: 0001039fe88f9d1560898d6d253a58ef2403729bd4deef9d4a60048cfff6fc7d
+-- Created: 2026-11-20T16:55:47Z
+-- Checksum: 1525de6ba27bf3b9c56cf756ba1c63dfacbfbed5bcbec7f3716f3b7c62d8cde9
+-- Chain: a178aa2e5ed065286273ae621db7615efa7107f3b95cd23a278c6102101426ea
 --
 -- IMPORTANT: Do not modify this file after commit. The checksum above
 -- tracks the integrity of this migration. Any changes will be detected
@@ -9,6 +9,13 @@
 --
 
 -- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;-- current.sql: Development-only migration file
 -- 
 -- This file is automatically applied in development environments.
 -- When ready for production, commit this as a numbered migration file (NNN_name.sql)
