@@ -76,7 +76,7 @@ func TestV081SvcScopeWithoutNowRoles(t *testing.T) {
 	}
 }
 
-// A stored filter (index edge_filters, the origin's filtered_gs) that
+// A stored filter (index edge_filters, the origin's filtered_views) that
 // holds a rule on /now judges as the read check does: a key-scope or
 // block rule refuses every read, and a role with one doesn't count, even
 // inside a not, which would pass against an envelope without now.

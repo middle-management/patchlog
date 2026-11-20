@@ -205,8 +205,8 @@ func TestV073P37IndexEdgeGrants(t *testing.T) {
 		t.Errorf("/_refs under the cookie: %d %v", r.status, r.body)
 	}
 	// Neither grant nor cookie, or a cookie that doesn't cover the URL.
-	_, refsGS := path(prefixes["_refs"])
-	other := strings.Replace(at, vid, refsGS, 1)
+	_, refsView := path(prefixes["_refs"])
+	other := strings.Replace(at, vid, refsView, 1)
 	for _, c := range [][]*http.Cookie{nil, cookies} {
 		if r := p37Do(t, x, "GET", other, "", "", c, ""); r.status != 401 {
 			t.Errorf("another vid's at URL with %d cookies: %d %v", len(c), r.status, r.body)
