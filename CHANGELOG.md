@@ -11,7 +11,8 @@
   frozen or live: with 10,000 of them a purge takes 8 ms on Postgres and 1.5 ms on SQLite,
   what a purge costs with no branches. Purges the branches do see are 15 to 30 % faster (0.7 s
   where 10,000 read the document through). For a name that more than 1,000 namespaces of the
-  deployment hold, the purge walks the branches below its namespace as before. What is written
+  deployment hold (a row, sealed copies or blob sealings, counted together), the purge walks
+  the branches below its namespace as before. What is written
   and purged is unchanged, and `PATCHLOG_TEST_VALIDATE_BOTH=1` still makes the full walk and
   panics if the two disagree.
 - **Frozen branches don't slow the creation of a branch.** The count of a namespace's live
