@@ -739,9 +739,9 @@ time only): the consumers read the revision each namespace entry names
   eight and sixteen namespaces wrote 3,126, 3,105 and 3,074 a second: 7% more, with the same
   latencies (p99 258, 637 and 1,419 ms). RDS CPU stayed at 24–38%.
 - **The next suspect is storage.** The runs used 20 GiB of gp3, which RDS gives 3,000 IOPS under
-  400 GiB and 12,000 from it, and writes stop near 3,000 a second. Each commit flushes the WAL,
-  so a write costs at least one write IOPS. RDS's WriteIOPS for these windows, and a run with
-  400 GiB, will tell.
+  400 GiB and 12,000 from it, and writes stop near 3,000 a second. Commits share WAL flushes
+  when they coincide, so a write need not cost a whole IOPS; RDS's WriteIOPS for these windows,
+  and a run with 400 GiB, will tell.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
