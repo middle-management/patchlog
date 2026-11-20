@@ -43,6 +43,7 @@ func (st *reqState) moveOnto(ctx context.Context, src, dst target) error {
 	if rev == "" {
 		return notMoved(src, dst)
 	}
+	src.docName = hd.name
 	return st.deleteSource(ctx, src, dst, hd.rev, "")
 }
 
@@ -69,7 +70,7 @@ func (st *reqState) moveAcross(ctx context.Context, src, dst target) error {
 	if err != nil {
 		return err
 	}
-	if _, obj := e.value.(map[string]any); obj {
+	if _, obj := e.root().(map[string]any); obj {
 		if err := st.allows(ctx, src, src.docNS, "append"); err != nil {
 			return err
 		}
@@ -91,6 +92,7 @@ func (st *reqState) moveAcross(ctx context.Context, src, dst target) error {
 			succ = name
 		}
 	}
+	src.docName = hd.name
 	return st.deleteSource(ctx, src, dst, hd.rev, succ)
 }
 
@@ -173,7 +175,7 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 		if err != nil {
 			return false, err
 		}
-		if _, obj := cur.value.(map[string]any); !obj {
+		if _, obj := cur.root().(map[string]any); !obj {
 			res, err := st.tk.c.Delete(ctx, ns, name, h.ID)
 			if client.IsStale(err) {
 				return true, nil
@@ -184,7 +186,7 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 			}
 			return false, err
 		}
-		ps := withNonce(in, cur.value, []any{map[string]any{"op": "add", "path": "/$successor", "value": successor}})
+		ps := withNonce(in, cur.root(), []any{map[string]any{"op": "add", "path": "/$successor", "value": successor}})
 		res, err := st.tk.c.Batch(ctx, ns, client.BatchRequest{Items: []client.BatchItem{{Resource: name, IfMatch: h.ID,
 			Steps: []client.Step{client.PatchStep(ps), client.DeleteStep()}}}}, false)
 		err = batchErr(err)

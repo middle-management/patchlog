@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "A file or folder of a file tree (TOOLS Addendum H)",
+  "description": "A file is a document with content, its bytes as a blob reference (raw) or any JSON value (a JSON file); a folder is one without content, the folder {folder}/{name}. A document is in the tree only when its folder is / or has a folder document.",
+  "type": "object",
+  "required": ["folder", "name"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "folder": {
+      "description": "The path of the folder holding it: / or /-separated titles.",
+      "type": "string",
+      "pattern": "^(/|(/[^/]+)+)$",
+      "x-index": "facet"
+    },
+    "name": {
+      "description": "Its title: NFC, 1 to 255 bytes of UTF-8 (the byte length is the tool's to check), not . or .., without /, \\, control characters, line or paragraph separators, or bidirectional controls.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "pattern": "^[^/\\\\\\p{Cc}\\p{Zl}\\p{Zp}‪-‮⁦-⁩]+$",
+      "not": { "enum": [".", ".."] },
+      "x-index": ["facet", "sort"]
+    },
+    "content": {
+      "description": "The file: a blob reference for a raw file, any value for a JSON file. Absent in a folder."
+    }
+  }
+}
