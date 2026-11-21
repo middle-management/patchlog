@@ -46,3 +46,18 @@ load generators, devices added 15,000 a step to 120,000. It holds each load gene
 (`loadgen-*.jsonl`, `cmd/devicebench`), each core's CPU, memory and open files
 (`server-*.samples`), RDS CPU (`rds-cpu.json`), EC2's network allowance counters, the settings
 and `summary.txt` (`deploy/devices-summary.py`).
+
+## Several namespaces on one database
+
+[`sources-aws-2026-11-20/`](sources-aws-2026-11-20/) is a run of doors'
+`apps/ouroboros/bench/aws/ec2-sources.sh` on AWS (eu-west-1) on 2026-11-20, against patchlog
+`0b017f31`: one `c7g.xlarge` core on an RDS `db.m7g.large`, writers on a `c7g.2xlarge`, consumers
+on a `c7g.xlarge`, with 1, 2, 4, 8 and 16 busy namespaces and with a quiet one beside busy ones.
+It holds `summary.md` (the tables of the run, the host CPU lines, and fan-out results that
+[CAPACITY.md](../CAPACITY.md) doesn't use), `settings.txt` and RDS CPU (`rds-cpu.json`).
+
+[`sources-aws-2026-11-20-rds2x/`](sources-aws-2026-11-20-rds2x/) is the same run on 2026-11-20
+with an RDS `db.m7g.2xlarge` (8 vCPU, 32 GiB), consumers reading 8 at a time only, each reading
+the revision its namespace entry names. It holds `summary.md` (the tables of the run and host CPU
+lines; the fan-out settings in `settings.txt` were not run in this mode), `settings.txt` and RDS CPU
+(`rds-cpu.json`).
