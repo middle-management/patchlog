@@ -1022,6 +1022,9 @@ func (ix *Index) keysHold(ctx context.Context, ns, m string, exp int64, also fun
 	if err != nil {
 		return err
 	}
+	if err := ix.basesJudged(ctx, cfg); err != nil {
+		return err
+	}
 	for _, k := range recorded {
 		key, ok, err := ix.entryHolds(ctx, cfg, k)
 		if err != nil {
@@ -1030,6 +1033,29 @@ func (ix *Index) keysHold(ctx context.Context, ns, m string, exp int64, also fun
 		if !ok || also != nil && !also(cfg, key, k) {
 			return errRulesChanged
 		}
+	}
+	return nil
+}
+
+// basesJudged is errRulesChanged where a cookie of cfg's namespace can't
+// be judged by every namespace-document entry of its bases after its
+// exchange (SERVICES §A.4 Cookies, v0.88: "in a branch by its bases'
+// entries after their checkpoints then too … A cookie it can't judge so
+// … is 403"): a base in its chain the index doesn't follow brings no
+// batch to judge (cookieEnds), so a change there and back would go
+// unseen. A base whose document can't be read now is that error.
+func (ix *Index) basesJudged(ctx context.Context, cfg *grantcheck.Config) error {
+	seen := map[string]bool{cfg.NS: true}
+	for cur := cfg; cur.Base != ""; {
+		if seen[cur.Base] || len(seen) > maxChain || !ix.known(cur.Base) {
+			return errRulesChanged
+		}
+		seen[cur.Base] = true
+		next, err := ix.checker.Config(ctx, cur.Base)
+		if err != nil {
+			return err
+		}
+		cur = next
 	}
 	return nil
 }
