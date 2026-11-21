@@ -775,6 +775,17 @@ time only): the consumers read the revision each namespace entry names
   - Group commits take a connection from a pool of their own (a quarter of the main pool's
     size) when one is free, so a group of about 30 writes no longer queues behind every
     write's check.
+- **With those (93149318), the draws are the limit.** On a pool of 64 and one writer principal,
+  4, 8 and 16 namespaces wrote 3,923, 3,933 and 2,181 a second; with a principal per namespace
+  3,960, 5,214 and 4,550. Up to 1,340 writes waited for one of the bucket pool's 16 connections,
+  with 13–16 draws running, and with one principal they queued on its row (`rate_draw` 1.7 ms,
+  `Lock:tuple` waits). Writes reached the group commit queue so slowly that groups shrank to
+  about 2. `rate_draw` took more of Postgres's time than every other statement together. With
+  `--local-rate-buckets` the same run wrote 7,733 and 8,134 a second at 8 and 16 namespaces (p99
+  171 and 675 ms), so a draw per write is what costs: a draw for many writes at once, as group
+  commit does for their rows, would take each bucket row's lock once. There the pool of 64 was
+  full again, 1,400 requests waiting, most of them for checks' read transactions (five round
+  trips each), and the core's instance at 82% CPU.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
