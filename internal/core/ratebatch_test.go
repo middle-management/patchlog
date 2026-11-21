@@ -37,21 +37,73 @@ func TestDrawBatchTake(t *testing.T) {
 	cancel()
 	bg := context.Background()
 	a, x, b, c, d := req(bg, drawBatchItems-10), req(gone, 1), req(bg, 10), req(bg, 1), req(bg, drawBatchItems+5)
-	s := &bucketStore{slots: 1, queue: []*drawReq{a, x, b, c, d}}
-	if got := s.take(); len(got) != 2 || got[0] != a || got[1] != b {
+	s := &bucketStore{slots: 1}
+	for _, r := range []*drawReq{a, x, b, c, d} {
+		s.enqueue(r)
+	}
+	take := func() []*drawReq {
+		got, _ := s.take()
+		s.drawn(got)
+		return got
+	}
+	if got := take(); len(got) != 2 || got[0] != a || got[1] != b {
 		t.Fatalf("first batch: %d draws, want a and b (up to %d buckets)", len(got), drawBatchItems)
 	}
 	if res := <-x.done; res.err != context.Canceled {
 		t.Fatalf("the gone draw: %v, want its context's error", res.err)
 	}
-	if got := s.take(); len(got) != 1 || got[0] != c {
+	if got := take(); len(got) != 1 || got[0] != c {
 		t.Fatalf("second batch: %d draws, want c alone (d is above the bound)", len(got))
 	}
-	if got := s.take(); len(got) != 1 || got[0] != d {
+	if got := take(); len(got) != 1 || got[0] != d {
 		t.Fatalf("third batch: %d draws, want d, alone however many buckets it draws on", len(got))
 	}
-	if got := s.take(); len(got) != 0 || s.queued() != 0 {
-		t.Fatalf("empty queue: %d draws taken, %d left", len(got), s.queued())
+	if got := take(); len(got) != 0 || s.queued() != 0 || len(s.queuedOn) != 0 || len(s.drawingOn) != 0 {
+		t.Fatalf("empty queue: %d draws taken, %d left, counts %v %v", len(got), s.queued(), s.queuedOn, s.drawingOn)
+	}
+}
+
+// While a batch draws on a bucket, take leaves the draws on it queued, and
+// any draw queued after one it left that shares a bucket with it, so that
+// draws on one bucket are judged in queue order; it takes the others. Once
+// the batch ends, the draws left go in one batch.
+func TestDrawBatchTakeByBucket(t *testing.T) {
+	req := func(keys ...string) *drawReq {
+		r := &drawReq{ctx: context.Background(), done: make(chan drawRes, 1)}
+		for _, k := range keys {
+			r.ds = append(r.ds, draw{key: k})
+		}
+		return r
+	}
+	s := &bucketStore{slots: 4}
+	running := req("p", "n1")
+	s.enqueue(running)
+	if got, _ := s.take(); len(got) != 1 {
+		t.Fatalf("first batch: %d draws", len(got))
+	}
+	a := req("p", "n2")  // p is drawn on: left
+	b := req("n2", "n3") // after a, on n2: left
+	c := req("n3")       // after b, on n3: left
+	d := req("q", "n4")  // disjoint: taken
+	e := req("n4", "q")  // with d: taken
+	f := req("p")        // left
+	for _, r := range []*drawReq{a, b, c, d, e, f} {
+		if s.free(r) != (r == d) {
+			t.Fatalf("free(%v): %v", r.ds, !s.free(r))
+		}
+		s.enqueue(r)
+	}
+	got, more := s.take()
+	if more || len(got) != 2 || got[0] != d || got[1] != e {
+		t.Fatalf("batch beside the running one: %v (more %v), want d and e", got, more)
+	}
+	if got, _ := s.take(); len(got) != 0 {
+		t.Fatalf("while both run: %d draws taken", len(got))
+	}
+	s.drawn([]*drawReq{running})
+	got, _ = s.take()
+	if len(got) != 4 || got[0] != a || got[1] != b || got[2] != c || got[3] != f {
+		t.Fatalf("once the first batch ends: %d draws, want a, b, c and f in order", len(got))
 	}
 }
 
@@ -436,5 +488,94 @@ func TestPGDrawBatchWrites(t *testing.T) {
 	}
 	if s.batched.Load() == before {
 		t.Fatal("no write drew in a batch")
+	}
+}
+
+// slotsEngine is batchEngine whose bucket pool runs up to n batches at
+// once.
+func slotsEngine(t *testing.T, n int) (*Engine, *bucketStore, time.Time) {
+	e, s, now := batchEngine(t, false)
+	s.qmu.Lock()
+	s.slots = n
+	s.qmu.Unlock()
+	return e, s, now
+}
+
+// Draws on a bucket a batch draws on queue for the next batch, though
+// connections are free, and go in it together: one statement, not one
+// each, waiting for the first's row lock.
+func TestPGDrawBatchOneBucket(t *testing.T) {
+	e, s, now := slotsEngine(t, 4)
+	release, blocked := holdBucket(t, e, s, now, "held")
+	r := Rate{1, 1e9}
+	var fns []func() admitted
+	for i := range 8 {
+		fns = append(fns, func() admitted {
+			w, l, ok, err := s.admit(context.Background(), now, []draw{{"held", r, 1, "held"}, {fmt.Sprint("own", i), r, 1, "own"}})
+			return admitted{w, l, ok, err}
+		})
+	}
+	for i, res := range queueDraws(t, s, release, blocked, fns...) {
+		if !res.ok {
+			t.Fatalf("draw %d: %+v", i, res)
+		}
+	}
+	if got := tokensOf(t, e, "held"); got != r.Burst-2-1-8 {
+		t.Fatalf("held: %v tokens, want %v", got, r.Burst-2-1-8)
+	}
+}
+
+// A draw on buckets no batch draws on starts a batch at once, beside one
+// that waits for its row: draws on disjoint buckets aren't serialised.
+func TestPGDrawBatchDisjoint(t *testing.T) {
+	e, s, now := slotsEngine(t, 4)
+	release, blocked := holdBucket(t, e, s, now, "held")
+	defer func() {
+		release()
+		if err := <-blocked; err != nil {
+			t.Fatalf("the held draw: %v", err)
+		}
+	}()
+	done := make(chan admitted, 1)
+	go func() {
+		w, l, ok, err := s.admit(context.Background(), now, []draw{{"other", Rate{1, 10}, 1, "other"}})
+		done <- admitted{w, l, ok, err}
+	}()
+	select {
+	case res := <-done:
+		if res.err != nil || !res.ok {
+			t.Fatalf("the other draw: %+v", res)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a draw on another bucket waits for the batch on the held one")
+	}
+	select {
+	case err := <-blocked:
+		t.Fatalf("the held draw ended while its row was held: %v", err)
+	default:
+	}
+}
+
+// A lone draw on an idle store starts its statement at once, alone: it
+// waits for no other draw to batch with.
+func TestPGDrawAlone(t *testing.T) {
+	_, s, now := slotsEngine(t, 4)
+	r := &drawReq{ds: []draw{{key: "a"}}}
+	s.qmu.Lock()
+	free := s.running < s.slots && s.free(r)
+	s.qmu.Unlock()
+	if !free {
+		t.Fatal("an idle store doesn't start a lone draw's batch at once")
+	}
+	batches := s.batches.Load()
+	start := time.Now()
+	if _, _, ok, err := s.admit(context.Background(), now, []draw{{"a", Rate{1, 10}, 1, "a"}}); err != nil || !ok {
+		t.Fatalf("the draw: %v %v", ok, err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("a lone draw took %v", d)
+	}
+	if n := s.batches.Load() - batches; n != 0 {
+		t.Fatalf("a lone draw ran in %d batches of more than one", n)
 	}
 }

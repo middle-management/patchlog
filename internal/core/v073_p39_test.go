@@ -58,13 +58,15 @@ func TestV073P39GroupBlockedIgnoresRateDraws(t *testing.T) {
 		})
 		close(done)
 	}()
-	// The first draw waits for the held row, the other for the first, or
-	// both in one batch (ratebuckets.go, draw) for the held row.
+	// The first draw waits for the held row, and the other queues for
+	// the next batch on its buckets, or both wait in one batch
+	// (ratebuckets.go, draw).
 	within(t, 10*time.Second, "both draws wait for the bucket row", func() bool {
 		var w, held int
 		e.db.QueryRow(`SELECT COUNT(*), COUNT(*) FILTER (WHERE $1 = ANY (pg_blocking_pids(pid))) FROM pg_stat_activity
 			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%rate_draw%'`, pid).Scan(&w, &held)
-		return w > 0 && held > 0 && e.rate.store.drawing.Load() == n
+		s := e.rate.store
+		return w > 0 && held > 0 && s.drawing.Load()+int64(s.queued()) == n
 	})
 	if waiting(e) == 0 {
 		t.Fatal("no lock wait while the draws wait")

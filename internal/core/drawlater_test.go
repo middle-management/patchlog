@@ -70,16 +70,15 @@ func TestPGDrawHoldsNoMainConn(t *testing.T) {
 		rtx.Rollback()
 		<-done
 	})
-	// Two draw statements wait, one on each of the bucket pool's
-	// connections, the first for the held row and the other for the
-	// first, each with one draw or a batch of them, and the other draws
-	// queue for the next batch (ratebuckets.go, draw).
+	// One draw statement waits, for the held row, with one draw or a
+	// batch of them, and the other draws, on the same buckets, queue for
+	// the next batch (ratebuckets.go, draw).
 	within(t, 10*time.Second, "every write's check ends and its draw waits", func() bool {
 		var w, held int
 		mon.QueryRow(`SELECT COUNT(*), COUNT(*) FILTER (WHERE $1 = ANY (pg_blocking_pids(pid))) FROM pg_stat_activity
 			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%rate_draw%'`, pid).Scan(&w, &held)
 		s := e.rate.store
-		return w == 2 && held > 0 && s.drawing.Load()+int64(s.queued()) == n
+		return w == 1 && held > 0 && s.drawing.Load()+int64(s.queued()) == n
 	})
 	// The main pool's connections are free, but for the leader lock's and
 	// one the tailer may hold.
