@@ -64,6 +64,9 @@ type bucketStore struct {
 	// retried counts the draws Postgres rolled back for a deadlock that
 	// ran again (tests).
 	retried atomic.Int64
+	// stopped counts the checks that stopped at a draw on a bucket known
+	// empty and were admitted, so ran again (checkOutside; tests).
+	stopped atomic.Int64
 	// empty holds, by key, the buckets this instance's last draw on found
 	// empty, until when (Unix microseconds) they stay so if no other
 	// instance's draws refill them: knownEmpty.

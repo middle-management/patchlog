@@ -248,13 +248,16 @@ func (e *Engine) checkOutside(ctx context.Context, req Request, items []Item, so
 			plan, res = p, r
 			return err
 		})
-		var ae *Error
-		if later != nil && len(later.draws) > 0 && (err == nil || errors.As(err, &ae)) {
+		// Drawn whatever the check found after its draw, an internal
+		// error too, as inside the transaction, unless the request is
+		// gone.
+		if later != nil && len(later.draws) > 0 && ctx.Err() == nil {
 			if derr := e.drawAfter(ctx, now, later); derr != nil {
 				return nil, nil, nil, derr
 			}
 			if later.first {
 				// Admitted after all: the whole check, its tokens drawn.
+				e.rate.store.stopped.Add(1)
 				rateDrawn = true
 				continue
 			}

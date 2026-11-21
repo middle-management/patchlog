@@ -106,9 +106,9 @@ func TestPGDrawHoldsNoMainConn(t *testing.T) {
 	}
 }
 
-// A write checked outside the lock, its draw made after the check, is
-// answered and draws as one whose draw is made inside its transaction (a
-// write on its own, checked in the lock): a write refused after its draw
+// A write checked outside the lock, its draw made after the check
+// (grouped), is answered and draws as one whose draw is made inside its
+// transaction (a write on its own, checked in the lock, the baseline): a write refused after its draw
 // (412) draws, one refused before it (400) doesn't, and once the bucket is
 // empty the 429 answers instead of what the check found after the draw.
 // Then the instance knows the bucket empty, and a check stops at its draw
@@ -165,6 +165,7 @@ func TestPGDrawAfterCheck(t *testing.T) {
 				err := create(name, 2)
 				p17Rate(t, "create of "+name+" once the bucket is empty", err, "ratePerPrincipal", 1000)
 			}
+			stopped := e.rate.store.stopped.Load()
 			if !e.rate.store.knownEmpty(e.now(), []draw{{key: string(pkey)}}) {
 				t.Fatal("the instance doesn't know the bucket empty after its 429")
 			}
@@ -178,6 +179,11 @@ func TestPGDrawAfterCheck(t *testing.T) {
 			}
 			if got := tokens(); got != 0 {
 				t.Fatalf("after it: %v tokens, want 0 (drawn once)", got)
+			}
+			// Checked outside the lock, it stopped at its draw and ran
+			// again; checked in the lock, it drew there.
+			if got := e.rate.store.stopped.Load() - stopped; got != map[bool]int64{false: 0, true: 1}[grouped] {
+				t.Fatalf("checks stopped at the draw and run again: %d", got)
 			}
 			if e.rate.store.knownEmpty(e.now(), []draw{{key: string(pkey)}}) {
 				t.Fatal("the instance still knows the bucket empty after a draw it admitted")
@@ -233,6 +239,9 @@ func TestPGCommitPool(t *testing.T) {
 				if got := p == e.commits.db; got != free {
 					t.Errorf("group transaction %d on the commit pool: %v, want %v", i, got, free)
 				}
+			}
+			if free && len(e.commits.free) != 0 {
+				t.Errorf("%d of the commit pool's connections still taken after the groups", len(e.commits.free))
 			}
 		})
 	}

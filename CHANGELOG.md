@@ -71,8 +71,12 @@ core, decided by the grant's own read rules. About 86,000 lines are removed and 
   check first.
 - **Postgres: group commits get connections of their own**, a pool a quarter of the main pool's
   size (at least 2), so a group no longer queues behind every write's check; with all of them
-  busy a group takes a connection of the main pool as before. An instance opens up to that
-  many more connections.
+  busy a group takes a connection of the main pool as before.
+- **Upgrading on Postgres: count connections again.** An instance now opens up to a quarter
+  more for its group commits (4 × `GOMAXPROCS` + 2 × `GOMAXPROCS` in all by default). A
+  `pool_max_conns` set high as a ceiling is now the pool's size: `pool_max_conns=100` on 4 vCPUs
+  went from 16 + 4 connections to 100 + 25 + 25. Keep every instance's sum under the server's
+  `max_connections`.
 - **A purge doesn't read the branches it has no work in.** A purge in a base looked every
   branch below it up by key, to learn whether it held the purged document or might read it
   through: about 0.005 ms a branch, 54 ms on Postgres with 10,000 branches that didn't see

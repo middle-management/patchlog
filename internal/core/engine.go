@@ -925,16 +925,22 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 // updateOnce runs f in one write transaction, first taking the advisory
 // locks of want (Postgres), and the log locks of logs at its first append.
 func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[int32]lockMode, logs map[int32]bool) (rotate []string, err error) {
-	db := e.db
+	var sqlTx *sql.Tx
 	if c := e.commits; c != nil && committingGroup(ctx) && c.take() {
 		// A group commit's transaction, on a connection no check queues
-		// for (commitPool).
-		db = c.db
-		defer c.give()
+		// for (commitPool); on the main pool if none opens (the server's
+		// max_connections reached, say).
+		if tx, err := c.db.BeginTx(ctx, nil); err == nil {
+			sqlTx = tx
+			defer c.give()
+		} else {
+			c.give()
+		}
 	}
-	sqlTx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
+	if sqlTx == nil {
+		if sqlTx, err = e.db.BeginTx(ctx, nil); err != nil {
+			return nil, err
+		}
 	}
 	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}, wake: map[string]map[string]bool{}}
 	committing := false
