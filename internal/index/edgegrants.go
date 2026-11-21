@@ -1836,6 +1836,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 	ex := &exchanged{subjects: map[string][]string{}, filters: map[string]*markerRec{}}
 	var (
 		markers []string
+		views   = map[string]string{}
 		refsExp time.Time
 		upErr   error
 		denied  *grant.AuthError
@@ -1926,6 +1927,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		}
 		if _, ok := reached[ns]; ok && ix.keys.Skipped(ns) == "" {
 			markers = append(markers, a.marker)
+			views[ns] = a.vid
 			if refsExp.IsZero() || exp.Before(refsExp) {
 				refsExp = exp
 			}
@@ -1935,7 +1937,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		return nil, nil, upErr
 	}
 	if len(markers) > 0 {
-		vid := grantcheck.ViewID(markers)
+		vid := refsViewID(views)
 		slices.Sort(markers)
 		ex.issues = append(ex.issues, svcIssue{Prefix: refsPrefix(vid), Exp: refsExp})
 		ex.subjects[refsPrefix(vid)] = markers

@@ -163,6 +163,9 @@ type refsReader struct {
 	// cookie, whose view is fixed.
 	covs    map[string]*access
 	markers map[string]string
+	// views, with a grant, are its view in each private namespace, which
+	// vid is over (refsViewID); nil under a cookie.
+	views map[string]string
 	// unverified: the request carries no grant the service verified in a
 	// private namespace it names (§B.11.5): none, one that doesn't decode,
 	// or one refused 401 wherever it was checked (malformed, badly signed,
@@ -202,16 +205,26 @@ func (ix *Index) recover(ctx context.Context, rd *refsReader, force bool) error 
 		rd.allow[ns] = a.allow
 		if rd.markers != nil {
 			rd.markers[ns] = a.marker
+			rd.views[ns] = a.vid
 		}
 	}
 	if rd.markers != nil {
-		ms := make([]string, 0, len(rd.markers))
-		for _, m := range rd.markers {
-			ms = append(ms, m)
-		}
-		rd.vid = grantcheck.ViewID(ms)
+		rd.vid = refsViewID(rd.views)
 	}
 	return nil
+}
+
+// refsViewID is /_refs' view (SERVICES §A.4, v0.88):
+// text(trunc160(sha256(canonical(markers)))), markers holding, in byte
+// order of UTF-8, {ns}:{v} for each followed non-public namespace ns where
+// the reader has view v (views). Readers with none share the empty
+// array's.
+func refsViewID(views map[string]string) string {
+	ms := make([]string, 0, len(views))
+	for ns, v := range views {
+		ms = append(ms, ns+":"+v)
+	}
+	return grantcheck.ViewID(ms)
 }
 
 // errMoved is a checkpoint of a namespace §7.9 covers that moved
@@ -254,9 +267,8 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			return rd, err
 		}
 	}
-	rd := &refsReader{public: true, allow: map[string]allowFunc{}, covs: map[string]*access{}, markers: map[string]string{}}
+	rd := &refsReader{public: true, allow: map[string]allowFunc{}, covs: map[string]*access{}, markers: map[string]string{}, views: map[string]string{}}
 	var (
-		markers  []string
 		refused  int
 		verified bool
 	)
@@ -307,8 +319,8 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			if a.cov != nil {
 				rd.covs[ns] = a
 			}
-			rd.public, markers = false, append(markers, a.marker)
-			rd.markers[ns] = a.marker
+			rd.public = false
+			rd.markers[ns], rd.views[ns] = a.marker, a.vid
 		}
 		rd.nss = append(rd.nss, ns)
 	}
@@ -327,7 +339,7 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 	default:
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant reads no namespace the service follows"}
 	}
-	rd.vid = grantcheck.ViewID(markers)
+	rd.vid = refsViewID(rd.views)
 	rd.unverified = !verified
 	return rd, nil
 }
@@ -591,7 +603,7 @@ func (ix *Index) refsOwnAt(ctx context.Context, rd *refsReader, vid, url string)
 	if err := json.Unmarshal(st.Body, &body); err != nil {
 		return false
 	}
-	markers := maps.Clone(rd.markers)
+	views := maps.Clone(rd.views)
 	for ns, a := range rd.covs {
 		cp := ix.keptCP(ns, body.Namespaces[ns])
 		if cp == nil {
@@ -601,13 +613,9 @@ func (ix *Index) refsOwnAt(ctx context.Context, rd *refsReader, vid, url string)
 		if b == nil {
 			return false
 		}
-		markers[ns] = b.marker
+		views[ns] = b.vid
 	}
-	ms := make([]string, 0, len(markers))
-	for _, m := range markers {
-		ms = append(ms, m)
-	}
-	return grantcheck.ViewID(ms) == vid
+	return refsViewID(views) == vid
 }
 
 // refsBadMins answers a /_refs request with mins refused as given (bad,

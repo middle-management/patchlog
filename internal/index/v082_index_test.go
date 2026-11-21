@@ -59,9 +59,9 @@ func readsView(ns string, k clienttest.Key) string {
 }
 
 // readsRefsView is the /_refs view of a reader of ns whole through k
-// alone, over its marker there.
+// alone: over {ns}:{v}, v its view there (SERVICES §A.4, v0.88).
 func readsRefsView(ns string, k clienttest.Key) string {
-	return grantcheck.ViewID([]string{"reads:" + ns + ":" + grantcheck.KeySubject(k.Kid, k.Pub)})
+	return grantcheck.ViewID([]string{ns + ":" + readsView(ns, k)})
 }
 
 // v82Grant is k's grant for sub with the role reader, expiring exp from
