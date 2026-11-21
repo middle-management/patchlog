@@ -786,6 +786,13 @@ time only): the consumers read the revision each namespace entry names
   commit does for their rows, would take each bucket row's lock once. There the pool of 64 was
   full again, 1,400 requests waiting, most of them for checks' read transactions (five round
   trips each), and the core's instance at 82% CPU.
+- **Past that, the core's CPU is the limit on 4 vCPUs.** A pool of 128 wrote less than 64 (6,544
+  and 7,451 a second at 8 and 16 namespaces): the core used 3.4 of its 4 vCPUs (pprof), and the
+  extra connections only waited on it (up to 91 sessions idle in a transaction). A write's check
+  took 31–36% of the core's CPU, about a fifth of it in pgx: six round trips (begin, the
+  namespace, resource and head reads, the retry lookup of §7.2, rollback), each a statement
+  through pgx and TLS (TLS writes 8–9% in all). Followers' revision reads took 10–15%, group
+  commits 9%, garbage collection 11%. Fewer round trips in the check would save the most.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
