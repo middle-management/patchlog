@@ -1135,7 +1135,7 @@ func (t *tx) planEntry(p *writePlan, author int64, entries []any, inserted []his
 			entry["source"] = p.src
 			// An import from another deployment starts a follow of its
 			// purges (§G.1).
-			t.recordImport(p.n, p.src, p.st)
+			t.recordImport(p.n, p.a, p.src, p.st)
 		}
 		return nsAppend{entry: entry, meta: batchGestures(p.st), author: author, hist: inserted}
 	}
