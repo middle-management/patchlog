@@ -234,8 +234,8 @@ func TestReferenceQueries(t *testing.T) {
 	}
 }
 
-// Private namespaces: reference queries follow the catalog-listing rules,
-// are routed under the reader's subject set, keep the encoded query, and
+// Private namespaces: reference queries follow the grant's rules,
+// are routed under the reader's view, keep the encoded query, and
 // show only what the reader may read.
 func TestReferencePrivate(t *testing.T) {
 	t.Parallel()
@@ -260,7 +260,7 @@ func TestReferencePrivate(t *testing.T) {
 	}
 	bob := issuer.Grant(t, s.Now(), "user:bob", []string{"sec"}, []string{"read"})
 	r := x.raw("/sec"+q, bob)
-	if r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/sec/g/") || !strings.HasSuffix(r.header.Get("Location"), "/at/"+x.ix.Checkpoint("sec")+q) {
+	if r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/sec/view/") || !strings.HasSuffix(r.header.Get("Location"), "/at/"+x.ix.Checkpoint("sec")+q) {
 		t.Fatalf("pointer: %d %v", r.status, r.header)
 	}
 	b := x.search("/sec"+q, bob)

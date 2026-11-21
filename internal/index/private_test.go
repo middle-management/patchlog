@@ -49,33 +49,19 @@ func TestPrivateNamespace(t *testing.T) {
 		t.Errorf("grant for another namespace: %d", r.status)
 	}
 
-	// A whole-namespace reader: routed through its subject set, which
+	// A whole-namespace reader: routed through its view, which
 	// comes before the checkpoint (§A.4, v0.51).
 	bob := issuer.Grant(t, s.Now(), "user:bob", []string{"sec"}, []string{"read"}, map[string]any{"groups": []any{"editors"}})
 	r := x.raw("/sec?q=secret", bob)
 	loc := r.header.Get("Location")
-	// A redirect that adds /g/{gs} is private, no-store (§A.4, v0.73).
-	if r.status != 302 || !strings.HasPrefix(loc, "/sec/g/") || !strings.HasSuffix(loc, "/at/"+cp+"?q=secret") || r.header.Get("Cache-Control") != "private, no-store" || r.header.Get("Vary") != "Authorization" {
+	// A redirect that adds /view/{view} is private, no-store (§A.4, v0.73).
+	if r.status != 302 || !strings.HasPrefix(loc, "/sec/view/") || !strings.HasSuffix(loc, "/at/"+cp+"?q=secret") || r.header.Get("Cache-Control") != "private, no-store" || r.header.Get("Vary") != "Authorization" {
 		t.Fatalf("pointer: %d %s %v", r.status, loc, r.header)
 	}
-	gs := strings.Split(loc, "/")[3]
+	vid := strings.Split(loc, "/")[3]
 	at := loc
-	if at != "/sec/g/"+gs+"/at/"+cp+"?q=secret" {
+	if at != "/sec/view/"+vid+"/at/"+cp+"?q=secret" {
 		t.Fatalf("at URL %s", at)
-	}
-	// The forms before v0.51 are moved there.
-	if r := x.raw("/g/"+gs+"/sec/at/"+cp+"?q=secret", ""); r.status != 301 || r.header.Get("Location") != at {
-		t.Errorf("old at URL: %d %s", r.status, r.header.Get("Location"))
-	}
-	if r := x.raw("/g/"+gs+"/sec?q=secret", ""); r.status != 301 || r.header.Get("Location") != "/sec?q=secret" {
-		t.Errorf("old pointer: %d %s", r.status, r.header.Get("Location"))
-	}
-	// A malformed one is moved nowhere, an empty segment least of all
-	// (its Location would be //…, another host).
-	for _, p := range []string{"/g/" + gs + "//at/" + cp, "/g/zzz/sec/at/" + cp, "/g/" + gs + "/sec/at/zzz", "/g/zzz/sec"} {
-		if r := x.raw(p, ""); r.status != 404 || r.header.Get("Location") != "" {
-			t.Errorf("%s: %d %s", p, r.status, r.header.Get("Location"))
-		}
 	}
 	r = x.raw(at, bob)
 	// No verifying edge (§9): no shared cache keeps a private result.
@@ -91,17 +77,17 @@ func TestPrivateNamespace(t *testing.T) {
 			t.Errorf("hit url %s", u)
 		}
 	}
-	// Another user in the same groups shares the subject set (and caches).
+	// Another user in the same groups shares the view (and caches).
 	amy := issuer.Grant(t, s.Now(), "user:amy", []string{"sec"}, []string{"read"}, map[string]any{"groups": []any{"editors"}})
-	if r := x.raw("/sec", amy); !strings.HasPrefix(r.header.Get("Location"), "/sec/g/"+gs+"/") {
+	if r := x.raw("/sec", amy); !strings.HasPrefix(r.header.Get("Location"), "/sec/view/"+vid+"/") {
 		t.Errorf("amy's subject set differs: %s", r.header.Get("Location"))
 	}
-	// Without a gs, an at URL redirects into the reader's subject set.
+	// Without a view, an at URL redirects into the reader's view.
 	if r := x.raw("/sec/at/"+cp+"?q=secret", bob); r.status != 302 || r.header.Get("Location") != at {
-		t.Errorf("at without gs: %d %s", r.status, r.header.Get("Location"))
+		t.Errorf("at without vid: %d %s", r.status, r.header.Get("Location"))
 	}
 
-	// A resource-scoped grant sees only its resource, under its own gs.
+	// A resource-scoped grant sees only its resource, under its own view.
 	onlyA := issuer.Grant(t, s.Now(), "user:bob", []string{"sec"}, []string{"read"}, map[string]any{"groups": []any{"editors"},
 		"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
 	b := x.search("/sec?q=secret", onlyA)
@@ -109,19 +95,19 @@ func TestPrivateNamespace(t *testing.T) {
 		t.Errorf("scoped grant sees %s", got)
 	}
 	r = x.raw("/sec", onlyA)
-	if strings.HasPrefix(r.header.Get("Location"), "/sec/g/"+gs+"/") {
+	if strings.HasPrefix(r.header.Get("Location"), "/sec/view/"+vid+"/") {
 		t.Error("a scoped grant shares the whole-namespace subject set")
 	}
-	// A grant reads only at its own gs (§A.4, §B.11.5, v0.73): someone
+	// A grant reads only at its own view (§A.4, §B.11.5, v0.73): someone
 	// else's is 403, no-store, with or without min, never redirected.
 	for _, p := range []string{at, at + "&min=" + cp} {
 		r = x.raw(p, onlyA)
 		if r.status != 403 || r.body["code"] != "forbidden" || r.header.Get("Cache-Control") != "no-store" || r.header.Get("Location") != "" {
-			t.Errorf("foreign gs %s: %d %v %v", p, r.status, r.body, r.header)
+			t.Errorf("foreign vid %s: %d %v %v", p, r.status, r.body, r.header)
 		}
 	}
-	// A reader's gs on a public-style URL of a private namespace is not served.
-	if r := x.raw("/sec/at/"+cp, onlyA); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/sec/g/") {
+	// A reader's view on a public-style URL of a private namespace is not served.
+	if r := x.raw("/sec/at/"+cp, onlyA); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/sec/view/") {
 		t.Errorf("public url for a private ns: %d %s", r.status, r.header.Get("Location"))
 	}
 

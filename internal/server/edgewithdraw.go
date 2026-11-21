@@ -30,7 +30,7 @@ func (s *Server) withdrawEdgeGrants(w http.ResponseWriter, r *http.Request) {
 // withdrawPrefixes are the prefix parameters of DELETE /edge-grants, at
 // least one: the only parameter it takes, and repeatable (§7, §C.5.4). Each
 // has a shape issuance returns, /r/{ns}/{name}, /r/{ns}, /ns/{ns} or
-// /ns/{ns}/g/{gs} (§B.11.9); repeats are withdrawn once.
+// /ns/{ns}/view/{view} (§7.9); repeats are withdrawn once.
 func withdrawPrefixes(raw string) ([]string, error) {
 	q, err := url.ParseQuery(raw)
 	if err != nil {
@@ -44,7 +44,7 @@ func withdrawPrefixes(raw string) ([]string, error) {
 		}
 		for _, p := range vs {
 			if _, ok := edge.ParseCorePrefix(p); !ok {
-				return nil, badInput(fmt.Sprintf("prefix %q isn't one issuance returns: /r/{ns}/{name}, /r/{ns}, /ns/{ns} or /ns/{ns}/g/{gs} (§C.5.4, §B.11.9)", p))
+				return nil, badInput(fmt.Sprintf("prefix %q isn't one issuance returns: /r/{ns}/{name}, /r/{ns}, /ns/{ns} or /ns/{ns}/view/{view} (§C.5.4, §7.9)", p))
 			}
 			if !seen[p] {
 				seen[p] = true

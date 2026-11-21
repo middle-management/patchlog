@@ -35,12 +35,8 @@ import (
 //   - A reader that may not read e's /heads: the fork is placed from eb's
 //     own /heads at its first namespace entry, what eb reads through
 //     folds, and an entry sealed under e spliced after the fork is flagged.
-//   - eb served as a remote branch of e (base.origin, base.chain): the
-//     fork is placed from eb's own /heads alone, and where the reader may
-//     not read it nothing sealed under e is accepted.
 //
-// Until v0.86 the playground checked no fork it couldn't place, and none
-// at all for a remote base.
+// Until v0.86 the playground checked no fork it couldn't place.
 func TestV086ForkUnplacedWithNode(t *testing.T) {
 	t.Parallel()
 	node := needNode(t)
@@ -91,15 +87,6 @@ func TestV086ForkUnplacedWithNode(t *testing.T) {
 	must(err)
 	ebDoc, err := c.NSDoc(ctx, "eb", ebHead.ID)
 	must(err)
-	remoteDoc := map[string]any{}
-	for k, v := range ebDoc.Value {
-		remoteDoc[k] = v
-	}
-	rb := map[string]any{"origin": "https://a.example", "chain": []any{"e"}}
-	for k, v := range ebDoc.Value["base"].(map[string]any) {
-		rb[k] = v
-	}
-	remoteDoc["base"] = rb
 
 	js, err := assets.ReadFile("static/app.js")
 	must(err)
@@ -233,10 +220,4 @@ func TestV086ForkUnplacedWithNode(t *testing.T) {
 		t.Errorf("the branch's own /heads at its first entry is read once: %v", out["through"].Paths)
 	}
 
-	out = run("remote", nil, remoteDoc)
-	placed("a remote base", out)
-	if asked(out["through"], "/ns/e/") != 0 {
-		t.Errorf("a remote base's /heads was asked for here: %v", out["through"].Paths)
-	}
-	unplaced("a remote base, the branch's own /heads unreadable", run("remote-unplaced", regexp.MustCompile(`^/ns/eb/`), remoteDoc))
 }

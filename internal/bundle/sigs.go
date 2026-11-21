@@ -521,8 +521,7 @@ func (sk *sourceKeys) keysAt(ctx context.Context, ns, entry string) ([]KeyEntry,
 	}
 	sk.bases[k] = nil
 	if b, ok := doc.Value["base"].(map[string]any); ok {
-		// A remote branch's keys don't follow its base (§C.4, §G.3).
-		if origin, _ := b["origin"].(string); origin == "" {
+		{
 			bns, _ := b["ns"].(string)
 			bat, _ := b["at"].(string)
 			if bns != "" {

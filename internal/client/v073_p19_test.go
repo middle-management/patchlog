@@ -78,16 +78,13 @@ func TestV073HeadsPageShapes(t *testing.T) {
 	}
 }
 
-// NSPrincipal reads key, operator and catalog (§7.4, RH-28): catalog's
-// trust for an unrestricted reader, trusted for any other; all absent from
-// older servers.
+// NSPrincipal reads key and operator (§7.4); both absent from older
+// servers.
 func TestV073PrincipalInfoFields(t *testing.T) {
 	t.Parallel()
 	bodies := []map[string]any{
-		{"kid": "k", "key": "thumb", "operator": true, "can": []any{"config"}, "roles": []any{}, "writer": map[string]any{},
-			"catalog": map[string]any{"trust": []any{"docs"}, "files": map[string]any{"ns": "docs", "x-a": 1.0}}},
-		{"kid": "k", "key": "thumb", "operator": false, "can": []any{}, "roles": []any{}, "writer": map[string]any{},
-			"catalog": map[string]any{"trusted": true, "files": map[string]any{"ns": "docs"}}},
+		{"kid": "k", "key": "thumb", "operator": true, "can": []any{"config"}, "roles": []any{}, "writer": map[string]any{}},
+		{"kid": "k", "key": "thumb", "operator": false, "can": []any{}, "roles": []any{}, "writer": map[string]any{}},
 		{"kid": "k", "can": []any{}, "roles": []any{}, "writer": map[string]any{}},
 	}
 	for i, body := range bodies {
@@ -98,17 +95,15 @@ func TestV073PrincipalInfoFields(t *testing.T) {
 		}
 		switch i {
 		case 0:
-			if p.Key != "thumb" || !p.Operator || p.Catalog == nil || !slices.Equal(p.Catalog.Trust, []string{"docs"}) ||
-				p.Catalog.Trusted != nil || p.Catalog.Files["x-a"] != 1.0 {
-				t.Errorf("operator answer %+v %+v", p, p.Catalog)
+			if p.Key != "thumb" || !p.Operator {
+				t.Errorf("operator answer %+v", p)
 			}
 		case 1:
-			if p.Operator || p.Catalog == nil || p.Catalog.Trust != nil || p.Catalog.Trusted == nil || !*p.Catalog.Trusted ||
-				p.Catalog.Files["ns"] != "docs" {
-				t.Errorf("limited answer %+v %+v", p, p.Catalog)
+			if p.Key != "thumb" || p.Operator {
+				t.Errorf("limited answer %+v", p)
 			}
 		case 2:
-			if p.Key != "" || p.Operator || p.Catalog != nil {
+			if p.Key != "" || p.Operator {
 				t.Errorf("older server %+v", p)
 			}
 		}

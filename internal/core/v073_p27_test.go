@@ -218,7 +218,7 @@ func TestV073RulesMarkerMigration(t *testing.T) {
 		fast := Rate{1e9, 1e9}
 		lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
 		e, err := Open(Options{Path: path, BlobDir: t.TempDir(), AuthDisabled: true, Limits: lim, Purger: discardPurger{},
-			RetentionInterval: -1, BlobSweepInterval: -1, RepurgeInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
+			RetentionInterval: -1, BlobSweepInterval: -1, RepurgeInterval: -1})
 		if err != nil {
 			t.Fatal(err)
 		}

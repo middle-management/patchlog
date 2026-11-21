@@ -59,8 +59,7 @@ var (
 )
 
 // dbSpan starts the span of a database transaction (nil while off). Only
-// within a trace: background jobs (the tailer's polls, retention, remote
-// following) would otherwise start a root trace per transaction.
+// within a trace: background jobs (the tailer's polls, retention) would otherwise start a root trace per transaction.
 func (e *Engine) dbSpan(ctx context.Context, name string) (context.Context, trace.Span) {
 	in := inst.Get()
 	if in == nil || !trace.SpanContextFromContext(ctx).IsValid() {

@@ -37,10 +37,10 @@ migration: ## commit each migrations directory's current.sql that holds SQL as i
 dev: ## run the core server natively in dev mode on :8080 (dev.db; dev.key enables sealed/e2e namespaces)
 	go run ./cmd/patchlog serve --dev --db dev.db --master-key dev.key --master-key-create
 
-up: ## build and start the whole stack (core, seed, index, tree, janitor, dav, cdn)
+up: ## build and start the whole stack (core, seed, index, janitor, dav, cdn)
 	docker compose up --build -d
-	@echo "through the CDN: core http://localhost:8080  playground http://localhost:8080/playground/  index http://localhost:8081  tree http://localhost:8082 (/cat/roots, /topics/roots, /drive/roots; and /playground/tree/)"
-	@echo "origins, bypassing it: core http://localhost:9080  index http://localhost:9081  tree http://localhost:9082"
+	@echo "through the CDN: core http://localhost:8080  playground http://localhost:8080/playground/  index http://localhost:8081"
+	@echo "origins, bypassing it: core http://localhost:9080  index http://localhost:9081"
 	@echo "WebDAV: http://localhost:8090/ (any user name, password patchlog-dev or DAV_PASSWORD)"
 
 up-pg: ## the same, with the core on Postgres (compose.postgres.yaml, Addendum D.8)
@@ -48,7 +48,7 @@ up-pg: ## the same, with the core on Postgres (compose.postgres.yaml, Addendum D
 
 up-host: ## the same, with host networking (hosts where Docker can't create network namespaces, e.g. sprites)
 	docker compose -f compose.yaml -f compose.host.yaml up --build -d
-	@echo "through the CDN: core http://localhost:8080 (playground /playground/), index :8081, tree :8082; origins directly on :9080-9082; WebDAV on :8090"
+	@echo "through the CDN: core http://localhost:8080 (playground /playground/), index :8081; origins directly on :9080-9081; WebDAV on :8090"
 
 down: ## stop the stack (data is kept; `docker compose down -v` wipes it)
 	docker compose down

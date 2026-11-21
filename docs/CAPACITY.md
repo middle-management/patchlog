@@ -739,19 +739,20 @@ time only): the consumers read the revision each namespace entry names
 - **Nor is the writers' principal's rate bucket**, one row of `rate_buckets` (`rate_draw`) that
   every write of a principal locks, across namespaces (§6.6): with a writer principal per
   namespace, writes stopped at 2,962–3,037 a second, as with one (3,000–3,055).
-- **The limit is the core's main pool, 16 connections.** It is 4 per GOMAXPROCS
-  (`internal/core/pgpool.go`), and `pool_max_conns` only lowers it, so a run with
-  `pool_max_conns=64` kept 16. Profiled (net/http/pprof) at 16 namespaces, the core had up to 700
-  requests waiting in `database/sql` for a connection, while Postgres had about 11 sessions not
-  idle, most of them idle in a transaction waiting for the core's next statement
-  (`pg_stat_activity`). Each write's check (D.3) takes a connection for five round trips, and the
-  group commit workers wait in the same queue: each spent about 90% of its time waiting for a
-  connection, so groups of about 30 writes (of `--group-commit` 32) committed about 100 times a
-  second in all, about 3,000 writes. Postgres did little: about 2.5 ms of statements per group.
+- **The limit is the core's main pool, 16 connections.** It is 4 per GOMAXPROCS by default
+  (`internal/core/pgpool.go`), and `pool_max_conns` could then only lower it, so a run with
+  `pool_max_conns=64` kept 16 (it now sets the pool's size: "Since these runs", below). Profiled
+  (net/http/pprof) at 16 namespaces, the core had up to 700 requests waiting in `database/sql`
+  for a connection, while Postgres had about 11 sessions not idle, most of them idle in a
+  transaction waiting for the core's next statement (`pg_stat_activity`). Each write's check
+  (D.3) takes a connection for five round trips, and the group commit workers wait in the same
+  queue: each spent about 90% of its time waiting for a connection, so groups of about 30 writes
+  (of `--group-commit` 32) committed about 100 times a second in all, about 3,000 writes.
+  Postgres did little: about 2.5 ms of statements per group.
 - **A pool of 64 raised the limit to about 4,600 writes a second.** With GOMAXPROCS 16 on the
-  core (`pool_max_conns` can't raise the pool), four namespaces wrote their full 3,992 a second,
-  and eight and sixteen 4,611 and 4,602 (write p99 376 and 861 ms); a quiet namespace beside
-  three busy ones stayed at p99 45 ms. RDS CPU peaked at 75%, the core's at 71%.
+  core (`pool_max_conns` couldn't raise the pool then), four namespaces wrote their full 3,992 a
+  second, and eight and sixteen 4,611 and 4,602 (write p99 376 and 861 ms); a quiet namespace
+  beside three busy ones stayed at p99 45 ms. RDS CPU peaked at 75%, the core's at 71%.
 - **The next limit is the rate-limit draw.** A write's check (D.3) draws its tokens (`rateLimit`,
   `bucketStore.draw`) inside its read transaction, so it holds a main-pool connection, idle in a
   transaction, while it waits for one of the bucket pool's 16 and then for its buckets' rows.
@@ -765,6 +766,15 @@ time only): the consumers read the revision each namespace entry names
   with about 40 sessions idle in a check's transaction, and the core's instance at 79% CPU, much
   of it garbage collection. So past a larger pool and the draw moved out of the check, the
   core's CPU is next on a 4-vCPU instance; more instances share the work (D.8).
+- **Since these runs** (not yet measured again):
+  - `pool_max_conns=N` sets the main pool to `N` connections, above 4 per GOMAXPROCS too, and
+    the bucket pool to a quarter of `N`.
+  - A write's draw is made after its check's read transaction, so it holds no main-pool
+    connection while it waits for the bucket pool or its rows. The draw comes before the write
+    is admitted, and its 429 answers as before.
+  - Group commits take a connection from a pool of their own (a quarter of the main pool's
+    size) when one is free, so a group of about 30 writes no longer queues behind every
+    write's check.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
@@ -901,7 +911,7 @@ Each limit is one of three kinds:
 |---|---|---|
 | **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request. The origin shares their reads ([Origin-side collapse](#origin-side-collapse)), at ~0.03–0.04 ms of core CPU per follower per write (0.12–0.14 ms through Varnish). | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
 | **No read replicas, and one `--db` for everything.** The core runs migrations, the tailer and leader jobs, so it can't run on a read-only database. | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
-| **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: 6–7 min on server X (fetches at 2,400–2,800/s); 1.3 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
+| **Consumers** (the index): one SQLite writer per process, 8 document fetches at a time, no sharding but by namespace lists. | Bootstrap of 1M documents: 6–7 min on server X (fetches at 2,400–2,800/s); 1.3 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
 | **Rule `test`s with a `schema` are not counted on reads, and annotation walks never.** A write's rule tests draw on its `validationSteps` with its validation (v0.85), and listing an invalid document's failures takes what is left of it. | A grant narrowed with a rule whose schema fragment is expensive to evaluate still costs that on every read, exchange and key request it is presented for; the spec bounds writes only (docs/SPEC-FEEDBACK.md, v0.85 Open 52). A schema's annotations can still be made expensive to walk. | Bound rule tests on reads too, once the spec says what a read that runs out answers; count annotation walks. |
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
 | **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.0 GB on server X and 1.4 GB on SQLite over a whole run. Scans, reads and small writes alone peaked at 0.2–0.3 GB; the rest came with 3.5 MiB documents and 5,000 followers. | Run with `GOMEMLIMIT` under container limits; profile the large-document path (an opt-in pprof listener would help). |
@@ -930,6 +940,7 @@ The defaults, and when to change them.
 | **Per-resource and per-principal rates** (`serve --max-rate-per-resource`, `--max-rate-per-principal`, and the namespace's `limits`) | 10/s and 50/s | One writer writes a small document often. |
 | **`ratePerNamespace`** | 500/s | Leave it: about half of one namespace's ceiling on server X, which leaves room for reads. Give importers and loaders allowances. |
 | **`itemsPerBatch`** | 1,000 | Leave it: batches are for imports; give importers allowances. |
+| **Postgres pools** (`pool_max_conns` in the URL) | 4 × GOMAXPROCS connections; a quarter of that, at least 2, for rate draws and for group commits each | Writes queue for connections while Postgres is mostly idle: a database a millisecond away wants more than the CPUs give, e.g. 64 on a `c7g.xlarge` ([Several namespaces on one database](#several-namespaces-on-one-database)). Keep every instance's pools together under `max_connections`. |
 | **The snapshot cadence, the long-poll interval and the log page size** | as shipped | — |
 
 ## Rerunning
@@ -990,6 +1001,7 @@ Options:
   with the core, the database, the writers and the consumers each on their own instance. The
   run in [Several namespaces on one database](#several-namespaces-on-one-database) used
   `NAMESPACES 1,2,4,8,16 RATE 10 DURATION 30000 FETCHES 1 8`. The `2xlarge` run used
-  `DB_CLASS=db.m7g.2xlarge FETCHES=8`.
+  `DB_CLASS=db.m7g.2xlarge FETCHES=8`; add `STORE_POOL_CONNS=64` to set the core's
+  `pool_max_conns`.
 - **Sizes**: `-docs`, `-revs`, `-namespaces`, `-doc-size`, `-append-batch`. `-help` lists the
   rest.

@@ -22,9 +22,7 @@ type NamespacesPage struct {
 // Namespaces lists the deployment's namespaces after the name after, a
 // plain bound, and, if prefix isn't "", starting with it, a namespace
 // name (400 bad_input otherwise, a request-shape error, §6.2), paged by
-// logPageSize (§6.6). Branches, remote ones too, and purged namespaces
-// are listed (§7.4). The hidden shadows of remote branches aren't: they
-// are no namespaces of the API (§G.3, isShadow).
+// logPageSize (§6.6). Branches and purged namespaces are listed (§7.4).
 //
 // It answers operator grants only (§C.4, namespaceLister), and everyone
 // while authentication is disabled (§1).
@@ -122,10 +120,9 @@ func plainBound(after string) string {
 	return after
 }
 
-// shadowsFrom is the least name of a remote branch's shadow (isShadow):
-// "~" sorts above every byte of a namespace name (§3.6), so the names
-// below it are the namespaces.
-const shadowsFrom = "~"
+// namesBelow sorts above every byte of a namespace name (§3.6), so every
+// namespace's name is below it.
+const namesBelow = "~"
 
 // pageNamespaces is a page of at most limit rows of GET /ns (§7.4). One
 // query reads the names, in byte order from the index on name (the "C"
@@ -137,7 +134,7 @@ func (t *tx) pageNamespaces(after, prefix string, limit int) *NamespacesPage {
 	if t.e.pg {
 		col = `n.name COLLATE "C"`
 	}
-	lower, bound, upper := ` > ?`, plainBound(after), shadowsFrom
+	lower, bound, upper := ` > ?`, plainBound(after), namesBelow
 	if prefix != "" {
 		if prefix > bound {
 			// An after below the prefix starts at it.
@@ -216,9 +213,6 @@ func (t *tx) listedDocs(seqs []int64) map[int64]listedDoc {
 		d := listedDoc{frozen: c.Frozen}
 		if b := c.Base; b != nil {
 			d.base = map[string]any{"ns": b.NS, "at": b.At}
-			if b.Remote() {
-				d.base["origin"] = b.Origin
-			}
 		}
 		out[s] = d
 	}
@@ -236,12 +230,7 @@ func (t *tx) listedDocs(seqs []int64) map[int64]listedDoc {
 		m, _ := jsonv.MustParse([]byte(doc)).(map[string]any)
 		d := listedDoc{frozen: m["frozen"] == true}
 		if b, ok := m["base"].(map[string]any); ok {
-			d.base = map[string]any{}
-			for k, v := range b {
-				if k != "chain" {
-					d.base[k] = v
-				}
-			}
+			d.base = map[string]any{"ns": b["ns"], "at": b["at"]}
 		}
 		out[seq] = d
 	}

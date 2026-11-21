@@ -23,7 +23,6 @@ package core
 import (
 	"bytes"
 	"context"
-	"crypto/ecdh"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -103,8 +102,6 @@ type Options struct {
 	// RetentionInterval is how often the retention applier runs (§8.6).
 	// Zero means one hour; negative disables it.
 	RetentionInterval time.Duration
-	// Remote configures remote branches of this deployment (§G.3).
-	Remote RemoteOptions
 	// KeyStore wraps the data keys of encryption at rest (Addendum E.1).
 	// Nil means none: a namespace document can't set encryption (422), and
 	// content stored encrypted answers 500.
@@ -186,6 +183,9 @@ type Options struct {
 	// are due. Zero means ten seconds; negative disables the loop
 	// (Repurge still sends them).
 	RepurgeInterval time.Duration
+	// FollowPurges follows the purges of trusted origins after imports
+	// (§G.1, purgefollow.go).
+	FollowPurges FollowPurgesOptions
 	// StoreCompression is "zstd" to store the patch sets of namespaces
 	// without encryption compressed (compress.go), or "" or "off" (the
 	// default) to store canonical JSON. SQLite only: Open refuses it on
@@ -205,7 +205,7 @@ type Options struct {
 	// least an eighth smaller. Negative compresses every patch set, even
 	// if it doesn't shrink, for tests of the compressed form.
 	StoreCompressMin int
-	// NoFilteredReads turns off filtered namespace reads (§B.11.9, an
+	// NoFilteredReads turns off filtered namespace reads (§7.9, an
 	// origin MAY): no namespace is covered, and partial readers get
 	// §C.5's answers (403) as before v0.75. The zero value serves them.
 	NoFilteredReads bool
@@ -219,13 +219,12 @@ type Options struct {
 	SealRotateAt int64
 	SealBlock    int64
 	// PurgeRaisedE2E purges, at Open, the namespaces a pre-v0.78
-	// deployment raised to e2e and the remote branches that mirror a
-	// raised source, which Open otherwise refuses to serve
+	// deployment raised to e2e, which Open otherwise refuses to serve
 	// (legacy_e2e.go): they then answer 410 purged.
 	PurgeRaisedE2E bool
 	// LegacyE2ERaiseForTests lets a config write raise a namespace to e2e
 	// and only records the new configuration, as a pre-v0.78 source did
-	// (tests of remote branches following one). Never set in production:
+	// (tests of the legacy-e2e gate). Never set in production:
 	// a namespace is end-to-end from its creation or never (Addendum E
 	// Levels).
 	LegacyE2ERaiseForTests bool
@@ -237,45 +236,6 @@ type Options struct {
 	// migrations, if not nil, replaces the embedded migrations (tests of
 	// a database an earlier version left).
 	migrations fs.FS
-}
-
-// RemoteOptions configure the branch side of remote branches (§G.3): how
-// this deployment reaches the deployments holding their bases.
-type RemoteOptions struct {
-	// Resolve maps a base's origin to the endpoint requests go to. Nil
-	// means the origin itself, telemetry.DefaultClient and no bearer grant.
-	Resolve func(origin string) (RemoteEndpoint, error)
-	// FollowInterval is how often bases' logs are followed, their purges
-	// applied and their raises followed (§G.3, §G.5.2), and registrations
-	// renewed. Zero means five minutes; negative disables the background
-	// follower (SyncRemotes still works). Following is a SHOULD (§G.3), but
-	// a deployment that sees a purge applies it: there is no option to
-	// record purges without applying them.
-	FollowInterval time.Duration
-	// Register registers each remote branch with its base (optional in
-	// §G.3) when it is created, and renews the registration before it
-	// expires. It needs read and export at the base.
-	Register bool
-	// RenewBefore is how long before expiry a registration is renewed.
-	// Zero means seven days.
-	RenewBefore time.Duration
-	// FollowTimeout bounds each base's step of a sync (SyncRemotes, and
-	// the first read of deeper bases as the follower starts): following
-	// its log, levels and epochs, fetching its pending sealings again, and
-	// registering. A base that doesn't answer in time is given up on until
-	// the next sync, and the next base is followed. Zero means ten
-	// minutes.
-	FollowTimeout time.Duration
-}
-
-// RemoteEndpoint is where and how a remote origin is reached.
-type RemoteEndpoint struct {
-	BaseURL    string       // e.g. https://cms.example; defaults to the origin
-	HTTPClient *http.Client // nil: telemetry.DefaultClient
-	Bearer     string       // grant for the base namespace (read, and export to register)
-	// Identity unwraps the keys of a sealed base (Addendum E.2) that the
-	// base wraps to the grant's enc (§E.2.3, §G.5). Nil: raw keys only.
-	Identity *ecdh.PrivateKey
 }
 
 // Purger purges CDN cache tags.
@@ -312,10 +272,15 @@ type Engine struct {
 	// refsCache is the $refs of schema revisions by path (schemaRefsOf).
 	refsMu    sync.Mutex
 	refsCache lru.Cache[string, []string]
-	// gsHeld is whether a gs cookie's record held under every document
-	// between its exchange's and a later one (gsHeldSince, gsHeldKey).
-	gsHeldMu    sync.Mutex
-	gsHeld      lru.Cache[[32]byte, bool]
+	// viewHeld is whether a view cookie's record held under every
+	// document between its exchange's and a later one (viewHeldSince,
+	// viewHeldKey).
+	viewHeldMu sync.Mutex
+	viewHeld   lru.Cache[[32]byte, bool]
+	// judgedMem keeps recent per-revision read answers (judge), which
+	// read_judged keeps for good.
+	judgedMu    sync.Mutex
+	judgedMem   lru.Cache[judgedKey, bool]
 	schemaScans atomic.Int64
 	cfgMu       sync.Mutex
 	cfgCache    map[int64]*Config
@@ -360,11 +325,13 @@ type Engine struct {
 	// purgeHoldersMax, if not 0, replaces the constant of that name for a
 	// test: negative, every purge searches level by level (purgeLevels).
 	purgeHoldersMax int
-	// Group commit (groupcommit.go): the queues, and for tests, noSolo
+	// Group commit (groupcommit.go): the queues, the connections only
+	// groups' transactions take (on Postgres), and for tests, noSolo
 	// queues even a write that finds its namespace idle, groupStart is
 	// called in a group's transaction once it holds its locks, and
 	// groupMember before each of its writes' entries is appended.
 	groups      groups
+	commits     *commitPool
 	noSolo      bool
 	groupStart  func(t *tx, size int)
 	groupMember func(t *tx, i int)
@@ -417,12 +384,6 @@ func Open(opt Options) (*Engine, error) {
 	}
 	if opt.Maximums == (Limits{}) {
 		opt.Maximums = opt.Limits
-	}
-	if opt.Limits.RemoteRegistration == 0 {
-		opt.Limits.RemoteRegistration = DefaultLimits().RemoteRegistration
-	}
-	if opt.Maximums.RemoteRegistration == 0 {
-		opt.Maximums.RemoteRegistration = opt.Limits.RemoteRegistration
 	}
 	// Options from before blobs (§7.8) leave their limits zero.
 	defaultBlobLimits(&opt.Limits, DefaultLimits())
@@ -513,7 +474,7 @@ func Open(opt Options) (*Engine, error) {
 		started:    opt.Now().UTC(),
 	}
 	e.refsCache.MaxEntries = 65536
-	e.gsHeld.MaxEntries = 65536
+	e.viewHeld.MaxEntries = 65536
 	e.rc.maxBytes = opt.ReadCacheBytes
 	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
 	if err := e.checkKeyStore(); err != nil {
@@ -558,6 +519,14 @@ func Open(opt Options) (*Engine, error) {
 			return nil, err
 		}
 	}
+	if e.grouping() {
+		// The group commits' own connections (groupcommit.go).
+		if e.commits, err = openCommitPool(opt.Path); err != nil {
+			e.rate.close()
+			db.Close()
+			return nil, err
+		}
+	}
 	if pg {
 		if e.opt.TailInterval <= 0 {
 			e.opt.TailInterval = 100 * time.Millisecond
@@ -565,6 +534,7 @@ func Open(opt Options) (*Engine, error) {
 		s, err := e.tailStart(context.Background())
 		if err != nil {
 			e.rate.close()
+			e.commits.close()
 			db.Close()
 			return nil, fmt.Errorf("starting the tailer: %w", err)
 		}
@@ -576,15 +546,6 @@ func Open(opt Options) (*Engine, error) {
 	if opt.RetentionInterval > 0 {
 		e.bg.Add(1)
 		go e.retentionLoop(opt.RetentionInterval)
-	}
-	if e.opt.Remote.FollowInterval == 0 {
-		e.opt.Remote.FollowInterval = 5 * time.Minute
-	}
-	if e.opt.Remote.RenewBefore == 0 {
-		e.opt.Remote.RenewBefore = 7 * 24 * time.Hour
-	}
-	if e.opt.Remote.FollowTimeout <= 0 {
-		e.opt.Remote.FollowTimeout = 10 * time.Minute
 	}
 	if e.opt.BlobSweepInterval == 0 {
 		e.opt.BlobSweepInterval = 10 * time.Minute
@@ -611,13 +572,12 @@ func Open(opt Options) (*Engine, error) {
 		e.bg.Add(1)
 		go e.repurgeLoop(e.opt.RepurgeInterval)
 	}
-	// Before anything is served: a raise a remote branch recorded but
-	// hasn't made, as one an earlier version left, is made now rather than
-	// at the first sync (catchUpLevels).
-	e.catchUpLevels(context.Background())
-	if e.opt.Remote.FollowInterval > 0 {
+	if e.opt.FollowPurges.Interval == 0 {
+		e.opt.FollowPurges.Interval = 5 * time.Minute
+	}
+	if len(e.opt.FollowPurges.Origins) > 0 && e.opt.FollowPurges.Interval > 0 {
 		e.bg.Add(1)
-		go e.remoteLoop(e.opt.Remote.FollowInterval)
+		go e.purgeFollowLoop(e.opt.FollowPurges.Interval)
 	}
 	return e, nil
 }
@@ -631,6 +591,7 @@ func (e *Engine) Close() error {
 	err := e.db.Close()
 	e.comp.close()
 	e.rate.close()
+	e.commits.close()
 	return err
 }
 
@@ -774,9 +735,17 @@ type tx struct {
 	// while it is set (readScope), nil outside one: every read check then
 	// gets a fresh budget.
 	readMeter *writeMeter
+	// judged are the per-revision read answers this transaction gave that
+	// read_judged doesn't hold yet (judge, flushJudged).
+	judged []judgedRow
 	// rateDrawn, when set, records that a write drew its rate-limit tokens,
-	// so a transaction run again doesn't draw them twice.
+	// so a transaction run again (Postgres, pglock.go) doesn't draw them
+	// twice.
 	rateDrawn *bool
+	// drawLater, when set (a write's check outside the lock on the store's
+	// buckets, checkOutside), records the rate-limit draws instead of
+	// making them (admit).
+	drawLater *drawLater
 	// memo and dirty: rows read in this transaction, and whether it has
 	// written (memo.go).
 	memo  memo
@@ -803,11 +772,10 @@ type tx struct {
 	storedGrants map[ids.ID]bool
 	// Encryption at rest (crypt.go): data keys created in this
 	// transaction (cached once committed), whether a purge destroyed keys,
-	// resources' levels, and the levels of shadows being created.
-	newDEKs      map[int64][]byte
-	flushDEKs    bool
-	resLevels    map[int64]int
-	shadowLevels map[string]int
+	// and resources' levels.
+	newDEKs   map[int64][]byte
+	flushDEKs bool
+	resLevels map[int64]int
 	// Sealed namespaces (sealed.go): epoch keys created in this
 	// transaction, whether a namespace purge destroyed some, and the
 	// namespaces whose config change revoked access (rotate-on-revoke).
@@ -864,6 +832,17 @@ type docPut struct {
 
 // read runs f in a read transaction.
 func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
+	var judged []judgedRow
+	err = e.read1(ctx, func(t *tx) error {
+		defer func() { judged = t.judged }()
+		return f(t)
+	})
+	// Per-revision answers it gave are kept once it has ended (judge).
+	e.flushJudged(ctx, judged)
+	return err
+}
+
+func (e *Engine) read1(ctx context.Context, f func(t *tx) error) (err error) {
 	ctx, span := e.dbSpan(ctx, "core.db.read")
 	defer func() { endDBSpan(span, err) }()
 	e.stmts.prepare(e.db)
@@ -946,9 +925,22 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 // updateOnce runs f in one write transaction, first taking the advisory
 // locks of want (Postgres), and the log locks of logs at its first append.
 func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[int32]lockMode, logs map[int32]bool) (rotate []string, err error) {
-	sqlTx, err := e.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
+	var sqlTx *sql.Tx
+	if c := e.commits; c != nil && committingGroup(ctx) && c.take() {
+		// A group commit's transaction, on a connection no check queues
+		// for (commitPool); on the main pool if none opens (the server's
+		// max_connections reached, say).
+		if tx, err := c.db.BeginTx(ctx, nil); err == nil {
+			sqlTx = tx
+			defer c.give()
+		} else {
+			c.give()
+		}
+	}
+	if sqlTx == nil {
+		if sqlTx, err = e.db.BeginTx(ctx, nil); err != nil {
+			return nil, err
+		}
 	}
 	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}, wake: map[string]map[string]bool{}}
 	committing := false
@@ -1154,12 +1146,6 @@ type nsRow struct {
 
 func (n *nsRow) isBranch() bool { return n.base.Valid }
 
-// isShadow reports whether n is the hidden shadow of a remote branch
-// (§G.3), holding the remote base's mirrored content. Its name starts with
-// "~", which the §3.6 grammar excludes, so it can never be addressed or
-// collide with a namespace.
-func (n *nsRow) isShadow() bool { return strings.HasPrefix(n.name, "~") }
-
 const nsCols = `ns, name, base, base_at, base_config_seq, frozen, purged, head_seq, config_seq`
 
 func scanNS(row interface{ Scan(...any) error }) (*nsRow, error) {
@@ -1170,9 +1156,7 @@ func scanNS(row interface{ Scan(...any) error }) (*nsRow, error) {
 	return n, err
 }
 
-// nsByName returns the namespace or nil. Shadows (§G.3) have no name that
-// can be looked up: they are reached only through their remote branch. In
-// a write transaction on Postgres it takes the namespace's lock shared
+// nsByName returns the namespace or nil. In a write transaction on Postgres it takes the namespace's lock shared
 // (pglock.go).
 func (t *tx) nsByName(name string) *nsRow {
 	return t.nsByNameLocked(name, lockShared)
@@ -1458,8 +1442,7 @@ func (t *tx) logHeadOf(n *nsRow) (*ids.ID, any) {
 	if !n.headSeq.Valid {
 		return nil, nil
 	}
-	// head_id is NULL in rows from before the column, and in remote
-	// shadows, whose chains are mirrored.
+	// head_id is NULL in rows from before the column.
 	p := ids.FromBytes(headID)
 	if headID == nil {
 		p = t.nsLogID(n.headSeq.Int64)

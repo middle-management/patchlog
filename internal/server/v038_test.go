@@ -87,37 +87,30 @@ func TestV038ClientGrantNull(t *testing.T) {
 }
 
 // §7.4 (v0.38): the addenda's objects may carry x- members, stored as
-// data; the keys of catalogs are catalog names; other members of them are
-// 422 invalid with a pointer to the member.
+// data; other members of them are 422 invalid with a pointer to the member.
 func TestV038AddendaXMembers(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	id := e.nsHead("docs")
 	expect(t, e.patchNS("docs", ops(
-		op("add", "/catalog", map[string]any{"mode": "tree", "x-label": "Season"}),
-		op("add", "/catalogs", map[string]any{"cat": map[string]any{"place": strs([]string{"group:desk"}), "x-since": "2025"}}),
 		op("add", "/merge", map[string]any{"authors": []any{}, "x-note": "bots"}),
 		op("add", "/merged", map[string]any{"at": id, "x-by": "release"}),
 		op("add", "/cleanup", map[string]any{"merged": "P7D", "x-why": "short"}),
 		op("add", "/roles", map[string]any{"editor": map[string]any{"can": strs([]string{"read"}), "move": true, "label": "Editors"}}),
 	), ""), 201)
 	doc := e.get("/ns/docs/rev/" + e.nsHead("docs")).Obj()
-	if doc["catalog"].(map[string]any)["x-label"] != "Season" || doc["merge"].(map[string]any)["x-note"] != "bots" {
+	if doc["merged"].(map[string]any)["x-by"] != "release" || doc["merge"].(map[string]any)["x-note"] != "bots" {
 		t.Fatalf("document %v", doc)
 	}
 	for ptr, patch := range map[string]map[string]any{
-		"/catalog/label":        op("replace", "/catalog", map[string]any{"label": "Season"}),
-		"/catalogs/cat/since":   op("replace", "/catalogs", map[string]any{"cat": map[string]any{"since": "2025"}}),
-		"/catalogs/X-desk":      op("replace", "/catalogs", map[string]any{"X-desk": map[string]any{}}),
-		"/merge/note":           op("replace", "/merge", map[string]any{"authors": []any{}, "note": "bots"}),
-		"/merged/by":            op("replace", "/merged", map[string]any{"at": id, "by": "release"}),
-		"/cleanup/why":          op("replace", "/cleanup", map[string]any{"why": "short"}),
-		"/merge/authors/0":      op("replace", "/merge", map[string]any{"authors": []any{map[string]any{"sub": "a", "kid": "k", "x-n": 1.0}}}),
-		"/catalogs/cat/place/0": op("replace", "/catalogs", map[string]any{"cat": map[string]any{"place": strs([]string{"desk"})}}),
-		"/cleanup/merged":       op("replace", "/cleanup", map[string]any{"merged": "a week"}),
-		"/abandoned":            op("add", "/abandoned", "yes"),
-		"/notes":                op("add", "/notes", "x"),
+		"/merge/note":      op("replace", "/merge", map[string]any{"authors": []any{}, "note": "bots"}),
+		"/merged/by":       op("replace", "/merged", map[string]any{"at": id, "by": "release"}),
+		"/cleanup/why":     op("replace", "/cleanup", map[string]any{"why": "short"}),
+		"/merge/authors/0": op("replace", "/merge", map[string]any{"authors": []any{map[string]any{"sub": "a", "kid": "k", "x-n": 1.0}}}),
+		"/cleanup/merged":  op("replace", "/cleanup", map[string]any{"merged": "a week"}),
+		"/abandoned":       op("add", "/abandoned", "yes"),
+		"/notes":           op("add", "/notes", "x"),
 	} {
 		r := e.patchNS("docs", ops(patch), "")
 		expectCode(t, r, 422, "invalid")

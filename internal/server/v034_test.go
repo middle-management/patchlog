@@ -80,22 +80,6 @@ func TestV034DraftsMember(t *testing.T) {
 	}
 }
 
-// §7.4: drafts is 422 in a remote branch (and its branches), where it could
-// have no effect.
-func TestV034DraftsRemote(t *testing.T) {
-	t.Parallel()
-	a, b, _ := pair(t, nil, nil)
-	a.mkNS("main", map[string]any{"read": "public"})
-	a.create("main", "x", map[string]any{"v": 1.0})
-	r := b.mkRemote("rel", remoteGenesis("main", a.nsHead("main"), map[string]any{"drafts": map[string]any{"for": strs([]string{"other"})}}))
-	expectCode(t, r, 422, "invalid")
-	expect(t, b.mkRemote("rel", remoteGenesis("main", a.nsHead("main"), nil)), 201)
-	expectCode(t, b.patchNS("rel", addDrafts("other"), ""), 422, "invalid")
-	expectCode(t, b.branch("rel", map[string]any{"name": "rel-b", "patches": addDrafts("other")}, "admin"), 422, "invalid")
-	expect(t, b.branch("rel", map[string]any{"name": "rel-b"}, "admin"), 201)
-	expectCode(t, b.patchNS("rel-b", addDrafts("other"), ""), 422, "invalid")
-}
-
 // §6.1, §7.5: a path N can't resolve for the writer because the writer
 // can't read it there falls through to drafts; the read in N is by the
 // rule for other namespaces too (§6.1 Read permission).

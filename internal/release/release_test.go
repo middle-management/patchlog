@@ -20,7 +20,7 @@ func parse(t *testing.T, s string) (*Doc, error) {
 }
 
 func TestParse(t *testing.T) {
-	d, err := parse(t, `{ "name": "release-7", "at": "`+id1+`",
+	d, err := parse(t, `{ "name": "release-7",
 	  "branches": { "matches": { "ns": "matches-r7", "at": "`+id1+`" },
 	                "cat-season": { "ns": "cat-season-r7" },
 	                "schemas": { "ns": "schemas-r7", "at": "`+id1+`" } },

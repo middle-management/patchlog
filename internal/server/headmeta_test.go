@@ -336,7 +336,7 @@ func TestHeadMetaSealedLater(t *testing.T) {
 		}
 		e.noRevMeta("/r/" + ns + "/a/rev/" + a)
 		// Later config writes don't purge again.
-		expect(t, e.patchNS(ns, ops(op("add", "/maxLag", "PT1H")), ""), 201)
+		expect(t, e.patchNS(ns, ops(op("add", "/x-note", "PT1H")), ""), 201)
 		if calls := rec.take(); purged(calls, "ns:"+ns) {
 			t.Fatalf("%s: a sealed config write purged %v", ns, calls)
 		}
@@ -480,32 +480,4 @@ func TestHeadMetaPurgeTags(t *testing.T) {
 	if it := e.headItems("n", at)["a"]; it["kind"] != "purge" || it["digest"] != nil {
 		t.Fatalf("purged %v", it)
 	}
-}
-
-// A remote branch lists the base's heads as the base does, sizes and
-// digests included, from the chains it mirrors; so does a namespace its
-// schemas are mirrored into (§G.3, insertChain).
-func TestHeadMetaRemote(t *testing.T) {
-	t.Parallel()
-	a, b, _ := pair(t, nil, nil)
-	f := populateA(t, a)
-	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
-	ha, hb := a.headItems("main", f.at), b.headItems("rel", b.nsHead("rel"))
-	for _, name := range []string{"derby", "old", "e", "f"} {
-		if hb[name]["digest"] == nil || hb[name]["digest"] != ha[name]["digest"] || hb[name]["size"] != ha[name]["size"] || hb[name]["created"] != ha[name]["created"] {
-			t.Fatalf("%s: B %v, A %v", name, hb[name], ha[name])
-		}
-		b.checkLiveHead("rel", hb[name])
-	}
-	if it := hb["b"]; it["kind"] != "tombstone" || it["created"] != ha["b"]["created"] || it["size"] != nil {
-		t.Fatalf("tombstone %v", it)
-	}
-	if it := hb["c"]; it["kind"] != "purge" || it["created"] != nil || it["size"] != nil {
-		t.Fatalf("purged %v", it)
-	}
-	s := b.headItems("schemas", b.nsHead("schemas"))["match"]
-	if s["target"] != f.s2 || s["digest"] != a.headItems("schemas", a.nsHead("schemas"))["match"]["digest"] {
-		t.Fatalf("mirrored schema %v", s)
-	}
-	b.checkLiveHead("schemas", s)
 }

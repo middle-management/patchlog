@@ -21,29 +21,20 @@
 //	                                      path is the full instance pointer, indices included
 //	sealed_views, sealed_view_tags   sealed results of sealed/e2e namespaces (derived.Cache)
 //	cdn_repurge(id, tags, due)       second CDN purges (package repurge), kept by a rebuild
-//	edge_subjects, edge_buckets      the markers of each subject set the service minted edge
+//	edge_subjects, edge_buckets      the markers of each view the service minted edge
 //	                                 grants for, until the last of them expires, and its
-//	                                 exchangeRate buckets (svcedge.Store, edgegrants.go)
+//	                                 exchangeRate buckets (edgeStore, edgegrants.go)
 //	edge_filters(marker, filter, exp) what each scope or g: marker of those stands for (markerRec)
-//	edge_gs(marker, subjects, kid, roles, pub, exp)  and, for a g: marker (§B.11.9), its subjects;
-//	                                      its kid, roles and pub are no longer read (edge_gs_keys)
-//	edge_gs_keys(marker, exp, kid, roles, pub, entry, pending, chain)  every key the cookie of a marker (reads:{ns}:{k}
+//	edge_views(marker, subjects, kid, roles, pub, exp)  and, for a g: marker (§7.9), its subjects;
+//	                                      its kid, roles and pub are no longer read (edge_view_keys)
+//	edge_view_keys(marker, exp, kid, roles, pub, entry, pending, chain)  every key the cookie of a marker (reads:{ns}:{k}
 //	                                      included) that expires at exp came from, with its read
-//	                                      roles and the digest of its entry and theirs (gsKey),
+//	                                      roles and the digest of its entry and theirs (viewKey),
 //	                                      written once: an exchange with other keys or entries
 //	                                      takes another exp (recordCookies)
-//	member_checkpoints(origin, ns, ns_id)  follow.SQLCheckpoints of the namespaces visibility reads
-//	                                      that the index follows without serving them, while it
-//	                                      follows them (members.go)
-//	member_conf(ns, public, level)        as ns_conf, for those
 //	ns_stopped(ns, ns_id)                 a namespace the index stopped following, or can't follow
 //	                                      past an entry, and the checkpoint it was stopped at
 //	                                      (purgeStopped)
-//	catalog_trust(ns, trust)              the catalog.trust last applied, of either, kept past a
-//	                                      purge-ns and a rebuild (recordTrust, fsTrust), read again
-//	                                      at a snapshot, forgotten once ns is neither served nor
-//	                                      followed, unless purged (dropUnfollowedTrust, forgetMember),
-//	                                      and once more for a served, purged one without (repairTrust)
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
@@ -78,7 +69,6 @@ import (
 	"crypto/ecdh"
 	"database/sql"
 	"embed"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -101,7 +91,6 @@ import (
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/repurge"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // Purger purges the index service's own cache tags (§A.1: a purge "also
@@ -113,18 +102,10 @@ type Options struct {
 	// Client reads the core API; with a private namespace it needs a grant
 	// with read on it (§C.6 least privilege). For sealed namespaces build it
 	// WithKeys (client.NewKeys(Recipient)); its grant must get epoch keys
-	// (read on the whole namespace), which seal the results. Where §B.11.9
-	// covers a namespace, its grant must also read the namespaces
-	// visibility reads there, which the index follows without serving them
-	// (filtered.go, members.go): the trusted catalogs, their catalog.trust members and
-	// a branch's bases. To tell whether §B.11.9 covers a namespace at all,
-	// for readers it doesn't let read the namespace whole, it must read,
-	// whether or not they turn out to cover it, every catalog a followed
-	// namespace's catalogs names through a key whose requireAt names it,
-	// every namespace a followed catalog's catalog.trust lists, and a
-	// followed branch's bases; where it can't, such readers are answered
-	// 502 and the log names the namespace (errGrantLacks), never as if the
-	// namespace weren't covered.
+	// (read on the whole namespace), which seal the results. Where a
+	// followed branch's keys follow its bases (§C.4), it must read those
+	// bases too; where it can't, readers judged by those keys are answered
+	// 502 and the log names the namespace (errGrantLacks).
 	Client *client.Client
 	// Recipient is the service's X25519 private key: it unwraps keys
 	// POST /keys wraps to the grant's enc, and makes e2e namespaces
@@ -147,9 +128,7 @@ type Options struct {
 	NoFTS bool
 	// Rebuild drops the index and replays from "" (§A.6).
 	Rebuild bool
-	// MinWait bounds how long ?min= waits (§A.5), and how long a query
-	// waits for a namespace visibility reads to be followed up to its head
-	// (members.go); default 2s.
+	// MinWait bounds how long ?min= waits (§A.5); default 2s.
 	MinWait time.Duration
 	// Purger receives cache tag purges; default: log.
 	Purger Purger
@@ -172,17 +151,17 @@ type Options struct {
 	Edge *edge.Verifier
 	// EdgeGrants, if set, mints and verifies the service's own edge
 	// grants (§A.4, §B.11.5, §C.5; edgegrants.go): cookies for
-	// /{ns}/g/{gs} and /_refs/g/{gs}, under a key and kid of the
+	// /{ns}/view/{view} and /_refs/view/{view}, under a key and kid of the
 	// service's own, never the origin's. Open sets its Vouches to those
 	// prefixes. Without it, POST and DELETE /edge-grants are 404
 	// not_offered.
 	EdgeGrants *edge.Cookies
 	// ExchangeRate is the exchangeRate bucket each principal draws one
 	// token from per exchange at POST /edge-grants (§C.5.2, §6.6; default
-	// svcedge.DefaultExchangeRate). It is a deployment's limit, so the
+	// DefaultExchangeRate). It is a deployment's limit, so the
 	// service has its own buckets, shared by every instance on its
-	// database DB (§B.11.5, svcedge.Store).
-	ExchangeRate svcedge.Rate
+	// database DB (§B.11.5, edgeStore).
+	ExchangeRate Rate
 	// Now is the clock for grant checks, kept results and the due times
 	// of second purges (default time.Now).
 	Now func() time.Time
@@ -215,6 +194,7 @@ const keepBytes = 64 << 20
 // Index is a running indexing service.
 type Index struct {
 	opt     Options
+	judged  revJudged // per-revision read answers (revjudge.go)
 	c       *client.Client
 	db      *sql.DB
 	cps     follow.SQLCheckpoints
@@ -228,14 +208,13 @@ type Index struct {
 	sealed  *derived.Cache // sealed results
 	kept    *kept.Store    // results kept past their checkpoint
 	repurge *repurge.Queue // second CDN purges
-	edge    *svcedge.Store // the service's edge grants (EdgeGrants)
+	edge    *edgeStore     // the service's edge grants (EdgeGrants)
 
 	fmu     sync.Mutex
-	filters map[string]keptFilter // scope or g: marker -> what it stands for (edge_filters, edge_gs)
+	filters map[string]keptFilter // scope or g: marker -> what it stands for (edge_filters, edge_views)
 	copied  sync.Map              // a local branch -> the kids it copied from its base (copiedKids)
 
-	fs  fstate  // the state of namespaces §B.11.9 covers (filtered.go)
-	mem members // the namespaces visibility reads there that the index doesn't serve (members.go)
+	fs fstate // the state of namespaces §7.9 covers (filtered.go)
 	// auth is the core's authentication mode as last read (authOff),
 	// kept for CheckerTTL.
 	auth struct {
@@ -276,15 +255,6 @@ type Index struct {
 	// epochMu orders judging pending epochs (judgeEpochsAt, read) with
 	// Apply's keys.Observe (write), which moves the current epoch.
 	epochMu sync.RWMutex
-	// testMemberBootstrap, if set, is called before a member's follower
-	// gives it its first checkpoint (tests: bootstrapMember).
-	testMemberBootstrap func(ctx context.Context, m string)
-	// testTrustRepair, if set, is called before each read of a purged
-	// namespace's document whose catalog.trust the index lost, and
-	// testTrustRepairPause, if set, is the first pause between two
-	// (tests: repairTrustOf).
-	testTrustRepair      func(ctx context.Context, ns string)
-	testTrustRepairPause time.Duration
 	// testBeforeAnswer, if set, is called once a reader's views are
 	// computed, before the answer is (tests: serve's head pointer,
 	// /_refs).
@@ -341,7 +311,6 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		roots:   map[string]bool{}, cur: map[string]string{}, purged: map[string]bool{}, stopped: map[string]string{}, changed: make(chan struct{}),
 	}
 	ix.fs.init()
-	ix.mem.init()
 	ix.repurge = repurge.New(db, opt.Purger, repurge.Options{Delay: opt.RepurgeDelay, Interval: opt.RepurgeInterval,
 		Now: opt.Now, Lock: &ix.wmu, Name: "index", Logf: opt.Logf})
 	for _, ns := range opt.Namespaces {
@@ -356,10 +325,6 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		return nil, err
 	}
 	if err := ix.loadState(ctx); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := ix.loadMembers(ctx); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -390,11 +355,8 @@ func (ix *Index) Origin() string { return ix.origin }
 var migrations embed.FS
 
 // resetStmts empty what a rebuild replays (cdn_repurge stays, and so do
-// the edge grants' tables, edge_filters, edge_gs and svcedge.Store's, and
-// member_checkpoints and member_conf, whose followers derive no rows: one
-// still needed resumes where it stopped, one no longer needed is forgotten
-// with a purge of idx:{m}, so no purge is missed, members.go), in one
-// transaction. checkpoints_bootstrap too: a snapshot left part-way would
+// the edge grants' tables, edge_filters, edge_views and edgeStore's), in
+// one transaction. checkpoints_bootstrap too: a snapshot left part-way would
 // otherwise be resumed, not replayed from its first page. text, made by
 // initSchema rather than a migration, is dropped, so a rebuild decides
 // between FTS5 and the LIKE fallback again.
@@ -494,10 +456,6 @@ func (ix *Index) initSchema(ctx context.Context) error {
 	if err := repurge.Init(ctx, ix.db); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
-	// Before a rebuild empties the checkpoints it goes by.
-	if err := ix.dropUnfollowedTrust(ctx); err != nil {
-		return fmt.Errorf("index: catalog trust: %w", err)
-	}
 	if ix.opt.Rebuild {
 		if err := ix.reset(ctx); err != nil {
 			return fmt.Errorf("index: rebuild: %w", err)
@@ -542,7 +500,7 @@ func (ix *Index) initSchema(ctx context.Context) error {
 // checkpoint, which retires them, may not move for long. A database of an
 // older format is rebuilt anyway (indexFormat); this covers one written
 // since. No URL of the shapes of v0.73 matches: a public URL's results are
-// JSON, and a whole JWE's URL has /g/{gs}.
+// JSON, and a whole JWE's URL has /view/{view}.
 func (ix *Index) dropWholePublic(ctx context.Context) error {
 	return ix.sealed.Drop(ctx, func(view, scope string, json bool) bool {
 		return !json && strings.HasPrefix(view, "/"+scope+"/at/")
@@ -627,20 +585,8 @@ func (ix *Index) known(ns string) bool {
 
 // Run follows every namespace until ctx is done. A follower that stops on a
 // permanent error is restarted after a pause; a purged namespace is not.
-// It also follows, without serving them, the namespaces visibility reads
-// for those §B.11.9 covers (members.go).
 func (ix *Index) Run(ctx context.Context) error {
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ix.runMembers(ctx)
-	}()
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ix.repairTrust(ctx)
-	}()
 	for ns := range ix.roots {
 		wg.Add(1)
 		go func() {
@@ -654,8 +600,6 @@ func (ix *Index) Run(ctx context.Context) error {
 
 func (ix *Index) follow(ctx context.Context, ns string) {
 	if _, purged, _ := ix.state(ns); purged {
-		// Nothing below runs for it, trustAt neither: a catalog.trust the
-		// index lost of it is read again by repairTrust.
 		ix.opt.Logf("index: %s was purged; not following", ns)
 		return
 	}
@@ -697,11 +641,6 @@ func (ix *Index) follow(ctx context.Context, ns string) {
 			}
 			err = fmt.Errorf("skipped: %s", reason)
 		} else {
-			if z, purged, cerr := ix.committed(ctx, ns); cerr == nil && !purged && z != "" {
-				// Resumed from a checkpoint committed before catalog_trust
-				// was (migration 009), or without a config entry since.
-				ix.trustAt(ctx, ns, z)
-			}
 			err = ix.runFollower(ctx, ns, opts)
 			if _, lacks := ix.keys.Skip(ns); lacks && ctx.Err() == nil {
 				// Apply stopped it: a config change (a raise to e2e, an
@@ -887,21 +826,10 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	}
 	// A snapshot carries no config entry (but a new branch's genesis,
 	// which narrowed records), so the namespace document is read at its
-	// checkpoint: the catalog.trust recorded before it (catalog_trust,
-	// which a rebuild keeps) may be one config entries the snapshot
-	// skipped have changed since, and fsTrust reads it once ns is purged.
-	// A purge-ns in place of a listing (a namespace purged before it was
-	// bootstrapped) carries none either: its document is read at the
-	// purge-ns entry, where the origin still serves it unless the
-	// namespace is sealed (§8.5), as a follower for visibility reads it
-	// at its bootstrap (bootstrapMember; §B.11.9 Where, v0.82: "the last
-	// one the origin stored or the service read"), and where that is 410
-	// too the trust recorded before is kept. Before, it was never read,
-	// and a catalog the index serves and met purged from a snapshot
-	// counted as no catalog unless a follower for visibility had read it
-	// first. A sealed namespace purged since the listing was read, whose
-	// document is 410 too, is forgotten (unknown: no catalog, which shows
-	// least).
+	// checkpoint. A purge-ns in place of a listing (a namespace purged
+	// before it was bootstrapped) carries none either: its document is
+	// read at the purge-ns entry, where the origin still serves it unless
+	// the namespace is sealed (§8.5).
 	//
 	// The document also decides, as a config entry's would, whether the
 	// snapshot narrows ns against what ns_conf records (none after a
@@ -909,12 +837,10 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// idx:{ns} (§9, §A.1): a namespace made private while the index was
 	// down or behind leaves no public result kept or cached.
 	var snapDoc *client.NSDoc
-	forgetTrust := false
 	if b.Replaces() && !config {
 		doc, err := ix.c.NSDoc(ctx, b.NS, b.NewCheckpoint)
 		switch {
 		case client.IsPurged(err):
-			forgetTrust = !co.PurgedNS
 		case err != nil:
 			return lacksRead(b.NS, fmt.Errorf("the document of %s at %s: %w", b.NS, b.NewCheckpoint, err))
 		default:
@@ -926,7 +852,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	}
 
 	// The cookies the batch's documents end, each judged in order, and
-	// all of them at a snapshot's start (cookieEnds; §B.11.9 gs, v0.86).
+	// all of them at a snapshot's start (cookieEnds; §7.9 view, v0.86).
 	ends, err := ix.cookieEnds(ctx, b.NS, b, snapDoc)
 	if err != nil {
 		return err
@@ -947,11 +873,6 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		// first); a purge-ns drops everything (Coalesce keeps only the
 		// changes after it).
 		if err := ix.dropNS(ctx, tx, b.NS); err != nil {
-			return err
-		}
-	}
-	if forgetTrust {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM catalog_trust WHERE ns = ?`, b.NS); err != nil {
 			return err
 		}
 	}
@@ -1062,7 +983,6 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// Redirects go by the committed checkpoint (Index.committed), so the
 	// gap between the commit and this doesn't make them alternate.
 	ix.mu.Lock()
-	first := ix.cur[b.NS] == ""
 	ix.cur[b.NS] = b.NewCheckpoint
 	if co.PurgedNS {
 		ix.purged[b.NS] = true
@@ -1088,11 +1008,6 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	}
 	if co.PurgedNS {
 		ix.keys.Forget(b.NS)
-	}
-	if config || co.PurgedNS || first {
-		// What coverage reads may have changed: which namespaces the
-		// index follows for it (members.go) is judged again.
-		ix.kickMembers()
 	}
 	return nil
 }
@@ -1188,15 +1103,9 @@ func (ix *Index) purgeTx(ctx context.Context, tx *sql.Tx, tags []string) error {
 }
 
 // purgeStored drops, once the apply that purges tags in ns has committed,
-// what fstate keeps of ns (fsForget) where tags purge idx:{ns}, first, then
 // the sealed results stored since its own purge of them (purgeTx), and the
-// /_refs answers they remove (refsPurged). fstate goes first: a view of
-// another namespace that read ns's state before is then computed before
-// any store counts the purge, and its answer isn't kept (fcp.gens).
+// /_refs answers they remove (refsPurged).
 func (ix *Index) purgeStored(ctx context.Context, ns string, tags []string, purgedNS bool) {
-	if slices.Contains(tags, "idx:"+ns) {
-		ix.fsForget(ns)
-	}
 	ix.sealed.Purged(tags)
 	ix.refsPurged(ctx, ns, tags, purgedNS)
 }
@@ -1205,11 +1114,8 @@ func (ix *Index) purgeStored(ctx context.Context, ns string, tags []string, purg
 // before its checkpoint is published, the kept results they remove, and
 // purges them from the service's cache (§A.1). Kept results go first: one
 // read before the commit that carries a tag it purges is then not kept
-// (kept.Store.Generation). Results at a combined checkpoint of another
-// namespace that lists ns (§A.4, filtered.go) carry idx:{ns} too, whether
-// ns is one the index serves or one it follows only for visibility
-// (members.go); what fstate keeps of ns went before (purgeStored).
-// Purgers don't block.
+// (kept.Store.Generation). Results of another namespace that list ns
+// (§A.4 Across namespaces) carry idx:{ns} too. Purgers don't block.
 func (ix *Index) purgeKept(ns string, tags []string) {
 	ix.kept.Purge(ns, tags)
 	if slices.Contains(tags, "idx:"+ns) {
@@ -1238,16 +1144,15 @@ func configDocs(b *follow.Batch) []*client.NSDoc {
 // narrowed reports whether one of docs, the namespace documents ns's
 // config units bring, or the one a snapshot is taken at (Apply), makes
 // ns private or raises it to sealed or e2e (§9), against the read mode
-// and level the index last applied (table: ns_conf, or member_conf for a
-// namespace it follows only for visibility, members.go), and records the
-// last one's, in tx, with its catalog.trust (recordTrust). Before
+// and level the index last applied (table: ns_conf), and records the
+// last one's, in tx. Before
 // the first it records, the namespace counts as public and unsealed, so
 // the first private or sealed document it applies counts too: once, at
 // the genesis of a namespace followed from the start, when nothing is
 // cached yet, and after an upgrade from a database without ns_conf, when
 // there may be.
 func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, table, ns string, docs []*client.NSDoc) (bool, error) {
-	if table != "ns_conf" && table != "member_conf" {
+	if table != "ns_conf" {
 		return false, fmt.Errorf("index: no table %q", table)
 	}
 	if len(docs) == 0 {
@@ -1267,87 +1172,8 @@ func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, table, ns string, doc
 		}
 		public, level = read == "public", lv
 	}
-	if err := recordTrust(ctx, tx, ns, docs[len(docs)-1].Value); err != nil {
-		return false, err
-	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO `+table+` (ns, public, level) VALUES (?, ?, ?) ON CONFLICT (ns) DO UPDATE SET public = excluded.public, level = excluded.level`, ns, public, level)
 	return narrowed, err
-}
-
-// recordTrust records, in tx, ns's catalog.trust as its document doc
-// gives it (null for a namespace that is no catalog), the one fsTrust
-// reads once ns is purged and its document 410 (catalog_trust).
-func recordTrust(ctx context.Context, tx *sql.Tx, ns string, doc map[string]any) error {
-	c, _ := doc["catalog"].(map[string]any)
-	trust, err := json.Marshal(c["trust"])
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO catalog_trust (ns, trust) VALUES (?, ?) ON CONFLICT (ns) DO UPDATE SET trust = excluded.trust`, ns, string(trust))
-	return err
-}
-
-// dropUnfollowedTrust forgets, at Open, the catalog.trust recorded for a
-// namespace the index served (it holds a checkpoint of it) and no longer
-// does (it isn't among the namespaces it serves now; with Branches, every
-// namespace it holds a checkpoint of is served, known), unless the index
-// applied its purge, whose last trust stays (fsTrust), or follows it as
-// a member (members.go, which records it again at its bootstrap and its
-// config entries): config entries the index no longer applies may change
-// it unseen, and once that namespace is purged, its document 410, fsTrust
-// would read the stale one, and may cover a namespace it no longer
-// trusts. Without one, it counts as no catalog, the reading that shows
-// least, as forgetMember leaves a live member it stops following.
-func (ix *Index) dropUnfollowedTrust(ctx context.Context) error {
-	if ix.opt.Branches {
-		return nil
-	}
-	rows, err := ix.db.QueryContext(ctx, `SELECT t.ns FROM catalog_trust t
-		WHERE EXISTS (SELECT 1 FROM checkpoints c WHERE c.ns = t.ns)
-		AND NOT EXISTS (SELECT 1 FROM ns_state s WHERE s.ns = t.ns AND s.purged = 1)
-		AND NOT EXISTS (SELECT 1 FROM member_checkpoints m WHERE m.ns = t.ns)`)
-	if err != nil {
-		return err
-	}
-	var drop []string
-	for rows.Next() {
-		var ns string
-		if err := rows.Scan(&ns); err != nil {
-			rows.Close()
-			return err
-		}
-		if !ix.roots[ns] {
-			drop = append(drop, ns)
-		}
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, ns := range drop {
-		ix.opt.Logf("index: %s is no longer served; forgetting its catalog.trust", ns)
-		if _, err := ix.db.ExecContext(ctx, `DELETE FROM catalog_trust WHERE ns = ?`, ns); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// lastTrust is ns's catalog.trust as the namespace document last applied
-// gave it (recordTrust), ok false if the index applied none of ns's
-// documents, nil for one that is no catalog.
-func (ix *Index) lastTrust(ctx context.Context, ns string) (trust []any, ok bool, err error) {
-	var s string
-	switch err := ix.db.QueryRowContext(ctx, `SELECT trust FROM catalog_trust WHERE ns = ?`, ns).Scan(&s); {
-	case errors.Is(err, sql.ErrNoRows):
-		return nil, false, nil
-	case err != nil:
-		return nil, false, err
-	}
-	if err := json.Unmarshal([]byte(s), &trust); err != nil {
-		return nil, false, err
-	}
-	return trust, true, nil
 }
 
 // levelRank orders encryption levels as raises go (Addendum E): at rest

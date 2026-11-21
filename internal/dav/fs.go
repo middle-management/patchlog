@@ -34,79 +34,62 @@ var errNotExist = os.ErrNotExist
 type kind int
 
 const (
-	kMissing   kind = iota // nothing, nor a directory to make it in
-	kRoot                  // /
-	kNSDir                 // a flat namespace
-	kCatDir                // a file tree's top level (§H.2), the children of files.root
-	kDoc                   // a flat namespace's JSON file, {name}.json (§H.2 "Flat view")
-	kRaw                   // a flat namespace's raw file, named by its resource name
-	kFolder                // a tree's folder, by its title in the folder it is in
-	kPlacement             // a tree's file, a placement, by its title in the folder it is in
-	kNewNode               // a name in a tree's folder that no child has: a new file (PUT) or folder (MKCOL)
-	kScratch               // a scratch file or directory (§H.6)
-	kBadName               // a name no file can have there: refused
+	kMissing kind = iota // nothing, nor a directory to make it in
+	kRoot                // /
+	kNSDir               // a flat namespace
+	kDoc                 // a flat namespace's JSON file, {name}.json (§H.2 "Flat view")
+	kRaw                 // a flat namespace's raw file, named by its resource name
+	kScratch             // a scratch file or directory (§H.6)
+	kBadName             // a name no file can have there: refused
+	kFolder              // a tree's folder (§H.2)
+	kNew                 // a name in a tree's folder that names nothing yet: a new file or folder
 )
 
 // target is a resolved path.
 type target struct {
 	kind            kind
 	path, dir, base string
-	ns              string // the namespace or catalog it is in
-	// docNS and docName are the content document of a kDoc, kRaw or
-	// kPlacement, live or not; rawName is the raw document a new kDoc's
+	ns              string // the namespace it is in
+	// docNS and docName are the content document of a kDoc or kRaw, live
+	// or not; rawName is the raw document a new kDoc's
 	// file is instead when its content isn't JSON (§H.1).
 	docNS, docName, rawName string
-	// node is the catalog node of a kCatDir (files.root), kFolder or
-	// kPlacement, and parent the folder node its path puts a kFolder,
-	// kPlacement or kNewNode in; title is the name a kFolder or kPlacement
-	// is shown by there, or the title a kNewNode gets (in NFC).
-	node, parent, title string
-	// listedAs is the name a kFolder or kPlacement was found by, before
-	// duplicates were numbered (nodeName): a write checks the node still
-	// has it (stillNamed)
-	listedAs string
-	sdir     bool // a kScratch that is a scratch directory
-	// otherCase: a kFolder or kPlacement named by another case of its
-	// name, which compares equal (nameKey) but isn't it
-	otherCase bool
-	// hiddenTop: a name at the top level of a tree whose files.root is
-	// hidden from the reader, that top level its roots (§B.11.5, §H.3;
-	// topWrite)
-	hiddenTop bool
+	sdir                    bool // a kScratch that is a scratch directory
+	// tree: a path in a file tree (§H.2); fpath is the folder path of a
+	// tree's directory or folder ("/" for its top), folder that of the
+	// folder holding a file, a folder or a new name, title the title its
+	// document has (a new name's, in NFC), and variant the name of a
+	// sibling a new name matches only under another case (§H.2)
+	tree                          bool
+	fpath, folder, title, variant string
+	// shown is the name the path's last segment matched in its folder's
+	// listing, where that differs from base (a name sent in NFD)
+	shown string
 }
 
 func (t target) isDir() bool {
-	return t.kind == kRoot || t.kind == kNSDir || t.kind == kCatDir || t.kind == kFolder || t.kind == kScratch && t.sdir
+	return t.kind == kRoot || t.kind == kNSDir || t.kind == kFolder || t.kind == kScratch && t.sdir
 }
 
-// shownAs is the name t's file or folder has in its directory's listing:
-// a tree's node the name it is shown by there (a client whose file system
-// ignores case may ask for it under another case), else the path's.
+// shownAs is the name t's file or folder has in its directory's listing.
 func (t target) shownAs() string {
-	if t.kind == kFolder || t.kind == kPlacement {
-		return t.title
+	if t.shown != "" {
+		return t.shown
 	}
 	return t.base
 }
 
-// isDoc: the path names a document's file (which may not be live), or a
-// file a write makes in a tree.
-func (t target) isDoc() bool {
-	return t.kind == kDoc || t.kind == kRaw || t.kind == kPlacement || t.kind == kNewNode
-}
+// isDoc: the path names a document's file (which may not be live).
+func (t target) isDoc() bool { return t.kind == kDoc || t.kind == kRaw }
 
 // resolve says what name names for the request's principal, noting the
-// document path a PUT writes (saveTo): one in a tree whose read failed
-// too (a 429, a timeout), as a file's, whose DELETE that follows may find
-// the tree read.
+// document path a PUT writes (saveTo).
 func (st *reqState) resolve(ctx context.Context, name string) (target, error) {
 	t, err := st.resolveName(ctx, name)
 	if st.method == "PUT" && st.saveTo == "" && slashClean(name) == st.path {
 		switch {
-		case err == nil && t.isDoc():
-			st.saveTo, st.saveDoc = t.path, t.kind == kDoc || t.kind == kRaw
-		case err != nil && st.treePath(st.path):
-			st.saveTo = st.path
+		case err == nil && (t.isDoc() || t.kind == kNew):
+			st.saveTo, st.saveDoc = t.path, true
 		}
 	}
 	return t, err
@@ -121,7 +104,7 @@ func (st *reqState) resolveName(ctx context.Context, name string) (target, error
 	}
 	segs := strings.Split(name[1:], "/")
 	t.ns = segs[0]
-	if st.s.flat[t.ns] || st.s.cats[t.ns] {
+	if st.s.flat[t.ns] || st.s.trees[t.ns] {
 		if why, err := st.offered(ctx, t.ns); err != nil || why != nil {
 			if err == nil {
 				err = why
@@ -135,20 +118,16 @@ func (st *reqState) resolveName(ctx context.Context, name string) (target, error
 		// moving it out.
 		return st.scratchAt(t, false), nil
 	}
+	if st.s.trees[t.ns] {
+		return st.resolveTree(ctx, t, segs)
+	}
 	switch {
 	case len(segs) == 1 && st.s.flat[t.ns]:
 		t.kind = kNSDir
-	case len(segs) == 1 && st.s.cats[t.ns]:
-		t.kind = kCatDir
-		if c, err := st.treeConf(ctx, t.ns); err == nil {
-			t.node = c.files.root
-		}
 	case len(segs) == 1:
 		t = st.scratchAt(t, true)
 	case st.s.flat[t.ns] && len(segs) == 2:
 		return st.resolveFlat(ctx, t)
-	case st.s.cats[t.ns]:
-		return st.resolveCatalog(ctx, t, segs[1:])
 	default:
 		t.kind = kMissing
 	}
@@ -252,8 +231,7 @@ func (st *reqState) flatOwner(ctx context.Context, ns, dir, base string) (headDo
 // made with MKCOL) can be: any other name is refused, since no file there
 // reaches the core, and kept only in memory it would vanish (a report.pdf
 // dropped on the mount's top folder, a Save As "Report.json"). A flat
-// namespace's directory refuses more (resolveFlat); a tree makes any
-// other name a new file (resolveCatalog).
+// namespace's directory refuses more (resolveFlat).
 func (st *reqState) scratchAt(t target, named bool) target {
 	t.kind = kScratch
 	f, ok := st.scratchPeek(t.path)
@@ -300,14 +278,13 @@ func appDir(base string) bool {
 }
 
 // mayScratchDir refuses a scratch directory at t (MKCOL, or a scratch
-// directory moved there) but an app's: outside a tree, files saved in a
-// folder a person made would be kept in memory only, and in a tree such a
-// folder is a folder node (resolveCatalog).
+// directory moved there) but an app's: files saved in a folder a person
+// made would be kept in memory only.
 func (st *reqState) mayScratchDir(t target) error {
 	if appDir(t.base) || st.isScratchDir(t.dir) {
 		return nil
 	}
-	return fail(http.StatusForbidden, "folders are made only in file trees (-catalog): %s can't hold one (a folder there would keep what is saved in it in memory only)", t.dir)
+	return fail(http.StatusForbidden, "%s can't hold a folder (a folder there would keep what is saved in it in memory only)", t.dir)
 }
 
 // replaced refuses a save of file t without a tag (§H.4) where its path
@@ -330,6 +307,8 @@ func (st *reqState) replaced(ctx context.Context, t target) error {
 	}
 	same := false
 	switch t.kind {
+	case kNew:
+		// A tree's name that names nothing now (§H.4 "Records").
 	case kDoc, kRaw:
 		same = ns == t.docNS && name == t.docName
 		if !same && ns == t.docNS && t.rawName != "" && name == t.rawName {
@@ -341,11 +320,6 @@ func (st *reqState) replaced(ctx context.Context, t target) error {
 			}
 			same = !live
 		}
-	case kPlacement:
-		same = ns == t.docNS && name == t.docName
-	case kNewNode:
-		d, ok := st.p.treeDeleted(t.path, st.s.opt.Now())
-		same = ok && d.cat == t.ns && d.parent == t.parent && ns == d.itemNS && name == d.itemName
 	default:
 		return nil
 	}
@@ -353,37 +327,11 @@ func (st *reqState) replaced(ctx context.Context, t target) error {
 		return nil
 	}
 	st.refuse(ns, name)
-	now := "names no file now"
-	if t.kind != kNewNode {
-		now = fmt.Sprintf("names %s/%s now", t.docNS, t.docName)
+	now := fmt.Sprintf("names %s/%s now", t.docNS, t.docName)
+	if t.kind == kNew {
+		now = "names nothing now"
 	}
 	return fail(http.StatusConflict, "%s held %s/%s when you opened it, and %s: it was deleted, moved or replaced since (§H.4), so your save isn't written over what is there; reload it", t.path, ns, name, now)
-}
-
-// otherCase refuses a write to t, a tree's file or folder named by
-// another case of its name (§H.2 "Siblings"): a client whose file system
-// tells case apart (rclone, davfs2) copying README.md and readme.md would
-// otherwise write one over the other. A client that ignores case uses a
-// file's name as listed, or as it read the file under (spelledSo); a
-// folder's is refused whatever the request carries, a file never written
-// over a folder.
-func otherCase(t target) error {
-	if t.kind == kFolder {
-		return fail(http.StatusConflict, "%s: %q is a folder here, and names in this tree compare without case (§H.2), so %q isn't made beside it; use another name", t.path, t.title, t.base)
-	}
-	return fail(http.StatusConflict, "%s: %q is a file here, and names in this tree compare without case (§H.2), so %q isn't made beside it, nor written over it; write it as %q, or use another name", t.path, t.title, t.base, t.title)
-}
-
-// spelledSo reports whether a write to t, named by another case of its
-// name, means that file: it names the revision it edited (If-Match, or an
-// If header's entity tag, which the save checks is the file's), or the
-// principal read or wrote that file under this spelling (pathOf).
-func (st *reqState) spelledSo(t target) bool {
-	if st.ifMatch != "" {
-		return true
-	}
-	ns, name, ok := st.s.pathOf(st.p, t.path)
-	return ok && ns == t.docNS && name == t.docName
 }
 
 // badName is the refusal of a kBadName.
@@ -394,9 +342,6 @@ func (st *reqState) badName(t target) error {
 		}
 	}
 	switch {
-	case st.s.cats[t.ns]:
-		_, err := newTitle(t.base)
-		return err
 	case st.s.flat[t.ns]:
 		return fail(http.StatusForbidden, "%q names no file and can't name one: in a namespace's directory (the flat view, §H.2) a file is named by its resource name, 1 to 128 lowercase letters, digits, \".\", \"_\" and \"-\" starting with a letter or digit (§3.6), and a JSON document by {name}.json; a file named otherwise would only be kept in memory for a while, so it is refused", t.base)
 	}
@@ -412,8 +357,7 @@ func notOffered(ns string) error {
 
 // offered returns why namespace ns isn't offered to the request's token,
 // or nil: a sealed or end-to-end one isn't (notOffered, §H.7; §7.4's
-// writer block says, to any grant the namespace verifies), nor a catalog
-// whose document makes no file tree (notTree, §H.2); one that refuses the
+// writer block says, to any grant the namespace verifies); one that refuses the
 // token's grant, or whose document it can't read, is (it then gets what
 // the core answers), as is one its grant doesn't name. An answer that
 // couldn't be had for now (a 429, a 5xx) is the error.
@@ -427,8 +371,6 @@ func (st *reqState) offered(ctx context.Context, ns string) (why, err error) {
 		return nil, err
 	case in.sealed:
 		return notOffered(ns), nil
-	case st.s.cats[ns] && in.notTree != "":
-		return notTree(ns, in.notTree), nil
 	}
 	return nil, nil
 }
@@ -521,13 +463,14 @@ func scratchInfo(name string, f *scratchFile) *fileInfo {
 type listing struct {
 	infos  []os.FileInfo
 	byName map[string]*fileInfo
-	docs   map[string]headDoc // file name -> document
-	res    map[string]headDoc // a flat namespace's: resource name -> document
+	docs   map[string]headDoc  // file name -> document
+	res    map[string]headDoc  // a flat namespace's: resource name -> document
+	tree   map[string]*treeEnt // a tree folder's: name -> file or folder
 }
 
 // list reads directory t: its files and folders as the core has them now
-// (each request reads a flat namespace again; a catalog's tree is kept
-// CatalogTTL), and the scope's scratch files in it. The root lists
+// (each request reads a namespace again), and the scope's scratch files
+// in it. The root lists
 // the namespaces offered (§H.7, §H.2). A flat namespace lists the head
 // rows of /heads (§H.3) by the flat view's names (§H.2): a raw document
 // by its name, any other as {name}.json, and one whose name a raw one has
@@ -555,7 +498,13 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 				add(st.dirInfo(ns))
 			}
 		}
-	case kNSDir:
+	case kNSDir, kFolder:
+		if t.tree {
+			if err := st.treeList(ctx, t, l); err != nil {
+				return nil, err
+			}
+			break
+		}
 		hs, err := st.s.liveHeads(ctx, st.tk, t.ns)
 		if err != nil {
 			return nil, err
@@ -577,47 +526,6 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 					name = dupName(name, false, taken)
 				}
 			}
-			l.docs[name] = hd
-			add(st.docInfo(name, hd))
-		}
-	case kCatDir, kFolder:
-		d, err := st.treeDir(ctx, t.ns, t.node)
-		if err != nil {
-			return nil, err
-		}
-		var files []headDoc
-		byRes := map[string]string{}
-		for _, e := range d.entries {
-			switch {
-			case e.node.Kind == kindFolder:
-				add(st.dirInfo(e.name))
-			case e.meta != nil:
-				// The file metadata the tree service listed (§H.3): no
-				// item is read.
-				hd := headDoc{ns: e.node.ItemNS, name: e.node.ItemName, rev: e.item.ID, created: e.modified, m: *e.meta, listed: true}
-				l.docs[e.name] = hd
-				add(st.docInfo(e.name, hd))
-			default:
-				files = append(files, headDoc{ns: e.node.ItemNS, name: e.node.ItemName, rev: e.item.ID})
-				byRes[e.node.ItemNS+"/"+e.node.ItemName] = e.name
-			}
-		}
-		// With tree-derived access, read under grants the catalog issues
-		// (§B.11.5 /read-grants). fetchHeads leaves out what it can't
-		// read, so names pair up by resource (an item is placed once per
-		// catalog, §B.2).
-		if err := st.readGrants(ctx, t.ns, files); err != nil {
-			return nil, err
-		}
-		docs, err := st.s.fetchHeads(ctx, st.tk, files, nil, false)
-		if err != nil {
-			return nil, err
-		}
-		for _, hd := range docs {
-			if hd.m.sealed {
-				continue
-			}
-			name := byRes[hd.ns+"/"+hd.name]
 			l.docs[name] = hd
 			add(st.docInfo(name, hd))
 		}
@@ -657,20 +565,13 @@ func (st *reqState) head(ctx context.Context, ns, name string) (*client.Head, er
 // file names no raw one, nor a raw file a JSON one), and never a sealed
 // one, which isn't offered (§H.7).
 func (st *reqState) docAt(ctx context.Context, t target) (headDoc, bool, error) {
+	if t.tree && st.method != "PROPFIND" {
+		return st.treeDocAt(ctx, t)
+	}
 	if l := st.lists[t.dir]; l != nil {
-		// A file the tree service listed (§H.3) is shown from its listing,
-		// as a PROPFIND opens it; anything else reads its document.
 		if hd, ok := l.docs[t.shownAs()]; !ok || !hd.listed || st.method == "PROPFIND" {
 			return hd, ok, nil
 		}
-	}
-	// With tree-derived access, under a grant the catalog issues for the
-	// item (§H.2 "Access"), to edit where the request writes it.
-	if err := st.itemAccess(ctx, t, st.writes() && (t.path == st.path || t.path == st.dst)); err != nil {
-		return headDoc{}, false, err
-	}
-	if t.kind == kPlacement && st.s.nsInfo(ctx, st.tk, t.docNS).sealed {
-		return headDoc{}, false, nil
 	}
 	h, err := st.head(ctx, t.docNS, t.docName)
 	if err != nil || h.State != client.Live {
@@ -714,7 +615,7 @@ func (st *reqState) stat(ctx context.Context, t target) (*fileInfo, error) {
 		}
 		return nil, errNotExist
 	}
-	if t.kind == kDoc || t.kind == kRaw || t.kind == kPlacement {
+	if t.kind == kDoc || t.kind == kRaw {
 		hd, live, err := st.docAt(ctx, t)
 		if err != nil {
 			return nil, err
@@ -758,13 +659,6 @@ func (d *davFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 	if err != nil {
 		return nil, st.fail(name, err)
 	}
-	if st.method == "MOVE" && t.path == st.dst && st.dst != st.path && (t.kind == kFolder || t.kind == kPlacement) {
-		// A rename to another case of the node's own name, which compares
-		// equal (nameKey): no other file is there, whatever Overwrite says.
-		if src, err := st.resolve(ctx, st.path); err == nil && src.kind == t.kind && src.ns == t.ns && src.node == t.node {
-			return nil, errNotExist
-		}
-	}
 	fi, err := st.stat(ctx, t)
 	if err != nil {
 		return nil, st.fail(name, err)
@@ -796,32 +690,25 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 	if flag&os.O_TRUNC != 0 {
 		// A write (PUT, the destination of a COPY, a LOCK of a new name):
 		// buffered, and committed on close. A COPY's file refused sets a
-		// guard, as a PUT's does (saveTo, §H.6); so does a PUT or COPY
-		// refused onto a tree's folder, which the DELETE that follows
-		// (rclone's) would otherwise delete.
-		switch {
-		case st.method == "COPY" && t.path == st.dst && (t.isDoc() || t.kind == kFolder):
-			st.saveTo = t.path
-		case st.method == "PUT" && t.path == st.path && t.kind == kFolder:
+		// guard, as a PUT's does (saveTo, §H.6).
+		if st.method == "COPY" && t.path == st.dst && (t.isDoc() || t.kind == kNew) {
 			st.saveTo = t.path
 		}
 		switch {
+		case t.kind == kMissing && t.tree:
+			// A new file's folder must be one the user can see (§H.4 "New
+			// files"): one with no folder document isn't in the tree.
+			return nil, fail(http.StatusConflict, "%s isn't a folder here (it doesn't exist, or isn't one you can see), so %s can't be made in it; make the folder first", t.dir, t.base)
 		case t.kind == kMissing:
 			return nil, errNotExist
 		case t.kind == kBadName:
 			return nil, st.badName(t)
-		case t.kind == kFolder && t.otherCase:
-			// Another case of a folder's name (§H.2 "Siblings"): 409,
-			// naming the folder, not the 403 or 405 of its own name.
-			return nil, otherCase(t)
 		case t.isDir() && (st.method == "COPY" || st.method == "MOVE"):
 			// A file copied or moved onto a folder (§H.5): 403, not the
 			// 405 of a PUT to one; Overwrite: F is x/net/webdav's 412.
 			return nil, fail(http.StatusForbidden, "%s is a folder: a file copied or moved there doesn't replace it (§H.5)", t.path)
 		case t.isDir():
 			return nil, fail(http.StatusMethodNotAllowed, "%s is a directory", t.path)
-		case t.kind == kPlacement && t.otherCase && !st.spelledSo(t):
-			return nil, otherCase(t)
 		}
 		if err := st.preconditions(ctx, t); err != nil {
 			return nil, st.undoOwnDelete(ctx, t, err)
@@ -832,10 +719,12 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 			}
 		}
 		switch {
-		case t.isDoc():
-			if err := st.writable(ctx, t); err != nil {
+		case t.kind == kNew:
+			if _, err := st.newPlaced(t, false, st.srcVariant()); err != nil {
 				return nil, err
 			}
+			return &writeFile{st: st, ctx: ctx, t: t, max: st.s.opt.MaxRawSize}, nil
+		case t.isDoc():
 			max, err := st.maxWrite(ctx, t)
 			if err != nil {
 				return nil, err
@@ -880,6 +769,14 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 	}
 	if !live {
 		return nil, errNotExist
+	}
+	if hd.rev != fi.rev {
+		// A tree's file read at its head, which the index's listing
+		// (stat) may lag: served under the head's tag and size.
+		fi = st.docInfo(t.shownAs(), hd)
+		if served && st.resp != nil {
+			st.resp.Set("Content-Type", fi.ctype)
+		}
 	}
 	if served {
 		if err := st.ifMatchGet(t, hd.rev); err != nil {
@@ -977,7 +874,7 @@ func (st *reqState) ifMatchGet(t target, rev string) error {
 // chain, deleted by someone else since, is that 409 (tombBase), and a
 // name without one a 412.
 func (st *reqState) preconditions(ctx context.Context, t target) error {
-	if st.ifMatch != "" && st.method == "PUT" && t.path == st.path && t.kind != kDoc && t.kind != kRaw && t.kind != kPlacement && !st.deletedPath(t) {
+	if st.ifMatch != "" && st.method == "PUT" && t.path == st.path && t.kind != kDoc && t.kind != kRaw && !st.deletedPath(t) {
 		return fail(http.StatusPreconditionFailed, "%s holds no file, so none has revision %s (If-Match): it was deleted or moved, or the name now names nothing; reload it", t.path, st.ifMatch)
 	}
 	if !st.noneMatch && !st.matchAny {
@@ -1011,29 +908,33 @@ func (st *reqState) mkdir(ctx context.Context, name string) error {
 	}
 	if st.method == "COPY" {
 		// x/net/webdav makes the copy of a folder before copying what is
-		// in it, one by one.
-		return st.copyFolder(ctx, t)
+		// in it, one by one: an app's temporary folder is copied, in
+		// memory, as the original, and a tree's folder as MKCOL makes one
+		// (§H.5 "Copy").
+		src, err := st.resolve(ctx, st.path+strings.TrimPrefix(t.path, st.dst))
+		if err != nil {
+			return err
+		}
+		if src.kind == kFolder || src.kind == kNSDir && src.tree && t.tree {
+			return st.treeCopyDir(ctx, src, t)
+		}
+		if src.kind == kScratch && src.sdir && t.path != st.dst && (t.kind == kScratch || t.kind == kBadName) {
+			return st.scratchMkdir(t.path)
+		}
+		return fail(http.StatusForbidden, "%s isn't a folder that is copied (§H.5): a namespace's directory isn't", src.path)
 	}
 	switch t.kind {
 	case kMissing:
 		// RFC 4918 §9.3.1: 409, the parent not being a collection.
 		return fail(http.StatusConflict, "%s can't be made: %s isn't a folder here (a file, or nothing); make the folders above it first", t.path, t.dir)
-	case kRoot, kNSDir, kCatDir, kFolder:
+	case kRoot, kNSDir, kFolder:
 		return os.ErrExist
-	case kNewNode:
-		if appDir(t.base) {
-			// An app saves through it: a scratch directory (§H.6).
-			return st.scratchMkdir(t.path)
-		}
-		return st.mkFolder(ctx, t)
+	case kNew:
+		return st.treeMkdir(ctx, t)
 	case kBadName, kScratch:
-		// Not a tree's folder: a scratch directory (an app's safe save),
-		// which a name no file can have may be (§H.6); in a tree, a name
-		// no title can be is refused as such.
+		// A scratch directory (an app's safe save), which a name no file
+		// can have may be (§H.6).
 		if err := st.mayScratchDir(t); err != nil {
-			if t.kind == kBadName && st.s.cats[t.ns] {
-				return st.badName(t)
-			}
 			return err
 		}
 		return st.scratchMkdir(t.path)
@@ -1057,9 +958,9 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 			return err
 		}
 		// The handler clears an existing destination before moving or
-		// copying onto it: a document or a tree's node there is written
-		// over (an edit, a rename), never deleted first.
-		if t.kind != kScratch && t.isDir() || t.kind == kPlacement {
+		// copying onto it: a document there is written over (an edit, a
+		// rename), never deleted first.
+		if t.kind != kScratch && t.isDir() {
 			return nil
 		}
 		if t.kind == kDoc || t.kind == kRaw {
@@ -1073,8 +974,13 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 	switch t.kind {
 	case kMissing:
 		return errNotExist
-	case kRoot, kNSDir, kCatDir:
+	case kRoot, kNSDir:
 		return fail(http.StatusForbidden, "the namespaces served are fixed; %s can't be deleted here", t.path)
+	case kFolder:
+		if err := st.afterRefusedSave(ctx, t); err != nil {
+			return err
+		}
+		return st.treeRmdir(ctx, t)
 	case kDoc, kRaw:
 		if hd, live, err := st.docAt(ctx, t); err != nil {
 			return err
@@ -1088,7 +994,7 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 			if match == "" {
 				match = hd.rev
 			}
-			_, err := st.deleteDoc(ctx, t.docNS, t.docName, match)
+			_, err := st.deleteDoc(ctx, t.docNS, hd.name, match)
 			if de, ok := err.(*davError); ok && de.status == http.StatusPreconditionFailed && st.ifMatch == "" {
 				err = movedSinceRead(t)
 			}
@@ -1097,23 +1003,6 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 			}
 			return err
 		}
-	case kPlacement:
-		if err := st.afterRefusedSave(ctx, t); err != nil {
-			return err
-		}
-		err := st.deleteFile(ctx, t, st.ifMatch, "")
-		if err == nil {
-			st.s.forgetPath(st.p, t.path)
-		}
-		return err
-	case kFolder:
-		// A folder a PUT or COPY was refused onto, or a write to another
-		// case of its name (§H.2 "Siblings"), is guarded as a file is
-		// (§H.6).
-		if err := st.afterRefusedSave(ctx, t); err != nil {
-			return err
-		}
-		return st.deleteFolder(ctx, t)
 	}
 	if !st.scratchRemove(t.path) {
 		return errNotExist
@@ -1121,8 +1010,7 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 	return nil
 }
 
-// afterRefusedSave refuses a DELETE of t, a document's file or a tree's
-// folder, that follows the principal's refused save to its path, using up
+// afterRefusedSave refuses a DELETE of t, a document's file, that follows the principal's refused save to its path, using up
 // one guard (refusedSaveFor,
 // §H.6), unless it names the revision it deletes, which passes and leaves
 // the guards. A document in a frozen namespace isn't deleted anyway: its
@@ -1148,12 +1036,8 @@ func (st *reqState) afterRefusedSave(ctx context.Context, t target) error {
 	if left > 0 {
 		again = fmt.Sprintf("it follows %d refused saves, each refusing one DELETE: delete it %d more times to delete it", left+1, left+1)
 	}
-	what := "file"
-	if t.kind == kFolder {
-		what = "path, a folder's"
-	}
-	return fail(http.StatusConflict, "%s wasn't deleted: this DELETE follows a refused save of the same %s (%d, moments ago), and some clients (rclone) delete a file whose upload failed; %s",
-		t.path, what, r.status, again)
+	return fail(http.StatusConflict, "%s wasn't deleted: this DELETE follows a refused save of the same file (%d, moments ago), and some clients (rclone) delete a file whose upload failed; %s",
+		t.path, r.status, again)
 }
 
 func (d *davFS) Rename(ctx context.Context, oldName, newName string) error {
@@ -1162,13 +1046,10 @@ func (d *davFS) Rename(ctx context.Context, oldName, newName string) error {
 }
 
 // rename is a MOVE: the handler has cleared an existing destination
-// (removeAll, which leaves documents and nodes in place). A live file
-// moved to a scratch name is an editor's backup: copied, it stays (§H.5).
-// Where a tree is involved, a file moves as §H.5 says (moveFile) and a
-// folder within its tree (moveFolder); in the flat view as §H.8 says
-// (moveFlat). A scratch file moved onto a file's name is a save of its
-// content, and a scratch directory moved to a tree's new name becomes a
-// folder there.
+// (removeAll, which leaves documents in place). A live file moved to a
+// scratch name is an editor's backup: copied, it stays (§H.5). A file
+// moves in the flat view as §H.8 says (moveFlat). A scratch file moved
+// onto a file's name is a save of its content.
 func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 	src, err := st.resolve(ctx, oldName)
 	if err != nil {
@@ -1182,19 +1063,12 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		return err
 	}
 	defer st.changed()
-	if dst.otherCase && !(src.ns == dst.ns && src.node == dst.node) && (dst.kind == kFolder || dst.kind == kPlacement && !st.spelledSo(dst)) {
-		// Another case of a sibling's name, file or folder (§H.2
-		// "Siblings"): refused, setting a guard (§H.6).
-		st.onto = dst.path
-		return otherCase(dst)
-	}
 	live := false
-	if src.kind == kDoc || src.kind == kRaw || src.kind == kPlacement {
+	if src.kind == kDoc || src.kind == kRaw {
 		if _, live, err = st.docAt(ctx, src); err != nil {
 			return err
 		}
 	}
-	tree := st.s.cats[src.ns] || st.s.cats[dst.ns]
 	switch {
 	case src.kind == kMissing || dst.kind == kMissing:
 		return errNotExist
@@ -1218,32 +1092,21 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		// only (davfs2's If-None-Match: *): that write is the edit.
 		st.p.setAside(src.path, st.s.opt.Now())
 		return nil
+	case src.kind == kFolder:
+		return st.treeMoveFolder(ctx, src, dst)
+	case live && (src.tree || dst.tree):
+		return st.treeMove(ctx, src, dst)
 	case live && st.deletedPath(dst):
 		// A DELETE, then a MOVE onto the name (rclone's mount without a
 		// cache saves through a temporary file so): a write to the path
 		// of a file the user deleted moments ago restores it (§H.6), with
 		// the content moved there, keeping its history.
 		return st.moveOnto(ctx, src, dst)
-	case live && tree:
-		return st.moveFile(ctx, src, dst)
-	case src.kind == kFolder:
-		return st.moveFolder(ctx, src, dst)
 	case live:
 		return st.moveFlat(ctx, src, dst)
 	case src.kind == kScratch && src.sdir:
 		switch {
-		case dst.kind == kNewNode && !appDir(dst.base):
-			// An app's directory given a person's name in a tree: a
-			// folder of that name, what is in it staying scratch.
-			if err := st.mkFolder(ctx, dst); err != nil {
-				return err
-			}
-			if err := st.scratchRename(src.path, dst.path); err != nil {
-				return err
-			}
-			st.scratchUnmark(dst.path)
-			return nil
-		case dst.kind == kScratch, dst.kind == kBadName, dst.kind == kNewNode:
+		case dst.kind == kScratch, dst.kind == kBadName:
 			if err := st.mayScratchDir(dst); err != nil {
 				return err
 			}
@@ -1258,21 +1121,16 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		return errNotExist
 	}
 	switch {
-	case dst.isDoc():
+	case dst.isDoc() || dst.kind == kNew:
 		// The atomic save: a temporary file moved over the document is
 		// a write of its content, and one refused over a live file sets a
 		// guard (§H.6).
-		if dst.kind != kNewNode {
-			if _, live, err := st.docAt(ctx, dst); err != nil {
-				return err
-			} else if live {
-				st.onto = dst.path
-			}
+		if _, live, err := st.docAt(ctx, dst); err != nil {
+			return err
+		} else if live {
+			st.onto = dst.path
 		}
 		if err := st.replaced(ctx, dst); err != nil {
-			return err
-		}
-		if err := st.writable(ctx, dst); err != nil {
 			return err
 		}
 		st.ctype = f.ctype
@@ -1313,18 +1171,12 @@ func (st *reqState) checkSource(ctx context.Context) error {
 	}
 	rev, exists := "", false
 	switch src.kind {
-	case kDoc, kRaw, kPlacement:
+	case kDoc, kRaw:
 		hd, live, err := st.docAt(ctx, src)
 		if err != nil {
 			return err
 		}
 		rev, exists = hd.rev, live
-	case kFolder:
-		h, err := st.head(ctx, src.ns, src.node)
-		if err != nil {
-			return err
-		}
-		rev, exists = h.ID, h.State == client.Live
 	case kScratch:
 		_, exists = st.scratchGet(src.path)
 	}
@@ -1347,21 +1199,17 @@ func (st *reqState) sourceMoved(p string) error {
 
 // deletedPath reports whether t is the path of a file the principal's
 // DELETE removed within ownDeleteUndo (§H.6 "Delete, then write"): a flat
-// namespace's resource, or a tree's file in the same folder.
+// namespace's resource.
 func (st *reqState) deletedPath(t target) bool {
 	now := st.s.opt.Now()
 	switch t.kind {
 	case kDoc, kRaw:
 		return st.p.deletedOwn(t.docNS, t.docName, "", now) || t.rawName != "" && st.p.deletedOwn(t.docNS, t.rawName, "", now)
-	case kNewNode:
-		d, ok := st.p.treeDeleted(t.path, now)
-		return ok && d.cat == t.ns && d.parent == t.parent
 	}
 	return false
 }
 
-// moveFlat is a MOVE of live file src of a flat namespace where no tree
-// is involved (§H.8, §H.5): onto an existing file, a save of its content
+// moveFlat is a MOVE of live file src of a flat namespace (§H.8, §H.5): onto an existing file, a save of its content
 // into it, which keeps that file's history (moveOnto); to a free name in
 // another namespace, a copy and a delete (moveAcross); to a free name in
 // its own, a create and a delete with $successor in one batch
@@ -1577,8 +1425,7 @@ func (st *reqState) fileBytes(ctx context.Context, hd *headDoc) ([]byte, error) 
 }
 
 // commitRev writes body to the file a path names: an edit, a create or a
-// restore, or in a tree a new file, an item and its placement (newFile),
-// as a file of the kind kindOf says (§H.1). It returns the revision now
+// restore, as a file of the kind kindOf says (§H.1). It returns the revision now
 // holding it ("" for none), and whether that holds exactly body. An empty
 // body is a file like any other (§H.1): a raw file of 0 bytes, made or
 // truncated, and a JSON file's 400; but where its content would decide
@@ -1586,11 +1433,6 @@ func (st *reqState) fileBytes(ctx context.Context, hd *headDoc) ([]byte, error) 
 // before the content), it is held as an empty placeholder (holdEmpty).
 func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (string, bool, error) {
 	defer st.changed()
-	// With tree-derived access, a file's item is edited under a grant the
-	// catalog issues for it (§H.2 "Access").
-	if err := st.itemAccess(ctx, t, true); err != nil {
-		return "", false, err
-	}
 	if len(body) == 0 {
 		hold, err := st.holdEmpty(ctx, t)
 		if err != nil {
@@ -1599,6 +1441,40 @@ func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (strin
 		if hold {
 			return "", true, st.scratchPut(t.path, nil, st.ctype)
 		}
+	}
+	if t.tree && t.isDoc() {
+		// Names before writes (§H.4): the file the listing named is read
+		// again, and must still be placed so; else the path is looked up
+		// again at the namespace's head (an index behind: 503), and the
+		// save goes where it leads now.
+		nt, _, live, err := st.treeFresh(ctx, t)
+		if err != nil {
+			return "", false, err
+		}
+		switch {
+		case !live && nt.isDoc():
+			return "", false, treeGone(t.path)
+		case !nt.isDoc() && nt.kind != kNew:
+			return "", false, fail(http.StatusConflict, "%s names no file now (moved, renamed or deleted since it was listed); reload the folder", t.path)
+		case nt.kind == kNew || nt.docName != t.docName:
+			// The path names another document now, or none: a save
+			// without a tag isn't written over it (§H.4 "Records").
+			if err := st.replaced(ctx, nt); err != nil {
+				return "", false, err
+			}
+		}
+		t = nt
+	}
+	if t.kind == kNew {
+		rev, exact, err := st.treeCreate(ctx, t, body)
+		if err != nil {
+			return "", false, err
+		}
+		if ns, name, ok := strings.Cut(st.wroteTo, "/"); ok {
+			st.s.notePath(st.p, t.path, ns, name)
+		}
+		st.scratchRemove(t.path)
+		return rev, exact, nil
 	}
 	raw, name, v, err := st.kindOf(ctx, t, body)
 	if err != nil {
@@ -1609,18 +1485,15 @@ func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (strin
 			return "", false, err
 		}
 	}
-	// A raw file is typed by its name (fileType): a tree's file by its
-	// title, a flat namespace's by its resource name.
-	fname := name
-	if t.kind == kPlacement || t.kind == kNewNode {
-		fname = t.title
-	}
+	// A raw file is typed by its name (fileType), its resource name.
 	var rev string
 	var exact bool
 	switch {
-	case t.kind == kNewNode:
-		rev, exact, err = st.newFile(ctx, t, raw, v, body)
 	case raw:
+		fname := name
+		if t.tree {
+			fname = t.title
+		}
 		rev, exact, err = st.commitRaw(ctx, t.docNS, name, body, saveOpts{pre: true, fname: fname})
 	default:
 		rev, exact, err = st.commitDoc(ctx, t.docNS, t.docName, v, body, saveOpts{pre: true})
@@ -1628,9 +1501,7 @@ func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (strin
 	if err != nil {
 		return "", false, err
 	}
-	if t.kind != kNewNode {
-		st.wroteTo = t.docNS + "/" + name
-	}
+	st.wroteTo = t.docNS + "/" + name
 	if ns, name, ok := strings.Cut(st.wroteTo, "/"); ok {
 		st.s.notePath(st.p, t.path, ns, name)
 	}
@@ -1648,11 +1519,12 @@ func (st *reqState) holdEmpty(ctx context.Context, t target) (bool, error) {
 	switch {
 	case st.copySrc != nil:
 		return false, nil
+	case t.kind == kNew:
 	case t.kind == kDoc || t.kind == kRaw:
 		if _, live, err := st.docAt(ctx, t); err != nil || live {
 			return false, err
 		}
-	case t.kind != kNewNode:
+	default:
 		return false, nil
 	}
 	return st.method == "LOCK" || strings.HasSuffix(strings.ToLower(t.base), ".json"), nil
@@ -1663,9 +1535,7 @@ func (st *reqState) holdEmpty(ctx context.Context, t target) (bool, error) {
 // file's path takes any bytes; a live JSON file only JSON; a new {name}.json
 // is JSON document {name} if body is I-JSON (a BOM dropped), else raw file
 // {name}.json; one the principal deleted moments ago is restored as the
-// file it was, JSON or raw (§H.6 "Delete, then write"); a tree's file
-// keeps its item's kind, and a new one is JSON where its title ends in
-// .json and body is I-JSON (newKind).
+// file it was, JSON or raw (§H.6 "Delete, then write").
 func (st *reqState) kindOf(ctx context.Context, t target, body []byte) (bool, string, any, error) {
 	switch t.kind {
 	case kRaw:
@@ -1686,31 +1556,6 @@ func (st *reqState) kindOf(ctx context.Context, t target, body []byte) (bool, st
 			return false, t.docName, v, nil
 		}
 		return true, t.rawName, nil, nil
-	case kPlacement:
-		h, err := st.head(ctx, t.docNS, t.docName)
-		if err != nil || h.State != client.Live {
-			return false, t.docName, nil, err
-		}
-		m, err := st.s.meta(ctx, st.tk, t.docNS, t.docName, h.ID)
-		return err == nil && m.raw != nil, t.docName, nil, err
-	case kNewNode:
-		if d, ok := st.p.treeDeleted(t.path, st.s.opt.Now()); ok && d.cat == t.ns && d.parent == t.parent {
-			h, err := st.head(ctx, d.itemNS, d.itemName)
-			if err != nil {
-				return false, "", nil, err
-			}
-			rev := h.ID
-			if h.State == client.Tombstoned {
-				rev = h.Last
-			}
-			if h.State == client.Live || h.State == client.Tombstoned && rev != "" {
-				if m, err := st.s.meta(ctx, st.tk, d.itemNS, d.itemName, rev); err == nil {
-					return m.raw != nil, "", nil, nil
-				}
-			}
-		}
-		raw, v := newKind(t.title, body)
-		return raw, "", v, nil
 	}
 	return false, t.docName, nil, nil
 }
@@ -1735,7 +1580,7 @@ func (st *reqState) maxWrite(ctx context.Context, t target) (int, error) {
 	if t.kind == kDoc && (t.rawName == "" || st.p.deletedOwn(t.docNS, t.docName, "", st.s.opt.Now())) {
 		return st.s.opt.MaxFileSize, nil
 	}
-	if t.kind == kDoc || t.kind == kPlacement {
+	if t.kind == kDoc {
 		hd, live, err := st.docAt(ctx, t)
 		if err != nil {
 			return 0, err
@@ -1960,4 +1805,29 @@ func (f *dirFile) Readdir(n int) ([]os.FileInfo, error) {
 	}
 	f.pos += n
 	return rest[:n], nil
+}
+
+// movedSinceRead is the answer for a DELETE without a tag of a file (§H.5
+// "Delete a file") whose delete, with If-Match on the head the gateway
+// read for it, found that head moved: someone else wrote the file in
+// between, which isn't deleted unseen. A client's own If-Match that isn't
+// the head is a 412 instead.
+func movedSinceRead(t target) error {
+	return fail(http.StatusConflict, "%s was changed by someone else while it was being deleted (§H.5), so it isn't deleted; reload it", t.path)
+}
+
+// batchErr is a batch's refusal (§7.5) as a single write's: its first
+// failing item's own failure, else err.
+func batchErr(err error) error {
+	if ae, ok := client.AsAPIError(err); ok && ae.Code == "batch" && len(ae.Items()) > 0 {
+		return itemError(ae.Items()[0])
+	}
+	return err
+}
+
+// itemError is a batch item's failure (§7.5) as a single write's error.
+func itemError(m map[string]any) *client.APIError {
+	status, _ := m["status"].(float64)
+	code, _ := m["code"].(string)
+	return &client.APIError{Status: int(status), Code: code, Body: m}
 }

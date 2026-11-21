@@ -134,10 +134,10 @@ func TestV075HeadsPrefix(t *testing.T) {
 }
 
 // v075Filtered is a fake origin filtering namespace m for a partial
-// reader (§B.11.9), in the shape of conformance scenarios 83 and 89: ranges
-// at /ns/m/g/{gs}/at/{at}/…, reached by 302 from the unfiltered URLs.
+// reader (§7.9), in the shape of conformance scenarios 83 and 89: ranges
+// at /ns/m/view/{view}/at/{at}/…, reached by 302 from the unfiltered URLs.
 type v075Filtered struct {
-	gs, at, end string
+	vid, at, end string
 	// log pages by since: entries, and X-Log-Next ("" on the last).
 	pages map[string]v075Page
 	heads map[string]v075Page
@@ -151,7 +151,7 @@ type v075Page struct {
 func (f *v075Filtered) serve(t *testing.T) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		base := "/ns/m/g/" + f.gs
+		base := "/ns/m/view/" + f.vid
 		switch p := r.URL.Path; {
 		case p == "/ns/m/log" && q.Get("live") == "":
 			// Through the unfiltered range, as a cached head pointer may.
@@ -194,7 +194,7 @@ func v075Entry(id, prev, kind, res string) map[string]any {
 	return m
 }
 
-// A filtered range (§B.11.9 Log ranges, §7.1): pages count hidden entries,
+// A filtered range (§7.9 Log ranges, §7.1): pages count hidden entries,
 // X-Log-Next names hidden ones, a page may be empty, and the range ends at
 // X-Namespace-Revision with the page that lacks X-Log-Next. FilteredLog
 // follows the redirects there and returns exactly the visible entries,
@@ -206,7 +206,7 @@ func TestV075FilteredLog(t *testing.T) {
 	end := v075ID("end")
 	batch := v075Entry(b1, c0, "batch", "")
 	batch["entries"] = []any{map[string]any{"kind": "head", "resource": "pub-a", "target": v075ID("pa")}}
-	f := &v075Filtered{gs: v075ID("gs"), at: v075ID("at"), end: end, pages: map[string]v075Page{
+	f := &v075Filtered{vid: v075ID("vid"), at: v075ID("at"), end: end, pages: map[string]v075Page{
 		"": {[]any{v075Entry(c0, "", "config", ""), batch}, h1},
 		h1: {[]any{}, h2},
 		h2: {[]any{v075Entry(e3, h2, "head", "pub-b")}, h4},
@@ -219,7 +219,7 @@ func TestV075FilteredLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (client.FilteredAt{NS: "m", GS: f.gs, At: f.at, End: end}); fa != want || !fa.Filtered() {
+	if want := (client.FilteredAt{NS: "m", View: f.vid, At: f.at, End: end}); fa != want || !fa.Filtered() {
 		t.Fatalf("at %+v, want %+v", fa, want)
 	}
 	var got []string
@@ -229,8 +229,8 @@ func TestV075FilteredLog(t *testing.T) {
 	if !reflect.DeepEqual(got, []string{c0, b1, e3, e5}) || len(es[1].Entries) != 1 || es[1].Entries[0].Resource != "pub-a" {
 		t.Fatalf("entries %v %+v", got, es)
 	}
-	// From a since naming a hidden entry, and under a cookie's /g/{gs}.
-	es, _, err = c.FilteredLogAt(ctx, client.FilteredAt{NS: "m", GS: f.gs}, h2)
+	// From a since naming a hidden entry, and under a cookie's /view/{view}.
+	es, _, err = c.FilteredLogAt(ctx, client.FilteredAt{NS: "m", View: f.vid}, h2)
 	if err != nil || len(es) != 2 || es[0].ID != e3 || es[1].ID != e5 {
 		t.Fatalf("from %s: %v %+v", h2, err, es)
 	}
@@ -265,14 +265,14 @@ func TestV075FilteredLog(t *testing.T) {
 	}
 }
 
-// Filtered /heads (§B.11.9 /heads): a partial reader is redirected to the
+// Filtered /heads (§7.9 /heads): a partial reader is redirected to the
 // listing at the current at, whose pages are filled and carry next on
 // every full page, so the last may be empty (SVC-10).
 func TestV075FilteredHeads(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	row := func(n string) any { return map[string]any{"resource": n, "kind": "head", "target": v075ID(n)} }
-	f := &v075Filtered{gs: v075ID("gs"), at: v075ID("at"), end: v075ID("end"), heads: map[string]v075Page{
+	f := &v075Filtered{vid: v075ID("vid"), at: v075ID("at"), end: v075ID("end"), heads: map[string]v075Page{
 		"":      {[]any{row("pub-a"), row("pub-b")}, "pub-b"},
 		"pub-b": {[]any{row("pub-d"), row("pub-e")}, "pub-e"},
 		"pub-e": {[]any{}, ""},
@@ -280,7 +280,7 @@ func TestV075FilteredHeads(t *testing.T) {
 	c := v075Fake(t, f.serve(t))
 	nsID := v075ID("old")
 	items, next, fa, err := c.FilteredHeadsPage(ctx, "m", nsID, "pub-", "")
-	if err != nil || len(items) != 2 || next != "pub-b" || fa != (client.FilteredAt{NS: "m", GS: f.gs, At: f.at, End: f.end}) {
+	if err != nil || len(items) != 2 || next != "pub-b" || fa != (client.FilteredAt{NS: "m", View: f.vid, At: f.at, End: f.end}) {
 		t.Fatalf("first page %v %+v %s %+v", err, items, next, fa)
 	}
 	all, fa2, err := c.FilteredHeads(ctx, "m", nsID, "pub-")
@@ -288,7 +288,7 @@ func TestV075FilteredHeads(t *testing.T) {
 		t.Fatalf("all %v %+v %+v", err, all, fa2)
 	}
 	// Under a cookie, without an at: redirected to the current one.
-	items, _, fa3, err := c.FilteredHeadsAt(ctx, client.FilteredAt{NS: "m", GS: f.gs}, "pub-", "pub-b")
+	items, _, fa3, err := c.FilteredHeadsAt(ctx, client.FilteredAt{NS: "m", View: f.vid}, "pub-", "pub-b")
 	if err != nil || len(items) != 2 || fa3.At != f.at {
 		t.Fatalf("at the current at %v %+v %+v", err, items, fa3)
 	}
@@ -298,26 +298,26 @@ func TestV075FilteredHeads(t *testing.T) {
 	}
 }
 
-// Filtered long-poll (§B.11.9 Long-poll, §7.7): LongPoll doesn't follow
-// the 302 into /ns/{ns}/g/{gs}/log, a log that isn't chain-verifiable
-// (§10), but names its gs in a *FilteredError; there an interval with only
+// Filtered long-poll (§7.9 Long-poll, §7.7): LongPoll doesn't follow
+// the 302 into /ns/{ns}/view/{view}/log, a log that isn't chain-verifiable
+// (§10), but names its view in a *FilteredError; there an interval with only
 // hidden entries ends 204, whose X-Namespace-Revision, the newest hidden
 // id, becomes the next since, and FilteredLongPoll sends it (conformance
 // scenario 72; SVC-11).
 func TestV075FilteredLongPoll(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	gs, s0, hidden, vis, newer := v075ID("gs"), v075ID("s0"), v075ID("hidden"), v075ID("vis"), v075ID("newer")
+	vid, s0, hidden, vis, newer := v075ID("vid"), v075ID("s0"), v075ID("hidden"), v075ID("vis"), v075ID("newer")
 	c := v075Fake(t, func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		switch {
 		case r.URL.Path == "/ns/m/log" && q.Get("live") == "long-poll":
-			http.Redirect(w, r, "/ns/m/g/"+gs+"/log?"+r.URL.RawQuery, 302)
-		case r.URL.Path == "/ns/m/g/"+gs+"/log" && q.Get("live") == "long-poll" && q.Get("since") == s0:
+			http.Redirect(w, r, "/ns/m/view/"+vid+"/log?"+r.URL.RawQuery, 302)
+		case r.URL.Path == "/ns/m/view/"+vid+"/log" && q.Get("live") == "long-poll" && q.Get("since") == s0:
 			w.Header().Set("X-Namespace-Revision", hidden)
 			w.Header().Set("X-Cursor", "8")
 			w.WriteHeader(204)
-		case r.URL.Path == "/ns/m/g/"+gs+"/log" && q.Get("live") == "long-poll" && q.Get("since") == hidden && q.Get("cursor") == "8":
+		case r.URL.Path == "/ns/m/view/"+vid+"/log" && q.Get("live") == "long-poll" && q.Get("since") == hidden && q.Get("cursor") == "8":
 			v075JSON(w, map[string]string{"X-Namespace-Revision": newer, "X-Cursor": "9"}, []any{v075Entry(vis, hidden, "head", "pub-a")})
 		default:
 			http.Error(w, `{"code":"not_found"}`, 404)
@@ -325,17 +325,17 @@ func TestV075FilteredLongPoll(t *testing.T) {
 	})
 	_, err := c.LongPoll(ctx, "m", s0, "")
 	fe, ok := client.AsFiltered(err)
-	if !ok || fe.NS != "m" || fe.GS != gs || fe.Err.Status != 302 || client.Retryable(err) {
+	if !ok || fe.NS != "m" || fe.View != vid || fe.Err.Status != 302 || client.Retryable(err) {
 		t.Fatalf("LongPoll: %v", err)
 	}
-	res, err := c.FilteredLongPoll(ctx, "m", fe.GS, s0, "")
+	res, err := c.FilteredLongPoll(ctx, "m", fe.View, s0, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.Timeout || res.Since != hidden || res.Cursor != "8" || res.GS != gs {
+	if !res.Timeout || res.Since != hidden || res.Cursor != "8" || res.View != vid {
 		t.Fatalf("timeout %+v", res)
 	}
-	res, err = c.FilteredLongPoll(ctx, "m", res.GS, res.Since, res.Cursor)
+	res, err = c.FilteredLongPoll(ctx, "m", res.View, res.Since, res.Cursor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -343,12 +343,12 @@ func TestV075FilteredLongPoll(t *testing.T) {
 		t.Fatalf("entries %+v", res)
 	}
 	if _, err := c.FilteredLongPoll(ctx, "m", "all", "", ""); err == nil {
-		t.Fatal("gs all accepted")
+		t.Fatal("vid all accepted")
 	}
 
 	// A redirect anywhere else stays the error it was.
 	o := v075Fake(t, func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/ns/other/g/"+gs+"/log?"+r.URL.RawQuery, 302)
+		http.Redirect(w, r, "/ns/other/view/"+vid+"/log?"+r.URL.RawQuery, 302)
 	})
 	if _, err := o.LongPoll(ctx, "m", "", ""); err == nil {
 		t.Fatal("followed a redirect into another namespace")
@@ -359,21 +359,21 @@ func TestV075FilteredLongPoll(t *testing.T) {
 	}
 }
 
-// Filtered events (§B.11.9 Events, §7.3): NSEvents doesn't follow the 302
-// into /ns/{ns}/g/{gs}/events (§10) but names its gs in a *FilteredError;
+// Filtered events (§7.9 Events, §7.3): NSEvents doesn't follow the 302
+// into /ns/{ns}/view/{view}/events (§10) but names its view in a *FilteredError;
 // FilteredNSEvents reads it with a since that may name a hidden entry
 // (SVC-11).
 func TestV075FilteredEvents(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	gs, hidden, a, b := v075ID("gs"), v075ID("hidden"), v075ID("a"), v075ID("b")
+	vid, hidden, a, b := v075ID("vid"), v075ID("hidden"), v075ID("a"), v075ID("b")
 	var mu sync.Mutex
 	var sinces []string
 	c := v075Fake(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/ns/m/events":
-			http.Redirect(w, r, "/ns/m/g/"+gs+"/events?"+r.URL.RawQuery, 302)
-		case "/ns/m/g/" + gs + "/events":
+			http.Redirect(w, r, "/ns/m/view/"+vid+"/events?"+r.URL.RawQuery, 302)
+		case "/ns/m/view/" + vid + "/events":
 			mu.Lock()
 			sinces = append(sinces, r.URL.Query().Get("since"))
 			mu.Unlock()
@@ -388,11 +388,11 @@ func TestV075FilteredEvents(t *testing.T) {
 	})
 	called := false
 	err := c.NSEvents(ctx, "m", hidden, func(client.NSEntry) error { called = true; return nil })
-	if fe, ok := client.AsFiltered(err); !ok || fe.GS != gs || called || client.Retryable(err) {
+	if fe, ok := client.AsFiltered(err); !ok || fe.View != vid || called || client.Retryable(err) {
 		t.Fatalf("NSEvents: %v (called %v)", err, called)
 	}
 	var got []string
-	if err := c.FilteredNSEvents(ctx, "m", gs, hidden, func(e client.NSEntry) error { got = append(got, e.ID); return nil }); err != nil {
+	if err := c.FilteredNSEvents(ctx, "m", vid, hidden, func(e client.NSEntry) error { got = append(got, e.ID); return nil }); err != nil {
 		t.Fatalf("FilteredNSEvents: %v", err)
 	}
 	if !reflect.DeepEqual(got, []string{a, b}) {
@@ -410,12 +410,12 @@ func TestV075FilteredEvents(t *testing.T) {
 }
 
 // A filtered /heads page carries next, its last row, on every full page
-// and no other (§B.11.9 /heads), its rows strictly after after (§7.4): an
+// and no other (§7.9 /heads), its rows strictly after after (§7.4): an
 // empty page naming next, a next that isn't the last row, or rows at or
 // before after are refused, so FilteredHeads can't repeat a page forever.
 func TestV075FilteredHeadsMalformedNext(t *testing.T) {
 	t.Parallel()
-	gs, at, end := v075ID("gs"), v075ID("at"), v075ID("end")
+	vid, at, end := v075ID("vid"), v075ID("at"), v075ID("end")
 	row := func(n string) any { return map[string]any{"resource": n, "kind": "head", "target": v075ID(n)} }
 	for name, page := range map[string]map[string]any{
 		"empty page naming next": {"heads": []any{}, "next": "pub-z"},
@@ -425,7 +425,7 @@ func TestV075FilteredHeadsMalformedNext(t *testing.T) {
 	} {
 		var asked atomic.Int64
 		c := v075Fake(t, func(w http.ResponseWriter, r *http.Request) {
-			base := "/ns/m/g/" + gs
+			base := "/ns/m/view/" + vid
 			if r.URL.Path != base+"/at/"+at+"/heads" {
 				http.Redirect(w, r, base+"/at/"+at+"/heads?"+r.URL.RawQuery, 302)
 				return
@@ -449,7 +449,7 @@ func TestV075FilteredHeadsMalformedNext(t *testing.T) {
 	c := v075Fake(t, func(w http.ResponseWriter, r *http.Request) {
 		v075JSON(w, map[string]string{"X-Namespace-Revision": end}, map[string]any{"heads": []any{}, "next": "pub-z"})
 	})
-	if _, _, _, err := c.FilteredHeadsAt(context.Background(), client.FilteredAt{NS: "m", GS: gs, At: at}, "pub-", "pub-c"); err == nil {
+	if _, _, _, err := c.FilteredHeadsAt(context.Background(), client.FilteredAt{NS: "m", View: vid, At: at}, "pub-", "pub-c"); err == nil {
 		t.Fatal("FilteredHeadsAt accepted an empty page naming next")
 	}
 }

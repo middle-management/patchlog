@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -38,20 +39,47 @@ func TestParsePGPool(t *testing.T) {
 	}
 }
 
-// An engine's two pools on Postgres take the URL's cap: pgtest's 8, a
-// quarter of it for the buckets.
-func TestPGPoolCap(t *testing.T) {
+// pool_max_conns sets the main pool's size, above 4 × GOMAXPROCS too, and
+// the bucket and commit pools are a quarter of it, at least 2; without it
+// the main pool is 4 × GOMAXPROCS.
+func TestPGPoolSizes(t *testing.T) {
+	for _, c := range []struct {
+		pool       pgPool
+		main, side int
+	}{
+		{pgPool{}, mainConns(), max(2, mainConns()/4)},
+		{pgPool{maxConns: 2}, 2, 2},
+		{pgPool{maxConns: 8}, 8, 2},
+		{pgPool{maxConns: 64}, 64, 16},
+		{pgPool{maxConns: 4*mainConns() + 3}, 4*mainConns() + 3, mainConns()},
+	} {
+		if got, side := c.pool.mainSize(), c.pool.sideSize(); got != c.main || side != c.side {
+			t.Errorf("%+v: main %d, side %d; want %d, %d", c.pool, got, side, c.main, c.side)
+		}
+	}
+}
+
+// An engine's pools on Postgres take the URL's size: pgtest's 8, and a
+// quarter of it, at least 2, for the buckets and the group commits; a
+// size above 4 × GOMAXPROCS raises the main pool.
+func TestPGPoolSize(t *testing.T) {
 	url := pgtest.NewDB(t)
-	e, err := Open(Options{Path: url, BlobDir: t.TempDir(), AuthDisabled: true})
-	if err != nil {
-		t.Fatal(err)
+	pools := func(url string) (main, buckets, commits int) {
+		t.Helper()
+		e, err := Open(Options{Path: url, BlobDir: t.TempDir(), AuthDisabled: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer e.Close()
+		return e.db.Stats().MaxOpenConnections, e.rate.store.db.Stats().MaxOpenConnections, e.commits.db.Stats().MaxOpenConnections
 	}
-	defer e.Close()
-	if got, want := e.db.Stats().MaxOpenConnections, min(8, mainConns()); got != want {
-		t.Errorf("main pool: %d connections, want pgtest's cap, %d", got, want)
+	if m, b, c := pools(url); m != 8 || b != 2 || c != 2 {
+		t.Errorf("pgtest's pool_max_conns=8: main %d, buckets %d, commits %d; want 8, 2, 2", m, b, c)
 	}
-	if got, want := e.rate.store.db.Stats().MaxOpenConnections, min(2, bucketConns()); got != want {
-		t.Errorf("bucket pool: %d connections, want %d", got, want)
+	big := 4*mainConns() + 8
+	raised := strings.Replace(url, "pool_max_conns=8", fmt.Sprintf("pool_max_conns=%d", big), 1)
+	if m, b, c := pools(raised); m != big || b != big/4 || c != big/4 {
+		t.Errorf("pool_max_conns=%d: main %d, buckets %d, commits %d; want %d, %d, %d", big, m, b, c, big, big/4, big/4)
 	}
 	bad := strings.Replace(url, "pool_max_conns=8", "pool_max_conns=1", 1)
 	if _, err := Open(Options{Path: bad, BlobDir: t.TempDir(), AuthDisabled: true}); err == nil || !strings.Contains(err.Error(), "pool_max_conns") {

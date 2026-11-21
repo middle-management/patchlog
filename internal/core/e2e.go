@@ -72,7 +72,6 @@ import (
 	"context"
 	"crypto/ecdh"
 	"database/sql"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -477,8 +476,7 @@ func (t *tx) e2eSnapshot(row *revRow) string {
 // §E.2.3 window the request asks; in a branch, those of each base's
 // keyring as of at (§F.8.1), whether or not the branch has written its own
 // since, for that base's epochs baseEpochs selects, which the request's
-// epochs don't narrow. A remote branch's shadows are bases like any other:
-// each holds a level of the remote base's chain as of at (§G.5.2). Only
+// epochs don't narrow. Only
 // keyring entries are relayed: the origin holds no key of an e2e
 // namespace (Addendum E Levels).
 func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error) {
@@ -542,23 +540,9 @@ func (t *tx) keyEpochs(n *nsRow, max int) []epochStart {
 	return t.epochStarts(`e2e_epochs`, n.id, max)
 }
 
-// epochNow is the epoch base b has in force now (§E.2.3): its document's,
-// or for a remote branch's shadow, whose document stays as the remote base's
-// was at at, the latest of the source's epochs the follower has seen
-// (followRemote), if later. A deeper shadow whose current document B can't
-// read has no epoch now that a branch's keys go by: baseEpochs gives none
-// of its epochs before asking (chainReadable).
+// epochNow is the epoch base b has in force now (§E.2.3): its document's.
 func (t *tx) epochNow(b *nsRow) int {
-	cur := t.config(b.configSeq).Epoch
-	if !b.isShadow() {
-		return cur
-	}
-	var max sql.NullInt64
-	t.must(t.QueryRow(`SELECT MAX(epoch) FROM e2e_epochs WHERE ns = ?`, b.id).Scan(&max))
-	if max.Valid && int(max.Int64) > cur {
-		return int(max.Int64)
-	}
-	return cur
+	return t.config(b.configSeq).Epoch
 }
 
 // baseEpochs lists the epochs of base b whose keys a branch's /keys gives
@@ -568,14 +552,8 @@ func (t *tx) epochNow(b *nsRow) int {
 // block has nbf, or authentication is disabled, the epoch b has in force
 // now (epochNow), so none once b has moved past its epoch at at; and no
 // more than b's historyEpochs at at before its epoch there: b's keyring
-// epochs. A base at at that isn't e2e gives none, and nor does a remote
-// branch's deeper base whose current namespace document B can't read
-// (chainReadable, §G.5.2 E3 sources): its keyring entries aren't relayed,
-// and its last-seen epoch isn't used.
+// epochs. A base at at that isn't e2e gives none.
 func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
-	if !t.chainReadable(b) {
-		return nil
-	}
 	var cseq, created int64
 	if err := t.QueryRow(`SELECT config_seq, created FROM ns_log WHERE seq = ?`, at).Scan(&cseq, &created); err != nil {
 		return nil
@@ -625,44 +603,15 @@ func (t *tx) hasEpochKey(ns int64, epoch int) bool {
 	return ok
 }
 
-// kidName is the namespace that kids of b's content name: b itself, or for
-// a remote branch's shadow the namespace of the remote base's chain it
-// mirrors, whose name read-through ciphertext keeps (§G.5.2): the remote
-// base for the branch's first shadow, and its base.chain's i-th name for
-// the shadow i levels below.
+// kidName is the namespace that kids of b's content name: b itself.
 func (t *tx) kidName(b *nsRow) string {
-	if !b.isShadow() {
-		return b.name
-	}
-	cur := b.id
-	for depth := 0; ; depth++ {
-		var branch int64
-		var ns string
-		err := t.QueryRow(`SELECT branch, ns FROM remote_bases WHERE shadow = ?`, cur).Scan(&branch, &ns)
-		if err == nil {
-			if depth == 0 {
-				return ns
-			}
-			if base := t.config(t.nsByID(branch).configSeq).Base; base != nil && depth < len(base.Chain) {
-				return base.Chain[depth]
-			}
-			return b.name
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			t.must(err)
-		}
-		// The shadow above reads through this one.
-		if t.QueryRow(`SELECT ns FROM namespaces WHERE base = ? AND name LIKE '~%'`, cur).Scan(&cur) != nil {
-			return b.name
-		}
-	}
+	return b.name
 }
 
 // keyringEntries returns the entries of keyring document d for the
 // recipient enc, of the given epochs, as /keys relays them (§E.2.3): the
 // entries whose to is enc's thumbprint, with from. Each entry's kid names
-// the keyring's owner, checked when it was written; for a remote branch's
-// shadow, the remote base (§G.5). Only a keyring of the §E.3.2 form, its
+// the keyring's owner, checked when it was written. Only a keyring of the §E.3.2 form, its
 // $nonce of §C.7's form as a write checks it (seal.CheckKeyringV2), is relayed: one
 // stored in the format before v0.63 relays nothing, failing closed until a
 // key holder wraps it again, and one with a $nonce written before v0.76
@@ -791,8 +740,7 @@ func (t *tx) pruneBlobsE2E(res, hseq int64, kept []ids.ID) {
 // horizon after an archive restore left the earlier one; and, for a
 // resource without a horizon that has more than one, all of them, since
 // none says which the last prune stored (readers fold from the restored
-// log). The one snapshot a restore keeps, and a remote branch's mirrored
-// one, which sits at its resource's horizon (insertChain), stay. It runs
+// log). The one snapshot a restore keeps stays. It runs
 // after the legacy-e2e gate, the migrations and that gate's purges, and
 // is idempotent. It returns the number of rows deleted.
 func (e *Engine) cleanStaleSnapshots(ctx context.Context) (int64, error) {

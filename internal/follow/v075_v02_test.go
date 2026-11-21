@@ -20,7 +20,7 @@ type v075CP string
 func (c v075CP) Load(context.Context, string, string) (string, error) { return string(c), nil }
 
 // A follower whose grant has become a partial reader's is redirected from
-// the namespace's long-poll and events to the filtered log (§B.11.9 URLs),
+// the namespace's long-poll and events to the filtered log (§7.9 URLs),
 // which isn't chain-verifiable and whose batches hold only visible items
 // (§10). It must not apply such a batch as the whole of it: Run stops with
 // the redirect, a *client.FilteredError naming gs, and applies nothing, in
@@ -42,15 +42,15 @@ func TestV075FollowerRefusesFilteredLog(t *testing.T) {
 			w.Header().Set("Location", "/ns/m/rev/"+h)
 			w.WriteHeader(302)
 		case p == "/ns/m/rev/"+h+"/heads":
-			http.Redirect(w, r, "/ns/m/g/"+gs+"/at/"+at+"/heads?"+r.URL.RawQuery, 302)
+			http.Redirect(w, r, "/ns/m/view/"+gs+"/at/"+at+"/heads?"+r.URL.RawQuery, 302)
 		case p == "/ns/m/log" && q.Get("live") == "long-poll", p == "/ns/m/events":
-			http.Redirect(w, r, "/ns/m/g/"+gs+p[len("/ns/m"):]+"?"+r.URL.RawQuery, 302)
-		case p == "/ns/m/g/"+gs+"/log" && q.Get("since") == h:
+			http.Redirect(w, r, "/ns/m/view/"+gs+p[len("/ns/m"):]+"?"+r.URL.RawQuery, 302)
+		case p == "/ns/m/view/"+gs+"/log" && q.Get("since") == h:
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Namespace-Revision", b)
 			w.Header().Set("X-Cursor", "1")
 			json.NewEncoder(w).Encode([]any{batch})
-		case p == "/ns/m/g/"+gs+"/events":
+		case p == "/ns/m/view/"+gs+"/events":
 			w.Header().Set("Content-Type", "text/event-stream")
 			d, _ := json.Marshal(batch)
 			fmt.Fprintf(w, "id: %s\nevent: batch\ndata: %s\n\n", b, d)
@@ -88,7 +88,7 @@ func TestV075FollowerRefusesFilteredLog(t *testing.T) {
 				mode, applied[0].NewCheckpoint, len(applied[0].Units[0].Changes()), err)
 		}
 		mu.Unlock()
-		if fe, ok := client.AsFiltered(err); !ok || fe.GS != gs || timedOut {
+		if fe, ok := client.AsFiltered(err); !ok || fe.View != gs || timedOut {
 			t.Fatalf("%s: Run: %v (timed out %v), not the redirect to the filtered log", mode, err, timedOut)
 		}
 	}

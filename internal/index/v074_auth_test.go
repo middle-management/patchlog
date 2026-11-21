@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/middle-management/patchlog/internal/svcedge"
+	"github.com/middle-management/patchlog/internal/index"
 )
 
 // v0.74 integration (§C.5.3, changelog Grants: "an empty Authorization
@@ -14,7 +14,7 @@ import (
 // ignored and the read is judged as a grant's, so it is 401.
 func TestV074EmptyAuthorizationIgnoresCookie(t *testing.T) {
 	t.Parallel()
-	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	w := p37Setup(t, index.DefaultExchangeRate)
 	x := w.x
 	amy := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"pa", "pb"}, []string{"read"})
 	prefixes, cookies := w.exchange(t, x, amy)

@@ -31,13 +31,6 @@ type davError struct {
 	// a nonce, a limit), which the token's copy of §7.4's writer block
 	// may have had out of date (record)
 	refresh bool
-	// tooBig: a folder holds more than a tree service listing takes
-	// (svcList), refused as a listing, not as a path (resolveCatalog)
-	tooBig bool
-	// svcRefused: a tree service refused the token's grant a listing
-	// (403), as one without tree-derived access refuses every grant that
-	// doesn't read its namespaces whole (§B.11.5)
-	svcRefused bool
 }
 
 func (e *davError) Error() string {
@@ -99,7 +92,7 @@ func limitRefusal(ae *client.APIError, more string) *davError {
 
 // upstream maps an error of the core (§12) to what the WebDAV client gets
 // (§H.4 "Answers"): 401, 403 and 404 pass through, a 302 to a filtered
-// read (§B.11.9) is 403, 409 frozen is 403 naming the successor (a frozen
+// read (§7.9) is 403, 409 frozen is 403 naming the successor (a frozen
 // namespace takes no writes, §8.4, for good: clients retry a 423, as a
 // lock that may go), 410 purged stays (§8.5) and another 410 (deleted
 // meanwhile, pruned) is a 409 asking for a reload, a limit refused (413,
@@ -155,9 +148,9 @@ func upstream(err error) error {
 		return fail(ae.Status, "%s", msg)
 	case ae.Status == 302:
 		// A partial reader's unfiltered namespace read, redirected to its
-		// filtered form (§B.11.9 URLs), which isn't read here: the grant
+		// filtered form (§7.9 URLs), which isn't read here: the grant
 		// doesn't read it unrestricted, as its 403 said before v0.75.
-		return fail(http.StatusForbidden, "your grant reads this namespace only filtered (§B.11.9)")
+		return fail(http.StatusForbidden, "your grant reads this namespace only filtered (§7.9)")
 	case ae.Status == 409 && ae.Code == "frozen":
 		e := fail(http.StatusForbidden, "%s: the namespace takes no writes (§8.4)", msg)
 		e.frozen, e.refresh = true, true
@@ -181,8 +174,7 @@ func upstream(err error) error {
 	return upFailed(theCore, err)
 }
 
-// theCore names the core in a 502 or 503, as a catalog's tree or catalog
-// service is named by its catalog.
+// theCore names the core in a 502 or 503.
 const theCore = "the core"
 
 // The Retry-After of this server's 503s, its own (§H.4 "Answers", v0.86):
@@ -192,7 +184,7 @@ const (
 	retryLate = "5" // one that didn't answer in time
 )
 
-// upBusy is the 503 for an upstream (what: the core, or a catalog's
+// upBusy is the 503 for an upstream (what: the core, or another
 // service) that answered 429 or 503: it names the upstream and nothing of
 // its answer (cause, which is logged), with this server's Retry-After.
 func upBusy(what string, cause error) *davError {

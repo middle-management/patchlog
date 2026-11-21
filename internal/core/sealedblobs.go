@@ -255,8 +255,14 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, name); err != nil {
-			return err
+		a, aerr := t.reader(n, cred, name)
+		if aerr != nil {
+			return aerr
+		}
+		if t.readsByDoc(n, a) && (n.purged || !t.mayReadRow(a, n, name, nil)) {
+			// Sealed content is judged with a null document (§6.4.1),
+			// as is a purged namespace's.
+			return notFound()
 		}
 		if n.purged {
 			return t.purgedRead(n)

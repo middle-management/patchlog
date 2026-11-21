@@ -272,12 +272,11 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 // otherwise public or private by its read. A branch's is its own. A
 // level this version doesn't know is the strictest, so no archive is
 // labelled below its namespace: an importer goes by the label (§G.5.1
-// Importing). A remote branch's shadow (§G.3) follows its branch's level
-// and is never public.
+// Importing).
 func (t *tx) archiveAccess(n *nsRow) string {
 	switch t.nsLevel(n) {
 	case levelNone, levelAtRest:
-		if !n.isShadow() && t.config(n.configSeq).Read == "public" {
+		if t.config(n.configSeq).Read == "public" {
 			return "public"
 		}
 		return "private"
@@ -309,7 +308,7 @@ func (t *tx) archiveGrant(n *nsRow, gid ids.ID, created time.Time) *ArchiveGrant
 	}
 	var chain []link
 	var bound sql.NullInt64
-	for cur := n; cur != nil && !cur.isShadow(); {
+	for cur := n; cur != nil; {
 		chain = append(chain, link{cur, bound})
 		if !cur.base.Valid {
 			break

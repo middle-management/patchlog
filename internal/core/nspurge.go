@@ -54,6 +54,11 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		if v.state == Purged {
 			return gone()
 		}
+		// Step 2.2: a head the grant's read rules hide is 403 before the
+		// precondition, which would name it (§6.2, §C.2 item 5).
+		if err := t.readsWrittenHead(n, cfg, a, name); err != nil {
+			return err
+		}
 		if ifMatch == "" {
 			return apiErr(428, "precondition_required")
 		}
@@ -344,7 +349,7 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 		t.readChains(unknown)
 	}
 	// Their locks, in one statement: the candidates' exclusive, those
-	// bases' shared, up to the root or the first remote shadow, as resolve
+	// bases' shared, up to the root, as resolve
 	// takes them (keepChain).
 	want := map[int32]lockMode{}
 	var all []int64
@@ -360,7 +365,7 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 			all = append(all, id)
 			want[lockKey(id)] = max(want[lockKey(id)], lockShared)
 			l := t.link(id)
-			if !l.isBranch() || l.isShadow() {
+			if !l.isBranch() {
 				break
 			}
 			id = l.base.Int64
@@ -1027,12 +1032,6 @@ func (t *tx) purgeApply(p *purgePlan, author int64, forced bool) ids.ID {
 	in, arg := `name = ? AND `+t.e.inArray("ns", "bigint"), t.e.arrayArg(reached)
 	t.deleteSealed(in, p.name, arg)
 	t.deleteBlobEpochs(in, p.name, arg)
-	// A remote branch's mirrored copy is its own: it goes too, in every
-	// shadow of its base's chain (§G.3). Only the purged namespace can be
-	// one: a branch below it has a local base.
-	for _, sh := range t.remoteShadows(p.root) {
-		t.purgeShadow(sh, p.name)
-	}
 	if validateBoth {
 		t.purgeCheck(p, true)
 	}
@@ -1110,7 +1109,7 @@ func (t *tx) appendPurges(as []purgeAppend, author int64) {
 // namespace in which the walk would purge the name, append an entry or
 // delete stored sealings is one the plan reaches, and the plan sees there
 // what the walk sees; done, after its last write, unless the walk finds
-// nothing left to do anywhere, the remote shadows included.
+// nothing left to do anywhere.
 func (t *tx) purgeCheck(p *purgePlan, done bool) {
 	steps := map[int64]purgeStep{}
 	for _, s := range p.steps {
@@ -1154,11 +1153,6 @@ func (t *tx) purgeCheck(p *purgePlan, done bool) {
 		walk(root)
 		if !done {
 			return
-		}
-		for _, sh := range t.remoteShadows(root) {
-			if r := t.resource(sh.id, p.name); r != nil && r.state != statePurged || stored(sh.id) {
-				panic(fmt.Sprintf("purge of %s in %s: its remote shadow %s still has it afterwards", p.name, p.root.name, sh.name))
-			}
 		}
 	})
 }
@@ -1254,7 +1248,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 
 // purgeNSNow purges namespace n, its checks passed (PurgeNamespace), or
 // at Open (purgeRaisedE2E), as author: its content, sealed bytes and epoch
-// keys go, with its remote shadows', and a purge-ns entry is appended. It
+// keys go, and a purge-ns entry is appended. It
 // returns the entry's ns_id.
 func (t *tx) purgeNSNow(n *nsRow, forced bool, author int64) string {
 	t.deleteArchives(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
@@ -1277,11 +1271,6 @@ func (t *tx) purgeNSNow(n *nsRow, forced bool, author int64) string {
 	t.metaChanged = true
 	_, err = t.Exec(`UPDATE namespaces SET purged = 1 WHERE ns = ?`, n.id)
 	t.must(err)
-	// A remote branch's mirrored copy of its base goes too; nothing
-	// reaches the base (§G.3).
-	for _, sh := range t.remoteShadows(n) {
-		t.purgeShadowNS(sh)
-	}
 	entry := map[string]any{"kind": "purge-ns"}
 	if forced {
 		entry["forced"] = true

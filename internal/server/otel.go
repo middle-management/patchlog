@@ -202,13 +202,6 @@ func (s *Server) createBranch(ctx context.Context, req core.Request, br core.Bra
 	return res, err
 }
 
-func (s *Server) registerRemoteBranch(ctx context.Context, req core.Request, rr core.RemoteRegistration) (*core.RegistrationResult, error) {
-	ctx, op := startWrite(ctx, "RegisterRemoteBranch", "remote_registration", req.NS)
-	res, err := s.e.RegisterRemoteBranch(ctx, req, rr)
-	op.end(0, false, false, err)
-	return res, err
-}
-
 func (s *Server) purge(ctx context.Context, req core.Request, name, ifMatch string, force bool) (string, error) {
 	ctx, op := startWrite(ctx, "Purge", "purge", req.NS)
 	id, err := s.e.Purge(ctx, req, name, ifMatch, force)

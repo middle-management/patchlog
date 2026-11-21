@@ -6,8 +6,7 @@
 //   - the root signature by a key of the namespace document at its head;
 //   - in a branch, keys follow the base (§C.4): a key the branch copied from
 //     its base is accepted only while the base's current document still has
-//     it with the same pub, recursively, through local bases only: a remote
-//     branch's keys and revocations are its own (§10, §G.3);
+//     it with the same pub, recursively;
 //   - revocations of the namespace and, for a branch, of every local base;
 //   - the order of §C.2 and §C.8: a token that can't be decoded, whose
 //     rules don't compile, or over grantSize or rulesPerGrant is 401
@@ -16,9 +15,8 @@
 //     key, bad signature, revoked, expired, not yet valid, "*" outside an
 //     operator grant) is 401;
 //   - key scopes, including attrs (validated with internal/rules as the
-//     core does), requireAt/maxLag (checked against the named chain,
-//     relative to the grant's issuance, default maxLag 60 seconds) and
-//     readScope (a read grant that doesn't fix /resource is 403, §2.1);
+//     core does) and readScope (a read grant that doesn't fix /resource
+//     is 403, §2.1);
 //   - read decisions: the grant allows read and its key-scope, block and
 //     role rules pass against a read envelope
 //     { action: "read", resource?, principal }, which has no now: a rule
@@ -70,27 +68,7 @@ type Checker struct {
 	seq         uint64
 	observed    map[string]uint64
 	invalidated uint64
-
-	// The heads of a requireAt chain read again at once for an at the
-	// cached ones don't reach (checkAt, forcedState): one read per
-	// namespace at a time (forcing), at least minForced after the one
-	// before it started (lastForced).
-	minForced  time.Duration
-	forcing    map[string]*forcedRead
-	lastForced map[string]time.Time
-
-	// purgedHeads is whether a frozen namespace a requireAt key names is
-	// purged at a head, by namespace and head (purgedAt): a head is
-	// purged or not for good.
-	purgedHeads map[string]bool
 }
-
-// minForcedInterval is the default Checker.minForced.
-const minForcedInterval = time.Second
-
-// forcedReadTimeout bounds a forced read (runForced), which no check's
-// context cancels: the client sets no timeout of its own.
-const forcedReadTimeout = 10 * time.Second
 
 // Option configures a Checker.
 type Option func(*Checker)
@@ -127,9 +105,7 @@ func (ch *Checker) ValidationSteps() int { return ch.steps }
 // New returns a Checker that reads namespace documents with c.
 func New(c *client.Client, opts ...Option) *Checker {
 	ch := &Checker{c: c, ttl: 30 * time.Second, now: time.Now, maxGrant: 8 << 10, maxRules: 32,
-		states: map[string]*nsState{}, copied: map[string]map[string]grant.Key{}, observed: map[string]uint64{},
-		minForced: minForcedInterval, forcing: map[string]*forcedRead{}, lastForced: map[string]time.Time{},
-		purgedHeads: map[string]bool{}}
+		states: map[string]*nsState{}, copied: map[string]map[string]grant.Key{}, observed: map[string]uint64{}}
 	for _, o := range opts {
 		o(ch)
 	}
@@ -144,10 +120,7 @@ type Config struct {
 	Keys    []grant.Key
 	Roles   grant.Roles
 	Revoked map[string]bool
-	MaxLag  *time.Duration
-	// Base is the base namespace of a local branch, "" otherwise: a
-	// remote branch's base is in another deployment, and contributes no
-	// keys or revocations (§C.4, §10, §G.3).
+	// Base is the base namespace of a branch, "" otherwise (§C.4, §10).
 	Base   string
 	BaseAt string
 	Doc    map[string]any
@@ -173,19 +146,9 @@ func ParseConfig(ns, head string, doc map[string]any) (*Config, error) {
 			}
 		}
 	}
-	if s, ok := doc["maxLag"].(string); ok {
-		if d, err := grant.ParseDuration(s); err == nil {
-			cfg.MaxLag = &d
-		}
-	}
 	if b, ok := doc["base"].(map[string]any); ok {
-		// A base with an origin is a remote branch's, in another
-		// deployment: a namespace of the same name here is unrelated,
-		// so it is never loaded for its keys (§10, §G.3).
-		if _, remote := b["origin"]; !remote {
-			cfg.Base, _ = b["ns"].(string)
-			cfg.BaseAt, _ = b["at"].(string)
-		}
+		cfg.Base, _ = b["ns"].(string)
+		cfg.BaseAt, _ = b["at"].(string)
 	}
 	return cfg, nil
 }
@@ -312,72 +275,6 @@ func (ch *Checker) stateWithin(ctx context.Context, ns string, ttl time.Duration
 	return st, now, nil
 }
 
-// forcedRead is a read of a namespace's heads that bypasses the TTL
-// (forcedState), shared by every check waiting for it.
-type forcedRead struct {
-	done    chan struct{} // closed once st and err are set
-	started time.Time     // before its heads were read
-	st      *nsState
-	err     error
-}
-
-// forcedState is stateWithin(ctx, target, 0) for a check begun at begun
-// that found an at the cached heads, read before it began, don't reach
-// (checkAt). Any grant whose key has a requireAt may name such an at, so
-// a read costs the origin a head per chain namespace, and a load and a
-// second log read if one moved: they are read once per namespace at a
-// time, and at least minForced after the read before started, which
-// every check waiting meanwhile shares. A state whose heads were read
-// after the check began, by any read, is used as it is; a read that
-// started before it is not, and the heads are read again (waiting out
-// what is left of minForced), so an at newer than every read is still
-// found. The read itself is not canceled with ctx, since other checks
-// may be waiting for it, but bounded by forcedReadTimeout.
-func (ch *Checker) forcedState(ctx context.Context, target string, begun time.Time) (*nsState, error) {
-	for {
-		ch.mu.Lock()
-		if st := ch.states[target]; st != nil && !st.checkedAt.Before(begun) {
-			ch.mu.Unlock()
-			return st, nil
-		}
-		f := ch.forcing[target]
-		if f == nil {
-			f = &forcedRead{done: make(chan struct{})}
-			ch.forcing[target] = f
-			wait := time.Until(ch.lastForced[target].Add(ch.minForced))
-			go ch.runForced(context.WithoutCancel(ctx), target, f, wait)
-		}
-		ch.mu.Unlock()
-		select {
-		case <-f.done:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		if !f.started.Before(begun) {
-			return f.st, f.err
-		}
-	}
-}
-
-// runForced is forcedRead f of target's heads, after wait.
-func (ch *Checker) runForced(ctx context.Context, target string, f *forcedRead, wait time.Duration) {
-	if wait > 0 {
-		time.Sleep(wait)
-	}
-	ch.mu.Lock()
-	f.started = time.Now()
-	ch.lastForced[target] = f.started
-	ch.mu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, forcedReadTimeout)
-	st, _, err := ch.stateWithin(ctx, target, 0)
-	cancel()
-	ch.mu.Lock()
-	f.st, f.err = st, err
-	delete(ch.forcing, target)
-	ch.mu.Unlock()
-	close(f.done)
-}
-
 // maxDepth bounds base chains (the deployment's branch depth is 8 by default).
 const maxDepth = 32
 
@@ -453,7 +350,7 @@ func (ch *Checker) copiedKeys(ctx context.Context, ns string, cfg *Config) (map[
 	}
 	entryID := ""
 	for _, e := range entries {
-		if e.Kind == "branch" && e.Name == ns && e.Remote == nil {
+		if e.Kind == "branch" && e.Name == ns {
 			entryID = e.ID
 			break
 		}
@@ -494,8 +391,7 @@ func findKey(ks []grant.Key, kid string) (grant.Key, bool) {
 // there is no usable grant (malformed, unknown key, bad signature, revoked,
 // expired or not yet valid, or a namespace that doesn't exist); 403 when a
 // valid grant's key scope refuses it. Grant failures are *grant.AuthError;
-// other errors are fetch failures, a *ChainError among them where the chain
-// a requireAt key names can't be read (§C.4).
+// other errors are fetch failures.
 func (ch *Checker) Verify(ctx context.Context, ns, token string) (*grant.Verified, error) {
 	if token == "" {
 		return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
@@ -522,7 +418,6 @@ func (ch *Checker) Verify(ctx context.Context, ns, token string) (*grant.Verifie
 		Revoked:       st.revoked,
 		Roles:         st.cfg.Roles,
 		ValidateAttrs: func(schema any, attrs map[string]any) error { return validateAttrs(schema, attrs, ch.steps) },
-		CheckAt:       ch.checkAt(ctx, ns),
 	}
 	return grant.Verify(g, env)
 }
@@ -624,204 +519,6 @@ func validateAttrs(schema any, attrs map[string]any, steps int) error {
 	return nil
 }
 
-// ChainError is a failure to read the chain a requireAt key names (§C.4
-// requireAt): its state, keys, document or log couldn't be fetched or
-// opened, or the namespace itself answered 404 (or refused the checker).
-// It is no refusal of the grant: grant.Verify returns it as is, and so do
-// Verify and CheckRead, as an error that is not a *grant.AuthError. Its
-// verifier answers 503 behind while Transient (§A.1: a transport error,
-// a deadline, a 5xx, 408 or 429, also within client.ErrKeyFetch), 502
-// upstream otherwise, naming no namespace, never 403 (§12.1). Its text
-// names none; Err, which it unwraps to, may, for logs.
-type ChainError struct {
-	Transient bool
-	Err       error
-}
-
-func (e *ChainError) Error() string { return "cannot read the chain a requireAt key names" }
-
-// Unwrap returns the failure the chain couldn't be read for.
-func (e *ChainError) Unwrap() error { return e.Err }
-
-// ChainUnreadable reports whether the failure is transient (§A.1): it is
-// the method callers match (errors.As) to answer 503 or 502.
-func (e *ChainError) ChainUnreadable() (transient bool) { return e.Transient }
-
-// A check canceled meanwhile (its request gone, or ended while it waited
-// for a forced read, forcedState) is transient too, as one past its
-// deadline is: the chain may well read once asked again.
-func chainError(err error) *ChainError {
-	return &ChainError{Transient: client.Transient(err) || errors.Is(err, context.Canceled), Err: err}
-}
-
-// checkAt resolves a key's requireAt (§C.4) against the public API, as the
-// core does: at must be an ns_id in the named chain (ns itself for
-// requireAt true), and must have been its head at some point within maxLag
-// before the grant was issued: its successor, if any, was written no
-// earlier than issued − maxLag. maxLag is the target namespace's (default
-// 60 seconds), or the key's when stricter. An at the cached head doesn't
-// reach (the log answers 404) may be newer than it: the heads are read
-// again at once, bypassing the TTL, before at is refused as not in the
-// chain, one read per namespace at a time, at most one a second
-// (forcedState). A chain it can't read is a *ChainError.
-func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
-	return func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
-		target := ns
-		if s, ok := requireAt.(string); ok {
-			target = s
-		}
-		var idText string
-		switch x := at.(type) {
-		case string:
-			idText = x
-		case map[string]any:
-			if n, _ := x["ns"].(string); n != target {
-				return fmt.Errorf("at names another namespace")
-			}
-			idText, _ = x["id"].(string)
-		}
-		if _, err := ids.Parse(idText); err != nil {
-			return fmt.Errorf("malformed at")
-		}
-		begun := time.Now()
-		// A purged namespace requireAt names fails the scope, as one
-		// that doesn't exist does at the origin (§C.4, v0.85): never a
-		// chain the checker can't read. Not the one the grant is
-		// checked in (v0.86): named by its own name it is as with
-		// requireAt: true, and its own 410 answers.
-		named := false
-		if s, ok := requireAt.(string); ok {
-			named = s != ns
-		}
-		gone := func(err error) bool { return named && purgedNS(err, target) }
-		tst, checked, err := ch.stateWithin(ctx, target, ch.ttl)
-		if err != nil {
-			if gone(err) {
-				return errRequireAt
-			}
-			return chainError(err)
-		}
-		entries, err := ch.chainAfter(ctx, target, tst, idText)
-		if notInChain(err) && checked.Before(begun) {
-			// The cached head may be older than at: read it again.
-			if tst, err = ch.forcedState(ctx, target, begun); err != nil {
-				if gone(err) {
-					return errRequireAt
-				}
-				return chainError(err)
-			}
-			entries, err = ch.chainAfter(ctx, target, tst, idText)
-		}
-		switch {
-		case notInChain(err), gone(err):
-			return errRequireAt
-		case err != nil:
-			return chainError(err)
-		}
-		if named {
-			purged, err := ch.purgedAt(ctx, target, tst.cfg, entries)
-			switch {
-			case err != nil:
-				return chainError(err)
-			case purged:
-				return errRequireAt
-			}
-		}
-		if len(entries) == 0 {
-			return nil
-		}
-		next, err := time.Parse(time.RFC3339Nano, entries[0].Created)
-		if err != nil {
-			return chainError(fmt.Errorf("grantcheck: namespace %s: bad log entry time", target))
-		}
-		lag := grant.EffectiveMaxLag(tst.cfg.MaxLag, keyMaxLag)
-		if !grant.HeadWithin(&next, issued, lag) {
-			return errRequireAt
-		}
-		return nil
-	}
-}
-
-// purgedNS reports whether err is the 410 purged of namespace ns itself
-// (§8.5), which a sealed one's head, documents and log answer once it is
-// purged, not that of a base in its chain.
-func purgedNS(err error, ns string) bool {
-	if !client.IsPurged(err) {
-		return false
-	}
-	ae, ok := client.AsAPIError(err)
-	if !ok {
-		return false
-	}
-	name, has := ae.Body["ns"].(string)
-	return !has || name == ns
-}
-
-// purgedAt reports whether target, whose document at its head is cfg and
-// whose log up to that head ends with entries (none where the at checked
-// is the head), is purged there (§C.4 requireAt, v0.85: "which a service
-// learns from its log or 410", §8.5). A purge-ns entry is the log's last,
-// so entries tell where there are any. Where at is the head, an unsealed
-// purged namespace still serves its document and log, and only its
-// /heads, 410 at any revision, tells: asked once per head (purgedHeads),
-// and only of a frozen namespace, as a purge needs one (§8.5); a purge
-// applied to a namespace that isn't frozen, such as one a remote branch
-// takes from its base, is learnt from the log alone.
-func (ch *Checker) purgedAt(ctx context.Context, target string, cfg *Config, entries []client.NSEntry) (bool, error) {
-	if n := len(entries); n > 0 {
-		return entries[n-1].Kind == "purge-ns", nil
-	}
-	if frozen, _ := cfg.Doc["frozen"].(bool); !frozen {
-		return false, nil
-	}
-	key := target + "\x00" + cfg.Head
-	ch.mu.Lock()
-	purged, known := ch.purgedHeads[key]
-	ch.mu.Unlock()
-	if known {
-		return purged, nil
-	}
-	_, _, err := ch.c.HeadsPage(ctx, target, cfg.Head, "")
-	switch {
-	case purgedNS(err, target):
-		purged = true
-	case err != nil:
-		return false, err
-	}
-	ch.mu.Lock()
-	if len(ch.purgedHeads) >= maxPurgedHeads {
-		clear(ch.purgedHeads)
-	}
-	ch.purgedHeads[key] = purged
-	ch.mu.Unlock()
-	return purged, nil
-}
-
-// maxPurgedHeads bounds Checker.purgedHeads.
-const maxPurgedHeads = 1024
-
-// errRequireAt is the refusal of an at a readable chain rejects, not in
-// it or not its head within maxLag: one text for both, naming no
-// namespace, since the chain a key names may be one the caller can't see
-// (§C.4, §C.5.2).
-var errRequireAt = errors.New("at rejected by requireAt")
-
-// notInChain reports a 404 from the log itself: at is not in the chain. A
-// 404 from /keys, met opening a log range sealed under an older epoch, is
-// a chain the checker can't read (§C.4), not a refusal.
-func notInChain(err error) bool {
-	return client.IsNotFound(err) && !errors.Is(err, client.ErrKeyFetch)
-}
-
-// chainAfter is the log of target after at up to the head of tst, none
-// when at is that head; a 404 when at is not in that chain.
-func (ch *Checker) chainAfter(ctx context.Context, target string, tst *nsState, at string) ([]client.NSEntry, error) {
-	if at == tst.cfg.Head {
-		return nil, nil
-	}
-	return ch.c.NSLog(ctx, target, tst.cfg.Head, at)
-}
-
 // Decision is the outcome of a read check.
 type Decision struct {
 	Allowed  bool
@@ -835,8 +532,8 @@ type Decision struct {
 // /resource pass). Public namespaces allow everyone; a token presented to a
 // public namespace is still verified (an invalid one is an error), matching
 // services that attribute reads. Grant failures are returned as a Decision
-// with Allowed false and the *grant.AuthError as the error; a *ChainError
-// (§C.4 requireAt), like any other fetch failure, with a nil Decision.
+// with Allowed false and the *grant.AuthError as the error; a fetch
+// failure with a nil Decision.
 func (ch *Checker) CheckRead(ctx context.Context, ns, token, resource string) (*Decision, error) {
 	st, err := ch.state(ctx, ns)
 	if token != "" {
@@ -877,7 +574,7 @@ func (ch *Checker) CheckRead(ctx context.Context, ns, token, resource string) (*
 		d.Allowed = true
 		return d, nil
 	}
-	if ok, why := ch.allowsRead(v, resource); !ok {
+	if ok, why := ch.allowsRead(v, resource, nil, false); !ok {
 		d.Reason = why
 		return d, nil
 	}
@@ -912,25 +609,39 @@ func FailsRead(r *rules.Rule) bool {
 }
 
 // AllowsRead reports whether a verified grant may read resource ("" = the
-// whole namespace): the grant allows read, its key-scope and block rules
-// pass against the read envelope, none failing for a read (FailsRead:
-// such a grant is refused every read, §C.2 item 5), and, if it carries
-// roles, so do the rules of one that lists read, a role with a rule that
-// fails for a read not counting.
+// whole namespace) where the read concerns no stored document (doc null,
+// §6.4.1): the grant allows read, its key-scope and block rules pass
+// against the read envelope, none failing for a read (FailsRead: such a
+// grant is refused every read, §C.2 item 5) nor referring to /doc, and,
+// if it carries roles, so do the rules of one that lists read, a role
+// with a rule that fails for a read not counting.
 func (ch *Checker) AllowsRead(v *grant.Verified, resource string) bool {
-	ok, _ := ch.allowsRead(v, resource)
+	ok, _ := ch.allowsRead(v, resource, nil, false)
 	return ok
 }
 
-func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string) {
+// AllowsReadDoc is AllowsRead for a revision of resource whose document
+// is doc (§C.2 item 5: reads are judged per revision).
+func (ch *Checker) AllowsReadDoc(v *grant.Verified, resource string, doc any) bool {
+	ok, _ := ch.allowsRead(v, resource, doc, true)
+	return ok
+}
+
+func (ch *Checker) allowsRead(v *grant.Verified, resource string, doc any, hasDoc bool) (bool, string) {
 	ok, roles := v.Allows("read")
 	if !ok {
 		return false, "the grant does not allow read"
 	}
 	env := ReadEnvelope(v, resource, ch.now())
+	if hasDoc {
+		env["doc"] = doc
+	}
 	// The check's budget of validationSteps: a rule whose schema test
 	// runs out fails it, whatever role might have passed (§6.6).
 	m := rules.Budget(ch.steps)
+	passes := func(r *rules.Rule) bool {
+		return (hasDoc || !RefersToDoc(r)) && r.Passes(env, m)
+	}
 	for _, src := range [][]any{v.KeyRules, v.BlockRules} {
 		for _, rv := range src {
 			r, err := ch.compile(rv)
@@ -940,7 +651,7 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 			if FailsRead(r) {
 				return false, "a grant or key rule refers to /now, which no read passes (§C.2 item 5)"
 			}
-			if !r.Passes(env, m) {
+			if !passes(r) {
 				return false, "a grant or key rule refuses the read"
 			}
 		}
@@ -950,7 +661,7 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 			pass := true
 			for _, rv := range v.RoleRules(role) {
 				r, err := ch.compile(rv)
-				if err != nil || FailsRead(r) || !r.Passes(env, m) {
+				if err != nil || FailsRead(r) || !passes(r) {
 					pass = false
 					break
 				}
@@ -988,7 +699,7 @@ func (ch *Checker) ReadsPerResource(v *grant.Verified) bool {
 	for _, l := range lists {
 		for _, rv := range l {
 			r, err := ch.compile(rv)
-			if err != nil || r.Refs()["resource"] || r.Refs()["*"] {
+			if err != nil || r.Refs()["resource"] || r.Refs()["doc"] || r.Refs()["*"] {
 				return true
 			}
 		}
@@ -1033,9 +744,10 @@ func (ch *Checker) ReadsUnrestricted(v *grant.Verified) bool {
 }
 
 // passWhole reports whether rules rs pass against env without referring to
-// /resource, or to /now (or the whole envelope), which fails any read.
+// /resource or /doc (§2.1 Unrestricted read), or to /now (or the whole
+// envelope), which fails any read.
 func (ch *Checker) passWhole(rs []any, env map[string]any, m *rules.Meter) bool {
-	return ch.passWholeRefs(rs, env, m, "resource", "now")
+	return ch.passWholeRefs(rs, env, m, "resource", "doc", "now")
 }
 
 // passWholeRefs reports whether rules rs pass against env, within what m
@@ -1073,14 +785,14 @@ func (ch *Checker) NamespaceWide(v *grant.Verified) bool {
 	}
 	env := ReadEnvelope(v, "", ch.now())
 	m := rules.Budget(ch.steps) // the check's validationSteps (§6.6)
-	if !ch.passWholeRefs(v.KeyRules, env, m, "resource", "now") || !ch.passWholeRefs(v.BlockRules, env, m, "resource", "now") {
+	if !ch.passWholeRefs(v.KeyRules, env, m, "resource", "doc", "now") || !ch.passWholeRefs(v.BlockRules, env, m, "resource", "doc", "now") {
 		return false
 	}
 	if !v.HasRoles() {
 		return true
 	}
 	for _, role := range roles {
-		pass := ch.passWholeRefs(v.RoleRules(role), env, m, "resource", "now")
+		pass := ch.passWholeRefs(v.RoleRules(role), env, m, "resource", "doc", "now")
 		if m.Over {
 			// As ReadsUnrestricted: a spent budget fails the whole check.
 			return false
@@ -1140,9 +852,9 @@ func SubjectSet(v *grant.Verified, includeSub bool) []string {
 	return out
 }
 
-// SubjectSetID is gs = text(trunc160(sha256(canonical(sorted subjects))))
-// (§B.11.5). subjects are sorted and de-duplicated first.
-func SubjectSetID(subjects []string) string {
+// ViewID is view = text(trunc160(sha256(canonical(sorted subjects))))
+// (§7.9 view, §A.4). subjects are sorted and de-duplicated first.
+func ViewID(subjects []string) string {
 	set := map[string]bool{}
 	for _, s := range subjects {
 		set[s] = true

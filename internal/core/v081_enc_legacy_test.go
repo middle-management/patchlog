@@ -67,8 +67,7 @@ func newV081Legacy(t *testing.T) *v081Legacy {
 	}
 	blobs := t.TempDir()
 	return &v081Legacy{path: path, opts: func() Options {
-		return Options{Path: path, BlobDir: blobs, AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
-			Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}, KeyStore: ks}
+		return Options{Path: path, BlobDir: blobs, AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1, Purger: discardPurger{}, KeyStore: ks}
 	}}
 }
 
@@ -343,36 +342,6 @@ func (l *v081Legacy) pendingTable(t *testing.T) bool {
 	return ok
 }
 
-// E2E-2: what recordLegacyE2E records, a remote branch included, is what
-// checkLegacyE2E finds once the marker tables are gone, and recording it
-// again changes nothing.
-func TestV081LegacyPendingRoundTrip(t *testing.T) {
-	t.Parallel()
-	path, pg := pgtest.FreshDB(t), pgtest.Enabled()
-	driver, dsn := "pgx", pgtest.DSN(path)
-	if !pg {
-		driver, dsn = "sqlite", sqlitedsn.DSN(filepath.Join(t.TempDir(), "p.db"), "_pragma=busy_timeout(10000)")
-	}
-	db, err := sql.Open(driver, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	want := &legacyE2E{raised: []string{"m", "n"}, remote: []string{"rb"}}
-	for range 2 {
-		if err := recordLegacyE2E(db, pg, want); err != nil {
-			t.Fatal(err)
-		}
-	}
-	got, err := checkLegacyE2E(db, pg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.names() != want.names() || !got.pendingOnly {
-		t.Fatalf("found %q (pending only %v), want %q", got.names(), got.pendingOnly, want.names())
-	}
-}
-
 // E2E-11: migrating a database whose only raised namespace was purged
 // under v0.26.1 needs no flag, and leaves neither marker table.
 func TestV081MigrationDropsMarkersOfPurged(t *testing.T) {
@@ -473,5 +442,35 @@ func TestV081SealCountsSeeded(t *testing.T) {
 		if got[k] != v {
 			t.Errorf("%s: sealed, reserved %v, want %v (all %v)", k, got[k], v, got)
 		}
+	}
+}
+
+// E2E-2: what recordLegacyE2E records, a remote branch included, is what
+// checkLegacyE2E finds once the marker tables are gone, and recording it
+// again changes nothing.
+func TestV081LegacyPendingRoundTrip(t *testing.T) {
+	t.Parallel()
+	path, pg := pgtest.FreshDB(t), pgtest.Enabled()
+	driver, dsn := "pgx", pgtest.DSN(path)
+	if !pg {
+		driver, dsn = "sqlite", sqlitedsn.DSN(filepath.Join(t.TempDir(), "p.db"), "_pragma=busy_timeout(10000)")
+	}
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	want := &legacyE2E{raised: []string{"m", "n"}}
+	for range 2 {
+		if err := recordLegacyE2E(db, pg, want); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := checkLegacyE2E(db, pg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.names() != want.names() || !got.pendingOnly {
+		t.Fatalf("found %q (pending only %v), want %q", got.names(), got.pendingOnly, want.names())
 	}
 }

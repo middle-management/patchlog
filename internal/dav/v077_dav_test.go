@@ -49,7 +49,7 @@ func (timeoutErr) Temporary() bool { return true }
 // requests go through a failRT answering status.
 func failingEnv(t *testing.T, status int) (*env, *failRT) {
 	t.Helper()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	rt := &failRT{status: status}
 	opt := e.opt
 	opt.Client = e.s.Client(t, client.WithAuthor("dav"), client.WithHTTPClient(&http.Client{Transport: rt}))

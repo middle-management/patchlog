@@ -12,17 +12,25 @@ import (
 
 // Connection pools on Postgres (D.8).
 //
-// An instance opens two pools on the database: the main one, of up to
-// 4 × GOMAXPROCS connections (mainConns), and the rate buckets', of a
-// quarter of that, at least 2 (bucketConns, ratebuckets.go). Each keeps
-// the connections it opened, idle, for the next request. Two query
-// parameters of the URL, the names pgxpool gives them, change that; they
-// are removed from the URL before it reaches pgx, which would send them
-// to the server as settings:
+// An instance opens three pools on the database: the main one, of
+// 4 × GOMAXPROCS connections by default (mainConns), and two small ones of
+// a quarter of the main pool's size, at least 2 (sideConns): the rate
+// buckets' (ratebuckets.go) and the group commits' (commitPool,
+// groupcommit.go). Each keeps the connections it opened, idle, for the
+// next request. Two query parameters of the URL, the names pgxpool gives
+// them, change that; they are removed from the URL before it reaches pgx,
+// which would send them to the server as settings:
 //
-//   - pool_max_conns=N caps the main pool at N connections, at least 2
+//   - pool_max_conns=N sets the main pool to N connections, at least 2
 //     (it holds one for the background loops' leader lock, pglock.go),
-//     and the bucket pool at a quarter of N, at least 2;
+//     whatever the CPUs, and each small pool to a quarter of N, at least
+//     2. A connection mostly waits on a round trip to the server, not on
+//     the instance's CPU: on RDS a 4-vCPU instance's 16 connections
+//     limited it to about 3,000 writes a second while Postgres sat mostly
+//     idle, and 64 took it to about 4,600 (docs/CAPACITY.md, "Several
+//     namespaces on one database"). Raise it for a database far from the
+//     instance; keep the sum of every instance's pools under the
+//     server's max_connections;
 //   - pool_max_conn_idle_time=D (a Go duration such as 5m) closes a
 //     connection that has been idle for longer than D.
 //
@@ -77,26 +85,27 @@ func parsePGPool(raw string) (string, pgPool, error) {
 	return u.String(), p, nil
 }
 
-// sizeMain sizes the main pool (mainConns).
-func (p pgPool) sizeMain(db *sql.DB) {
-	p.size(db, mainConns(), p.maxConns)
-}
-
-// sizeBuckets sizes the bucket pool (bucketConns).
-func (p pgPool) sizeBuckets(db *sql.DB) {
-	limit := 0
+// mainSize is the size of the main pool: pool_max_conns, or mainConns.
+func (p pgPool) mainSize() int {
 	if p.maxConns > 0 {
-		limit = max(2, p.maxConns/4)
+		return p.maxConns
 	}
-	p.size(db, bucketConns(), limit)
+	return mainConns()
 }
 
-// size sets db's pool to n connections, or limit if lower (and not 0),
-// all kept idle until the idle time, if any, passes.
-func (p pgPool) size(db *sql.DB, n, limit int) {
-	if limit > 0 {
-		n = min(n, limit)
-	}
+// sideSize is the size of the bucket pool and of the commit pool: a
+// quarter of the main pool's, at least 2 (sideConns).
+func (p pgPool) sideSize() int { return sideConns(p.mainSize()) }
+
+// sizeMain sizes the main pool (mainSize).
+func (p pgPool) sizeMain(db *sql.DB) { p.size(db, p.mainSize()) }
+
+// sizeSide sizes a bucket or commit pool (sideSize).
+func (p pgPool) sizeSide(db *sql.DB) { p.size(db, p.sideSize()) }
+
+// size sets db's pool to n connections, all kept idle until the idle
+// time, if any, passes.
+func (p pgPool) size(db *sql.DB, n int) {
 	db.SetMaxOpenConns(n)
 	db.SetMaxIdleConns(n)
 	if p.maxIdleTime > 0 {
@@ -104,6 +113,13 @@ func (p pgPool) size(db *sql.DB, n, limit int) {
 	}
 }
 
-// mainConns is the size of the main pool on Postgres, as of a SQLite
-// file's (openSQLite).
+// mainConns is the size of the main pool on Postgres without
+// pool_max_conns, as of a SQLite file's (openSQLite).
 func mainConns() int { return 4 * runtime.GOMAXPROCS(0) }
+
+// sideConns is the size of a small pool beside a main pool of main
+// connections: a quarter of it, at least two (a bucket sweep holds one).
+// A draw is one short statement, and a group commit one transaction for
+// up to GroupCommit writes: a fraction of the round trips of the checks
+// on the main pool.
+func sideConns(main int) int { return max(2, main/4) }

@@ -26,13 +26,4 @@ func TestW1XCanonicalOrigins(t *testing.T) {
 		t.Fatalf("Open with a canonical origin: %v", err)
 	}
 	e.Close()
-	for o, want := range map[string]bool{
-		"https://b.example": true, "http://localhost:8080": true, "http://127.0.0.2": true, "http://[::1]:9": true,
-		"http://b.example": false, "https://B.example": false, "https://b.example:443": false, "https://bücher.example": false,
-		"https://b.example:0444": false, "http://localhost:80": false,
-	} {
-		if ValidRemoteOrigin(o) != want {
-			t.Errorf("ValidRemoteOrigin(%q) = %v", o, !want)
-		}
-	}
 }

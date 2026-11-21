@@ -26,20 +26,4 @@ func TestV081DigestRootOpIsAddOrReplace(t *testing.T) {
 	if got != want {
 		t.Fatalf("got  %s\nwant %s", got, want)
 	}
-
-	// A plan stored with the digest of the stripped test (as v0.26.1
-	// rendered it) no longer matches: the step fails closed, and the
-	// release is planned and approved again (ErrPlanChanged).
-	st := &ReleaseStep{Step: 3, Key: "m"}
-	items := []stepItem{{name: "derby", pre: map[string]any{"ifMatch": "1a"}, steps: steps[:1]}}
-	stripped := []any{map[string]any{"resource": "derby", "ifMatch": "1a",
-		"steps": []any{[]any{map[string]any{"op": "test", "path": "", "value": map[string]any{"t": 1.0}}}}}}
-	st.Digest = stepDigest(st, stripped)
-	if approvedStep(&ReleasePlan{Format: PlanFormat}, st, items) {
-		t.Fatal("a step approved over the stripped test still counts as approved")
-	}
-	st.Digest = stepDigest(st, digestItems(st, items))
-	if !approvedStep(&ReleasePlan{Format: PlanFormat}, st, items) {
-		t.Fatal("the step's own digest isn't approved")
-	}
 }

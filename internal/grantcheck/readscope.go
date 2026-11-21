@@ -15,7 +15,7 @@ import (
 
 // What a grant that reads a namespace only in part reads there, shared by
 // the index (§A.4's scope marker) and the origin's filtered reads
-// (§B.11.9's scope:{digest} subject and item 2).
+// (§7.9's scope:{digest} subject and item 2).
 
 // ScopeInput is what §A.4's scope marker digests: the rules a grant's
 // reads in a namespace are judged by, those of its key's scope, its blocks
@@ -56,41 +56,6 @@ func readRoles(v *grant.Verified) []string {
 	return out
 }
 
-// RefusedByNow reports whether rules on /now refuse v every read (§C.2
-// item 5): a key-scope or block rule fails for a read (FailsRead), or v
-// carries roles, some listing read, and every one of those has a rule
-// that fails for a read, so none counts. A grant that allows no read at
-// all is not this case.
-func RefusedByNow(v *grant.Verified) bool {
-	if RefusedByNowRule(v) {
-		return true
-	}
-	ok, readers := v.Allows("read")
-	return ok && v.HasRoles() && len(readers) > 0 && len(readRoles(v)) == 0
-}
-
-// RefusedByNowRule is the first half of RefusedByNow: a key-scope or
-// block rule of v fails for a read (FailsRead), referring to /now or the
-// whole envelope. The catalog's POST /grants and POST /read-grants refuse
-// such a grant whatever it wants (§B.11.4 The caller's grant, §C.2 item
-// 5); its roles' rules are judged per want there (ReadsNothing).
-func RefusedByNowRule(v *grant.Verified) bool {
-	return failsRead(v.KeyRules) || failsRead(v.BlockRules)
-}
-
-// ReadsNothing reports whether v allows read nowhere it verifies in
-// (§B.11.4 The caller's grant, §C.2 item 2): its blocks or key don't
-// allow read, or it carries roles and none counts for read, each either
-// not listing read or having a rule that fails for a read (readRoles,
-// §C.2 item 5: such a role "doesn't count for read"). v is a grant as
-// verified in one namespace, the one this is judged in.
-func ReadsNothing(v *grant.Verified) bool {
-	if ok, _ := v.Allows("read"); !ok {
-		return true
-	}
-	return v.HasRoles() && len(readRoles(v)) == 0
-}
-
 // failsRead reports whether some rule of rs fails for a read (FailsRead).
 func failsRead(rs []any) bool {
 	for _, rv := range rs {
@@ -102,7 +67,7 @@ func failsRead(rs []any) bool {
 }
 
 // ReadsScope digests what the reads of a grant that reads a namespace only
-// in part depend on (§A.4, §B.11.9): the rules they are judged by there
+// in part depend on (§A.4, §7.9): the rules they are judged by there
 // (its key's scope, its blocks' and those of its roles that grant read,
 // §C.5) and the /principal values those refer to, so readers with the same
 // rules and values share answers. It reports false if a rule refers to
@@ -121,7 +86,7 @@ func ReadsScope(v *grant.Verified) (digest string, ok bool) {
 }
 
 // ScopeDigest is ReadsScope over its inputs, so that the origin can digest
-// a stored gs's rules again as of another checkpoint (§B.11.9: a gs cookie
+// a stored view's rules again as of another checkpoint (§7.9: a view cookie
 // is 403 at an at where those rules differ). It reports false where any
 // rule, a role's included, refers to /now or the whole envelope: a stored
 // role that has gained one since doesn't count for read any more (§C.2
@@ -177,31 +142,33 @@ func CombinedAt(cps map[string]string) string {
 	return ids.FromBytes(sum[:ids.Size]).String()
 }
 
-// ReadFilter is what a scope marker, or a filtered-read gs (§B.11.9 item
-// 2), stands for: the rules a grant's reads in a namespace are judged by,
-// those of its key's scope, its blocks and, if it carries roles, each
-// effective role that counts for read (any one passing), and its
-// /principal envelope. A key-scope or block rule referring to /now gives
-// no marker (ReadsScope), and a role with one doesn't count (FilterOf), so
-// the filter judges a read as the grant's read check does, without a
-// clock; one decoded with such a rule (DecodeReadFilter) refuses every
-// read, or doesn't count the role, as that check does (FailsRead).
-// Fields must not change once Allows or AllowsItem has been called.
+// ReadFilter is what a view (§7.9) or a scope marker (§A.4) stands for:
+// the rules a grant's reads in a namespace are judged by, those of its
+// key's scope, its blocks and, if it carries roles, each effective role
+// that counts for read (any one passing), and its /principal envelope. A
+// key-scope or block rule referring to /now gives no view (ReadsScope),
+// and a role with one doesn't count (FilterOf), so the filter judges a
+// read as the grant's read check does, without a clock; one decoded with
+// such a rule (DecodeReadFilter) refuses every read, or doesn't count the
+// role, as that check does (FailsRead). Reads are judged per revision
+// (§C.2 item 5): the read envelope carries the revision's doc, and where
+// it is null every rule that refers to /doc fails as a whole (§6.4.1).
+// Fields must not change once a method has been called.
 type ReadFilter struct {
 	KeyRules, BlockRules []any
 	Roles                [][]any // nil: the grant carries no roles
 	Principal            map[string]any
-	// Steps is the validation steps each Allows and AllowsItem may take
-	// in the rules' schema tests (§6.6 Validation work: each item a
-	// service filters by a grant has its own budget). One that needs more
-	// doesn't allow. It isn't part of what Encode keeps: 0, as a decoded
-	// filter has, is §12.2's default, and a service sets its own
+	// Steps is the validation steps each judgement may take in the rules'
+	// schema tests (§6.6 Validation work: each item a service filters by
+	// a grant has its own budget). One that needs more doesn't allow. It
+	// isn't part of what Encode keeps: 0, as a decoded filter has, is
+	// §12.2's default, and a service sets its own
 	// (Checker.ValidationSteps).
 	Steps int
 
 	once     sync.Once
 	compiled [][]*rules.Rule // KeyRules, BlockRules, then each role's
-	item     []bool          // per role: it counts for AllowsItem
+	docRefs  bool            // some rule refers to /doc
 	err      error
 }
 
@@ -220,7 +187,7 @@ func FilterOf(v *grant.Verified) *ReadFilter {
 }
 
 // Encode is f as it is kept (the index's edge_filters, the origin's
-// filtered_gs): canonical JSON.
+// filtered_views): canonical JSON.
 func (f *ReadFilter) Encode() string {
 	m := map[string]any{"keyRules": f.KeyRules, "blockRules": f.BlockRules, "principal": f.Principal}
 	if f.Roles != nil {
@@ -268,18 +235,18 @@ var failRule = func() *rules.Rule {
 	return r
 }()
 
-var (
-	ptrPrincipal       = pointer.Pointer{"principal"}
-	ptrPrincipalGroups = pointer.Pointer{"principal", "groups"}
-	ptrPrincipalRoles  = pointer.Pointer{"principal", "roles"}
-)
+// RefersToDoc reports whether r refers to /doc (§2.1 Refers to): such a
+// rule fails as a whole for a read whose doc is null (§6.4.1).
+func RefersToDoc(r *rules.Rule) bool {
+	refs := r.Refs()
+	return refs["doc"] || refs["*"]
+}
 
 func (f *ReadFilter) compile() {
 	f.once.Do(func() {
 		lists := append([][]any{f.KeyRules, f.BlockRules}, f.Roles...)
 		for i, l := range lists {
 			var rs []*rules.Rule
-			item := true
 			for _, rv := range l {
 				r, err := rules.Compile(rv)
 				if err != nil {
@@ -297,40 +264,49 @@ func (f *ReadFilter) compile() {
 					rs = append(rs, failRule)
 					continue
 				}
-				for _, p := range r.RefPaths() {
-					if p.Overlaps(ptrPrincipal) && !p.HasPrefix(ptrPrincipalGroups) && !p.HasPrefix(ptrPrincipalRoles) {
-						item = false
-					}
+				if RefersToDoc(r) {
+					f.docRefs = true
 				}
 				rs = append(rs, r)
 			}
 			f.compiled = append(f.compiled, rs)
-			if i >= 2 {
-				f.item = append(f.item, item)
-			}
 		}
 	})
 }
 
-// Allows reports whether the reads f stands for may read resource: every
-// key-scope and block rule passes against the read envelope (§6.4.1) and,
-// with roles, every rule of some role does (§C.1.1).
-func (f *ReadFilter) Allows(resource string) bool { return f.allows(resource, false) }
+// RefersToDoc reports whether a rule of f refers to /doc: only then does
+// a read's answer depend on the revision it concerns rather than on the
+// resource's name alone.
+func (f *ReadFilter) RefersToDoc() bool {
+	f.compile()
+	return f.docRefs
+}
 
-// AllowsItem is §B.11.9's item 2: Allows, but a role counts only as
-// §B.11.5 counts roles, so one with a rule that refers to anything in
-// /principal but /principal/groups and /principal/roles never allows.
-func (f *ReadFilter) AllowsItem(resource string) bool { return f.allows(resource, true) }
+// Allows reports whether the reads f stands for may read resource where
+// the read concerns no stored document (doc null, §6.4.1): every rule
+// that refers to /doc fails.
+func (f *ReadFilter) Allows(resource string) bool { return f.AllowsDoc(resource, nil, false) }
 
-func (f *ReadFilter) allows(resource string, item bool) bool {
+// AllowsDoc reports whether the reads f stands for may read a revision of
+// resource whose document is doc (§C.2 item 5): every key-scope and block
+// rule passes against the read envelope (§6.4.1) and, with roles, every
+// rule of some role does (§C.1.1). hasDoc false is a null doc, against
+// which every rule that refers to /doc fails as a whole.
+func (f *ReadFilter) AllowsDoc(resource string, doc any, hasDoc bool) bool {
 	f.compile()
 	if f.err != nil {
 		return false
 	}
 	env := map[string]any{"action": "read", "resource": resource, "principal": f.Principal}
+	if hasDoc {
+		env["doc"] = doc
+	}
 	m := rules.Budget(f.Steps)
 	pass := func(rs []*rules.Rule) bool {
 		for _, r := range rs {
+			if !hasDoc && RefersToDoc(r) {
+				return false
+			}
 			if !r.Passes(env, m) {
 				return false
 			}
@@ -345,10 +321,85 @@ func (f *ReadFilter) allows(resource string, item bool) bool {
 	if f.Roles == nil {
 		return true
 	}
-	for i, rs := range f.compiled[2:] {
-		if (!item || f.item[i]) && pass(rs) {
+	for _, rs := range f.compiled[2:] {
+		if pass(rs) {
 			return true
 		}
 	}
 	return false
+}
+
+// WithoutDoc is f with only its rules that don't refer to /doc, each
+// top-level all flattened into the rules it holds first (§7.9 Log
+// entries: a purge is shown where these allow read of its resource).
+func (f *ReadFilter) WithoutDoc() *ReadFilter {
+	keep := func(rs []any) []any {
+		out := []any{}
+		var walk func(rs []any)
+		walk = func(rs []any) {
+			for _, rv := range rs {
+				if m, ok := rv.(map[string]any); ok && len(m) == 1 {
+					if all, ok := m["all"].([]any); ok {
+						walk(all)
+						continue
+					}
+				}
+				if r, err := rules.Compile(rv); err == nil && RefersToDoc(r) && !FailsRead(r) {
+					continue
+				}
+				out = append(out, rv)
+			}
+		}
+		walk(rs)
+		return out
+	}
+	g := &ReadFilter{KeyRules: keep(f.KeyRules), BlockRules: keep(f.BlockRules), Principal: f.Principal, Steps: f.Steps}
+	if f.Roles != nil {
+		g.Roles = [][]any{}
+		for _, rs := range f.Roles {
+			g.Roles = append(g.Roles, keep(rs))
+		}
+	}
+	return g
+}
+
+// KeyPrefix prefixes a view's key subject (KeySubject).
+const KeyPrefix = "key:"
+
+// ScopePrefix prefixes a view's scope subject, scope:{digest}.
+const ScopePrefix = "scope:"
+
+// KeySubject is the subject that binds a view (§7.9) to the key that
+// verified its grant's root block, by kid and pub, the pub member string
+// as the key's entry has it: key:{text(trunc160(sha256(canonical([kid,
+// pub]))))}. Without it readers through two keys with the same scope rules
+// would share a view, and so one stored record, whose kid and pub, those
+// of its last exchange, would judge both keys' cookies.
+func KeySubject(kid, pub string) string {
+	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo([]any{kid, pub})))
+	return KeyPrefix + ids.FromBytes(sum[:ids.Size]).String()
+}
+
+// ScopeKeyDigest is the digest of §A.4's scope marker
+// reads:{ns}:scope:{digest}, which covers the rules that limit a reader's
+// reads, d (ReadsScope), and its key's key: string (KeySubject): the
+// digest of canonical([d, key:…]). A view carries the same as its
+// scope:{digest} subject (ViewSubjects); implementations needn't agree
+// on it (§7.9 view).
+func ScopeKeyDigest(d, kid, pub string) string {
+	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo([]any{d, KeySubject(kid, pub)})))
+	return ids.FromBytes(sum[:ids.Size]).String()
+}
+
+// ViewSubjects are a view's subjects (§7.9 view), sorted: for a reader
+// whose reads are limited (scoped), scope:{ScopeKeyDigest(d, kid, pub)},
+// and always KeySubject(kid, pub). A grant §C.5.2 would give /ns/{ns}
+// has no scope: subject. Its view is ViewID of the result.
+func ViewSubjects(d, kid, pub string, scoped bool) []string {
+	out := []string{KeySubject(kid, pub)}
+	if scoped {
+		out = append(out, ScopePrefix+ScopeKeyDigest(d, kid, pub))
+	}
+	slices.Sort(out)
+	return out
 }

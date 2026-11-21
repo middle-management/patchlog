@@ -48,8 +48,7 @@ func p36NewEnv(t *testing.T) *p36Env {
 	now := p36T0
 	env := &p36Env{now: &now, op: opPriv}
 	env.keys.add("admin", map[string]any{"can": []any{"*"}})
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1, BlobSweepInterval: -1,
-		Remote: RemoteOptions{FollowInterval: -1}, Limits: p17Fast(), Purger: discardPurger{}, KeyStore: ks,
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1, BlobSweepInterval: -1, Limits: p17Fast(), Purger: discardPurger{}, KeyStore: ks,
 		Now: func() time.Time { return *env.now }})
 	if err != nil {
 		t.Fatal(err)

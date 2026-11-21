@@ -39,7 +39,7 @@ func strsOf(v any) []string {
 var sixSixKeys = []string{"patchSetSize", "opsPerSet", "documentSize", "valueSize", "pathSize", "nestingDepth",
 	"rulesPerNamespace", "rulesPerGrant", "grantSize", "itemsPerBatch", "batchSize", "logPageBytes", "logPageSize",
 	"branchDepth", "branchesPerNamespace", "ratePerResource", "ratePerPrincipal", "ratePerNamespace", "retryWindow",
-	"keepPerResource", "remoteRegistration", "blobSize", "blobsPerDocument", "blobPending", "blobGrace", "blobRate",
+	"keepPerResource", "blobSize", "blobsPerDocument", "blobPending", "blobGrace", "blobRate",
 	"exchangeRate", "validationSteps"}
 
 // v0.55 §7.4: what a grant is in a namespace, to a grant limited to some
@@ -91,7 +91,7 @@ func TestV055Principal(t *testing.T) {
 	if l["patchSetSize"] != 210000.0 || l["opsPerSet"] != float64(def.OpsPerSet) || l["logPageSize"] != float64(def.LogPageSize) ||
 		!reflect.DeepEqual(l["ratePerNamespace"], map[string]any{"rate": 200.0, "burst": 400.0}) ||
 		!reflect.DeepEqual(l["exchangeRate"], map[string]any{"rate": def.ExchangeRate.Rate, "burst": def.ExchangeRate.Burst}) ||
-		l["retryWindow"] != "PT5M" || l["remoteRegistration"] != "P30D" || l["blobGrace"] != "P1D" ||
+		l["retryWindow"] != "PT5M" || l["blobGrace"] != "P1D" ||
 		l["documentSize"] != float64(def.DocumentSize) || l["validationSteps"] != float64(core.DefaultMaxValidationSteps) {
 		t.Fatalf("limits %v", l)
 	}
@@ -264,7 +264,7 @@ func TestV055PrincipalAuthDisabled(t *testing.T) {
 	if _, has := b["kid"]; has {
 		t.Fatalf("kid with auth disabled: %s", r.Body)
 	}
-	if got := strsOf(b["can"]); len(got) != 11 || len(strsOf(b["roles"])) != 0 {
+	if got := strsOf(b["can"]); len(got) != 10 || len(strsOf(b["roles"])) != 0 {
 		t.Fatalf("can %v roles %v", got, b["roles"])
 	}
 	if l := b["writer"].(map[string]any)["limits"].(map[string]any); l["opsPerSet"] != 7.0 {

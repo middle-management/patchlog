@@ -48,7 +48,6 @@ type runner interface{ run(name string) }
 type cli struct {
 	Serve   *serveCmd   `arg:"subcommand:serve" group:"Server commands" help:"run the patch-log server"`
 	Index   *indexCmd   `arg:"subcommand:index" group:"Server commands" help:"run the search index service (Addendum A)"`
-	Tree    *treeCmd    `arg:"subcommand:tree" group:"Server commands" help:"run the tree service, or with --access the catalog service (Addendum B); tree ls lists a catalog"`
 	Dav     *davCmd     `arg:"subcommand:dav" group:"Server commands" help:"serve namespaces over WebDAV (a prototype)"`
 	Streams *streamsCmd `arg:"subcommand:streams" group:"Server commands" help:"run the stream proxy (TOOLS Addendum J.1-J.4); streams read prints a stream"`
 
@@ -116,7 +115,7 @@ $PATCHLOG_AUTHOR; resources are named NS/NAME, and JSON is given inline, as
 
 // telemetryCommands are the commands that set up OpenTelemetry, if
 // configured by OTEL_* (off by default).
-var telemetryCommands = []string{"serve", "index", "tree", "dav", "streams", "merge", "rebase", "janitor", "export", "import", "bundle", "archive", "schema"}
+var telemetryCommands = []string{"serve", "index", "dav", "streams", "merge", "rebase", "janitor", "export", "import", "bundle", "archive", "schema"}
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -176,7 +175,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error:", err)
 		return 2
 	}
-	if slices.Contains(telemetryCommands, names[0]) && !((names[0] == "tree" || names[0] == "streams") && len(names) > 1) { // tree ls and streams read are clients, not the services
+	if slices.Contains(telemetryCommands, names[0]) && !(names[0] == "streams" && len(names) > 1) { // streams read is a client, not the service
 		// Flushed when the command returns (after a server's graceful
 		// shutdown), not on log.Fatal.
 		defer startTelemetry(names[0])()
@@ -238,61 +237,54 @@ func (keygenCmd) run(string) {
 
 // serveCmd is patchlog serve.
 type serveCmd struct {
-	Addr                string        `arg:"--addr" default:":8080" help:"listen address"`
-	DB                  string        `arg:"--db,env:PATCHLOG_DB" default:"patchlog.db" placeholder:"PATH|URL" help:"SQLite database path, or a Postgres URL (postgres://user:pass@host/db, Addendum D.8)"`
-	BlobDir             string        `arg:"--blob-dir,env:PATCHLOG_BLOB_DIR" placeholder:"DIR" help:"directory blob bytes are stored in; default <db>.blobs next to a SQLite file. On Postgres every instance must share it (a shared volume); without one, bytes are stored in the database"`
-	Origin              string        `arg:"--origin" default:"http://localhost:8080" placeholder:"URL" help:"canonical origin (§G.1)"`
-	Dev                 bool          `arg:"--dev" help:"disable authentication (development only); X-Author names the author"`
-	Playground          bool          `arg:"--playground" default:"true" help:"serve the web playground at /playground/ (--playground=false to turn it off)"`
-	InlinePDF           bool          `arg:"--inline-pdf" help:"serve application/pdf blobs for inline display, without the sandbox that blanks Chromium's viewer, instead of with Content-Disposition: attachment (§7.8)"`
-	TreeURL             []string      `arg:"--tree-url,separate" placeholder:"[CATALOG=]URL" help:"tree service (Addendum B) the playground reads through a read-only proxy at /playground/tree/, e.g. http://tree:8082; CATALOG=URL maps one catalog to its own (repeatable)"`
-	IndexURL            string        `arg:"--index-url" placeholder:"URL" help:"search index (Addendum A) the playground reads through a read-only proxy at /playground/index/, e.g. http://index:8081; one index serves several namespaces"`
-	SchemaFetch         bool          `arg:"--schema-fetch" help:"let the playground's schema import fetch http(s) URLs (off: it takes uploaded files only); private, loopback and link-local addresses are refused unless the host is in --schema-fetch-hosts"`
-	SchemaFetchHosts    string        `arg:"--schema-fetch-hosts" placeholder:"H,H" help:"comma-separated hosts --schema-fetch is limited to, e.g. www.schemastore.org,raw.githubusercontent.com (also trusted with private addresses)"`
-	MaxBranchDepth      int           `arg:"--max-branch-depth" placeholder:"N" help:"branchDepth (§6.6): how deep local branches of branches may stack (default 8); deployment-wide"`
-	MaxBranchesPerNS    int           `arg:"--max-branches-per-namespace" placeholder:"N" help:"deployment maximum of branchesPerNamespace (§6.6; default: the namespace default, 100); a namespace document's limits may go up to it"`
-	MaxItemsPerBatch    int           `arg:"--max-items-per-batch" placeholder:"N" help:"deployment maximum items per batch (default: the namespace default, 1000); allowances may go up to it, so an atomic import of more items needs it raised (§6.6)"`
-	MaxBatchSize        *byteSize     `arg:"--max-batch-size" placeholder:"SIZE" help:"deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB); allowances may go up to it (§6.6)"`
-	DocumentSize        *byteSize     `arg:"--document-size" placeholder:"SIZE" help:"default documentSize of namespaces that don't set one, e.g. \"4 MiB\" (default 1 MiB, where §6.6 says 4 MiB; see docs/CAPACITY.md), at most --max-document-size"`
-	MaxDocumentSize     *byteSize     `arg:"--max-document-size" placeholder:"SIZE" help:"deployment maximum documentSize, which namespaces may set in their limits, e.g. \"8 MiB\" (default 4 MiB, §6.6's default)"`
-	MaxValidationSteps  int           `arg:"--max-validation-steps" default:"5000000" placeholder:"N" help:"validationSteps (§6.6, §12.2): steps a write's validation against its schema and its rules' schema tests may take together, a step being one schema or subschema applied to one value; a write that needs more is refused (422 limit, validationSteps), and each read check, exchange, key request and item filtered by a grant has as many for its rules' schema tests, failing if it needs more; at least 1: no deployment leaves it unbounded"`
-	FullValidation      bool          `arg:"--full-validation" help:"validate the whole document on every write; by default a patch to a document this instance has validated against the same schema revision is validated only where it can have changed the verdict"`
-	GrantCache          int           `arg:"--grant-cache" placeholder:"N" help:"verified bearer grants kept per instance, the least recently used evicted (default 65536; every request whose grant isn't kept verifies it, docs/CAPACITY.md)"`
-	DocCacheSize        *byteSize     `arg:"--doc-cache-size" placeholder:"SIZE" help:"documents kept in memory by revision id, e.g. \"1 GiB\" (default 256 MiB)"`
-	ReadCacheSize       *byteSize     `arg:"--read-cache-size" placeholder:"SIZE" help:"revisions the read cache keeps, served without a transaction, e.g. \"256 MiB\" (default 64 MiB)"`
-	MaxBlobSize         *byteSize     `arg:"--max-blob-size" placeholder:"SIZE" help:"deployment maximum blob size, e.g. \"1 GiB\" (default: the namespace default, 64 MiB; §7.8)"`
-	MaxBlobPending      *byteSize     `arg:"--max-blob-pending" placeholder:"SIZE" help:"deployment maximum bytes of pending blobs per uploader and namespace, e.g. \"16 GiB\" (default: the namespace default, 256 MiB); allowances may go up to it (§6.6)"`
-	LogPageSize         int           `arg:"--log-page-size" placeholder:"N" help:"log page size (§6.6, deployment only): a log range answers at most this many entries a page, with X-Log-Next naming the next page's since (§7.1); long-poll answers and /heads pages are as long (default 1000)"`
-	LogPageBytes        *byteSize     `arg:"--log-page-bytes" placeholder:"SIZE" help:"bytes of patch sets per resource log page (§6.6 logPageBytes, deployment only), e.g. \"16 MiB\" (the default): a resource log range, long-poll answer or event-stream catch-up page ends before an entry that would take it past, though it always holds one (§7.1, §7.7)"`
-	MaxRatePerNS        string        `arg:"--max-rate-per-namespace" placeholder:"RATE,BURST" help:"deployment maximum of ratePerNamespace, e.g. 100000,1000000 (default: the namespace default, 500,1000): namespaces may set their ratePerNamespace up to it, and an allowance's bucket never exceeds it, so an importer's or load harness's allowance needs it raised (§6.6)"`
-	MaxRatePerResource  string        `arg:"--max-rate-per-resource" placeholder:"RATE,BURST" help:"deployment maximum of ratePerResource (default: the namespace default, 10,20): namespaces may set their ratePerResource up to it, for small documents that one principal writes often; no allowance lifts the per-resource rate (§6.6)"`
-	MaxRatePrincipal    string        `arg:"--max-rate-per-principal" placeholder:"RATE,BURST" help:"deployment maximum of ratePerPrincipal (default: the namespace default, 50,100): namespaces may set their ratePerPrincipal up to it (§6.6)"`
-	ExchangeRate        string        `arg:"--exchange-rate" placeholder:"RATE,BURST" help:"edge-grant exchanges per principal (§6.6, §C.5, deployment only), e.g. 10,100 (the default): each POST /edge-grants draws one token from the bucket of each principal whose grants it carries, and none from their write buckets"`
-	OperatorKey         []string      `arg:"--operator-key,separate" placeholder:"PUB" help:"base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)"`
-	OperatorKeyHistory  []string      `arg:"--operator-key-history,separate" placeholder:"KID=PUB,FROM[,UNTIL]" help:"an operator key and the RFC 3339 period it was in force, published in the JWK Set at jwks_uri (§C.4); list retired keys here too, which are published but no longer accepted; a key authorises only from FROM until UNTIL, even as an --operator-key (repeatable; FROM must be no later than the first entry written under a grant the key signed; an --operator-key not listed is published as in force since the deployment's first entry)"`
-	JWKSURI             string        `arg:"--jwks-uri" placeholder:"URL" help:"the jwks_uri GET / publishes (§C.4); default <origin>/.well-known/patchlog-keys, which this server serves"`
-	Archive             string        `arg:"--archive" placeholder:"file:///DIR" help:"default pruning archive destination, a file:// directory (§8.6)"`
-	ArchiveRoot         []string      `arg:"--archive-root,separate" placeholder:"file:///DIR" help:"file:// directory under which retention rules may name archive destinations (repeatable; --archive is always allowed)"`
-	RetentionInterval   time.Duration `arg:"--retention-interval" default:"1h" placeholder:"DURATION" help:"how often retention policies are applied (0 disables)"`
-	RemoteBearer        []string      `arg:"--remote-bearer,separate" placeholder:"ORIGIN=GRANT" help:"grant sent to the deployment at ORIGIN for remote branches (read, and export to register) (repeatable, §G.3)"`
-	RemoteURL           []string      `arg:"--remote-url,separate" placeholder:"ORIGIN=URL" help:"reach the deployment at ORIGIN through URL instead (repeatable)"`
-	RemoteOriginURL     []string      `arg:"--remote-origin-url,separate" placeholder:"ORIGIN=URL" help:"ignored since v0.81; still accepted, with a warning at start, so command lines keep working: it said where the deployment at ORIGIN itself answers, for the start times of a source's epochs from before its e2e raise, which no remote branch reads any more (Addendum E Levels)"`
-	RemoteIdentity      []string      `arg:"--remote-identity,separate" placeholder:"ORIGIN=FILE" help:"X25519 private key (JWK) unwrapping the keys of sealed bases at ORIGIN, named by the --remote-bearer grant's enc (repeatable, §G.5.2)"`
-	RemoteFollow        time.Duration `arg:"--remote-follow-interval" default:"5m" placeholder:"DURATION" help:"how often remote bases' logs are followed: their purges applied and their raises of level followed (§G.3, §G.5.2); 0 disables following"`
-	RemoteFollowTimeout time.Duration `arg:"--remote-follow-timeout" default:"10m" placeholder:"DURATION" help:"how long one remote base's step of a follow may take, after which it is given up until the next and the next base is followed"`
-	RemoteRegister      bool          `arg:"--remote-register" help:"register remote branches with their bases and renew the registrations (§G.3)"`
-	MasterKey           string        `arg:"--master-key" placeholder:"FILE" help:"file holding the 32-byte master key of encryption at rest (Addendum E.1); mode 0600"`
-	MasterKeyCreate     bool          `arg:"--master-key-create" help:"create the --master-key file with a new random key if it doesn't exist"`
-	RotateEpochs        time.Duration `arg:"--rotate-epochs" default:"0s" placeholder:"DURATION" help:"rotate every sealed namespace's epoch once it is this old, e.g. 24h (Addendum E.2; 0 disables)"`
-	RotateOnRevoke      bool          `arg:"--rotate-on-revoke" help:"rotate a sealed namespace's epoch right after a config write that revokes a grant or removes or changes a key (§E.2.4)"`
-	PurgeRaisedE2E      bool          `arg:"--purge-raised-e2e" help:"purge at start, destroying their keys, the namespaces an earlier version raised to e2e by a config write and the remote branches of sources raised so, which this version refuses to start with (Addendum E Levels; to keep a copy, export them with the v0.26.1 tools first)"`
-	GroupCommit         int           `arg:"--group-commit" default:"32" placeholder:"N" help:"Postgres: at most this many concurrent resource writes and batches of one namespace committed in one transaction (group commit, D.8); 1 or less commits every write on its own"`
-	GroupCommitWait     time.Duration `arg:"--group-commit-wait" default:"200us" placeholder:"DURATION" help:"Postgres: at most how long a group waits for writes of its namespace still being checked (0: no wait)"`
-	LocalRateBuckets    bool          `arg:"--local-rate-buckets" help:"Postgres: keep the rate-limit buckets (§6.6) in this instance's memory rather than in the database, saving a round trip per write; only for a deployment of one instance, since instances sharing a database must share their buckets"`
-	StoreCompression    string        `arg:"--store-compression" default:"off" placeholder:"off|zstd" help:"zstd: store the patch sets of namespaces without encryption, from 1 KiB, compressed (SQLite only). A format change: earlier versions can't read a database once it holds compressed patch sets, and turning it off again doesn't decompress them"`
-	EdgeGrantKey        []string      `arg:"--edge-grant-key,separate" placeholder:"[KID=]FILE" help:"a file holding a key edge-grant cookies of POST /edge-grants are signed with, named KID (a plain FILE takes --edge-grant-kid) (§C.5); a FILE with '=' before any '/' is given as KID=FILE or ./FILE; repeatable, to rotate keys: cookies under any are accepted, and the last given signs new ones. Without it, a random key per process, so cookies don't survive a restart, reach another instance or verify at an edge: an edge verifying cookies needs key files. FILE edge-secret is the key derived from --edge-secret, for migrating to key files only: every holder of the edge secret, services included, can derive it and mint cookies with it"`
-	EdgeGrantKid        string        `arg:"--edge-grant-kid" default:"origin" placeholder:"KID" help:"the name (kid) of the edge-grant key given as a plain --edge-grant-key FILE, or of the random one without --edge-grant-key, which the cookies carry and a verifying edge looks the key up by (§C.5.3)"`
+	Addr               string        `arg:"--addr" default:":8080" help:"listen address"`
+	DB                 string        `arg:"--db,env:PATCHLOG_DB" default:"patchlog.db" placeholder:"PATH|URL" help:"SQLite database path, or a Postgres URL (postgres://user:pass@host/db, Addendum D.8)"`
+	BlobDir            string        `arg:"--blob-dir,env:PATCHLOG_BLOB_DIR" placeholder:"DIR" help:"directory blob bytes are stored in; default <db>.blobs next to a SQLite file. On Postgres every instance must share it (a shared volume); without one, bytes are stored in the database"`
+	Origin             string        `arg:"--origin" default:"http://localhost:8080" placeholder:"URL" help:"canonical origin (§G.1)"`
+	Dev                bool          `arg:"--dev" help:"disable authentication (development only); X-Author names the author"`
+	Playground         bool          `arg:"--playground" default:"true" help:"serve the web playground at /playground/ (--playground=false to turn it off)"`
+	InlinePDF          bool          `arg:"--inline-pdf" help:"serve application/pdf blobs for inline display, without the sandbox that blanks Chromium's viewer, instead of with Content-Disposition: attachment (§7.8)"`
+	IndexURL           string        `arg:"--index-url" placeholder:"URL" help:"search index (Addendum A) the playground reads through a read-only proxy at /playground/index/, e.g. http://index:8081; one index serves several namespaces"`
+	SchemaFetch        bool          `arg:"--schema-fetch" help:"let the playground's schema import fetch http(s) URLs (off: it takes uploaded files only); private, loopback and link-local addresses are refused unless the host is in --schema-fetch-hosts"`
+	SchemaFetchHosts   string        `arg:"--schema-fetch-hosts" placeholder:"H,H" help:"comma-separated hosts --schema-fetch is limited to, e.g. www.schemastore.org,raw.githubusercontent.com (also trusted with private addresses)"`
+	MaxBranchDepth     int           `arg:"--max-branch-depth" placeholder:"N" help:"branchDepth (§6.6): how deep local branches of branches may stack (default 8); deployment-wide"`
+	MaxBranchesPerNS   int           `arg:"--max-branches-per-namespace" placeholder:"N" help:"deployment maximum of branchesPerNamespace (§6.6; default: the namespace default, 100); a namespace document's limits may go up to it"`
+	MaxItemsPerBatch   int           `arg:"--max-items-per-batch" placeholder:"N" help:"deployment maximum items per batch (default: the namespace default, 1000); allowances may go up to it, so an atomic import of more items needs it raised (§6.6)"`
+	MaxBatchSize       *byteSize     `arg:"--max-batch-size" placeholder:"SIZE" help:"deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB); allowances may go up to it (§6.6)"`
+	DocumentSize       *byteSize     `arg:"--document-size" placeholder:"SIZE" help:"default documentSize of namespaces that don't set one, e.g. \"4 MiB\" (default 1 MiB, where §6.6 says 4 MiB; see docs/CAPACITY.md), at most --max-document-size"`
+	MaxDocumentSize    *byteSize     `arg:"--max-document-size" placeholder:"SIZE" help:"deployment maximum documentSize, which namespaces may set in their limits, e.g. \"8 MiB\" (default 4 MiB, §6.6's default)"`
+	MaxValidationSteps int           `arg:"--max-validation-steps" default:"5000000" placeholder:"N" help:"validationSteps (§6.6, §12.2): steps a write's validation against its schema and its rules' schema tests may take together, a step being one schema or subschema applied to one value; a write that needs more is refused (422 limit, validationSteps), and each read check, exchange, key request and item filtered by a grant has as many for its rules' schema tests, failing if it needs more; at least 1: no deployment leaves it unbounded"`
+	FullValidation     bool          `arg:"--full-validation" help:"validate the whole document on every write; by default a patch to a document this instance has validated against the same schema revision is validated only where it can have changed the verdict"`
+	GrantCache         int           `arg:"--grant-cache" placeholder:"N" help:"verified bearer grants kept per instance, the least recently used evicted (default 65536; every request whose grant isn't kept verifies it, docs/CAPACITY.md)"`
+	DocCacheSize       *byteSize     `arg:"--doc-cache-size" placeholder:"SIZE" help:"documents kept in memory by revision id, e.g. \"1 GiB\" (default 256 MiB)"`
+	ReadCacheSize      *byteSize     `arg:"--read-cache-size" placeholder:"SIZE" help:"revisions the read cache keeps, served without a transaction, e.g. \"256 MiB\" (default 64 MiB)"`
+	MaxBlobSize        *byteSize     `arg:"--max-blob-size" placeholder:"SIZE" help:"deployment maximum blob size, e.g. \"1 GiB\" (default: the namespace default, 64 MiB; §7.8)"`
+	MaxBlobPending     *byteSize     `arg:"--max-blob-pending" placeholder:"SIZE" help:"deployment maximum bytes of pending blobs per uploader and namespace, e.g. \"16 GiB\" (default: the namespace default, 256 MiB); allowances may go up to it (§6.6)"`
+	LogPageSize        int           `arg:"--log-page-size" placeholder:"N" help:"log page size (§6.6, deployment only): a log range answers at most this many entries a page, with X-Log-Next naming the next page's since (§7.1); long-poll answers and /heads pages are as long (default 1000)"`
+	LogPageBytes       *byteSize     `arg:"--log-page-bytes" placeholder:"SIZE" help:"bytes of patch sets per resource log page (§6.6 logPageBytes, deployment only), e.g. \"16 MiB\" (the default): a resource log range, long-poll answer or event-stream catch-up page ends before an entry that would take it past, though it always holds one (§7.1, §7.7)"`
+	MaxRatePerNS       string        `arg:"--max-rate-per-namespace" placeholder:"RATE,BURST" help:"deployment maximum of ratePerNamespace, e.g. 100000,1000000 (default: the namespace default, 500,1000): namespaces may set their ratePerNamespace up to it, and an allowance's bucket never exceeds it, so an importer's or load harness's allowance needs it raised (§6.6)"`
+	MaxRatePerResource string        `arg:"--max-rate-per-resource" placeholder:"RATE,BURST" help:"deployment maximum of ratePerResource (default: the namespace default, 10,20): namespaces may set their ratePerResource up to it, for small documents that one principal writes often; no allowance lifts the per-resource rate (§6.6)"`
+	MaxRatePrincipal   string        `arg:"--max-rate-per-principal" placeholder:"RATE,BURST" help:"deployment maximum of ratePerPrincipal (default: the namespace default, 50,100): namespaces may set their ratePerPrincipal up to it (§6.6)"`
+	ExchangeRate       string        `arg:"--exchange-rate" placeholder:"RATE,BURST" help:"edge-grant exchanges per principal (§6.6, §C.5, deployment only), e.g. 10,100 (the default): each POST /edge-grants draws one token from the bucket of each principal whose grants it carries, and none from their write buckets"`
+	OperatorKey        []string      `arg:"--operator-key,separate" placeholder:"PUB" help:"base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)"`
+	OperatorKeyHistory []string      `arg:"--operator-key-history,separate" placeholder:"KID=PUB,FROM[,UNTIL]" help:"an operator key and the RFC 3339 period it was in force, published in the JWK Set at jwks_uri (§C.4); list retired keys here too, which are published but no longer accepted; a key authorises only from FROM until UNTIL, even as an --operator-key (repeatable; FROM must be no later than the first entry written under a grant the key signed; an --operator-key not listed is published as in force since the deployment's first entry)"`
+	JWKSURI            string        `arg:"--jwks-uri" placeholder:"URL" help:"the jwks_uri GET / publishes (§C.4); default <origin>/.well-known/patchlog-keys, which this server serves"`
+	Archive            string        `arg:"--archive" placeholder:"file:///DIR" help:"default pruning archive destination, a file:// directory (§8.6)"`
+	ArchiveRoot        []string      `arg:"--archive-root,separate" placeholder:"file:///DIR" help:"file:// directory under which retention rules may name archive destinations (repeatable; --archive is always allowed)"`
+	RetentionInterval  time.Duration `arg:"--retention-interval" default:"1h" placeholder:"DURATION" help:"how often retention policies are applied (0 disables)"`
+	MasterKey          string        `arg:"--master-key" placeholder:"FILE" help:"file holding the 32-byte master key of encryption at rest (Addendum E.1); mode 0600"`
+	MasterKeyCreate    bool          `arg:"--master-key-create" help:"create the --master-key file with a new random key if it doesn't exist"`
+	RotateEpochs       time.Duration `arg:"--rotate-epochs" default:"0s" placeholder:"DURATION" help:"rotate every sealed namespace's epoch once it is this old, e.g. 24h (Addendum E.2; 0 disables)"`
+	RotateOnRevoke     bool          `arg:"--rotate-on-revoke" help:"rotate a sealed namespace's epoch right after a config write that revokes a grant or removes or changes a key (§E.2.4)"`
+	PurgeRaisedE2E     bool          `arg:"--purge-raised-e2e" help:"purge at start, destroying their keys, the namespaces an earlier version raised to e2e by a config write, which this version refuses to start with (Addendum E Levels; to keep a copy, export them with the v0.26.1 tools first)"`
+	GroupCommit        int           `arg:"--group-commit" default:"32" placeholder:"N" help:"Postgres: at most this many concurrent resource writes and batches of one namespace committed in one transaction (group commit, D.8); 1 or less commits every write on its own"`
+	GroupCommitWait    time.Duration `arg:"--group-commit-wait" default:"200us" placeholder:"DURATION" help:"Postgres: at most how long a group waits for writes of its namespace still being checked (0: no wait)"`
+	LocalRateBuckets   bool          `arg:"--local-rate-buckets" help:"Postgres: keep the rate-limit buckets (§6.6) in this instance's memory rather than in the database, saving a round trip per write; only for a deployment of one instance, since instances sharing a database must share their buckets"`
+	StoreCompression   string        `arg:"--store-compression" default:"off" placeholder:"off|zstd" help:"zstd: store the patch sets of namespaces without encryption, from 1 KiB, compressed (SQLite only). A format change: earlier versions can't read a database once it holds compressed patch sets, and turning it off again doesn't decompress them"`
+	EdgeGrantKey       []string      `arg:"--edge-grant-key,separate" placeholder:"[KID=]FILE" help:"a file holding a key edge-grant cookies of POST /edge-grants are signed with, named KID (a plain FILE takes --edge-grant-kid) (§C.5); a FILE with '=' before any '/' is given as KID=FILE or ./FILE; repeatable, to rotate keys: cookies under any are accepted, and the last given signs new ones. Without it, a random key per process, so cookies don't survive a restart, reach another instance or verify at an edge: an edge verifying cookies needs key files. FILE edge-secret is the key derived from --edge-secret, for migrating to key files only: every holder of the edge secret, services included, can derive it and mint cookies with it"`
+	EdgeGrantKid       string        `arg:"--edge-grant-kid" default:"origin" placeholder:"KID" help:"the name (kid) of the edge-grant key given as a plain --edge-grant-key FILE, or of the random one without --edge-grant-key, which the cookies carry and a verifying edge looks the key up by (§C.5.3)"`
 	purgeArgs
+	followPurgesArgs
 	edgeArgs
 	corsArgs
 	shutdownArgs
@@ -320,17 +312,6 @@ func (a *serveCmd) run(string) {
 	}
 	if len(a.EdgeGrantKey) > 0 {
 		log.Printf("edge grants: minted under kid %s, accepted under %s", cookies.Kid(), strings.Join(cookies.Kids(), ", "))
-	}
-	remote, warn, err := remoteOptions(a.RemoteBearer, a.RemoteURL, a.RemoteIdentity, a.RemoteOriginURL)
-	if err != nil {
-		log.Fatal(err)
-	}
-	for _, w := range warn {
-		log.Print("warning: " + w)
-	}
-	remote.Register, remote.FollowInterval, remote.FollowTimeout = a.RemoteRegister, a.RemoteFollow, a.RemoteFollowTimeout
-	if remote.FollowInterval == 0 {
-		remote.FollowInterval = -1
 	}
 
 	var keys []grant.Key
@@ -425,15 +406,6 @@ func (a *serveCmd) run(string) {
 	} else if a.MasterKeyCreate {
 		log.Fatal("--master-key-create needs --master-key")
 	}
-	var treeProxy http.Handler
-	if len(a.TreeURL) > 0 {
-		if !a.Playground {
-			log.Fatal("--tree-url needs the playground (it proxies under " + server.TreeProxyPrefix + ")")
-		}
-		if treeProxy, err = server.NewTreeProxy(a.TreeURL...); err != nil {
-			log.Fatal(err)
-		}
-	}
 	var indexProxy http.Handler
 	if a.IndexURL != "" {
 		if !a.Playground {
@@ -444,7 +416,7 @@ func (a *serveCmd) run(string) {
 		}
 	}
 	opt := core.Options{Path: a.DB, BlobDir: a.BlobDir, Origin: a.Origin, AuthDisabled: a.Dev, OperatorKeys: keys, OperatorKeyHistory: history, JWKSURI: a.JWKSURI,
-		Limits: limits, Maximums: max, GrantCacheEntries: a.GrantCache, DocCacheBytes: sizeOr(a.DocCacheSize, 0), ReadCacheBytes: sizeOr(a.ReadCacheSize, 0), Archiver: arch, RetentionInterval: retention, Remote: remote, KeyStore: ks,
+		Limits: limits, Maximums: max, GrantCacheEntries: a.GrantCache, DocCacheBytes: sizeOr(a.DocCacheSize, 0), ReadCacheBytes: sizeOr(a.ReadCacheSize, 0), Archiver: arch, RetentionInterval: retention, KeyStore: ks,
 		RotateEpochs: a.RotateEpochs, RotateOnRevoke: a.RotateOnRevoke, PurgeRaisedE2E: a.PurgeRaisedE2E, GroupCommit: a.GroupCommit, GroupCommitWait: a.GroupCommitWait, LocalRateBuckets: a.LocalRateBuckets, StoreCompression: a.StoreCompression}
 	if opt.GroupCommit < 1 {
 		opt.GroupCommit = 1 // off
@@ -460,6 +432,9 @@ func (a *serveCmd) run(string) {
 	if purger != nil {
 		opt.Purger = purger
 	}
+	if opt.FollowPurges, err = a.followPurgesArgs.options(a.Origin); err != nil {
+		log.Fatal(err)
+	}
 	e, err := core.Open(opt)
 	if err != nil {
 		log.Fatal(err)
@@ -468,7 +443,7 @@ func (a *serveCmd) run(string) {
 	if a.InlinePDF {
 		sopts = append(sopts, server.WithInlinePDF())
 	}
-	srv := &http.Server{Addr: a.Addr, Handler: a.corsArgs.wrap(handler(server.New(e, sopts...), a.Playground, treeProxy, indexProxy, playground.Options{SchemaFetch: a.SchemaFetch, SchemaFetchHosts: splitList(a.SchemaFetchHosts)})), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: a.Addr, Handler: a.corsArgs.wrap(handler(server.New(e, sopts...), a.Playground, indexProxy, playground.Options{SchemaFetch: a.SchemaFetch, SchemaFetchHosts: splitList(a.SchemaFetchHosts)})), ReadHeaderTimeout: 10 * time.Second}
 	ls := a.shutdownArgs.server("patchlog", srv, e.Ping)
 	sigCtx, sigs := shutdownSignals("patchlog")
 	ln, err := net.Listen("tcp", a.Addr)
@@ -478,9 +453,6 @@ func (a *serveCmd) run(string) {
 	log.Printf("patchlog %s listening on %s (origin %s, dev=%v)", version, a.Addr, a.Origin, a.Dev)
 	if a.Playground {
 		log.Printf("playground: %s%s", localURL(a.Addr), playground.Prefix)
-	}
-	if treeProxy != nil {
-		log.Printf("tree proxy: %s%s -> %s (GET/HEAD only)", localURL(a.Addr), server.TreeProxyPrefix, strings.Join(a.TreeURL, ","))
 	}
 	if indexProxy != nil {
 		log.Printf("index proxy: %s%s -> %s (GET/HEAD only)", localURL(a.Addr), server.IndexProxyPrefix, a.IndexURL)
@@ -684,7 +656,7 @@ func edgeGrantCookies(kid string, keyFlags []string, ev *edge.Verifier, c *corsA
 	}
 	for _, k := range keys {
 		if k.derived() {
-			warn = append(warn, fmt.Sprintf("edge grants: --edge-grant-key %s=%s holds the key derived from --edge-secret: every holder of the edge secret, the catalog service and the search index included, can derive it and mint cookies for any namespace with it. Use it only to migrate to key files, and drop it once its cookies have expired (§C.5)", k.kid, edgeSecretKey))
+			warn = append(warn, fmt.Sprintf("edge grants: --edge-grant-key %s=%s holds the key derived from --edge-secret: every holder of the edge secret, the search index included, can derive it and mint cookies for any namespace with it. Use it only to migrate to key files, and drop it once its cookies have expired (§C.5)", k.kid, edgeSecretKey))
 		}
 	}
 	ck, err = cookiesOf(keys, c)
@@ -759,62 +731,13 @@ func operatorKeyHistory(flags []string) ([]core.OperatorKeyPeriod, error) {
 	return out, nil
 }
 
-// remoteOriginURLIgnored is the warning of a start with --remote-origin-url.
-const remoteOriginURLIgnored = "--remote-origin-url is ignored since v0.81: it said where an origin itself answers, for the start times of a source's epochs from before its e2e raise, which no remote branch reads any more (Addendum E Levels); remove it"
-
-// remoteOptions builds the endpoints of remote bases from ORIGIN=VALUE
-// flags. originURLs (--remote-origin-url) are checked as the others but
-// ignored, with a warning: nothing reads them since v0.81.
-func remoteOptions(bearers, urls, identities, originURLs []string) (core.RemoteOptions, []string, error) {
-	eps := map[string]core.RemoteEndpoint{}
-	for _, pair := range [][]string{bearers, urls, identities, originURLs} {
-		for _, kv := range pair {
-			o, v, ok := strings.Cut(kv, "=")
-			if !ok || !core.ValidRemoteOrigin(o) || v == "" {
-				return core.RemoteOptions{}, nil, fmt.Errorf("remote endpoint %q: want ORIGIN=VALUE with an https origin", kv)
-			}
-			eps[o] = core.RemoteEndpoint{}
-		}
-	}
-	var warn []string
-	if len(originURLs) > 0 {
-		warn = append(warn, remoteOriginURLIgnored)
-	}
-	for _, kv := range bearers {
-		o, v, _ := strings.Cut(kv, "=")
-		ep := eps[o]
-		ep.Bearer = v
-		eps[o] = ep
-	}
-	for _, kv := range urls {
-		o, v, _ := strings.Cut(kv, "=")
-		ep := eps[o]
-		ep.BaseURL = v
-		eps[o] = ep
-	}
-	for _, kv := range identities {
-		o, v, _ := strings.Cut(kv, "=")
-		id, err := bundle.LoadIdentity(v)
-		if err != nil {
-			return core.RemoteOptions{}, nil, fmt.Errorf("--remote-identity %s: %w", o, err)
-		}
-		ep := eps[o]
-		ep.Identity = id
-		eps[o] = ep
-	}
-	return core.RemoteOptions{Resolve: func(origin string) (core.RemoteEndpoint, error) {
-		return eps[origin], nil
-	}}, warn, nil
-}
-
 // handler routes /playground/ to the web UI and everything else to the API.
 // The playground has its own ServeMux, but the API is not put behind one:
 // http.ServeMux cleans paths and answers 301, where §3.6 requires the API's
 // own 400 for non-canonical URLs, so only playground paths reach the mux.
-// treeProxy, if not nil, serves server.TreeProxyPrefix (--tree-url);
-// without it those paths are the playground's 404. indexProxy likewise
-// serves server.IndexProxyPrefix (--index-url).
-func handler(api http.Handler, withPlayground bool, treeProxy, indexProxy http.Handler, pgOpt ...playground.Options) http.Handler {
+// indexProxy, if not nil, serves server.IndexProxyPrefix (--index-url);
+// without it those paths are the playground's 404.
+func handler(api http.Handler, withPlayground bool, indexProxy http.Handler, pgOpt ...playground.Options) http.Handler {
 	if !withPlayground {
 		return api
 	}
@@ -824,9 +747,6 @@ func handler(api http.Handler, withPlayground bool, treeProxy, indexProxy http.H
 		po = pgOpt[0]
 	}
 	mux.Handle(playground.Prefix, playground.HandlerWith(api, po))
-	if treeProxy != nil {
-		mux.Handle(server.TreeProxyPrefix, treeProxy)
-	}
 	if indexProxy != nil {
 		mux.Handle(server.IndexProxyPrefix, indexProxy)
 	}

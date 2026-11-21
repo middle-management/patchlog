@@ -38,8 +38,8 @@ func (e *SyntaxError) Error() string {
 
 // Parse parses exactly one I-JSON value. It rejects duplicate object keys,
 // lone surrogates, invalid UTF-8, non-finite numbers and integer literals
-// outside ±(2^53−1). It accepts Unicode noncharacters, so stored rows,
-// remote bases and bundles written before §3.1 refused them still parse;
+// outside ±(2^53−1). It accepts Unicode noncharacters, so stored rows
+// and bundles written before §3.1 refused them still parse;
 // request bodies use ParseInput.
 func Parse(data []byte) (any, error) {
 	return parse(data, false)

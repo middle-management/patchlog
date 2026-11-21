@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
-	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/rules"
@@ -25,7 +25,24 @@ type Credentials struct {
 	// Edge is a verified edge grant (§C.5), for GET and HEAD under its
 	// prefix only: the server sets it from a cookie, never for writes.
 	Edge *EdgeGrant
+	// viewed is set by ViewCredentials for a request at a view's content
+	// URL (§7.9 Content), once admitted there: the resource read paths
+	// then judge each revision by the view, as they judge a grant's.
+	viewed *viewedBy
 }
+
+// viewedBy is a request admitted at a view's content URL: of namespace
+// ns, judged by j, or reading unrestricted where j is nil (an
+// unrestricted reader's /ns/{ns} cookie).
+type viewedBy struct {
+	ns, view string
+	j        *judge
+	reader   *actor
+}
+
+// Viewed reports whether cred stands for a request at a view's content
+// URL (ViewCredentials).
+func (c Credentials) Viewed() bool { return c.viewed != nil }
 
 // actor is the authenticated principal of a request in one namespace.
 type actor struct {
@@ -38,10 +55,13 @@ type actor struct {
 	// noAuth: a request made while authentication is disabled (§1). The
 	// namespace entries written for it record "grant": null (§7.4).
 	noAuth bool
-	// gs is the subject set of a filtered read's edge grant (§B.11.9,
+	// view is the view of a filtered read's cookie (§7.9,
 	// filteredAdmit): such an actor never reads unrestricted (readsNS,
 	// canRead).
-	gs string
+	view string
+	// judge is the per-revision read check of the grant (grantJudge),
+	// once built.
+	judge *judge
 }
 
 func (a *actor) id() string { return a.principal.ID }
@@ -208,7 +228,6 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 		env.Keys = t.effectiveKeys(n, cfg)
 		env.Revoked = t.effectiveRevoked(n, cfg)
 		env.Roles = cfg.Roles
-		env.CheckAt = t.checkAt(n)
 	}
 	// grantSize and rulesPerGrant were checked as the bearer was decoded,
 	// at the deployment's values (decodeGrant, §C.8).
@@ -298,11 +317,8 @@ func validateAttrs(schema any, attrs map[string]any, steps int) error {
 // accepted, whatever the branch's entry says. A key the branch copied from
 // its base at creation that the base has since removed stops working. Keys
 // added only to the branch are its own.
-//
-// Keys don't follow a base in another deployment (§7.6, §G.3): a remote
-// branch's keys are its own.
 func (t *tx) effectiveKeys(n *nsRow, cfg *Config) []grant.Key {
-	if !n.isBranch() || t.remoteShadow(n) != nil {
+	if !n.isBranch() {
 		return cfg.Keys
 	}
 	base := t.base(n)
@@ -330,16 +346,16 @@ func findKey(ks []grant.Key, kid string) (grant.Key, bool) {
 }
 
 // effectiveRevoked merges the revocations of the namespace and all its
-// bases in this deployment; they stop at a remote base (§7.6, §G.3).
+// bases (§7.6).
 func (t *tx) effectiveRevoked(n *nsRow, cfg *Config) map[string]bool {
-	if !n.isBranch() || t.remoteShadow(n) != nil {
+	if !n.isBranch() {
 		return cfg.Revoked
 	}
 	out := map[string]bool{}
 	for k := range cfg.Revoked {
 		out[k] = true
 	}
-	for b := n; b.isBranch() && t.remoteShadow(b) == nil; {
+	for b := n; b.isBranch(); {
 		b = t.base(b)
 		for k := range t.config(b.configSeq).Revoked {
 			out[k] = true
@@ -348,72 +364,19 @@ func (t *tx) effectiveRevoked(n *nsRow, cfg *Config) map[string]bool {
 	return out
 }
 
-// errAtRejected is every refusal of a key's requireAt at the origin: one
-// text for a namespace that doesn't exist, an at that isn't in its chain
-// and one that wasn't its head within maxLag, and for an at of another
-// shape or namespace, so that no key-scope 403 names the namespace
-// requireAt gives, or tells whether it exists (§C.4 requireAt: "answered
-// as any other scope failure. ... No key-scope 403 names the namespace
-// requireAt gives"; v0.82).
-var errAtRejected = errors.New("at rejected by requireAt")
-
-// checkAt resolves a key's requireAt (§C.4): the grant's at must be an
-// ns_id in the named chain, and must have been that namespace's head at
-// some point within maxLag before the grant was issued (or later). maxLag
-// is the target namespace's (default 60 seconds), or the key's when that
-// is stricter. At the origin, at is in no chain of a namespace that
-// doesn't exist: the grant fails the scope as for any other at, with
-// errAtRejected, and so it does where requireAt names a purged namespace
-// (v0.85).
-func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
-	return func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
-		target := n
-		if s, ok := requireAt.(string); ok {
-			target = t.nsByName(s)
-			// A purged namespace as one that doesn't exist (§C.4,
-			// v0.85): its log is kept, and its purge-ns entry stays
-			// its head for good, but the grant fails the scope. Not
-			// the one the grant is checked in (v0.86): named by its
-			// own name it is as with requireAt: true, so the grant
-			// verifies against its kept chain and the purged
-			// namespace's own 410 answers, never the scope's 403.
-			if target == nil || target.purged && (n == nil || target.id != n.id) {
-				return errAtRejected
-			}
-		}
-		var idText string
-		switch x := at.(type) {
-		case string:
-			idText = x
-		case map[string]any:
-			ns, _ := x["ns"].(string)
-			if ns != target.name {
-				return errAtRejected
-			}
-			idText, _ = x["id"].(string)
-		}
-		id, err := ids.Parse(idText)
-		if err != nil {
-			// Not reached through grant.Verify: a grant decodes only
-			// with at an ns_id or {"ns","id"} with one, and one without
-			// at is refused before (key "requires at").
-			return errAtRejected
-		}
-		seq, ok := t.nsLogSeq(target.id, id)
-		if !ok {
-			return errAtRejected
-		}
-		var nextMs int64
-		if err := t.QueryRow(`SELECT created FROM ns_log WHERE ns = ? AND prev_seq = ?`, target.id, seq).Scan(&nextMs); err != nil {
-			return nil // at is still the head
-		}
-		next := time.UnixMilli(nextMs)
-		lag := grant.EffectiveMaxLag(t.config(target.configSeq).MaxLag, keyMaxLag)
-		if !grant.HeadWithin(&next, issued, lag) {
-			return errAtRejected
-		}
+// admitOnce is admit, once for a request: a write whose transaction runs
+// again (Postgres, pglock.go) keeps its draw (rateDrawn).
+func (t *tx) admitOnce(draws []draw) *Error {
+	if t.rateDrawn != nil && *t.rateDrawn {
 		return nil
 	}
+	if err := t.admit(draws); err != nil {
+		return err
+	}
+	if t.rateDrawn != nil {
+		*t.rateDrawn = true
+	}
+	return nil
 }
 
 // basicEnvelope is the envelope of step 1 and of reads. A read envelope
@@ -510,13 +473,22 @@ func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 	if cfg.Read == "public" || t.e.opt.AuthDisabled {
 		return true
 	}
-	if a == nil || a.verified == nil || a.gs != "" {
+	if a == nil || a.verified == nil || a.view != "" {
 		return false
 	}
 	if !a.verified.Can["read"] {
 		return false
 	}
-	return t.grantRules(a, "read", nil, t.basicEnvelope("read", resource, a), false) == nil
+	if t.grantRules(a, "read", nil, t.basicEnvelope("read", resource, a), false) != nil {
+		return false
+	}
+	// Rules on /doc are left to the revision the read concerns
+	// (mayReadRow); the parts of them that don't refer to /doc, alls
+	// flattened, hold for every revision it may read.
+	if j := t.grantJudge(a); resource != "" && j != nil && j.doc && !j.byNameOnly(resource) {
+		return false
+	}
+	return true
 }
 
 // reader authenticates a read of a resource URL (/r/{ns}/{name} and the
@@ -525,20 +497,23 @@ func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 // doesn't exist, except that public namespaces ignore it and answer as to
 // an unauthenticated request; other refusals, a key-scope failure
 // included, answer 404 rather than 403, so that neither the resource's
-// nor the namespace's existence is revealed (§7, §C.2 item 1). Past the
-// check, a resource whose source was raised to a level this server lacks
-// answers 502 upstream (upstreamRefusal, §1).
+// nor the namespace's existence is revealed (§7, §C.2 item 1).
 func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	var a *actor
 	var err *Error
+	if v := cred.viewed; v != nil {
+		// Admitted at the view's URL (ViewCredentials): each revision is
+		// judged by the view (mayReadRow).
+		if v.ns != n.name {
+			return nil, notFound()
+		}
+		return &actor{principal: v.reader.principal, bucketKey: v.reader.bucketKey, view: v.view, judge: v.j}, nil
+	}
 	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
 		a, err = t.edgeReader(n, cred.Edge, resource)
 	} else {
 		a, err = t.readerCheckURL(n, cred, func(a *actor) bool { return t.canRead(n, cfg, a, resource) }, readResource)
-	}
-	if err == nil && resource != "" {
-		err = t.upstreamRefusal(n, resource)
 	}
 	return a, err
 }
@@ -555,7 +530,7 @@ func (t *tx) nsReader(n *nsRow, cred Credentials) (*actor, *Error) {
 	return t.readerCheck(n, cred, func(a *actor) bool { return t.readsNS(n, cfg, a, false) })
 }
 
-// accessKind classifies a reader of a namespace (§B.11.9 Partial reader).
+// accessKind classifies a reader of a namespace (§7.9 Partial reader).
 type accessKind int
 
 const (
@@ -573,7 +548,7 @@ const (
 // or key scope refer to /now is refused in the read check itself
 // (readerCheckURL), before any redirect. Anything else is nsReader's
 // refusal. An edge grant for a
-// filtered read (GS) is none: filteredAdmit judges it at filtered URLs.
+// filtered read (a view's) is none: filteredAdmit judges it at filtered URLs.
 func (t *tx) nsAccess(n *nsRow, cred Credentials) (*actor, accessKind, *fscope, *Error) {
 	cfg := t.config(n.configSeq)
 	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
@@ -592,7 +567,7 @@ func (t *tx) nsAccess(n *nsRow, cred Credentials) (*actor, accessKind, *fscope, 
 		if a == nil || a.verified == nil {
 			return false
 		}
-		if _, ok := readRoles(a); !ok {
+		if !t.partialReader(a) {
 			return false
 		}
 		if fs = t.filteredScope(n); fs != nil {
@@ -633,7 +608,7 @@ func (t *tx) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
 // readerCheck authenticates a read that isn't of a resource URL, such as
 // /ns/{ns} and the URLs under it, or POST /ns/{ns}/keys, and decides
 // access with may. A grant its key's scope doesn't allow (sub, groups,
-// maxTtl, requireAt, readScope …) is 403 there, as for a write: only a
+// maxTtl, readScope …) is 403 there, as for a write: only a
 // read of a resource URL in a private namespace answers 404 (§C.2 item
 // 1, §7). A verified grant that may not read is 403 too (§7, v0.74).
 func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
@@ -730,10 +705,9 @@ func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, k
 // authentication disabled, and otherwise a grant that may read there
 // through rules none of which refers to /resource (unrestrictedRoles)
 // and that pass for a read, so none on /now (§C.2 item 5). /ns/{ns} and everything under it but the gestures listing need it, as
-// do a batch's source check (§7.5), branching (§7.6) and remote branch
-// registration (§G.3): a grant whose rules hide some resources could
+// do a batch's source check (§7.5), branching (§7.6): a grant whose rules hide some resources could
 // otherwise list their names and heads, or read them through a branch.
-// Branching and registration check it as step 1 checks verbs (stepOne,
+// Branching checks it as step 1 checks verbs (stepOne,
 // §6.2, §2.1, §C.2 item 2), in a public namespace too: the grant must read
 // n unrestricted and allow read, and its key-scope and block rules that
 // refer only to /action or /principal must pass with /action read,
@@ -751,8 +725,8 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 	}
 	if a.verified == nil {
 		// A namespace's edge grant (edgeReader), but not a filtered
-		// read's (§B.11.9).
-		return a.gs == ""
+		// read's (§7.9).
+		return a.view == ""
 	}
 	roles, ok := a.unrestrictedRoles()
 	if !ok {
@@ -765,18 +739,19 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 }
 
 // unrestrictedRoles reports whether a grant's rules leave every resource
-// readable (§2.1 Unrestricted read): its key has no readScope, no rule of
-// its blocks or key scope refers to /resource, and, if it carries roles,
-// some role listing read has no rule that refers to /resource or to /now.
-// Those roles are returned, nil for a grant without roles; roles are
-// alternatives (§C.1.1), so one is enough. A role with a rule on /now
-// doesn't count for read (§C.2 item 5), so it gives no unrestricted read
-// either: it is left out here, not only by the read envelope its callers
-// then evaluate (readsNS, the /keys relay of K_e), so that no caller can
-// take it for one (v0.82).
+// and revision readable (§2.1 Unrestricted read): its key has no
+// readScope, no rule of its blocks or key scope refers to /resource or
+// /doc, and, if it carries roles, some role listing read has no rule that
+// refers to /resource, /doc or /now. Those roles are returned, nil for a
+// grant without roles; roles are alternatives (§C.1.1), so one is enough.
+// A role with a rule on /now doesn't count for read (§C.2 item 5), so it
+// gives no unrestricted read either: it is left out here, not only by the
+// read envelope its callers then evaluate (readsNS, the /keys relay of
+// K_e), so that no caller can take it for one (v0.82).
 func (a *actor) unrestrictedRoles() ([]string, bool) {
 	v := a.verified
-	if v.Key.ReadScopeResource || refersToResource(v.KeyRules) || refersToResource(v.BlockRules) {
+	if v.Key.ReadScopeResource || refersToResource(v.KeyRules) || refersToResource(v.BlockRules) ||
+		refersToDoc(v.KeyRules) || refersToDoc(v.BlockRules) {
 		return nil, false
 	}
 	ok, roles := v.Allows("read")
@@ -785,7 +760,7 @@ func (a *actor) unrestrictedRoles() ([]string, bool) {
 	}
 	var out []string
 	for _, r := range roles {
-		if rs := v.RoleRules(r); !refersToResource(rs) && !rulesReferToNow(rs) {
+		if rs := v.RoleRules(r); !refersToResource(rs) && !refersToDoc(rs) && !rulesReferToNow(rs) {
 			out = append(out, r)
 		}
 	}
@@ -798,6 +773,19 @@ func refersToResource(rs []any) bool {
 	for _, rv := range rs {
 		r, err := compileCached(rv)
 		if err != nil || r.Refs()["resource"] || r.Refs()["*"] {
+			return true
+		}
+	}
+	return false
+}
+
+// refersToDoc reports whether a rule of rs refers to /doc, or to the
+// whole envelope (grantcheck.RefersToDoc). A rule that doesn't compile
+// counts.
+func refersToDoc(rs []any) bool {
+	for _, rv := range rs {
+		r, err := compileCached(rv)
+		if err != nil || grantcheck.RefersToDoc(r) {
 			return true
 		}
 	}
@@ -948,15 +936,29 @@ func (t *tx) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
 	return draw{"b\x00" + a.bucketKey, cfg.Limits.BlobRate, float64(size), "blobRate"}
 }
 
-// admit draws tokens, or answers 429 (§6.6): Retry-After in whole seconds,
-// rounded up, and in the body retryAfter, the wait in seconds as a decimal
-// (rounded up to the millisecond), which a client under a fast allowance
-// waits by instead.
+// admit draws tokens, or answers 429 (§6.6).
+//
+// In a write's check outside the lock (checkOutside, drawLater) on the
+// store's buckets it only records the draws, which checkOutside makes
+// once the check's read transaction has ended, so that no connection of
+// the main pool waits, idle in a transaction, for the bucket pool and
+// the buckets' row locks: the check goes on as if admitted. Unless this
+// instance last found a bucket of draws empty and it hasn't refilled
+// since (bucketStore.knownEmpty): then the check stops here (errDrawFirst),
+// as it would at a 429, and runs again once the draw admits it.
 func (t *tx) admit(draws []draw) *Error {
 	var wait time.Duration
 	var hit string
 	var ok bool
 	if s := t.e.rate.store; s != nil {
+		if l := t.drawLater; l != nil {
+			l.draws = append(l.draws, draws)
+			if s.knownEmpty(t.now, draws) {
+				l.first = true
+				return errDrawFirst
+			}
+			return nil
+		}
 		var err error
 		wait, hit, ok, err = s.admit(t.ctx, t.now, draws)
 		t.must(err)
@@ -964,29 +966,49 @@ func (t *tx) admit(draws []draw) *Error {
 		wait, hit, ok = t.e.rate.admit(t.now, draws)
 	}
 	if !ok {
-		secs := int(math.Ceil(wait.Seconds()))
-		if secs < 1 {
-			secs = 1
-		}
-		e := apiErr(429, "rate", "message", "rate limit exceeded", "limit", hit, "retryAfter", math.Ceil(wait.Seconds()*1000)/1000)
-		e.Header = map[string][]string{"Retry-After": {fmt.Sprint(secs)}}
-		return e
+		return rateRefused(wait, hit)
 	}
 	return nil
 }
 
-// admitOnce is admit, once for a request: a write that runs again, as one
-// that reads a remote branch's base does (withRemoteSource), keeps its
-// draw (rateDrawn).
-func (t *tx) admitOnce(draws []draw) *Error {
-	if t.rateDrawn != nil && *t.rateDrawn {
-		return nil
+// rateRefused is the 429 of a refused draw (§6.6): Retry-After in whole
+// seconds, rounded up, and in the body retryAfter, the wait in seconds as
+// a decimal (rounded up to the millisecond), which a client under a fast
+// allowance waits by instead.
+func rateRefused(wait time.Duration, hit string) *Error {
+	secs := int(math.Ceil(wait.Seconds()))
+	if secs < 1 {
+		secs = 1
 	}
-	if err := t.admit(draws); err != nil {
-		return err
-	}
-	if t.rateDrawn != nil {
-		*t.rateDrawn = true
+	e := apiErr(429, "rate", "message", "rate limit exceeded", "limit", hit, "retryAfter", math.Ceil(wait.Seconds()*1000)/1000)
+	e.Header = map[string][]string{"Retry-After": {fmt.Sprint(secs)}}
+	return e
+}
+
+// drawLater holds the draws a write's check recorded (admit), in order,
+// for checkOutside to make after its read transaction.
+type drawLater struct {
+	draws [][]draw
+	// first: the check stopped at the last of draws (errDrawFirst).
+	first bool
+}
+
+// errDrawFirst stops a write's check at a draw on a bucket this instance
+// found empty (admit). checkOutside never answers it.
+var errDrawFirst = &Error{Status: 429, Body: map[string]any{"code": "rate"}}
+
+// drawAfter makes the draws a write's check recorded (drawLater), one
+// atomic draw after another as the check would have, and answers the
+// first refusal's 429.
+func (e *Engine) drawAfter(ctx context.Context, now time.Time, l *drawLater) error {
+	for _, draws := range l.draws {
+		wait, hit, ok, err := e.rate.store.admit(ctx, now, draws)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return rateRefused(wait, hit)
+		}
 	}
 	return nil
 }
@@ -1029,7 +1051,7 @@ func (t *tx) allowanceOf(cfg *Config, a *actor) *Allowance {
 
 // guardedPaths need a grant chained to a * key (§7.4, §C.2): a config
 // write or a branch's patches covering or overlapping one of them.
-var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/merge", "/retention", "/encryption", "/signatures", "/nonce", "/schemaReads", "/catalogs", "/maxLag"}
+var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/merge", "/retention", "/encryption", "/signatures", "/nonce", "/schemaReads"}
 
 func touchesGuarded(writes []string) bool {
 	for _, w := range writes {

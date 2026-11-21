@@ -47,7 +47,7 @@ func TestMinOtherNamespace(t *testing.T) {
 	old := map[string]string{}
 	for tok, name := range map[string]string{amy: "amy", bob: "bob"} {
 		r := x.raw("/pa?limit=5", tok)
-		if loc := r.header.Get("Location"); r.status != 302 || !strings.HasPrefix(loc, "/pa/g/") {
+		if loc := r.header.Get("Location"); r.status != 302 || !strings.HasPrefix(loc, "/pa/view/") {
 			t.Fatalf("%s: %d %s", name, r.status, loc)
 		}
 		old[name] = r.header.Get("Location")

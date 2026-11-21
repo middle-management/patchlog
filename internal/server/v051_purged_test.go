@@ -1,12 +1,7 @@
 package server
 
 import (
-	"context"
-	"crypto/ed25519"
-	"sync"
 	"testing"
-
-	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // purgeAs freezes ns and purges it, as bearer when authentication is on,
@@ -109,51 +104,5 @@ func TestV051PurgedSealedReadCheck(t *testing.T) {
 	expect(t, r, 302)
 	if etagOf(r) != head {
 		t.Fatalf("head %s, want %s", etagOf(r), head)
-	}
-}
-
-// v0.51 §8.5, §G.3: a remote branch of a sealed base learns of the base's
-// purge from the 410 purged of its log, whose head stands in for the
-// purge-ns entry: every name the base had is purged here, the branch's own
-// stay, and following again changes nothing.
-func TestV051RemoteSealedBasePurged(t *testing.T) {
-	t.Parallel()
-	var aPriv ed25519.PrivateKey
-	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning)
-	a.opPriv = aPriv
-	kA := newKey("admin")
-	a.mkNS("s", sealedDoc(map[string]any{"read": "grant", "keys": []any{kA.entry("*")}}))
-	root := a.grant(kA, "user:root", []string{"s"}, allVerbs)
-	a.wr("s", "x", "", withNonce(addRoot(map[string]any{"v": encMarker})), root)
-	at := a.nsHead("s", root)
-	bJWK, bPriv, err := seal.GenerateRecipient()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var mu sync.Mutex
-	id := bPriv
-	rt := &route{url: a.srv.URL, bearer: a.grant(kA, "svc:b", []string{"s"}, []string{"read", "export"}, map[string]any{"enc": bJWK})}
-	b := newEnv(t, withOrigin(originB), withRemote(rt, withRemoteIdentity(&mu, &id)), withKeyStore(newKeyStore(t)), withEncTuning)
-	expect(t, b.mkRemote("rel", remoteGenesis("s", at, map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}})), 201)
-	b.wr("rel", "mine", "", withNonce(addRoot(map[string]any{})))
-	ctx := context.Background()
-	if err := b.e.SyncRemotes(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	head := a.purgeAs("s", root)
-	expectPurged(t, a.get("/ns/s/rev/"+head+"/log?since="+at, rt.bearer), head)
-	if err := b.e.SyncRemotes(ctx); err != nil {
-		t.Fatal(err)
-	}
-	expect(t, b.get("/r/rel/x"), 410)
-	expect(t, b.get("/r/rel/mine"), 302)
-	ns, err := b.e.RemoteNotices(ctx, "rel")
-	if err != nil || len(ns) != 1 || ns[0].Kind != "purge-ns" || ns[0].ID != head || !ns[0].Applied {
-		t.Fatalf("notices %+v %v", ns, err)
-	}
-	h := b.nsHead("rel")
-	if err := b.e.SyncRemotes(ctx); err != nil || b.nsHead("rel") != h {
-		t.Fatalf("second sync: %v", err)
 	}
 }

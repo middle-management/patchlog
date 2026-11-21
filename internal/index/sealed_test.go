@@ -108,7 +108,7 @@ func TestSealedNamespace(t *testing.T) {
 	}
 	// A reader of sec whole, under reads:sec (§A.4).
 	rd := k.Grant(t, s.Now(), "user:r", []string{"sec"}, []string{"read"})
-	gs := readsGS("sec", k)
+	vid := readsView("sec", k)
 	all := []string{"read", "create", "append", "purge", "config"}
 	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"sec", "pub", "schemas"}, all)), client.WithKeys(client.NewKeys(nil)))
 	// The schema lives in a public namespace (§E.2.5).
@@ -153,7 +153,7 @@ func TestSealedNamespace(t *testing.T) {
 	}
 	h := must(seal.ParseHeader(string(f.body)))
 	at := x.ix.Checkpoint("sec")
-	if h.Kid != "sec#1" || h.Zip != "" || fmt.Sprint(h.PL) != fmt.Sprint(map[string]any{"ns": "sec", "view": "/sec/g/" + gs + "/at/" + at + "?counts=%2Ftag&q=secret"}) {
+	if h.Kid != "sec#1" || h.Zip != "" || fmt.Sprint(h.PL) != fmt.Sprint(map[string]any{"ns": "sec", "view": "/sec/view/" + vid + "/at/" + at + "?counts=%2Ftag&q=secret"}) {
 		t.Fatalf("header %+v", h)
 	}
 	keys := epochKeys(t, w, "sec")
@@ -195,7 +195,7 @@ func TestSealedNamespace(t *testing.T) {
 	if again := x.fetch(f.path, rd); string(again.body) != string(f.body) || !strings.Contains(again.header.Get("Cache-Tag"), "r:sec/a") {
 		t.Fatalf("resealed after a restart (tags %q)", again.header.Get("Cache-Tag"))
 	}
-	if r := x.raw("/sec/g/"+gs+"/at/"+at+"?q=secret&counts=/tag", rd); r.status != 302 || r.header.Get("Location") != f.path {
+	if r := x.raw("/sec/view/"+vid+"/at/"+at+"?q=secret&counts=/tag", rd); r.status != 302 || r.header.Get("Location") != f.path {
 		t.Fatalf("non-canonical: %d %s", r.status, r.header.Get("Location"))
 	}
 
@@ -222,7 +222,7 @@ func TestSealedNamespace(t *testing.T) {
 	if again := x.fetch(f.path, rd); again.path != f.path || string(again.body) != string(f.body) {
 		t.Fatalf("kept result: %s, changed %v", again.path, string(again.body) != string(f.body))
 	}
-	if r := x.raw("/sec/g/"+gs+"/at/"+at+"?q=secret&counts=/tag", rd); r.status != 302 || r.header.Get("Location") != f.path {
+	if r := x.raw("/sec/view/"+vid+"/at/"+at+"?q=secret&counts=/tag", rd); r.status != 302 || r.header.Get("Location") != f.path {
 		t.Fatalf("non-canonical, kept: %d %s", r.status, r.header.Get("Location"))
 	}
 

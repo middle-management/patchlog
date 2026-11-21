@@ -1,6 +1,6 @@
 # Patch Log — Tools
 
-Status: draft v0.86 · 2026-11-19. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.87 · 2026-11-19. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Clients and tools that use the protocol's public API. A server needs nothing from this document.
 
@@ -10,7 +10,7 @@ Status: draft v0.86 · 2026-11-19. A companion to the [Patch Log specification](
 - **Addendum H (suggested, non-normative):** files: how file tools, such as WebDAV gateways and mounts, store files, folders and names to share a namespace.
 - **Addendum J (suggested, non-normative):** streams: a proxy that keeps an upstream's streamed response for clients to resume, and shared agent sessions built on it.
 
-**Reading.** "Reading this spec" in [SPEC.md](SPEC.md) applies here, and so do its terms (§2, §2.1). The three documents share one numbering: §1–§10, §12, §13, §C, §E (but §E.2.6), §G.1, §G.3, §G.4.1, §G.5–§G.7 and §I are in SPEC.md; §A, §B and §E.2.6 are in [SERVICES.md](SERVICES.md).
+**Reading.** "Reading this spec" in [SPEC.md](SPEC.md) applies here, and so do its terms (§2, §2.1). The three documents share one numbering: §1–§10, §12, §13, §C, §E (but §E.2.6), §G.1, §G.4.1, §G.5–§G.7 and §I are in SPEC.md; §A and §E.2.6 are in [SERVICES.md](SERVICES.md).
 
 ---
 
@@ -21,9 +21,9 @@ Status: draft v0.86 · 2026-11-19. A companion to the [Patch Log specification](
 - **submit(patches):** `PATCH` with `If-Match: "{head}"`, then apply the returned revision. On `412`, `sync(body.head)` and resend the same patches, re-sealed at E3 (§E.3.1) and re-signed if signed (§C.3.1): this is the rebase. Surface `422` and `403` errors; retry a bounded number of times.
 - **Conflict safety:** prefix a set that must not land on changed data with `test` ops of the values seen. A retry on changed data then fails with `422`. At E3, where the server applies nothing (§6.2), it fails instead when the client applies it to the new head before re-sealing.
 - **watch:** SSE from `since={head}`, or long-poll (§7.7). De-duplicate by entry id: the client's own writes echo back.
-- **Filtered logs:** a client library hands a filtered log (§B.11.9) only to a caller that asked for one.
+- **Filtered logs:** a client library hands a filtered log (§7.9) only to a caller that asked for one.
 - **Deleted resources:** a `410` on the head means deleted.
-  - A `successor` (§8.1) means the resource moved: offer it as a link. Follow it automatically only into a namespace the client already trusts (a catalog grants nothing there).
+  - A `successor` (§8.1) means the resource moved: offer it as a link. Follow it automatically only into a namespace the client already trusts.
   - In sealed and end-to-end namespaces read `$successor` from the document at `last` instead.
   - At E3 read the verified document, ignoring any `successor` on a `410`. A sealed-namespace client that doesn't trust caches does the same before following one automatically.
 - **Frozen namespaces:** on `409 frozen` with a `successor`, load the resource there and replay the pending patch sets as on `412`.
@@ -44,7 +44,7 @@ Status: draft v0.86 · 2026-11-19. A companion to the [Patch Log specification](
 
 - **Split documents along the lines of access, editing and size:** a document is the unit of read access (§C.5), concurrency and rate limits (§6.6), merge conflicts (§F.3) and revision cost.
 
-  Split one that grows without bound, has parts with different readers, or is edited by unrelated people at once; link the parts with `x-ref` (§6.5) and group them with a catalog (Addendum B).
+  Split one that grows without bound, has parts with different readers, or is edited by unrelated people at once; link the parts with `x-ref` (§6.5).
 
   Where several parties add to one list, make each entry a resource: creates of different resources never collide, and the namespace log orders them. This gives up constraints across entries, such as a schema's `maxItems`. Writers of one shared document queue behind its head, each lost race costing a request and its rate tokens (§6.6), and a `test` guards whatever a write depends on (§11).
 
@@ -124,7 +124,6 @@ This addendum uses the core's branches (§7.6), batches (§7.5), and namespace f
   | Releases                         | Publish many documents as one batch per namespace, possibly at a set time (§F.9)                                                                                                                                            |
   | Schema migrations                | Write the new schema revision first, or draft it in a branch of the schema namespace (§6.1, §F.9); migrate the documents in a branch and merge them in one batch whose `config` updates the rule allowing the new `$schema` |
   | Private drafts of public content | A branch with `read: "grant"`                                                                                                                                                                                               |
-  | Catalog reorganisations          | Branch a catalog namespace (Addendum B), review, merge the moves at once                                                                                                                                                    |
 
 ## F.2 Creating and working in a branch
 
@@ -183,7 +182,7 @@ A merge is **one batch into the base**, built from the branch's changes:
 
       Removing an author withdraws its earlier batches, so a retired `kid` stays listed while branches it merged may merge again or await cleanup. Changing `/merge` needs a `*` key (§7.4). Other merges, such as an editor's by hand, aren't tracked, so such a branch should be rebased (§F.5) before it is merged again. The merger's dry-run report lists, per resource, which batch and author its pair came from.
 
-- **Blobs.** A merger with unrestricted `read` on the branch copies nothing within the deployment, as the batch's `source` makes the branch's blobs available (§7.8). Any other merger copies them first, or uploads them where the ranks refuse a copy (§2.1), and a merge from another deployment uploads them (§G.3). At E3, a resource whose document references a blob that can't be declared, of another type or with a nonce (§E.3.1), gets no item: the merger reports it and offers it again.
+- **Blobs.** A merger with unrestricted `read` on the branch copies nothing within the deployment, as the batch's `source` makes the branch's blobs available (§7.8). Any other merger copies them first, or uploads them where the ranks refuse a copy (§2.1). At E3, a resource whose document references a blob that can't be declared, of another type or with a nonce (§E.3.1), gets no item: the merger reports it and offers it again.
 - **Nonces.** Tools that diff documents for a merge or a review leave out a fresh `$nonce`, as `writes` do (§6.4.1).
 - **Conflicts inside arrays.** For merge and rebase, a write whose last segment indexes an array counts as one to the whole outermost array holding it.
 - **Configuration is never merged implicitly.** A config change meant for the base goes in the batch's `config`.
@@ -232,12 +231,12 @@ To bring `release-7` up to date with `matches`:
 
 - **The janitor MUST verify claims,** which any config writer of the branch can set: `merged`, `successor`, `abandoned` and `cleanup`, which it holds to the base's minimums (above). Before purging, it checks:
 
-  - **merged:** the base's log has a batch that counts as a merge (§F.3), and the branch's log has no `head`, `tombstone` or `batch` entry after its `source.at`; entries of other kinds are allowed. A remote branch, merged back with `origin` (§G.3), never passes: it is cleaned up as superseded or abandoned, or by hand.
+  - **merged:** the base's log has a batch that counts as a merge (§F.3), and the branch's log has no `head`, `tombstone` or `batch` entry after its `source.at`; entries of other kinds are allowed.
   - **superseded:** all of these hold:
     - The successor is still one §7.4 allows. Or it was, until a purge after the branch was last frozen, and the janitor still holds what this check needs that the purge stopped serving, read before it (§8.5).
     - The successor's log has a batch without `origin` whose `source.ns` is the branch and whose `source.at` is in the branch's chain. That batch's recorded grant has a root `sub` and `kid` in the base's current `merge.authors`, or chains to a current `*` key of the branch.
     - The branch's log has no `head`, `tombstone` or `batch` entry after that `source.at`.
-  - **abandoned:** the branch's document has `"abandoned": true`, set by a config write whose recorded grant (§C.3) chains to a current `*` key of the branch, inherited from a local base or its own.
+  - **abandoned:** the branch's document has `"abandoned": true`, set by a config write whose recorded grant (§C.3) chains to a current `*` key of the branch, inherited from a base or its own.
   - A batch in the branch's log counts as a `batch` entry only through its items.
   - At E3, entries for the branch's `keyring` resource, which is never merged (§F.8.1), are allowed after `source.at` too, in either check; a batch counts only if it has other items.
 
@@ -269,31 +268,16 @@ To bring `release-7` up to date with `matches`:
 
   - `read` on bases and branches
   - `branch` on bases, and writes in branches, for rebases
-  - `config` on branches, to freeze them and record `merged` or `successor`, and writes to its merge locks (§F.9)
+  - `config` on branches, to freeze them and record `merged` or `successor`
   - write access to a base only if it merges on its own
 
-## F.8 Access, encryption, catalogs and indexes
+## F.8 Access, encryption and indexes
 
-- **Editors limited to some documents** can't branch the base themselves (§7.6). A service that may branch it creates the branch for them, recorded with `via` (§C.1), with `read: "grant"`, and issues them grants on it fixed to the resources their base grants cover, as the catalog does for the base (§B.11.4).
+- **Editors limited to some documents** can't branch the base themselves (§7.6). A service that may branch it creates the branch for them, recorded with `via` (§C.1), with `read: "grant"`, and issues them grants on it with the rules of their base grants. Filtered reads don't cover branches (§7.9), so such grants list only through a preview index (below, §A.4).
 - **Keys and revocation** in a base reach its branches (§C.4); roles and rules don't (§7.6, §F.3).
 - **Encryption (Addendum E),** whose Levels also bind a branch's level to its base's:
   - **E2** as §E.2.5 says, where fast-forward merges keep ids, which are over plaintext.
   - **E3** as §F.8.1 says.
-- **Catalogs (Addendum B).**
-  - A catalog service MAY compute preview access from a branch, but MUST issue content grants only from the catalog it follows as the base.
-  - Merging a catalog branch goes through the catalog service. For an end-to-end catalog it issues no merge grants and checks no catalog batch. Without a merge key (below) it issues none either. In both cases a request for one is `404` (`not_offered`), as organising requests are in an end-to-end catalog (§B.11.4).
-    - It checks every change in the batch as §B.11.4 checks organising requests, with the plan's approver as the caller, and no widening whoever approved. The approver is resolved from that person's own grant as §B.11.4 resolves one.
-    - It issues one grant covering exactly that batch: its rules allow exactly the batch's pairs of `/resource` and `/action`, and it expires within minutes.
-    - The catalog service signs merge grants with a key used for nothing else, which can neither assert admin groups nor write `$access` (§B.11.3). It signs them only for the merge service (root `sub` the merge service's, `attrs.approvedBy` the plan's approver), and hands them to nobody else.
-    - The merge service submits exactly the batch that was checked.
-    - The catalog base lists that pair of `sub` and `kid` in `merge.authors` (§F.3).
-  - Changes to `$access`, and moves and re-placings that widen (§B.11.4), need `catalog-admins` (§B.11.3), which the catalog key may never assert. So a catalog batch with such a change, and any catalog batch of an end-to-end catalog, goes only with an approver in `catalog-admins`. In an end-to-end catalog, the approver is in it by its grant's root `groups`. Such a batch:
-    - is checked by the catalog service in a dry run, with the `catalog-admins` member whose grant it goes under as the caller, except in an end-to-end catalog (above)
-    - is submitted under that grant through the merge service, which adds a narrowing block with its own `via` (§C.1)
-
-    The catalog base lists each such admin in `merge.authors`, so the batch counts as a merge.
-  - A catalog branch in a release previews against the release's content branches (§B.5), and is merged in two batches around the content (§F.9).
-  - **Filtered reads** (§B.11.9) don't cover branches, so collaborators who read the base unrestricted get unrestricted `read` on every branch of the release, as previews need (§B.5). A branch reads through all of its base, so other collaborators get grants fixed to the resources their base grants cover, as editors do (first bullet), and can't view previews (§B.5). Draft placements live in a catalog branch listed with the content branch in the release (§F.9), never in the catalog base; a release that only edits existing documents needs none, and a catalog branch can join it later, from the catalog's current head.
 - **Indexes (Addendum A).** Search over a branch is a separate preview index (§10, Branches); the main index follows only the base.
 
 ### F.8.1 Merging and rebasing at E3
@@ -302,10 +286,7 @@ At E3 a merge (§F.3) or a rebase (§F.5) is carried out by a client that holds 
 
 - **Keys.** The merger needs the branch's own epochs, plus the base's epochs up to the branch's `at` for read-through content, to read, and the target's current epoch key to write.
 
-  A `kid` `{ns}#{e}` names the namespace whose `keyring` holds its key. Read-through content in a branch keeps the base's ciphertext and `kid`, and the branch's own writes carry the branch's `kid`s. A client asks the namespace it is reading for keys first, and only if that fails the `kid`'s namespace:
-
-  - `POST /ns/{branch}/keys` relays its bases' keyring entries as of `at` (§E.2.3).
-  - A remote branch's `POST /ns/{branch}/keys` relays them from its mirrored keyring (§G.5.2).
+  A `kid` `{ns}#{e}` names the namespace whose `keyring` holds its key. Read-through content in a branch keeps the base's ciphertext and `kid`, and the branch's own writes carry the branch's `kid`s. A client asks the namespace it is reading for keys first, and only if that fails the `kid`'s namespace: `POST /ns/{branch}/keys` relays its bases' keyring entries as of `at` (§E.2.3).
 
   A branch's `keyring` is never merged.
 
@@ -334,89 +315,49 @@ At E3 a merge (§F.3) or a rebase (§F.5) is carried out by a client that holds 
 
 - **Later merges and the janitor.** Every E3 merge is a replay, so a second merge finds its common ancestors in earlier merge batches (§F.3); these, like the janitor's checks (§F.6), need no keys. Without such a batch, a merger MAY count a resource as merged when the target's and the branch's head documents are equal as decrypted plaintext. Every other resource the branch changed conflicts; rebase instead (§F.5).
 
-- **Rebases** (§F.5) re-seal in the same way, with the successor as the target. Only read-through content keeps its ids. Remote branches (§G.5.2) are merged in the same way, with the target's keys.
+- **Rebases** (§F.5) re-seal in the same way, with the successor as the target. Only read-through content keeps its ids.
 
 ## F.9 Releases across namespaces
 
-A release may span several namespaces, such as content, a catalog (Addendum B) and schemas. Each is branched as usual, and the branches are listed in a **release document**: an ordinary resource that tools read and the core doesn't.
+A release may span several namespaces, such as content and schemas. Each is branched as usual, from heads that SHOULD have been current together, and the branches are listed, each with its own `at`, which is authoritative, in a **release document**: an ordinary resource that tools read and the core doesn't. It authorises nothing: every tool acting on it checks under its own authority what it is about to do.
 
 ``` jsonc
 // /r/releases/release-7
 { "name": "release-7",
-  "at": "1c…",                                   // optional: combined checkpoint the branches started from (§B.5)
-  "branches": { "matches":    { "ns": "matches-r7",    "at": "1k…" },
-                "cat-season": { "ns": "cat-season-r7", "at": "1m…" },
-                "schemas":    { "ns": "schemas-r7",    "at": "1d…" } },
+  "branches": { "matches": { "ns": "matches-r7", "at": "1k…" },
+                "schemas": { "ns": "schemas-r7", "at": "1d…" } },
   "on": "/r/releases/release-6/rev/1x…",          // optional: the release this one builds on
   "owners": ["user:anna"] }
 ```
 
-- **Where it lives.** In a namespace whose rules decide who may create and change release documents. Every tool acting on a release document checks for itself, under its own authority, what it is about to do.
+- **Documents keep naming the bases** (`x-ref`s `/r/matches/…`, `$schema` `/r/schemas/…`). Draft schema revisions are written in the release's branch of the schema namespace, which lists the other branches in `drafts.for` (§6.1, §7.4); a namespace that keeps its schemas beside its content drafts them in its own branch, merging its schema resources in step 1 and the rest in step 2. Previews follow the listed branches (§F.8, Indexes).
 
-- **Starting.** Each branch's own `at` is authoritative; the document's `at` is optional, and is dropped after a rebase. The branches SHOULD start at heads that were current together, such as the `ns_id`s in a catalog service's combined checkpoint (§B.5), except a catalog branch added later (§F.8).
+- **Merging** is one batch per branch, so a release across namespaces isn't atomic (§7.5). The merge service submits, in order:
 
-- **Documents keep naming the bases** (placements `matches.final`, `x-ref`s `/r/matches/…`, `$schema` `/r/schemas/…`), never the branch names.
+  1.  **Schemas, by fast-forward only,** in `$ref` order: the resources whose documents have a dialect URL as `$schema` (§6.1), tombstones and restores included. One the base changed since `at` is a conflict: rebase (below), and migrate the documents with `replace /$schema` (§6.3). An end-to-end schema namespace isn't branched: new revisions are written to it first.
+  2.  **Content,** in any order.
+  3.  **Publishing,** where readers' rules test a field that marks documents published (e.g. `/doc/published`, §7.9, guarded as §6.4.4 says): one batch per content namespace sets it on the documents the release created, which carried it unset. A change to that field in steps 1 and 2 is a conflict. Edits to documents already published show at step 2.
 
-- **Schemas.** Draft schema revisions are written in the release's branch of the schema namespace, and documents in the release's other branches resolve them by their base paths (§6.1) once that branch lists the other branches in `drafts.for` (§7.4). No namespace name is special: a namespace that keeps its schemas next to its content drafts them in its own branch.
+- **The plan.** A person approves the plan's **digest**, `text(trunc160(sha256(canonical(plan))))`, where `plan` is `{ "release": <the release document's revision path>, "batches": [{ "ns", "source"?, "config"?, "items": [{ "resource", "ifMatch" | "ifNoneMatch", "steps" }] }] }`, with no other members.
+  - `release` is `/r/{ns}/{name}/rev/{id}`, the id in text form, as `on` writes it.
+  - The batches are in submission order, as §7.5 sends them but before any sealing; only step 3's have no `source`.
+  - Each step is `"delete"` or its plaintext patch set, without fresh `$nonce` ops (§6.4.1) or a fresh top-level `$nonce` in the value of an `add` or `replace` at `""`.
+  - A precondition on an earlier batch's result is `{ "batch", "item" }`, or `{ "batch" }` for its config id, counting from 0.
+  - Implementations agree on the digest of a given plan, not on how a plan is ordered.
 
-- **Reading.** Previews follow the listed branches, and refuse viewers (`403`), as §B.5 says, never showing the base's versions.
+- **Before approval** the merge service checks that each branch's `base` is the namespace it is keyed by, or, for a release built on another, that release's branch for the key where it lists one, and that it isn't frozen or purged. It reports as conflicts a pinned `x-ref` (§6.5) to a revision of another listed branch that the merge replays (at E3, every one, §F.8.1), and a document resolving a draft in a branch the release doesn't list.
 
-- **Merging** is one batch per branch, so the release as a whole isn't atomic (§7.5).
+- **Approval** fails if planning again gives another digest. It freezes every listed branch (§8.4), each `source.at` staying the branch's `ns_id` before that freeze; the merge service accepts that freeze on resuming, and unfreezing a branch invalidates the plan. Each step is dry-run right before it is submitted, and stops for a new approval if it differs. The plan is stored before anything is submitted; a merge that stops resumes from it and never reverts. Each branch records `merged` after the last step, with `at` the target's `ns_id` after the last batch into it.
 
-  - **Before approval,** the merge service checks that each listed branch's `base` is the namespace it is keyed by, or, for a release built on another, that release's branch for the same key where it lists one (below). It also checks that the branch isn't frozen or purged. On resuming, it accepts the freeze its own approval made.
-  - **The plan.** A person approves the plan's **digest**, `text(trunc160(sha256(canonical(plan))))`, where `plan` is `{ "release": <the release document's revision path>, "batches": [{ "ns", "source", "config"?, "items": [{ "resource", "ifMatch" | "ifNoneMatch", "steps" }] }] }`. The plan has no other members.
-    - `release` is `/r/{ns}/{name}/rev/{id}`, the id in text form, as `on` writes it.
-    - The batches are in the order they will be submitted.
-    - Their members are as §7.5 sends them, but before any sealing.
-    - Each step is its plaintext patch set, or `"delete"`. The patch set is without fresh `$nonce` ops (§6.4.1), and without a fresh top-level `$nonce` in the value of an `add` or `replace` whose `path` is `""`.
-    - A precondition on an earlier batch's result is `{ "batch", "item" }`, or `{ "batch" }` for its config id, in place of an id. Indices count from 0.
-    - Implementations agree on the digest of a given plan, not on how a plan is ordered.
-  - **Approval.**
-    - Approval fails if planning again doesn't give the same digest.
-    - Approving freezes every listed branch (§8.4). When a step is classified again, each `source.at` stays the branch's `ns_id` before that freeze.
-    - Unfreezing one invalidates the plan.
-    - Each step is classified again, with a dry run, right before it is submitted, and stops for a new approval if it differs from the approved plan.
+- **Releases built on another** branch its branches and name it in `on`, still keyed by the namespaces paths name, and resolve drafts from both (§6.1) where the earlier draft branch lists the earlier release's branches in `drafts.for`. Of two releases drafting one schema resource, the second to merge is rebased onto the first.
 
-  The merge service orders the batches so that each state in between is safe:
+- **Rebasing** creates a successor of each branch (§F.5), the schema one first, with `drafts.for` naming the others in its creation `patches`, and lists them in a new revision of the release document. A resource referencing a replayed draft is squashed (§F.3), with `$schema` moved to the new revision.
 
-  1.  **Schemas, by fast-forward only,** in `$ref` order. A schema resource is one whose documents are schemas, with a dialect URL as `$schema` (§6.1); its tombstones and restores fast-forward like any entry. One the base changed since `at` is a conflict, as replaying it would give new ids that no document references: rebase (below), and migrate the documents to the new revision with `replace /$schema` (§6.3). A branch that holds both schemas and content merges its schema resources here and its content in step 3. An end-to-end schema namespace isn't branched for a release (§F.8.1, §6.1): new revisions are written to it first.
-  2.  **Catalog changes that narrow access.** A change goes here when, for every subject, the roles at every node afterwards are a subset of those before, judged by the test of §B.11.4 on the step-2 batch as a whole, whoever merges, `catalog-admins` included. A folder the release creates goes here, with its own `$access`, when a narrowing move needs it; the subset test applies to the items moved into it, not to the folder itself, whose title and `$access` powers take effect from then on.
-  3.  **Content branches,** in any order. New documents aren't placed yet.
-  4.  **Catalog changes that widen access:** new placements, and the remaining moves and `$access` edits. This step publishes the release.
-
-  Before submitting anything, the merge service reports these as conflicts for a person:
-
-  - a catalog node whose change narrows access for some subjects and widens it for others, resolved with two resolution sets (§F.3): one narrowing for step 2, one widening for step 4.
-  - a content item that step 3 creates or restores and that a placement in the catalog base already names, unless step 2 removes that placement, or the release keeps it unchanged and its approver accepts that.
-  - a pinned `x-ref` (§6.5) or manifest entry (§B.4) naming a revision of another listed branch that the merge replays rather than fast-forwards. At E3 every merge replays (§F.8.1), so such references must be rewritten after the merge.
-  - a document resolving a draft in a branch the release doesn't list.
-
-  The merge service stores the whole plan, both halves of every split node included, before it submits step 2, and a merge that stops part-way resumes from that plan and never reverts. Catalog batches are submitted as §F.8 says. A split node's step-2 batch records a pair for it, which the more recent step-4 batch replaces (§F.3); until then the stored plan, not classification, decides what is left. Every branch records `merged` only after step 4, with `at` the target's `ns_id` after the last batch into it.
-
-  - **Exposure between steps.** Step 1 shows the schema drafts to readers of the schema namespace, and step 3 shows new documents to whoever reads the content namespace unrestricted (§B.11.9). Where that matters, keep the content private and read it through the catalog, or keep catalog and content in one namespace (§B.8, §B.9).
-
-- **Several releases.**
-
-  - Releases on the same bases merge one at a time: the merge service merges one release per catalog base at a time, under the merge lock below. The reason: another release's catalog changes can turn a narrowing move into a widening one without touching the moved node, which preconditions wouldn't catch.
-  - **The merge lock** is a resource per catalog base in the release namespace, `merge-lock.{catalog}`, where `{catalog}` is the catalog base's namespace name. Releases on one catalog base keep their documents in one namespace.
-    - Its document is `{ "holder": <the merge service's sub>, "plan"?: <plan digest> }` while held, and `{}`, or only a `$nonce`, while free.
-    - It is advisory, taken by compare-and-append. The first take is a create with `If-None-Match: *`. Later ones are an append with `If-Match` on a free head.
-    - Each take sets `holder`, and `plan` if its plan is already stored. Otherwise the holder sets `plan` with a further compare-and-append once it is stored.
-    - The holder releases the lock with an append back to `{}`.
-    - A resuming service replaces `holder` with its own `sub`, by compare-and-append, only if the lock's `plan` is the digest of the plan it stored. Any other held lock is released by a person.
-  - Two drafts of the same schema resource in different releases both start from its head, so only the first merged fast-forwards; the other release is rebased onto it, and its documents move to a revision that has both changes. To avoid this, larger schema changes go into a new schema resource, or a release may merge its step 1 early, making its drafts visible.
-  - A release built on another one branches that release's branches and names it in `on`. Its `branches` are still keyed by the namespaces paths name, and each listed branch's `base` is the earlier release's branch for the same key where it lists one. Its documents resolve drafts from both (§6.1), as long as the earlier release's draft branches list the earlier release's branches in `drafts.for`.
-
-- **Rebasing** a release creates a successor of each branch (§F.5) and lists them in a new revision of the release document. The schema successor is created with `drafts.for` naming the other successors, in its creation `patches`, and is replayed first. A draft that has to be replayed gets a new id, so a resource whose entries reference such a draft is squashed (§F.3): one resolution set against its new base, reaching the branch's document with `$schema` moved to the new revision.
-
-- **Cleanup.** The janitor (§F.6) purges each branch as usual, the release's draft branch last (§6.1, §8.5). The release document only orders this, and never authorises a purge.
-
-- **Abandoning** a release before step 1 leaves nothing in the bases; after it, the merged schema revisions stay unused in the schema namespace's history. Its branches are frozen with `abandoned: true` by an administrator (§F.6).
+- **Cleanup** is the janitor's (§F.6), the draft branch last (§6.1, §8.5). **Abandoning** freezes the branches with `abandoned: true` (§F.6); schema revisions merged in step 1 stay, unused.
 
 ## F.10 Open questions
 
 - Should grants have a form covering a namespace **and its branches**, or all the branches of a release?
-- Releases with branches in several deployments (§G.3).
 - Should there be a stable alias that follows `successor` chains, for previews and bookmarks?
 - Should the server offer three-way diffs, or leave them to the merge service?
 
@@ -424,7 +365,7 @@ A release may span several namespaces, such as content, a catalog (Addendum B) a
 
 # Addendum G — Federation and portability: consumers, export and import (suggested)
 
-The rest of Addendum G is in [SPEC.md](SPEC.md): its principles (§G.1), remote branches (§G.3), the bundle format (§G.4.1), encryption (§G.5), multi-region (§G.6) and open questions (§G.7). Exporting is a consumer (§G.2), and importing a client of the batch API (§7.5).
+The rest of Addendum G is in [SPEC.md](SPEC.md): its principles (§G.1), the bundle format (§G.4.1), encryption (§G.5), multi-region (§G.6) and open questions (§G.7). Working across deployments is exporting and importing: exporting is a consumer (§G.2), and importing a client of the batch API (§7.5).
 
 ## G.2 External consumers
 
@@ -436,7 +377,7 @@ A consumer in another network or organisation works as in §10, plus:
 
 ### G.4.2 Selection and dependencies
 
-A selection is a list of resources, or anything a resolver turns into one, e.g. a catalog folder (Addendum B). The **dependency closure** is built in three levels:
+A selection is a list of resources, or anything a resolver turns into one, e.g. an index query (Addendum A). The **dependency closure** is built in three levels:
 
 1.  **Core references, always:** the `$schema` of **every exported revision**, not only the head's, `$ref` inside those schemas, and the blobs those revisions reference (§7.8). A document referencing a schema revision that exists only in a branch (§6.1) can't be exported until that branch is merged (`schema_unavailable`), unless that schema's namespace is declared `external`, when the importer checks the target instead.
 2.  **Declared references:** fields marked `x-ref` in the documents' schemas (§6.5). A **pinned** reference needs that exact revision, a **live** one the head as of the export's `at`.
@@ -483,7 +424,7 @@ Each document is exported in one of two modes:
     - **Size.** Batches split to fit §6.6 make the import non-atomic, so one that must land at once, such as a release, runs as one batch under an allowance (§6.6), typically as a merge from a branch it was first imported into (§F.3). The tool paces its batches, dry runs included, at a fraction of the lower of the namespace's and its own principal's rate, or, under an allowance, at up to its full rate, per-resource buckets still applying (§6.6). With several batches in flight, a request is paced as drawing when it is sent: the server may draw later, after later requests, never earlier.
     - **Blobs first.** The importer uploads the blobs a batch's steps' values mention (§G.4.1) before the batch, or copies them with `Blob-From` within one deployment (§7.8), unless the batch's local `source` already makes them available. Uploads aren't writes for step 1: an import that will submit uploads a batch's blobs before its dry run, if any (step 4). One that only dry-runs uploads none, and gets them reported as missing (§7.5). A snapshot document's blobs go to both its upstream resource and its target. Pending blobs expire after `blobGrace` (§7.8), and a large import needs an allowance raising the importer's `blobPending` (§6.6).
     - **Missing namespaces.** Under authentication, the operator creates the missing namespaces, upstream ones included, before step 1 (§C.4, §7), with keys that include the importer's and, for pacing at full rate, an allowance for it (§6.6).
-    - **Renaming.** An import MAY map source namespaces to new names together (`src=dst`), to clone them; snapshot documents then go through `{dst}-upstream`. It rewrites every reference to a mapped namespace: `$schema`, `$ref`, pinned and live `x-ref` values, and pins to revisions, which take the new ids. A full-history document's rewritten steps are new content, submitted one by one with new ids, never fast-forwarded, without their signatures; `source.ids` records the source ids. The dry run lists undeclared strings naming a mapped namespace (`/r/{src}/…`). Catalog placement names aren't renamed, and a renamed namespace's configuration isn't in the bundle (§G.7). Further:
+    - **Renaming.** An import MAY map source namespaces to new names together (`src=dst`), to clone them; snapshot documents then go through `{dst}-upstream`. It rewrites every reference to a mapped namespace: `$schema`, `$ref`, pinned and live `x-ref` values, and pins to revisions, which take the new ids. A full-history document's rewritten steps are new content, submitted one by one with new ids, never fast-forwarded, without their signatures; `source.ids` records the source ids. The dry run lists undeclared strings naming a mapped namespace (`/r/{src}/…`). A renamed namespace's configuration isn't in the bundle (§G.7). Further:
       - a `$successor` naming a mapped namespace (`/r/{src}/…`), and the value of an `add` or `replace` at `/$successor` in a history line, is rewritten as any reference is, and a bare one needs nothing;
       - documents of unmapped namespaces in the bundle that reference a renamed one are rewritten too, and a reference that only a later revision's schema declares is rewritten in that revision, by an added `replace`;
       - mapping onto a branch whose `base` chain reaches `src` isn't a rename: references and ids are kept;
@@ -498,6 +439,7 @@ Each document is exported in one of two modes:
       - reports as deferred any failure that wouldn't occur once the earlier batches are written
       - skips a batch that continues a chain an earlier one cuts
 6.  **Today's rules judge old history.** A full-history import replays every step through the target's **current** gate (§6.2), as the importer, at the current `now`. Rules on `/principal`, `/now`, `writes` or, for replayed deletes, `/doc` may reject history valid at the source, as may a target that requires nonces, or a sealed one, whose writers add a fresh `$nonce` to every patch set (§C.7, §E.2.5). Such imports need an importer whose roles satisfy those rules, or snapshot mode.
+7.  **Purges follow.** The target's deployment, not the importer, applies the origin's later purges of what it imported (§G.1).
 
 ---
 
@@ -544,74 +486,59 @@ Tools that show namespaces as files (WebDAV gateways, mounts, sync tools, editor
 - **Writer's bytes.** Every tool shows a document as the same rendering. A gateway MAY serve a writer its own bytes back for a revision that holds exactly what it sent, under the weak `ETag` `W/"{id}"`; everyone else gets the rendering. A gateway takes the weak tag like the strong one in any `If-Match`, as a save's base (§H.4) and as a delete's or move's precondition (§H.5).
 
 - **Nonces.** Where nonces are required (§C.7) or the namespace is sealed (E2; at E3 ids need none):
-  - A JSON file's root must be an object, which carries `$nonce`. Any other root is `422`, saying why.
+  - In the flat view, a JSON file's root must be an object, which carries `$nonce`. Any other root is `422`, saying why.
   - A raw file's root carries `$nonce` beside the reference, its blob a `Blob-Nonce` (§7.8).
 
-- **Identity.** A file's `ETag` is its item's head revision id. A raw save is always stored with the uploaded value, and a JSON save when the stored document's rendering parses to it. After a save the gateway merged with others' edits (§H.4), the next `GET`, `HEAD` or `PROPFIND` of the file is answered in full, whatever validators it carries.
+- **Identity.** A file's `ETag` is its document's head revision id. A raw save is always stored with the uploaded value, and a JSON save when the stored document's rendering parses to it. After a save the gateway merged with others' edits (§H.4), the next `GET`, `HEAD` or `PROPFIND` of the file is answered in full, whatever validators it carries.
 
 ## H.2 Trees
 
-A tree of files lives in a catalog namespace (Addendum B), with names as data:
+A **file tree** is a namespace whose documents carry their place as data. A gateway is configured with the namespaces it serves as trees, and the file schema they use.
 
-- **A file tree is a catalog** `C`. Its `catalog` object (§B.6, §7.4) carries `"files": { "ns", "root", "folder"?, "placement"? }`, which may also hold `x-` members (§7.4):
+``` jsonc
+// /r/docs/f-7kq2…   (an opaque name)
+{ "$schema": "/r/schemas/file/rev/…",
+  "folder": "/reports/2026", "name": "q3.pdf",
+  "content": { "$blob": "…", "type": "application/pdf", "size": 48211 } }
+```
 
-  - `ns`, the content namespace new files are created in. The namespace document doesn't require `C` to trust it; a tool checks that before creating there (§H.4). The tree **owns** the items in `files.ns`: a gateway takes each to be placed only in this tree, and doesn't also serve `files.ns` as a writable flat folder;
-  - `root`, the node name (§B.2: no dot) of the folder whose children are the tree's top level, created without parents when the catalog is set up, before its rules forbid new roots (§B.6), or under a rule that exempts it;
-  - `folder` and `placement`, schema revision paths that new folder and placement nodes carry as `$schema`.
-
-- **Folders** are folder nodes (§B.2), with opaque names. A folder's name in the tree is its `title`.
-
-- **Files** are placements, named `{ns}.{item}` (§B.2), and a file's name in the tree is its placement's `title`. The item `/r/{ns}/{item}` has an opaque name; a readable stem is allowed but means nothing. A node without a non-empty string `title`, written by another tool, is shown by its item's name, or a folder by its node name. A file tree doesn't set `catalog.title` (§B.5); where one does, tools read titles from the placement documents, never from listings.
-
-- **Untrusted namespaces.** Placements of items in namespaces `C` doesn't trust are dangling (§B.5), and tools leave them out however they list, through the tree service or from the node documents.
-
-- **Shape.** File trees set `catalog.mode: "tree"` (§B.6): a file or folder has exactly one parent, inside the `root` subtree. New nodes get an `order` after their last sibling (§B.2).
-
+- **`content`** is the file. Everything this addendum says of a file's document applies to `content`, paths included (`/content/$blob`); `$nonce` and `$successor` stay at the document's top level, so a JSON file's root may be any value.
+- **`folder`** is the path of the folder holding it, `/` or `/`-separated titles, and **`name`** its title. The file schema marks `/folder` and `/name` `x-index: "facet"`, and `/name` `"sort"` too (§A.2).
+- **Folders** are documents without `content`: the folder `{folder}/{name}`, or `/{name}` at the top. A document is in the tree only when its `folder` is `/` or has a folder document; tools leave out the rest however they list. Two folder documents for one path, left by a race, are one folder.
 - **Titles** are Unicode in NFC, 1 to 255 bytes of UTF-8. They are never `.` or `..`, and are without `/`, `\`, characters of the categories `Cc`, `Zl` and `Zp`, or the bidirectional controls U+202A–U+202E and U+2066–U+2069 (other `Cf` characters are allowed).
-  - A catalog enforces this with a rule `pattern`, and the tool the byte length.
+  - The file schema enforces this with a `pattern`, and the tool the byte length.
   - A gateway converts names it receives to NFC, refuses a trailing space or dot on create and rename for every client, and shows an existing one escaped.
   - Another tool's title that breaks these rules is shown with each offending character, a trailing space or dot, and a whole `.` or `..` percent-encoded as UTF-8. The stem is shortened so the name stays within 255 bytes.
   - An escaped name never takes a real title's name, and is numbered as a duplicate instead (Siblings).
-
 - **Siblings.** Files and folders in one folder share one set of names. Names are compared after NFC and, unless the gateway is set to be case-sensitive, after Unicode simple (not full) case folding.
   - Tools refuse to create a name a visible sibling has. The source of a `MOVE` isn't its sibling, so a rename that only changes case is allowed.
   - A `PUT`, `COPY` or `MOVE` to a name that matches a sibling only under another case is `409`, naming the sibling, unless the sibling is a file and either the request carries a tag or the user read or wrote that file under this spelling.
   - `MKCOL` under another case is `405`.
   - A folder in the middle of a path matches whatever its case.
-  - A duplicate left by a race is shown as `name (2).ext`, `name (3).ext`, …, the first keeping its name. The order is the nodes' `born` (§B.5), nodes without one last, then node name.
+  - A duplicate left by a race is shown as `name (2).ext`, `name (3).ext`, …, in order of resource name, the first keeping its name.
   - A number that would collide with a real title is skipped, and the stem shortened so the name stays within 255 bytes.
-
-- **Access.** In a catalog with tree-derived access (§B.11), a user's rights to read, place and move come from the catalog's grants and `/read-grants`, not from a grant on the content namespace.
-
-- **Flat view.** A namespace may also be shown without a catalog, as one directory whose file names are resource names: a raw document as its name, any other document as `{name}.json`.
+- **Flat view.** A namespace may also be shown as one directory whose file names are resource names: a raw document as its name, any other document as `{name}.json`.
   - If a raw resource `x.json` and a document `x` both exist, the raw file keeps its name and the document is shown by the duplicate rule above.
   - There are no folders, and a rename is a copy and a delete (§H.5, §8.1).
   - A new file whose resource is tombstoned, where §H.6 doesn't restore it, restores it with a root `replace` (§8.2). If the last revision has a `$successor`, it is `409` instead, naming the new path.
   - A new file whose resource is a live document shown under another file name is `409`, naming that file.
 
-- **Not covered:** branches of file trees (§F.9) and manifests (§B.4).
-
 ## H.3 Listings
 
-- **In a tree,** a folder is listed from the tree service's `children` listing, with `total`. The top level is listed from `roots` where `root` is hidden from the user or missing (§B.11.5). A path of titles is resolved with its `lookup` (§B.5). A case-sensitive gateway lists the folder instead when the answer's title differs in case.
-  - A tree service following a file tree adds `file: { "size", "type", "modified"? }` to each placement of an item in a namespace the catalog trusts. It reads `file` from the item's head once per revision, and `file` is cacheable for good:
-    - for a raw file, the blob reference's `size` and `type`
-    - for a JSON file, its rendering's length and `application/json`
-    - `modified` is the head's `created`, where known
-  - In sealed namespaces it seals `file` as a value of another resource (§E.2.6).
-  - Where it can't give `file`, it says why: `"file": { "absent": "e2e" }` for an end-to-end item, `{ "absent": "pending" }` for a head it hasn't read yet, which a tool then reads from the core.
-- **A folder too large to list whole** (beyond what a tool pages through) is refused (`403`, saying why), never listed cut short. A path inside it still resolves by `lookup`, or is `403` too in a sealed or end-to-end catalog, which doesn't offer that (§B.5).
-- **A tree service that is behind** answers `503 behind` with `Retry-After` (§B.5); a tool answers `503` (§H.4 Answers), and deletes nothing on the strength of a listing meanwhile.
-- **Read-your-writes.** A tool sends the `X-Namespace-Revision` of each of its writes, the catalog's and the content namespace's, as `?min` on later listings, kept and dropped as §A.5 says.
-- **In the flat view,** a directory is listed from the `head` rows of `/heads` (§7.4), tombstones and purges left out: `ETag` from `target`, the time from `created`. A JSON file's size is its rendering's, not `/heads`' `size`, and a raw file's the blob reference's `size` (at E3 its `sealed.size`), both read from the head document once per revision, cacheable for good.
+- **In a tree,** a folder is listed by the index (Addendum A): `GET /{ns}?facet[/folder]={path}&schema=/r/schemas/file&sort=/name`, paged through. A path is resolved one folder at a time, or with `facet[/name]` too. Hits are filtered by the reader's read rules (§A.4, §7.9).
+- **A folder too large to list whole** (beyond what a tool pages through) is refused (`403`, saying why), never listed cut short.
+- **An index that is behind** answers `503 behind` (§A.5); a tool answers `503` (§H.4 Answers), and deletes nothing on the strength of a listing meanwhile.
+- **Read-your-writes.** A tool sends the `X-Namespace-Revision` of its writes as `?min` on later listings (§A.5).
+- **In the flat view,** a directory is listed from the `head` rows of `/heads` (§7.4), tombstones and purges left out: `ETag` from `target`, the time from `created`.
+- **Sizes.** A JSON file's size is its rendering's, not `/heads`' `size`, and a raw file's the blob reference's `size` (at E3 its `sealed.size`), both read from the head document once per revision, cacheable for good.
 - **Where times are absent,** rows without `created` take `Last-Modified` from the document read for the size (§7.1). In sealed and end-to-end namespaces a gateway with keys takes them from the logs.
-- **Sealed and end-to-end catalogs** seal their titles too, so a gateway without the catalog's keys doesn't offer the tree.
+- **End-to-end trees** no index holds keys for (§E.2.6) are listed only by a gateway with keys and unrestricted `read`, from the documents.
 
 ## H.4 Saving a file
 
 A save follows §11.3, with these specifics:
 
-- **Names before writes.** Before any write a tool checks the names it resolved from a listing against the node documents, found through the catalog's `/heads` (§7.4): each node still in its folder under that name, and no node under a name the listing lacked. Where they disagree it reads the graph again and resolves the path from the node documents, which alone decide a folder's emptiness. A grant that can't read them keeps the listing's view for names, and deletes no folder (`403`). A name the tree service's filtered listing lacks is never revealed or edited: a `PUT` onto a name only a sibling hidden from the user has creates a new file.
+- **Names before writes.** The index lags (§A.5), so before any write a tool reads the documents it resolved from a listing and checks that each still has that `folder` and `name`, and lists again with `?min` where one doesn't. A folder is empty only when a listing at or past the tool's last write in the namespace has nothing in it. A name the filtered listing lacks is never revealed or edited: a `PUT` onto a name only a sibling hidden from the user has creates a new file.
 
 - **The base.** The entity tag a client sends names the **base**: the revision the client opened. The tag is the one in `If-Match` (its first value, `W/` dropped) or, failing that, in an `If` header (the first tag of the first list that applies to this resource and isn't negated with `Not`; tag-only lists are not lock tokens).
 
@@ -621,7 +548,7 @@ A save follows §11.3, with these specifics:
   - A tag naming a revision of a flat resource another user has since deleted is `409`.
 
   - An unknown revision is `412`. A pruned one is `409`, asking for a reload, as are a recorded base below a horizon and a pruned range between base and head. A failed read of anything the save decides by, `theirs` and the user's own entries included, fails the save (Answers, below). The head is never taken as the base instead.
-  - **Records.** Without a tag, a gateway MAY keep, per user (§H.7) and path, the revisions it served that user in full and those it wrote for them, with the item each path named when last read whole or written.
+  - **Records.** Without a tag, a gateway MAY keep, per user (§H.7) and path, the revisions it served that user in full and those it wrote for them, with the document each path named when last read whole or written.
     - A `304`, `HEAD` or `PROPFIND` records nothing, and a save that changed nothing isn't a write.
     - Records outlive sessions, for a day, and a path whose records expired counts as evicted.
     - A save at a path that now names another document, or none, is `409`, and a `GET` of the path is the reload.
@@ -647,11 +574,7 @@ A save follows §11.3, with these specifics:
 
   A `412` retry reuses the pending blob. Bytes are compared by blob id, so under nonces identical bytes count as a change.
 
-- **New files** in a tree: check that `C` trusts `files.ns`. Then:
-  - Where grants come from the catalog (§B.11), the create grant is resolved from the placement (§B.11.4). So place first, then upload a raw file's blob and create the item with `If-None-Match: *`. The placement dangles meanwhile (§B.7) and is deleted if the create fails.
-  - Otherwise, dry-run the placement as a one-item batch (§7.5) before any upload. Then upload, create the item and place it, removing the item at once if the placement fails.
-
-  Nobody else deletes an unplaced item younger than `blobGrace` (§6.6).
+- **New files** in a tree: upload a raw file's blob, then create the document under a fresh opaque name with `If-None-Match: *`, its `folder` a folder the user can see (`409` otherwise).
 
 - **Partial writes** (`PUT` with `Content-Range`) are `400`, and so is a body cut short; nothing is written. `POST` to a file is `405`, with `Allow`.
 
@@ -663,11 +586,11 @@ A save follows §11.3, with these specifics:
   | Saved, merged by the gateway with others' edits                                                                                                                                                                                                                            | `201` or `204`, no `ETag`, and the next read in full (§H.1)                                                                                                                |
   | Overlap with others' edits since the base, a delete or restore by another user (§H.7) between base and head (§11.3), a pruned base, records that disagree or were evicted, a path that now names another file, or a file moved away or whose last revision the gateway can't read but for a failed read                                        | `409`, naming the paths, and telling the user to reload                                                                                                                    |
   | The client's own precondition failed: `If-None-Match: *` on a live file (but see the move-aside, §H.5), `If-Match` naming an unknown revision, or where the path holds no file (a flat resource another user deleted excepted, §H.4), `Overwrite: F` on an existing target | `412`                                                                                                                                                                      |
-  | A new name that breaks the title rules or ends in a space or dot (§H.2), or that isn't a resource name in the flat view (§H.2, §H.6); a new file where `C` doesn't trust `files.ns`                                                                                        | `403`, saying why                                                                                                                                                          |
-  | Validation, rules, blob or nonce refused (`422`), or the grant refused (`401`, `403`), by the core or by the tree service                                                                                                                                                  | that answer, with its message; where the user can't fix it, as when the gateway's own grant is refused, `502` naming the service                                           |
+  | A new name that breaks the title rules or ends in a space or dot (§H.2), or that isn't a resource name in the flat view (§H.2, §H.6)                                                                                        | `403`, saying why                                                                                                                                                          |
+  | Validation, rules, blob or nonce refused (`422`), or the grant refused (`401`, `403`), by the core or by the index                                                                                                                                                  | that answer, with its message; where the user can't fix it, as when the gateway's own grant is refused, `502` naming the service                                           |
   | Frozen namespace                                                                                                                                                                                                                                                           | `403`, naming the successor; never `423` (§H.6)                                                                                                                            |
   | Purged                                                                                                                                                                                                                                                                     | `410`                                                                                                                                                                      |
-  | Rate limited, or a service behind, for longer than a client waits (§6.6, §B.5)                                                                                                                                                                                             | `503` with `Retry-After`                                                                                                                                                   |
+  | Rate limited, or a service behind, for longer than a client waits (§6.6, §A.5)                                                                                                                                                                                             | `503` with `Retry-After`                                                                                                                                                   |
   | A core or service request the gateway makes for the user's request fails (`408`, `429`, `5xx`, no connection, or no answer in time), a read of another namespace's documents or a write included, whether or not the answer needed it; a failed read never counts as a refusal | `503` with `Retry-After` after a `429`, a `503` or no answer in time, else `502` |
   | A limit exceeded (the core's `413` or `422` with `code: "limit"`)                                                                                                                                                                                                          | `413`, in one shape: `too large: {limit} {measured} > {max} (§6.6): {message}`, a limit without sizes named alone, and a `413` that names no limit keeping the core's text |
   | A bound of the gateway's own (an upload buffer, a file-size setting, `blobSize` checked before an upload)                                                                                                                                                                  | `413` in the same shape, naming its setting, `measured` a lower bound where reading stopped                                                                                |
@@ -677,22 +600,22 @@ A save follows §11.3, with these specifics:
 
 ## H.5 Deleting, renaming, moving and copying
 
-- **Delete a file:** delete its placement, then, where the tree owns the item (§H.2) and the grant allows `delete` there, the item; otherwise, or after a failure between the two (§H.4), the item stays, unplaced or placed elsewhere. The delete carries `If-Match` on the head the tool read: a client's `If-Match` that isn't the head is `412`, and the gateway's own delete finding the head moved since its read is `409`.
-- **Delete a folder:** only one without visible children, taken from the node documents (§H.4); `409` otherwise, naming those children (§B.11.5). Dangling placements (§B.3) aren't contents: the gateway deletes those it can first, and the rest are orphaned. Placements the user can't see don't stop the delete and become orphans (§B.7, §B.11.5), as does a child placed while the folder is deleted.
-- **Rename or move within a tree:** one append to the node's `title` or `parents`, with `If-Match`, after checking that the node's document still has the name and parent the path named (`404` otherwise). Under a Move grant from the catalog (§B.11.4), the append begins with the `test` of `/parents` it requires. The new parent must be inside the `root` subtree, and not the node itself or a descendant of it (`403`). On any `MOVE`, a client's `If-Match` names the source, and one that isn't its head is `412`.
+- **Delete a file:** delete its document, with `If-Match` on the head the tool read: a client's `If-Match` that isn't the head is `412`, and the gateway's own delete finding the head moved since its read is `409`.
+- **Delete a folder:** only one without visible children (§H.4); `409` otherwise, naming those children. Children the user can't see don't stop the delete, and fall out of the tree (§H.2).
+- **Rename or move a file:** one append replacing `/name` or `/folder`, with `If-Match`, after checking that the document still has the name and folder the path named (`404` otherwise). The new folder must exist. On any `MOVE`, a client's `If-Match` names the source, and one that isn't its head is `412`.
+- **Rename or move a folder:** one batch (§7.5) rewriting the folder document and the `folder` of every visible document under it, each item with `ifMatch` on the head the tool read. One into itself or a descendant is `403`, and one too large for a batch is refused as a limit (§6.6, §H.4 Answers). Documents under it the user can't see fall out of the tree.
 - **Move onto an existing file** (`Overwrite: T` or absent; `F` is `412`): a save of the source's content into the target (§H.4), then a delete of the source as above.
   - The source's type stands for the upload's `Content-Type` (§H.1).
   - The target's base is taken as §H.4 says, but never from `If-Match`, which names the source.
 
   A `MOVE` or `COPY` onto an existing folder, or of a folder onto a file, is `403` (`412` with `Overwrite: F`).
-- **Moves that copy** (onto an existing file, across trees or namespaces) check first that the source can be deleted; then copy, then delete the source with `If-Match` naming the revision copied. A source that changed since is `409` and stays; a delete that fails anyway leaves the copy, with no rollback.
+- **Moves that copy** (onto an existing file, across namespaces) check first that the source can be deleted; then copy, then delete the source with `If-Match` naming the revision copied. A source that changed since is `409` and stays; a delete that fails anyway leaves the copy, with no rollback.
 - **Move to a scratch name** (§H.6): the file is copied into scratch and stays live. The next create-only `PUT` of the original path by the same user within 30 seconds is accepted once as an edit, its base taken as for any untagged save (§H.4), rather than `412`.
-- **Across trees or namespaces:** when the item itself goes to another namespace, its last revision before the tombstone carries `$successor` (§8.1); a JSON file whose root isn't an object can't, and moves without one.
-- **Copy:** a new item with the source's current content, and a placement for it. A `COPY` onto an existing file (`Overwrite: T`) is instead a save into it, as for a move onto it.
-  - A folder is copied, or moved to another tree, as a new folder node as `MKCOL` makes one, titled with the destination's last segment, without the source's `$access` (§B.11.3). Its visible children are then copied or moved into it one by one (`Depth: 0` copies the folder alone), and a moved folder is deleted once empty.
-  - A copy into the folder itself or a descendant of it is `403`, before anything is written. This is judged by the ancestry the user sees: the node documents, or for a grant that can't read them the tree service's `ancestors` (§B.5), `403` too where that reports a cut (`tooDeep` or `truncated`).
-  - A gateway MAY refuse (`403`) to copy a folder that carries, sits under or holds `$access`, as a stricter policy (§B.11.4 Copies).
-  - A failure part-way, such as a nested copy's `403` where `ancestors` reports a cut, leaves what was done, with no rollback, and is answered as that child's request would be.
+- **Across namespaces:** the document's last revision before the tombstone carries `$successor` (§8.1); a flat view's JSON file whose root isn't an object can't, and moves without one.
+- **Copy:** a new document with the source's current content. A `COPY` onto an existing file (`Overwrite: T`) is instead a save into it, as for a move onto it.
+  - A folder is copied, or moved to another namespace, as a new folder document as `MKCOL` makes one, titled with the destination's last segment. Its visible children are then copied or moved into it one by one (`Depth: 0` copies the folder alone), and a moved folder is deleted once empty.
+  - A copy into the folder itself or a descendant of it is `403`, before anything is written.
+  - A failure part-way leaves what was done, with no rollback, and is answered as that child's request would be.
   - A raw file's blob is copied with `Blob-From` where §7.8 allows it. Otherwise its bytes are uploaded again: decrypted with the reference's key from an `e2e` source, and encrypted under a fresh key, with a new id, into an `e2e` target (§E.3.1).
 
 ## H.6 Clients as they are
@@ -701,14 +624,14 @@ A save follows §11.3, with these specifics:
 
   - files: `.DS_Store`, `._*`, `Thumbs.db`, `Icon` followed by CR (U+000D), `~$*`, `.~lock.*#`, `*.swp`, `*.swo`, `*.swx`, `4913`, `*~`, `#*#`, `*___jb_tmp___`, `*___jb_old___`, `.goutputstream-*`, `sed` followed by six ASCII letters or digits;
   - folders: `(A Document Being Saved By …)`, `.Trashes`, `.Trash`, `.Trash-*`, `.Spotlight-V100`, `.fseventsd`, `.DocumentRevisions-V100`, `.TemporaryItems`. Any other folder, a dot folder included, is real.
-  - An existing node with such a name is real. The names a file manager gives a copy beside a file (`x copy.txt`, `x (1).txt`) are real names in a tree, and, in the flat view, scratch only as `COPY` destinations; a plain `PUT` of one there is `403`.
+  - An existing document with such a name is real. The names a file manager gives a copy beside a file (`x copy.txt`, `x (1).txt`) are real names in a tree, and, in the flat view, scratch only as `COPY` destinations; a plain `PUT` of one there is `403`.
 
 - **Delete, then write.** Some clients delete a file before writing it again, or about a second after any refused upload (rclone). So:
 
-  - A write to a path the same user deleted within the last 30 seconds restores that file (its placement, then its item) rebased on its last live document (§8.2).
+  - A write to a path the same user deleted within the last 30 seconds restores that file rebased on its last live document (§8.2).
     - A restore whose patch set would exceed `opsPerSet` or `patchSetSize` is written as a whole-document `replace` when its base is the last live document.
     - If the restore is refused (`403`, `410`), the write creates a new file or is refused as such a write would be.
-    - A file that was moved away (its item has `$successor`), or whose last revision the gateway can't read, is never restored this way. A failed read fails the write (§H.4).
+    - A file that was moved away (its document has `$successor`), or whose last revision the gateway can't read, is never restored this way. A failed read fails the write (§H.4).
   - If such a write is refused, the user's delete, never one older than 30 seconds, is undone where it can be.
   - A refused `PUT` or `COPY`, a refused move onto a file, or a refused case variant (§H.2) sets a guard: that user's `DELETE` of that path within the next 10 seconds is `409`, once per refusal. A `DELETE` that carries `If-Match` passes, and leaves the guard in place. A refused plain move sets none, two refusals never share one guard, a guard ends only by time, and none is set after an undo. Guards are sized for many uploads at once.
 
@@ -726,9 +649,9 @@ A save follows §11.3, with these specifics:
 
 ## H.7 Access and encryption
 
-- **Grants.** A gateway either passes each user's grant through as the bearer of every core request, or narrows its own grant per user with `via` (§C.1); either way the core authorises every core read and write. A gateway that narrows its own grant serves only trees it is configured to know lack tree-derived access (§B.11, §B.11.5), and in those hides from each user what that user's narrowed grant can't read.
+- **Grants.** A gateway either passes each user's grant through as the bearer of every core request, or narrows its own grant per user with `via` (§C.1); either way the core authorises every core read and write.
 - **Users.** A user is the root `sub` with the `key` that verified the root block, from `GET /ns/{ns}/principal` (§7.4). After a key rotation the person is a new user.
-  - A user's own entries are those whose `grant` has its `sub` and a `kid` that named, when written, its `key` or, in content namespaces of a tree with tree-derived access, the catalog's key there (§B.11.4).
+  - A user's own entries are those whose `grant` has its `sub` and a `kid` that named, when written, its `key`.
   - One token's reading of the namespace documents serves another only once that one has read a range of the namespace log. For a token that can't read them (§C.5), a `kid` counts as naming the key it names now.
   - With authentication disabled, a user is an `X-Author` (§7.2), and its entries those with that `author`.
   - Operator grants (`operator: true`) are never users of a gateway (`403`).
@@ -737,16 +660,12 @@ A save follows §11.3, with these specifics:
 - **What a user's tokens share.**
   - State that holds no content (guards, the user's own deletes, move-aside marks, records) is per user.
   - State that holds content (scratch files, placeholders, locks with their owners, dead properties) is kept per user and **scope**, the token's rights. It is served only to a token of that scope whose grant names the namespace.
-  - The rights are its root block without `kid`, `sub`, `nbf`, `exp`, `at`, `enc` and `signers`, and its narrowing blocks without `nbf` and `exp`, with `ns`, `can`, `roles` and `groups` compared as sets.
+  - The rights are its root block without `kid`, `sub`, `nbf`, `exp`, `enc` and `signers`, and its narrowing blocks without `nbf` and `exp`, with `ns`, `can`, `roles` and `groups` compared as sets.
   - Caches of what was read (documents, graphs, listings, writer blocks) are per token.
   - Each kind of per-user state is bounded per user. A new scope when content scopes are full is `503` with `Retry-After`, never a drop of one holding content.
 - **Re-checking.** A gateway creates state for a grant only after the core has accepted it, bounds the users it keeps state for, and re-checks a grant at least every five minutes. It relies on a `writer` block (§7.4) for 30 seconds at most, and reads it again after `409 frozen`, `422 nonce` or a limit refusal. When the core refuses a token, the gateway stops serving it; the user's state stays for their other tokens, each re-checked at its next request.
-- **Limited grants.** A grant limited to some resources lists in one of two ways:
-  - in a tree with tree-derived access, through the tree service, which filters by the reader (§B.11.5)
-  - a flat view, from the namespace's filtered `/heads` where the origin offers them (§B.11.9)
-
-  Elsewhere it can't list, as `/heads` needs unrestricted read (§2.1, §C.5). It learns what it needs to write, and the tree's settings, from `GET /ns/{ns}/principal` (§7.4).
-- **Catalog writes** (titles, parents, new nodes) carry a fresh `$nonce` where the catalog requires nonces or is sealed (§C.7), as file writes do.
+- **Limited grants** list a tree through the index (§H.3), and a flat view only through filtered `/heads` (§7.9). They learn what they may write from `GET /ns/{ns}/principal` (§7.4).
+- **Folders as access.** Read rules on `/doc/folder` give a grant a subtree (§7.9), its own folder document included: `{ "any": [{ "op": "test", "path": "/doc/folder", "schema": { "pattern": "^/team-a(/|$)" } }, { "all": [{ "op": "test", "path": "/doc/folder", "value": "/" }, { "op": "test", "path": "/doc/name", "value": "team-a" }] }] }`. Write rules guard `folder` and `name` (§6.4.4), else anyone who may edit a file, even one it can't read, may move it into its own view or another's. In sealed and end-to-end trees `/doc` rules fail (§6.4.1), so such grants read nothing there.
 - **Sealed and end-to-end namespaces** need keys (Addendum E). A gateway without them doesn't offer those namespaces, and never shows their files as writable empty files.
 
 ## H.8 WebDAV
@@ -755,11 +674,11 @@ One mapping, as an example:
 
 | WebDAV                      | In a tree                                                                | In the flat view                                               |
 |-----------------------------|--------------------------------------------------------------------------|----------------------------------------------------------------|
-| `PROPFIND` (`Depth` 0 or 1) | `children` of the folder (§H.3)                                          | `/heads` (§H.3)                                                |
-| `GET`, `HEAD`               | the item: its bytes for a raw file (§H.6), the rendering for a JSON file | the same                                                       |
+| `PROPFIND` (`Depth` 0 or 1) | the index's listing of the folder (§H.3)                                 | `/heads` (§H.3)                                                |
+| `GET`, `HEAD`               | its bytes for a raw file (§H.6), the rendering for a JSON file           | the same                                                       |
 | `PUT`                       | §H.4                                                                     | §H.4                                                           |
 | `DELETE`                    | §H.5                                                                     | delete the resource                                            |
-| `MKCOL`                     | a folder node                                                            | `403`                                                          |
+| `MKCOL`                     | a folder document                                                        | `403`                                                          |
 | `MOVE`                      | §H.5                                                                     | `403`, or a create and a delete with `$successor` in one batch |
 | `COPY`                      | §H.5                                                                     | a new resource                                                 |
 | `LOCK`, `UNLOCK`            | in the gateway (§H.6)                                                    | the same                                                       |
@@ -769,9 +688,7 @@ One mapping, as an example:
 ## H.9 Open questions
 
 - Line-level merges for text files, which are raw and conflict as a whole.
-- Should the tree service, rather than each tool, flag sibling title collisions and unplaced items, e.g. in `/problems` (§B.12)?
 - A tentative delete, or an atomic "replace content", for clients that delete before they write, so other readers don't see the deleted window.
-- Branches of file trees, and manifests that keep titles.
 
 ---
 
@@ -844,7 +761,7 @@ A **shared session** is a namespace in which several people and agents work on t
   ```
 
 - **Who acts.** People edit as themselves. An agent acts through the person's grant narrowed with `via` naming it (§C.1), or, shared by all, through a grant of its own. Each log entry records `author` and `via` (§7.1, §7.4). The server verifies `user:anna`; `via agent:claude-code` is what her narrowing named.
-- **Roles, not grant rules,** limit what participants write, since a grant whose rules refer to `/resource` loses unrestricted `read` and with it the session's log (§2.1). Every grant names `reader`, since `member` never counts for reading the log: its rules refer to `/resource`. Members add `member`:
+- **Roles, not grant rules,** limit what participants write, since a grant whose rules refer to `/resource` loses unrestricted `read` and with it the session's whole log (§2.1, §7.9). Every grant names `reader`, since `member` never counts for reading the log: its rules refer to `/resource`. Members add `member`:
 
   ``` jsonc
   "roles": {

@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -248,40 +247,6 @@ func TestGatewayBounds(t *testing.T) {
 	e.expect(e.doAs(k.Grant(t, now, "user:t", []string{"docs"}, []string{"read"}), "PUT", "/docs/x.swp", strings.Repeat("B", 2<<20)), 201, "the budget is whole")
 }
 
-// A root listing names the served namespaces without reading them, so a
-// grant that reads only some of them still mounts; the others refuse when
-// opened. A tree's folder leaves out the files whose items the grant
-// doesn't read (§B.11.5: nothing hidden shows).
-func TestGatewayPartialGrant(t *testing.T) {
-	t.Parallel()
-	e, k := authEnv(t, true)
-	for _, ns := range []string{"secret", "cat"} {
-		op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, ns)))
-		doc := map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}
-		if ns == "cat" {
-			doc["catalog"] = treeCatalog("docs", "secret")
-		}
-		must(op.CreateNamespace(e.ctx, ns, doc))
-	}
-	w := e.s.Client(t, client.WithBearer(k.Grant(t, e.s.Now(), "user:admin", []string{"secret", "cat"}, []string{"read", "create"})))
-	e.create("docs", "a", map[string]any{"v": 1})
-	must(w.CreateDoc(e.ctx, "secret", "s", map[string]any{"v": 2}))
-	must(w.CreateDoc(e.ctx, "cat", "root", map[string]any{"parents": []any{}}))
-	for _, n := range []string{"docs.a", "secret.s"} {
-		must(w.CreateDoc(e.ctx, "cat", n, map[string]any{"title": n + ".json", "parents": parents("cat", "root")}))
-	}
-	srv := must(dav.New(dav.Options{Client: e.s.Client(t), Namespaces: []string{"docs", "secret"}, Catalogs: []string{"cat"}, Gateway: true, Logf: t.Logf}))
-	hs := httptest.NewServer(srv)
-	defer hs.Close()
-	g := &env{t: t, ctx: e.ctx, s: e.s, c: e.c, dav: hs, pw: k.Grant(t, e.s.Now(), "user:alice", []string{"docs", "cat"}, []string{"read"})}
-	sameStrings(t, "root", names(g.propfind("/"), "/"), []string{"cat/", "docs/", "secret/"})
-	sameStrings(t, "docs", names(g.propfind("/docs/"), "/docs/"), []string{"a.json"})
-	if r := g.do("PROPFIND", "/secret/", "", "Depth", "1"); r.status != 403 {
-		t.Fatalf("PROPFIND /secret/: %d %s", r.status, r.body)
-	}
-	sameStrings(t, "cat", names(g.propfind("/cat/"), "/cat/"), []string{"docs.a.json"})
-}
-
 // A grant the core refuses for its key's scope (a lifetime over the
 // key's maxTtl, a sub outside its pattern) reads as 404 there, as a
 // namespace the grant can't see: that isn't an acceptance. Nothing is
@@ -409,59 +374,6 @@ func TestGatewayRootPerNamespace(t *testing.T) {
 	}
 }
 
-// Before a grant is verified, the gateway says nothing of what it serves,
-// and a self-signed grant naming every namespace costs the core a few
-// requests, not one per namespace served; a refused grant presented again
-// soon costs none.
-func TestGatewayPreauth(t *testing.T) {
-	t.Parallel()
-	var calls atomic.Int64
-	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true, Wrap: func(h http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			calls.Add(1)
-			h.ServeHTTP(w, r)
-		})
-	}})
-	ctx := context.Background()
-	k := clienttest.NewKey("k")
-	var nss []string
-	for i := 0; i < 6; i++ {
-		ns := "ns" + strconv.Itoa(i)
-		nss = append(nss, ns)
-		op := s.Client(t, client.WithBearer(s.OperatorGrant(t, ns)))
-		must(op.CreateNamespace(ctx, ns, map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
-	}
-	srv := must(dav.New(dav.Options{Client: s.Client(t), Namespaces: nss, Catalogs: []string{"secret-cat"}, Gateway: true, Logf: t.Logf}))
-	hs := httptest.NewServer(srv)
-	defer hs.Close()
-	e := &env{t: t, ctx: ctx, s: s, dav: hs}
-	self := clienttest.NewKey("x").Grant(t, s.Now(), "x", []string{"nope"}, []string{"read"})
-	r := e.expect(e.doAs(self, "GET", "/", ""), 401, "a self-signed grant naming nothing served")
-	if strings.Contains(r.body, "ns0") || strings.Contains(r.body, "secret-cat") {
-		t.Fatalf("401 %q", r.body)
-	}
-	star := func(i int) string {
-		return clienttest.NewKey("x").Grant(t, s.Now(), "x"+strconv.Itoa(i), []string{"*"}, []string{"read"})
-	}
-	e.expect(e.doAs(star(-1), "GET", "/", ""), 401, "warm the publicity cache")
-	calls.Store(0)
-	for i := 0; i < 10; i++ {
-		e.expect(e.doAs(star(i), "GET", "/", ""), 401, "a forged grant naming everything")
-	}
-	if n := calls.Load(); n > 30 {
-		t.Fatalf("10 forged grants: %d requests to the core", n)
-	}
-	again := star(99)
-	e.expect(e.doAs(again, "GET", "/", ""), 401, "a forged grant")
-	calls.Store(0)
-	for i := 0; i < 5; i++ {
-		e.expect(e.doAs(again, "GET", "/", ""), 401, "the same forged grant again")
-	}
-	if n := calls.Load(); n != 0 {
-		t.Fatalf("a refused grant again: %d requests to the core", n)
-	}
-}
-
 // Locks are bounded: an owner is at most 1 KiB, a lock's timeout at most
 // the scratch idle time (Infinite too), and a principal holds at most
 // MaxLocks of them, so a read-only grant can't pin memory with them.
@@ -552,8 +464,7 @@ func TestXMLBodyBound(t *testing.T) {
 
 // In a gateway, nothing is kept for a user in a served namespace their
 // grant doesn't name, which they can't list: scratch files and
-// directories there are refused, as in a catalog the core's refusal of
-// its tree refuses them.
+// directories there are refused.
 func TestGatewayScratchUnnamed(t *testing.T) {
 	t.Parallel()
 	e, k := authEnv(t, true, func(o *dav.Options) { o.Namespaces = []string{"docs", "secret"} })
@@ -567,51 +478,4 @@ func TestGatewayScratchUnnamed(t *testing.T) {
 	e.expect(e.doAs(carol, "PUT", "/secret/.scratch.swp", "x"), 201, "carol's scratch file in secret")
 	e.expect(e.doAs(carol, "MOVE", "/secret/.scratch.swp", "", "Destination", "/docs/.moved"), 403, "carol's scratch file moved to docs")
 	e.expect(e.doAs(carol, "PUT", "/.DS_Store", "x"), 201, "carol's scratch file at the root")
-}
-
-// In a gateway, a PUT of a new file in a tree is checked by a dry run of
-// its placement with the user's grant (§7.5) before its item is created:
-// a catalog the grant reads but can't write (its role there allows only
-// read) refuses it, and nothing is written; one it writes takes it. A
-// DELETE whose grant doesn't delete in files.ns deletes the placement and
-// leaves the item (§H.5).
-func TestGatewayPlacementRefusedByGrant(t *testing.T) {
-	t.Parallel()
-	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
-	ctx := context.Background()
-	k := clienttest.NewKey("k")
-	member := func(can ...any) map[string]any { return map[string]any{"member": map[string]any{"can": can}} }
-	for ns, doc := range map[string]map[string]any{
-		"matches": {"read": "grant", "keys": []any{k.Entry("*")}, "roles": member("read", "create", "append")},
-		"cat":     {"read": "grant", "keys": []any{k.Entry("*")}, "roles": member("read", "create", "append", "delete"), "catalog": treeCatalog("matches")},
-		"ro":      {"read": "grant", "keys": []any{k.Entry("*")}, "roles": member("read"), "catalog": treeCatalog("matches")},
-	} {
-		op := s.Client(t, client.WithBearer(s.OperatorGrant(t, ns)))
-		must(op.CreateNamespace(ctx, ns, doc))
-	}
-	admin := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{"matches", "cat", "ro"}, []string{"read", "create", "append"})))
-	for _, cat := range []string{"cat", "ro"} {
-		must(admin.CreateDoc(ctx, cat, "root", map[string]any{"parents": []any{}}))
-	}
-	srv := must(dav.New(dav.Options{Client: s.Client(t), Namespaces: []string{"matches"}, Catalogs: []string{"cat", "ro"}, Gateway: true, Logf: t.Logf}))
-	hs := httptest.NewServer(srv)
-	defer hs.Close()
-	e := &env{t: t, ctx: ctx, s: s, c: admin, dav: hs}
-	alice := k.Grant(t, s.Now(), "user:alice", []string{"matches", "cat", "ro"}, nil, map[string]any{"roles": []any{"member"}})
-	sameStrings(t, "ro", names(e.propfindAs(alice, "/ro/"), "/ro/"), nil)
-	e.expect(e.doAs(alice, "PUT", "/ro/refused.json", `{"title": "Refused"}`), 403, "PUT of a file in a tree the grant only reads")
-	sameStrings(t, "matches", e.liveNames("matches"), nil)
-	e.expect(e.doAs(alice, "PUT", "/cat/taken.json", `{"title": "Taken"}`), 201, "PUT of a file in a tree the grant writes")
-	node, _ := e.titled("cat", "taken.json")
-	_, item, _ := strings.Cut(node, ".")
-	_, doc := e.load("matches", item)
-	sameJSON(t, doc, map[string]any{"title": "Taken"})
-	if en := e.lastEntry("cat", node); en.Grant == nil || en.Grant.Sub != "user:alice" {
-		t.Fatalf("placement entry %+v", en)
-	}
-	e.expect(e.doAs(alice, "DELETE", "/cat/taken.json", ""), 204, "DELETE without delete in files.ns")
-	e.expectTombstoned("cat", node, "the placement")
-	if h, _ := e.load("matches", item); h.State != client.Live {
-		t.Fatalf("an item the grant can't delete is %v", h.State)
-	}
 }

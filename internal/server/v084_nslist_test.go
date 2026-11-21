@@ -319,130 +319,6 @@ func TestV084NamespacesKeyPeriod(t *testing.T) {
 	expectCode(t, n.get("/ns"), 401, "unauthenticated")
 }
 
-// HTTP-69 (§7.4): the rows. { name, created, base?, frozen, purged }:
-// created is that of the entry that created the namespace, the base's
-// branch entry for a local branch and otherwise the chain's first; base is
-// the namespace document's, without chain; frozen as §8.4, purged as §8.5.
-// While authentication is disabled it answers everyone (§1).
-func TestV084NamespacesRows(t *testing.T) {
-	t.Parallel()
-	var stored core.Options
-	a, e, _ := pair(t, nil, []envOpt{withFileDB(t), func(o *core.Options) { stored = *o }})
-	f := populateA(t, a)
-
-	e.mkNS("plain", map[string]any{})
-	e.clock.Advance(time.Minute)
-	e.mkNS("icy", map[string]any{})
-	e.clock.Advance(time.Minute)
-	expect(t, e.patchNS("icy", ops(op("add", "/frozen", true)), ""), 201)
-	e.clock.Advance(time.Minute)
-	e.mkNS("gone", map[string]any{})
-	e.create("gone", "doc", map[string]any{"a": 1})
-	e.clock.Advance(time.Minute)
-	e.purgeDev("gone")
-	e.clock.Advance(time.Minute)
-	e.create("plain", "doc", map[string]any{"a": 1})
-	at := e.nsHead("plain")
-	e.clock.Advance(time.Minute)
-	e.create("plain", "later", map[string]any{"a": 1})
-	e.clock.Advance(time.Minute)
-	branched := e.clock.Now()
-	// A branch at an earlier ns_id, frozen from its genesis.
-	expect(t, e.branch("plain", map[string]any{"name": "plain-b", "at": at, "patches": ops(op("add", "/frozen", true))}, "alice"), 201)
-	e.clock.Advance(time.Minute)
-	bbAt := e.nsHead("plain-b")
-	expect(t, e.branch("plain-b", map[string]any{"name": "plain-bb"}, "alice"), 201)
-	e.clock.Advance(time.Minute)
-	remoteAt := e.clock.Now()
-	expect(t, e.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
-
-	// Authentication is disabled: no credentials, and any are ignored.
-	rows, next := e.nsPage("")
-	if other, _ := e.nsPage("", "garbage"); !reflect.DeepEqual(other, rows) {
-		t.Fatalf("with a bearer: %v, without: %v", other, rows)
-	}
-	stamp := func(tm time.Time) string { return tm.UTC().Format("2006-01-02T15:04:05.000Z") }
-	want := []map[string]any{
-		{"name": "gone", "created": stamp(t0.Add(3 * time.Minute)), "frozen": true, "purged": true},
-		{"name": "icy", "created": stamp(t0.Add(time.Minute)), "frozen": true, "purged": false},
-		{"name": "plain", "created": stamp(t0), "frozen": false, "purged": false},
-		{"name": "plain-b", "created": stamp(branched), "base": map[string]any{"ns": "plain", "at": at}, "frozen": true, "purged": false},
-		{"name": "plain-bb", "created": stamp(branched.Add(time.Minute)), "base": map[string]any{"ns": "plain-b", "at": bbAt}, "frozen": false, "purged": false},
-		// A remote branch: its chain's first entry, written here; base
-		// as its document gives it, less chain. The shadow that mirrors
-		// its base (§G.3) is no namespace and isn't listed.
-		{"name": "rel", "created": stamp(remoteAt), "base": map[string]any{"origin": originA, "ns": "main", "at": f.at}, "frozen": false, "purged": false},
-		// The namespace its creation mirrored the base's schemas into
-		// (§G.3) is one like any other.
-		{"name": "schemas", "created": stamp(remoteAt), "frozen": false, "purged": false},
-	}
-	if !reflect.DeepEqual(rows, want) || next != "" {
-		t.Fatalf("rows\n %v\nwant\n %v\nnext %q", rows, want, next)
-	}
-	// The same from another server on the database, which has none of the
-	// namespace documents in its configuration cache: the two ways base
-	// and frozen are read agree.
-	stored.BlobDir = t.TempDir()
-	cold, err := core.Open(stored)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer cold.Close()
-	page, err := cold.Namespaces(t.Context(), "", "", core.Credentials{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !reflect.DeepEqual(page.Items, want) || page.Next != "" {
-		t.Fatalf("rows of a cold server\n %v\nwant\n %v", page.Items, want)
-	}
-	if _, err := cold.Namespaces(t.Context(), "", "A", core.Credentials{}); err == nil {
-		t.Fatal("the core accepts a prefix that is no namespace name")
-	}
-	for _, n := range []string{"icy", "plain", "plain-b", "plain-bb", "rel", "schemas"} {
-		expect(t, e.get("/ns/"+n+"/rev/"+e.nsHead(n)), 200)
-	}
-	if again, _ := e.nsPage(""); !reflect.DeepEqual(again, want) {
-		t.Fatalf("rows with cached documents\n %v\nwant\n %v", again, want)
-	}
-
-	// created is the created of the base's branch entry, and base the
-	// namespace document's.
-	var entry map[string]any
-	for _, x := range e.get("/ns/plain/rev/" + e.nsHead("plain") + "/log").Arr() {
-		if m := x.(map[string]any); m["kind"] == "branch" && m["name"] == "plain-b" {
-			entry = m
-		}
-	}
-	if entry == nil || entry["created"] != rowOf(t, rows, "plain-b")["created"] {
-		t.Fatalf("branch entry %v, row %v", entry, rowOf(t, rows, "plain-b"))
-	}
-	first := e.get("/ns/rel/rev/" + e.nsHead("rel") + "/log").Arr()[0].(map[string]any)
-	if first["created"] != rowOf(t, rows, "rel")["created"] {
-		t.Fatalf("remote branch's first entry %v, row %v", first, rowOf(t, rows, "rel"))
-	}
-	for _, n := range []string{"plain-b", "plain-bb", "rel"} {
-		base := e.get("/ns/" + n + "/rev/" + e.nsHead(n)).Obj()["base"].(map[string]any)
-		delete(base, "chain")
-		if got := rowOf(t, rows, n)["base"]; !reflect.DeepEqual(got, base) {
-			t.Fatalf("%s: base %v, document's %v", n, got, base)
-		}
-	}
-
-	// Unfreezing shows; a purged branch stays listed, with its base.
-	expect(t, e.patchNS("icy", ops(op("replace", "/frozen", false)), ""), 201)
-	e.purgeDev("plain-bb")
-	rows, _ = e.nsPage("")
-	if r := rowOf(t, rows, "icy"); r["frozen"] != false {
-		t.Fatalf("unfrozen row %v", r)
-	}
-	if r := rowOf(t, rows, "plain-bb"); r["purged"] != true || r["frozen"] != true || !reflect.DeepEqual(r["base"], want[4]["base"]) || r["created"] != want[4]["created"] {
-		t.Fatalf("purged branch row %v", r)
-	}
-	if got := rowNames(rows); !reflect.DeepEqual(got, []string{"gone", "icy", "plain", "plain-b", "plain-bb", "rel", "schemas"}) {
-		t.Fatalf("names %v", got)
-	}
-}
-
 // HTTP-69 (§7.4): rows in ascending byte order of name, strictly after
 // after, a plain bound, paged by logPageSize with next absent on the last
 // page; prefix, a namespace name, keeps the names that start with it.
@@ -629,5 +505,113 @@ func TestV085NamespacesKeyScope(t *testing.T) {
 	// Before verification, the ns check still answers 403 for both.
 	if r := e.get("/ns", e.opGrant(map[string]any{"sub": "user:eve", "ns": []any{"main"}}).Encode()); r.Code != 403 {
 		t.Fatalf("ns names a namespace: %d %s", r.Code, r.Body)
+	}
+}
+
+// HTTP-69 (§7.4): the rows. { name, created, base?, frozen, purged }:
+// created is that of the entry that created the namespace, the base's
+// branch entry for a local branch and otherwise the chain's first; base is
+// the namespace document's, without chain; frozen as §8.4, purged as §8.5.
+// While authentication is disabled it answers everyone (§1).
+func TestV084NamespacesRows(t *testing.T) {
+	t.Parallel()
+	var stored core.Options
+	e := newEnv(t, withFileDB(t), func(o *core.Options) { stored = *o })
+
+	e.mkNS("plain", map[string]any{})
+	e.clock.Advance(time.Minute)
+	e.mkNS("icy", map[string]any{})
+	e.clock.Advance(time.Minute)
+	expect(t, e.patchNS("icy", ops(op("add", "/frozen", true)), ""), 201)
+	e.clock.Advance(time.Minute)
+	e.mkNS("gone", map[string]any{})
+	e.create("gone", "doc", map[string]any{"a": 1})
+	e.clock.Advance(time.Minute)
+	e.purgeDev("gone")
+	e.clock.Advance(time.Minute)
+	e.create("plain", "doc", map[string]any{"a": 1})
+	at := e.nsHead("plain")
+	e.clock.Advance(time.Minute)
+	e.create("plain", "later", map[string]any{"a": 1})
+	e.clock.Advance(time.Minute)
+	branched := e.clock.Now()
+	// A branch at an earlier ns_id, frozen from its genesis.
+	expect(t, e.branch("plain", map[string]any{"name": "plain-b", "at": at, "patches": ops(op("add", "/frozen", true))}, "alice"), 201)
+	e.clock.Advance(time.Minute)
+	bbAt := e.nsHead("plain-b")
+	expect(t, e.branch("plain-b", map[string]any{"name": "plain-bb"}, "alice"), 201)
+
+	// Authentication is disabled: no credentials, and any are ignored.
+	rows, next := e.nsPage("")
+	if other, _ := e.nsPage("", "garbage"); !reflect.DeepEqual(other, rows) {
+		t.Fatalf("with a bearer: %v, without: %v", other, rows)
+	}
+	stamp := func(tm time.Time) string { return tm.UTC().Format("2006-01-02T15:04:05.000Z") }
+	want := []map[string]any{
+		{"name": "gone", "created": stamp(t0.Add(3 * time.Minute)), "frozen": true, "purged": true},
+		{"name": "icy", "created": stamp(t0.Add(time.Minute)), "frozen": true, "purged": false},
+		{"name": "plain", "created": stamp(t0), "frozen": false, "purged": false},
+		{"name": "plain-b", "created": stamp(branched), "base": map[string]any{"ns": "plain", "at": at}, "frozen": true, "purged": false},
+		{"name": "plain-bb", "created": stamp(branched.Add(time.Minute)), "base": map[string]any{"ns": "plain-b", "at": bbAt}, "frozen": false, "purged": false},
+	}
+	if !reflect.DeepEqual(rows, want) || next != "" {
+		t.Fatalf("rows\n %v\nwant\n %v\nnext %q", rows, want, next)
+	}
+	// The same from another server on the database, which has none of the
+	// namespace documents in its configuration cache: the two ways base
+	// and frozen are read agree.
+	stored.BlobDir = t.TempDir()
+	cold, err := core.Open(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cold.Close()
+	page, err := cold.Namespaces(t.Context(), "", "", core.Credentials{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(page.Items, want) || page.Next != "" {
+		t.Fatalf("rows of a cold server\n %v\nwant\n %v", page.Items, want)
+	}
+	if _, err := cold.Namespaces(t.Context(), "", "A", core.Credentials{}); err == nil {
+		t.Fatal("the core accepts a prefix that is no namespace name")
+	}
+	for _, n := range []string{"icy", "plain", "plain-b", "plain-bb"} {
+		expect(t, e.get("/ns/"+n+"/rev/"+e.nsHead(n)), 200)
+	}
+	if again, _ := e.nsPage(""); !reflect.DeepEqual(again, want) {
+		t.Fatalf("rows with cached documents\n %v\nwant\n %v", again, want)
+	}
+
+	// created is the created of the base's branch entry, and base the
+	// namespace document's.
+	var entry map[string]any
+	for _, x := range e.get("/ns/plain/rev/" + e.nsHead("plain") + "/log").Arr() {
+		if m := x.(map[string]any); m["kind"] == "branch" && m["name"] == "plain-b" {
+			entry = m
+		}
+	}
+	if entry == nil || entry["created"] != rowOf(t, rows, "plain-b")["created"] {
+		t.Fatalf("branch entry %v, row %v", entry, rowOf(t, rows, "plain-b"))
+	}
+	for _, n := range []string{"plain-b", "plain-bb"} {
+		base := e.get("/ns/" + n + "/rev/" + e.nsHead(n)).Obj()["base"].(map[string]any)
+		if got := rowOf(t, rows, n)["base"]; !reflect.DeepEqual(got, base) {
+			t.Fatalf("%s: base %v, document's %v", n, got, base)
+		}
+	}
+
+	// Unfreezing shows; a purged branch stays listed, with its base.
+	expect(t, e.patchNS("icy", ops(op("replace", "/frozen", false)), ""), 201)
+	e.purgeDev("plain-bb")
+	rows, _ = e.nsPage("")
+	if r := rowOf(t, rows, "icy"); r["frozen"] != false {
+		t.Fatalf("unfrozen row %v", r)
+	}
+	if r := rowOf(t, rows, "plain-bb"); r["purged"] != true || r["frozen"] != true || !reflect.DeepEqual(r["base"], want[4]["base"]) || r["created"] != want[4]["created"] {
+		t.Fatalf("purged branch row %v", r)
+	}
+	if got := rowNames(rows); !reflect.DeepEqual(got, []string{"gone", "icy", "plain", "plain-b", "plain-bb"}) {
+		t.Fatalf("names %v", got)
 	}
 }

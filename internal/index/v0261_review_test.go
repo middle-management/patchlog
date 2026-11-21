@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,10 +17,8 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
-	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/index"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // TestV0261WidenPending503: pr is private (its genesis recorded in
@@ -81,8 +78,8 @@ func TestV0261WidenPending503(t *testing.T) {
 		t.Errorf("anonymous /pr, public at its head, the widening not applied yet: %d %v, want 401", r.status, r.body)
 	}
 	rg := k.Grant(t, s.Now(), "user:r", []string{"pr"}, []string{"read"})
-	if g := x.raw("/pr?limit=6", rg); g.status != 302 || !strings.HasPrefix(g.header.Get("Location"), "/pr/g/") {
-		t.Errorf("a grant holder's /pr meanwhile: %d %q %v, want a redirect to its gs", g.status, g.header.Get("Location"), g.body)
+	if g := x.raw("/pr?limit=6", rg); g.status != 302 || !strings.HasPrefix(g.header.Get("Location"), "/pr/view/") {
+		t.Errorf("a grant holder's /pr meanwhile: %d %q %v, want a redirect to its vid", g.status, g.header.Get("Location"), g.body)
 	} else if f := x.raw(g.header.Get("Location"), rg); f.status != 200 {
 		t.Errorf("a grant holder's %s meanwhile: %d %v", g.header.Get("Location"), f.status, f.body)
 	}
@@ -152,78 +149,6 @@ type v0261HookPurger struct {
 }
 
 func (p v0261HookPurger) PurgeTags(tags []string) { p.next.PurgeTags(tags); p.f(tags) }
-
-// TestV0261MemberPurgeWindow (gap 1): the index serves matches and
-// covers it through cat-season, a member. A placement in cat-season,
-// matches.shared, is purged: memberHandler.Apply commits, drops kept
-// results tagged idx:cat-season, and only then publishes the member's new
-// checkpoint (reach), and later tells the checker (Observe). li, a fan,
-// asks in between (from PurgeTags). Is an answer computed there, at the
-// member's position before the purge, kept with shared, and served after?
-func TestV0261MemberPurgeWindow(t *testing.T) {
-	ctx := context.Background()
-	w := newV75XOn(t, clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}))
-	var armed atomic.Bool
-	type seen struct {
-		loc  string
-		ptr  resp
-		hits string
-	}
-	got := make(chan seen, 1)
-	var li string
-	ev := must(edge.New([]byte("s3cret"), "", ""))
-	all := []string{"schemas", "cat-season", "matches", "matches-r7"}
-	w.x = startSvcWith(t, w.s.Client(t, client.WithBearer(w.k.Grant(t, w.s.Now(), "svc:indexer", all, []string{"read"}))),
-		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, untyped: true, now: w.s.Now},
-		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
-			o.Purger = v0261HookPurger{next: o.Purger, f: func(tags []string) {
-				if !slices.Contains(tags, "idx:cat-season") || !armed.CompareAndSwap(true, false) {
-					return
-				}
-				done := make(chan seen, 1)
-				go func() {
-					var sn seen
-					sn.ptr = w.x.raw("/matches", li)
-					sn.loc = sn.ptr.header.Get("Location")
-					if sn.ptr.status == 302 {
-						sn.hits = strings.Join(resources(w.x.raw(sn.loc, li).body), ",")
-					}
-					done <- sn
-				}()
-				select {
-				case sn := <-done:
-					got <- sn
-				case <-time.After(5 * time.Second):
-					got <- seen{loc: "timeout"}
-				}
-			}}
-		})
-	w.x.caughtUp("matches")
-	li = w.reader("user:li", []any{"fans"})
-	loc0, _, _ := w.pointer("/matches", li)
-	if got := strings.Join(resources(w.x.search(loc0, li)), ","); got != "derby,shared" {
-		t.Fatalf("li sees %s, want derby,shared", got)
-	}
-	armed.Store(true)
-	h := must(w.admin.Head(ctx, "cat-season", "matches.shared"))
-	must(w.admin.Purge(ctx, "cat-season", "matches.shared", h.ID, false))
-	sn := <-got
-	t.Logf("li in the window: %d Location=%q hits=%q", sn.ptr.status, sn.loc, sn.hits)
-	waitFor(t, "cat-season followed to its head", func() bool { return w.x.ix.Members()["cat-season"] == w.head("cat-season") })
-	if sn.loc == "" || sn.loc == "timeout" {
-		return
-	}
-	if loc2, _, _ := w.pointer("/matches", li); loc2 == sn.loc {
-		t.Logf("the window's answer is at the post-purge at: the pre-purge position wasn't exercised")
-	}
-	r := w.x.raw(sn.loc, li)
-	after := strings.Join(resources(r.body), ",")
-	t.Logf("li GET %s after the purge: %d hits=%q kept=%v", sn.loc, r.status, after, w.x.ix.KeptHas(sn.loc))
-	if r.status == 200 && strings.Contains(after, "shared") {
-		t.Errorf("li's answer computed in the member's purge window, showing the purged placement's item, served after the purge: %s %q", sn.loc, after)
-	}
-}
 
 // TestV0261StaleCheckerAfterNarrowing (F1's guard for I1): pr is made
 // private and the index has applied it, but the grant checker reloads pr

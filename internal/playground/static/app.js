@@ -359,8 +359,7 @@ async function api(method, path, o = {}) {
 }
 
 /* WRITES: the last write this page made to each namespace, by X-Namespace-Revision. The Search tab passes it as
- * ?min= (§A.5) so the index has applied it before it answers, and the Catalog tab for the catalog and the
- * namespaces it trusts (§B.5 fresh listings after a write). */
+ * ?min= (§A.5) so the index has applied it before it answers. */
 const WRITES = new Map(); // ns -> { id, at: Date }
 function noteWrite(method, path, e) {
   if (method === 'GET' || method === 'HEAD' || !(e.status >= 200 && e.status < 300) || !e.resHeaders || /[?&]dry-run=/.test(path)) return;
@@ -582,8 +581,8 @@ function renderNsStatus() {
     h('dt', {}, 'config id'), h('dd', {}, S.config ? idEl(S.config) : h('span', { class: 'muted' }, 'unknown')),
     h('dt', {}, 'readable'), h('dd', {}, S.nsPurged ? 'nothing: purged, its documents and log are 410 (§8.5)' : S.nsDoc ? 'document, log, heads' : 'log only (document not readable)'));
   if (d.base) kv.append(h('dt', {}, 'base'), h('dd', {}, `${d.base.ns} @ `, idEl(d.base.at),
-    // a local branch (no origin, §G.3) merges into the base it names (§F.3)
-    d.base.origin === undefined && Z.isNamespaceName(d.base.ns) && Z.isNamespaceName(S.ns) && !S.nsPurged
+    // a branch merges into the base it names (§F.3)
+    Z.isNamespaceName(d.base.ns) && Z.isNamespaceName(S.ns) && !S.nsPurged
       ? [' ', h('button', { class: 'tiny', id: 'nsMergeInto', onclick: () => mgOpen(S.ns, d.base.ns) }, `Merge into ${d.base.ns}\u2026`)] : null));
   if (d.successor) kv.append(h('dt', {}, 'successor'), h('dd', {}, d.successor));
   if (S.nsLevel) {
@@ -686,14 +685,14 @@ function renderBranches() {
   if (S.branches.length) openUnlessSet(tb); // rows with open/merge buttons: shown unless the user closed the card
   if (!S.branches.length) { tb.replaceChildren(h('tr', {}, h('td', { class: 'empty', colspan: 6 }, 'No branches.'))); return; }
   tb.replaceChildren(...S.branches.map((b) => h('tr', {},
-    h('td', { class: 'mono' }, b.name || (b.remote ? 'remote ' + b.remote : '')),
+    h('td', { class: 'mono' }, b.name || ''),
     h('td', {}, b.at ? idEl(b.at) : ''),
     h('td', {}, b.frozen ? h('span', { class: 'badge warn' }, 'frozen') : 'no'),
     h('td', {}, b.purged ? h('span', { class: 'badge err' }, 'purged') : 'no'),
     h('td', { class: 'mono' }, b.successor || ''),
     h('td', {}, b.name ? h('button', { class: 'tiny', onclick: () => asUser(() => selectNS(b.name)) }, 'open') : '',
       // a local branch that still has its content can be merged into this namespace (§F.3)
-      b.name && !b.remote && !b.purged && Z.isNamespaceName(b.name) && Z.isNamespaceName(S.ns)
+      b.name && !b.purged && Z.isNamespaceName(b.name) && Z.isNamespaceName(S.ns)
         ? [' ', h('button', { class: 'tiny', title: `plan a merge of ${b.name} into ${S.ns}`, onclick: () => mgOpen(b.name, S.ns) }, 'merge\u2026')] : ''))));
 }
 
@@ -2110,7 +2109,7 @@ async function readDoc(ns, name, id, r, retried) {
  * asked for, which holds it (§7.1 Paging): nothing here is a read of the range. */
 async function nsFirstEntry(ns) {
   const l = await api('GET', `/ns/${ns}/log`, { auto: true, label: 'fork' });
-  // The range at the head, not a partial reader's filtered log (§B.11.9), which may leave the first entry out.
+  // The range at the head, not a partial reader's filtered log (§7.9), which may leave the first entry out.
   const whole = l.finalPath === undefined || new RegExp(`^/ns/${ns}(/rev/1[a-z2-7]{32})?/log$`).test(l.finalPath.split('?')[0]);
   const first = l.status === 200 && whole && Array.isArray(l.json) ? l.json[0] : null;
   return first && typeof first === 'object' && (first.prev || '') === '' ? first : null;
@@ -2133,8 +2132,7 @@ async function revPrecedes(ns, name, a, b) {
  * base's namespace is refused once the fold is past the fork
  * from that base: the base's head of the resource as of the branch's at, or none where the base had no such
  * resource. The fork is what the base's /heads lists at at, or else what the branch's own /heads lists at its first
- * namespace entry (§G.4.1), which is all there is for a remote base (§G.3), whose chain, base.chain, lies behind
- * that one fork. Where this reader can place a fork by neither, no namespace behind it is accepted (v0.86: the op
+ * namespace entry (§G.4.1). Where this reader can place a fork by neither, no namespace behind it is accepted (v0.86: the op
  * fails the check), as internal/client's chainCheck has it. */
 async function nsChainOK(ns, kns, at) {
   if (kns === ns) return true;
@@ -2146,7 +2144,7 @@ async function nsChainOK(ns, kns, at) {
     for (let page = 0; page < 20; page++) {
       const path = `/ns/${of}/rev/${nsID}/heads`;
       const r = await api('GET', path + (after ? `?after=${encodeURIComponent(after)}` : ''), { auto: true, label: 'fork' });
-      // A partial reader is redirected to its filtered listing (§B.11.9), which places no fork.
+      // A partial reader is redirected to its filtered listing (§7.9), which places no fork.
       if (r.status !== 200 || !r.json || (r.finalPath || path).split('?')[0] !== path) return null;
       const rows = r.json.heads || r.json.items || [];
       const row = rows.find((x) => x && x.resource >= name);
@@ -2165,13 +2163,12 @@ async function nsChainOK(ns, kns, at) {
   for (let cur = ns, i = 0; i < 16; i++) {
     const b = ((await nsInfo(cur)).doc || {}).base;
     if (!b || typeof b !== 'object' || typeof b.ns !== 'string' || typeof b.at !== 'string') return false;
-    const remote = b.origin !== undefined;
     if (at) {
       const k = cur + ' ' + at.name;
       let fork = forks.get(k);
       if (fork === undefined && at.missed && at.missed.has(k)) return false;
       if (fork === undefined) {
-        fork = remote ? null : await headAt(b.ns, b.at, at.name);
+        fork = await headAt(b.ns, b.at, at.name);
         if (fork === null) fork = await ownFork(cur, at.name);
         // A fork that isn't placed is asked for again by a later fold, as the /heads may be readable then, but
         // once in a fold (at.missed).
@@ -2188,7 +2185,6 @@ async function nsChainOK(ns, kns, at) {
         if (!forks.get(kk)) return false;
       }
     }
-    if (remote) return kns === b.ns || (Array.isArray(b.chain) && b.chain.includes(kns));
     if ((cur = b.ns) === kns) return true;
   }
   return false;
@@ -2857,195 +2853,24 @@ async function runSelfTest() {
 }
 
 /* ------------------------------------------------------------------ *
- * catalog (Addendum B)
+ * shared helpers: namespace documents, sealed answers
  * ------------------------------------------------------------------ */
-const TREE = '/playground/tree';
 const NODE_RE = /^[a-z0-9][a-z0-9_-]*$/;
-const C = {
-  ns: '', head: '', config: '', doc: null, nodes: new Map(), trust: [], mode: 'tree', contentDocs: {}, contentHeads: {}, nonces: false,
-  source: '', proxy: null, proxyCatalogs: [], listing: null, at: '', view: '', note: '', problems: null, sel: '', min: [], loading: false, gen: 0,
-  catalogs: null, discovering: false, // discovered catalog namespaces: [{ ns, mode }], null until found
-};
-
 const cmpCU = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
-const hrefOf = (name) => `/r/${C.ns}/${name}`;
-function nodeName(href) {
-  const m = /^\/r\/([^/]+)\/([^/]+)$/.exec(href || '');
-  return m && m[1] === C.ns ? m[2] : '';
-}
-function itemOf(name) { const i = name.indexOf('.'); return i > 0 ? { ns: name.slice(0, i), name: name.slice(i + 1), href: `/r/${name.slice(0, i)}/${name.slice(i + 1)}` } : null; }
-function parentsOf(n) { return n && n.doc && Array.isArray(n.doc.parents) ? n.doc.parents.filter((p) => p && typeof p.href === 'string') : []; }
-
-async function mapLimit(items, n, fn) {
-  const out = new Array(items.length); let i = 0;
-  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (i < items.length) { const k = i++; out[k] = await fn(items[k], k); } }));
-  return out;
-}
-async function allHeads(ns, head) {
-  let items = [], after = '';
-  for (let page = 0; page < 20; page++) {
-    const r = await api('GET', `/ns/${ns}/rev/${head}/heads` + (after ? `?after=${encodeURIComponent(after)}` : ''), { auto: true, label: 'catalog' });
-    if (r.status !== 200 || !r.json) break;
-    items = items.concat(headsOf(r.json));
-    if (!r.json.next) break;
-    after = r.json.next;
-  }
-  return items;
-}
 /* nsHeadDoc reads a namespace document (decrypting a sealed one) and its head. What is no namespace name (§3.6) is
  * not asked for: status 400, as a server answers it. */
 async function nsHeadDoc(ns) {
   if (!Z.isNamespaceName(ns)) return { status: 400 };
-  const r = await api('GET', `/ns/${ns}`, { auto: true, label: 'catalog' });
+  const r = await api('GET', `/ns/${ns}`, { auto: true, label: 'ns' });
   if (r.status !== 200) return { status: r.status };
   const head = r.etag() || ((/\/rev\/([^/]+)$/.exec(r.finalPath) || [])[1] || '');
   const doc = r.jose ? (await decrypted(r, ns, '', nsDocPL(ns, head))).value : r.json;
   return { status: 200, head, config: r.hdr('X-Config-Revision') || '', doc, sealed: r.jose };
 }
 
-/* probeProxy asks the core whether it proxies a tree service (--tree-url), and which catalogs it maps to their own. */
-async function probeProxy() {
-  const p = await api('GET', `${TREE}/`, { auto: true, label: 'tree' });
-  C.proxy = p.status === 200 && p.json && p.json.proxy === 'tree';
-  C.proxyCatalogs = C.proxy && Array.isArray(p.json.catalogs) ? p.json.catalogs.filter((c) => typeof c === 'string') : [];
-}
-
-/* discoverCatalogs finds namespaces with a catalog config (§B.6). There is no namespace listing, so the
- * candidates are what the tree service serves (/_status), the proxy's mappings, the demo's catalogs and
- * the namespaces this browser has used; each is kept if its namespace document has a "catalog". */
-async function discoverCatalogs() {
-  if (C.proxy === null) await probeProxy();
-  const cands = new Set(['cat', 'topics', ...known, ...C.proxyCatalogs, C.ns].filter((c) => c && NODE_RE.test(c)));
-  if (C.proxy) {
-    const st = await api('GET', `${TREE}/_status`, { auto: true, label: 'tree' });
-    if (st.status === 200 && st.json && Array.isArray(st.json.catalogs)) st.json.catalogs.forEach((c) => typeof c === 'string' && cands.add(c));
-  }
-  const found = await mapLimit([...cands].sort(), 4, async (ns) => {
-    const r = await api('GET', `/ns/${ns}`, { auto: true, label: 'catalog' });
-    if (r.status !== 200) return null;
-    if (r.jose) return { ns, mode: '?' }; // a sealed namespace document: kept, its mode shows once loaded
-    const cat = r.json && r.json.catalog;
-    return cat && typeof cat === 'object' ? { ns, mode: cat.mode === 'dag' ? 'dag' : 'tree' } : null;
-  });
-  C.catalogs = found.filter(Boolean);
-  renderCatPick();
-}
-
-function renderCatPick() {
-  const sel = $('catPick');
-  const list = (C.catalogs || []).slice();
-  if (C.ns && C.head && !list.some((c) => c.ns === C.ns) && C.doc && C.doc.catalog) list.push({ ns: C.ns, mode: C.mode });
-  list.sort((a, b) => cmpCU(a.ns, b.ns));
-  sel.replaceChildren(h('option', { value: '' }, C.catalogs === null ? 'finding catalogs…' : list.length ? '— pick —' : '— none found —'),
-    ...list.map((c) => h('option', { value: c.ns, selected: c.ns === C.ns }, `${c.ns} (${c.ns === C.ns && C.head ? C.mode : c.mode})`)));
-  $('catNsList').replaceChildren(...[...new Set([...list.map((c) => c.ns), ...known])].map((v) => h('option', { value: v })));
-}
-
-async function loadCatalog() {
-  const ns = ($('catNs').value.trim() || 'cat');
-  $('catNs').value = ns;
-  store.set('pl.catNs', ns);
-  if (C.catalogs === null && !C.discovering) { C.discovering = true; discoverCatalogs().finally(() => { C.discovering = false; }); }
-  if (ns !== C.ns) C.sel = '';
-  const gen = ++C.gen;
-  C.ns = ns; C.loading = true;
-  renderCatStatus();
-  // Everything is read into x and published at once, so a slower earlier load can't overwrite a newer one.
-  const x = { head: '', config: '', doc: null, nodes: new Map(), trust: [], mode: 'tree', contentDocs: {}, contentHeads: {}, nonces: false };
-  // 1. The catalog namespace itself, from the core.
-  const nd = await nsHeadDoc(ns);
-  if (gen !== C.gen) return;
-  if (nd.status !== 200) {
-    Object.assign(C, x, { listing: null, loading: false, source: '', note: `GET /ns/${ns} answered ${nd.status}: not a readable namespace.` });
-    return renderCatalog();
-  }
-  x.head = nd.head; x.config = nd.config; x.doc = nd.doc || {};
-  // Writes add a fresh nonce in a sealed catalog (§E.2.5), and where it requires them, or its document didn't open (§C.7).
-  x.nonces = !!nd.sealed || needsNonce(nd.doc);
-  const cat = x.doc.catalog || {};
-  x.trust = Array.isArray(cat.trust) ? cat.trust.filter((t) => typeof t === 'string') : [];
-  x.mode = cat.mode === 'dag' ? 'dag' : 'tree';
-  C.min = treeMins(ns, x.trust);
-  // 2. Every node document at the catalog's head (needed for $access and for If-Match).
-  const heads = (await allHeads(ns, x.head)).filter((e) => e.kind === 'head');
-  const docs = await mapLimit(heads.slice(0, 500), 6, async (e) => {
-    const r = await api('GET', `/r/${ns}/${e.resource}/rev/${e.target}`, { auto: true, label: 'catalog' });
-    if (r.status !== 200 && !notOffered(r)) return null;
-    const d = await readDoc(ns, e.resource, e.target, r);
-    return { name: e.resource, head: e.target, doc: d.doc && typeof d.doc === 'object' ? d.doc : {}, kind: e.resource.includes('.') ? 'item' : 'folder', sealed: !!d.seal };
-  });
-  x.nodes = new Map(docs.filter(Boolean).map((n) => [n.name, n]));
-  // 3. Trusted content namespaces: their roles (what a role means, includes) and which items exist.
-  await Promise.all(x.trust.map(async (t) => {
-    const cd = await nsHeadDoc(t);
-    if (cd.status !== 200) return;
-    x.contentDocs[t] = cd.doc || {};
-    x.contentHeads[t] = new Map((await allHeads(t, cd.head)).map((e) => [e.resource, e]));
-  }));
-  // 4. The tree service, through the core's same-origin proxy (--tree-url).
-  Object.assign(x, await loadTreeListing());
-  if (x.listing) addDangling(x);
-  if (gen !== C.gen) return;
-  Object.assign(C, x, { loading: false });
-  renderCatalog();
-}
-
-/* addDangling puts dangling placements, which drop out of the service's listings (§B.7), back under
- * their folders, marked, so a placement of a not-yet-existing item is visible where it was placed. */
-function addDangling(x) {
-  const folders = new Map();
-  // In a DAG a folder is listed once per path to it: add to every listing of it.
-  const walk = (e) => { if (e.kind === 'folder') { (folders.get(e.name) || folders.set(e.name, []).get(e.name)).push(e); (e.children || []).forEach(walk); } };
-  x.listing.forEach(walk);
-  for (const d of ((x.problems && x.problems.body && x.problems.body.danglingItems) || [])) {
-    const name = nodeName(d.href), n = x.nodes.get(name);
-    if (!n) continue;
-    for (const p of parentsOf(n)) {
-      for (const f of folders.get(nodeName(p.href)) || []) {
-        if (f.children && !f.children.some((c) => c.name === name)) f.children.push({ name, href: d.href, kind: 'item', item: d.item, dangling: d.reason || 'dangling', order: p.order, unlisted: true });
-      }
-    }
-  }
-}
-
-/* treeMins is ?min= for the tree service: {ns}:{ns_id} of this page's last write to the catalog and to each
- * namespace it trusts (WRITES, from X-Namespace-Revision), the namespaces its listings depend on (§A.5, §B.5). */
-function treeMins(ns, trust) {
-  return [ns, ...trust].filter((n) => WRITES.has(n)).map((n) => `${n}:${WRITES.get(n).id}`);
-}
-
-/* treeGet fetches a tree service listing through the proxy, following its redirect to [/g/{gs}]/at/{at}/…,
- * retrying while the service is behind ?min, and opening sealed views (§E.2.6). It uses the HTTP cache:
- * listings at an at never change, and the redirect to the current at is a head pointer, which a browser may
- * serve stale for a few seconds. So after its own write the page relists with ?min= from the write's
- * X-Namespace-Revision: a new URL, which the service answers once it has caught up (§B.5), rather than
- * fetching with no-store. */
-async function treeGet(path) {
-  const q = C.min.map((m, i) => (i === 0 && !path.includes('?') ? '?' : '&') + 'min=' + encodeURIComponent(m)).join('');
-  let r;
-  for (let i = 0; i < 4; i++) {
-    r = await api('GET', `${TREE}/${C.ns}/${path}${q}`, { auto: true, label: 'tree', cache: 'default' });
-    if (r.status !== 503) break;
-    await sleep(800);
-  }
-  if (r.status !== 200) return { r };
-  const view = r.finalPath.startsWith(TREE + '/') ? r.finalPath.slice(TREE.length) : r.finalPath;
-  let body = r.json;
-  if (r.jose) {
-    let pl = {};
-    try { pl = Z.parseJWE(r.text.trim()).header.pl || {}; } catch (_) { /* reported by decrypted */ }
-    const d = await decrypted(r, pl.ns || C.ns, '', { ns: pl.ns || C.ns, view });
-    if (d.error) return { r, view, sealedWhole: d };
-    body = d.value;
-  }
-  // A sealed or e2e catalog's listing that came as JSON is sealed per entry (§E.2.6); one opened whole is authentic as it is.
-  if (body && typeof body === 'object') await openSealedEntries(body, view, undefined, undefined, { ns: C.ns, sealed: !r.jose && await sealedLevel(C.ns) });
-  return { r, view, body };
-}
-
 /* branchBase is the namespace a local branch ns was created from, the "base" of its namespace document (§7.6), which
- * never changes: "" where ns is no namespace name (nsHeadDoc asks for no such thing) or no branch, its base is
- * another deployment's (§G.3), or its document can't be read. A document naming a lower encryption level than this browser holds for ns is refused as
+ * never changes: "" where ns is no namespace name (nsHeadDoc asks for no such thing) or no branch, or its document
+ * can't be read. A document naming a lower encryption level than this browser holds for ns is refused as
  * nsInfo refuses it (§7.1, Levels): a sealed or e2e namespace's document in the clear is not its document, and
  * names no base. A base is kept for the page. That there is none is kept in none only, a Set the caller gives for
  * as long as one answer is read (a namespace may be created, or its document become readable, later), so the
@@ -3059,7 +2884,7 @@ async function branchBase(ns, none) {
   // The level the answer names, as nsInfo reads it: a sealed document's is sealed, a clear one's its own word.
   const lowered = d.status === 200 && Z.learnDoc(ns, d.sealed, doc).lowered;
   const b = doc && !lowered ? doc.base : null;
-  if (!b || typeof b !== 'object' || typeof b.ns !== 'string' || b.origin !== undefined) { if (none) none.add(ns); return ''; }
+  if (!b || typeof b !== 'object' || typeof b.ns !== 'string') { if (none) none.add(ns); return ''; }
   known.set(ns, b.ns);
   return b.ns;
 }
@@ -3236,548 +3061,11 @@ async function openSealedEntries(v, view, from, filed, ctx) {
   }
 }
 
-async function loadTreeListing() {
-  const x = { listing: null, at: '', view: '', problems: null, note: '', source: 'core', treeStatus: null, sealedView: false };
-  if (C.proxy === null) await probeProxy();
-  if (!C.proxy) { x.note = 'Computed listings (the combined checkpoint, ordering and dangling detection by the service, access filtering, manifests) need the tree service. Start the core with --tree-url (compose does) to read it through the same-origin proxy at /playground/tree/. Showing the catalog documents read directly from the core API.'; return x; }
-  const roots = await treeGet('roots');
-  if (!roots.body) {
-    const r = roots.r;
-    x.note = roots.sealedWhole ? 'The tree service answered with a sealed listing this browser has no key for: ' + roots.sealedWhole.error
-      : r.status === 502 ? 'The tree service is not reachable through the proxy (502): it may still be starting. Showing core documents.'
-        : r.status === 404 ? `No tree service behind the proxy serves a catalog named ${C.ns} (404): add it to the tree service's --catalog flags, or map it to its own with the core's --tree-url ${C.ns}=URL. Showing core documents.`
-          : `The tree service answered ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}. Showing core documents.`;
-    return x;
-  }
-  x.source = 'tree';
-  x.at = roots.body.at || ''; x.view = roots.view;
-  // What the service follows, and whether it seals listings or skips a namespace (§E.2.6).
-  const st = await api('GET', `${TREE}/_status?catalog=${encodeURIComponent(C.ns)}`, { auto: true, label: 'tree' });
-  x.treeStatus = st.status === 200 && st.json ? st.json : null;
-  x.sealedView = roots.r.jose;
-  const trees = [];
-  for (const root of roots.body.roots || []) {
-    if (root.kind !== 'folder') { trees.push(root); continue; }
-    const st = await treeGet(`subtree?of=${encodeURIComponent(root.href)}&depth=64`);
-    trees.push(st.body && st.body.tree ? st.body.tree : root);
-    if (st.body && st.body.at) x.at = st.body.at;
-  }
-  x.listing = trees;
-  const [pr, or] = [await treeGet('problems'), await treeGet('orphans')];
-  x.problems = { service: true, body: pr.body, orphans: or.body ? or.body.orphans : [] };
-  return x;
-}
-
-/* ---- the local graph: derived access, problems ---- */
-function ownAccess(n) {
-  const a = n && n.doc && n.doc.$access;
-  const out = {};
-  if (a && typeof a === 'object' && !Array.isArray(a)) for (const [s, roles] of Object.entries(a)) if (s !== 'inherit' && Array.isArray(roles)) out[s] = roles.filter((x) => typeof x === 'string');
-  return out;
-}
-function inherits(n) { const a = n && n.doc && n.doc.$access; return !(a && a.inherit === false); }
-function isLive(name) { return C.nodes.has(name); }
-function liveFolderParents(n) {
-  return parentsOf(n).map((p) => nodeName(p.href)).filter((pn) => pn && NODE_RE.test(pn) && isLive(pn));
-}
-/* cyclicSet: the folders on a cycle through parents, i.e. in a strongly connected component, as the tree
- * service computes them (§B.5). Walks never pass through them, and they contribute no access (§B.11.2). */
-function cyclicSet() {
-  if (C.cycFor === C.nodes) return C.cyc;
-  const cyc = new Set();
-  for (const n of C.nodes.values()) {
-    if (n.kind !== 'folder') continue;
-    const seen = new Set(), stack = liveFolderParents(n);
-    while (stack.length) {
-      const x = stack.pop();
-      if (x === n.name) { cyc.add(n.name); break; }
-      if (!seen.has(x)) { seen.add(x); stack.push(...liveFolderParents(C.nodes.get(x))); }
-    }
-  }
-  C.cycFor = C.nodes; C.cyc = cyc;
-  return cyc;
-}
-/* walkableParents: live parent folders, where neither end is on a cycle (§B.5). */
-function walkableParents(n) {
-  const cyc = cyclicSet();
-  if (!n || cyc.has(n.name)) return [];
-  return liveFolderParents(n).filter((pn) => !cyc.has(pn));
-}
-function itemExists(name) {
-  const it = itemOf(name);
-  if (!it || !C.contentHeads[it.ns]) return null; // unknown: namespace not trusted or not readable
-  const x = C.contentHeads[it.ns].get(it.name);
-  return !!(x && x.kind === 'head');
-}
-/* effective: subject -> role -> Set(nodes where assigned), over every walkable path up to a root (§B.11.2). */
-function effectiveAccess(name) {
-  const eff = {};
-  const walk = (nm, path, depth) => {
-    const n = C.nodes.get(nm);
-    if (!n || path.has(nm) || depth > 64 || cyclicSet().has(nm)) return;
-    for (const [s, roles] of Object.entries(ownAccess(n))) for (const role of roles) ((eff[s] = eff[s] || {})[role] = eff[s][role] || new Set()).add(nm);
-    if (!inherits(n)) return;
-    const next = new Set(path); next.add(nm);
-    for (const p of walkableParents(n)) walk(p, next, depth + 1);
-  };
-  walk(name, new Set(), 0);
-  return eff;
-}
-/* roleInfo describes a role as the namespace that owns its meaning defines it. */
-function roleInfo(role, itemNs) {
-  if (itemNs) {
-    const roles = (C.contentDocs[itemNs] || {}).roles || {};
-    const d = roles[role];
-    if (!d) return `${itemNs} defines no role "${role}": it grants nothing there`;
-    const inc = [], seen = new Set([role]);
-    const q = [...(d.includes || [])];
-    while (q.length) { const x = q.shift(); if (seen.has(x)) continue; seen.add(x); inc.push(x); q.push(...(((roles[x] || {}).includes) || [])); }
-    return `${itemNs}: ${role} can ${(d.can || []).join(', ') || 'nothing'}${d.rules ? ' (with rules)' : ''}${inc.length ? '; includes ' + inc.join(', ') : ''}`;
-  }
-  const d = ((C.doc || {}).roles || {})[role];
-  return d ? `catalog role ${role}: ${Object.keys(d).filter((k) => d[k] === true).join(', ') || 'no tree powers'}` : `the catalog defines no role "${role}"`;
-}
-function treePowers(n) {
-  const roles = (C.doc || {}).roles || {};
-  const out = [];
-  for (const [s, rs] of Object.entries(ownAccess(n))) {
-    const p = ['move', 'place'].filter((k) => rs.some((r) => roles[r] && roles[r][k] === true));
-    if (p.length) out.push({ s, p });
-  }
-  return out;
-}
-function localProblems() {
-  const dangling = [], parents = [], orphans = [], cycles = [];
-  for (const n of C.nodes.values()) {
-    if (n.kind === 'item' && itemExists(n.name) === false) dangling.push(n.name);
-    const ps = parentsOf(n);
-    for (const p of ps) {
-      const pn = nodeName(p.href);
-      if (!pn) parents.push({ node: n.name, parent: p.href, why: 'not a folder of this catalog' });
-      else if (!NODE_RE.test(pn)) parents.push({ node: n.name, parent: p.href, why: 'a placement cannot be a parent' });
-      else if (!isLive(pn)) parents.push({ node: n.name, parent: p.href, why: 'missing or deleted' });
-    }
-    if (ps.length && !walkableParents(n).length) orphans.push(n.name);
-  }
-  // cycles: folders that reach themselves through parents
-  cycles.push(...[...cyclicSet()].sort());
-  return { dangling, parents, orphans, cycles };
-}
-/* localTree builds the listing from the documents: children ordered as §B.2 (ordered first, by code unit, then by name). */
-function localTree() {
-  const kids = new Map();
-  for (const n of C.nodes.values()) {
-    parentsOf(n).forEach((p) => {
-      const pn = nodeName(p.href);
-      if (!pn || !isLive(pn) || !NODE_RE.test(pn) || cyclicSet().has(pn) || cyclicSet().has(n.name)) return;
-      (kids.get(pn) || kids.set(pn, []).get(pn)).push({ name: n.name, order: typeof p.order === 'string' ? p.order : undefined });
-    });
-  }
-  const sortKids = (a, b) => (a.order !== undefined) !== (b.order !== undefined) ? (a.order !== undefined ? -1 : 1) : (a.order !== b.order ? cmpCU(a.order, b.order) : cmpCU(a.name, b.name));
-  const build = (name, onPath, depth) => {
-    const n = C.nodes.get(name);
-    const e = { name, href: hrefOf(name), kind: n.kind, title: n.doc.title };
-    if (n.kind === 'item') { const it = itemOf(name); e.item = it.href; const x = C.contentHeads[it.ns] && C.contentHeads[it.ns].get(it.name); if (x && x.kind === 'head') e.head = x.target; else if (itemExists(name) === false) e.dangling = 'item missing'; }
-    if (n.kind === 'folder') {
-      e.children = [];
-      if (depth < 64 && !onPath.has(name)) {
-        const next = new Set(onPath); next.add(name);
-        for (const k of (kids.get(name) || []).sort(sortKids)) if (!next.has(k.name)) { const c = build(k.name, next, depth + 1); if (k.order !== undefined) c.order = k.order; e.children.push(c); }
-      }
-    }
-    return e;
-  };
-  return [...C.nodes.values()].filter((n) => !parentsOf(n).length && !cyclicSet().has(n.name)).sort((a, b) => cmpCU(a.name, b.name)).map((n) => build(n.name, new Set(), 0));
-}
-
-/* ---- rendering ---- */
-function renderCatStatus() {
-  const box = $('catStatus');
-  if (!C.ns) { box.className = 'muted'; box.textContent = 'Load a catalog namespace.'; return; }
-  if (C.loading) { box.className = 'muted'; box.textContent = `Loading ${C.ns}…`; return; }
-  box.className = '';
-  if (C.proxy !== null) markService('cat', !C.proxy, '(tree service not configured)');
-  if (!C.head) { box.replaceChildren(h('div', { class: 'errbox' }, C.note || 'not loaded')); return; }
-  const kv = h('dl', { class: 'kv' },
-    h('dt', {}, 'source'), h('dd', {}, C.source === 'tree' ? h('span', { class: 'badge ok' }, 'tree service via /playground/tree/') : h('span', { class: 'badge warn' }, 'core documents only')),
-    h('dt', {}, 'catalog ns_id'), h('dd', {}, idEl(C.head), h('span', { class: 'muted small' }, ' the catalog namespace head (what catalog grants carry as at, §B.11.4)')),
-    C.at ? h('dt', {}, 'listing at') : null, C.at ? h('dd', {}, idEl(C.at), h('span', { class: 'muted small' }, ' combined checkpoint over the catalog and ' + (C.trust.join(', ') || 'no') + ' (§B.5); listings at an at never change')) : null,
-    C.view ? h('dt', {}, 'listing URL') : null, C.view ? h('dd', { class: 'mono small' }, C.view, C.sealedView ? h('span', { class: 'badge tomb', title: 'served as one JWE, pl { ns, view } (§E.2.6)' }, 'sealed listing') : null) : null,
-    C.treeStatus ? h('dt', {}, 'service status') : null, C.treeStatus ? h('dd', {}, h('details', {}, h('summary', { class: 'muted small' }, 'GET /_status: followed namespaces, encryption, skipped'), jsonPre(C.treeStatus))) : null,
-    C.min.length ? h('dt', {}, 'read-your-writes') : null, C.min.length ? h('dd', { class: 'mono small' }, C.min.map((m) => '?min=' + m).join(' ')) : null,
-    h('dt', {}, 'trust'), h('dd', { class: 'mono' }, C.trust.join(', ') || '(none: catalog.trust is empty)'),
-    h('dt', {}, 'mode'), h('dd', {}, C.mode + (C.mode === 'tree' ? ' (one parent per node)' : ' (several parents allowed)')),
-    h('dt', {}, 'nodes'), h('dd', {}, `${[...C.nodes.values()].filter((n) => n.kind === 'folder').length} folder(s), ${[...C.nodes.values()].filter((n) => n.kind === 'item').length} placement(s)`));
-  const roles = (C.doc || {}).roles;
-  if (roles) kv.append(h('dt', {}, 'catalog roles'), h('dd', {}, ...Object.keys(roles).map((r) => h('span', { class: 'badge', title: roleInfo(r) }, r + (Object.keys(roles[r]).filter((k) => roles[r][k] === true).length ? ': ' + Object.keys(roles[r]).filter((k) => roles[r][k] === true).join('+') : '')))));
-  box.replaceChildren(kv, C.note ? h('p', { class: 'note' }, C.note) : '');
-}
-
-function accessChips(name, itemNs) {
-  const eff = effectiveAccess(name);
-  const own = ownAccess(C.nodes.get(name));
-  const chips = [];
-  for (const s of Object.keys(eff).sort()) for (const role of Object.keys(eff[s]).sort()) {
-    const where = [...eff[s][role]];
-    chips.push(h('span', { class: 'badge info chip' + ((own[s] || []).includes(role) ? ' own' : ''), title: `${roleInfo(role, itemNs)}\nassigned on: ${where.join(', ')}` }, `${s}: ${role}`));
-  }
-  return chips;
-}
-
-const titleOf = (name) => { const n = C.nodes.get(name); return (n && n.doc.title) || name; };
-
-/* treeRow renders one listing entry. In a DAG a node is listed under each of its parents (the tree service's
- * subtree does that too): path is the chain of folders it is listed under here, and seen maps each folder
- * already expanded to where, so a shared folder's children are expanded once and folded elsewhere. */
-function treeRow(e, path = [], seen = new Map()) {
-  const n = C.nodes.get(e.name);
-  const parent = path[path.length - 1];
-  const others = n ? walkableParents(n).filter((p) => p !== parent) : [];
-  const shared = n && walkableParents(n).length > 1;
-  // A folder listed again under another parent: the tree service marks it "repeat" and leaves its
-  // children out (§B.5); a listing built here has them, and is folded the same way.
-  const repeat = e.kind === 'folder' && (e.repeat || seen.has(e.name));
-  const kids = e.children && e.children.length ? e.children : repeat ? ((seen.kids && seen.kids.get(e.name)) || []) : [];
-  const it = e.kind === 'item' ? itemOf(e.name) : null;
-  const dangling = e.dangling || (it && itemExists(e.name) === false ? 'item missing' : '');
-  const row = h('div', { class: 'cat-row' + (e.name === C.sel ? ' sel' : '') + (dangling ? ' dangling' : ''), tabindex: 0, role: 'button' },
-    h('span', { class: 'cat-kind ' + e.kind }, e.kind === 'folder' ? 'dir' : 'item'),
-    e.title ? h('b', {}, e.title) : null,
-    it ? h('button', { class: 'link mono', title: 'open ' + it.href + ' in the Resource tab', onclick: (ev) => { ev.stopPropagation(); openItem(it.ns, it.name); } }, it.href) : h('span', { class: 'mono muted' }, e.name),
-    e.order !== undefined ? h('span', { class: 'muted small', title: 'order among siblings' }, '↕' + e.order) : null,
-    e.head ? idEl(e.head) : null,
-    dangling ? h('span', { class: 'badge err', title: 'dangling (' + dangling + '): drops out of listings and access (§B.7)' + (e.unlisted ? '; shown here from /problems, not in the service listing' : '') }, 'dangling') : null,
-    e.self ? h('span', { class: 'badge' }, 'self-placed') : null,
-    shared ? h('span', { class: 'badge info', title: `${walkableParents(n).length} parents (a DAG node, §B.2): listed under each of them` }, 'shared') : null,
-    shared && others.length ? h('span', { class: 'muted small', title: others.join(', ') }, 'also in ' + others.map(titleOf).join(', ')) : null,
-    e._sealedErr ? h('span', { class: 'badge tomb', title: e._sealedErr }, 'sealed') : e._opened ? h('span', { class: 'badge ok', title: 'decrypted with ' + e._opened }, 'decrypted') : null,
-    n && n.doc.$access && n.doc.$access.inherit === false ? h('span', { class: 'badge warn', title: 'inherit: false stops the ancestor walk here' }, 'no inherit') : null,
-    !n ? h('span', { class: 'badge warn', title: 'the tree service lists it, but its document was not read' }, 'no doc') : null,
-    n ? accessChips(e.name, it && it.ns) : null,
-    n ? treePowers(n).map((x) => h('span', { class: 'badge', title: 'tree powers of ' + x.s + ' here (not inherited)' }, `${x.s}: ${x.p.join('+')}`)) : null,
-    e.more ? h('span', { class: 'muted small' }, '… deeper levels not listed') : null);
-  row.onclick = () => selectNode(e.name);
-  row.onkeydown = (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); selectNode(e.name); } };
-  const li = h('li', {}, row);
-  if (kids.length) {
-    const here = [...path, e.name];
-    if (repeat) {
-      // Listed again under another parent: fold its children, which are expanded where it was first listed.
-      const first = seen.get(e.name);
-      const d = h('details', {}, h('summary', { class: 'muted small' }, `${kids.length} child(ren), expanded where first listed${first ? ', under ' + (first.map(titleOf).join(' / ') || 'a root') : ''}`));
-      d.addEventListener('toggle', () => { if (d.open && d.children.length === 1) d.append(h('ul', {}, ...kids.map((c) => treeRow(c, here, seen)))); });
-      li.append(d);
-    } else {
-      if (e.kind === 'folder') {
-        seen.set(e.name, path);
-        (seen.kids || (seen.kids = new Map())).set(e.name, kids);
-      }
-      li.append(h('ul', {}, ...kids.map((c) => treeRow(c, here, seen))));
-    }
-  } else if (e.repeat) {
-    li.append(h('div', { class: 'muted small' }, 'listed again: expanded where first listed'));
-  }
-  return li;
-}
-
-/* cycleNote lists the folders on cycles, which no listing traverses (§B.5). */
-function cycleNote() {
-  const svc = C.source === 'tree' && C.problems && C.problems.body;
-  const groups = svc ? (C.problems.body.cycles || []).map((c) => [].concat(c).map((x) => nodeName(x) || x)) : (cyclicSet().size ? [[...cyclicSet()].sort()] : []);
-  if (!groups.length) return null;
-  return h('p', { class: 'note' }, h('span', { class: 'badge err' }, 'cycle'), ' not traversed: ',
-    ...groups.map((g, i) => [i ? '; ' : '', ...g.map((x, j) => [j ? ' ⇄ ' : '', h('button', { class: 'link mono', onclick: () => selectNode(x) }, x)])]),
-    h('span', { class: 'muted small' }, svc ? ' (flagged by the tree service: every edge inside a cycle is excluded, so these folders and anything only below them are listed under Problems, not here)' : ' (computed here: every edge inside a cycle is excluded from walks)'));
-}
-
-function renderCatalog() {
-  renderCatStatus();
-  const box = $('catTree');
-  const trees = C.source === 'tree' && C.listing ? C.listing : localTree();
-  $('catTreeMeta').textContent = C.head ? (C.source === 'tree' ? `tree service listing at ${short(C.at)}` : `built here from the documents at ns_id ${short(C.head)}`) : '';
-  const seen = new Map();
-  box.replaceChildren(trees.length ? h('ul', { class: 'cat-tree' }, ...trees.map((e) => treeRow(e, [], seen))) : h('p', { class: 'muted' }, C.head ? 'No nodes yet: create a folder.' : '—'));
-  const cn = C.head ? cycleNote() : null;
-  if (cn) box.append(cn);
-  // folder pickers and item suggestions
-  const folders = [...C.nodes.values()].filter((n) => n.kind === 'folder').map((n) => n.name).sort();
-  const opt = (f) => h('option', { value: f }, (C.nodes.get(f).doc.title ? C.nodes.get(f).doc.title + ' — ' : '') + f);
-  for (const id of ['catFParent', 'catPParent']) {
-    const sel = $(id), cur = sel.value;
-    sel.replaceChildren(...(id === 'catFParent' ? [h('option', { value: '' }, '(none: a new root)')] : []), ...folders.map(opt));
-    if (folders.includes(cur) || cur === '') sel.value = cur; else if (id === 'catFParent' && C.sel && folders.includes(C.sel)) sel.value = C.sel;
-  }
-  const items = [];
-  for (const t of Object.keys(C.contentHeads)) for (const [name, x] of C.contentHeads[t]) if (x.kind === 'head' && !C.nodes.has(`${t}.${name}`)) items.push(`/r/${t}/${name}`);
-  $('catItemList').replaceChildren(...items.map((v) => h('option', { value: v })));
-  renderCatPick();
-  renderCatSel();
-  renderCatProblems();
-}
-
-function renderCatProblems() {
-  const box = $('catProblems');
-  if (!C.head) { box.className = 'muted'; box.textContent = '—'; $('catProbMeta').textContent = ''; setCardCount(box, 0); return; }
-  box.className = '';
-  const lp = localProblems();
-  let total = 0;
-  const line = (label, list, f) => (total += list.length, list.length) ? h('div', {}, h('b', {}, label + ': '), ...list.map((x, i) => [i ? ', ' : '', f(x)])) : null;
-  const nodeLink = (name) => h('button', { class: 'link mono', onclick: () => selectNode(name) }, name);
-  const parts = [];
-  if (C.problems && C.problems.service && C.problems.body) {
-    const p = C.problems.body;
-    $('catProbMeta').textContent = 'from the tree service (/problems, /orphans)';
-    parts.push(line('cycles', p.cycles || [], (c) => h('span', { class: 'mono' }, [].concat(c).map((x) => nodeName(x) || x).join(' → '))),
-      line('dangling items', p.danglingItems || [], (x) => [nodeLink(nodeName(x.href)), h('span', { class: 'muted small' }, ` (${x.reason || 'dangling'})`)]),
-      line('dangling parents', p.danglingParents || [], (x) => [nodeLink(nodeName(x.href)), h('span', { class: 'muted small' }, ` → ${x.parent || ''} ${x.state || ''}`)]),
-      line('orphans', C.problems.orphans || [], (x) => nodeLink(x.name)));
-  } else {
-    $('catProbMeta').textContent = 'computed here from the documents';
-    parts.push(line('cycles', lp.cycles, nodeLink), line('dangling items', lp.dangling, nodeLink),
-      line('dangling parents', lp.parents, (x) => [nodeLink(x.node), h('span', { class: 'muted small' }, ` → ${x.parent} (${x.why})`)]),
-      line('orphans', lp.orphans, nodeLink));
-  }
-  const shown = parts.filter(Boolean);
-  box.replaceChildren(...(shown.length ? shown : [h('span', { class: 'muted' }, 'No problems.')]));
-  setCardCount(box, total, 'warn');
-}
-
-function breadcrumbs(name) {
-  const paths = [];
-  const walk = (nm, acc, depth) => {
-    const n = C.nodes.get(nm);
-    if (!n || acc.includes(nm) || depth > 64 || paths.length > 20) return;
-    const next = [nm, ...acc];
-    const ps = walkableParents(n);
-    if (!parentsOf(n).length) paths.push(next); else ps.forEach((p) => walk(p, next, depth + 1));
-  };
-  walk(name, [], 0);
-  return paths;
-}
-
-function renderCatSel() {
-  const box = $('catSel');
-  const n = C.nodes.get(C.sel);
-  $('catSelMeta').textContent = n ? n.kind : '';
-  const moveTo = $('catMoveTo');
-  moveTo.multiple = C.mode === 'dag';
-  moveTo.size = C.mode === 'dag' ? 5 : 1;
-  if (!n) { box.className = 'muted'; box.textContent = C.sel ? `${C.sel} is not a live node.` : 'Select a node in the tree.'; moveTo.replaceChildren(); return; }
-  box.className = '';
-  // folders it may move under: not itself, not a descendant (that would close a cycle)
-  const below = new Set([n.name]);
-  let grew = true;
-  while (grew) { grew = false; for (const m of C.nodes.values()) if (!below.has(m.name) && walkableParents(m).some((p) => below.has(p))) { below.add(m.name); grew = true; } }
-  const cur = new Set(parentsOf(n).map((p) => nodeName(p.href)));
-  moveTo.replaceChildren(...[...C.nodes.values()].filter((m) => m.kind === 'folder' && !below.has(m.name)).map((m) => m.name).sort()
-    .map((f) => h('option', { value: f, selected: cur.has(f) }, (C.nodes.get(f).doc.title ? C.nodes.get(f).doc.title + ' — ' : '') + f)));
-  const p0 = parentsOf(n)[0];
-  $('catMoveOrder').value = p0 && typeof p0.order === 'string' ? p0.order : '';
-  const it = itemOf(n.name);
-  const crumbs = breadcrumbs(n.name);
-  box.replaceChildren(
-    h('div', { class: 'state-line' }, h('span', { class: 'cat-kind ' + n.kind }, n.kind === 'folder' ? 'dir' : 'item'), h('b', { class: 'mono' }, n.name), h('span', { class: 'muted' }, 'head'), idEl(n.head)),
-    h('dl', { class: 'kv' },
-      it ? h('dt', {}, 'item') : null, it ? h('dd', {}, h('button', { class: 'link mono', onclick: () => openItem(it.ns, it.name) }, it.href),
-        itemExists(n.name) === false ? h('span', { class: 'badge err' }, 'dangling') : itemExists(n.name) === null ? h('span', { class: 'badge warn', title: 'the item namespace is not in catalog.trust or not readable' }, 'unknown') : null) : null,
-      h('dt', {}, 'paths'), h('dd', {}, crumbs.length ? h('div', {}, ...crumbs.map((p) => pathRow(p, it && it.ns)),
-        crumbs.length > 1 ? h('div', { class: 'note' }, `${crumbs.length} paths to a root: the effective roles below are the union of what each path collects (§B.11.2).`) : null)
-        : h('span', { class: 'muted' }, cyclicSet().has(n.name) ? 'none: on a cycle, which walks never pass (§B.5)' : 'none: an orphan or a root')),
-      h('dt', {}, 'effective'), h('dd', {}, ...accessChips(n.name, it && it.ns), (it && itemExists(n.name) === false) ? h('div', { class: 'note' }, 'A dangling placement grants nothing, except create for an item that never existed (§B.11.4).') : null)),
-    h('div', { class: 'row' },
-      h('button', { class: 'tiny', onclick: () => openItem(C.ns, n.name) }, 'Open node in Resource tab'),
-      it ? h('button', { class: 'tiny', onclick: () => openItem(it.ns, it.name) }, 'Open item') : null,
-      C.proxy && C.source === 'tree' ? h('button', { class: 'tiny', onclick: () => showWhere(n) }, it ? 'where? (tree service)' : 'ancestors (tree service)') : null),
-    h('div', { id: 'catWhere' }),
-    jsonPre(n.doc));
-}
-
-/* pathAccess collects $access along one path (root … node), from the node up, stopping after a node with
- * inherit: false (§B.11.2). */
-function pathAccess(path) {
-  const grants = []; let stop = '';
-  for (let i = path.length - 1; i >= 0; i--) {
-    const n = C.nodes.get(path[i]);
-    for (const [s, roles] of Object.entries(ownAccess(n))) for (const role of roles) grants.push({ s, role, at: path[i] });
-    if (!inherits(n)) { if (i > 0) stop = path[i]; break; }
-  }
-  return { grants, stop };
-}
-function pathRow(path, itemNs) {
-  const { grants, stop } = pathAccess(path);
-  const by = new Map();
-  for (const g of grants) { const k = `${g.s}: ${g.role}`; (by.get(k) || by.set(k, { g, at: [] }).get(k)).at.push(g.at); }
-  return h('div', { class: 'cat-path' },
-    h('span', { class: 'mono small' }, path.map(titleOf).join(' / ')),
-    ...[...by.keys()].sort().map((k) => h('span', { class: 'badge info chip', title: `${roleInfo(by.get(k).g.role, itemNs)}
-assigned on: ${by.get(k).at.join(', ')}` }, k)),
-    !by.size ? h('span', { class: 'muted small' }, 'no roles along this path') : null,
-    stop ? h('span', { class: 'badge warn', title: `${stop} has inherit: false: nothing above it counts on this path` }, 'stops at ' + titleOf(stop)) : null);
-}
-
-/* wherePaths reads an ancestors or where answer (SERVICES.md §B.5): { paths, cut, why }. paths is every path, each
- * an array of { name, href, title } from a root down to the node itself. v0.82 answers each path as an array of node
- * names, with the nodes' href and title (or sealed, opened by treeGet) in the top-level nodes map, and reports a cut
- * as "tooDeep": true (depth 64) or "truncated": true (the node limit); a service before it answered path elements as
- * objects { name, href, title } and tooDeep as a count, which is read too. A cut, a missing paths, or anything that
- * doesn't decode is cut: the paths shown are then not all of them, and nothing may be concluded from one's absence. */
-function wherePaths(body) {
-  const out = { paths: [], cut: false, why: '' };
-  const cut = (why) => { out.cut = true; if (!out.why) out.why = why; };
-  if (!body || typeof body !== 'object' || Array.isArray(body)) { cut('not an object'); return out; }
-  if ('tooDeep' in body && body.tooDeep !== false && body.tooDeep !== 0) cut('paths deeper than the depth limit were cut (tooDeep)');
-  if ('truncated' in body && body.truncated !== false) cut('the node limit was reached (truncated)');
-  if ('incomplete' in body && body.incomplete !== false && body.incomplete !== 0) cut('some paths are incomplete');
-  if (!Array.isArray(body.paths)) { cut('no paths'); return out; }
-  const nodes = body.nodes && typeof body.nodes === 'object' && !Array.isArray(body.nodes) ? body.nodes : {};
-  for (const p of body.paths) {
-    if (!Array.isArray(p) || !p.length) { cut('a path that is no array of nodes'); continue; }
-    const row = [];
-    for (const x of p) {
-      let name = '', info = null;
-      if (typeof x === 'string') { name = x; info = Object.prototype.hasOwnProperty.call(nodes, x) ? nodes[x] : null; }
-      else if (x && typeof x === 'object' && !Array.isArray(x) && typeof x.name === 'string') { name = x.name; info = x; }
-      if (!name) { row.length = 0; break; }
-      info = info && typeof info === 'object' ? info : {};
-      row.push({ name, href: typeof info.href === 'string' ? info.href : '', title: typeof info.title === 'string' ? info.title : '' });
-    }
-    if (!row.length) { cut('a path element that names no node'); continue; }
-    out.paths.push(row);
-  }
-  return out;
-}
-
-async function showWhere(n) {
-  const it = itemOf(n.name);
-  const r = await asUser(() => treeGet(it ? `where?item=${encodeURIComponent(it.href)}` : `ancestors?of=${encodeURIComponent(hrefOf(n.name))}`));
-  const box = document.getElementById('catWhere');
-  if (!box) return;
-  if (!r.body) return box.replaceChildren(h('div', { class: 'errbox' }, 'HTTP ' + r.r.status));
-  const w = wherePaths(r.body);
-  box.replaceChildren(
-    ...w.paths.map((p) => h('div', { class: 'cat-path' }, h('span', { class: 'mono small' }, p.map((x) => x.title || x.name).join(' / ')))),
-    !w.paths.length && !w.cut ? h('div', { class: 'muted small' }, 'no paths') : null,
-    w.cut ? h('div', { class: 'note' }, 'Not every path is shown: ' + w.why + ' (\u00a7B.5).') : null,
-    h('details', {}, h('summary', { class: 'muted small' }, 'answer'), jsonPre(r.body)));
-}
-
-function selectNode(name) { C.sel = name; renderCatalog(); expandCard($('catSel')); }
-
 function openItem(ns, name) {
   asUser(async () => { if (S.ns !== ns) await selectNS(ns); await selectRes(name); });
   showTab('res'); expandCard($('resState'));
 }
 
-/* ---- writes (to the catalog namespace, through the core API) ---- */
-function commonSchema(kind) {
-  const counts = {};
-  for (const n of C.nodes.values()) if (n.kind === kind && typeof n.doc.$schema === 'string') counts[n.doc.$schema] = (counts[n.doc.$schema] || 0) + 1;
-  return Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0] || '';
-}
-function parseAccessField(id) {
-  const t = $(id).value.trim();
-  if (!t) return { ok: true };
-  const p = tryParse(t);
-  if (!p.ok || !p.v || typeof p.v !== 'object' || Array.isArray(p.v)) return { ok: false };
-  return { ok: true, v: p.v };
-}
-async function catWrite(what, method, name, o) {
-  const r = await api(method, `/r/${C.ns}/${name}`, Object.assign({ label: 'catalog' }, o));
-  const out = $('catOut');
-  expandCard(out);
-  out.className = '';
-  out.replaceChildren(
-    h('div', { class: 'state-line' }, h('b', {}, what), h('span', { class: 'mono' }, `${method} /r/${C.ns}/${name}`), h('span', { class: 'badge ' + (r.ok ? 'ok' : 'err') }, r.neterr ? 'network error' : `HTTP ${r.status}`),
-      r.hdr('X-Namespace-Revision') ? h('span', { class: 'muted small' }, 'catalog ns_id ') : null, r.hdr('X-Namespace-Revision') ? idEl(r.hdr('X-Namespace-Revision')) : null),
-    h('div', { class: 'split' },
-      h('div', {}, h('h3', {}, 'Request'), h('div', { class: 'mono small' }, Object.entries(o.headers || {}).map(([k, v]) => `${k}: ${v}`).join('  ')), o.body !== undefined ? jsonPre(typeof o.body === 'string' ? pretty(o.body) : o.body) : h('span', { class: 'muted small' }, '(no body)')),
-      h('div', {}, h('h3', {}, 'Response'), r.json && !r.ok ? errBox(r.entry) : null, jsonPre(r.text ? pretty(r.text) : (r.neterr || '(empty)')))));
-  // The write's X-Namespace-Revision is in WRITES (noteWrite): relisting adds it as ?min= (treeMins).
-  if (r.ok) await loadCatalog();
-  return r;
-}
-
-async function catCreateFolder() {
-  if (!C.head) return toast('Load a catalog first');
-  const name = $('catFName').value.trim();
-  if (!NODE_RE.test(name)) return toast('A folder name has no dot: [a-z0-9][a-z0-9_-]*');
-  const acc = parseAccessField('catFAccess');
-  if (!acc.ok) return toast('$access must be a JSON object');
-  const doc = {};
-  const schema = commonSchema('folder');
-  if (schema) doc.$schema = schema;
-  if ($('catFTitle').value.trim()) doc.title = $('catFTitle').value.trim();
-  const parent = $('catFParent').value;
-  if (parent) { const p = { href: hrefOf(parent) }; if ($('catFOrder').value.trim()) p.order = $('catFOrder').value.trim(); doc.parents = [p]; }
-  if (acc.v) doc.$access = acc.v;
-  if (C.nonces) doc.$nonce = Z.newNonce();
-  const r = await catWrite('New folder', 'PATCH', name, { ct: PJ, headers: { 'If-None-Match': '*' }, body: [{ op: 'add', path: '', value: doc }] });
-  if (r.ok) { C.sel = name; $('catFName').value = ''; renderCatalog(); }
-}
-
-async function catPlace() {
-  if (!C.head) return toast('Load a catalog first');
-  const t = $('catPItem').value.trim();
-  const m = /^(?:\/r\/)?([a-z0-9][a-z0-9_-]*)[/.]([a-z0-9][a-z0-9._-]*)$/.exec(t);
-  if (!m) return toast('Item: /r/{ns}/{name}');
-  if (m[1] === C.ns) return toast('Items are content documents, not nodes of this catalog');
-  if (C.trust.length && !C.trust.includes(m[1])) toast(`${m[1]} is not in catalog.trust; the catalog's rules may refuse it`);
-  const parent = $('catPParent').value;
-  if (!parent) return toast('Pick a folder');
-  const acc = parseAccessField('catPAccess');
-  if (!acc.ok) return toast('$access must be a JSON object');
-  const p = { href: hrefOf(parent) };
-  if ($('catPOrder').value.trim()) p.order = $('catPOrder').value.trim();
-  const doc = {};
-  const schema = commonSchema('item');
-  if (schema) doc.$schema = schema;
-  doc.parents = [p];
-  if (acc.v) doc.$access = acc.v;
-  doc.$nonce = Z.newNonce();
-  const name = `${m[1]}.${m[2]}`;
-  const r = await catWrite('Place', 'PATCH', name, { ct: PJ, headers: { 'If-None-Match': '*' }, body: [{ op: 'add', path: '', value: doc }] });
-  if (r.ok) { C.sel = name; $('catPItem').value = ''; renderCatalog(); }
-}
-
-async function catMove() {
-  const n = C.nodes.get(C.sel);
-  if (!n) return toast('Select a node first');
-  const to = [...$('catMoveTo').selectedOptions].map((o) => o.value);
-  if (!to.length) return toast('Pick the new parent folder');
-  const order = $('catMoveOrder').value.trim();
-  if (order && !/^[0-9A-Za-z]{1,64}$/.test(order)) return toast('An order key is [0-9A-Za-z]{1,64}');
-  const cur = parentsOf(n);
-  const curNames = cur.map((p) => nodeName(p.href));
-  let ops;
-  if (to.length === 1 && curNames.length === 1 && curNames[0] === to[0]) {
-    // Reorder: only the order key of the existing edge changes (§B.2).
-    if ((cur[0].order || '') === order) return toast('Nothing to change');
-    ops = order ? [{ op: cur[0].order !== undefined ? 'replace' : 'add', path: '/parents/0/order', value: order }] : [{ op: 'remove', path: '/parents/0/order' }];
-  } else {
-    const parents = to.map((f) => {
-      const keep = cur.find((p) => nodeName(p.href) === f);
-      const e = { href: hrefOf(f) };
-      if (order && (to.length === 1 || !keep)) e.order = order; else if (keep && keep.order !== undefined) e.order = keep.order;
-      return e;
-    });
-    ops = [{ op: Array.isArray(n.doc.parents) ? 'replace' : 'add', path: '/parents', value: parents }];
-  }
-  // A fresh nonce where the catalog needs them, or the node has one (§C.7).
-  if (C.nonces || '$nonce' in n.doc) ops = withNonce(ops);
-  await catWrite('Move', 'PATCH', n.name, { ct: PJ, headers: { 'If-Match': quoteId(n.head) }, body: ops });
-}
-
-async function catRemove() {
-  const n = C.nodes.get(C.sel);
-  if (!n) return toast('Select a node first');
-  const kids = [...C.nodes.values()].filter((m) => walkableParents(m).includes(n.name)).length;
-  const msg = n.kind === 'folder'
-    ? `Delete folder ${n.name}?` + (kids ? `\n\nIts ${kids} child node(s) are not deleted: they become orphans (§B.7).` : '')
-    : `Remove ${itemOf(n.name).href} from the catalog ${C.ns}?\n\nThe content document is unaffected.`;
-  if (!confirm(msg)) return;
-  const r = await catWrite('Remove', 'DELETE', n.name, { headers: { 'If-Match': quoteId(n.head) } });
-  if (r.ok) { C.sel = ''; renderCatalog(); }
-}
 
 /* ------------------------------------------------------------------ *
  * examples
@@ -4884,7 +4172,7 @@ function initMerge() {
  * tab shown, and what the inspector strip shows. */
 const UI = { cards: {}, parts: new Map(), tab: 'ns', last: null, errs: 0, createHint: '' };
 const CORE_TABS = ['ns', 'res', 'hist', 'batch', 'live']; // these work on the selected namespace
-const MORE_TABS = { cat: 'Catalog', sr: 'Search', si: 'Schemas', keys: 'Keys' };
+const MORE_TABS = { sr: 'Search', si: 'Schemas', keys: 'Keys' };
 
 function showTab(name) {
   UI.tab = name;
@@ -5157,7 +4445,7 @@ function init() {
     ['frozen: true', () => add('/frozen', true)],
     ['frozen: false', () => add('/frozen', false)],
     // Members the spec doesn't define must start with "x-" (§7.4), at the
-    // top level and inside the addenda's objects (catalog, merge, cleanup…).
+    // top level and inside the addenda's objects (merge, cleanup…).
     ['x-title', () => add('/x-title', 'My namespace')],
   ], 'nsPatch');
 
@@ -5223,18 +4511,6 @@ function init() {
   $('resendSealed').onclick = sendSealed;
   $('sealE2E').disabled = true;
 
-  // catalog
-  $('catNs').value = store.get('pl.catNs', 'cat');
-  const catLoad = () => { expandCard($('catTree')); return asUser(() => loadCatalog()); };
-  $('catLoad').onclick = catLoad;
-  $('catNs').onkeydown = (e) => { if (e.key === 'Enter') catLoad(); };
-  $('catRefresh').onclick = () => asUser(() => { C.proxy = null; C.catalogs = null; return loadCatalog(); });
-  $('catPick').onchange = () => { const v = $('catPick').value; if (v) { $('catNs').value = v; catLoad(); } };
-  $('catFCreate').onclick = catCreateFolder;
-  $('catPCreate').onclick = catPlace;
-  $('catMove').onclick = catMove;
-  $('catRemove').onclick = catRemove;
-  document.querySelector('.tab[data-tab="cat"]').addEventListener('click', () => { if (!C.ns && !C.loading) loadCatalog(); });
   document.querySelector('.tab[data-tab="keys"]').addEventListener('click', () => { if (KR.ns !== S.ns) loadKeyring(); });
 
   // search
@@ -5247,7 +4523,6 @@ function init() {
   renderNsSelect(); renderNsAll(); renderResAll(); renderHistory(); updateLiveUrls();
   const ns = store.get('pl.ns', ''), res = store.get('pl.res', '');
   if (ns) { S.res = res; asUser(() => selectNS(ns, { keepRes: true })); $('resName').value = res; }
-  if (store.get('pl.tab', 'ns') === 'cat') loadCatalog();
   if (store.get('pl.tab', 'ns') === 'si') asUser(probeSI);
   if (store.get('pl.tab', 'ns') === 'sr') probeIndex().then(() => { renderSrPick(); renderSearch(); });
 }

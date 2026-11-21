@@ -161,7 +161,6 @@ type Resource struct {
 	Note     string `json:"note,omitempty"`
 
 	branchPurged bool
-	forced       bool // Force: an item whatever the classification
 	resolution   []client.Step
 	resolvedAt   string // B the resolution was written against
 	baseLast     string // the last live revision when B is a tombstone
@@ -276,8 +275,8 @@ type Options struct {
 	// resolve (§6.1).
 	SourceAuthorizations []string
 	// BatchClient, if set, submits the batches (dry runs included) in
-	// place of the plan's client, e.g. under a catalog service's merge
-	// grant (§F.8). Reads still use the plan's client.
+	// place of the plan's client, e.g. under a grant narrowed to the
+	// batch (§F.8). Reads still use the plan's client.
 	BatchClient *client.Client
 	// Signer, if set, signs every step the plan's batches write (§C.3.1):
 	// the digest binds the target deployment's origin, the target
@@ -300,6 +299,9 @@ type Options struct {
 	// then picks up exactly what is new, which matters most at E3, where
 	// nothing kept its id.
 	successor bool
+	// noRetry is set by a release (§F.9): a 412 on submitting stops the
+	// merge for a new approval rather than classifying again.
+	noRetry bool
 }
 
 // Plan is a classified merge of Branch into Target.
@@ -794,7 +796,6 @@ func (p *Plan) classify(ctx context.Context, r *Resource) error {
 	if err := p.classifyAncestry(ctx, r, h); err != nil {
 		return err
 	}
-	r.forceClass()
 	if p.TargetLevel == "e2e" && h.State == client.Live && (r.Class == FastForward || r.Class == Replay) {
 		// Whether keeping B could be recorded with a sealed empty set,
 		// which repeats B's declared blobs (§F.3, §E.3.1). A document that

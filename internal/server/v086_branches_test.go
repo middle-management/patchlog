@@ -4,7 +4,6 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
-	"time"
 )
 
 // v086BranchKeys pages GET /ns/{ns}/branches from after to the end and
@@ -34,13 +33,8 @@ func v086BranchKeys(t *testing.T, e *tenv, ns, after string, limit int) [][]stri
 		for _, x := range rows {
 			m := x.(map[string]any)
 			key, _ := m["name"].(string)
-			if rm, ok := m["remote"].(map[string]any); ok {
-				key = rm["origin"].(string) + "/" + rm["ns"].(string)
-				if len(m) != 4 || m["at"] == nil || m["ns_id"] == nil || m["expires"] == nil {
-					t.Fatalf("remote row %v", m)
-				}
-			} else if m["at"] == nil || m["frozen"] == nil || m["purged"] == nil {
-				t.Fatalf("local row %v", m)
+			if m["remote"] != nil || m["at"] == nil || m["frozen"] == nil || m["purged"] == nil {
+				t.Fatalf("row %v", m)
 			}
 			page = append(page, key)
 		}
@@ -60,14 +54,14 @@ func v086BranchKeys(t *testing.T, e *tenv, ns, after string, limit int) [][]stri
 	}
 }
 
-// HTTP-31, HTTP-19 (§7.4 GET /ns/{ns}/branches?after={key}; v0.86):
-// { "branches": [ … ], "next"? }, local and remote rows together in
-// ascending byte order of key (a local branch's name, a remote one's
-// {origin}/{ns}), strictly after after, a plain bound, paged by
-// logPageSize, next absent on the last page.
+// HTTP-31, HTTP-19 (§7.4 GET /ns/{ns}/branches?after={key}; v0.86, v0.87):
+// { "branches": [ … ], "next"? }, the local branches in ascending byte
+// order of name, strictly after after, a plain bound, paged by
+// logPageSize, next absent on the last page. v0.87 removed remote
+// branches: a registration body is 400 as any unknown member.
 func TestV086BranchesPaged(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, withOrigin(originA), withLogPageSize(3))
+	e := newEnv(t, withLogPageSize(3))
 	e.mkNS("main", map[string]any{"read": "public"})
 	at := e.nsHead("main")
 	// Byte order: "-" < digits < "_" < letters, which no linguistic
@@ -75,44 +69,32 @@ func TestV086BranchesPaged(t *testing.T) {
 	for _, name := range []string{"ab", "a_b", "a0", "a-b", "zz", "b"} {
 		expect(t, e.branch("main", map[string]any{"name": name}, "alice"), 201)
 	}
-	// Remote rows by {origin}/{ns}, not by (origin, ns): "." < "/", so
-	// "https://r.example.org/x" is before "https://r.example/x".
-	for _, rm := range [][2]string{{"https://r.example", "x"}, {"https://r.example.org", "x"}, {"https://r.example", "a"}} {
-		expect(t, e.do(req{method: "POST", path: "/ns/main/branches", ifNoneMatch: "*", author: "b",
-			body: map[string]any{"remote": map[string]any{"origin": rm[0], "ns": rm[1]}, "at": at}}), 201)
-	}
-	// Nine rows, three a page: the last page is full and carries no next.
-	want := [][]string{
-		{"a-b", "a0", "a_b"},
-		{"ab", "b", "https://r.example.org/x"},
-		{"https://r.example/a", "https://r.example/x", "zz"},
-	}
+	expect(t, e.do(req{method: "POST", path: "/ns/main/branches", ifNoneMatch: "*", author: "b",
+		body: map[string]any{"remote": map[string]any{"origin": "https://r.example", "ns": "x"}, "at": at}}), 400)
+	// Six rows, three a page: the last page is full and carries no next.
+	want := [][]string{{"a-b", "a0", "a_b"}, {"ab", "b", "zz"}}
 	if got := v086BranchKeys(t, e, "main", "", 3); !reflect.DeepEqual(got, want) {
 		t.Fatalf("pages %v, want %v", got, want)
 	}
-	// after is a plain bound: a key that is no row's, a remote key, one
-	// past every row, and strings no key can be (bytes above "~", a NUL).
+	// after is a plain bound: a key that is no row's, a row's, one past
+	// every row, and strings no name can be (bytes above "~", a NUL).
 	for after, want := range map[string][][]string{
-		"a1":                     {{"a_b", "ab", "b"}, {"https://r.example.org/x", "https://r.example/a", "https://r.example/x"}, {"zz"}},
-		"https://r.example.org/": {{"https://r.example.org/x", "https://r.example/a", "https://r.example/x"}, {"zz"}},
-		"https://r.example/a":    {{"https://r.example/x", "zz"}},
-		"https://r.example/x":    {{"zz"}},
-		"zz":                     {{}},
-		"zzz":                    {{}},
-		"bé":                     {{"https://r.example.org/x", "https://r.example/a", "https://r.example/x"}, {"zz"}},
-		"a_\x00z":                {{"a_b", "ab", "b"}, {"https://r.example.org/x", "https://r.example/a", "https://r.example/x"}, {"zz"}},
+		"a1":      {{"a_b", "ab", "b"}, {"zz"}},
+		"a-b":     {{"a0", "a_b", "ab"}, {"b", "zz"}},
+		"zz":      {{}},
+		"zzz":     {{}},
+		"bé":      {{"zz"}},
+		"a_\x00z": {{"a_b", "ab", "b"}, {"zz"}},
 	} {
 		if got := v086BranchKeys(t, e, "main", after, 3); !reflect.DeepEqual(got, want) {
 			t.Errorf("after %q: pages %v, want %v", after, got, want)
 		}
 	}
-	// A purged branch stays listed, and an expired registration doesn't.
+	// A purged branch stays listed.
 	expect(t, e.patchNS("b", ops(op("add", "/frozen", true)), ""), 201)
 	expect(t, e.do(req{method: "POST", path: "/ns/b/purge", ifMatch: e.nsHead("b"), author: "admin"}), 204)
-	e.clock.Advance(31 * 24 * time.Hour)
-	want = [][]string{{"a-b", "a0", "a_b"}, {"ab", "b", "zz"}}
 	if got := v086BranchKeys(t, e, "main", "", 3); !reflect.DeepEqual(got, want) {
-		t.Fatalf("after the registrations expired: pages %v, want %v", got, want)
+		t.Fatalf("after the purge: pages %v, want %v", got, want)
 	}
 	// A parameter the route doesn't define is 400 as on every route.
 	expect(t, e.get("/ns/main/branches?prefix=a"), 400)

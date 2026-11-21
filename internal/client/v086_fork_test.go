@@ -121,28 +121,6 @@ func TestV086ForkPlacedFromBranchOwnHeads(t *testing.T) {
 	}
 }
 
-// v0.86 §E.2.2, §G.3 (scenario 87, for a remote base): a remote branch's
-// fork is placed only by the branch's own /heads at its first entry. A
-// reader that may not read it accepts no namespace of the remote chain.
-func TestV086RemoteForkUnplaceableFailsClosed(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	v, fork, forgedID, forged := v85Branch(t)
-	rt, _ := v86NoHeads(v85Splice(fork, forgedID, forged, func(ns string, doc map[string]any) {
-		if b, ok := doc["base"].(map[string]any); ok && ns == "eb" {
-			b["origin"], b["chain"] = "https://a.example", []any{"e"}
-		}
-	}), regexp.MustCompile(`^/ns/eb/`))
-	x := v.s.Client(t, client.WithBearer(v.grant), client.WithHTTPClient(&http.Client{Transport: rt})).E2E(v.priv)
-	if d, err := x.DocE2E(ctx, "eb", "d", fork); err == nil {
-		t.Fatalf("a remote branch whose own /heads the reader may not read: %+v, want no valid revision", d)
-	}
-	es, flags := must2(x.OpenLog(ctx, "eb", "d", must(v.c.Log(ctx, "eb", "d", fork, ""))))
-	if len(es) != 2 || !strings.Contains(flags[0], "foreign parent") || !strings.Contains(flags[1], "foreign parent") {
-		t.Fatalf("OpenLog of a remote branch whose fork can't be placed: flags %q", flags)
-	}
-}
-
 // v0.86 §E.2.2 (the fail-closed reading for a chain of branches): ec is a
 // branch of eb, a branch of e. The reader places ec's fork from eb, but
 // not eb's fork from e. What eb sealed is accepted up to the fork it can
@@ -213,7 +191,7 @@ func TestV086SnapshotUnplaceableForeignParent(t *testing.T) {
 	}
 }
 
-// v0.86 §E.2.2, §B.11.9: a partial reader's /heads is a redirect to its
+// v0.86 §E.2.2, §7.9: a partial reader's /heads is a redirect to its
 // filtered listing, which doesn't place a fork. It counts as a /heads the
 // reader can't read: the fork is placed from the branch's own, and where
 // that redirects too, nothing sealed under the base is accepted. Until
@@ -227,7 +205,7 @@ func TestV086FilteredHeadsDoNotPlaceAFork(t *testing.T) {
 		return roundTrip(func(req *http.Request) (*http.Response, error) {
 			if req.Method == "GET" && strings.HasSuffix(req.URL.Path, "/heads") && deny.MatchString(req.URL.Path) {
 				h := http.Header{}
-				h.Set("Location", strings.Replace(req.URL.Path, "/rev/", "/g/1"+strings.Repeat("a", 32)+"/rev/", 1))
+				h.Set("Location", strings.Replace(req.URL.Path, "/rev/", "/view/1"+strings.Repeat("a", 32)+"/rev/", 1))
 				return &http.Response{StatusCode: 302, Header: h, Body: io.NopCloser(strings.NewReader("")), Request: req}, nil
 			}
 			return next.RoundTrip(req)
@@ -246,30 +224,25 @@ func TestV086FilteredHeadsDoNotPlaceAFork(t *testing.T) {
 
 // v0.86 §E.2.2 ("Where they can't place that parent, the op fails the
 // check"): a branch whose document names a base without the entry it was
-// forked at, local or remote, as no deployment writes, gives nothing to
+// forked at, as no deployment writes, gives nothing to
 // place the fork by. Nothing sealed under the base is accepted. The first
 // cut of v0.86 stopped there without a fork and so checked none.
 func TestV086BaseWithoutAtFailsClosed(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	for _, remote := range []bool{false, true} {
-		v, fork, forgedID, forged := v85Branch(t)
-		rt := v85Splice(fork, forgedID, forged, func(ns string, doc map[string]any) {
-			if b, ok := doc["base"].(map[string]any); ok && ns == "eb" {
-				delete(b, "at")
-				if remote {
-					b["origin"], b["chain"] = "https://a.example", []any{"e"}
-				}
-			}
-		})
-		x := v.s.Client(t, client.WithBearer(v.grant), client.WithHTTPClient(&http.Client{Transport: rt})).E2E(v.priv)
-		if d, err := x.DocE2E(ctx, "eb", "d", forgedID); err == nil {
-			t.Fatalf("remote %v: a base without at: %+v, want no valid revision", remote, d)
+	v, fork, forgedID, forged := v85Branch(t)
+	rt := v85Splice(fork, forgedID, forged, func(ns string, doc map[string]any) {
+		if b, ok := doc["base"].(map[string]any); ok && ns == "eb" {
+			delete(b, "at")
 		}
-		es, flags := must2(x.OpenLog(ctx, "eb", "d", must(v.c.Log(ctx, "eb", "d", fork, ""))))
-		if len(es) != 2 || !strings.Contains(flags[0], "foreign parent") || !strings.Contains(flags[1], "foreign parent") {
-			t.Fatalf("remote %v: a base without at: flags %q", remote, flags)
-		}
+	})
+	x := v.s.Client(t, client.WithBearer(v.grant), client.WithHTTPClient(&http.Client{Transport: rt})).E2E(v.priv)
+	if d, err := x.DocE2E(ctx, "eb", "d", forgedID); err == nil {
+		t.Fatalf("a base without at: %+v, want no valid revision", d)
+	}
+	es, flags := must2(x.OpenLog(ctx, "eb", "d", must(v.c.Log(ctx, "eb", "d", fork, ""))))
+	if len(es) != 2 || !strings.Contains(flags[0], "foreign parent") || !strings.Contains(flags[1], "foreign parent") {
+		t.Fatalf("a base without at: flags %q", flags)
 	}
 }
 

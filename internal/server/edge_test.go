@@ -256,7 +256,7 @@ func TestPurgeOnPublicToPrivate(t *testing.T) {
 	rec.take()
 
 	// Unrelated config write of a public namespace.
-	expect(t, e.patchNS("docs", ops(op("add", "/maxLag", "PT1H")), ""), 201)
+	expect(t, e.patchNS("docs", ops(op("add", "/x-note", "PT1H")), ""), 201)
 	if calls := rec.take(); purged(calls, "ns:docs") {
 		t.Errorf("unrelated config write purged: %v", calls)
 	}
@@ -266,7 +266,7 @@ func TestPurgeOnPublicToPrivate(t *testing.T) {
 		t.Errorf("public→private: purges %v", calls)
 	}
 	// Unrelated write of a private namespace.
-	expect(t, e.patchNS("docs", ops(op("replace", "/maxLag", "PT2H")), ""), 201)
+	expect(t, e.patchNS("docs", ops(op("replace", "/x-note", "PT2H")), ""), 201)
 	if calls := rec.take(); purged(calls, "ns:docs") {
 		t.Errorf("private config write purged: %v", calls)
 	}

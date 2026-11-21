@@ -7,34 +7,6 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
-// strictJWE reports whether jwe is a compact JWE of the form the origin's
-// own sealings take (§E.2.2, alg dir): five segments of base64url, the
-// encrypted key's empty, and nothing else. Base64 decoding skips CR and
-// LF, so a remote base could otherwise inflate a sealing that still opens,
-// inside its segments, and B would store and serve it at that length
-// (v0.26.1; a remote E3 source's snapshot, mirrorSnapshot).
-func strictJWE(jwe string) bool {
-	parts := strings.Split(jwe, ".")
-	if len(parts) != 5 || parts[1] != "" {
-		return false
-	}
-	for i, p := range parts {
-		if i == 1 {
-			continue
-		}
-		if p == "" {
-			return false
-		}
-		for j := 0; j < len(p); j++ {
-			c := p[j]
-			if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
-				return false
-			}
-		}
-	}
-	return true
-}
-
 // jweProtected reads a compact JWE's protected header without a key, and
 // without judging it beyond its being a JSON object: what a stored
 // sealing binds (kid, pl) and whether it carries a zip member, which

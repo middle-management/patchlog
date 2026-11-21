@@ -38,9 +38,6 @@ func TestNSPrincipal(t *testing.T) {
 	if d, ok := w.Duration("retryWindow"); !ok || d != 5*time.Minute {
 		t.Fatalf("retryWindow %v %v", d, ok)
 	}
-	if d, ok := w.Duration("remoteRegistration"); !ok || d != 30*24*time.Hour {
-		t.Fatalf("remoteRegistration %v %v", d, ok)
-	}
 	if r, b, ok := w.Rate("ratePerPrincipal"); !ok || r != 5 || b != 9 {
 		t.Fatalf("ratePerPrincipal %v %v %v", r, b, ok)
 	}

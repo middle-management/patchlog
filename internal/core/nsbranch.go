@@ -223,7 +223,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 			return nil, withPointer(aerr)
 		}
 	}
-	if cfg.Base == nil || cfg.Base.NS != base.name || cfg.Base.At != atText || cfg.Base.Remote() {
+	if cfg.Base == nil || cfg.Base.NS != base.name || cfg.Base.At != atText {
 		return nil, docInvalid("/base", "/base cannot be changed (§7.4)")
 	}
 	if cfg.DraftsFor != nil && base.isBranch() && t.draftRoot(base) == "" {
@@ -235,7 +235,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 		if err := keepsStarKeys(bcfg, cfg, b, t.config(b.configSeq)); err != nil {
 			return nil, err
 		}
-		if !b.isBranch() || t.remoteShadow(b) != nil {
+		if !b.isBranch() {
 			break
 		}
 	}

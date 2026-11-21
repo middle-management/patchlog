@@ -71,17 +71,18 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 			return err
 		}
 		// 410 after authorisation and the rate limits, like every write
-		// (§6.2 step 2.1, §8.5); then §1's 502, and a purged resource's
-		// 410 (§8.3).
+		// (§6.2 step 2.1, §8.5); then a purged resource's 410 (§8.3).
 		if n.purged {
 			return t.purgedNS(n)
-		}
-		if err := t.upstreamRefusal(n, name); err != nil {
-			return err
 		}
 		v := t.resolve(n, name, nil)
 		if v.state == Purged {
 			return gone()
+		}
+		// Step 2.2: a head the grant's read rules hide is 403, before the
+		// horizon is looked up in its ancestry (§6.2, §C.2 item 5).
+		if err := t.readsWrittenHead(n, cfg, a, name); err != nil {
+			return err
 		}
 		// A prune takes no precondition: one sent is 428 at step 2.5
 		// (§7.2, §8.6).
@@ -323,8 +324,7 @@ func (t *tx) effectiveHorizon(own *resRow, h *revRow) (*revRow, bool) {
 }
 
 // protect moves a horizon down past the protected revisions of §8.6: the
-// retry window and the heads as of the at of every live local branch and
-// every unexpired remote branch registration.
+// retry window and the heads as of the at of every live local branch.
 func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 	var minSeq sql.NullInt64
 	cutoff := t.now.Add(-cfg.Limits.RetryWindow).UnixMilli()
@@ -336,8 +336,6 @@ func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 	for _, b := range t.allBranchesOf(n) {
 		ats = append(ats, b.baseAt.Int64)
 	}
-	// Remote branches whose registration hasn't expired (§G.3).
-	ats = append(ats, t.registeredAts(n)...)
 	for _, at := range ats {
 		var p int64
 		if err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1`, res, at).Scan(&p); err == nil && p < h.seq {

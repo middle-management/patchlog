@@ -12,7 +12,7 @@ import (
 )
 
 // A user's own entries are those whose grant has its sub and a kid that
-// named, when written, its key, or the catalog's key there (§H.7 "Users").
+// named, when written, its key (§H.7 "Users").
 // A kid is only a name, which a namespace may give to another key later
 // (§C.4), so a kid is judged by the key it named at the entry: from the
 // keys of the namespace documents in force, read from the namespace log's
@@ -24,7 +24,7 @@ import (
 type keyChange struct {
 	at   time.Time
 	keys map[string]string // kid → "alg pub"
-	base string            // the local base, "" for none (or a remote one)
+	base string            // the base, "" for none
 }
 
 // keyHistory is a namespace's config writes as a token read them: its log
@@ -94,9 +94,6 @@ func keysOf(doc map[string]any) (map[string]string, string) {
 	}
 	bref, _ := doc["base"].(map[string]any)
 	base, _ := bref["ns"].(string)
-	if _, remote := bref["origin"]; remote {
-		base = ""
-	}
 	return out, base
 }
 
@@ -252,13 +249,11 @@ func keyThumbprint(key string) string {
 // the core records its writes (§H.7 "Users"): with authentication
 // disabled, under its X-Author; else under a grant with its sub and a kid
 // that named, when written, its key (one GET /ns/{ns}/principal named,
-// verifiedAs), or for a kid the catalog issued it a grant under
-// (issuedTo), the key that kid names now, the catalog's. An entry whose
+// verifiedAs). An entry whose
 // kid named another key then, as before a namespace gave the kid to the
 // user's key, is someone else's; so is one whose key can't be ordered
 // against a config write of the same time. Where the token can't read
-// the namespace's history (a grant limited to some resources, or a
-// content namespace a catalog's grants open, §H.7), the kid is judged as
+// the namespace's history (a grant limited to some resources, §H.7), the kid is judged as
 // it names the key now, as the user was told. A history whose read
 // failed for now (408, 429, 5xx, no answer) is no such history: whose
 // entry it is isn't known, and the error fails the save that asks (§H.4

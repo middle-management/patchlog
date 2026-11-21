@@ -369,8 +369,7 @@ func resourceKey(epochKey []byte, ns, name string) ([]byte, error) {
 }
 
 // keyVia is Key for content read through namespace via: its relay is asked
-// first, since a branch relays its base's keyring, and a remote branch's
-// base (§G.5.2) isn't a namespace of this deployment at all.
+// first, since a branch relays its base's keyring.
 func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	x.keys.mu.Lock()
 	k := x.keys.m[kid]
@@ -540,12 +539,8 @@ type e2eConfig struct {
 	Config string // config revision id
 	Epoch  int
 	Base   string // the base namespace of a branch, "" otherwise
-	Remote bool   // the base is in another deployment (§G.3)
-	// Chain is a remote base's base.chain: its namespace and its bases as
-	// of at (§G.3); nil if the document doesn't give it.
-	Chain []string
-	Pad   bool   // encryption.pad (§E.2.2)
-	At    string // a branch's base.at, the base's namespace entry it forked at
+	Pad    bool   // encryption.pad (§E.2.2)
+	At     string // a branch's base.at, the base's namespace entry it forked at
 }
 
 func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
@@ -568,14 +563,6 @@ func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
 	if b, ok := d.Value["base"].(map[string]any); ok {
 		out.Base, _ = b["ns"].(string)
 		out.At, _ = b["at"].(string)
-		_, out.Remote = b["origin"]
-		if arr, ok := b["chain"].([]any); ok && out.Remote {
-			for _, x := range arr {
-				if s, ok := x.(string); ok && ValidNSName(s) {
-					out.Chain = append(out.Chain, s)
-				}
-			}
-		}
 	}
 	return out, nil
 }
@@ -1274,14 +1261,9 @@ func (x *E2E) foldLog(ctx context.Context, ns, name, id, since string) ([]any, e
 
 // chain maps ns and its bases to their depth: 0 for ns, 1 for its base,
 // and so on (a branch reads its base's ciphertext, whose patch sets and
-// snapshots are bound to the base, §F.8). A remote base (§G.3) ends the
-// walk: its namespaces are in another deployment, so they are listed in
-// remote and not read here. They are the base's base.chain (the remote
-// base and its own bases, as the branch's deployment followed them), or
-// just the base's namespace without one. A remote branch keeps their names
-// in pl.ns (§G.5.2).
-func (x *E2E) chain(ctx context.Context, ns string) (depth map[string]int, remote map[string]bool, err error) {
-	depth, remote = map[string]int{}, map[string]bool{}
+// snapshots are bound to the base, §F.8).
+func (x *E2E) chain(ctx context.Context, ns string) (depth map[string]int, err error) {
+	depth = map[string]int{}
 	for cur, d := ns, 0; cur != ""; d++ {
 		if _, seen := depth[cur]; seen {
 			break
@@ -1289,23 +1271,11 @@ func (x *E2E) chain(ctx context.Context, ns string) (depth map[string]int, remot
 		depth[cur] = d
 		cfg, err := x.config(ctx, cur)
 		if err != nil {
-			return nil, nil, err
-		}
-		if cfg.Remote {
-			names := cfg.Chain
-			if len(names) == 0 {
-				names = []string{cfg.Base}
-			}
-			for i, b := range names {
-				if _, seen := depth[b]; !seen {
-					depth[b], remote[b] = d+1+i, true
-				}
-			}
-			break
+			return nil, err
 		}
 		cur = cfg.Base
 	}
-	return depth, remote, nil
+	return depth, nil
 }
 
 // chainCheck checks, for the entries of one resource log of ns in order,
@@ -1315,19 +1285,18 @@ func (x *E2E) chain(ctx context.Context, ns string) (depth map[string]int, remot
 // writes. A base's namespace is accepted only for entries up to where the
 // chain forked from that base (Addendum E Levels, §E.3.1): its head of the
 // resource as of the branch's at, the fork, which /heads gives. Past the
-// fork, every entry is the branch's own. A remote base's fork is the head
-// the branch lists at its first entry (ownFork; §G.3, v0.85), and so is a
-// local base's where the reader may not read the base's /heads (§G.4.1).
+// fork, every entry is the branch's own. A base's fork is the head the
+// branch lists at its first entry (ownFork) where the reader may not read
+// the base's /heads (§G.4.1).
 // Where a reader can place a fork by neither, the check fails closed: no
 // namespace beyond that fork is accepted, anywhere in the log (§E.2.2,
 // v0.86), while the bases up to it are checked as ever.
 type chainCheck struct {
-	x      *E2E
-	ctx    context.Context
-	ns     string
-	depth  map[string]int
-	remote map[string]bool
-	last   int
+	x     *E2E
+	ctx   context.Context
+	ns    string
+	depth map[string]int
+	last  int
 
 	// name is the resource whose log is checked ("" for no fork check);
 	// since and ids are the range: what it starts after, and its ids.
@@ -1370,7 +1339,7 @@ func (c *chainCheck) ok(kns string) (bool, error) {
 	if kns != c.ns {
 		if c.depth == nil {
 			var err error
-			if c.depth, c.remote, err = c.x.chain(c.ctx, c.ns); err != nil {
+			if c.depth, err = c.x.chain(c.ctx, c.ns); err != nil {
 				return false, err
 			}
 		}
@@ -1464,9 +1433,8 @@ type forkList struct {
 // (chainCheck.forks). A fork is the base's head of the resource as of the
 // branch's at, which is also the head the branch itself lists at its first
 // entry (ownFork; §G.4.1): the base's /heads is asked first, and the
-// branch's own where this reader may not read the base's, or the base is
-// in another deployment. A remote base ends the list with the one fork
-// every namespace of its chain lies behind. A fork that neither places
+// branch's own where this reader may not read the base's. A fork that
+// neither places
 // ends the list as unplaced (§E.2.2: the op fails the check).
 func (x *E2E) forksOf(ctx context.Context, ns, name string) (forkList, error) {
 	key := ns + "/" + name
@@ -1478,7 +1446,7 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) (forkList, error) {
 	}
 	// A listing this reader may not read, or that isn't there for it: a
 	// refusal, or the redirect a partial reader gets to its filtered
-	// listing (§B.11.9), which isn't the one a fork is placed by.
+	// listing (§7.9), which isn't the one a fork is placed by.
 	cant := func(err error) bool {
 		var ae *APIError
 		return IsAuth(err) || IsNotFound(err) || IsGone(err) || errors.Is(err, errNoGenesis) ||
@@ -1501,15 +1469,8 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) (forkList, error) {
 			forks.unplaced = true
 			break
 		}
-		fork, err := "", error(nil)
-		if cfg.Remote {
-			// The base is in another deployment, whose /heads this
-			// reader may not reach: the foreign parent is the head the
-			// branch itself lists at its first entry, which is what it
-			// reads through as of at (§G.3, §7.6). Every namespace of
-			// the remote chain lies behind this one fork.
-			fork, err = x.ownFork(ctx, cur, name)
-		} else if fork, err = x.headAt(ctx, cfg.Base, cfg.At, name); cant(err) {
+		fork, err := x.headAt(ctx, cfg.Base, cfg.At, name)
+		if cant(err) {
 			fork, err = x.ownFork(ctx, cur, name)
 		}
 		if cant(err) {
@@ -1520,9 +1481,6 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) (forkList, error) {
 			return forkList{}, err
 		}
 		forks.ids = append(forks.ids, fork)
-		if cfg.Remote {
-			break
-		}
 		cur = cfg.Base
 	}
 	// Only a list placed in full is kept: a refusal may be of the moment
@@ -1537,14 +1495,14 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) (forkList, error) {
 }
 
 // errNoGenesis is a branch whose log doesn't start with its config
-// genesis, as a deployment's (§G.3, §10 Branches) does: its fork can't be
+// genesis, as a deployment's (§10 Branches) does: its fork can't be
 // placed from its own /heads.
 var errNoGenesis = errors.New("the log does not start with a config genesis")
 
 // ownFork is the revision of name a branch ns forked from in its base, as
 // the branch itself gives it (§G.4.1): its head of name as of its own first
 // namespace entry, the config genesis its log starts with, before any
-// write of its own (§G.3, §10 Branches). "" if it read none through.
+// write of its own (§10 Branches). "" if it read none through.
 func (x *E2E) ownFork(ctx context.Context, ns, name string) (string, error) {
 	h, err := x.c.NSHead(ctx, ns)
 	if err != nil {
@@ -1603,9 +1561,6 @@ func (x *E2E) ancestor(ctx context.Context, ns, name, a, b string) (bool, error)
 	return false, err
 }
 
-// isRemote reports a remote base, whose configuration isn't readable here.
-func (c *chainCheck) isRemote(kns string) bool { return c.remote[kns] }
-
 // openSealed opens the sealed patch set of revision e of name. A non-empty
 // flag says why the revision can't be folded: it isn't a sealed patch set,
 // is sealed under a namespace nsOK refuses, or doesn't open or verify. A
@@ -1647,8 +1602,7 @@ func (x *E2E) openSealed(ctx context.Context, name string, e LogEntry, nsOK *cha
 	if err != nil {
 		return nil, "sealed patch set: " + err.Error(), "", nil
 	}
-	// A remote base's padding history isn't readable here (§G.5.2).
-	if !padded && !nsOK.isRemote(kns) {
+	if !padded {
 		if must, err := x.paddedAt(ctx, kns, e.ID); err != nil {
 			return nil, "", "", err
 		} else if must {

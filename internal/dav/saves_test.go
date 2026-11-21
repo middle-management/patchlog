@@ -44,7 +44,7 @@ func replace(path string, v any) map[string]any {
 // as does a second client's save. Others' edits survive either way.
 func TestSaveBases(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 
 	// A second reader: the editor GETs, someone else edits /b, another
 	// program GETs the new revision, the editor saves its buffer.
@@ -107,7 +107,7 @@ func TestSaveBases(t *testing.T) {
 // was edited from: that is the base, whatever else the principal read.
 func TestSaveIfMatch(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	g := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET")
 	e.theirs("docs", "x", replace("/b", "theirs"))
@@ -117,7 +117,7 @@ func TestSaveIfMatch(t *testing.T) {
 	sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
 
 	// With no record at all (a restart), If-Match is all there is.
-	e2 := newEnv(t, []string{"docs"}, nil, nil)
+	e2 := newEnv(t, []string{"docs"}, nil)
 	r0 := e2.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	e2.theirs("docs", "x", replace("/b", "theirs"))
 	text := rendered(map[string]any{"a": "mine", "b": "1"})
@@ -132,7 +132,7 @@ func TestSaveIfMatch(t *testing.T) {
 // and save from it later. A 304 doesn't count as served either.
 func TestSaveValidators(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"title": "A", "body": "x", "n": "0"})
 	served := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET")
 	e.theirs("docs", "x", replace("/body", "theirs"))
@@ -190,7 +190,7 @@ func TestSaveValidators(t *testing.T) {
 // If-Match: * edits only.
 func TestSavePreconditions(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "notes", map[string]any{"by": "alice", "text": "alice's notes"})
 	e.expect(e.do("PUT", "/docs/notes.json", `{"by": "bob"}`, "If-None-Match", "*"), 412, "create-only over a live document")
 	_, doc := e.load("docs", "notes")
@@ -209,7 +209,7 @@ func TestSavePreconditions(t *testing.T) {
 // last live document: edits others made since are kept.
 func TestSaveDeleteThenWrite(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/b", "theirs"))
@@ -257,7 +257,7 @@ func TestSaveRecordsOutliveSweep(t *testing.T) {
 // same edit saves.
 func TestSaveAmbiguousBase(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	for _, c := range []struct {
 		name, old, now, new string
 		doc                 map[string]any
@@ -306,7 +306,7 @@ func TestSaveAmbiguousBase(t *testing.T) {
 // 409 makes the reload drop.
 func TestSaveConflictThenReload(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"title": "A", "n": "1"})
 	editor := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/title", "Theirs"))
@@ -328,8 +328,8 @@ func TestSaveBaseReadErrors(t *testing.T) {
 	t.Parallel()
 	var failRev atomic.Value
 	failRev.Store("")
-	e := newEnv(t, []string{"docs"}, nil, nil, func(c *clienttest.Options, o *dav.Options) {
-		o.CacheBytes = 4096 // documents over 1 KiB aren't kept
+	e := newEnv(t, []string{"docs"}, nil, func(c *clienttest.Options, o *dav.Options) {
+		o.CacheBytes = 4096
 		c.Wrap = func(h http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if rev := failRev.Load().(string); rev != "" && r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/rev/"+rev) {
@@ -343,6 +343,7 @@ func TestSaveBaseReadErrors(t *testing.T) {
 			})
 		}
 	})
+
 	pad := strings.Repeat("p", 2048)
 	// If-Match, nothing served (a restart).
 	r0 := e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
@@ -384,7 +385,7 @@ func TestSaveBaseReadErrors(t *testing.T) {
 // first save may be a 409, but the reload it asks for settles it.
 func TestSaveIfMatchAfterMerge(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/b", "theirs"))
@@ -415,7 +416,7 @@ func TestSaveIfMatchAfterMerge(t *testing.T) {
 // the version the editor opened: the oldest record of a document stays.
 func TestSaveRecordCap(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"title": "A", "n": 0.0})
 	editor := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET editor").body
 	for i := 1; i <= 18; i++ {
@@ -472,10 +473,11 @@ func TestSaveRecordsPerUser(t *testing.T) {
 // a 409, never the file as written over others' edits; the reload saves.
 func TestSaveRecordsLost(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) {
+	e := newEnv(t, []string{"docs"}, nil, func(_ *clienttest.Options, o *dav.Options) {
 		o.MaxFileSize = 16 << 10
 		o.RecordBytes = 64 << 10
 	})
+
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/b", "theirs"))
@@ -499,10 +501,11 @@ func TestSaveRecordsLost(t *testing.T) {
 // rebased on the preview's read and written over others' edits.
 func TestSaveRecordsLostPreview(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) {
+	e := newEnv(t, []string{"docs"}, nil, func(_ *clienttest.Options, o *dav.Options) {
 		o.MaxFileSize = 16 << 10
 		o.RecordBytes = 64 << 10
 	})
+
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "the editor's GET").body
 	e.theirs("docs", "x", replace("/b", "theirs"))
@@ -521,7 +524,7 @@ func TestSaveRecordsLostPreview(t *testing.T) {
 // would revert the edit of someone else's it reproduced.
 func TestSaveNoopIsNoWrite(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	editor1 := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET editor 1").body
 	e.theirs("docs", "x", replace("/b", "theirs"))
@@ -537,7 +540,7 @@ func TestSaveNoopIsNoWrite(t *testing.T) {
 // under the merged revision's tag (davfs2 asks for it with a HEAD).
 func TestSaveMergedRevalidates(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	body := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/b", "theirs"))
@@ -555,7 +558,7 @@ func TestSaveMergedRevalidates(t *testing.T) {
 // undone, as a plain PUT refused leaves the document as it was.
 func TestSaveDeleteThenWriteRefused(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/a", "theirs"))
@@ -586,7 +589,7 @@ func TestSaveDeleteThenWriteRefused(t *testing.T) {
 // version a client saw doesn't tombstone one someone else changed since.
 func TestDeleteIfMatch(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"a": "1"})
 	g := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET")
 	e.theirs("docs", "x", replace("/a", "theirs"))
@@ -609,7 +612,7 @@ func TestDeleteIfMatch(t *testing.T) {
 // does: x/net/webdav would take it for a lock token and fail it (412).
 func TestSaveIfHeaderETag(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	for i, f := range []string{"([%s])", "(Not <DAV:no-lock> [%s])"} {
 		n := "x" + strconv.Itoa(i)
 		r0 := e.create("docs", n, map[string]any{"a": "1", "b": "1"})
@@ -633,69 +636,12 @@ func TestSaveIfHeaderETag(t *testing.T) {
 // If-Match: * writes over it, as over any file listed.
 func TestSavePreconditionsPlaceholder(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>me</D:owner></D:lockinfo>`
 	tok := e.expect(e.do("LOCK", "/docs/new.json", lock, "Timeout", "Second-60"), 201, "LOCK a new name").header.Get("Lock-Token")
 	e.expect(e.do("PUT", "/docs/new.json", `{"v": 1}`, "If-None-Match", "*", "If", "("+tok+")"), 412, "create-only over the placeholder")
 	e.expect(e.do("PUT", "/docs/new.json", `{"v": 1}`, "If-Match", "*", "If", "("+tok+")"), 201, "edit-only over the placeholder")
 	_, doc := e.load("docs", "new")
-	sameJSON(t, doc, map[string]any{"v": 1})
-}
-
-// A save that deletes the original before writing the new version gets
-// it back whatever refuses the write that follows, not only a conflict: a
-// body that isn't JSON (rclone's mount without a cache renames over a
-// file as DELETE, then MOVE of a scratch file onto the name), one over
-// -max-file-size, a failed precondition. A tree's file deleted by the
-// user's DELETE before a write to its path is put back the same way: its
-// placement, and its item.
-func TestSaveDeleteThenWriteFails(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{
-		"cat": {"catalog": treeCatalog("files")},
-	}, func(_ *clienttest.Options, o *dav.Options) { o.MaxFileSize = 1024 })
-	must(e.c.CreateNamespace(e.ctx, "files", map[string]any{"read": "public"}))
-	for i, c := range []struct {
-		what   string
-		status int
-		write  func(p string) resp
-	}{
-		{"PUT of a body that isn't JSON", 400, func(p string) resp { return e.do("PUT", p, `{"v": 2`) }},
-		{"MOVE of a scratch file that isn't JSON", 400, func(p string) resp {
-			e.expect(e.do("PUT", "/docs/.goutputstream-XYZ", `{"v": 2`), 201, "PUT scratch")
-			return e.do("MOVE", "/docs/.goutputstream-XYZ", "", "Destination", p, "Overwrite", "F")
-		}},
-		{"PUT over -max-file-size", 413, func(p string) resp { return e.do("PUT", p, `{"v": "`+strings.Repeat("x", 2000)+`"}`) }},
-		{"PUT with If-Match: *", 412, func(p string) resp { return e.do("PUT", p, `{"v": 2}`, "If-Match", "*") }},
-	} {
-		name := "x" + strconv.Itoa(i)
-		e.create("docs", name, map[string]any{"v": 1})
-		e.expect(e.do("GET", "/docs/"+name+".json", ""), 200, "GET")
-		e.expect(e.do("DELETE", "/docs/"+name+".json", ""), 204, "DELETE")
-		r := e.expect(c.write("/docs/"+name+".json"), c.status, c.what)
-		if !strings.Contains(r.body, "restored as it was") {
-			t.Fatalf("%s: %q", c.what, r.body)
-		}
-		h, doc := e.load("docs", name)
-		if h.State != client.Live {
-			t.Fatalf("%s: the document is %v", c.what, h.State)
-		}
-		sameJSON(t, doc, map[string]any{"v": 1})
-		if en := e.lastEntry("docs", name); en.Kind != "rev" || len(en.Patches.([]any)) != 0 {
-			t.Fatalf("%s: restored with %+v", c.what, en)
-		}
-	}
-	e.create("files", "p", map[string]any{"v": 1})
-	e.create("cat", "root", map[string]any{"parents": []any{}})
-	e.create("cat", "files.p", map[string]any{"title": "p.json", "parents": parents("cat", "root")})
-	e.expect(e.do("DELETE", "/cat/p.json", ""), 204, "DELETE a tree's file")
-	e.expectTombstoned("files", "p", "the item")
-	r := e.expect(e.do("PUT", "/cat/p.json", `{"v": 2`), 400, "PUT of a body that isn't JSON to its path")
-	if !strings.Contains(r.body, "restored as it was") {
-		t.Fatalf("400 %q", r.body)
-	}
-	sameJSON(t, e.parentsOf("files.p"), parents("cat", "root"))
-	_, doc := e.load("files", "p")
 	sameJSON(t, doc, map[string]any{"v": 1})
 }
 
@@ -707,7 +653,7 @@ func TestSaveDeleteThenWriteFails(t *testing.T) {
 // through as sent.
 func TestSaveOwnRevert(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"a": "orig", "b": "orig"})
 	e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET")
 	e.expect(e.do("PUT", "/docs/x.json", `{"a": "changed", "b": "orig"}`), 201, "save")
@@ -721,67 +667,4 @@ func TestSaveOwnRevert(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/x.json", `{"a": "orig", "b": "changed"}`), 201, "save after the reload")
 	_, doc := e.load("docs", "x")
 	sameJSON(t, doc, map[string]any{"a": "orig", "b": "changed"})
-}
-
-// Records are kept by document, and a path may come to name another: a
-// save without a tag at a path that names another document than the one
-// the user read or wrote under it, or none, is a 409 rather than a save
-// over what is there (§H.4): a tree's title given to a new item after the
-// old one was deleted, a raw x.json taking JSON document x's name. A
-// reload (a GET of the path) settles it. A save naming a revision
-// (If-Match) where the path holds no file is a 412, never a new file.
-func TestSavePathReplaced(t *testing.T) {
-	t.Parallel()
-	e := treeEnv(t, func(_ *clienttest.Options, o *dav.Options) { o.CatalogTTL = time.Nanosecond })
-	g := e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET")
-	hn, _ := e.load("cat", "matches.derby")
-	must(e.c.Delete(e.ctx, "cat", "matches.derby", hn.ID))
-	hi, _ := e.load("matches", "derby")
-	must(e.c.Delete(e.ctx, "matches", "derby", hi.ID))
-	e.create("matches", "newderby", map[string]any{"title": "Their new derby", "venue": "Theirs"})
-	e.create("cat", "matches.newderby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
-	h, _ := e.load("matches", "newderby")
-	mine := edit(t, g.body, `"title": "Derby"`, `"title": "My derby"`)
-	e.expect(e.do("PUT", "/cat/Season/derby.json", mine), 409, "PUT, the path naming a new item")
-	e.expect(e.do("PUT", "/cat/Season/derby.json", mine, "If-Match", g.header.Get("ETag")), 412, "PUT If-Match, the path naming a new item")
-	e.expectLive("matches", "newderby", h, "after the refused saves")
-	r := e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "reload")
-	e.expect(e.do("PUT", "/cat/Season/derby.json", edit(t, r.body, `"Theirs"`, `"Mine"`)), 201, "PUT after the reload")
-	_, doc := e.load("matches", "newderby")
-	sameJSON(t, doc, map[string]any{"title": "Their new derby", "venue": "Mine"})
-
-	// Deleted by someone else, the tree read again since: no new file.
-	g = e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET")
-	o := e.another()
-	o.expect(o.do("DELETE", "/cat/Season/derby.json", ""), 204, "another user's DELETE")
-	before := e.liveNames("matches")
-	e.expect(e.do("PUT", "/cat/Season/derby.json", `{"title": "Mine"}`), 409, "PUT over another user's delete")
-	e.expect(e.do("PUT", "/cat/Season/derby.json", `{"title": "Mine"}`, "If-Match", g.header.Get("ETag")), 412, "PUT If-Match over another user's delete")
-	sameStrings(t, "matches", e.liveNames("matches"), before)
-	e.expect(e.do("GET", "/cat/Season/derby.json", ""), 404, "reload: gone")
-	e.expect(e.do("PUT", "/cat/Season/derby.json", `{"title": "Mine"}`), 201, "PUT after the reload")
-	if ns, item := e.itemOf("cat", "derby.json"); ns != "matches" || item == "newderby" {
-		t.Fatalf("derby.json is %s/%s", ns, item)
-	}
-
-	// The flat view: a raw x.json takes JSON document x's name.
-	f := newEnv(t, []string{"docs"}, nil, nil)
-	f.create("docs", "x", map[string]any{"v": "1"})
-	g = f.expect(f.do("GET", "/docs/x.json", ""), 200, "GET")
-	f.rawDoc("docs", "x.json", "application/json", []byte("// someone's raw file\n"), nil)
-	f.expect(f.do("PUT", "/docs/x.json", edit(t, g.body, `"v": "1"`, `"v": "2"`)), 409, "PUT, a raw x.json taking the name")
-	if _, data := f.rawOf("docs", "x.json"); string(data) != "// someone's raw file\n" {
-		t.Fatalf("raw x.json %q", data)
-	}
-	f.expect(f.do("GET", "/docs/x.json", ""), 200, "reload")
-	f.expect(f.do("PUT", "/docs/x.json", "// mine\n"), 201, "PUT after the reload")
-	if _, data := f.rawOf("docs", "x.json"); string(data) != "// mine\n" {
-		t.Fatalf("raw x.json %q", data)
-	}
-	// If-Match naming a revision, where no file is.
-	for _, p := range []string{"/docs/new.md", "/docs/new2.json"} {
-		f.expect(f.do("PUT", p, `{}`, "If-Match", `"bzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"`), 412, "PUT If-Match "+p)
-	}
-	f.expect(f.do("PUT", "/docs/.x.swp", `swap`, "If-Match", `"bzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"`), 412, "PUT If-Match to a scratch name")
-	sameStrings(t, "docs", f.liveNames("docs"), []string{"x", "x.json"})
 }

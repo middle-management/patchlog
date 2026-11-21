@@ -4,19 +4,18 @@ import (
 	"errors"
 	"fmt"
 	"testing"
-
-	"github.com/middle-management/patchlog/internal/grant"
 )
 
-// TestV082WorseUpstream (SVC-15i; §C.4, §C.5.2): of the failures to read
+// TestV082WorseUpstream (SVC-15i; §C.5.2): of the failures to read
 // upstream that one exchange meets, across its grants and across the
 // namespaces one grant names, the first lasting one answers (502), and
 // one for now (503 behind) only where none is lasting, whatever their
 // order.
 func TestV082WorseUpstream(t *testing.T) {
-	lasting, transient := error(fakeChain{false}), error(fakeChain{true})
-	doc := errors.New("a namespace document that can't be read")
-	joined := errors.Join(&grant.AuthError{Status: 403, Msg: grant.RequireAtRefusal}, fakeChain{true})
+	transient := error(&rootErr{fmt.Errorf("down: %w", fakeTransient{})})
+	transient2 := error(&rootErr{fmt.Errorf("still down: %w", fakeTransient{})})
+	lasting := errors.New("a namespace document that can't be read")
+	lasting2 := errors.New("another")
 	for _, c := range []struct {
 		name string
 		errs []error
@@ -25,10 +24,9 @@ func TestV082WorseUpstream(t *testing.T) {
 		{"one transient", []error{transient}, transient},
 		{"transient then lasting", []error{transient, lasting}, lasting},
 		{"lasting then transient", []error{lasting, transient}, lasting},
-		{"two transient: the first", []error{joined, transient}, joined},
-		{"two lasting: the first", []error{doc, lasting}, doc},
-		{"transient, document, lasting", []error{transient, doc, lasting}, doc},
-		{"a root for now, then a lasting chain", []error{&rootErr{fmt.Errorf("down: %w", fakeTransient{})}, lasting}, lasting},
+		{"two transient: the first", []error{transient, transient2}, transient},
+		{"two lasting: the first", []error{lasting, lasting2}, lasting},
+		{"transient, lasting, lasting", []error{transient, lasting, lasting2}, lasting},
 	} {
 		var got error
 		for _, e := range c.errs {

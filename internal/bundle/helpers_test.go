@@ -42,6 +42,7 @@ type deployment struct {
 	origin string
 	url    string
 	c      *client.Client
+	e      *core.Engine
 }
 
 func newDeployment(t testing.TB, origin string, opts ...func(*core.Options)) *deployment {
@@ -86,7 +87,7 @@ func newDeployment(t testing.TB, origin string, opts ...func(*core.Options)) *de
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &deployment{t: t, origin: origin, url: hs.URL, c: c}
+	return &deployment{t: t, origin: origin, url: hs.URL, c: c, e: e}
 }
 
 func must[T any](v T, err error) T {

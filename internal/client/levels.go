@@ -26,9 +26,7 @@ import (
 // chain is what the namespace documents the client has read name as each
 // namespace's local base (link), which never changes; the level held for
 // a namespace is the highest over it and those bases. A client that has
-// read no document of a branch doesn't know its bases, and a remote base
-// (base.origin) is another deployment's namespace, for which this table,
-// kept per deployment, holds nothing.
+// read no document of a branch doesn't know its bases.
 
 // ErrLevelLowered reports a namespace document or /keys answer naming a
 // lower encryption level than the client has learnt for the namespace
@@ -198,10 +196,10 @@ func (t *levelTable) link(ns, base string) {
 }
 
 // learnBase records the local base that doc, a namespace document of ns,
-// names (link). A remote base, one with an origin, is none.
+// names (link).
 func (t *levelTable) learnBase(ns string, doc map[string]any) {
 	b, _ := doc["base"].(map[string]any)
-	if _, remote := b["origin"]; b == nil || remote {
+	if b == nil {
 		return
 	}
 	if base, _ := b["ns"].(string); base != "" {

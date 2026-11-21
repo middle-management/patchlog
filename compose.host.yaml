@@ -7,8 +7,8 @@
 #
 # Every container shares the host's network. The service names still
 # resolve (to 127.0.0.1, via extra_hosts), and the ports are the ones
-# compose.yaml publishes: the CDN on 8080–8082, the origins directly on
-# 9080–9082, the WebDAV gateway on 8090 (DAV_PORT). `docker compose exec`
+# compose.yaml publishes: the CDN on 8080–8081, the origins directly on
+# 9080–9081, the WebDAV gateway on 8090 (DAV_PORT). `docker compose exec`
 # doesn't work on such hosts either.
 
 x-host: &host
@@ -17,7 +17,6 @@ x-host: &host
   extra_hosts:
     - patchlog:127.0.0.1
     - index:127.0.0.1
-    - tree:127.0.0.1
     - cdn:127.0.0.1
 
 services:
@@ -33,7 +32,6 @@ services:
       - --archive=file:///data/archive
       - --master-key=/data/master.key
       - --master-key-create
-      - --tree-url=http://tree:9082
       - --index-url=http://index:9081
       - --schema-fetch
       - --schema-fetch-hosts=www.schemastore.org,json.schemastore.org,raw.githubusercontent.com
@@ -41,7 +39,7 @@ services:
       - --shutdown-timeout=20s
     # Healthchecks run through `docker exec`, which joins the container's
     # namespaces, and hosts like these refuse that too, so compose.yaml's
-    # `patchlog health` checks are off for the core, index, tree and dav. The
+    # `patchlog health` checks are off for the core, index and dav. The
     # seed polls /_health itself instead, and the CDN only needs the
     # origins started (its own probes of /_health still work: they are
     # plain HTTP over the host network). Graceful shutdown doesn't depend
@@ -64,24 +62,14 @@ services:
     healthcheck:
       disable: true
 
-  tree:
-    <<: *host
-    command: [tree, --api=http://patchlog:9080, --catalog=cat, --catalog=topics, --catalog=drive, "--db=/data/tree-{catalog}.db", --addr=:9082, --purge-url=http://cdn:8080/, --shutdown-timeout=20s]
-    healthcheck:
-      disable: true
-
-  # Started once the tree service is (its folders' listings answer 502
-  # until it listens).
   dav:
     <<: *host
-    command: [dav, --api=http://patchlog:9080, --ns=demo, --catalog=drive, --tree-url=http://tree:9082, "--addr=:${DAV_PORT:-8090}", --password-file=/run/dav.password, --author=dav, --shutdown-timeout=20s]
+    command: [dav, --api=http://patchlog:9080, --ns=demo, --ns=files, "--addr=:${DAV_PORT:-8090}", --password-file=/run/dav.password, --author=dav, --shutdown-timeout=20s]
     healthcheck:
       disable: true
     depends_on: !override
       seed:
         condition: service_completed_successfully
-      tree:
-        condition: service_started
 
   janitor:
     <<: *host
@@ -94,13 +82,11 @@ services:
         condition: service_started
       index:
         condition: service_started
-      tree:
-        condition: service_started
-    # The VCL's backends are the origins' in-network ports (8080–8082);
-    # here they listen on 9080–9082, so point it there before starting.
+    # The VCL's backends are the origins' in-network ports (8080–8081);
+    # here they listen on 9080–9081, so point it there before starting.
     entrypoint: ["sh", "-c"]
     command:
       - >-
-        sed -e 's/\.port = "808\([0-2]\)"/.port = "908\1"/' /etc/varnish/default.vcl > /var/lib/varnish/varnishd/host.vcl &&
+        sed -e 's/\.port = "808\([0-1]\)"/.port = "908\1"/' /etc/varnish/default.vcl > /var/lib/varnish/varnishd/host.vcl &&
         exec varnishd -F -f /var/lib/varnish/varnishd/host.vcl -n /var/lib/varnish/varnishd
-        -a core=:8080 -a search=:8081 -a tree=:8082 -s malloc,256m
+        -a core=:8080 -a search=:8081 -s malloc,256m

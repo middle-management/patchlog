@@ -6,7 +6,7 @@ import (
 )
 
 // V75-03 (v0.75): the gestures listing's after test (§7.4) and its
-// filtering for partial readers (§B.11.9 Answers).
+// filtering for partial readers (§7.9 Answers).
 
 // §7.4 (v0.75): a gestures listing's after must name a row the listing
 // would give the caller: one written with the gesture or undoing it.
@@ -27,7 +27,7 @@ func TestV075GesturesAfterNamesARow(t *testing.T) {
 	expect(t, e.get("/ns/main/gestures/"+gB+"?after=x/"+r2), 200)
 }
 
-// §B.11.9 Answers, §7.4 (scenarios 77, 86): the gestures listing shows a
+// §7.9 Answers, §7.4 (scenarios 77, 86): the gestures listing shows a
 // partial reader only what is visible to it: never an unplaced document,
 // and an after naming one is 404. no-store.
 func TestV075GesturesFiltered(t *testing.T) {

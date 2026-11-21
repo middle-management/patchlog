@@ -286,7 +286,7 @@ func TestV050EdgeGrantsAllOrNothing(t *testing.T) {
 // verified.
 func TestV050EdgeGrantsFiniteSets(t *testing.T) {
 	t.Parallel()
-	f := newAuthFixture(t, nil)
+	f := newAuthFixture(t, nil, noFilteredReads)
 	e := f.tenv
 	e.mkNS("sec2", map[string]any{"read": "grant", "keys": []any{f.admin.entry("*"), f.issuer.entry("read")}})
 	for _, n := range []string{"a", "b", "c", "d"} {
@@ -476,7 +476,8 @@ func TestV050EdgeGrantsKeyScopeSet(t *testing.T) {
 	}{
 		{"key scope", issue(ks), "/r/ks/a /r/ks/b"},
 		{"key scope and block", issue(ks, in("b", "c")), "/r/ks/b"},
-		{"key scope and a disjoint block", issue(ks, in("c")), ""},
+		// An empty set fixes nothing (§2.1): a partial reader's view.
+		{"key scope and a disjoint block", issue(ks, in("c")), "/ns/ks/view/*"},
 		{"readScope with a set", issue(kr, in("a", "b")), "/r/ks/a /r/ks/b"},
 		{"readScope unfixed", issue(kr), ""},
 	} {
@@ -487,7 +488,7 @@ func TestV050EdgeGrantsKeyScopeSet(t *testing.T) {
 			continue
 		}
 		expect(t, c.r, 200)
-		if got := prefixesOf(t, c.r); got != c.prefixes {
+		if got := prefixesOf(t, c.r); got != c.prefixes && !(strings.HasSuffix(c.prefixes, "*") && strings.HasPrefix(got, strings.TrimSuffix(c.prefixes, "*"))) {
 			t.Errorf("%s: prefixes %s", c.name, got)
 		}
 	}
@@ -612,15 +613,15 @@ func TestV050EdgeGrantsRefusedCheaply(t *testing.T) {
 	for i := range nss {
 		nss[i] = fmt.Sprintf("n%d", i)
 	}
-	gs := make([]string, 50)
-	for i := range gs {
-		gs[i] = e.grant(k, fmt.Sprintf("user:x%d", i), nss, []string{"read"})
+	vid := make([]string, 50)
+	for i := range vid {
+		vid[i] = e.grant(k, fmt.Sprintf("user:x%d", i), nss, []string{"read"})
 	}
-	if len(gs[0]) > 8<<10 {
-		t.Fatalf("grant of %d bytes", len(gs[0]))
+	if len(vid[0]) > 8<<10 {
+		t.Fatalf("grant of %d bytes", len(vid[0]))
 	}
 	start := time.Now()
-	r := e.issueGrants(gs...)
+	r := e.issueGrants(vid...)
 	if took := time.Since(start); r.Code != 401 || took > 5*time.Second {
 		t.Fatalf("%d in %v", r.Code, took)
 	}

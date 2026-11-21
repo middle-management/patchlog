@@ -28,8 +28,8 @@ func TestPurgedAfterReadCheck(t *testing.T) {
 		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, untyped: true, now: s.Now})
 	x.caughtUp("sec")
 	bob := issuer.Grant(t, s.Now(), "user:bob", []string{"sec"}, []string{"read"})
-	ptr := x.raw("/sec", bob).header.Get("Location") // /sec/g/{gs}/at/{ns_id}
-	gs := strings.Split(ptr, "/")[3]
+	ptr := x.raw("/sec", bob).header.Get("Location") // /sec/view/{vid}/at/{ns_id}
+	vid := strings.Split(ptr, "/")[3]
 
 	must(root.PatchConfig(ctx, "sec", must(root.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
 	purged := must(root.PurgeNamespace(ctx, "sec", must(root.NSHead(ctx, "sec")).ID))
@@ -42,7 +42,7 @@ func TestPurgedAfterReadCheck(t *testing.T) {
 			t.Errorf("token %.10q: %d %v, want %d", tok, r.status, r.body, want)
 		}
 	}
-	for _, u := range []string{"/sec?q=x", ptr, "/sec/g/" + gs + "/at/" + purged} {
+	for _, u := range []string{"/sec?q=x", ptr, "/sec/view/" + vid + "/at/" + purged} {
 		if r := x.raw(u, bob); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != purged || r.header.Get("Cache-Control") != "no-store" {
 			t.Errorf("%s: %d %v %v", u, r.status, r.body, r.header)
 		}
@@ -52,9 +52,9 @@ func TestPurgedAfterReadCheck(t *testing.T) {
 // TestReadsUnrestrictedRoles (§C.5, B8): a grant reads a namespace whole
 // when one of its read roles has no rule on /resource and passes, whatever
 // its other roles (roles are alternatives): it shares a plain reader's
-// subject set and results, here and in /_refs. One whose only read roles
+// view and results, here and in /_refs. One whose only read roles
 // test /resource, or whose other read role has a rule on /now that fails,
-// is filtered per resource under a subject set of its own, and in /_refs
+// is filtered per resource under a view of its own, and in /_refs
 // rules on /now in it make the namespace unreadable (§A.4).
 func TestReadsUnrestrictedRoles(t *testing.T) {
 	t.Parallel()
@@ -84,18 +84,18 @@ func TestReadsUnrestrictedRoles(t *testing.T) {
 		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, now: s.Now})
 	x.caughtUp("sec")
 
-	gsOf := func(tok string) string {
+	viewOf := func(tok string) string {
 		t.Helper()
 		r := x.raw("/sec?q=secret", tok)
 		loc := r.header.Get("Location")
-		if r.status != 302 || !strings.HasPrefix(loc, "/sec/g/") {
+		if r.status != 302 || !strings.HasPrefix(loc, "/sec/view/") {
 			t.Fatalf("pointer: %d %s %v", r.status, loc, r.body)
 		}
 		return strings.Split(loc, "/")[3]
 	}
 	q := "?to=" + url.QueryEscape(target)
 	plain := issuer.Grant(t, s.Now(), "user:amy", []string{"sec"}, []string{"read"}, map[string]any{"groups": []any{"editors"}})
-	plainGs := gsOf(plain)
+	plainView := viewOf(plain)
 	_, plainRefs, _ := x.refsPointer(q, plain)
 	for _, tc := range []struct {
 		name, sub string
@@ -121,15 +121,15 @@ func TestReadsUnrestrictedRoles(t *testing.T) {
 			}
 			continue
 		}
-		if gs := gsOf(tok); (gs == plainGs) != tc.whole {
-			t.Errorf("%s: gs %s, a plain reader's %s", tc.name, gs, plainGs)
+		if vid := viewOf(tok); (vid == plainView) != tc.whole {
+			t.Errorf("%s: vid %s, a plain reader's %s", tc.name, vid, plainView)
 		}
 		if got := strings.Join(resources(x.search("/sec?q=secret", tok)), ","); got != tc.hits {
 			t.Errorf("%s: hits %s", tc.name, got)
 		}
-		_, gs, loc := x.refsPointer(q, tok)
-		if (gs == plainRefs) != tc.whole || strings.ReplaceAll(refsAllHits(x.search(loc, tok)), "sec/", "") != strings.ReplaceAll(tc.hits, ",", " ") {
-			t.Errorf("%s: /_refs %s, a plain reader's gs %s", tc.name, loc, plainRefs)
+		_, vid, loc := x.refsPointer(q, tok)
+		if (vid == plainRefs) != tc.whole || strings.ReplaceAll(refsAllHits(x.search(loc, tok)), "sec/", "") != strings.ReplaceAll(tc.hits, ",", " ") {
+			t.Errorf("%s: /_refs %s, a plain reader's vid %s", tc.name, loc, plainRefs)
 		}
 	}
 	// A grant whose reads can't differ between resources and that doesn't

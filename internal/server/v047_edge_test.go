@@ -28,7 +28,7 @@ func TestV047EdgeGrantRoles(t *testing.T) {
 		"clock":   map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}}},
 		"bobonly": map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"op": "test", "path": "/principal/id", "value": "user:bob"}}},
 		"lister":  map[string]any{"can": []any{"append"}},
-	}})
+	}}, noFilteredReads)
 	e := f.tenv
 	e.create("sec", "a", map[string]any{"v": 1.0}, f.adminG)
 	e.create("sec", "b", map[string]any{"v": 2.0}, f.adminG)

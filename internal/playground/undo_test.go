@@ -86,7 +86,7 @@ const undoHarness = undoPrelude + `
   out.moveDone = !!(await undoRun('docs', input.gm, {})).ok;
   // E: sealed: no listing, the namespace log is scanned, every set gets a fresh nonce.
   S.ns = 's';
-  const e = await undoRun('s', input.gs, { level: 'sealed' });
+  const e = await undoRun('s', input.vid, { level: 'sealed' });
   out.sealedE = { ok: !!e.ok, source: e.ok ? e.plan.source : '', steps: e.ok ? e.plan.items[0].steps : null, err: e.refused || e.impossible || '' };
   // F: a namespace that came to require nonces after the gesture: the set gets a fresh one, though the document has none.
   S.ns = 'n';
@@ -182,8 +182,8 @@ func TestUndoWithNode(t *testing.T) {
 	nonced := func(p []any) []any { return append(p, op("add", "/$nonce", seal.NewNonce())) }
 	w, err = alice.Create(ctx, "s", "a", nonced(client.GenesisPatches(map[string]any{"t": 1})))
 	check(w, err)
-	gs := client.NewGesture()
-	w, err = alice.Append(ctx, "s", "a", w.ID, nonced(ops(op("replace", "/t", 2))), client.WithGesture(gs))
+	vid := client.NewGesture()
+	w, err = alice.Append(ctx, "s", "a", w.ID, nonced(ops(op("replace", "/t", 2))), client.WithGesture(vid))
 	check(w, err)
 	oldNonce := func() string {
 		d, err := alice.Doc(ctx, "s", "a", w.ID)
@@ -219,7 +219,7 @@ func TestUndoWithNode(t *testing.T) {
 	}
 
 	b := runUndoHarness(t, node, undoHarness, map[string]any{"base": s.URL, "author": "alice", "key": base64.RawURLEncoding.EncodeToString(fk[0].Key),
-		"g": g, "gd": gd, "gp": gp, "gm": gm, "gs": gs, "gn": gn, "go": gO, "ga": gA})
+		"g": g, "gd": gd, "gp": gp, "gm": gm, "vid": vid, "gn": gn, "go": gO, "ga": gA})
 	var out struct {
 		PlanA struct {
 			Source, Author string

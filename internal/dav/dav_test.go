@@ -5,7 +5,6 @@ import (
 	"io"
 	"net"
 	"net/http/httptest"
-	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -26,7 +25,7 @@ import (
 // canonical form indented, ETag the revision.
 func TestListAndGet(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	ra := e.create("docs", "a", map[string]any{"title": "A", "n": 1.5, "list": []any{1, "x"}})
 	e.create("docs", "b", map[string]any{"title": "B"})
 	rc := e.create("docs", "c", map[string]any{"title": "C"})
@@ -75,7 +74,7 @@ func TestListAndGet(t *testing.T) {
 // it, so its size checks out (others read the rendering).
 func TestPutCreateEdit(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	upload := `{"b": 1, "a": [1, 2], "keep": {"x": true}}`
 	r := e.expect(e.do("PUT", "/docs/new.json", upload), 201, "PUT new")
 	h, doc := e.load("docs", "new")
@@ -143,7 +142,7 @@ func TestPutCreateEdit(t *testing.T) {
 // write nothing.
 func TestMergeAndConflict(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"title": "A", "body": "x", "meta": map[string]any{"k": "v"}, "list": []any{"a", "b"}})
 	served := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 
@@ -216,9 +215,10 @@ func TestMergeAndConflict(t *testing.T) {
 // errors; nothing is written.
 func TestInvalid(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs", "ruled"}, nil, map[string]map[string]any{
+	e := newEnv(t, []string{"docs", "ruled"}, map[string]map[string]any{
 		"ruled": {"rules": []any{map[string]any{"op": "test", "path": "/doc/title", "schema": map[string]any{"type": "string"}}}},
 	})
+
 	must(e.c.CreateNamespace(e.ctx, "schemas", map[string]any{"read": "public"}))
 	sch := must(e.c.CreateDoc(e.ctx, "schemas", "item", map[string]any{"$schema": schema.Dialect2020, "type": "object",
 		"properties": map[string]any{"n": map[string]any{"type": "number"}}}))
@@ -245,7 +245,7 @@ func TestInvalid(t *testing.T) {
 // patchSetSize).
 func TestDeleteRestore(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	first := e.create("docs", "a", map[string]any{"v": 1})
 	e.expect(e.do("DELETE", "/docs/a.json", ""), 204, "DELETE")
 	h, _ := e.load("docs", "a")
@@ -271,7 +271,7 @@ func TestDeleteRestore(t *testing.T) {
 // file behind.
 func TestEditorSaves(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	first := e.create("docs", "x", map[string]any{"title": "A", "n": 1})
 	served := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 
@@ -318,7 +318,7 @@ func TestEditorSaves(t *testing.T) {
 // the core.
 func TestScratchFiles(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"v": 1})
 	e.expect(e.do("PUT", "/docs/._x.json", "\x00\x05\x16\x07apple"), 201, "AppleDouble")
 	e.expect(e.do("PUT", "/docs/.DS_Store", "Bud1"), 201, ".DS_Store")
@@ -344,7 +344,7 @@ func TestScratchFiles(t *testing.T) {
 // document (as Finder does).
 func TestCopyMoveLock(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs", "other"}, nil, nil)
+	e := newEnv(t, []string{"docs", "other"}, nil)
 	ra := e.create("docs", "a", map[string]any{"v": 1})
 	e.create("docs", "b", map[string]any{"v": 2})
 	// A flat namespace's files move as §H.8 says (TestFlatMoves), but for
@@ -413,7 +413,7 @@ func TestCopyMoveLock(t *testing.T) {
 // stored as sent (its ETag), and the $nonce is never part of an edit.
 func TestNonceRequired(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"priv"}, nil, map[string]map[string]any{"priv": {"nonce": "required"}})
+	e := newEnv(t, []string{"priv"}, map[string]map[string]any{"priv": {"nonce": "required"}})
 	put := e.expect(e.do("PUT", "/priv/x.json", `{"title": "A"}`), 201, "PUT new")
 	h, doc := e.load("priv", "x")
 	n1, _ := doc.(map[string]any)["$nonce"].(string)
@@ -454,12 +454,13 @@ func TestNonceRequired(t *testing.T) {
 // the write or the gateway, knowing the limit, didn't send it.
 func TestLimits(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"small", "slow", "tiny"}, nil, map[string]map[string]any{
-		// 3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize (§6.6 Values).
+	e := newEnv(t, []string{"small", "slow", "tiny"}, map[string]map[string]any{
+
 		"small": {"limits": map[string]any{"patchSetSize": 2048, "valueSize": 300, "pathSize": 40}},
 		"slow":  {"limits": map[string]any{"ratePerResource": map[string]any{"rate": 0.001, "burst": 1.0}}},
 		"tiny":  {"limits": map[string]any{"documentSize": 2048}},
 	})
+
 	e.create("small", "x", map[string]any{"v": 1})
 	e.do("GET", "/small/x.json", "")
 	// A patch set over patchSetSize from the head is written as a root
@@ -523,9 +524,10 @@ func TestLimits(t *testing.T) {
 // A 429 with a short Retry-After is waited out (§6.6).
 func TestRateLimitWait(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, map[string]map[string]any{
+	e := newEnv(t, []string{"docs"}, map[string]map[string]any{
 		"docs": {"limits": map[string]any{"ratePerResource": map[string]any{"rate": 4.0, "burst": 1.0}}},
 	}, func(c *clienttest.Options, _ *dav.Options) { c.RealClock = true })
+
 	e.expect(e.do("PUT", "/docs/x.json", `{"v": 1}`), 201, "first write")
 	e.expect(e.do("PUT", "/docs/x.json", `{"v": 2}`), 201, "second write, after a wait")
 	e.expect(e.do("PUT", "/docs/x.json", `{"v": 3}`), 201, "third write, after a wait")
@@ -539,10 +541,11 @@ func TestScratchBounds(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
 	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
-	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) {
+	e := newEnv(t, []string{"docs"}, nil, func(_ *clienttest.Options, o *dav.Options) {
 		o.ScratchFiles, o.ScratchBytes = 2, 10
 		o.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
 	})
+
 	e.expect(e.do("PUT", "/docs/a.swp", "12345"), 201, "first")
 	e.expect(e.do("PUT", "/docs/b.swp", "12345"), 201, "second")
 	e.expect(e.do("PUT", "/docs/c.swp", "1"), 507, "third file")
@@ -567,10 +570,11 @@ func TestScratchBounds(t *testing.T) {
 func TestSealed(t *testing.T) {
 	t.Parallel()
 	ks := must(keystore.New(keystore.Generate()))
-	e := newEnv(t, []string{"docs", "sec", "e2e"}, nil, map[string]map[string]any{
+	e := newEnv(t, []string{"docs", "sec", "e2e"}, map[string]map[string]any{
 		"sec": {"encryption": map[string]any{"level": "sealed"}},
 		"e2e": {"encryption": map[string]any{"level": "e2e"}},
 	}, func(c *clienttest.Options, _ *dav.Options) { c.KeyStore = ks })
+
 	w := e.s.Client(t, client.WithAuthor("other"), client.WithKeys(client.NewKeys(nil)))
 	ps := append(client.GenesisPatches(map[string]any{"secret": true}), map[string]any{"op": "add", "path": "/$nonce", "value": seal.NewNonce()})
 	must(w.Create(e.ctx, "sec", "x", ps))
@@ -598,47 +602,13 @@ func TestSealed(t *testing.T) {
 	}
 }
 
-// A name a person gives a file that no file can have (a Save As
-// "Report.json", capitals, a space, a copy's name without the original
-// beside it, a dot) is refused: kept in memory only, it would vanish
-// within the hour; in a flat namespace's directory every name but a
-// resource name (§H.2), and every name a resource has is a file's; at the
-// root, a .json name. (In a file tree such names are titles, TestTreeNewFiles.)
-// Editors' and the system's own names stay scratch files (§H.6). (In docs:
-// matches, the tree's files.ns, is read-only in the flat view, §H.2.)
-func TestRefusedNames(t *testing.T) {
-	t.Parallel()
-	e := treeDocsEnv(t)
-	e.create("docs", "x", map[string]any{"a": "1"})
-	for _, p := range []string{"/docs/Report.json", "/docs/Notes.JSON", "/docs/y copy.json", "/docs/Untitled", "/docs/My%20notes.md", "/docs/.x.json.tmp",
-		"/Report.json"} {
-		r := e.expect(e.do("PUT", p, `{"a": "2"}`), 403, "PUT "+p)
-		if !strings.Contains(r.body, "names no") {
-			t.Fatalf("PUT %s: %q", p, r.body)
-		}
-	}
-	e.expect(e.do("PUT", "/docs/.goutputstream-x", `{"a": "3"}`), 201, "temporary file")
-	e.expect(e.do("MOVE", "/docs/.goutputstream-x", "", "Destination", "/docs/Report.json"), 403, "MOVE to a refused name")
-	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
-	e.expect(e.do("LOCK", "/docs/Report.json", lock), 403, "LOCK of a refused name")
-	for _, p := range []string{"/docs/x.json~", "/docs/._x.json", "/docs/.x.json.swp", "/docs/4913", "/docs/x.json___jb_tmp___",
-		"/docs/x.json___jb_old___", "/docs/~$x.json", "/docs/%23x.json%23", "/docs/.DS_Store", "/docs/Thumbs.db"} {
-		e.expect(e.do("PUT", p, "scratch"), 201, "PUT "+p)
-	}
-	sameStrings(t, "listing", names(e.propfind("/docs/"), "/docs/"), []string{"#x.json#", ".DS_Store", "._x.json", ".goutputstream-x", ".x.json.swp", "4913",
-		"Thumbs.db", "x.json", "x.json___jb_old___", "x.json___jb_tmp___", "x.json~", "~$x.json"})
-	if heads := must(e.c.Heads(e.ctx, "docs", must(e.c.NSHead(e.ctx, "docs")).ID)); len(heads) != 1 {
-		t.Fatalf("scratch files reached the core: %+v", heads)
-	}
-}
-
 // Directories a flat namespace or the root can't hold as documents are
 // scratch directories: a macOS app's safe save writes the new version in
 // one and moves it out; a file manager's "untitled folder" holds files
 // for a while. Deleting one drops what is in it.
 func TestScratchDirs(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"title": "A"})
 	served := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 
@@ -674,7 +644,7 @@ func TestScratchDirs(t *testing.T) {
 // editors' temporary files still get the 507.
 func TestJunkFiles(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.ScratchFiles = 3 })
+	e := newEnv(t, []string{"docs"}, nil, func(_ *clienttest.Options, o *dav.Options) { o.ScratchFiles = 3 })
 	e.expect(e.do("PUT", "/docs/.x.json.swp", "swap"), 201, "swap file")
 	for i := 0; i < 5; i++ {
 		e.expect(e.do("PUT", "/docs/._f"+strconv.Itoa(i)+".json", "apple"), 201, "AppleDouble")
@@ -691,7 +661,7 @@ func TestJunkFiles(t *testing.T) {
 // closes (commits) the file all the same.
 func TestCutShortBody(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "n", 1.0)
 	h, _ := e.load("docs", "n")
 	srv := e.dav.Config.Handler
@@ -715,7 +685,7 @@ func (r errReader) Read([]byte) (int, error) { return 0, r.err }
 // mebibyte, the written files buffered at once at InflightBytes (503).
 func TestBodyLimits(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.InflightBytes = 64 })
+	e := newEnv(t, []string{"docs"}, nil, func(_ *clienttest.Options, o *dav.Options) { o.InflightBytes = 64 })
 	big := `<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop>` + strings.Repeat("<D:a/>", 1<<18) + `</D:prop></D:propfind>`
 	if r := e.do("PROPFIND", "/docs/", big, "Depth", "0"); r.status != 400 && r.status != 413 {
 		t.Fatalf("a 1.5 MiB PROPFIND body: %d", r.status)
@@ -766,7 +736,7 @@ func TestUnreachableCore(t *testing.T) {
 // move the edit into its lost+found).
 func TestVimOnDavfs2(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	body := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/b", "theirs"))
@@ -789,99 +759,6 @@ func TestVimOnDavfs2(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/x.json", `{"a": "again"}`, "If-None-Match", "*"), 412, "PUT create-only after it")
 }
 
-// Folders are made only where they can hold documents (file trees) and
-// where apps save through them (a name starting with a dot, TextEdit's
-// "(A Document Being Saved By …)"): a person's folder in a flat namespace
-// or at the root would keep what is saved into it in memory only. In a
-// tree, a file manager's "untitled folder" is a folder like any other,
-// and holds files at once.
-func TestFoldersWhereNoFolderCanBe(t *testing.T) {
-	t.Parallel()
-	e := treeDocsEnv(t)
-	for _, p := range []string{"/docs/untitled folder", "/docs/archive", "/untitled folder", "/New folder"} {
-		e.expect(e.do("MKCOL", p, ""), 403, "MKCOL "+p)
-	}
-	e.expect(e.do("MKCOL", "/docs/.hidden", ""), 403, "MKCOL a dot folder")
-	e.expect(e.do("MKCOL", "/docs/.TemporaryItems", ""), 201, "MKCOL an app's folder")
-	e.expect(e.do("MOVE", "/docs/.TemporaryItems", "", "Destination", "/docs/archive"), 403, "MOVE it to a person's name")
-	e.expect(e.do("PUT", "/docs/.TemporaryItems/q3.json", `{"draft": true}`), 201, "PUT in an app's folder")
-	e.expect(e.do("MKCOL", "/cat/untitled folder", ""), 201, "New Folder in a tree")
-	e.expect(e.do("PUT", "/cat/untitled folder/Report.json", `{"draft": true}`), 201, "PUT a file in it")
-	e.expect(e.do("MOVE", "/cat/untitled folder", "", "Destination", "/cat/Draft Ideas"), 201, "MOVE it to a person's name")
-	folder, _ := e.titled("cat", "Draft Ideas")
-	sameJSON(t, e.parentsOf(folder), []any{map[string]any{"href": "/r/cat/root", "order": "a0"}})
-	ns, item := e.itemOf("cat", "Report.json")
-	if h, _ := e.load(ns, item); h.State != client.Live {
-		t.Fatalf("%s/%s %v", ns, item, h.State)
-	}
-}
-
-// Duplicating a document in place, then renaming the copy, is how a
-// file manager starts a document from a template: in the flat view the
-// copy names file managers give (Finder's "x copy.json", Explorer's "x -
-// Copy.json", Keep Both's "x (1).json", ...) of a document beside them are
-// scratch files, committed by the rename; other .json names a person
-// gives are refused. In a tree the copy is a file, renamed by a title.
-func TestDuplicateThenRename(t *testing.T) {
-	t.Parallel()
-	e := treeDocsEnv(t)
-	e.create("docs", "template", map[string]any{"a": "1"})
-	for i, n := range []string{"template copy.json", "template copy 2.json", "template - Copy.json", "template - Copy (2).json", "Copy of template.json",
-		"template (1).json", "template 2.json", "template (copy).json", "template (another copy).json", "template (3rd copy).json"} {
-		p := "/docs/" + url.PathEscape(n)
-		e.expect(e.do("COPY", "/docs/template.json", "", "Destination", p), 201, "COPY to "+n)
-		dst := "/docs/new" + strconv.Itoa(i) + ".json"
-		e.expect(e.do("MOVE", p, "", "Destination", dst), 201, "MOVE "+n)
-		_, doc := e.load("docs", "new"+strconv.Itoa(i))
-		sameJSON(t, doc, map[string]any{"a": "1"})
-	}
-	for _, n := range []string{"Template copy.json", "other copy.json", "season 2026.json"} {
-		e.expect(e.do("PUT", "/docs/"+url.PathEscape(n), `{}`), 403, "PUT "+n)
-	}
-	e.expect(e.do("COPY", "/cat/Season/derby.json", "", "Destination", "/cat/Season/derby%20copy.json"), 201, "Duplicate a file in a tree")
-	e.expect(e.do("MOVE", "/cat/Season/derby%20copy.json", "", "Destination", "/cat/Season/derby2.json"), 201, "rename it")
-	ns, item := e.itemOf("cat", "derby2.json")
-	_, doc := e.load(ns, item)
-	sameJSON(t, doc, map[string]any{"title": "Derby"})
-}
-
-// MKCOL of a directory that exists is 405 (RFC 4918 §9.3.1) and isn't
-// logged: rclone sends one for the parent before every upload. MKCOL
-// below a file is 409 saying so.
-func TestMkcolExisting(t *testing.T) {
-	t.Parallel()
-	var mu sync.Mutex
-	var logged []string
-	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("files", "docs")}}, func(_ *clienttest.Options, o *dav.Options) {
-		o.Logf = func(format string, args ...any) {
-			mu.Lock()
-			logged = append(logged, fmt.Sprintf(format, args...))
-			mu.Unlock()
-		}
-	})
-	must(e.c.CreateNamespace(e.ctx, "files", map[string]any{"read": "public"}))
-	e.create("docs", "x", map[string]any{"v": 1})
-	e.create("cat", "root", map[string]any{"parents": []any{}})
-	e.create("cat", "sub", map[string]any{"title": "Sub", "parents": parents("cat", "root")})
-	e.create("cat", "docs.x", map[string]any{"title": "x.json", "parents": parents("cat", "root")})
-	e.expect(e.do("MKCOL", "/docs/.TemporaryItems", ""), 201, "MKCOL scratch directory")
-	for _, p := range []string{"/", "/docs/", "/docs", "/cat/", "/cat/Sub/", "/cat/sub", "/docs/.TemporaryItems"} {
-		e.expect(e.do("MKCOL", p, ""), 405, "MKCOL "+p)
-	}
-	for _, p := range []string{"/docs/x.json/sub", "/cat/x.json/sub", "/cat/nowhere/sub"} {
-		if r := e.expect(e.do("MKCOL", p, ""), 409, "MKCOL below a file"); !strings.Contains(r.body, "isn't a folder") {
-			t.Fatalf("MKCOL %s: %q", p, r.body)
-		}
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	for _, l := range logged {
-		if strings.Contains(l, "MKCOL") && strings.Contains(l, "exist") {
-			t.Fatalf("logged: %s", l)
-		}
-	}
-}
-
 // Only editors' and systems' own files and app folders can be at the root
 // (§H.6): a file there never reaches the core, so any other name is
 // refused rather than kept in memory a while (a report.pdf dropped on the
@@ -889,7 +766,7 @@ func TestMkcolExisting(t *testing.T) {
 // folders, a dot folder too: what is copied into it would be lost.
 func TestRootAndFlatFolders(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	for _, n := range []string{"report.pdf", "notes.md", "Report.json", "photos", ".hidden"} {
 		e.expect(e.do("PUT", "/"+n, "data\n"), 403, "PUT /"+n)
 	}
@@ -913,7 +790,7 @@ func TestRootAndFlatFolders(t *testing.T) {
 // locked.
 func TestLockLifecycle(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>me</D:owner></D:lockinfo>`
 	take := func(p string) string {
 		t.Helper()
@@ -957,7 +834,7 @@ func TestLockLifecycle(t *testing.T) {
 // MOVE and dropped with a DELETE; never written to the core.
 func TestDeadProps(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.expect(e.do("PUT", "/docs/notes.md", "hello\n"), 201, "PUT")
 	set := `<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:x"><D:set><D:prop><Z:color>red</Z:color></D:prop></D:set></D:propertyupdate>`
 	get := `<?xml version="1.0"?><D:propfind xmlns:D="DAV:" xmlns:Z="urn:x"><D:prop><Z:color/></D:prop></D:propfind>`
@@ -997,7 +874,7 @@ func TestDeadProps(t *testing.T) {
 // default blobSize), a JSON file and a temporary file as -max-file-size.
 func TestFileSizes(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.MaxFileSize = 1024 })
+	e := newEnv(t, []string{"docs"}, nil, func(_ *clienttest.Options, o *dav.Options) { o.MaxFileSize = 1024 })
 	big := strings.Repeat("x", 4096)
 	e.expect(e.do("PUT", "/docs/big.pdf", big), 201, "PUT a raw file over -max-file-size")
 	if _, data := e.rawOf("docs", "big.pdf"); len(data) != len(big) {
@@ -1016,7 +893,7 @@ func TestFileSizes(t *testing.T) {
 	if !regexp.MustCompile(`^too large: --max-file-size [0-9]+ > 1024 `).MatchString(r.body) {
 		t.Fatalf("413 %q", r.body)
 	}
-	s := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.MaxFileSize, o.MaxRawSize = 1024, 2048 })
+	s := newEnv(t, []string{"docs"}, nil, func(_ *clienttest.Options, o *dav.Options) { o.MaxFileSize, o.MaxRawSize = 1024, 2048 })
 	r = s.expect(s.do("PUT", "/docs/big.pdf", big), 413, "PUT a raw file over -max-raw-size")
 	if !regexp.MustCompile(`^too large: --max-raw-size [0-9]+ > 2048 .*raw file`).MatchString(r.body) {
 		t.Fatalf("413 %q", r.body)

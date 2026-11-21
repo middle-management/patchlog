@@ -48,7 +48,7 @@ func TestRealServerGrantExport(t *testing.T) {
 			w := must(writer.Create(ctx, tc.ns, "d", p1))
 			w2 := must(writer.Append(ctx, tc.ns, "d", w.ID, p2))
 
-			bearer := admin.Grant(t, s.Now(), "user:root", []string{tc.ns}, []string{"read", "export"})
+			bearer := admin.Grant(t, s.Now(), "user:root", []string{tc.ns}, []string{"read"})
 			reader := s.Client(t, client.WithBearer(bearer), client.WithKeys(client.NewKeys(nil)))
 			var buf bytes.Buffer
 			plan, _, err := bundle.Export(ctx, reader, &buf, bundle.ExportOptions{Select: []string{tc.ns}, Authors: true,

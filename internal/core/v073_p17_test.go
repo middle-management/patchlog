@@ -64,69 +64,12 @@ func v073CreateIn(e *Engine, ns string, cred Credentials, name string) (*WriteRe
 	return e.WriteResource(context.Background(), Request{NS: ns, Cred: cred}, it)
 }
 
-// Config writes and a branch's patches covering or overlapping /catalogs
-// or /maxLag need a * key, as the other members §7.4 lists do (§7.4,
-// §C.2, v0.67).
-func TestV073P17CatalogsAndMaxLagNeedStarKey(t *testing.T) {
-	e := v073Engine(t, p17Fast(), p17Fast(), map[string]any{"read": "grant"})
-	ctx := context.Background()
-	var ks p17Keys
-	ks.add("star", map[string]any{"can": []any{"*"}})
-	ks.add("cfg", map[string]any{"can": []any{"config", "read", "branch"}})
-	e.create("p", map[string]any{"read": "grant", "keys": ks.entries})
-	cfgOnly := ks.mint(t, map[string]any{"kid": "cfg", "sub": "user:c", "ns": []any{"p"}, "can": []any{"config", "read", "branch"}})
-	star := ks.mint(t, map[string]any{"kid": "star", "sub": "user:s", "ns": []any{"p"}, "can": []any{"config", "read", "branch"}})
-	cur := func() string {
-		t.Helper()
-		info, err := e.NamespaceHead(ctx, "p", star)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return info.Config
-	}
-	members := map[string]any{
-		"/maxLag":            "PT30S",
-		"/catalogs":          map[string]any{"cat": map[string]any{"place": []any{"group:editors"}}},
-		"/catalogs/cat":      map[string]any{"place": []any{"group:editors"}},
-		"/maxLag-and-x-note": nil,
-	}
-	i := 0
-	for path, v := range members {
-		i++
-		patches := []any{map[string]any{"op": "add", "path": path, "value": v}}
-		if path == "/maxLag-and-x-note" {
-			patches = []any{map[string]any{"op": "add", "path": "/x-note", "value": "n"}, map[string]any{"op": "add", "path": "/maxLag", "value": "PT1M"}}
-		}
-		if path == "/catalogs/cat" {
-			patches = []any{map[string]any{"op": "add", "path": "/catalogs", "value": map[string]any{}}, patches[0]}
-		}
-		_, err := e.WriteConfig(ctx, Request{NS: "p", Cred: cfgOnly}, ConfigChange{IfMatch: cur(), Patches: patches})
-		if v073Status(err) != 403 {
-			t.Errorf("config write to %s under a key that isn't *: want 403, got %v", path, err)
-		}
-		_, err = e.CreateBranch(ctx, Request{NS: "p", Cred: cfgOnly}, BranchRequest{Name: "br" + string(rune('a'+i)), IfNoneMatch: true, Patches: patches})
-		if v073Status(err) != 403 {
-			t.Errorf("branch patches at %s under a key that isn't *: want 403, got %v", path, err)
-		}
-	}
-	// The same key may write other members, and a * key these.
-	if _, err := e.WriteConfig(ctx, Request{NS: "p", Cred: cfgOnly}, ConfigChange{IfMatch: cur(), Patches: []any{map[string]any{"op": "add", "path": "/x-note", "value": "n"}}}); err != nil {
-		t.Fatalf("x- member under a key that isn't *: %v", err)
-	}
-	if _, err := e.WriteConfig(ctx, Request{NS: "p", Cred: star}, ConfigChange{IfMatch: cur(), Patches: []any{
-		map[string]any{"op": "add", "path": "/maxLag", "value": "PT30S"},
-		map[string]any{"op": "add", "path": "/catalogs", "value": map[string]any{"cat": map[string]any{"place": []any{"group:editors"}}}},
-	}}); err != nil {
-		t.Fatalf("under a * key: %v", err)
-	}
-}
-
 // The first matching allowance whose until hasn't passed applies: one that
 // has ended doesn't hide a later match. With authentication disabled an
 // entry matches the author's sub alone, so two entries can match (§6.6
 // Allowances).
 func TestV073P17EndedAllowanceDoesNotHideLater(t *testing.T) {
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1,
 		Limits: p17Fast(), Maximums: p17Fast(), TailInterval: tailEvery, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
@@ -182,8 +125,8 @@ func TestV073P17BranchRoleRulesInFull(t *testing.T) {
 	}
 }
 
-// A grant its key's scope doesn't allow (readScope, sub, groups, maxTtl,
-// requireAt) is 403 on every request that doesn't ignore it: writes,
+// A grant its key's scope doesn't allow (readScope, sub, groups, maxTtl)
+// is 403 on every request that doesn't ignore it: writes,
 // /principal, POST /keys, and /ns/{ns} and the URLs under it in a private
 // namespace. Only a read of a resource URL there answers 404 (§C.2 item 1,
 // §7).
@@ -279,7 +222,7 @@ func TestV073P17KeyScopeFailureIs403(t *testing.T) {
 // namespace defaults (maximums fast), and creates namespace n.
 func p17RateEngine(t *testing.T, path, dir string, clock *atomic.Int64, lim Limits, local bool) *Engine {
 	t.Helper()
-	e, err := Open(Options{Path: path, BlobDir: dir, AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: path, BlobDir: dir, AuthDisabled: true, RetentionInterval: -1,
 		Limits: lim, Maximums: p17Fast(), TailInterval: tailEvery, Purger: discardPurger{}, LocalRateBuckets: local,
 		Now: func() time.Time { return time.UnixMilli(clock.Load()) }})
 	if err != nil {

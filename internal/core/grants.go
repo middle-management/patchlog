@@ -24,8 +24,7 @@ import (
 // "Recorded by an entry" is read from the namespace log: every entry
 // written on a request stores its grant's id (ns_log.grant_id, grantref.go),
 // and the revisions and tombstones of a write record the same grant as its
-// entry. A remote branch's base is followed no further than the branch
-// itself: what it reads through is verified at its base (§G.3).
+// entry.
 //
 // It needs unrestricted read on the namespace, as every /ns/{ns} URL but
 // the gestures listing does (§C.5). A purged namespace answers 410
@@ -140,7 +139,7 @@ func (t *tx) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
 // their at (recursively), records grant id.
 func (t *tx) recordsGrant(n *nsRow, id ids.ID) bool {
 	var bound sql.NullInt64 // the namespace's own entries: all of them
-	for cur := n; cur != nil && !cur.isShadow(); {
+	for cur := n; cur != nil; {
 		var found bool
 		var err error
 		if bound.Valid {

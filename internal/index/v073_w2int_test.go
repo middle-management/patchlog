@@ -7,8 +7,7 @@ import (
 )
 
 // GR-20 (§C.8, §C.6, F-C3 default): the index answers a grant over
-// grantSize or rulesPerGrant as the origin, the tree service and the
-// catalog service do, 413 limit naming the limit, no-store, on a query of
+// grantSize or rulesPerGrant as the origin does, 413 limit naming the limit, no-store, on a query of
 // a private namespace and on /_refs; a public namespace's reads ignore
 // the grant.
 func TestV073W2GrantOverLimits(t *testing.T) {

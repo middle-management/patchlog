@@ -2,180 +2,42 @@ package index
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
-	"maps"
 	"net/http"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/singleflight"
-
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/lru"
-	"github.com/middle-management/patchlog/internal/tree"
 )
 
-// Namespaces §B.11.9 covers (§A.4 Private namespaces, Across namespaces).
+// Namespaces §7.9 covers (§A.4 Private namespaces).
 //
-// A followed namespace is covered, as the origin decides it, from the
-// namespace documents alone (§B.11.9 Where), whether or not the origin
+// A followed namespace is covered, as the origin decides it, from its
+// namespace document alone (§7.9 Where), whether or not the origin
 // implements filtered reads, and only while the core's authentication is
-// on (authOff):
-//
-//   - content kind: not public, sealed or e2e, and it trusts some catalog
-//     through a key whose requireAt names it (catvis.TrustedCatalogs), a
-//     purged or e2e one, or a branch, local or remote, among them, which
-//     makes nothing visible (dark);
-//   - no branch is covered (§B.11.9 Where, v0.78): coverageOf answers nil
-//     for one before anything else;
-//   - catalog kind: a catalog, neither public nor sealed, that some local
-//     namespace of its catalog.trust trusts as content kind.
+// on (authOff): neither a branch, public, sealed nor e2e.
 //
 // A partial reader of a covered namespace (one whose grant allows read
 // there without a namespace-wide edge grant, §C.5.2) reads it filtered by
-// visibility (§B.11.9 Visible): its marker is reads:{ns}:g:{gs}, gs being
-// the origin's (catvis.FilteredSubjects of all its groups, its sub where a
-// deciding catalog's Profile adds it, and grantcheck.ReadsScope's digest,
-// with catvis.KeySubject of its key), and its
-// answers are at the combined checkpoint (grantcheck.CombinedAt) of every
-// namespace visibility reads, which they list as namespaces, one ns_id per
-// namespace (§B.11.9 URLs, §A.4 Answers; fcp.ids):
-//
-//   - {ns} at the index's checkpoint;
-//   - each trusted, non-e2e, unpurged catalog, and each local, unpurged
-//     member of those catalogs' catalog.trust, a branch's root among
-//     them, at its head (memberAt): the index's checkpoint of it, whether
-//     it serves it or follows it only for this (members.go);
-//   - for a branch, each base read only as a base, at the baseAt its
-//     branch reads it at, which the branch's entry fixes.
-//
-// Where visibility reads each namespace is kept apart from what is listed
-// (fcp.reads): a branch's bases, the root among them, are read as of the
-// baseAt its branch reads them at, whatever ns_id they are listed at.
-//
-// The index follows those catalogs, members and bases without serving them
-// (members.go), so that their purges reach idx:{m} and kept results (§A.1):
-// it reads each one's state as of the id in the checkpoint, which never
-// changes, through the core's API (its namespace document, /heads and
-// documents), and keeps a catalog's graph (tree.BuildGraph, with its
-// tombstoned nodes' last live documents, catvis.NewCatalogDeleted) per
-// checkpoint. The Client's grant must read them: a covered namespace one
-// of whose catalogs or members it can't read is 502 to partial readers.
-// Unrestricted readers, and every reader of a namespace that isn't
-// covered, are answered as before, but a partial reader of one that isn't
-// covered and is a catalog, or whose catalogs, or those of a local base in
-// its chain, names one, which has no marker (§A.4, catalogShaped).
+// visibility: a resource is visible where its grant's blocks, key scope
+// and roles allow reading it. Its marker is reads:{ns}:g:{view}, view being
+// the origin's (grantcheck.FilteredSubjects: scope:{digest} of
+// grantcheck.ReadsScope's digest with its key, and grantcheck.KeySubject
+// of its key), and its answers are at the index's checkpoint of {ns},
+// which they list as namespaces (fcp.ids).
 
-// Kinds of covered namespace (fcp.kind).
-const (
-	fsContent = iota // trusts a catalog
-	fsCatalog        // a catalog that a content namespace trusts
-)
-
-// fsBase is a base of a covered branch, read as of the ns_id at (its
-// branch's baseAt).
-type fsBase struct{ ns, at string }
-
-// fsCat is a catalog a covered namespace trusts, with its document as of
-// id (its ns_id in the checkpoint), whether it is e2e, a branch, local or
-// remote (a remote one the index doesn't follow has no id), or purged
-// (gone: no document, no id), any of which makes nothing visible and
-// keeps it out of at (dark), and the kids of the root's keys whose
-// requireAt names it.
-type fsCat struct {
-	ns, id string
-	doc    map[string]any
-	e2e    bool
-	branch bool
-	gone   bool
-	kids   []string
-}
-
-// dark reports whether c makes nothing visible (§B.11.9 Where: "a
-// trusted catalog makes nothing visible where it is a branch, local or
-// remote (§G.3), purged, or end-to-end, which the origin can't read"):
-// it still counts for coverage, but decides no view and stays out of at
-// and its ids.
-func (c fsCat) dark() bool { return c.e2e || c.branch || c.gone }
-
-// fcp is a covered namespace's combined checkpoint (§B.11.9 URLs, §A.4):
-// at is grantcheck.CombinedAt over ids, and cats the deciding catalogs'
-// visibility as of reads. It is immutable.
+// fcp is a covered namespace's checkpoint (§A.4): at is the index's
+// checkpoint of ns, and ids lists it, {ns: at}. It is immutable.
 type fcp struct {
-	ns    string
-	kind  int
-	root  string   // the content namespace whose catalogs decide; "" for catalog kind
-	chain []fsBase // a branch's bases, from its own up to root
-	at    string
-	// ids are the namespaces the checkpoint lists, one ns_id each (§A.4
-	// Answers, §B.11.9 URLs), which at, answers' namespaces, idx: tags
-	// (coverTags) and min judge by: a namespace read at its head ({ns},
-	// each deciding catalog, each member of their catalog.trust, a
-	// branch's root among them) at that head, a base read only as a base
-	// (onlyBase) at the baseAt its branch reads it at.
+	ns  string
+	at  string
 	ids map[string]string
-	// reads are where visibility reads each namespace in ids, never what is
-	// listed: ids' ns_ids, but every base of a branch's chain at the baseAt
-	// its branch reads it at (its live names, and for the root its trust,
-	// keys and roles, catalogAt).
-	reads map[string]string
-	// onlyBase are the bases ids lists at their baseAt because nothing
-	// reads them at their head: an answer across namespaces lists each at
-	// its own checkpoint instead where it has one (refsMerge, keptCPsIn).
-	onlyBase map[string]bool
-	cats     []*catvis.Catalog
-	// live are the names live, as of ids, in a branch's bases (Branches)
-	// and in a catalog's members (whose placements a catalog shows only
-	// where their items are live).
-	live map[string]map[string]bool
-	// gens are the generations of the stores answers are kept in, taken
-	// as the checkpoint first read another namespace's position (memberAt,
-	// baseFollowed: noteGens), before it read that namespace's state; nil
-	// where it read none. An answer whose view was computed here isn't kept
-	// where a purge since, in a namespace it read, carried one of its tags
-	// (§A.1: "drop kept results"; answer, refsAnswer): such a purge drops
-	// what fstate keeps of that namespace (fsForget) before it counts in
-	// any store (purgeStored), so a view that read the namespace's state
-	// before that drop took its generations before the purge too.
-	gens *fcpGens
-}
-
-// fcpGens are the kept results' generation of the checkpoint's namespace
-// (kept.Store.Generation), /_refs answers' and stored sealed results'.
-type fcpGens struct{ kept, refs, sealed uint64 }
-
-// gensKey carries a gensSet, the generations a computation of a
-// checkpoint of ns noted (fcp.gens).
-type gensKey struct{}
-
-type gensSet struct {
-	mu sync.Mutex
-	ns string
-	g  *fcpGens
-}
-
-// noteGens notes, for the checkpoint ctx computes, the stores' generations
-// now, as it reads another namespace's position: the first note, the
-// earliest, holds.
-func (ix *Index) noteGens(ctx context.Context) {
-	s, _ := ctx.Value(gensKey{}).(*gensSet)
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.g == nil {
-		s.g = &fcpGens{kept: ix.kept.Generation(s.ns), refs: ix.refs.Generation(refsScope), sealed: ix.sealed.Generation()}
-	}
 }
 
 // errNotReached is a namespace the index hasn't reached yet whose
@@ -188,29 +50,24 @@ var (
 )
 
 // errGrantLacks is a namespace the index's own grant (Options.Client)
-// can't read, 401 or 403, that it reads only to tell whether §B.11.9
-// covers a namespace it follows, or what visibility reads there: a
-// catalog that namespace's catalogs names through a requireAt key, each
-// namespace a followed catalog's catalog.trust lists, a branch's bases,
-// and their state at a checkpoint. Its coverage can't be told, so a
-// partial reader is refused (502) rather than answered as by an
-// uncovered namespace's rules, which could show what visibility hides
-// (§B.11.9 Visible). Its Error names the namespace, for the operator's
-// log; answers don't, as /principal doesn't name a catalog's trust to
-// one who can't read the catalog whole (§7.4).
+// can't read, 401 or 403, that it reads only to tell whether §7.9
+// covers a namespace it follows: its state at a checkpoint. Its coverage
+// can't be told, so a partial reader is refused (502) rather than
+// answered as by an uncovered namespace's rules. Its Error names the
+// namespace, for the operator's log; answers don't.
 type errGrantLacks struct {
 	ns  string
 	err error
 }
 
 func (e *errGrantLacks) Error() string {
-	return "the index's grant cannot read " + e.ns + ", which tells whether §B.11.9 covers a namespace the index follows, or what visibility reads there (widen Options.Client's grant to it): " + e.err.Error()
+	return "the index's grant cannot read " + e.ns + ", which tells whether §7.9 covers a namespace the index follows, or what visibility reads there (widen Options.Client's grant to it): " + e.err.Error()
 }
 
 func (e *errGrantLacks) Unwrap() error { return e.err }
 
 // msgGrantLacks answers errGrantLacks.
-const msgGrantLacks = "the index's grant cannot read a namespace that decides how this one is read (§B.11.9): see the index's log"
+const msgGrantLacks = "the index's grant cannot read a namespace that decides how this one is read (§7.9): see the index's log"
 
 // lacksRead is err, an upstream read of ns, as errGrantLacks where it is
 // 401 or 403.
@@ -222,95 +79,21 @@ func lacksRead(ns string, err error) error {
 }
 
 // fstate is what the index keeps to compute checkpoints: caches only, of
-// state that never changes once read (namespace documents, /heads and
-// documents at an ns_id, graphs at a checkpoint) but for a purge, which
-// drops what it changes (fsForget). A purge can commit while a request
-// reads the origin, and that request's result must not be kept past the
-// purge, as kept.Store and derived.Cache have it (§A.1: "drop kept
-// results"): what is read of a namespace after fsGeneration is stored
-// (fsPutSince) only if no fsForget of it ran since.
+// state that never changes once read (namespace documents at an ns_id,
+// checkpoints).
 type fstate struct {
-	mu      sync.Mutex
-	docs    lru.Cache[string, map[string]any]  // ns \0 ns_id → namespace document
-	live    lru.Cache[string, map[string]bool] // ns \0 ns_id → names live there
-	cats    lru.Cache[string, *catvis.Catalog] // catalogKey → catalog
-	cps     lru.Cache[string, *fcp]            // ns \0 at → checkpoint, for URLs at older ats
-	nodes   map[string]map[string]catNode      // catalog → its node documents last read
-	deleted lru.Cache[string, map[string]any]  // catalog \0 name \0 tombstone → last live document
-	order   lru.Cache[string, bool]            // ns \0 a \0 b → a comes before b in ns's chain (chainBefore)
-	flight  singleflight.Group
-	// gen counts the purges fsForget dropped a namespace's state for
-	// (fsGeneration), and purged holds the namespaces of the last ones,
-	// oldest first, at most fsMaxPurges.
-	gen    uint64
-	purged []string
-	// beforeStore, set by tests only, runs between an origin read and
-	// storing what it read (fsPutSince), with what is stored.
-	beforeStore func(what string)
-}
-
-// catNode is a catalog node's document as last read, at revision id.
-type catNode struct {
-	id  string
-	doc any
+	mu   sync.Mutex
+	docs lru.Cache[string, map[string]any] // ns \0 ns_id → namespace document
+	cps  lru.Cache[string, *fcp]           // ns \0 at → checkpoint, for URLs at older ats
 }
 
 const (
-	fsDocsMax    = 4096
-	fsLiveMax    = 64
-	fsCatsMax    = 64
-	fsCPsMax     = 256
-	fsDeletedMax = 4096
-	// fsMaxPurges is how many purges fstate recalls the namespace of: a
-	// read from before more purges than that counts as purged.
-	fsMaxPurges = 1024
+	fsDocsMax = 4096
+	fsCPsMax  = 256
 )
 
 func (st *fstate) init() {
-	st.docs.MaxEntries, st.live.MaxEntries, st.cats.MaxEntries = fsDocsMax, fsLiveMax, fsCatsMax
-	st.cps.MaxEntries, st.deleted.MaxEntries, st.order.MaxEntries = fsCPsMax, fsDeletedMax, fsDeletedMax
-	st.nodes = map[string]map[string]catNode{}
-}
-
-// fsGeneration is the number of purges fsForget has counted so far. Take
-// it before reading from the origin what fstate keeps, and store what was
-// read with fsPutSince.
-func (ix *Index) fsGeneration() uint64 {
-	ix.fs.mu.Lock()
-	defer ix.fs.mu.Unlock()
-	return ix.fs.gen
-}
-
-// fsPutSince runs put, which stores in fstate what was read of nss after
-// gen (fsGeneration), with fs.mu held, unless a purge in one of nss has
-// dropped fstate's state of it (fsForget) since: what was read may predate
-// the purge's commit, and is served as it is, once, but not kept (§A.1).
-func (ix *Index) fsPutSince(what string, gen uint64, put func(), nss ...string) {
-	if h := ix.fs.beforeStore; h != nil {
-		h(what)
-	}
-	ix.fs.mu.Lock()
-	defer ix.fs.mu.Unlock()
-	if ix.fs.purgedSinceLocked(gen, nss) {
-		return
-	}
-	put()
-}
-
-// purgedSinceLocked reports whether fsForget dropped the state of one of
-// nss since generation gen, or may have: a purge no longer recalled
-// (fsMaxPurges) is taken to. Called with mu held.
-func (st *fstate) purgedSinceLocked(gen uint64, nss []string) bool {
-	n := st.gen - gen
-	if n > uint64(len(st.purged)) {
-		return true
-	}
-	for _, p := range st.purged[uint64(len(st.purged))-n:] {
-		if slices.Contains(nss, p) {
-			return true
-		}
-	}
-	return false
+	st.docs.MaxEntries, st.cps.MaxEntries = fsDocsMax, fsCPsMax
 }
 
 // seedDoc keeps cfg's document as its namespace's at the ns_id the grant
@@ -348,463 +131,53 @@ func (ix *Index) docAt(ctx context.Context, ns, id string) (map[string]any, erro
 	return doc.Value, nil
 }
 
-// sharedReadTimeout bounds a read that shared serves to every request
-// that joined it.
-const sharedReadTimeout = 30 * time.Second
-
-// shared runs f once for every concurrent caller with key, as the core's
-// shared live reads do: f runs under a context that no caller's
-// cancellation ends, bounded by sharedReadTimeout, so a request that goes
-// away doesn't fail the others that joined its read; each caller stops
-// waiting when its own ctx ends.
-func (ix *Index) shared(ctx context.Context, key string, f func(ctx context.Context) (any, error)) (any, error) {
-	ch := ix.fs.flight.DoChan(key, func() (any, error) {
-		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), sharedReadTimeout)
-		defer cancel()
-		return f(sctx)
-	})
-	select {
-	case r := <-ch:
-		return r.Val, r.Err
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-// liveAt are the names live in ns as of ns_id id (immutable).
-func (ix *Index) liveAt(ctx context.Context, ns, id string) (map[string]bool, error) {
-	k := ns + "\x00" + id
-	ix.fs.mu.Lock()
-	l, ok := ix.fs.live.Get(k)
-	ix.fs.mu.Unlock()
-	if ok {
-		return l, nil
-	}
-	v, err := ix.shared(ctx, "live\x00"+k, func(ctx context.Context) (any, error) {
-		gen := ix.fsGeneration()
-		items, err := ix.c.Heads(ctx, ns, id)
-		if err != nil {
-			return nil, lacksRead(ns, fmt.Errorf("the heads of %s at %s: %w", ns, id, err))
-		}
-		l := make(map[string]bool, len(items))
-		for _, it := range items {
-			if it.Kind == "head" {
-				l[it.Resource] = true
-			}
-		}
-		ix.fsPutSince("live", gen, func() { ix.fs.live.Put(k, l, 1) }, ns)
-		return l, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return v.(map[string]bool), nil
-}
-
-// memberAt is the ns_id a namespace read at its head is taken at, as a
-// member of a checkpoint (a catalog, a catalog.trust member) or as a
-// branch's root judged at its head (coverage): its committed position,
-// the index's checkpoint if it serves m and has reached it, otherwise the
-// checkpoint its follower for visibility committed (members.go, memberCP:
-// "the service follows the namespaces visibility reads", §A.4), once it
-// has reached the head the grant checker read, waiting for it up to
-// MinWait, never a head no follower has applied; its document there is
-// docAt(m, id), which never changes. ok is false for a namespace that is
-// purged, doesn't exist or is a remote branch (§B.11.9: local, unpurged
-// members only); err is a document the index can't read, or errMemberBehind
-// before m's follower holds its first checkpoint (503 behind to partial
-// readers). Callers depend on that contract alone, not on where the
-// position comes from.
-func (ix *Index) memberAt(ctx context.Context, m string) (id string, ok bool, err error) {
-	id, ok, _, err = ix.memberAtGone(ctx, m)
-	return id, ok, err
-}
-
-// memberAtGone is memberAt, telling a purged namespace (purged) from one
-// that doesn't exist or is a remote branch.
-func (ix *Index) memberAtGone(ctx context.Context, m string) (id string, ok, purged bool, err error) {
-	if !client.ValidNSName(m) {
-		return "", false, false, nil
-	}
-	if ix.known(m) {
-		id, purged, err := ix.committed(ctx, m)
-		switch {
-		case err != nil:
-			return "", false, false, err
-		case purged:
-			return "", false, true, nil
-		case id != "":
-			ix.noteGens(ctx)
-			return id, true, false, nil
-		}
-	}
-	cfg, err := ix.checker.Config(ctx, m)
-	switch {
-	case client.IsPurged(err):
-		return "", false, true, nil
-	case client.IsNotFound(err):
-		return "", false, false, nil
-	case err != nil:
-		return "", false, false, lacksRead(m, fmt.Errorf("the head of %s: %w", m, err))
-	case remoteBranch(cfg.Doc):
-		return "", false, false, nil
-	}
-	ix.seedDoc(cfg)
-	return ix.memberCP(ctx, m, cfg.Head)
-}
-
 // fsOpen reports whether a namespace with document doc can be covered:
-// not public, not sealed or e2e (§B.11.9 Where).
+// not public, not sealed or e2e (§7.9 Where).
 func fsOpen(doc map[string]any) bool {
 	read, _ := doc["read"].(string)
 	return read != "public" && !derived.Protected(derived.InfoOf(doc).Level)
 }
 
-// localBase is a local branch's base and the ns_id it was cut at, ok
-// false for a root or a remote branch (whose base is in another
-// deployment, §10, §G.3).
-func localBase(doc map[string]any) (ns, at string, ok bool) {
-	b, _ := doc["base"].(map[string]any)
-	if b == nil {
-		return "", "", false
-	}
-	if _, remote := b["origin"]; remote {
-		return "", "", false
-	}
-	ns, _ = b["ns"].(string)
-	at, _ = b["at"].(string)
-	return ns, at, ns != "" && at != ""
-}
-
-func remoteBranch(doc map[string]any) bool {
-	b, _ := doc["base"].(map[string]any)
-	_, remote := b["origin"]
-	return remote
-}
-
-func isCatalog(doc map[string]any) bool {
-	_, ok := doc["catalog"]
-	return ok
-}
-
-// purgedSealed reports whether purged namespace ns was sealed or
-// end-to-end by the last document the index applied of it (ns_conf, or
-// member_conf for one followed for visibility): the origin then answers
-// 410 for its documents, its purge head's included (§8.5). False where
-// the index recorded no level of it.
-func (ix *Index) purgedSealed(ctx context.Context, ns string) (bool, error) {
-	return ix.purgedSealedTx(ctx, ix.db, ns)
-}
-
-// purgedSealedTx is purgedSealed read through db, a transaction or the
-// database. A member's row goes once its follower is forgotten
-// (forgetMember), which forgets a sealed one's catalog.trust with it.
-func (ix *Index) purgedSealedTx(ctx context.Context, db interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-}, ns string) (bool, error) {
-	for _, table := range []string{"ns_conf", "member_conf"} {
-		var level string
-		switch err := db.QueryRowContext(ctx, `SELECT level FROM `+table+` WHERE ns = ?`, ns).Scan(&level); {
-		case errors.Is(err, sql.ErrNoRows):
-		case err != nil:
-			return false, err
-		case derived.Protected(level):
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// fsTrust are the catalogs root trusts with document doc (§B.11.9 Where,
-// catvis.TrustedCatalogs), each with its document as of the id it is
-// taken at (memberAt): local, unpurged namespaces, and purged ones (gone),
-// which make nothing visible and still count for coverage, as at the
-// origin (§B.11.9 Where: "a branch or a purged one makes nothing
-// visible"), as does a branch, local or remote (fsCat.branch; §B.11.9
-// Where, v0.82: "a branch, local or remote (§G.3)"). A remote branch the
-// index doesn't follow has no checkpoint here (memberAt): its
-// catalog.trust is that of its own document at its head, as the origin
-// stores it (remoteCatalog), and no follower is started for it. A purged
-// catalog's document is 410: its catalog.trust is the one the index last
-// applied (catalog_trust), which for a namespace that was neither sealed
-// nor end-to-end is that of its document at its purge head, where the
-// origin still serves it (§B.11.9 Where, v0.85: "A service reads it from
-// the catalog's document at its purge head where the origin serves that,
-// and one it can't read there counts as no catalog"). One the index
-// never applied a document of counts as no catalog, and so does one that
-// was sealed or end-to-end when it was purged, whose document is 410 at
-// its purge head (purgedSealed; before v0.85 the trust the index had
-// read of it while it lived was kept): root is not covered through it,
-// the reading that shows least (§A.4: no marker, 403). The origin, which
-// still holds a purged sealed catalog's last document, keeps root
-// covered through it, dark. A live catalog whose document can't be read
-// is an error (502), never no catalog.
-func (ix *Index) fsTrust(ctx context.Context, root string, doc map[string]any) ([]fsCat, error) {
-	var ferr error
-	ids, docs, gone := map[string]string{}, map[string]map[string]any{}, map[string]bool{}
-	trusts := catvis.TrustedCatalogs(root, doc, func(cat string) map[string]any {
-		if ferr != nil {
-			return nil
-		}
-		id, ok, purged, err := ix.memberAtGone(ctx, cat)
-		if err == nil && !ok && !purged {
-			// No member here: a remote branch still counts, dark.
-			d, err := ix.remoteCatalog(ctx, cat)
-			if err != nil {
-				ferr = err
-				return nil
-			}
-			if d != nil {
-				docs[cat] = d
-			}
-			return d
-		}
-		if purged && err == nil {
-			trust, known, err := ix.lastTrust(ctx, cat)
-			if err != nil {
-				ferr = err
-				return nil
-			}
-			if !known {
-				return nil
-			}
-			// One whose document the origin doesn't serve at its
-			// purge head, a sealed or end-to-end namespace's (§8.5),
-			// counts as no catalog, whatever the index read of it
-			// while it lived (§B.11.9 Where, v0.85).
-			if sealed, err := ix.purgedSealed(ctx, cat); err != nil {
-				ferr = err
-				return nil
-			} else if sealed {
-				return nil
-			}
-			gone[cat] = true
-			return map[string]any{"catalog": map[string]any{"trust": trust}}
-		}
-		if err != nil || !ok {
-			ferr = err
-			return nil
-		}
-		d, err := ix.docAt(ctx, cat, id)
-		if err != nil {
-			ferr = err
-			return nil
-		}
-		ids[cat], docs[cat] = id, d
-		return d
-	})
-	if ferr != nil {
-		return nil, ferr
-	}
-	out := make([]fsCat, 0, len(trusts))
-	for _, tr := range trusts {
-		if gone[tr.Catalog] {
-			out = append(out, fsCat{ns: tr.Catalog, gone: true, kids: tr.Kids})
-			continue
-		}
-		// A branch, local or remote: the one the index follows is judged
-		// by its document at its checkpoint.
-		_, _, branch := localBase(docs[tr.Catalog])
-		out = append(out, fsCat{ns: tr.Catalog, id: ids[tr.Catalog], doc: docs[tr.Catalog],
-			e2e: derived.InfoOf(docs[tr.Catalog]).Level == derived.LevelE2E, branch: branch || remoteBranch(docs[tr.Catalog]), kids: tr.Kids})
-	}
-	return out, nil
-}
-
-// remoteCatalog is cat's document at its head where cat is a remote
-// branch (§G.3), which memberAt gives no checkpoint, nil where it is
-// none (it doesn't exist, or its name is no namespace's): a trusted
-// catalog that is a remote branch counts for coverage through its own
-// document as stored at this origin, and makes nothing visible (§B.11.9
-// Where, v0.82; fsCat.dark). It is read through the grant checker, at the
-// head it holds, and never followed: nothing of it is in a checkpoint.
-func (ix *Index) remoteCatalog(ctx context.Context, cat string) (map[string]any, error) {
-	if !client.ValidNSName(cat) {
-		return nil, nil
-	}
-	cfg, err := ix.checker.Config(ctx, cat)
-	switch {
-	case client.IsPurged(err), client.IsNotFound(err):
-		return nil, nil
-	case err != nil:
-		return nil, lacksRead(cat, fmt.Errorf("the head of %s: %w", cat, err))
-	case !remoteBranch(cfg.Doc):
-		return nil, nil
-	}
-	return cfg.Doc, nil
-}
-
-// maxChain bounds a branch's chain of bases (the deployment's branch
-// depth is 8 by default, grantcheck's bound 32).
-const maxChain = 32
-
-// coverage is ns's coverage at its checkpoint z (§B.11.9 Where): its
-// kind, root, chain and trusted catalogs, nil if it isn't covered, as
-// nothing is while the core's authentication is off.
-//
-// The core's root (authOff) is read only for a namespace the documents
-// would cover, or whose coverage they fail to decide: one they can never
-// cover (a private namespace that is no catalog and names none) is
-// uncovered whatever the root says, and its readers don't depend on it.
-// While authentication is off, an error deciding coverage is moot: nothing
-// is covered.
-func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, []fsCat, error) {
-	cp, cats, err := ix.coverageOf(ctx, ns, z)
-	if cp == nil && err == nil {
-		return nil, nil, nil
-	}
-	// Nothing is covered while the core's authentication is off (§B.11.9
-	// Where: "only while authentication is on (§1)").
-	off, aerr := ix.authOff(ctx)
-	switch {
-	case aerr == nil && off:
-		return nil, nil, nil
-	case err != nil:
-		return nil, nil, err
-	case aerr != nil:
-		return nil, nil, aerr
-	}
-	return cp, cats, nil
-}
-
-// coverageOf is coverage as ns's documents decide it, whatever the core's
-// authentication mode.
-func (ix *Index) coverageOf(ctx context.Context, ns, z string) (*fcp, []fsCat, error) {
+// coverage is ns's checkpoint at z, the index's checkpoint of it (§7.9
+// Where), nil if it isn't covered, as nothing is while the core's
+// authentication is off.
+func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, error) {
 	if cfg, err := ix.checker.Config(ctx, ns); err == nil {
 		ix.seedDoc(cfg) // read by the read check already, as a rule
 	}
 	doc, err := ix.docAt(ctx, ns, z)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	if !fsOpen(doc) || remoteBranch(doc) {
-		return nil, nil, nil
+	if !coverable(doc) {
+		return nil, nil
 	}
-	if _, _, ok := localBase(doc); ok {
-		// No branch is covered (§B.11.9 Where: "neither a branch (§7.6),
-		// public, sealed nor end-to-end", v0.78): a partial reader of one
-		// whose base names a catalog has no marker (catalogShaped, §A.4).
-		return nil, nil, nil
+	// Nothing is covered while the core's authentication is off (§7.9
+	// Where: "only while authentication is on (§1)").
+	if off, err := ix.authOff(ctx); err != nil {
+		return nil, err
+	} else if off {
+		return nil, nil
 	}
-	cp := &fcp{ns: ns}
-	cats, err := ix.fsTrust(ctx, ns, doc)
-	if err != nil {
-		return nil, nil, err
-	}
-	if len(cats) > 0 {
-		cp.kind, cp.root = fsContent, ns
-		return cp, cats, nil
-	}
-	if !isCatalog(doc) {
-		return nil, nil, nil
-	}
-	for _, m := range catvis.TrustList(ns, doc) {
-		id, ok, err := ix.memberAt(ctx, m)
-		if err != nil {
-			return nil, nil, err
-		}
-		if !ok {
-			continue
-		}
-		mdoc, err := ix.docAt(ctx, m, id)
-		if err != nil {
-			return nil, nil, err
-		}
-		if _, _, branch := localBase(mdoc); branch || !fsOpen(mdoc) {
-			continue
-		}
-		// Whether m trusts ns, ns's document alone deciding: the other
-		// catalogs m names are none of this one's coverage, and aren't
-		// read (errGrantLacks).
-		if len(catvis.TrustedCatalogs(m, mdoc, func(c string) map[string]any {
-			if c == ns {
-				return doc
-			}
-			return nil
-		})) > 0 {
-			cp.kind = fsCatalog
-			return cp, []fsCat{{ns: ns, id: z, doc: doc}}, nil
-		}
-	}
-	return nil, nil, nil
+	return &fcp{ns: ns, at: z, ids: map[string]string{ns: z}}, nil
 }
 
-// checkpoint is ns's combined checkpoint with ns at z, the index's
-// checkpoint of it, nil if ns isn't covered (§B.11.9 URLs, §A.4). It
-// reads every member's state it needs and keeps the result by at.
+// coverable reports whether a namespace with document doc is covered
+// while authentication is on: neither a branch (§7.6), public, sealed nor
+// end-to-end (§7.9 Where).
+func coverable(doc map[string]any) bool {
+	_, branch := doc["base"]
+	return fsOpen(doc) && !branch
+}
+
+// checkpoint is ns's checkpoint with ns at z, the index's checkpoint of
+// it, nil if ns isn't covered (§7.9 URLs, §A.4). It keeps the result
+// by at.
 func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
-	gens := &gensSet{ns: ns}
-	ctx = context.WithValue(ctx, gensKey{}, gens)
-	cp, cats, err := ix.coverage(ctx, ns, z)
+	cp, err := ix.coverage(ctx, ns, z)
 	if err != nil || cp == nil {
 		return nil, err
 	}
-	// Listed once each (§A.4 Answers): a namespace read at its head at
-	// it, a base read only as a base at its baseAt; read where visibility
-	// reads it.
-	cp.ids, cp.onlyBase = map[string]string{}, map[string]bool{}
-	add := func(m, id string) {
-		if _, ok := cp.ids[m]; !ok {
-			cp.ids[m] = id
-		}
-	}
-	add(ns, z)
-	var deciding []fsCat
-	for _, c := range cats {
-		if c.dark() {
-			continue
-		}
-		deciding = append(deciding, c)
-		add(c.ns, c.id)
-		for _, m := range catvis.TrustList(c.ns, c.doc) {
-			id, ok, err := ix.memberAt(ctx, m)
-			if err != nil {
-				return nil, err
-			}
-			if ok {
-				add(m, id)
-			}
-		}
-	}
-	cp.reads = maps.Clone(cp.ids)
-	for _, b := range cp.chain {
-		// A base the index doesn't serve has a follower (members.go).
-		if err := ix.baseFollowed(ctx, b.ns); err != nil {
-			return nil, err
-		}
-		if _, ok := cp.ids[b.ns]; !ok {
-			cp.ids[b.ns], cp.onlyBase[b.ns] = b.at, true
-		}
-		cp.reads[b.ns] = b.at
-	}
-	cp.at = grantcheck.CombinedAt(cp.ids)
-	for _, c := range deciding {
-		cv, err := ix.catalogAt(ctx, c, cp.reads)
-		if err != nil {
-			return nil, err
-		}
-		cp.cats = append(cp.cats, cv)
-	}
-	cp.live = map[string]map[string]bool{}
-	var lives []string
-	switch cp.kind {
-	case fsCatalog:
-		for m := range cp.ids {
-			if m != ns {
-				lives = append(lives, m)
-			}
-		}
-	}
-	for _, m := range lives {
-		l, err := ix.liveAt(ctx, m, cp.reads[m])
-		if err != nil {
-			return nil, err
-		}
-		cp.live[m] = l
-	}
-	gens.mu.Lock()
-	cp.gens = gens.g
-	gens.mu.Unlock()
 	ix.fs.mu.Lock()
 	ix.fs.cps.Put(cp.ns+"\x00"+cp.at, cp, 1)
 	ix.fs.mu.Unlock()
@@ -812,8 +185,8 @@ func (ix *Index) checkpoint(ctx context.Context, ns, z string) (*fcp, error) {
 }
 
 // keptCP is the checkpoint at of ns computed earlier, nil if none is
-// held: a reader's gs at an older at is computed there (§B.11.9: a
-// grant reads at its own gs as of the URL's at).
+// held: a reader's view at an older at is computed there (§7.9: a
+// grant reads at its own view as of the URL's at).
 func (ix *Index) keptCP(ns, at string) *fcp {
 	ix.fs.mu.Lock()
 	defer ix.fs.mu.Unlock()
@@ -823,357 +196,74 @@ func (ix *Index) keptCP(ns, at string) *fcp {
 	return nil
 }
 
-// keptCPsIn are the checkpoints of ns the index holds that an answer
-// across namespaces at ids (its namespaces, refsMerge) was read at: ns
-// and each of their members at its id in ids, but a base listed only as
-// a base (onlyBase), which ids may hold at its own checkpoint instead
-// (§A.4 Across namespaces).
-func (ix *Index) keptCPsIn(ns string, ids map[string]string) []*fcp {
-	ix.fs.mu.Lock()
-	defer ix.fs.mu.Unlock()
-	var out []*fcp
-	for _, k := range ix.fs.cps.Keys() {
-		cp, ok := ix.fs.cps.Get(k)
-		if !ok || cp.ns != ns {
-			continue
-		}
-		in := true
-		for m, id := range cp.ids {
-			got, ok := ids[m]
-			if !ok || (!cp.onlyBase[m] && got != id) {
-				in = false
-				break
-			}
-		}
-		if in {
-			out = append(out, cp)
-		}
-	}
-	return out
-}
-
-// catalogAt is catalog c's visibility as of ids, where visibility reads
-// each namespace (fcp.reads, §B.11.9 Visible): its graph from its
-// documents at ids[c.ns], its tombstoned nodes from their last live
-// documents, and its catalog.trust members in ids as its content
-// namespaces, each with its document as of its id (for a branch's root,
-// as of the branch's baseAt) and the kids of its keys whose requireAt
-// names c.
-func (ix *Index) catalogAt(ctx context.Context, c fsCat, ids map[string]string) (*catvis.Catalog, error) {
-	var key strings.Builder
-	key.WriteString(c.ns + "\x00" + ids[c.ns])
-	var inCP []string
-	for _, m := range catvis.TrustList(c.ns, c.doc) {
-		if id, ok := ids[m]; ok {
-			inCP = append(inCP, m)
-			key.WriteString("\x00" + m + "\x00" + id)
-		}
-	}
-	k := key.String()
-	ix.fs.mu.Lock()
-	cv, ok := ix.fs.cats.Get(k)
-	ix.fs.mu.Unlock()
-	if ok {
-		return cv, nil
-	}
-	v, err := ix.shared(ctx, "cat\x00"+k, func(ctx context.Context) (any, error) {
-		gen := ix.fsGeneration()
-		g, deleted, err := ix.catalogGraph(ctx, gen, c.ns, ids[c.ns], c.doc)
-		if err != nil {
-			return nil, err
-		}
-		contents := map[string]*catvis.Content{}
-		for _, m := range inCP {
-			mdoc, err := ix.docAt(ctx, m, ids[m])
-			if err != nil {
-				return nil, err
-			}
-			ct := &catvis.Content{NS: m}
-			if cfg, err := grantcheck.ParseConfig(m, "", mdoc); err == nil {
-				ct.Cfg = cfg // one that doesn't parse: nothing counts through it
-			}
-			for _, tr := range catvis.TrustedCatalogs(m, mdoc, func(name string) map[string]any {
-				if name == c.ns {
-					return c.doc
-				}
-				return nil
-			}) {
-				ct.Kids = tr.Kids
-			}
-			contents[m] = ct
-		}
-		cv := catvis.NewCatalogDeleted(g, contents, deleted)
-		// The key names c.ns and inCP, whose purges each drop it (fsForget).
-		ix.fsPutSince("cat", gen, func() { ix.fs.cats.Put(k, cv, 1) }, append([]string{c.ns}, inCP...)...)
-		return cv, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return v.(*catvis.Catalog), nil
-}
-
-// catalogGraph is catalog cat's graph as of ns_id id, whose document is
-// doc, and its tombstoned nodes, each parsed from its last live document
-// (the revision its tombstone follows), as the origin builds them. A
-// document already read at the same revision is not read again; a
-// tombstoned node whose last live document is gone (pruned or purged) is
-// left out, as one purged is. gen is the fsGeneration taken before any of
-// it was read.
-func (ix *Index) catalogGraph(ctx context.Context, gen uint64, cat, id string, doc map[string]any) (*tree.Graph, []*tree.Node, error) {
-	items, err := ix.c.Heads(ctx, cat, id)
-	if err != nil {
-		return nil, nil, lacksRead(cat, fmt.Errorf("the heads of %s at %s: %w", cat, id, err))
-	}
-	ix.fs.mu.Lock()
-	prev := ix.fs.nodes[cat]
-	ix.fs.mu.Unlock()
-	var (
-		mu       sync.Mutex
-		nodes    = map[string]catNode{}
-		docs     = map[string]any{}
-		lastLive = map[string]any{}
-	)
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(ix.opt.FetchConcurrency)
-	for _, it := range items {
-		switch it.Kind {
-		case "head":
-			if n, ok := prev[it.Resource]; ok && n.id == it.Target {
-				mu.Lock()
-				nodes[it.Resource], docs[it.Resource] = n, n.doc
-				mu.Unlock()
-				continue
-			}
-			g.Go(func() error {
-				d, err := ix.c.Doc(gctx, cat, it.Resource, it.Target)
-				if err != nil {
-					return fmt.Errorf("%s/%s at %s: %w", cat, it.Resource, it.Target, err)
-				}
-				mu.Lock()
-				nodes[it.Resource], docs[it.Resource] = catNode{id: it.Target, doc: d.Value}, d.Value
-				mu.Unlock()
-				return nil
-			})
-		case "tombstone":
-			g.Go(func() error {
-				d, err := ix.lastLive(gctx, cat, it.Resource, it.Target)
-				if err != nil {
-					return err
-				}
-				if d != nil {
-					mu.Lock()
-					lastLive[it.Resource] = d
-					mu.Unlock()
-				}
-				return nil
-			})
-		}
-	}
-	if err := g.Wait(); err != nil {
-		return nil, nil, err
-	}
-	ix.fsPutSince("nodes", gen, func() { ix.fs.nodes[cat] = nodes }, cat)
-	gr := tree.BuildGraph(cat, doc, docs)
-	deleted := make([]*tree.Node, 0, len(lastLive))
-	for name, d := range lastLive {
-		deleted = append(deleted, tree.ParseNode(gr.Catalog, name, "", d))
-	}
-	return gr, deleted, nil
-}
-
-// lastLive is the document of cat's node name before its tombstone (the
-// tombstone's parent), nil if it is gone or there is none.
-func (ix *Index) lastLive(ctx context.Context, cat, name, tombstone string) (map[string]any, error) {
-	k := cat + "\x00" + name + "\x00" + tombstone
-	ix.fs.mu.Lock()
-	d, ok := ix.fs.deleted.Get(k)
-	ix.fs.mu.Unlock()
-	if ok {
-		return d, nil
-	}
-	gone := func(err error) bool { return client.IsGone(err) || client.IsNotFound(err) }
-	gen := ix.fsGeneration()
-	entries, err := ix.c.Log(ctx, cat, name, tombstone, "")
-	if err != nil && !gone(err) {
-		return nil, fmt.Errorf("the log of %s/%s: %w", cat, name, err)
-	}
-	var parent string
-	if n := len(entries); err == nil && n > 0 && entries[n-1].ID == tombstone {
-		parent = entries[n-1].Parent
-	}
-	if parent != "" {
-		doc, err := ix.c.Doc(ctx, cat, name, parent)
-		switch {
-		case err == nil:
-			d, _ = doc.Value.(map[string]any)
-		case !gone(err):
-			return nil, fmt.Errorf("%s/%s at %s: %w", cat, name, parent, err)
-		}
-	}
-	ix.fsPutSince("deleted", gen, func() { ix.fs.deleted.Put(k, d, 1) }, cat)
-	return d, nil
-}
-
-// fview is one subject set's view of a covered namespace at a checkpoint
-// (§B.11.9 Visible): its subjects decide item 1, its read filter item 2.
-// It memoises each name's answer and is safe for concurrent use.
+// fview is one view's reading of a covered namespace at a checkpoint
+// (§7.9 Visible): its read filter decides, per revision (revAllow).
 type fview struct {
 	cp       *fcp
-	gs       string // the §B.11.9 gs of subjects, which the marker names
+	vid      string // the §7.9 view of subjects
 	subjects []string
 	filter   *grantcheck.ReadFilter
-	views    []*catvis.View
-
-	mu   sync.Mutex
-	memo map[string]bool
+	visible  allowFunc
 }
 
-func newFview(cp *fcp, subjects []string, filter *grantcheck.ReadFilter) *fview {
-	fv := &fview{cp: cp, gs: grantcheck.SubjectSetID(subjects), subjects: subjects, filter: filter, memo: map[string]bool{}}
-	for _, c := range cp.cats {
-		v := c.View(subjects)
-		v.Steps = filter.Steps // each item's validation steps (§6.6)
-		fv.views = append(fv.views, v)
-	}
-	return fv
+func (ix *Index) newFview(cp *fcp, subjects []string, filter *grantcheck.ReadFilter) *fview {
+	return &fview{cp: cp, vid: grantcheck.ViewID(subjects), subjects: subjects, filter: filter, visible: ix.revAllow(cp.ns, filter)}
 }
 
-// visible reports whether name is visible to the view (§B.11.9), as the
-// origin judges it:
-//
-//   - in a content namespace: some deciding catalog has a live, explicit
-//     placement {ns}.{name} that its view passes as if live (item 1,
-//     catvis.View.Placement), and the filter allows reading it, roles
-//     counting as §B.11.5 counts them (item 2, ReadFilter.AllowsItem);
-//   - in a branch: name is live in every base as of the at its branch
-//     reads it at, then item 1 in the root and item 2 with the filter of
-//     the grant verified in the branch: a name new in the branch is hidden
-//     (Branches);
-//   - in a catalog: item 2 allows the node, the catalog's node test
-//     passes (catvis.View.Node; a tombstoned node's last live document
-//     as if live, Deleted resources), and a placement's item is live in
-//     its namespace as of the checkpoint (Catalogs).
-func (fv *fview) visible(name string) bool {
-	fv.mu.Lock()
-	v, ok := fv.memo[name]
-	fv.mu.Unlock()
-	if ok {
-		return v
-	}
-	v = fv.judge(name)
-	fv.mu.Lock()
-	fv.memo[name] = v
-	fv.mu.Unlock()
-	return v
-}
-
-func (fv *fview) judge(name string) bool {
-	if !fv.filter.AllowsItem(name) {
-		return false
-	}
-	cp := fv.cp
-	switch cp.kind {
-	case fsContent:
-		for _, v := range fv.views {
-			if v.Placement(cp.root, name) {
-				return true
-			}
-		}
-		return false
-	}
-	if len(cp.cats) == 0 {
-		return false
-	}
-	c, v := cp.cats[0], fv.views[0]
-	if n := c.G.Node(name); n != nil && c.G.Explicit(name) {
-		return v.Node(n) && fv.itemLive(n)
-	}
-	n := c.Deleted(name)
-	return n != nil && v.AsIfLive(n) && fv.itemLive(n)
-}
-
-// itemLive reports, for a placement n, whether its item is live in its
-// namespace as of the checkpoint; it is true for a folder.
-func (fv *fview) itemLive(n *tree.Node) bool {
-	if n.Kind != tree.KindPlacement {
-		return true
-	}
-	return fv.cp.live[n.ItemNS][n.ItemName]
-}
-
-// grantFview is a partial reader's view at cp (§B.11.9 gs): its subjects
-// are catvis.FilteredSubjects of every one of the grant's groups, its sub
-// where some deciding catalog's Profile there adds it (Deciding), and
-// §A.4's marker digest (its ReadsScope digest with its key,
-// scopeKeyDigest), with catvis.KeySubject of its key, as the origin's;
-// its filter the grant's (grantcheck.FilterOf). A grant whose key-scope
-// or block rules refer to /now, or whose roles all do, can't read this
-// way: 403 (§C.2 item 5).
-func grantFview(cp *fcp, v *grant.Verified, steps int) (*fview, error) {
+// grantFview is a partial reader's view at cp (§7.9 view): its subjects
+// are grantcheck.FilteredSubjects of its ReadsScope digest and key, as
+// the origin's; its filter the grant's (grantcheck.FilterOf). A grant
+// whose key-scope or block rules refer to /now, or whose roles all do,
+// can't read this way: 403 (§C.2 item 5).
+func (ix *Index) grantFview(cp *fcp, v *grant.Verified, steps int) (*fview, error) {
 	digest, ok := grantcheck.ReadsScope(v)
 	if !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "a rule limiting the grant's reads refers to /now"}
 	}
-	var deciding [][]string
-	for _, c := range cp.cats {
-		subs, _ := c.Profile().Deciding(v.Principal)
-		deciding = append(deciding, subs)
-	}
 	pub, _ := v.Key.Raw["pub"].(string)
-	subjects := append(catvis.FilteredSubjects(deciding, v.Principal.Groups, scopeKeyDigest(digest, v.Key.Kid, pub)), catvis.KeySubject(v.Key.Kid, pub))
-	slices.Sort(subjects)
 	f := grantcheck.FilterOf(v)
 	f.Steps = steps
-	return newFview(cp, subjects, f), nil
+	return ix.newFview(cp, grantcheck.ViewSubjects(digest, v.Key.Kid, pub, true), f), nil
 }
 
-// errRulesChanged and errPartial refuse a cookie for a marker
-// reads:{ns}:g:{gs} at a checkpoint it doesn't stand for (§B.11.9 gs,
-// §B.11.5): the reader exchanges its grant again. errPartial is a marker
-// whose subjects were recorded holding "partial", under an earlier draft:
-// no gs leaves a group out any more (v0.78), so it stands for nothing.
+// errRulesChanged refuses a cookie for a marker reads:{ns}:g:{view} at a
+// checkpoint it doesn't stand for (§7.9 view): the reader exchanges its
+// grant again; errUncovered one for a namespace no longer covered.
 var (
-	errRulesChanged = &grant.AuthError{Status: 403, Msg: "the rules this subject set was issued under have changed: exchange the grant again (§B.11.9)"}
-	errPartial      = &grant.AuthError{Status: 403, Msg: "this subject set leaves out groups: exchange the grant again (§B.11.5, §B.11.9)"}
-	errUncovered    = &grant.AuthError{Status: 403, Msg: "the namespace is no longer read filtered: exchange the grant again (§B.11.9)"}
+	errRulesChanged = &grant.AuthError{Status: 403, Msg: "the rules this subject set was issued under have changed: exchange the grant again (§7.9)"}
+	errUncovered    = &grant.AuthError{Status: 403, Msg: "the namespace is no longer read filtered: exchange the grant again (§7.9)"}
 )
 
-// storedFview is the view of the cookie for marker m, reads:{ns}:g:{gs},
+// storedFview is the view of the cookie for marker m, reads:{ns}:g:{view},
 // that expires at exp, at cp, judged from what the exchanges recorded
-// alone (rec, gsKeysAt), never from a grant the request doesn't carry:
-// 403 where, for any key that cookie came from (gsKeysAt: those of one
+// alone (rec, viewKeysAt), never from a grant the request doesn't carry:
+// 403 where, for any key that cookie came from (viewKeysAt: those of one
 // exchange with several grants, each of which must hold), its whole entry or
 // one of its roles' whole definitions in ns's document as of cp differs
-// in any member from what the exchange recorded (entryHolds; §B.11.9 gs,
+// in any member from what the exchange recorded (entryHolds; §7.9 view,
 // v0.82), the scope digest of its kid's scope rules and
 // its roles' definitions, read from ns's document as of cp (a branch's
 // keys follow its base, §C.4), with rec's block rules and principal,
 // differs from the one rec's subjects carry (a kid or role gone, or no
 // longer listing read, counts as differing), or the key with its kid no
-// longer has the pub it had (§B.11.9 gs: a key "no longer accepted" as
+// longer has the pub it had (§7.9 view: a key "no longer accepted" as
 // §C.4 judges a base's keys, "only while the base has it with the same
 // pub"; a record without one, from before migration 006, never does),
-// where m has no such key recorded (from before migration 011), and where
-// its subjects hold "partial", recorded under an earlier draft (§B.11.5,
-// v0.78: no gs leaves a group out); otherwise item 1 from rec's
-// subjects and item 2 from its filter. Readers with the same subjects
+// or where m has no such key recorded (from before migration 011);
+// otherwise visibility from its filter. Readers with the same subjects
 // and rules share m, but a cookie only with exchanges through the same
 // keys with the same entries (recordCookies): never a cookie read under
 // a key no longer accepted, nor one vouched for again by an exchange
 // that isn't its own.
 func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *markerRec, exp int64) (*fview, error) {
-	if slices.Contains(rec.subjects, catvis.Partial) {
-		return nil, errPartial
-	}
-	recorded, err := ix.gsKeysAt(ctx, m, exp)
+	recorded, err := ix.viewKeysAt(ctx, m, exp)
 	if err != nil {
 		return nil, err
 	}
 	if len(recorded) == 0 {
 		return nil, errRulesChanged
 	}
-	doc, err := ix.docAt(ctx, cp.ns, cp.reads[cp.ns])
+	doc, err := ix.docAt(ctx, cp.ns, cp.at)
 	if err != nil {
 		return nil, err
 	}
@@ -1195,25 +285,25 @@ func (ix *Index) storedFview(ctx context.Context, cp *fcp, m string, rec *marker
 		// with the rules' digest alone (before this release) never holds:
 		// its cookies are 403 until the reader exchanges again.
 		holds := func(d string) bool {
-			return slices.Contains(rec.subjects, catvis.ScopePrefix+scopeKeyDigest(d, k.kid, k.pub))
+			return slices.Contains(rec.subjects, grantcheck.ScopePrefix+scopeKeyDigest(d, k.kid, k.pub))
 		}
-		if !gsKeyHolds(cfg, []grant.Key{key}, rec.f, k, holds) {
+		if !viewKeyHolds(cfg, []grant.Key{key}, rec.f, k, holds) {
 			return nil, errRulesChanged
 		}
 	}
-	return newFview(cp, rec.subjects, rec.f), nil
+	return ix.newFview(cp, rec.subjects, rec.f), nil
 }
 
-// gsKeyHolds reports whether k, a key a cookie of a marker came from, is
+// viewKeyHolds reports whether k, a key a cookie of a marker came from, is
 // still accepted with the pub it had, among keys (cfg's, or for a branch
 // its effective ones, §C.4), and lists read, and whether its scope rules
 // and its roles' definitions in cfg, each role still listing read, with
 // f's block rules and principal, still digest to what the marker stands
 // for (holds: for a g: marker, the scope subject its subjects carry,
 // storedFview; for a scope marker, the marker's own digest,
-// scopeKeysHold). §B.11.9 gs ends a gs cookie so, and §A.4 a scope cookie
-// "where a marker's key, rules or roles would end a gs cookie".
-func gsKeyHolds(cfg *grantcheck.Config, keys []grant.Key, f *grantcheck.ReadFilter, k gsKey, holds func(digest string) bool) bool {
+// scopeKeysHold). §7.9 view ends a view cookie so, and §A.4 a scope cookie
+// "where a marker's key, rules or roles would end a view cookie".
+func viewKeyHolds(cfg *grantcheck.Config, keys []grant.Key, f *grantcheck.ReadFilter, k viewKey, holds func(digest string) bool) bool {
 	i := slices.IndexFunc(keys, func(key grant.Key) bool { return key.Kid == k.kid })
 	if i < 0 || !keys[i].Lists("read") || k.pub == "" || keyPub(keys[i]) != k.pub {
 		return false
@@ -1222,7 +312,7 @@ func gsKeyHolds(cfg *grantcheck.Config, keys []grant.Key, f *grantcheck.ReadFilt
 		BlockRules: f.BlockRules, Roles: map[string][]any{}, Principal: f.Principal}
 	for _, r := range k.roles {
 		// A role that no longer lists read counts as gone, as at the
-		// origin (core gsDigestHolds): a cookie never reads where its
+		// origin (core viewDigestHolds): a cookie never reads where its
 		// grant couldn't (§2.1, §A.4).
 		def, ok := cfg.Roles[r]
 		if !ok || !def.Lists("read") {
@@ -1234,13 +324,13 @@ func gsKeyHolds(cfg *grantcheck.Config, keys []grant.Key, f *grantcheck.ReadFilt
 	return ok && holds(d)
 }
 
-// gMarker is the marker of a partial reader of covered ns with §B.11.9
-// subject set gs (§A.4).
-func gMarker(ns, gs string) string { return "reads:" + ns + ":g:" + gs }
+// gMarker is the marker of a partial reader of covered ns with §7.9
+// view view (§A.4).
+func gMarker(ns, vid string) string { return "reads:" + ns + ":g:" + vid }
 
 // cover computes a's view of covered namespace ns at the checkpoint with
 // ns at z ("" for the index's committed one), and with a grant (not a
-// cookie) sets a's marker and gs to it (§A.4). It is errUncovered for a
+// cookie) sets a's marker and view to it (§A.4). It is errUncovered for a
 // namespace not covered there (a grant's access is then that of an
 // uncovered namespace, a cookie's 403), errNotReached before the index's
 // first checkpoint of ns and errPurgedNS once ns is purged.
@@ -1275,11 +365,11 @@ func (ix *Index) cover(ctx context.Context, a *access, ns, z string) error {
 	return nil
 }
 
-// setView makes fv a's view; with a grant, a's marker and gs are fv's.
+// setView makes fv a's view; with a grant, a's marker and view are fv's.
 func (a *access) setView(ns string, fv *fview) {
 	a.cov, a.allow, a.filter = fv, fv.visible, fv.filter
 	if !a.cookie {
-		a.marker = gMarker(ns, fv.gs)
+		a.marker = gMarker(ns, fv.vid)
 		marked(a)
 	}
 }
@@ -1304,19 +394,11 @@ func (ix *Index) mayBeCovered(ctx context.Context, ns string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if !fsOpen(cfg.Doc) {
-		return false, nil
-	}
-	_, _, branch := localBase(cfg.Doc)
-	if branch || isCatalog(cfg.Doc) {
-		return true, nil
-	}
-	cats, _ := cfg.Doc["catalogs"].(map[string]any)
-	return len(cats) > 0, nil
+	return coverable(cfg.Doc), nil
 }
 
 // authReuse bounds how long a successful read of the core's root is
-// reused (§B.11.9 Where, v0.85: "reusing a successful read for at most a
+// reused (§7.9 Where, v0.85: "reusing a successful read for at most a
 // minute and none once a later read has failed").
 const authReuse = time.Minute
 
@@ -1363,95 +445,8 @@ func (e *rootErr) transient() bool {
 	return client.Transient(e.err)
 }
 
-// errNoMarker refuses a partial reader of a namespace §B.11.9 doesn't
-// cover that could be covered by its shape (catalogShaped): it has no
-// marker there, so no hits judged by rules alone (§A.4).
-var errNoMarker = &grant.AuthError{Status: 403, Msg: "the namespace is not read filtered now, and a reader of it in part reads none of it (§A.4, §B.11.9)"}
-
-// catalogShaped reports whether a partial reader of ns, which §B.11.9
-// doesn't cover, has no marker there (§A.4, v0.82: none "where it doesn't
-// but {ns} is neither sealed nor end-to-end and is a catalog (§B.6) or
-// its catalogs, or that of any local base in its chain at the base's head
-// or as of the at it is read through at, names one"): ns's document at
-// its head, or at the index's checkpoint of it, is a catalog, or names a
-// catalog in catalogs, or a local base up its chain does, read as of the
-// at its branch reads it at and at its head, either counting, unless ns
-// is sealed or e2e by each of those documents. A base purged or gone
-// counts as naming one: what it named can't be read.
-func (ix *Index) catalogShaped(ctx context.Context, ns string) (bool, error) {
-	cfg, err := ix.checker.Config(ctx, ns)
-	if err != nil {
-		return false, err
-	}
-	docs := []map[string]any{cfg.Doc}
-	if z, purged, err := ix.committed(ctx, ns); err != nil {
-		return false, err
-	} else if !purged && z != "" {
-		d, err := ix.docAt(ctx, ns, z)
-		if err != nil {
-			return false, err
-		}
-		docs = append(docs, d)
-	}
-	if !slices.ContainsFunc(docs, func(d map[string]any) bool { return !derived.Protected(derived.InfoOf(d).Level) }) {
-		return false, nil
-	}
-	for _, d := range docs {
-		if namesCatalog(d) {
-			return true, nil
-		}
-		b, at, ok := localBase(d)
-		for n := 0; ok; n++ {
-			if n == maxChain {
-				return true, nil
-			}
-			heads, err := ix.checker.Config(ctx, b)
-			if client.IsPurged(err) || client.IsNotFound(err) {
-				return true, nil
-			}
-			if err != nil {
-				return false, lacksRead(b, fmt.Errorf("the head of %s: %w", b, err))
-			}
-			bdoc, err := ix.docAt(ctx, b, at)
-			if client.IsPurged(err) || client.IsGone(err) || client.IsNotFound(err) {
-				return true, nil
-			}
-			if err != nil {
-				return false, err
-			}
-			if namesCatalog(heads.Doc) || namesCatalog(bdoc) {
-				return true, nil
-			}
-			b, at, ok = localBase(bdoc)
-		}
-	}
-	return false, nil
-}
-
-// namesCatalog reports whether doc is a catalog or its catalogs names one.
-func namesCatalog(doc map[string]any) bool {
-	cats, _ := doc["catalogs"].(map[string]any)
-	return isCatalog(doc) || len(cats) > 0
-}
-
-// members are the namespaces cp's at covers but ns, sorted.
-func (cp *fcp) members() []string {
-	out := make([]string, 0, len(cp.ids))
-	for m := range cp.ids {
-		if m != cp.ns {
-			out = append(out, m)
-		}
-	}
-	slices.Sort(out)
-	return out
-}
-
 // coverTags are the Cache-Tags of an answer at cp besides its hits':
-// idx:{m} for every namespace in at, as listed (ids, §A.4).
+// idx:{ns} (§A.4).
 func coverTags(cp *fcp) []string {
-	tags := []string{"idx:" + cp.ns}
-	for _, m := range cp.members() {
-		tags = append(tags, "idx:"+m)
-	}
-	return tags
+	return []string{"idx:" + cp.ns}
 }

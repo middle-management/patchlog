@@ -13,9 +13,9 @@
 //	               {"status":"ok"}.
 //
 // Both are Cache-Control: no-store and CDN-Cache-Control: no-store, so no
-// CDN keeps them. The paths start with an underscore, which no namespace or
-// catalog name can (§3.6: ^[a-z0-9][a-z0-9_-]{0,63}$), so they can't shadow
-// the index's /{ns} or the tree service's /{catalog} routes; they follow the
+// CDN keeps them. The paths start with an underscore, which no namespace
+// name can (§3.6: ^[a-z0-9][a-z0-9_-]{0,63}$), so they can't shadow the
+// index's /{ns} routes; they follow the
 // services' existing /_status.
 //
 // Shutdown (Server.Shutdown) runs in phases:

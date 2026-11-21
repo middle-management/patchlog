@@ -8,8 +8,7 @@ package core
 //
 //   - one per resource row (deks.res = resources.res) of a namespace whose
 //     encryption.level is at-rest or higher, created at its first encrypted
-//     write. A branch's own rows, and a remote branch's shadow rows, have
-//     their own resource rows and so their own keys; read-through decrypts a
+//     write. A branch's own rows have their own resource rows and so their own keys; read-through decrypts a
 //     base's rows with the base's keys.
 //   - one for the whole deployment (deks.res = 0), for grants.blocks: a
 //     grant is stored once, however many namespaces it is used in.
@@ -49,7 +48,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"strings"
 	"sync"
 
 	"github.com/middle-management/patchlog/internal/grant"
@@ -196,22 +194,8 @@ func isSealed(b string) bool { return len(b) > 0 && b[0] == rowVersion }
 
 // --- levels -----------------------------------------------------------------
 
-// nsLevel is a namespace's encryption level. A remote branch's shadow
-// (§G.3) follows its branch.
+// nsLevel is a namespace's encryption level.
 func (t *tx) nsLevel(n *nsRow) int {
-	if n.isShadow() {
-		if l, ok := t.shadowLevels[n.name]; ok {
-			return l
-		}
-		var cfg sql.NullInt64
-		// "~{branch}" or, for a base of its base, "~{branch}~{i}".
-		branch, _, _ := strings.Cut(n.name[1:], "~")
-		err := t.QueryRow(`SELECT n.config_seq FROM namespaces n JOIN remote_bases r ON r.branch = n.ns WHERE n.name = ?`, branch).Scan(&cfg)
-		if err == nil && cfg.Valid {
-			return t.config(cfg.Int64).level
-		}
-		return levelNone
-	}
 	return t.config(n.configSeq).level
 }
 
@@ -413,19 +397,14 @@ func (t *tx) storeGrantBlocks(id, blocks []byte, root *grantRoot, encrypt bool) 
 
 // --- turning encryption on ----------------------------------------------------
 
-// encryptNamespace encrypts the stored rows of n (and of its remote shadow)
-// that are still plaintext, after its level was raised to at-rest: patch
+// encryptNamespace encrypts the stored rows of n that are still plaintext, after its level was raised to at-rest: patch
 // sets, head and intermediate snapshots, and the grants its revisions and
 // namespace entries were written with. It runs in the config write's
 // transaction, so the namespace is never observed half-way; reads handle
 // mixed rows anyway.
 func (t *tx) encryptNamespace(n *nsRow) {
 	t.resLevels = nil
-	nss := []int64{n.id}
-	for _, sh := range t.remoteShadows(n) {
-		nss = append(nss, sh.id)
-	}
-	for _, ns := range nss {
+	for _, ns := range []int64{n.id} {
 		t.lockNS(ns, lockExclusive)
 		// The heads' sizes and plaintext digests go: at rest they would
 		// confirm a guess of a document beside its encrypted content, and
@@ -552,8 +531,7 @@ func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 
 // checkNoE2ERaise refuses a config write that raises an existing
 // namespace to e2e: a namespace is end-to-end from its creation or never
-// (Addendum E Levels, Changing it), whatever its base or source, so a
-// remote branch's is refused before its source is read (§G.5.2). Content
+// (Addendum E Levels, Changing it), whatever its base. Content
 // that should become end-to-end is written into a new e2e namespace by a
 // key holder (§G.5.1), which no reference tool does: the importer refuses
 // plaintext into an e2e target. Options.LegacyE2ERaiseForTests lets it through, only

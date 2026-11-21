@@ -36,8 +36,6 @@ func TestReviewGateOrderNS(t *testing.T) {
 		{method: "PATCH", path: "/ns/sec", body: ops(op("add", "/x-note", "n"))},      // no precondition: no 428
 		{method: "POST", path: "/ns/sec/branches", body: map[string]any{"name": "r"}}, // no If-None-Match: no 428
 		{method: "POST", path: "/ns/sec/purge", ifMatch: e.nsHead("sec", f.adminG)},
-		{method: "POST", path: "/ns/sec/branches", body: map[string]any{
-			"remote": map[string]any{"origin": "https://b.example", "ns": "rel"}, "at": e.nsHead("sec", f.adminG)}},
 	}
 	for _, q := range unauth {
 		expectCode(t, e.do(q), 401, "unauthenticated")

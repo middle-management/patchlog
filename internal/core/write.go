@@ -391,32 +391,24 @@ func (e *Engine) WriteResource(ctx context.Context, req Request, item Item) (*Wr
 // Batch performs an atomic batch (§7.5).
 func (e *Engine) Batch(ctx context.Context, req Request, items []Item, cfg *ConfigChange, source any, dryRun bool) (*WriteResult, error) {
 	if dryRun {
-		// A dry run writes nothing: steps 1–6 in a read transaction. A
-		// config change a remote branch's base judges reads the base's
-		// document first, as a config write does (withRemoteSource, §G.5.2).
+		// A dry run writes nothing: steps 1–6 in a read transaction.
 		var res *WriteResult
-		err := e.withRemoteSource(ctx, func(ctx context.Context) error {
-			return e.read(ctx, func(t *tx) error {
-				r, err := t.writeItems(req, items, cfg, source, true, true, false)
-				res = r
-				return err
-			})
+		err := e.read(ctx, func(t *tx) error {
+			r, err := t.writeItems(req, items, cfg, source, true, true, false)
+			res = r
+			return err
 		})
 		return res, err
 	}
 	if cfg != nil {
 		// A batch that changes the configuration is rare, and its config
 		// change reads more than the re-check covers (dependents, archive
-		// destinations): it runs its whole gate inside the write lock,
-		// after reading what a remote branch's base judges it by
-		// (withRemoteSource, §G.5.2).
+		// destinations): it runs its whole gate inside the write lock.
 		var res *WriteResult
-		err := e.withRemoteSource(ctx, func(ctx context.Context) error {
-			return e.update(ctx, func(t *tx) error {
-				r, err := t.writeItems(req, items, cfg, source, true, false, false)
-				res = r
-				return err
-			})
+		err := e.update(ctx, func(t *tx) error {
+			r, err := t.writeItems(req, items, cfg, source, true, false, false)
+			res = r
+			return err
 		})
 		return res, err
 	}
@@ -831,10 +823,17 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	// Settling the verb completes authorisation: a 403 here is reported
 	// like one of step 1, and a dry run answers it as a submit would
-	// (§6.2, §7.5). It runs for every item before anything else of step 2.
+	// (§6.2, §7.5). It runs for every item before anything else of step 2,
+	// after the read check of the head (step 2.2): settling tells a
+	// tombstone from a live head, which a head the grant can't read must
+	// not (§C.2 item 5).
 	var denied []itemErr
 	for _, s := range st {
-		if err := t.settle(n, s); err != nil {
+		err := t.readsWrittenHead(n, cfg, a, s.Resource)
+		if err == nil {
+			err = t.settle(n, s)
+		}
+		if err != nil {
 			if err.Status == 403 {
 				denied = append(denied, itemErr{s.index, err})
 			} else {
@@ -1107,6 +1106,9 @@ func (t *tx) planEntry(p *writePlan, author int64, entries []any, inserted []his
 		entry := map[string]any{"kind": "batch", "entries": entries}
 		if p.src != nil {
 			entry["source"] = p.src
+			// An import from another deployment starts a follow of its
+			// purges (§G.1).
+			t.recordImport(p.n, p.src, p.st)
 		}
 		return nsAppend{entry: entry, meta: batchGestures(p.st), author: author, hist: inserted}
 	}
@@ -1219,6 +1221,31 @@ func (t *tx) settle(n *nsRow, s *itemState) *Error {
 	return nil
 }
 
+// readsWrittenHead is the rest of §6.2 step 2.2: a write to a resource
+// with a head as the writer sees it (a branch's view, read through
+// included), a delete or create included, by a grant that may read but
+// whose read rules don't allow reading that head (§C.2 item 5: its
+// revision's read envelope, a tombstone's being the document it deleted)
+// is 403, so that steps 3–5 never judge a document it can't read. A grant
+// without read, through its verbs and a role that counts for read, isn't
+// judged here: it learns from steps 3–5 what §6.4.1 says it may.
+func (t *tx) readsWrittenHead(n *nsRow, cfg *Config, a *actor, name string) *Error {
+	if a == nil || a.verified == nil || t.e.opt.AuthDisabled || cfg.Read == "public" {
+		return nil
+	}
+	if _, ok := readRoles(a); !ok || scopeReferToNow(a) {
+		return nil
+	}
+	v := t.resolve(n, name, nil)
+	if v.head == nil || v.state == Purged {
+		return nil
+	}
+	if !t.canRead(n, cfg, a, name) || !t.mayReadRow(a, n, name, v.head) {
+		return forbidden("the grant may read but its read rules don't allow reading this resource's head (§6.2 step 2.2, §C.2 item 5)")
+	}
+	return nil
+}
+
 // entryVerb is the verb an entry was written with: restore when its parent
 // is a tombstone, append otherwise (§6.2).
 func (t *tx) entryVerb(row *revRow) string {
@@ -1281,16 +1308,12 @@ func expectedIDs(s *itemState) ([]ids.ID, bool) {
 }
 
 // purgedItems answers step 2.1's refusals before the retry lookup, which
-// doesn't apply to them (§6.2 step 2, §7.2): the 502 upstream of a
-// resource whose source was raised to a level this server lacks
-// (upstreamRefusal, §1), and 410 for each item whose resource is purged,
+// doesn't apply to them (§6.2 step 2, §7.2): 410 for each item whose resource is purged,
 // as the writer sees it (§7.6), as every URL of it is (§8.3).
 func (t *tx) purgedItems(n *nsRow, st []*itemState) []itemErr {
 	var fs []itemErr
 	for _, s := range st {
-		if err := t.upstreamRefusal(n, s.Resource); err != nil {
-			fs = append(fs, itemErr{s.index, err})
-		} else if t.resolve(n, s.Resource, nil).state == Purged {
+		if t.resolve(n, s.Resource, nil).state == Purged {
 			fs = append(fs, itemErr{s.index, gone()})
 		}
 	}
@@ -2148,8 +2171,7 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 // canonical form, the bytes GET …/rev/{id} serves, which /heads lists
 // (§7.4) without reading any document. Every path
 // that moves a head stores them where it has the document at hand: step 7
-// here, and the chains remote branches and mirrored schemas insert
-// (insertChain). Sealed and e2e namespaces store none, as they list none
+// here. Sealed and e2e namespaces store none, as they list none
 // (e2e content has no document here, §E.3), nor do namespaces encrypted
 // at rest, where the digest would sit in plaintext beside the encrypted
 // content (§E.1 Stored digests), nor tombstones, nor rows written before
@@ -2195,17 +2217,6 @@ func storedLen(v any) int {
 		return len(v)
 	}
 	return 0
-}
-
-// maybeSnapshot writes an intermediate snapshot at seq, res's latest
-// revision, once enough patch sets have accumulated since its last one
-// (D.4), counted from its revisions; the paths that insert revisions
-// outside step 7 use it, and leave the row's counts unknown.
-func (t *tx) maybeSnapshot(res, seq int64, doc []byte) {
-	revs, size := t.countSinceSnapshot(res)
-	if revs >= int64(t.e.opt.SnapshotEveryRevisions) || size >= int64(t.e.opt.SnapshotEveryBytes) {
-		t.bulkExec(insSnapshots, [][]any{{seq, res, t.putDoc("snapshots", res, seq, doc)}})
-	}
 }
 
 // sortedKeys is a helper for stable output.

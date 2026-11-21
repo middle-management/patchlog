@@ -24,7 +24,7 @@ import (
 // checked in write mode, and each revision of a closure compiles under
 // current rules, a stored revision only an earlier version accepted being
 // an invalid schema (a write pinning it is 422 invalid). They are still
-// recorded and served, unchanged, so a database or a remote mirror keeps
+// recorded and served, unchanged, so a database keeps
 // the same rows either side of the upgrade:
 //
 // Each revision row records, in revisions.rules, the rules its document was
@@ -34,10 +34,7 @@ import (
 // part of the revision id.
 //
 // A schema revision read in the clear carries its marker in
-// schema.RulesHeader (Rev.SchemaRules). The rows a remote branch mirrors
-// from another deployment (§G.3) keep the marker the base serves each
-// schema revision with (fetchRules, F-S1), and are NULL where it serves
-// none.
+// schema.RulesHeader (Rev.SchemaRules).
 //
 // A revision whose document is a schema document and whose id other rows
 // already have is a content-addressed copy of them (§3.3): a fast-forward
@@ -76,8 +73,7 @@ func (t *tx) validateStep(step *stepState, sc *schemaCtx, pending map[string]any
 // validatedDocs remembers which revisions this engine, since it started,
 // has found valid against which schema revision: the proof that a patch
 // to one may be validated by its changes alone. That a revision is stored
-// is no such proof: a remote branch mirrors revisions another deployment
-// validated (§G.3), and those of an earlier version of this one were
+// is no such proof: those of an earlier version of this one were
 // validated as that version read schemas and formats. A revision id fixes
 // its document (§3.3) and a schema revision path its schema, so the fact
 // holds wherever and whenever the id is met again; the first patch to a
@@ -225,7 +221,7 @@ func (t *tx) docRules(id ids.ID, doc any, sc *schemaCtx) schema.Rules {
 }
 
 // rowRules is the rules marker revision row seq was stored with: NULL
-// (written before markers, or mirrored from a base that served none) is
+// (written before markers) is
 // Legacy. A row's marker never
 // changes, whoever resolves it: the transaction keeps it (t.schemas, by
 // seq), read ahead with the heads of a batch's pinned schemas
@@ -545,7 +541,7 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, int64, error) {
 		// Never into a branch (schema_ref), but that tells only a writer
 		// who can read the revision there: for any other the path doesn't
 		// resolve, as in a namespace that doesn't exist (§6.1).
-		if row := t.schemaRevRow(n, ref); row != nil && t.schemaReadable(n, ref.Name, sc) && t.schemaKeysOpen(n, ref.Name, row, sc) {
+		if row := t.schemaRevRow(n, ref); row != nil && t.schemaReadable(n, ref.Name, row, sc) && t.schemaKeysOpen(n, ref.Name, row, sc) {
 			return nil, 0, schema.ErrBranch
 		}
 		return nil, 0, schema.ErrUnavailable
@@ -558,11 +554,14 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, int64, error) {
 	// A namespace that opens its schemas with schemaReads lets writes to a
 	// listed namespace resolve them without read (§6.1); only schema
 	// documents, checked once loaded.
-	readable := t.schemaReadable(n, ref.Name, sc)
+	// Read is judged per revision (§C.2 item 5): a revision the writer's
+	// read rules hide is unreadable, refused as one in a namespace it
+	// can't read, its content never judged (§6.1 Read permission).
+	row := t.schemaRevRow(n, ref)
+	readable := t.schemaReadable(n, ref.Name, row, sc)
 	if !readable && (sc.target == nil || !t.schemaReadsServe(n, sc.target)) {
 		return nil, 0, schema.ErrForbidden
 	}
-	row := t.schemaRevRow(n, ref)
 	if row == nil {
 		return nil, 0, schema.ErrUnavailable
 	}
@@ -579,15 +578,23 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, int64, error) {
 	return d, row.seq, nil
 }
 
-// schemaReadable reports whether the writer of sc may read resource name
-// of n (§6.1 Read permission): in the namespace written, with the write's
-// own grant; in any other, by the rule for other namespaces (§7.5), with
-// it or a grant in Source-Authorization.
-func (t *tx) schemaReadable(n *nsRow, name string, sc *schemaCtx) bool {
+// schemaReadable reports whether the writer of sc may read revision row
+// of resource name of n (§6.1 Read permission): in the namespace written,
+// with the write's own grant; in any other, by the rule for other
+// namespaces (§7.5), with it or a grant in Source-Authorization. Read
+// rules referring to /doc are judged on row (§C.2 item 5); a nil row (no
+// such revision) is judged by name alone.
+func (t *tx) schemaReadable(n *nsRow, name string, row *revRow, sc *schemaCtx) bool {
 	if sc.target != nil && n.id == sc.target.id {
-		return t.canRead(n, t.config(n.configSeq), sc.a, name)
+		if !t.canRead(n, t.config(n.configSeq), sc.a, name) {
+			return false
+		}
+		return row == nil || t.mayReadRow(sc.a, n, name, row)
 	}
-	return t.credsRead(n, name, sc.creds)
+	if row == nil {
+		return t.credsRead(n, name, sc.creds)
+	}
+	return t.credsReadRow(n, name, row, sc.creds)
 }
 
 // schemaKeysOpen reports whether the writer of sc gets keys opening schema
@@ -695,9 +702,7 @@ func (t *tx) prefetchSchemas(refs []schema.Ref) {
 		for rows.Next() {
 			n, err := scanNS(rows)
 			t.must(err)
-			if !n.isShadow() { // never a path's (nsByName)
-				t.memoSchemaNS(n)
-			}
+			t.memoSchemaNS(n)
 		}
 		t.must(rows.Err())
 		rows.Close()

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"log"
 	"math/rand/v2"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -35,7 +34,11 @@ import (
 // write it admits can commit: an admitted write's deduction is never lost,
 // and a request refused after admission, or whose transaction runs again,
 // keeps it (§6.6). It runs on a pool of its own, so a draw never waits for
-// a connection that transactions waiting on draws hold, and it takes no
+// a connection that transactions waiting on draws hold. A write checked
+// outside the lock (D.3) draws after its check's read transaction, so it
+// holds no connection of the main pool while it waits (checkOutside); one
+// checked in the lock, on its own (writeLocked), draws in its transaction,
+// as config writes, branch writes and prunes do. The draw takes no
 // lock a write transaction holds: bucket rows don't join the advisory and
 // log locks whose order pglock.go keeps, and a principal's writes to
 // different namespaces don't wait for each other's commits. Hot buckets
@@ -61,6 +64,13 @@ type bucketStore struct {
 	// retried counts the draws Postgres rolled back for a deadlock that
 	// ran again (tests).
 	retried atomic.Int64
+	// stopped counts the checks that stopped at a draw on a bucket known
+	// empty and were admitted, so ran again (checkOutside; tests).
+	stopped atomic.Int64
+	// empty holds, by key, the buckets this instance's last draw on found
+	// empty, until when (Unix microseconds) they stay so if no other
+	// instance's draws refill them: knownEmpty.
+	empty sync.Map
 }
 
 // openBucketStore opens the bucket pool on the Postgres database url.
@@ -75,18 +85,16 @@ func openBucketStore(url string) (*bucketStore, error) {
 	}
 	cfg.RuntimeParams["synchronous_commit"] = "off"
 	db := stdlib.OpenDB(*cfg)
-	pool.sizeBuckets(db)
+	pool.sizeSide(db)
 	return &bucketStore{db: db}, nil
 }
 
-// bucketConns is the size of the bucket pool: a quarter of the main
-// pool's (mainConns, 4 × GOMAXPROCS), a connection per CPU, at least two
-// (a sweep holds one). A draw is one short statement, a fraction of the
-// round trips of the write that waits for it on the main pool, and draws
-// on one bucket queue on its row lock whatever the pool's size: more
-// connections would only hold more of the server's max_connections, which
-// every instance's two pools share.
-func bucketConns() int { return max(2, runtime.GOMAXPROCS(0)) }
+// The bucket pool is a quarter of the main pool's size, at least two
+// (pgPool.sideSize): a draw is one short statement, a fraction of the
+// round trips of the write that waits for it, and draws on one bucket
+// queue on its row lock whatever the pool's size: more connections would
+// only hold more of the server's max_connections, which every instance's
+// pools share.
 
 // close waits for a running sweep and closes the pool.
 func (s *bucketStore) close() error {
@@ -127,14 +135,24 @@ func merged(draws []draw) []draw {
 // the longest wait, the first in draws among equal ones.
 func (s *bucketStore) admit(ctx context.Context, now time.Time, draws []draw) (time.Duration, string, bool, error) {
 	tokens, ok, err := s.draw(ctx, now, draws, false)
-	if err != nil || ok {
+	if err != nil {
+		return 0, "", ok, err
+	}
+	if ok {
+		for _, d := range draws {
+			if _, was := s.empty.Load(d.key); was {
+				s.empty.Delete(d.key)
+			}
+		}
 		return 0, "", ok, err
 	}
 	var wait time.Duration
 	var hit string
 	for _, d := range draws {
 		if t := tokens[d.key]; t < 1 {
-			if w := time.Duration((1 - t) / d.rate.Rate * float64(time.Second)); w > wait {
+			w := time.Duration((1 - t) / d.rate.Rate * float64(time.Second))
+			s.empty.Store(d.key, now.Add(w).UnixMicro())
+			if w > wait {
 				wait, hit = w, d.name
 			}
 		}
@@ -145,6 +163,21 @@ func (s *bucketStore) admit(ctx context.Context, now time.Time, draws []draw) (t
 		wait, hit = time.Microsecond, draws[0].name
 	}
 	return wait, hit, false, nil
+}
+
+// knownEmpty reports whether this instance's last draw on a bucket of
+// draws found it empty, and it can't have refilled a token by now. Draws
+// of other instances only take tokens, so it is then empty unless the
+// bucket's rate was raised meanwhile: a write's check stops at its draw
+// then, as at a 429, and doesn't go on to its later steps first (admit,
+// checkOutside). It is a hint, never an answer: the draw decides.
+func (s *bucketStore) knownEmpty(now time.Time, draws []draw) bool {
+	for _, d := range draws {
+		if until, ok := s.empty.Load(d.key); ok && now.UnixMicro() < until.(int64) {
+			return true
+		}
+	}
+	return false
 }
 
 // charge is rateLimiter.charge on the store: it deducts d's cost whatever
@@ -280,6 +313,13 @@ func (s *bucketStore) maybeSweep(now time.Time) {
 		return
 	}
 	s.swept, s.sweeping = now, true
+	// Hints past their time (knownEmpty) go with the full buckets.
+	s.empty.Range(func(k, until any) bool {
+		if now.UnixMicro() >= until.(int64) {
+			s.empty.Delete(k)
+		}
+		return true
+	})
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()

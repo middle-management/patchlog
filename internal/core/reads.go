@@ -198,8 +198,17 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, name); err != nil {
+		a, err := t.reader(n, cred, name)
+		if err != nil {
 			return err
+		}
+		if t.readsByDoc(n, a) {
+			// Judged with the head's document (§C.2 item 5), a purged
+			// namespace's or resource's being null: answered as a read the
+			// reader may not make where the rules don't allow it (§7).
+			if n.purged || !t.mayReadRow(a, n, name, t.resolve(n, name, nil).head) {
+				return notFound()
+			}
 		}
 		// May read: the answer is the same for every reader (readcache.go).
 		if c, ok := e.rc.headFor(g, ns, name); ok {
@@ -236,7 +245,7 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 // successorAt is the top-level $successor of the document at row, a
 // tombstone's last live revision, if it has the form of §8.1 (§6.5); ""
 // if it has none, another form, or the document can't be read. The row
-// may be a base's (read-through) or a remote base's mirror: its document
+// may be a base's (read-through): its document
 // is read here either way. Whoever wrote the document wrote it (§8.1).
 func (t *tx) successorAt(row *revRow) string {
 	if row == nil || row.kind != kindRev {
@@ -298,13 +307,23 @@ type Rev struct {
 	// e2e, or the revision is from before a raise to e2e from none or
 	// at-rest), the rules marker its revision row was stored with
 	// (schema.Rules.String, schemaload.go), sent as schema.RulesHeader so
-	// clients and remote mirrors compile it as this server does (§6.1).
+	// clients compile it as this server does (§6.1).
 	// "" otherwise.
 	SchemaRules string
 }
 
-// ResourceRev serves the document at a revision.
+// ResourceRev serves the document at a revision. A partial reader's
+// request with its grant in Authorization is a *FilteredRedirect to the
+// URL's form under its view (§7.9 Content).
 func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
+	return e.resourceRev(ctx, ns, name, id, cred, "/rev/"+id)
+}
+
+// resourceRev is ResourceRev, redirecting a partial reader to its view's
+// form of the URL ending in content after the resource's name, unless
+// content is "" (a read for another URL's answer, as ResourceRaw's of
+// /raw, which stays at its own URL).
+func (e *Engine) resourceRev(ctx context.Context, ns, name, id string, cred Credentials, content string) (*Rev, error) {
 	if c := e.rc.rev(ns, name, id); c != nil {
 		return c.answer(true), nil
 	}
@@ -320,15 +339,25 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		rid, perr := ids.Parse(id)
 		referrer := false
-		if _, err := t.reader(n, cred, name); err != nil {
+		a, aerr := t.reader(n, cred, name)
+		if aerr != nil {
 			// A schema revision n opens with schemaReads, to a reader of
 			// a document that pins it (§6.1, §7); nothing else of n.
 			if perr != nil || !t.schemaReadsRev(n, name, rid, cred, g) {
-				return err
+				return aerr
 			}
 			referrer = true
 		}
+		if !referrer && content != "" {
+			if err := t.contentRedirect(n, cred, a, name, content); err != nil {
+				return err
+			}
+		}
+		byDoc := !referrer && t.readsByDoc(n, a)
 		if n.purged {
+			if byDoc {
+				return notFound() // judged with a null document (§6.4.1)
+			}
 			return t.purgedRead(n)
 		}
 		out = &Rev{Public: t.cachePublic(n), Referrer: referrer}
@@ -342,7 +371,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		// May read: a plain document is the same for every reader
 		// (readcache.go). Sealed and e2e content is never cached.
-		if !t.isSealedNS(n) && !t.e2eContent(n, name) {
+		if !t.isSealedNS(n) && !t.e2eContent(n, name) && !byDoc {
 			if c := e.rc.revFor(g, ns, name, id); c != nil {
 				out, cached = c.answer(out.Public), true
 				out.Referrer = referrer
@@ -351,6 +380,12 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		v := t.resolve(n, name, nil)
 		if v.state == Purged {
+			if byDoc {
+				// Judged with a null document (§6.4.1), and answered as
+				// an id the resource doesn't have, headers included.
+				out.Status = 404
+				return nil
+			}
 			out.Status = 410
 			return nil
 		}
@@ -360,6 +395,15 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		row := t.findInAncestry(v.head, rid)
 		if row == nil {
+			out.Status = 404
+			return nil
+		}
+		if byDoc && !t.mayReadRow(a, n, name, row) {
+			// That revision's read envelope (§C.2 item 5): a read-rule
+			// failure, 404 at a resource's URL (§7), answered as an id
+			// the resource doesn't have, its cache headers and tags
+			// included, so they don't tell a hidden revision from one
+			// that doesn't exist.
 			out.Status = 404
 			return nil
 		}
@@ -586,29 +630,42 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 		if aerr != nil {
 			return aerr
 		}
+		byDoc := t.readsByDoc(n, a)
 		if n.purged {
+			if byDoc {
+				return notFound() // judged with null documents (§6.4.1)
+			}
 			return t.purgedRead(n)
 		}
 		if q != nil {
 			q.ok, q.anyone, q.until = standing(t, n, cred, a)
+			if byDoc {
+				// Its answers are judged per entry, never shared.
+				q.ok = false
+			}
 		}
 		out = &Log{Public: t.cachePublic(n), Until: t.admittedUntil(n, cred, a)}
 		v := t.resolve(n, name, nil)
 		if v.state == Purged {
+			if byDoc {
+				return notFound() // judged with null documents (§6.4.1)
+			}
 			out.Status = 410
 			return nil
 		}
-		if v.head == nil {
-			// A resource with no entries: from its head and genesis (a
-			// live read with an empty since), an empty range, which an
-			// event stream or long-poll waits on, once the read check
-			// above has passed (§7.3, §7.7). Any other range of it is
-			// unknown.
-			out.Status = 404
+		// A resource with no entries: from its head and genesis (a live
+		// read with an empty since), an empty range, which an event
+		// stream or long-poll waits on, once the read check above has
+		// passed (§7.3, §7.7). Any other range of it is unknown.
+		absent := func() error {
+			out.Status, out.Entries, out.More, out.Last = 404, nil, false, since
 			if id == "" && since == "" {
 				out.Status = 200
 			}
 			return nil
+		}
+		if v.head == nil {
+			return absent()
 		}
 		to := v.head
 		if id != "" {
@@ -654,6 +711,20 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 			var pe *prunedError
 			switch {
 			case errors.As(err, &pe):
+				// A reader whose read rules refer to /doc learns of the
+				// horizon only where the kept range would be answered it
+				// (judgeEntries): one that can read none of it is
+				// answered as for a name that doesn't exist, any other
+				// that can't read all of it, but a partial reader, as for
+				// a range with a revision it can't read (§C.2 item 5).
+				if byDoc {
+					switch seen, all := t.seesKeptRange(n, a, name, to); {
+					case !seen:
+						return absent()
+					case !all && !t.readsPartially(n, a):
+						return notFound()
+					}
+				}
 				out.Status = 410
 				out.Horizon, out.Archive = t.prunedInfo(pe)
 			case errors.Is(err, errNotAncestor):
@@ -668,6 +739,24 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 		// entries after it: the horizon's sealed snapshot is served as
 		// /rev/{H} (ResourceRev), never as a log entry (§7.1 Paging).
 		out.Last = since
+		if byDoc {
+			// Each entry judged with its own read envelope (§C.2 item 5).
+			ms, ok := t.judgeEntries(n, a, name, entries)
+			if !ok {
+				// A range it can read nothing of from genesis is a
+				// resource it can read no revision of: answered as a name
+				// that doesn't exist (§C.2 item 5).
+				if since == "" && !t.seesAnyEntry(n, a, name, entries) {
+					return absent()
+				}
+				return notFound()
+			}
+			out.Entries = ms
+			if len(entries) > 0 {
+				out.Last = entries[len(entries)-1].ID
+			}
+			return nil
+		}
 		for _, e := range entries {
 			out.Entries = append(out.Entries, e.value())
 			out.Last = e.ID
@@ -704,23 +793,23 @@ type NSInfo struct {
 }
 
 // NamespaceHead returns the namespace head and config ids. A partial
-// reader of a namespace §B.11.9 covers gets them too, the head pointer of
-// §7.4, though the revision it names stays 403 to it (§B.11.9 Answers).
+// reader of a namespace §7.9 covers gets them too, the head pointer of
+// §7.4, though the revision it names stays 403 to it (§7.9 Answers).
 func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials) (*NSInfo, error) {
 	return e.namespaceHead(ctx, ns, cred, false)
 }
 
 // NamespaceLogHead is NamespaceHead for GET /ns/{ns}/log without live,
 // redirected to the range /ns/{ns}/rev/{head}/log: a partial reader of a
-// namespace §B.11.9 covers gets a *FilteredRedirect to the filtered range
-// at the current at instead (§B.11.9 URLs).
+// namespace §7.9 covers gets a *FilteredRedirect to the filtered range
+// at the current at instead (§7.9 URLs).
 func (e *Engine) NamespaceLogHead(ctx context.Context, ns string, cred Credentials) (*NSInfo, error) {
 	return e.namespaceHead(ctx, ns, cred, true)
 }
 
 func (e *Engine) namespaceHead(ctx context.Context, ns string, cred Credentials, redirect bool) (*NSInfo, error) {
 	var out *NSInfo
-	err := e.filteredRead(ctx, func(t *tx) error {
+	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
@@ -822,7 +911,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 	var out *Log
 	var jobs []*sealJob
 	var nsRowID int64
-	err := e.filteredRead(ctx, func(t *tx) error {
+	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		var a *actor
 		var aerr *Error
@@ -840,13 +929,13 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 		default:
 			// A partial reader is redirected to the filtered form: a range
-			// at the current at, events and long-poll without one (§B.11.9
+			// at the current at, events and long-poll without one (§7.9
 			// URLs).
 			var err error
 			if a, err = t.nsReaderOrRedirect(n, cred); err != nil {
 				var fr *FilteredRedirect
 				if errors.As(err, &fr) && (perEntry || live != nil) {
-					fr.At, fr.CP = "", nil
+					fr.At = ""
 				}
 				return err
 			}
@@ -946,6 +1035,9 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		if resource != "" {
 			// A resource stream's purge and prune events (eventseal.go).
 			out.Entries = resourceEvents(out.Entries, resource)
+			if t.readsByDoc(n, a) {
+				out.Entries = t.judgePruneEvents(n, a, resource, out.Entries)
+			}
 			if t.isSealedNS(n) {
 				out.Sealed, nsRowID = true, n.id
 				jobs = t.resourceEventJobs(n, resource, out.Entries)
@@ -1020,19 +1112,19 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 // NamespaceHeadsPrefix is NamespaceHeads of the names starting with prefix
 // ("" for all), a resource name the caller checked (§7.4 ?prefix=, §12.4);
 // next stays absent on the last page. A partial reader of a namespace
-// §B.11.9 covers, by the grant in Authorization, gets a *FilteredRedirect
+// §7.9 covers, by the grant in Authorization, gets a *FilteredRedirect
 // to the filtered form at the current at instead, which is recorded first
-// (§B.11.9 URLs), unless the namespace is purged: then 410 directly.
+// (§7.9 URLs), unless the namespace is purged: then 410 directly.
 func (e *Engine) NamespaceHeadsPrefix(ctx context.Context, ns, nsID, after, prefix string, cred Credentials) (*HeadsPage, error) {
 	var out *HeadsPage
-	err := e.filteredRead(ctx, func(t *tx) error {
+	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
 		if _, err := t.nsReaderOrRedirect(n, cred); err != nil {
 			// A partial reader's unfiltered /heads of a covered namespace
-			// that is purged is 410 without the 302 (§B.11.9 Purged
+			// that is purged is 410 without the 302 (§7.9 Purged
 			// namespaces, §8.5): her read check passed, so the answer is
 			// the one the filtered form would give, and no at is
 			// recorded. A grant that can't be redirected keeps its 403.
@@ -1059,7 +1151,7 @@ func (e *Engine) NamespaceHeadsPrefix(ctx context.Context, ns, nsID, after, pref
 	return out, err
 }
 
-// headRows are page's rows of /heads (§7.4), filtered or not (§B.11.9).
+// headRows are page's rows of /heads (§7.4), filtered or not (§7.9).
 func (t *tx) headRows(n *nsRow, page []headItem) []map[string]any {
 	out := []map[string]any{}
 	// created, size and digest show what sealed and e2e namespaces hide:
@@ -1071,11 +1163,6 @@ func (t *tx) headRows(n *nsRow, page []headItem) []map[string]any {
 	// migration 008_clear_at_rest_digests, encryptNamespace).
 	level := t.nsLevel(n)
 	plain := level < levelSealed
-	// Nor for a resource §1 answers 502 for, read through a remote branch
-	// whose source was raised to a level this server lacks, or one held
-	// back while the branch's raise fails (remoteHeld): its source
-	// hides them now (§1, §7.4).
-	rb, _, _, lost := t.lostRemote(n)
 	for _, h := range page {
 		kind := "head"
 		switch h.state {
@@ -1089,11 +1176,10 @@ func (t *tx) headRows(n *nsRow, page []headItem) []map[string]any {
 			item["target"] = h.row.id.String()
 		}
 		// created, the target's created time as log entries give it, but
-		// not a purged one's, which a remote branch's mirror doesn't know;
-		// and a live head's document's size and digest, as GET
+		// not a purged one's; and a live head's document's size and digest, as GET
 		// …/rev/{target} serves it uncoded, where the write stored them
 		// (headMeta). A pruned head keeps them, as it keeps its target.
-		if plain && h.row != nil && h.state != Purged && !(lost && t.upstreamCovers(rb, h.name, &view{state: h.state})) {
+		if plain && h.row != nil && h.state != Purged {
 			item["created"] = formatTime(h.row.created)
 			if h.state == Live && level < levelAtRest && h.row.size.Valid && len(h.row.digest) == sha256.Size {
 				item["size"] = float64(h.row.size.Int64)
@@ -1118,7 +1204,7 @@ func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]m
 // Branches is the answer of GET /ns/{ns}/branches (§7.4): a page of rows
 // in List, Next the after of the following page ("" on the last), Public
 // its cache visibility. Private is never set since v0.78: a partial
-// reader's /branches is 403 (§B.11.9 Answers); it stays for callers of
+// reader's /branches is 403 (§7.9 Answers); it stays for callers of
 // v0.77.
 type Branches struct {
 	List    []map[string]any
@@ -1128,18 +1214,16 @@ type Branches struct {
 }
 
 // BranchList is a page of GET /ns/{ns}/branches?after={key} (§7.4): the
-// namespace's direct branches and the remote branches whose registration
-// hasn't expired (§G.3), in ascending byte order of key, strictly after
-// after, at most logPageSize of them. A row's key is a local branch's
-// name, or a remote one's {origin}/{ns}; after is a plain bound, any
-// string. Once the namespace is purged it is 410 purged, after the
-// unrestricted-read check (§8.5). A partial reader of a namespace §B.11.9
+// namespace's direct branches, local ones only (v0.87), in ascending byte
+// order of name, strictly after after, at most logPageSize of them; after
+// is a plain bound, any string. Once the namespace is purged it is 410 purged, after the
+// unrestricted-read check (§8.5). A partial reader of a namespace §7.9
 // covers is refused, 403 as for any reader without an unrestricted read,
 // before a purged namespace's 410: filtered reads cover no branch
-// (§B.11.9 Answers; v0.78).
+// (§7.9 Answers; v0.78).
 //
-// Only the page is read: one row more than it of each kind, by the
-// indexes on a base's branch names and a namespace's registration keys.
+// Only the page is read: one row more than it, by the index on a base's
+// branch names.
 func (e *Engine) BranchList(ctx context.Context, ns, after string, cred Credentials) (*Branches, error) {
 	var out *Branches
 	err := e.read(ctx, func(t *tx) error {
@@ -1152,7 +1236,7 @@ func (e *Engine) BranchList(ctx context.Context, ns, after string, cred Credenti
 			return err
 		}
 		if kind == accessPartial {
-			return forbidden("a partial reader's grant doesn't read the branches of " + ns + ": filtered reads cover no branch (§B.11.9)")
+			return forbidden("a partial reader's grant doesn't read the branches of " + ns + ": filtered reads cover no branch (§7.9)")
 		}
 		if n.purged {
 			return t.purgedRead(n)
@@ -1160,36 +1244,21 @@ func (e *Engine) BranchList(ctx context.Context, ns, after string, cred Credenti
 		out = &Branches{List: []map[string]any{}, Public: t.cachePublic(n)}
 		limit, bound := e.opt.Maximums.LogPageSize, plainBound(after)
 		local := t.branchesAfter(n, bound, false, limit+1)
-		remote := t.registrationsAfter(n, bound, limit+1)
-		// The two kinds merged by key. No key is of both: a namespace
-		// name holds no "/" (§3.6).
-		for len(out.List) < limit && (len(local) > 0 || len(remote) > 0) {
-			if len(remote) == 0 || len(local) > 0 && local[0].name < remote[0].key {
-				b := local[0]
-				local = local[1:]
-				cfg := t.config(b.configSeq)
-				m := map[string]any{"name": b.name, "at": t.nsLogID(b.baseAt.Int64).String(), "frozen": cfg.Frozen, "purged": b.purged}
-				if cfg.Successor != "" {
-					m["successor"] = cfg.Successor
-				}
-				if d, ok := cfg.Doc["drafts"]; ok && cfg.DraftsFor != nil {
-					m["drafts"] = d // §7.4: clients apply drafts.for (§6.1)
-				}
-				out.List = append(out.List, m)
-				out.Next = b.name
-				continue
+		for len(out.List) < limit && len(local) > 0 {
+			b := local[0]
+			local = local[1:]
+			cfg := t.config(b.configSeq)
+			m := map[string]any{"name": b.name, "at": t.nsLogID(b.baseAt.Int64).String(), "frozen": cfg.Frozen, "purged": b.purged}
+			if cfg.Successor != "" {
+				m["successor"] = cfg.Successor
 			}
-			r := remote[0]
-			remote = remote[1:]
-			out.List = append(out.List, map[string]any{
-				"remote":  map[string]any{"origin": r.origin, "ns": r.name},
-				"at":      t.nsLogID(r.at).String(),
-				"ns_id":   t.nsLogID(r.seq).String(),
-				"expires": formatTime(r.exp),
-			})
-			out.Next = r.key
+			if d, ok := cfg.Doc["drafts"]; ok && cfg.DraftsFor != nil {
+				m["drafts"] = d // §7.4: clients apply drafts.for (§6.1)
+			}
+			out.List = append(out.List, m)
+			out.Next = b.name
 		}
-		if len(local) == 0 && len(remote) == 0 {
+		if len(local) == 0 {
 			out.Next = "" // the last page
 		}
 		return nil

@@ -24,7 +24,7 @@ func TestV086BranchesFollowNext(t *testing.T) {
 	}
 	var got []string
 	for _, b := range must(c.Branches(ctx, "main")) {
-		got = append(got, b.Key())
+		got = append(got, b.Name)
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("Branches %v, want every page's rows %v", got, want)

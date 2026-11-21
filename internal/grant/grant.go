@@ -37,7 +37,7 @@ import (
 
 // Verbs are the actions a grant may carry (§C.1). "*" is valid only in a
 // key's can.
-var Verbs = []string{"read", "create", "append", "restore", "delete", "purge", "config", "branch", "purge-ns", "export", "prune"}
+var Verbs = []string{"read", "create", "append", "restore", "delete", "purge", "config", "branch", "purge-ns", "prune"}
 
 var verbSet = func() map[string]bool {
 	m := map[string]bool{}
@@ -112,7 +112,6 @@ type Block struct {
 	Groups, Roles, NS, Can  []string
 	Attrs                   map[string]any
 	Nbf, Exp                *time.Time
-	At                      any
 	Rules                   []any
 	HasRoles, HasCan, HasNS bool
 	// Enc is the root block's recipient key for wrapped key responses
@@ -563,7 +562,7 @@ func (g *Grant) usesStar() bool {
 	return false
 }
 
-var rootFields = map[string]bool{"kid": true, "sub": true, "groups": true, "roles": true, "attrs": true, "ns": true, "can": true, "nbf": true, "exp": true, "at": true, "rules": true, "enc": true, "signers": true}
+var rootFields = map[string]bool{"kid": true, "sub": true, "groups": true, "roles": true, "attrs": true, "ns": true, "can": true, "nbf": true, "exp": true, "rules": true, "enc": true, "signers": true}
 var narrowFields = map[string]bool{"via": true, "ns": true, "can": true, "roles": true, "nbf": true, "exp": true, "rules": true}
 
 func parseBlock(raw map[string]any, root bool) (Block, error) {
@@ -615,12 +614,6 @@ func parseBlock(raw map[string]any, root bool) (Block, error) {
 				return b, errors.New("attrs must be an object")
 			}
 			b.Attrs = m
-		}
-		if v, ok := raw["at"]; ok {
-			if err := checkAt(v); err != nil {
-				return b, err
-			}
-			b.At = v
 		}
 		if v, ok := raw["enc"]; ok {
 			m, isObj := v.(map[string]any)
@@ -718,28 +711,4 @@ func timeField(raw map[string]any, k string) (*time.Time, error) {
 		return nil, fmt.Errorf("%s must be an RFC 3339 time", k)
 	}
 	return &t, nil
-}
-
-func checkAt(v any) error {
-	switch x := v.(type) {
-	case string:
-		if _, err := ids.Parse(x); err != nil {
-			return errors.New("at must be an ns_id")
-		}
-		return nil
-	case map[string]any:
-		if len(x) != 2 {
-			return errors.New(`at must be an ns_id or {"ns","id"}`)
-		}
-		ns, ok1 := x["ns"].(string)
-		id, ok2 := x["id"].(string)
-		if !ok1 || !ok2 || ns == "" {
-			return errors.New(`at must be an ns_id or {"ns","id"}`)
-		}
-		if _, err := ids.Parse(id); err != nil {
-			return errors.New("at.id must be an ns_id")
-		}
-		return nil
-	}
-	return errors.New(`at must be an ns_id or {"ns","id"}`)
 }
