@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/schema"
 )
@@ -213,24 +214,57 @@ func (e *Engine) writeOptimistic(ctx context.Context, req Request, items []Item,
 // checkOutside runs steps 1–6 of a resource write or batch in a read
 // transaction, outside any lock (D.3), recording what it read (writeDeps).
 // It returns a plan to re-check and insert, or a final result or error.
+//
+// On the store's rate buckets (ratebuckets.go) the check's draws are made
+// after its read transaction (drawLater): a draw waits for a connection
+// of the bucket pool and then for its buckets' row locks, which every
+// write of a busy principal or namespace takes, and inside the
+// transaction the check's main-pool connection waited with it, idle in a
+// transaction. The outcome is the same (§6.6): the tokens are drawn
+// before the write is admitted, as of the check's clock; a write refused
+// after its draw (412, 422, an idempotent retry) still draws; and a
+// refused draw answers its 429 instead of what the check found after it.
+// A check whose error comes before its draw (a 401, a 403) draws nothing,
+// as before. Only a check that stopped at a bucket known empty
+// (errDrawFirst) runs again, once its draw admits it, not drawing again.
 func (e *Engine) checkOutside(ctx context.Context, req Request, items []Item, source any, isBatch, rateDrawn bool) (*writePlan, *writeDeps, *WriteResult, error) {
-	var plan *writePlan
-	var deps *writeDeps
-	var res *WriteResult
-	// The read transaction is closed before the write lock is taken, so
-	// the single connection of :memory: is never held while waiting.
-	err := e.read(ctx, func(t *tx) error {
-		t.deps = newWriteDeps()
-		deps = t.deps
-		p, r, err := t.checkItems(req, items, nil, source, isBatch, false, rateDrawn)
-		plan, res = p, r
-		return err
-	})
-	if err == nil {
-		// After the read transaction too: compressing is CPU only.
-		e.packPlan(plan)
+	for {
+		var plan *writePlan
+		var deps *writeDeps
+		var res *WriteResult
+		var later *drawLater
+		var now time.Time
+		// The read transaction is closed before the write lock is taken, so
+		// the single connection of :memory: is never held while waiting.
+		err := e.read(ctx, func(t *tx) error {
+			t.deps = newWriteDeps()
+			deps = t.deps
+			if e.rate.store != nil && !rateDrawn {
+				later = &drawLater{}
+				t.drawLater = later
+			}
+			now = t.now
+			p, r, err := t.checkItems(req, items, nil, source, isBatch, false, rateDrawn)
+			plan, res = p, r
+			return err
+		})
+		var ae *Error
+		if later != nil && len(later.draws) > 0 && (err == nil || errors.As(err, &ae)) {
+			if derr := e.drawAfter(ctx, now, later); derr != nil {
+				return nil, nil, nil, derr
+			}
+			if later.first {
+				// Admitted after all: the whole check, its tokens drawn.
+				rateDrawn = true
+				continue
+			}
+		}
+		if err == nil {
+			// After the read transaction too: compressing is CPU only.
+			e.packPlan(plan)
+		}
+		return plan, deps, res, err
 	}
-	return plan, deps, res, err
 }
 
 // writeAlone is writeOptimistic for a write on its own. rateDrawn skips

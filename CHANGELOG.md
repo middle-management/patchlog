@@ -56,6 +56,23 @@ core, decided by the grant's own read rules. About 86,000 lines are removed and 
   **Index, SQLite:** `014`–`017`. The catalog's and tree service's own databases are no longer
   used.
 
+- **Postgres: `pool_max_conns` sets the main pool's size** (README "Postgres", Connections).
+  It could only lower the default of 4 × `GOMAXPROCS`, which on RDS held a 4-vCPU core to about
+  3,000 writes a second across namespaces while Postgres sat mostly idle; 64 connections took
+  it to about 4,600 (docs/CAPACITY.md, "Several namespaces on one database"). The rate-draw pool
+  is a quarter of it, at least 2, as before. The default is unchanged.
+- **Postgres: a write's rate-limit draw no longer holds a connection of the main pool.** A
+  write checked outside the lock (D.3) drew its tokens inside its check's read transaction, so
+  its connection sat idle in a transaction while the draw waited for the bucket pool and its
+  buckets' row locks. The draw is now made after the check: before the write is admitted, at
+  the check's clock, and still for writes refused after it (412, 422, idempotent retries); a
+  refused draw answers its 429 as before. Once an instance has seen a bucket empty, checks stop
+  at their draw until it can have refilled, so writes over their limit don't run their whole
+  check first.
+- **Postgres: group commits get connections of their own**, a pool a quarter of the main pool's
+  size (at least 2), so a group no longer queues behind every write's check; with all of them
+  busy a group takes a connection of the main pool as before. An instance opens up to that
+  many more connections.
 - **A purge doesn't read the branches it has no work in.** A purge in a base looked every
   branch below it up by key, to learn whether it held the purged document or might read it
   through: about 0.005 ms a branch, 54 ms on Postgres with 10,000 branches that didn't see

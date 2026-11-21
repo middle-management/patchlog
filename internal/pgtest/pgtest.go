@@ -78,9 +78,10 @@ func NewDB(t testing.TB) string {
 // in parallel, and with the default pools, which grow with the CPUs and
 // keep every connection they opened, they need far more connections than
 // a stock server's max_connections of 100. Even bounded, a run peaks above
-// 100 at 4 CPUs (an engine's main pool and its rate buckets' pool, 10
-// connections, for each of the engines of the tests running at once, up to
-// GOMAXPROCS packages × GOMAXPROCS tests): the server needs more (CI's has
+// 100 at 4 CPUs (an engine's main pool, its rate buckets' pool and its
+// group commits' pool, 12 connections, for each of the engines of the
+// tests running at once, up to GOMAXPROCS packages × GOMAXPROCS tests;
+// most engines never group a commit): the server needs more (CI's has
 // 300), or a run fewer packages at once (go test -p). Eight each leaves
 // room for the leader lock, the tailer, and the transactions and locks a
 // test holds open on an engine's pool while its writes wait

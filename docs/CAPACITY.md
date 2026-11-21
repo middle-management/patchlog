@@ -739,19 +739,20 @@ time only): the consumers read the revision each namespace entry names
 - **Nor is the writers' principal's rate bucket**, one row of `rate_buckets` (`rate_draw`) that
   every write of a principal locks, across namespaces (§6.6): with a writer principal per
   namespace, writes stopped at 2,962–3,037 a second, as with one (3,000–3,055).
-- **The limit is the core's main pool, 16 connections.** It is 4 per GOMAXPROCS
-  (`internal/core/pgpool.go`), and `pool_max_conns` only lowers it, so a run with
-  `pool_max_conns=64` kept 16. Profiled (net/http/pprof) at 16 namespaces, the core had up to 700
-  requests waiting in `database/sql` for a connection, while Postgres had about 11 sessions not
-  idle, most of them idle in a transaction waiting for the core's next statement
-  (`pg_stat_activity`). Each write's check (D.3) takes a connection for five round trips, and the
-  group commit workers wait in the same queue: each spent about 90% of its time waiting for a
-  connection, so groups of about 30 writes (of `--group-commit` 32) committed about 100 times a
-  second in all, about 3,000 writes. Postgres did little: about 2.5 ms of statements per group.
+- **The limit is the core's main pool, 16 connections.** It is 4 per GOMAXPROCS by default
+  (`internal/core/pgpool.go`), and `pool_max_conns` could then only lower it, so a run with
+  `pool_max_conns=64` kept 16 (it now sets the pool's size: "Since these runs", below). Profiled
+  (net/http/pprof) at 16 namespaces, the core had up to 700 requests waiting in `database/sql`
+  for a connection, while Postgres had about 11 sessions not idle, most of them idle in a
+  transaction waiting for the core's next statement (`pg_stat_activity`). Each write's check
+  (D.3) takes a connection for five round trips, and the group commit workers wait in the same
+  queue: each spent about 90% of its time waiting for a connection, so groups of about 30 writes
+  (of `--group-commit` 32) committed about 100 times a second in all, about 3,000 writes.
+  Postgres did little: about 2.5 ms of statements per group.
 - **A pool of 64 raised the limit to about 4,600 writes a second.** With GOMAXPROCS 16 on the
-  core (`pool_max_conns` can't raise the pool), four namespaces wrote their full 3,992 a second,
-  and eight and sixteen 4,611 and 4,602 (write p99 376 and 861 ms); a quiet namespace beside
-  three busy ones stayed at p99 45 ms. RDS CPU peaked at 75%, the core's at 71%.
+  core (`pool_max_conns` couldn't raise the pool then), four namespaces wrote their full 3,992 a
+  second, and eight and sixteen 4,611 and 4,602 (write p99 376 and 861 ms); a quiet namespace
+  beside three busy ones stayed at p99 45 ms. RDS CPU peaked at 75%, the core's at 71%.
 - **The next limit is the rate-limit draw.** A write's check (D.3) draws its tokens (`rateLimit`,
   `bucketStore.draw`) inside its read transaction, so it holds a main-pool connection, idle in a
   transaction, while it waits for one of the bucket pool's 16 and then for its buckets' rows.
@@ -759,6 +760,15 @@ time only): the consumers read the revision each namespace entry names
   1.9 ms, and Postgres showed row-lock waits (`Lock:tuple`, `Lock:transactionid`). Drawing
   outside the check's transaction would free the connection; a principal writing across many
   namespaces still serialises on its row.
+- **Since these runs** (not yet measured again):
+  - `pool_max_conns=N` sets the main pool to `N` connections, above 4 per GOMAXPROCS too, and
+    the bucket pool to a quarter of `N`.
+  - A write's draw is made after its check's read transaction, so it holds no main-pool
+    connection while it waits for the bucket pool or its rows. The draw comes before the write
+    is admitted, and its 429 answers as before.
+  - Group commits take a connection from a pool of their own (a quarter of the main pool's
+    size) when one is free, so a group of about 30 writes no longer queues behind every
+    write's check.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
@@ -924,6 +934,7 @@ The defaults, and when to change them.
 | **Per-resource and per-principal rates** (`serve --max-rate-per-resource`, `--max-rate-per-principal`, and the namespace's `limits`) | 10/s and 50/s | One writer writes a small document often. |
 | **`ratePerNamespace`** | 500/s | Leave it: about half of one namespace's ceiling on server X, which leaves room for reads. Give importers and loaders allowances. |
 | **`itemsPerBatch`** | 1,000 | Leave it: batches are for imports; give importers allowances. |
+| **Postgres pools** (`pool_max_conns` in the URL) | 4 × GOMAXPROCS connections; a quarter of that, at least 2, for rate draws and for group commits each | Writes queue for connections while Postgres is mostly idle: a database a millisecond away wants more than the CPUs give, e.g. 64 on a `c7g.xlarge` ([Several namespaces on one database](#several-namespaces-on-one-database)). Keep every instance's pools together under `max_connections`. |
 | **The snapshot cadence, the long-poll interval and the log page size** | as shipped | — |
 
 ## Rerunning
@@ -984,6 +995,7 @@ Options:
   with the core, the database, the writers and the consumers each on their own instance. The
   run in [Several namespaces on one database](#several-namespaces-on-one-database) used
   `NAMESPACES 1,2,4,8,16 RATE 10 DURATION 30000 FETCHES 1 8`. The `2xlarge` run used
-  `DB_CLASS=db.m7g.2xlarge FETCHES=8`.
+  `DB_CLASS=db.m7g.2xlarge FETCHES=8`; add `STORE_POOL_CONNS=64` to set the core's
+  `pool_max_conns`.
 - **Sizes**: `-docs`, `-revs`, `-namespaces`, `-doc-size`, `-append-batch`. `-help` lists the
   rest.
