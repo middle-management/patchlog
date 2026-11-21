@@ -3,12 +3,14 @@ package dav_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,6 +94,8 @@ func newTreeEnv(t *testing.T, trees ...string) *treeEnv {
 type treeOpts struct {
 	minWait    time.Duration
 	maxListing int
+	// wrapIndex, if set, wraps the index's handler.
+	wrapIndex func(http.Handler) http.Handler
 }
 
 func newTreeEnvWith(t *testing.T, o treeOpts, trees ...string) *treeEnv {
@@ -112,7 +116,11 @@ func newTreeEnvWith(t *testing.T, o treeOpts, trees ...string) *treeEnv {
 	ix := must(index.Open(ctx, index.Options{Client: ixc, DB: filepath.Join(t.TempDir(), "i.db"), Namespaces: trees,
 		Now: s.Now, CheckerTTL: time.Millisecond, MinWait: o.minWait, RepurgeInterval: -1,
 		Logf: func(string, ...any) {}}))
-	ihs := httptest.NewServer(ix.Handler())
+	ih := ix.Handler()
+	if o.wrapIndex != nil {
+		ih = o.wrapIndex(ih)
+	}
+	ihs := httptest.NewServer(ih)
 	rctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() { ix.Run(rctx); close(done) }()
@@ -685,4 +693,42 @@ func TestTreeFolderAccess(t *testing.T) {
 	}
 	e.want(e.do("GET", "/files/team-b/y.txt", ""), http.StatusNotFound)
 	e.want(e.do("GET", "/files/top.txt", ""), http.StatusNotFound)
+}
+
+// v0.88 TOOLS §H.3 ("The index's 400 for the facet path … lists an empty
+// folder, never one empty for a write"), FILE-15: an index that answers a
+// folder's facet 400, as marked by no schema, lists it empty, but neither
+// a delete of the folder nor a move of it goes by that: listed again at the
+// namespace head and still 400, each is 503 and nothing is written. Until
+// v0.88 the 400 was an empty folder for the delete too, which removed the
+// folder over files the index didn't show.
+func TestTreeUnmarkedIsNoEmptyFolderForWrites(t *testing.T) {
+	t.Parallel()
+	var unmark atomic.Bool
+	e := newTreeEnvWith(t, treeOpts{wrapIndex: func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if unmark.Load() && r.URL.Query().Get("facet[/folder]") == "/docs" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				io.WriteString(w, `{"code":"bad_input","message":"facet[/folder]: /folder is not a path any schema indexed for what the reader may see"}`)
+				return
+			}
+			h.ServeHTTP(w, r)
+		})
+	}}, "files")
+	e.want(e.do("MKCOL", "/files/docs", ""), http.StatusCreated)
+	e.want(e.do("PUT", "/files/docs/kept.txt", "k"), http.StatusCreated)
+	e.settle("/files/docs/")
+	unmark.Store(true)
+	if got := e.ls("/files/docs/"); len(got) != 0 {
+		t.Fatalf("a folder the index answers 400 for lists %v, want empty", got)
+	}
+	if r := e.do("DELETE", "/files/docs", ""); r.status != http.StatusServiceUnavailable || r.header.Get("Retry-After") == "" {
+		t.Fatalf("DELETE of a folder the index answers 400 for: %d %s, want 503 with Retry-After", r.status, r.body)
+	}
+	e.want(e.do("MOVE", "/files/docs", "", "Destination", "/files/moved"), http.StatusServiceUnavailable)
+	e.placed("files", "/", "docs")
+	e.placed("files", "/docs", "kept.txt")
+	unmark.Store(false)
+	e.want(e.do("DELETE", "/files/docs", ""), http.StatusConflict)
 }
