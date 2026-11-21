@@ -166,12 +166,12 @@ func (t *tx) recordImport(n *nsRow, a *actor, src any, st []*itemState) {
 // or patches). Each check has a budget of its own; one that runs out may
 // not. It changes nothing.
 func (t *tx) mayPurgeAll(n *nsRow, a *actor, st []*itemState) []*itemState {
-	prev := t.meter
-	defer func() { t.meter = prev }()
+	prev, prevRead := t.meter, t.readMeter
+	defer func() { t.meter, t.readMeter = prev, prevRead }()
 	cfg := t.config(n.configSeq)
 	var out []*itemState
 	for _, s := range st {
-		t.meter = nil
+		t.meter, t.readMeter = nil, nil
 		if t.mayPurge(n, cfg, a, s.Resource) {
 			out = append(out, s)
 		}

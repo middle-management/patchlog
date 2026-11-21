@@ -394,6 +394,9 @@ func TestV088AdvPurgedNames(t *testing.T) {
 		if n == "secret" && (v75Status(herr) == 410 || ls == 410 || bs == 410 || v75Status(lerr) == 410 || v75Status(berr) == 410) {
 			t.Errorf("LEAK: purged %s answered 410 to li, whose /resource rule refuses it", n)
 		}
+		if n == "shared" && ls != 410 {
+			t.Errorf("purged shared, whose name li's rules allow: log %d %v, want 410", ls, lerr)
+		}
 	}
 }
 
@@ -448,11 +451,57 @@ func TestV089AdvBlobRedirectHiddenEpoch(t *testing.T) {
 			t.Fatalf("the blob v1 references: %+v %v, want 302 to epoch 2", b, err)
 		}
 	}
+	if b, err := w.e.OpenSealedBlob(ctx, "matches", "derby", bid, "2", vc); err != nil || b.Status != 200 {
+		t.Errorf("the blob under epoch 2 at the view URL: %+v %v", b, err)
+	} else {
+		b.Close()
+	}
+	// Nor is it served under the epoch only h2 has.
+	if b, err := w.e.OpenSealedBlob(ctx, "matches", "derby", bid, "1", vc); v75Status(err) != 404 {
+		if b != nil {
+			b.Close()
+		}
+		t.Errorf("the blob under h2's epoch 1 at the view URL: %+v %v, want 404", b, err)
+	}
 	if b, err := w.e.OpenBlob(ctx, "matches", "derby", hb, vc); v75Status(err) != 404 && (b == nil || b.Status != 404) {
 		t.Errorf("a blob only hidden revisions reference: %+v %v, want 404", b, err)
 	}
 	// Now v1's epoch is fixed, the latest for every reader.
 	if b, err := w.e.OpenBlob(ctx, "matches", "derby", bid, w.admin); err != nil || b.Status != 302 || b.Epoch != 2 {
 		t.Errorf("admin, after: %+v %v, want 302 to epoch 2", b, err)
+	}
+}
+
+// The same through a real import batch: step 2.2 judges the head the
+// batch itself wrote, recording a name whose imported document the
+// importer's read rules allow, and not one they hide.
+func TestV088AdvPurgeFollowImportBatch(t *testing.T) {
+	w := newV75World(t, v75Opts{})
+	ctx := context.Background()
+	imp := w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "svc:importer", "ns": []any{"matches"},
+		"can": []any{"read", "create", "append", "purge"}, "rules": []any{map[string]any{"any": []any{
+			map[string]any{"not": map[string]any{"op": "test", "path": "/action", "value": "read"}},
+			map[string]any{"op": "test", "path": "/doc/team", "value": "a"}}}}})
+	src := map[string]any{"origin": "https://staging.example", "ns": "matches", "at": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bundle": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	item := func(name, team string) Item {
+		return Item{Resource: name, IfNoneMatch: true, Steps: []Step{{Patches: []any{
+			map[string]any{"op": "add", "path": "", "value": map[string]any{"team": team}}}}}}
+	}
+	if _, err := w.e.Batch(ctx, Request{NS: "matches", Cred: imp}, []Item{item("seen", "a"), item("hidden", "b")}, nil, src, false); err != nil {
+		t.Fatal(err)
+	}
+	var rows []string
+	w.inTx(func(t *tx) {
+		q, err := t.Query(`SELECT name FROM purge_follow_names ORDER BY name`)
+		t.must(err)
+		defer q.Close()
+		for q.Next() {
+			var s string
+			t.must(q.Scan(&s))
+			rows = append(rows, s)
+		}
+	})
+	if len(rows) != 1 || rows[0] != "seen" {
+		t.Fatalf("recorded %v, want [seen]", rows)
 	}
 }
