@@ -22,7 +22,7 @@ func withoutBlobSweep(o *core.Options) { o.BlobSweepInterval = -1 }
 // openSealedBlob opens a blob sealed for delivery, requiring kid and pl.
 func openSealedBlob(t *testing.T, sealed, key []byte, kid string, pl seal.PL) []byte {
 	t.Helper()
-	h, data, err := seal.OpenBlob(sealed, key)
+	h, data, err := seal.OpenBlob(sealed, belowKr(t, key, pl))
 	if err != nil {
 		t.Fatalf("open sealed blob: %v", err)
 	}

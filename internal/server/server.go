@@ -94,6 +94,7 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("GET /ns/{ns}/view/{view}/r/{name}/rev/{id}", s.viewContent(s.resourceRev))
 	m.HandleFunc("GET /ns/{ns}/view/{view}/r/{name}/rev/{id}/raw", s.viewContent(s.resourceRaw))
 	m.HandleFunc("GET /ns/{ns}/view/{view}/r/{name}/blob/{bid}", s.viewContent(s.blobGet))
+	m.HandleFunc("GET /ns/{ns}/view/{view}/r/{name}/blob/{bid}/e/{e}", s.viewContent(s.blobEpochGet))
 	m.HandleFunc("GET /ns/{ns}/gestures/{gesture}", s.nsGestures)
 	m.HandleFunc("GET /ns/{ns}/principal", s.nsPrincipal)
 	m.HandleFunc("GET /ns/{ns}/grants/{gid}", s.nsGrant)

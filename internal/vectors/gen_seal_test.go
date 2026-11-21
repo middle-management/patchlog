@@ -253,6 +253,11 @@ func TestVectorSealedPayloads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// v0.89: below K_r, each revision's document under its K_rev, each
+	// log entry under its K_log and each blob under its K_blob (§E.2.1).
+	krevG, _ := seal.RevKey(kr, idG)
+	klogG, _ := seal.LogKey(kr, idG)
+	klogT, _ := seal.LogKey(kr, idT)
 	kid := seal.Kid("demo", 3)
 	doc := []byte(`{"title":"Hello","views":0}`)
 	// A genesis revision's entry, as the core seals it (LogEntry.value):
@@ -315,10 +320,10 @@ func TestVectorSealedPayloads(t *testing.T) {
 		plaintext     []byte
 		pad           bool
 	}{
-		{"/rev/{id} document", "K_r", kr, seal.ResourcePL("demo", "derby", idG, seal.KindDoc), doc, false},
-		{"/rev/{id} document, padded", "K_r", kr, seal.ResourcePL("demo", "derby", idG, seal.KindDoc), doc, true},
-		{"resource log entry (rev)", "K_r", kr, seal.ResourcePL("demo", "derby", idG, seal.KindRev), entry, false},
-		{"resource log entry (tombstone)", "K_r", kr, seal.ResourcePL("demo", "derby", idT, seal.KindTombstone), tombstone, false},
+		{"/rev/{id} document", "K_rev", krevG, seal.ResourcePL("demo", "derby", idG, seal.KindDoc), doc, false},
+		{"/rev/{id} document, padded", "K_rev", krevG, seal.ResourcePL("demo", "derby", idG, seal.KindDoc), doc, true},
+		{"resource log entry (rev)", "K_log", klogG, seal.ResourcePL("demo", "derby", idG, seal.KindRev), entry, false},
+		{"resource log entry (tombstone)", "K_log", klogT, seal.ResourcePL("demo", "derby", idT, seal.KindTombstone), tombstone, false},
 		{"resource purge event", "K_r", kr, seal.ResourceEventPL("demo", "derby", seal.KindPurge), purgeEvent, false},
 		{"namespace document", "K_n", kn, seal.NamespaceDocPL("demo", nsID1), []byte(`{"encryption":{"epoch":3,"level":"sealed"},"read":"public"}`), false},
 		{"namespace log range", "K_n", kn, seal.RangePL("demo", nsID1, nsID2), rangeEntries, false},
@@ -367,11 +372,12 @@ func TestVectorSealedPayloads(t *testing.T) {
 	vs = append(vs, obj{{Key: "name", Value: "E3 write: sealed op with declared blobs"}, {Key: "fn", Value: "seal.WithBlobs, ids.Revision (read by seal.SealedOp, seal.OpenPatchSet)"},
 		{Key: "patches", Value: string(sealedSet)}, {Key: "revision", Value: ids.Revision(nil, sealedSet).String()}})
 
-	// Sealed blobs (§E.2.2): E2 under K_r with {enc, kid, pl}, padded and
+	// Sealed blobs (§E.2.2): E2 under K_blob with {enc, kid, pl}, padded and
 	// not; E3 under the writer's own key with {enc} only (§E.3.1).
 	data := []byte("hello patchlog\n")
 	plainBid := ids.Blob("text/plain", "", data).String()
 	blobKey := seq(0xe0)
+	kblob, _ := seal.BlobKey(kr, plainBid)
 	for _, c := range []struct {
 		name string
 		key  []byte
@@ -379,8 +385,8 @@ func TestVectorSealedPayloads(t *testing.T) {
 		pl   seal.PL
 		pad  bool
 	}{
-		{"E2 sealed blob", kr, kid, seal.BlobPL("demo", "derby", plainBid), false},
-		{"E2 sealed blob, padded", kr, kid, seal.BlobPL("demo", "derby", plainBid), true},
+		{"E2 sealed blob", kblob, kid, seal.BlobPL("demo", "derby", plainBid), false},
+		{"E2 sealed blob, padded", kblob, kid, seal.BlobPL("demo", "derby", plainBid), true},
 		{"E3 sealed blob", blobKey, "", nil, false},
 	} {
 		sb, err := seal.SealBlobWithIV(c.key, c.kid, c.pl, data, c.pad, fixedIV)
@@ -413,7 +419,7 @@ func TestVectorSealedPayloads(t *testing.T) {
 	}
 	golden.Check(t, "sealed", obj{
 		{Key: "section", Value: "§E.2.1, §E.2.2, §E.3.1"},
-		{Key: "about", Value: "sealed payloads: JWEs (alg dir, enc A256GCM, protected header {alg, enc, kid, pl}) under K_r = HKDF(K_e, \"patchlog-e2\", ns LF name) or K_n = HKDF(K_e, \"patchlog-e2\", ns LF), with K_e = 00 01 … 1f, ns demo, name derby, epoch 3 and a fixed IV; the E3 write; sealed blobs \"PLB1\" ‖ len ‖ header ‖ iv ‖ AES-256-GCM(size ‖ bytes ‖ padding) ‖ tag"},
+		{Key: "about", Value: "sealed payloads: JWEs (alg dir, enc A256GCM, protected header {alg, enc, kid, pl}) under K_rev = HKDF(K_r, \"patchlog-e2-rev\", id), K_log = HKDF(K_r, \"patchlog-e2-log\", id) or K_blob = HKDF(K_r, \"patchlog-e2-blob\", bid) below K_r = HKDF(K_e, \"patchlog-e2\", ns LF name), K_r itself (purge events, E3) or K_n = HKDF(K_e, \"patchlog-e2\", ns LF), with K_e = 00 01 … 1f, ns demo, name derby, epoch 3 and a fixed IV; the E3 write; sealed blobs \"PLB1\" ‖ len ‖ header ‖ iv ‖ AES-256-GCM(size ‖ bytes ‖ padding) ‖ tag"},
 		{Key: "K_r", Value: golden.Hex(kr)},
 		{Key: "K_n", Value: golden.Hex(kn)},
 		{Key: "vectors", Value: vs},

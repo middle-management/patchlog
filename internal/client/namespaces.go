@@ -394,7 +394,11 @@ func headsQuery(prefix, after string) url.Values {
 // parseHeads reads a /heads page (§7.4): its rows, each of whose names
 // must start with prefix, and next.
 func parseHeads(r *response, prefix string) (items []HeadItem, next string, err error) {
-	m := r.obj()
+	return parseHeadsValue(r.obj(), r.path, prefix)
+}
+
+// parseHeadsValue reads a /heads page m, the body of a 200 at path.
+func parseHeadsValue(m map[string]any, path, prefix string) (items []HeadItem, next string, err error) {
 	// { heads, next? } (§7.4); servers before v0.65 answer { items, next? }.
 	arr, ok := m["heads"].([]any)
 	if !ok {
@@ -407,7 +411,7 @@ func parseHeads(r *response, prefix string) (items []HeadItem, next string, err 
 			it.Size = int64(n)
 		}
 		if !strings.HasPrefix(it.Resource, prefix) {
-			return nil, "", fmt.Errorf("client: %s: row %q outside prefix %q (§7.4)", r.path, it.Resource, prefix)
+			return nil, "", fmt.Errorf("client: %s: row %q outside prefix %q (§7.4)", path, it.Resource, prefix)
 		}
 		items = append(items, it)
 	}

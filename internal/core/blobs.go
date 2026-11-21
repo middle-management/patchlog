@@ -1249,7 +1249,15 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 		}
 		if t.isSealedNS(n) {
 			// Sealed namespaces never serve the plaintext: 302 to the blob
-			// sealed under an epoch (§E.2.2, sealedblobs.go).
+			// sealed under an epoch (§E.2.2, sealedblobs.go); for a reader
+			// judged per revision, the latest of a revision it may read
+			// (§7.9 Content, v0.89).
+			if byDoc {
+				if eps, all := t.visibleBlobEpochs(a, n, name, bid); !all && len(eps) > 0 {
+					out.Status, out.Epoch = 302, latestEpoch(eps)
+					return nil
+				}
+			}
 			job, nsID = t.sealedBlobHead(n, name, bid, out), n.id
 			return nil
 		}

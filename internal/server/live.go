@@ -513,7 +513,7 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 	nsSince := head.Last
 	// Without since, a resource with no entries yet is an empty range:
 	// the stream starts and waits for its first (§7.3).
-	lg, err := s.e.ResourceLog(r.Context(), ns, name, "", since, page, cred)
+	lg, err := s.e.ResourceEventLog(r.Context(), ns, name, since, page, cred)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -571,7 +571,7 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 	// between (a purge, or a prune past since) ends the stream as it does
 	// below.
 	for lg.More && r.Context().Err() == nil {
-		if lg, err = s.e.ResourceLog(r.Context(), ns, name, "", since, page, cred); err != nil || lg.Status != 200 {
+		if lg, err = s.e.ResourceEventLog(r.Context(), ns, name, since, page, cred); err != nil || lg.Status != 200 {
 			nsEntries()
 			return
 		}
@@ -598,7 +598,7 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for {
-			lg, err := s.e.ResourceLog(r.Context(), ns, name, "", since, page, cred)
+			lg, err := s.e.ResourceEventLog(r.Context(), ns, name, since, page, cred)
 			if err != nil || lg.Status != 200 {
 				// A purge that committed after the namespace read above:
 				// send its event before ending the stream.

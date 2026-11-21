@@ -290,7 +290,43 @@ func (e *Engine) seedSealCountsAt016(ctx context.Context) error {
 	if e.opt.migrations != nil {
 		return nil
 	}
-	return e.seedSealCounts(ctx)
+	if err := e.seedSealCounts(ctx); err != nil {
+		return err
+	}
+	return e.discardBlobSealingsBeforeV089(ctx)
+}
+
+// discardBlobSealingsBeforeV089 deletes, once, at the first Open of
+// v0.89, the stored sealings of blobs (blob_epochs rows with bytes),
+// which earlier drafts sealed under K_r and nothing marks: since v0.89 a
+// blob is sealed under its K_blob (§E.2.1), and no reader opens them. Each
+// is sealed again under its epoch on its next request (§E.2.2 Stored
+// once: an earlier draft's bytes are discarded, as drafts promise no
+// compatibility). Rows recording an epoch pruned (no bytes) stay. A
+// marker row of seal_counts (namespace 0) says it ran.
+func (e *Engine) discardBlobSealingsBeforeV089(ctx context.Context) error {
+	return e.update(ctx, func(t *tx) error {
+		res, err := t.Exec(`INSERT INTO seal_counts (ns, epoch, name, sealed, reserved) VALUES (0, 0, '~blobs-v0.89', 0, 0) ON CONFLICT (ns, epoch, name) DO NOTHING`)
+		t.must(err)
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			return err
+		}
+		rows, err := t.Query(`SELECT file FROM blob_epochs WHERE file IS NOT NULL`)
+		t.must(err)
+		var files []string
+		for rows.Next() {
+			var f string
+			t.must(rows.Scan(&f))
+			files = append(files, f)
+		}
+		rows.Close()
+		_, err = t.Exec(`DELETE FROM blob_epochs WHERE data IS NOT NULL OR file IS NOT NULL`)
+		t.must(err)
+		for _, f := range files {
+			t.dropFile(f)
+		}
+		return nil
+	})
 }
 
 // boundRotationDue makes k's namespace's rotation due where k is of its
@@ -350,6 +386,10 @@ func jobSealKey(ns int64, j *sealJob) sealKey {
 		e, _ = strconv.Atoi(j.kid[i+1:])
 	}
 	name := j.name
+	if j.view != "" {
+		// K_view of a view (§E.2.1), which no resource name can be (§3.6).
+		return sealKey{ns, e, "view:" + j.view}
+	}
 	if j.kind == sealConfig || j.kind == sealRange || j.kind == sealGrant {
 		name = ""
 	}

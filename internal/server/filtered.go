@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/lifecycle"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Filtered namespace reads (§7.9): /heads, log ranges, long-poll and
@@ -207,6 +209,14 @@ func (s *Server) viewHeads(w http.ResponseWriter, r *http.Request) {
 	}
 	setFilteredAt(w, info)
 	s.filteredCache(w, r, info, ccImmutable, page.Public, filteredHeadsTags(ns)...)
+	if page.JWE != "" {
+		// A sealed namespace's: one JWE under the view's K_view (§7.9,
+		// §E.2.2).
+		w.Header().Set("Content-Type", seal.ContentType)
+		w.WriteHeader(200)
+		io.WriteString(w, page.JWE)
+		return
+	}
 	out := map[string]any{"heads": page.Items}
 	if page.Next != "" {
 		out["next"] = page.Next
@@ -363,7 +373,7 @@ func (s *Server) viewEvents(w http.ResponseWriter, r *http.Request) {
 	cred := creds(r)
 	page := s.e.Limits().LogPageSize
 	wait := s.e.Wait(ns)
-	lg, _, err := s.e.FilteredLiveLog(r.Context(), ns, view, since, page, cred)
+	lg, _, err := s.e.FilteredEventLog(r.Context(), ns, view, since, page, cred)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -402,7 +412,7 @@ func (s *Server) viewEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		wait = s.e.Wait(ns)
-		lg, _, err = s.e.FilteredLiveLog(r.Context(), ns, view, since, page, cred)
+		lg, _, err = s.e.FilteredEventLog(r.Context(), ns, view, since, page, cred)
 		if err != nil || lg.Status != 200 {
 			return
 		}

@@ -560,9 +560,12 @@ func TestRefsAcrossSealed(t *testing.T) {
 	}
 	// Keys in the clear, for a grant without enc.
 	kc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"sec"}, []string{"read"})))
-	keyOf := map[string]func(string) []byte{"sec": derived.ItemKey(epochKeys(t, kc, "sec"), "sec", "s")}
+	// At E2 a hit opens under its revision's K_rev, at E3 under K_r
+	// (§E.2.6, v0.89).
+	secKeys := epochKeys(t, kc, "sec")
+	keyOf := map[string]func(string) []byte{}
 	ke := must(ad.Key(ctx, "e#1"))
-	keyOf["e"] = derived.ItemKey(func(kid string) []byte {
+	keyOf["e"] = derived.ItemKeyE3(func(kid string) []byte {
 		if kid == "e#1" {
 			return ke
 		}
@@ -574,6 +577,9 @@ func TestRefsAcrossSealed(t *testing.T) {
 		jwe, _ := hit["sealed"].(string)
 		if len(hit) != 5 || jwe == "" || hit["id"] == nil || hit["url"] == nil {
 			t.Fatalf("sealed hit %v", hit)
+		}
+		if ns == "sec" {
+			keyOf["sec"] = derived.ItemKey(secKeys, "sec", "s", hit["id"].(string))
 		}
 		if pl := must(seal.ParseHeader(jwe)).PL; fmt.Sprint(pl) != fmt.Sprint(map[string]any{"ns": ns, "name": name, "view": f.path}) {
 			t.Errorf("pl %v", pl)

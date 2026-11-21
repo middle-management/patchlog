@@ -386,7 +386,7 @@ func (e *Engine) ResourceLiveLog(ctx context.Context, ns, name, since string, li
 	// the channel, or both.
 	q := &quietRead{woken: e.WaitResource(ns, name)}
 	q.meta = e.rc.meta.Load()
-	lg, err := e.resourceLog(ctx, ns, name, "", since, limit, cred, q)
+	lg, err := e.resourceLog(ctx, ns, name, "", since, limit, cred, q, false)
 	if err == nil && lg != nil {
 		e.rememberQuiet(ns, name, cred, lg, q)
 	}

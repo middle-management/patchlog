@@ -81,7 +81,7 @@ func (t *tx) blobEpochs(n *nsRow, head *revRow, bid ids.ID) map[int]bool {
 			rows.Close()
 		}
 		// Content without an epoch of its own: that of its stored sealing.
-		q := `SELECT substr(s.jwe, 1, 4096)` + refRevs + ` JOIN sealed s ON s.ns = ? AND s.rev_seq = r.seq AND s.kind IN ('doc', 'entry')` + where
+		q := `SELECT substr(s.jwe, 1, 4096)` + refRevs + ` JOIN sealed s ON s.ns = ? AND s.rev_seq = r.seq AND s.kind IN ('doc', 'entry', 'keys')` + where
 		args := []any{n.id, seg.res, bid[:], seg.max}
 		if own {
 			q += ` AND NOT EXISTS (SELECT 1 FROM rev_epochs e WHERE e.seq = r.seq)`
@@ -259,9 +259,11 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 		if aerr != nil {
 			return aerr
 		}
-		if t.readsByDoc(n, a) && (n.purged || !t.mayReadRow(a, n, name, nil)) {
-			// Sealed content is judged with a null document (§6.4.1),
-			// as is a purged namespace's.
+		byDoc := t.readsByDoc(n, a)
+		if byDoc && (n.purged || !t.isSealedNS(n) && !t.mayReadRow(a, n, name, nil)) {
+			// A purged namespace's content is judged with a null document
+			// (§6.4.1); a sealed one's by the revisions of the epoch
+			// asked, below (v0.89).
 			return notFound()
 		}
 		if n.purged {
@@ -284,6 +286,13 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 		if perr != nil || eerr != nil || ep < 1 || strconv.Itoa(ep) != epochText {
 			out.Status = 404
 			return nil
+		}
+		if byDoc {
+			// Readable where a visible revision of epoch ep references
+			// it; otherwise a read-rule failure (§7.9 Content, §7.8).
+			if eps, all := t.visibleBlobEpochs(a, n, name, bid); !all && !eps[ep] {
+				return notFound()
+			}
 		}
 		ans := t.servableBlob(n, name, bid)
 		out.Status = ans.status
@@ -327,8 +336,8 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			out.setContent(memContent(data))
 			return nil
 		}
-		k, err := seal.ResourceKey(t.epochKey(n.id, ep), n.name, name)
-		t.must(err)
+		// Under the blob's K_blob of that epoch (§E.2.1, v0.89).
+		k := t.blobKey(n, ep, name, bid.String())
 		job = &sealedBlobJob{ns: n.id, name: name, bid: bid, epoch: ep, key: k, kid: seal.Kid(n.name, ep),
 			pl: seal.BlobPL(n.name, name, bid.String()), plain: t.readBytes(ans.row.owner, ans.row.hash), pad: t.config(n.configSeq).Pad}
 		return nil

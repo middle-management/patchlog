@@ -109,7 +109,13 @@ func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
 		// A sealed namespace: to the latest epoch the blob is served under,
 		// cached as a head pointer (§E.2.2).
 		s.cache(w, r, ccHead, b.Public, resTags(ns, name)...)
-		w.Header().Set("Location", "/r/"+ns+"/"+name+"/blob/"+bid+"/e/"+strconv.Itoa(b.Epoch))
+		loc := "/r/" + ns + "/" + name + "/blob/" + bid + "/e/" + strconv.Itoa(b.Epoch)
+		if viewedOf(r) != nil {
+			// Under a view's prefix, to its form there, the latest epoch
+			// of a revision the view sees (§7.9 Content, v0.89).
+			loc = "/ns/" + ns + "/view/" + r.PathValue("view") + "/r/" + name + "/blob/" + bid + "/e/" + strconv.Itoa(b.Epoch)
+		}
+		w.Header().Set("Location", loc)
 		w.WriteHeader(302)
 		return
 	}

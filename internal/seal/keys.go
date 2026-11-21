@@ -195,22 +195,50 @@ const WrapInfoPrefix = "patchlog-key-v1\n"
 //
 //	{ "kid": "{ns}#{e}", "name"?: resource, "from"?: thumbprint, "wrapped": base64url(enc ‖ ct) }
 //
-// name is set for a per-resource key K_r, and from for a keyring entry
-// relayed at E3 (§E.3.2), wrapped in HPKE auth mode under the admin key
-// whose thumbprint it is (UnwrapKeyAuth). The HPKE info binds kid and the
-// resource name (wrapInfo), so a wrapped key can't be presented as another
-// epoch's or resource's.
+// name is set for a per-resource key K_r, view for a view key K_view
+// (§E.2.1, v0.89), and from for a keyring entry relayed at E3 (§E.3.2),
+// wrapped in HPKE auth mode under the admin key whose thumbprint it is
+// (UnwrapKeyAuth). The HPKE info binds kid and the resource name, or
+// "view:{view}" for a K_view, which no resource name can be (wrapInfo), so
+// a wrapped key can't be presented as another epoch's, resource's or
+// view's.
 type WrappedKey struct {
 	Kid      string
 	Resource string // the wire's name: "" for an epoch key
+	View     string // the wire's view: set for a K_view only
 	From     string // thumbprint of the sender of a keyring entry, "" otherwise
 	Wrapped  []byte // HPKE enc ‖ ciphertext
 }
 
-// wrapInfo is the HPKE info of kid's key: K_r of resource, or K_e with
-// resource "", whose info then ends in 0x0A (§E.2.3).
-func wrapInfo(kid, resource string) []byte {
-	return []byte(WrapInfoPrefix + kid + "\n" + resource)
+// ViewWrapName is the name a K_view of view is wrapped under in the HPKE
+// info: "view:{view}" (§E.2.3).
+func ViewWrapName(view string) string { return viewWrapNamePfx + view }
+
+// infoName is the name w's HPKE info ends in: its resource, its view's
+// ViewWrapName, or "" for an epoch key.
+func (w WrappedKey) infoName() string {
+	if w.View != "" {
+		return ViewWrapName(w.View)
+	}
+	return w.Resource
+}
+
+// wrapInfo is the HPKE info of kid's key: K_r of resource, K_view with
+// name "view:{view}", or K_e with name "", whose info then ends in 0x0A
+// (§E.2.3).
+func wrapInfo(kid, name string) []byte {
+	return []byte(WrapInfoPrefix + kid + "\n" + name)
+}
+
+// WrapViewKey wraps K_view of view, epoch kid, for recipient in HPKE base
+// mode (§E.2.3): its info names "view:{view}".
+func WrapViewKey(recipient *ecdh.PublicKey, kid, view string, key []byte) (WrappedKey, error) {
+	w, err := WrapKey(recipient, kid, ViewWrapName(view), key)
+	if err != nil {
+		return WrappedKey{}, err
+	}
+	w.Resource, w.View = "", view
+	return w, nil
 }
 
 var (
@@ -237,7 +265,7 @@ func WrapKey(recipient *ecdh.PublicKey, kid, resource string, key []byte) (Wrapp
 
 // UnwrapKey recovers the key in w with the recipient's private key.
 func UnwrapKey(priv *ecdh.PrivateKey, w WrappedKey) ([]byte, error) {
-	return unwrapBase(priv, wrapInfo(w.Kid, w.Resource), w.Wrapped)
+	return unwrapBase(priv, wrapInfo(w.Kid, w.infoName()), w.Wrapped)
 }
 
 func unwrapBase(priv *ecdh.PrivateKey, info, wrapped []byte) ([]byte, error) {
@@ -258,6 +286,9 @@ func (w WrappedKey) Value() map[string]any {
 	m := map[string]any{"kid": w.Kid, "wrapped": b64.EncodeToString(w.Wrapped)}
 	if w.Resource != "" {
 		m["name"] = w.Resource
+	}
+	if w.View != "" {
+		m["view"] = w.View
 	}
 	if w.From != "" {
 		m["from"] = w.From
@@ -297,6 +328,13 @@ func ParseWrappedKey(v any) (WrappedKey, error) {
 			return WrappedKey{}, fmt.Errorf("%w: wrapped key %s", ErrFormat, member)
 		}
 		w.Resource = s
+	}
+	if vv, ok := m["view"]; ok {
+		s, ok := vv.(string)
+		if !ok || s == "" || w.Resource != "" {
+			return WrappedKey{}, fmt.Errorf("%w: wrapped key view", ErrFormat)
+		}
+		w.View = s
 	}
 	if f, ok := m["from"]; ok {
 		if w.From, ok = f.(string); !ok || !ValidThumbprint(w.From) {

@@ -307,7 +307,7 @@ func (k *Keys) Current(ctx context.Context, ns string) (Info, Key, error) {
 		return in, Key{}, err
 	}
 	key, err := k.EpochKey(ctx, ns, in.Epoch)
-	return in, Key{NS: ns, Epoch: in.Epoch, K: key, Pad: in.Pad}, err
+	return in, Key{NS: ns, Epoch: in.Epoch, K: key, Pad: in.Pad, E3: in.Level == LevelE2E}, err
 }
 
 // ErrUnjudged is KeyAt asked for the key of an epoch that isn't known (0
@@ -330,7 +330,7 @@ func (k *Keys) KeyAt(ctx context.Context, ns string, epoch int) (Key, error) {
 		return Key{}, err
 	}
 	key, err := k.EpochKey(ctx, ns, epoch)
-	return Key{NS: ns, Epoch: epoch, K: key, Pad: in.Pad}, err
+	return Key{NS: ns, Epoch: epoch, K: key, Pad: in.Pad, E3: in.Level == LevelE2E}, err
 }
 
 // EpochOf is the epoch of kid, "{ns}#{e}", the kid of a sealed document

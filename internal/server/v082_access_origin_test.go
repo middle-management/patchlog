@@ -155,8 +155,10 @@ func TestV082AccessNowRoleReadsNothing(t *testing.T) {
 	both := with("clock", "prefixed")
 	expect(t, e.get("/r/p/pub-a", both), 302)
 	expect(t, e.get("/ns/p/log", both), 302) // a partial reader (§7.9)
-	if c := keys(both); c != 403 {
-		t.Errorf("/keys with a /now role and a /resource role: %d, want 403 (no K_e)", c)
+	// A partial reader of a sealed namespace gets its view's K_view, never
+	// K_e (§E.2.3, v0.89).
+	if r := e.do(req{method: "POST", path: "/ns/s/keys", body: map[string]any{}, bearer: both}); r.Code != 200 || !strings.Contains(string(r.Body), `"view":`) {
+		t.Errorf("/keys with a /now role and a /resource role: %d %s, want 200 with a view key (no K_e)", r.Code, r.Body)
 	}
 	if c := branch(both); c != 403 {
 		t.Errorf("branching with a /now role and a /resource role: %d, want 403", c)

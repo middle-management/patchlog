@@ -4,7 +4,7 @@ package client
 //
 //   - Sealed namespaces (E2) never serve a blob's plaintext: GET
 //     /r/{ns}/{name}/blob/{bid} answers 302 to …/blob/{bid}/e/{e}, the blob
-//     in the binary sealed form (seal.SealBlob) under the resource's K_r of
+//     in the binary sealed form (seal.SealBlob) under the blob's K_blob (v0.89) of
 //     epoch e. GetBlobRef follows the redirect, opens the blob with the
 //     client's Keys (WithKeys) and checks it against the reference. Only a
 //     blob reached through …/e/{e} is opened so: in any other namespace a
@@ -245,7 +245,13 @@ func (c *Client) getBlobRef(ctx context.Context, ns, name string, ref any, epoch
 		// integer: the client sends its grant there, and anything else
 		// (dot segments, a query) could point it elsewhere on the host.
 		loc := resp.header.Get("Location")
-		rest, ok := strings.CutPrefix(loc, base+"/e/")
+		at, want := loc, base
+		if m := viewPrefixRe.FindString(loc); m != "" && strings.HasPrefix(m, "/ns/"+ns+"/") {
+			// A partial reader's, under its view's prefix, where the
+			// resource's URLs name no namespace (§7.9 Content).
+			at, want = loc[len(m):], "/r/"+name+"/blob/"+r.bid
+		}
+		rest, ok := strings.CutPrefix(at, want+"/e/")
 		if e, err := strconv.Atoi(rest); !ok || err != nil || e < 1 || strconv.Itoa(e) != rest {
 			return nil, fmt.Errorf("client: %s redirects to %q", path, loc)
 		}
@@ -273,8 +279,8 @@ func (c *Client) getBlobRef(ctx context.Context, ns, name string, ref any, epoch
 }
 
 // openBlob opens a blob of ns/name sealed for delivery (§E.2.2): its kid
-// names ns and its pl the resource and blob; the key is the resource's
-// K_r of that epoch (or derived from K_e).
+// names ns and its pl the resource and blob; the key is the blob's K_blob
+// of that epoch, carried by a filtered answer or derived from K_r or K_e.
 func (c *Client) openBlob(ctx context.Context, ns, name, bid string, sealed []byte) ([]byte, error) {
 	if c.keys == nil {
 		return nil, ErrNoKeys
@@ -294,7 +300,9 @@ func (c *Client) openBlob(ctx context.Context, ns, name, bid string, sealed []by
 	if kns != ns {
 		return nil, fmt.Errorf("client: blob of %s is sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
 	}
-	key, err := c.keys.key(ctx, c, h.Kid, name, ns)
+	// Under its K_blob (§E.2.1, v0.89): carried by a filtered answer, or
+	// derived from K_r.
+	key, err := c.keys.subKey(ctx, c, h.Kid, name, subBlob, bid, ns)
 	if err != nil {
 		return nil, err
 	}

@@ -13,7 +13,7 @@ import (
 // without compression (§E.2.2), with the plaintext minus the padding.
 func openPadded(t *testing.T, jwe string, key []byte, kid string, pl seal.PL) (bool, []byte) {
 	t.Helper()
-	h, pt, err := seal.Open(jwe, key)
+	h, pt, err := seal.Open(jwe, belowKr(t, key, pl))
 	if err != nil {
 		t.Fatal(err)
 	}

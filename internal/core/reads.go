@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // headItem is one resource as a namespace sees it.
@@ -598,6 +600,13 @@ type Log struct {
 	// if none bounds it (admission.go): an event stream ends there at the
 	// latest (§7.3).
 	Until time.Time
+	// named lists, per entry of a filtered page, the visible revisions it
+	// names; fseals is the sealing of a filtered answer in a sealed
+	// namespace, prepared with the read and made after it
+	// (sealFilteredLog), one per entry for events (fsEvents).
+	named    [][]namedRev
+	fseals   []*fsealing
+	fsEvents bool
 }
 
 // ResourceLog serves /r/{ns}/{name}/rev/{id}/log?since= (§7.1). With id
@@ -609,12 +618,19 @@ type Log struct {
 // logPageBytes, at E2 bytes of the entries' JWEs, though always one entry;
 // namespace logs carry no patch sets.
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
-	return e.resourceLog(ctx, ns, name, id, since, limit, cred, nil)
+	return e.resourceLog(ctx, ns, name, id, since, limit, cred, nil, false)
+}
+
+// ResourceEventLog is ResourceLog for an event stream (§7.3): what a
+// partial reader of a sealed namespace reads filtered is sealed one
+// JWE per event, not as one range (§7.9 Sealed namespaces, §E.2.2).
+func (e *Engine) ResourceEventLog(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
+	return e.resourceLog(ctx, ns, name, "", since, limit, cred, nil, true)
 }
 
 // resourceLog is ResourceLog, recording in q, if given, what its read
 // check decided (live.go, quiet resources).
-func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials, q *quietRead) (*Log, error) {
+func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials, q *quietRead, events bool) (*Log, error) {
 	if testResourceLogRead != nil {
 		testResourceLogRead()
 	}
@@ -741,7 +757,7 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 		out.Last = since
 		if byDoc {
 			// Each entry judged with its own read envelope (§C.2 item 5).
-			ms, ok := t.judgeEntries(n, a, name, entries)
+			ms, shown, patches, ok := t.judgeEntries(n, a, name, entries)
 			if !ok {
 				// A range it can read nothing of from genesis is a
 				// resource it can read no revision of: answered as a name
@@ -755,6 +771,39 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 			if len(entries) > 0 {
 				out.Last = entries[len(entries)-1].ID
 			}
+			if !sealed {
+				return nil
+			}
+			if !t.readsPartially(n, a) {
+				// Every entry read, as unfiltered: each its own JWE.
+				jobs = jobs[:len(entries)]
+				out.Sealed, nsRowID = true, n.id
+				return nil
+			}
+			// A partial reader's answer at sealed: one JWE under its
+			// view's K_view, or one per event (§7.9 Sealed namespaces,
+			// §E.2.2 Filtered answers).
+			jobs = nil
+			if id == "" && len(ms) == 0 {
+				// A live read with nothing shown waits or answers 204:
+				// nothing to seal.
+				return nil
+			}
+			fs := t.filteredScope(n)
+			fv, verr := t.grantView(fs, t.filteredCurrent(fs), a)
+			if verr != nil {
+				return verr
+			}
+			value := func(r *revRow) []byte {
+				for _, le := range entries {
+					if le.row == r {
+						return jsonv.Canonical(le.value())
+					}
+				}
+				return nil
+			}
+			out.fsEvents = events
+			out.fseals = t.resourceRangeSealing(n, fv, name, since, out.Last, ms, shown, patches, value, events)
 			return nil
 		}
 		for _, e := range entries {
@@ -767,7 +816,10 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 		}
 		return nil
 	})
-	if err == nil && out != nil && out.Sealed {
+	if err == nil && out != nil && out.fseals != nil {
+		err = e.sealFilteredLog(ctx, out)
+	}
+	if err == nil && out != nil && out.Sealed && out.EntryJWEs == nil && out.Range == "" {
 		if err = e.finishSeal(ctx, nsRowID, jobs); err == nil {
 			out.EntryJWEs = make([]string, len(jobs))
 			for i, j := range jobs {
@@ -1038,6 +1090,29 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			if t.readsByDoc(n, a) {
 				out.Entries = t.judgePruneEvents(n, a, resource, out.Entries)
 			}
+			if t.isSealedNS(n) && t.readsPartially(n, a) {
+				// A partial reader's, under its view's K_view, each with
+				// the keys of a prune's horizon (§7.9 Sealed namespaces).
+				fs := t.filteredScope(n)
+				fv, verr := t.grantView(fs, t.filteredCurrent(fs), a)
+				if verr != nil {
+					return verr
+				}
+				head := t.resolve(n, resource, nil).head
+				out.fsEvents = true
+				for _, d := range out.Entries {
+					d := d
+					var revs []namedRev
+					if id, err := ids.Parse(fmt.Sprint(d["target"])); err == nil && d["kind"] == "prune" && head != nil {
+						if row := t.findInAncestry(head, id); row != nil {
+							revs = []namedRev{{resource, row}}
+						}
+					}
+					kind, _ := d["kind"].(string)
+					out.fseals = append(out.fseals, t.filteredSealing(n, fv, seal.ResourceEventPL(n.name, resource, kind), revs, nil, func() any { return d }))
+				}
+				return nil
+			}
 			if t.isSealedNS(n) {
 				out.Sealed, nsRowID = true, n.id
 				jobs = t.resourceEventJobs(n, resource, out.Entries)
@@ -1072,7 +1147,10 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		}
 		return nil
 	})
-	if err == nil && out != nil && out.Sealed {
+	if err == nil && out != nil && out.fseals != nil {
+		err = e.sealFilteredLog(ctx, out)
+	}
+	if err == nil && out != nil && out.Sealed && out.EntryJWEs == nil && out.Range == "" {
 		if err = e.finishSeal(ctx, nsRowID, jobs); err == nil {
 			if perEntry || resource != "" {
 				out.EntryJWEs = make([]string, len(jobs))
@@ -1099,6 +1177,9 @@ type HeadsPage struct {
 	Items  []map[string]any `json:"heads"`
 	Next   string           `json:"next,omitempty"`
 	Public bool             `json:"-"`
+	// JWE is a filtered page of a sealed namespace (§7.9, §E.2.2): served
+	// as it is, application/jose, in place of Items and Next.
+	JWE string `json:"-"`
 }
 
 // NamespaceHeads lists every resource as of a namespace revision, including

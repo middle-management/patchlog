@@ -98,7 +98,7 @@ type addendumI struct {
 	} `json:"I.22"`
 	I23 struct {
 		Q, Sort, CanonicalQuery, View string
-		ViewKeyKr                     string
+		ViewKeyKrevC                  string
 		Item                          struct{ Header, Plaintext, JWE, PaddedTag string }
 		Served, Rejected              string
 	} `json:"I.23"`
@@ -727,8 +727,8 @@ func sealedTags(t *testing.T, key []byte, pl seal.PL, pt []byte) (jwe, tag, padd
 }
 
 // I.19 (§E.2.2), keys and bytes: each row's plaintext sealed with I.7's
-// K_e under the K_r or K_n the reference derives (seal.ResourceKey,
-// seal.NamespaceKey), with the pl its production constructor gives
+// K_e under the K_log or K_n the reference derives (seal.LogKey of
+// seal.ResourceKey, v0.89; seal.NamespaceKey), with the pl its production constructor gives
 // (seal.ResourcePL, NamespaceDocPL, RangePL), kid demo#3 and the IV
 // c0 … cb, through seal.SealWithIV, unpadded and padded; entry_g's JWE in
 // full; and the resource log range's array. The plaintexts are
@@ -772,7 +772,15 @@ func TestI19SealedPayloads(t *testing.T) {
 		if got := string(jsonv.Canonical(jsonv.FromGo(map[string]any(pls[i])))); got != r.PL {
 			t.Errorf("row %d: pl %s, want %s", i, got, r.PL)
 		}
-		key := map[string][]byte{"K_r": kr, "K_n": kn}[r.Key]
+		// v0.89: each resource entry under its own K_log (§E.2.1).
+		logKey := func(id string) []byte {
+			k, err := seal.LogKey(kr, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return k
+		}
+		key := map[string][]byte{"K_log(g)": logKey(idG), "K_log(c)": logKey(idC), "K_log(t)": logKey(idT), "K_n": kn}[r.Key]
 		if key == nil {
 			t.Fatalf("row %d: key %q", i, r.Key)
 		}
@@ -926,6 +934,16 @@ func (d *sealedDemo) stream(t *testing.T, path, since string) (next func() (id, 
 	}
 }
 
+// logKey is K_log of revision or tombstone id of derby (§E.2.1, v0.89).
+func (d *sealedDemo) logKey(t *testing.T, id string) []byte {
+	t.Helper()
+	k, err := seal.LogKey(d.kr, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
 // open opens jwe under want and checks it opens under no other of the
 // keys; it returns the plaintext, which must be canonical JSON.
 func (d *sealedDemo) open(t *testing.T, what, jwe string, want []byte, pl seal.PL) []byte {
@@ -997,7 +1015,8 @@ func TestI19SealedServed(t *testing.T) {
 	p := loadAddendumI(t).I19
 	d := newSealedDemo(t, p.Plaintexts["nsdoc"], p.Plaintexts)
 
-	// The resource log from genesis to the tombstone: entries under K_r.
+	// The resource log from genesis to the tombstone: entries each under
+	// its K_log (v0.89).
 	var log []string
 	if err := json.Unmarshal(d.get(t, "/r/demo/derby/rev/"+d.tomb+"/log"), &log); err != nil || len(log) != 3 {
 		t.Fatalf("the resource log: %v %v", log, err)
@@ -1005,7 +1024,7 @@ func TestI19SealedServed(t *testing.T) {
 	for i, c := range []struct {
 		want, id, kind, parent string
 	}{{"entry_g", d.g, "rev", ""}, {"entry_c", d.c, "rev", d.g}, {"entry_t", d.tomb, "tombstone", d.c}} {
-		sv := d.like(t, c.want, d.open(t, c.want, log[i], d.kr, seal.ResourcePL("demo", "derby", c.id, c.kind)), c.want, false)
+		sv := d.like(t, c.want, d.open(t, c.want, log[i], d.logKey(t, c.id), seal.ResourcePL("demo", "derby", c.id, c.kind)), c.want, false)
 		if sv["id"] != c.id || sv["parent"] != c.parent {
 			t.Errorf("%s: id %v parent %v, want %s %q", c.want, sv["id"], sv["parent"], c.id, c.parent)
 		}

@@ -128,6 +128,18 @@ function resourceKey(epochKey, ns, name) {
   return hkdf(epochKey, utf8(RESOURCE_KEY_SALT), utf8(ns + '\n' + name), 32);
 }
 
+/* Below K_r (§E.2.1, v0.89): K_rev = HKDF-SHA256(K_r, "patchlog-e2-rev", id) seals a revision's document,
+ * K_log = HKDF-SHA256(K_r, "patchlog-e2-log", id) its or a tombstone's log entry, and
+ * K_blob = HKDF-SHA256(K_r, "patchlog-e2-blob", bid) a blob, ids in text form. */
+function revKey(resourceKey, id) { return belowKey(resourceKey, 'patchlog-e2-rev', id); }
+function logKey(resourceKey, id) { return belowKey(resourceKey, 'patchlog-e2-log', id); }
+function blobKey(resourceKey, bid) { return belowKey(resourceKey, 'patchlog-e2-blob', bid); }
+function belowKey(key, salt, info) {
+  if (key.length !== 32) throw new Error('key must be 32 bytes');
+  if (typeof info !== 'string' || !info) throw new Error('a derived key needs an id');
+  return hkdf(key, utf8(salt), utf8(info), 32);
+}
+
 /* K_n = HKDF-SHA256(K_e, "patchlog-e2", ns ‖ "\n"): namespace documents, log ranges, events and grants (§E.2.1). */
 function namespaceKey(epochKey, ns) {
   if (epochKey.length !== 32) throw new Error('epoch key must be 32 bytes');
@@ -977,7 +989,7 @@ class SealCounter {
 root.PLSeal = {
   SUITE, b64u, unb64u, b32, hex, unhex, utf8, equalBytes, randomBytes, newNonce, canonical, padLen,
   sha256, chainID, revisionID, tombstoneID, idBytes,
-  hkdf, resourceKey, namespaceKey, viewKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, thumbprint, parseJWK,
+  hkdf, resourceKey, namespaceKey, viewKey, revKey, logKey, blobKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, thumbprint, parseJWK,
   hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapRelayedKey, checkRelayedEntry, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
   sealPatchSet, sealedJWE, sealedBlobs, BLOB_TYPE, blobType, blobID, blobIDs, sameBlobs, parseBlob, openBlob, sealBlob, encryptBlob, decryptBlob,
   isKeyringV2, parseKeyringV2, buildKeyringV2, keyringV2ForWrite, keyringV2Add, keyringV2EpochKey, keyringV2Epochs,

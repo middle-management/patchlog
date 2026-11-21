@@ -1007,7 +1007,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 			case lacks:
 				m = map[string]any{}
 			default:
-				jwe, err := derived.SealItem(key, derived.View{NS: ns, Target: view}, h.Resource, m)
+				jwe, err := derived.SealItem(key, derived.View{NS: ns, Target: view}, h.Resource, h.ID, m)
 				if err != nil {
 					return derived.Stored{}, "", false, fmt.Errorf("sealing a hit: %w", err)
 				}
