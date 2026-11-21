@@ -20,8 +20,8 @@ import (
 // the locks, that all of it is unchanged:
 //
 //   - every namespace the check read: the target, every base whose keys and
-//     revocations applied (§C.4), the namespaces of resolved schemas, of a
-//     requireAt and of a batch source. Their config_seq (rules, keys,
+//     revocations applied (§C.4), the namespaces of resolved schemas and of
+//     a batch source. Their config_seq (rules, keys,
 //     revocations, roles, limits, allowances, frozen), frozen and purged
 //     flags and base must be the same. A namespace's head may move: that is
 //     another resource's write.

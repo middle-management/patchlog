@@ -14,8 +14,8 @@ import (
 // through or its own; the chain is kept, so z stays held when its
 // document is unreadable later. A holder of sealed refuses a plaintext
 // 200 in n itself too, the resource named keyring included. The chain is
-// followed through every base whose document was read; a remote base and
-// an unrelated one are not in it. Until v0.86 a level was held per
+// followed through every base whose document was read; an unrelated one
+// is not in it. Until v0.86 a level was held per
 // namespace only, and only a holder of e2e refused a document in the
 // clear.
 func TestV086PlaygroundBranchLevelWithNode(t *testing.T) {
@@ -64,10 +64,8 @@ globalThis.location = { origin: 'https://o.example' };
   await read('z2 before n2 is read', 'z2');
   nsInfoCache.clear(); await nsInfo('n2');
   await read('z2 after n2 is read', 'z2');
-  // A remote base, and a base nothing is held for.
-  plain('r'); plain('q');
-  routes['/ns/r'] = { status: 200, json: { base: { origin: 'https://a.example', ns: 'n', at: input.id }, encryption: { level: 'at-rest' } } };
-  await read('a remote branch', 'r');
+  // A base nothing is held for.
+  plain('q');
   routes['/ns/q'] = { status: 200, json: { base: base('p') } };
   await read('a branch of another', 'q');
   out['stored'] = { stored: JSON.parse(localStorage.getItem('pl.bases')) };
@@ -100,14 +98,11 @@ globalThis.location = { origin: 'https://o.example' };
 	if g := out["z2 after n2 is read"]; g.Level != "e2e" || g.Held != "e2e" || g.Lowered == "" || g.Read != nil || g.Keyring == nil {
 		t.Errorf("z2 under an e2e chain: %+v", g)
 	}
-	if g := out["a remote branch"]; g.Level != "at-rest" || g.Held != "at-rest" || g.Lowered != "" || g.Read == nil {
-		t.Errorf("a remote branch isn't held to a local namespace of its base's name: %+v", g)
-	}
 	if g := out["a branch of another"]; g.Level != "" || g.Held != "" || g.Read == nil || g.ReadErr != "" {
 		t.Errorf("a branch of a namespace nothing is held for: %+v", g)
 	}
 	st := out["stored"].Stored
-	if len(st["https://o.example z"]) != 1 || st["https://o.example z"][0] != "n" || len(st["https://o.example r"]) != 0 {
+	if len(st["https://o.example z"]) != 1 || st["https://o.example z"][0] != "n" {
 		t.Errorf("the chain as stored: %v", st)
 	}
 	if g := out["forgotten"]; g.Held != "" || len(g.Stored["https://o.example z"]) != 0 {
@@ -176,39 +171,37 @@ async function nsInfo(ns) { return { level: 'e2e', doc: docs[ns] || null }; }
   nsChainOK.forks = new Map();
   routes['/ns/n/log'] = { status: 200, json: [{ id: I.G, prev: '', kind: 'head' }] };
   out['no config genesis'] = await nsChainOK('z', 'm', at());
-  // A remote base: only the branch's own /heads, and its chain behind it.
+  // A base whose /heads this reader may not read: only the branch's own /heads at its first entry.
   nsChainOK.forks = new Map();
-  docs.r = { base: { origin: 'https://a.example', ns: 'n', at: I.A, chain: ['n', 'm'] } };
-  const before = asked.length;
-  out['remote, unplaced'] = await nsChainOK('r', 'm', at());
-  out['remote asked no base'] = !asked.slice(before).some((p) => p.includes('/ns/n/') || p.includes('/ns/m/'));
+  docs.r = { base: { ns: 'q', at: I.A } }; docs.q = {};
+  routes['/ns/q/rev/' + I.A + '/heads'] = denied;
   routes['/ns/r/log'] = { status: 200, json: [{ id: I.G, prev: '', kind: 'config' }] };
   routes['/ns/r/rev/' + I.G + '/heads'] = heads(I.F1);
-  out['remote n'] = await nsChainOK('r', 'n', at()); out['remote m'] = await nsChainOK('r', 'm', at());
-  out['remote past the fork'] = await nsChainOK('r', 'm', at([I.F1]));
-  out['remote, not in the chain'] = await nsChainOK('r', 'x', at());
+  out['unread base q'] = await nsChainOK('r', 'q', at());
+  out['q past the fork'] = await nsChainOK('r', 'q', at([I.F1]));
+  out['not in the chain'] = await nsChainOK('r', 'x', at());
   // A partial reader's /heads is a redirect to its filtered listing, which api follows: it places no fork.
   nsChainOK.forks = new Map();
-  routes['/ns/r/rev/' + I.G + '/heads'] = Object.assign(heads(I.F1), { finalPath: '/ns/r/g/' + I.W + '/rev/' + I.G + '/heads' });
-  out['filtered /heads'] = await nsChainOK('r', 'n', at());
+  routes['/ns/r/rev/' + I.G + '/heads'] = Object.assign(heads(I.F1), { finalPath: '/ns/r/view/' + I.W + '/rev/' + I.G + '/heads' });
+  out['filtered /heads'] = await nsChainOK('r', 'q', at());
   routes['/ns/r/rev/' + I.G + '/heads'] = heads(I.F1);
-  routes['/ns/r/log'] = { status: 200, json: [{ id: I.G, prev: '', kind: 'config' }], finalPath: '/ns/r/g/' + I.W + '/rev/' + I.X + '/log' };
-  out['filtered namespace log'] = await nsChainOK('r', 'n', at());
+  routes['/ns/r/log'] = { status: 200, json: [{ id: I.G, prev: '', kind: 'config' }], finalPath: '/ns/r/view/' + I.W + '/rev/' + I.X + '/log' };
+  out['filtered namespace log'] = await nsChainOK('r', 'q', at());
   routes['/ns/r/log'] = { status: 200, json: [{ id: I.G, prev: '', kind: 'config' }], finalPath: '/ns/r/rev/' + I.X + '/log' };
-  out['the range at the head'] = await nsChainOK('r', 'n', at());
+  out['the range at the head'] = await nsChainOK('r', 'q', at());
   // Whether since precedes the fork: an answer of the moment concludes nothing and isn't kept.
   routes['/r/r/d/rev/' + I.F1 + '/log?since=' + I.W] = { status: 503, json: { code: 'behind' } };
-  try { await nsChainOK('r', 'n', at([], I.W)); out['503 throws'] = false; } catch (e) { out['503 throws'] = true; }
+  try { await nsChainOK('r', 'q', at([], I.W)); out['503 throws'] = false; } catch (e) { out['503 throws'] = true; }
   routes['/r/r/d/rev/' + I.F1 + '/log?since=' + I.W] = { status: 429, json: { code: 'rate_limited' } };
-  try { await nsChainOK('r', 'n', at([], I.W)); out['429 throws'] = false; } catch (e) { out['429 throws'] = true; }
+  try { await nsChainOK('r', 'q', at([], I.W)); out['429 throws'] = false; } catch (e) { out['429 throws'] = true; }
   routes['/r/r/d/rev/' + I.F1 + '/log?since=' + I.W] = { status: 200, json: [] };
-  out['after the 503'] = await nsChainOK('r', 'n', at([], I.W));
+  out['after the 503'] = await nsChainOK('r', 'q', at([], I.W));
   routes['/r/r/d/rev/' + I.F1 + '/log?since=' + I.X] = { status: 404, json: { code: 'not_found' } };
-  out['a refusal is an answer'] = await nsChainOK('r', 'n', at([], I.X));
+  out['a refusal is an answer'] = await nsChainOK('r', 'q', at([], I.X));
   // The base had no such resource: nothing is read through.
   routes['/ns/r/rev/' + I.G + '/heads'] = { status: 200, json: { heads: [{ resource: 'c', kind: 'head', target: I.W }] } };
   nsChainOK.forks = new Map();
-  out['the base had none'] = await nsChainOK('r', 'n', at());
+  out['the base had none'] = await nsChainOK('r', 'q', at());
 `, map[string]any{"ids": ids}, &out)
 	for key, want := range map[string]bool{
 		"member n": true, "member m": true, "member x": false,
@@ -217,8 +210,7 @@ async function nsInfo(ns) { return { level: 'e2e', doc: docs[ns] || null }; }
 		"range holding the fork": true, "asked0": true,
 		"m, its fork unplaced": false, "n, the nearer fork placed": true, "n past its fork, still": false,
 		"m, placed from n's own /heads": true, "m past it": false, "no config genesis": false,
-		"remote, unplaced": false, "remote asked no base": true, "remote n": true, "remote m": true,
-		"remote past the fork": false, "remote, not in the chain": false, "the base had none": false,
+		"unread base q": true, "q past the fork": false, "not in the chain": false, "the base had none": false,
 		"filtered /heads": false, "filtered namespace log": false, "the range at the head": true,
 		"503 throws": true, "429 throws": true, "after the 503": true, "a refusal is an answer": false,
 	} {
@@ -237,8 +229,8 @@ async function nsInfo(ns) { return { level: 'e2e', doc: docs[ns] || null }; }
 // openSealedEntries. A catalog entry sealed under a release branch of the
 // catalog opens, and so does one sealed under a branch of that branch,
 // which until v0.86 the playground followed for an item's value only. One
-// sealed under a namespace whose document the reader can't read, a remote
-// branch, or a branch of something else shows by name only; so does an
+// sealed under a namespace whose document the reader can't read, or a
+// branch of something else shows by name only; so does an
 // item's value sealed under such a namespace.
 func TestV086PlaygroundPreviewChainWithNode(t *testing.T) {
 	t.Parallel()
@@ -247,12 +239,9 @@ func TestV086PlaygroundPreviewChainWithNode(t *testing.T) {
 	local := func(base string) map[string]any {
 		return map[string]any{"base": map[string]any{"ns": base, "at": xrev2Head}}
 	}
-	remote := func(base string) map[string]any {
-		return map[string]any{"base": map[string]any{"origin": "https://a.example", "ns": base, "at": xrev2Head}}
-	}
 	docs := map[string]any{
-		"cat-r": local("cat"), "cat-rr": local("cat-r"), "cat-remote": remote("cat"), "cat-other": local("elsewhere"),
-		"matches-r": local("matches"), "matches-rr": local("matches-r"), "matches-remote": remote("matches"), "matches-other": local("elsewhere"),
+		"cat-r": local("cat"), "cat-rr": local("cat-r"), "cat-other": local("elsewhere"),
+		"matches-r": local("matches"), "matches-rr": local("matches-r"), "matches-other": local("elsewhere"),
 	}
 	// Each child: the namespace its own value is sealed under, and the one
 	// its item's file value is, named by its content URL.
@@ -260,9 +249,8 @@ func TestV086PlaygroundPreviewChainWithNode(t *testing.T) {
 		{"cat-r", "matches-r"},           // 0: a release preview
 		{"cat-rr", "matches-rr"},         // 1: a stacked one
 		{"cat-unread", "matches-unread"}, // 2: documents the reader can't read
-		{"cat-remote", "matches-remote"}, // 3: remote branches
-		{"cat-other", "matches-other"},   // 4: branches of something else
-		{"cat", "matches"},               // 5: no preview
+		{"cat-other", "matches-other"},   // 3: branches of something else
+		{"cat", "matches"},               // 4: no preview
 	}
 	var kids []any
 	for _, c := range cases {
@@ -296,7 +284,7 @@ func TestV086PlaygroundPreviewChainWithNode(t *testing.T) {
 		t.Fatalf("children: %+v", out.Children)
 	}
 	for i, c := range out.Children {
-		opens := i == 0 || i == 1 || i == 5
+		opens := i == 0 || i == 1 || i == 4
 		if c.Name != "matches.derby" {
 			t.Errorf("child %d: the name is gone: %+v", i, c)
 		}

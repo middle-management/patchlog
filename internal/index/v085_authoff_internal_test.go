@@ -11,7 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 )
 
-// SERVICES §B.11.9 Where (v0.85): "A service learns whether
+// SERVICES §7.9 Where (v0.85): "A service learns whether
 // authentication is on from the origin's GET / (§7), reusing a successful
 // read for at most a minute and none once a later read has failed." With
 // a CheckerTTL of ten minutes a read is still reused for a minute at

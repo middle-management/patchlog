@@ -18,70 +18,39 @@ func TestCheckMembers(t *testing.T) {
 	ok := []string{
 		`{}`,
 		`{"read":"public","x-title":"Docs","x-":1,"x-nested":{"anything":[1,"two"]}}`,
-		`{"catalog":{"trust":["matches","docs"],"mode":"tree"}}`,
-		`{"catalog":{"mode":"dag"}}`,
-		`{"catalog":{}}`,
-		`{"catalogs":{"cat-season":{"place":["group:match-desk","user:anna"]},"topics":{}}}`,
 		`{"merged":{"at":"` + id + `"}}`,
 		`{"cleanup":{"merged":"P7D","superseded":"P30D","abandoned":"PT12H"}}`,
 		`{"cleanup":{}}`,
 		`{"abandoned":true}`,
 		`{"abandoned":false}`,
 		`{"revoked":["` + id + `"]}`,
-		`{"merge":{"authors":[]},"frozen":true,"successor":"next","maxLag":"PT60S"}`,
-		// v0.38: the addenda's objects may carry x- members; the keys of
-		// catalogs are catalog names, so "x-desk" is one.
-		`{"catalog":{"mode":"tree","x-label":"Season"}}`,
-		`{"catalogs":{"cat":{"place":["group:desk"],"x-note":"since 2025"},"x-desk":{}}}`,
+		`{"merge":{"authors":[]},"frozen":true,"successor":"next"}`,
+		// v0.38: the addenda's objects may carry x- members.
 		`{"merged":{"at":"` + id + `","x-by":"release-bot"}}`,
 		`{"cleanup":{"merged":"P7D","x-why":"short-lived"}}`,
 		`{"merge":{"authors":[],"x-note":"bots only"}}`,
-		// v0.55: catalog.files makes a file tree (§H.2).
-		`{"catalog":{"trust":["files"],"mode":"tree","files":{"ns":"files","root":"root"}}}`,
-		`{"catalog":{"files":{"ns":"files","root":"top_1","folder":"/r/schemas/folder/rev/` + id + `","placement":"/r/schemas/placement/rev/` + id + `","x-tool":"dav"}}}`,
 	}
 	bad := map[string]string{
-		`{"title":"Docs"}`:                                              `/title is not a namespace-document member`,
-		`{"X-title":"Docs"}`:                                            `/X-title is not`,
-		`{"xtitle":1}`:                                                  `e.g. /x-xtitle`,
-		`{"a/b":1}`:                                                     `/a~1b is not`,
-		`{"catalog":[]}`:                                                `/catalog must be`,
-		`{"catalog":{"trust":"matches"}}`:                               `/catalog/trust must be an array`,
-		`{"catalog":{"trust":["Matches"]}}`:                             `/catalog/trust/0 must be a namespace name`,
-		`{"catalog":{"mode":"forest"}}`:                                 `/catalog/mode must be "tree" or "dag"`,
-		`{"catalog":{"trusts":[]}}`:                                     `/catalog/trusts is not a known field`,
-		`{"catalogs":[]}`:                                               `/catalogs must be`,
-		`{"catalogs":{"Cat":{"place":[]}}}`:                             `catalog namespace names`,
-		`{"catalogs":{"cat":[]}}`:                                       `/catalogs/cat must be`,
-		`{"catalogs":{"cat":{"place":"group:x"}}}`:                      `/catalogs/cat/place must be an array`,
-		`{"catalogs":{"cat":{"place":["match-desk"]}}}`:                 `/catalogs/cat/place/0 must be a subject`,
-		`{"catalogs":{"cat":{"place":["group:"]}}}`:                     `/catalogs/cat/place/0 must be a subject`,
-		`{"catalogs":{"cat":{"move":[]}}}`:                              `/catalogs/cat/move is not a known field`,
-		`{"merged":true}`:                                               `/merged must be`,
-		`{"merged":{"at":"nope"}}`:                                      `/merged must be`,
-		`{"cleanup":"P7D"}`:                                             `/cleanup must be`,
-		`{"cleanup":{"merged":"7 days"}}`:                               `/cleanup/merged must be an ISO 8601 duration`,
-		`{"cleanup":{"merged":7}}`:                                      `/cleanup/merged must be an ISO 8601 duration`,
-		`{"cleanup":{"purged":"P7D"}}`:                                  `/cleanup/purged is not a known field`,
-		`{"abandoned":"yes"}`:                                           `/abandoned must be a boolean`,
-		`{"revoked":["1aaaa"]}`:                                         `/revoked/0 must be a revocation id`,
-		`{"revoked":["` + id + `","not an id"]}`:                        `/revoked/1 must be a revocation id`,
-		`{"x-title":1,"titel":2,"catalog":{"mode":"forest"}}`:           `/catalog/mode`, // in member order
-		`{"keys":[{"kid":"a","x-note":"ops"}]}`:                         `/keys/0/x-note is not a key field`,
-		`{"catalogs":{"X-desk":{}}}`:                                    `/catalogs/X-desk is not a catalog namespace name`,
-		`{"catalog":{"X-label":"Season"}}`:                              `/catalog/X-label is not a known field`,
-		`{"merged":{"at":"` + id + `","by":"x"}}`:                       `/merged/by is not a known field`,
-		`{"cleanup":{"x-why":"a","why":"b"}}`:                           `/cleanup/why is not a known field`,
-		`{"catalog":{"files":true}}`:                                    `/catalog/files must be`,
-		`{"catalog":{"files":{"root":"r"}}}`:                            `/catalog/files must have "ns"`,
-		`{"catalog":{"files":{"ns":"f"}}}`:                              `/catalog/files must have "root"`,
-		`{"catalog":{"files":{"ns":"F","root":"r"}}}`:                   `/catalog/files/ns must be a namespace name`,
-		`{"catalog":{"files":{"ns":"f","root":"a.b"}}}`:                 `/catalog/files/root must be a folder name`,
-		`{"catalog":{"files":{"ns":"f","root":7}}}`:                     `/catalog/files/root must be a folder name`,
-		`{"catalog":{"files":{"ns":"f","root":"/r/c/r"}}}`:              `/catalog/files/root must be a folder name`,
-		`{"catalog":{"files":{"ns":"f","root":"r","folder":"/r/s/f"}}}`: `/catalog/files/folder must be a schema revision path`,
-		`{"catalog":{"files":{"ns":"f","root":"r","placement":1}}}`:     `/catalog/files/placement must be a schema revision path`,
-		`{"catalog":{"files":{"ns":"f","root":"r","mode":"tree"}}}`:     `/catalog/files/mode is not a known field`,
+		`{"title":"Docs"}`:   `/title is not a namespace-document member`,
+		`{"X-title":"Docs"}`: `/X-title is not`,
+		`{"xtitle":1}`:       `e.g. /x-xtitle`,
+		`{"a/b":1}`:          `/a~1b is not`,
+		// v0.87: catalogs and the members that served them are gone.
+		`{"catalog":{}}`:                          `/catalog is not a namespace-document member`,
+		`{"catalogs":{}}`:                         `/catalogs is not a namespace-document member`,
+		`{"maxLag":"PT60S"}`:                      `/maxLag is not a namespace-document member`,
+		`{"merged":true}`:                         `/merged must be`,
+		`{"merged":{"at":"nope"}}`:                `/merged must be`,
+		`{"cleanup":"P7D"}`:                       `/cleanup must be`,
+		`{"cleanup":{"merged":"7 days"}}`:         `/cleanup/merged must be an ISO 8601 duration`,
+		`{"cleanup":{"merged":7}}`:                `/cleanup/merged must be an ISO 8601 duration`,
+		`{"cleanup":{"purged":"P7D"}}`:            `/cleanup/purged is not a known field`,
+		`{"abandoned":"yes"}`:                     `/abandoned must be a boolean`,
+		`{"revoked":["1aaaa"]}`:                   `/revoked/0 must be a revocation id`,
+		`{"revoked":["` + id + `","not an id"]}`:  `/revoked/1 must be a revocation id`,
+		`{"keys":[{"kid":"a","x-note":"ops"}]}`:   `/keys/0/x-note is not a key field`,
+		`{"merged":{"at":"` + id + `","by":"x"}}`: `/merged/by is not a known field`,
+		`{"cleanup":{"x-why":"a","why":"b"}}`:     `/cleanup/why is not a known field`,
 	}
 	for _, s := range ok {
 		if err := checkMembers(jsonv.MustParse([]byte(s)).(map[string]any), nil); err != nil {
@@ -101,8 +70,8 @@ func TestCheckMembers(t *testing.T) {
 	if p, msg := errPointer(t, ae); ae.Status != 422 || ae.Body["code"] != "invalid" || p != "/title" || !strings.Contains(msg, `must start with "x-"`) {
 		t.Fatalf("unknown member error %v", ae)
 	}
-	ae = configErr(checkMembers(jsonv.MustParse([]byte(`{"catalogs":{"cat":{"place":["desk"]}}}`)).(map[string]any), nil))
-	if p, _ := errPointer(t, ae); p != "/catalogs/cat/place/0" {
+	ae = configErr(checkMembers(jsonv.MustParse([]byte(`{"cleanup":{"merged":"7 days"}}`)).(map[string]any), nil))
+	if p, _ := errPointer(t, ae); p != "/cleanup/merged" {
 		t.Fatalf("nested error %v", ae)
 	}
 	// merge is read by parseConfig: x- members are data there too, others
@@ -208,39 +177,12 @@ func TestDefinedMembers(t *testing.T) {
 	}
 }
 
-// A shadow keeps the encryption members this version defines, and only
-// valid ones (§G.3): a base of a newer version may carry others.
-func TestShadowEncryption(t *testing.T) {
-	t.Parallel()
-	e := &Engine{opt: Options{Limits: DefaultLimits(), Maximums: DefaultLimits()}}
-	got, err := e.shadowEncryption("matches", map[string]any{"level": "e2e", "epoch": 3.0, "historyEpochs": 2.0, "pad": true, "suite": "future"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := map[string]any{"level": "e2e", "epoch": 3.0, "historyEpochs": 2.0, "pad": true}
-	if !jsonv.Equal(jsonv.FromGo(got), jsonv.FromGo(want)) {
-		t.Fatalf("shadow encryption %v", got)
-	}
-	if _, err := e.shadowEncryption("matches", map[string]any{"level": "e2e", "epoch": "three"}); err == nil || err.Status != 502 {
-		t.Fatalf("malformed epoch: %v", err)
-	}
-	// Not held to §6.6 Values, which holds creations and config writes
-	// only, never a stored document such as the shadow's: the remote
-	// branch's own creation is (v0.73).
-	small := DefaultLimits()
-	small.PatchSetSize = 200 << 10
-	e = &Engine{opt: Options{Limits: small, Maximums: small}}
-	if _, err := e.shadowEncryption("matches", map[string]any{"level": "e2e"}); err != nil {
-		t.Fatalf("e2e under limits without room for it: %v", err)
-	}
-}
-
 // A namespace whose document was stored before this version, with members
 // it doesn't define, can still be configured, frozen and branched; a write
 // that changes such a member must give it an "x-" name (§7.4).
 func TestStoredMembersAfterUpgrade(t *testing.T) {
 	t.Parallel()
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1})
 	if err != nil {
 		t.Fatal(err)
 	}

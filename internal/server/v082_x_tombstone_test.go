@@ -9,38 +9,32 @@ import (
 
 	plclient "github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/ids"
-	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// XT-1 (7), E2E-3, E2E-4 and E2E-6 end to end (§7.1, §8.6, §E.3.1,
-// §G.5.2; v0.82: "A tombstone's /rev/{T} is 410 with { tombstone, last },
-// so a pruner and a mirroring remote branch learn its parent there"): the
-// reference's client writes x in m, an e2e namespace of A, deletes it and
-// prunes at the tombstone T. It learns T's parent P from A's 410 for
-// /rev/{T}, checks it against T's id, and stores the snapshot of P, whose
-// pl names P. B then takes a remote branch r of m: it learns P the same
-// way and mirrors that snapshot. A reader of r at B, with m#1's key and no
-// access to A, gets what the writer wrote: x's head is the tombstone, its
-// /rev/{T} the 410 naming P, and the document at P opens from the
-// mirrored snapshot, byte for byte A's.
-func TestV082XTombstoneHorizonPrunedMirroredRead(t *testing.T) {
+// XT-1 (7), E2E-3, E2E-4 and E2E-6 end to end (§7.1, §8.6, §E.3.1;
+// v0.82: "A tombstone's /rev/{T} is 410 with { tombstone, last }, so a
+// pruner learns its parent there"): the reference's client writes x in m,
+// an e2e namespace, deletes it and prunes at the tombstone T. It learns
+// T's parent P from the 410 for /rev/{T}, checks it against T's id, and
+// stores the snapshot of P, whose pl names P.
+func TestV082XTombstoneHorizonPruned(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	var aPriv ed25519.PrivateKey
-	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning,
+	a := newEnv(t, withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning,
 		withArchive(t, t.TempDir()), withoutRetentionLoop)
 	a.opPriv = aPriv
-	s := &v081Source{a: a, kA: newKey("admin")}
-	a.mkNS("m", e2eDoc(map[string]any{"read": "grant", "keys": []any{s.kA.entry("*")}}))
-	s.root = func() string { return a.grant(s.kA, "user:root", []string{"m"}, allVerbs) }
+	kA := newKey("admin")
+	a.mkNS("m", e2eDoc(map[string]any{"read": "grant", "keys": []any{kA.entry("*")}}))
+	root := func() string { return a.grant(kA, "user:root", []string{"m"}, allVerbs) }
 
 	// The writer: the client, with a keyring of its own making.
 	jwk, priv, err := seal.GenerateRecipient()
 	if err != nil {
 		t.Fatal(err)
 	}
-	wc, err := plclient.New(a.srv.URL, plclient.WithBearer(a.grant(s.kA, "user:root", []string{"m"}, allVerbs, map[string]any{"enc": jwk})))
+	wc, err := plclient.New(a.srv.URL, plclient.WithBearer(a.grant(kA, "user:root", []string{"m"}, allVerbs, map[string]any{"enc": jwk})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +81,7 @@ func TestV082XTombstoneHorizonPrunedMirroredRead(t *testing.T) {
 	if res, err := wx.PruneE2E(ctx, "m", "x", T); err != nil || res.Horizon != T {
 		t.Fatalf("PruneE2E at the tombstone: %+v %v", res, err)
 	}
-	snap := a.get("/r/m/x/rev/"+P, s.root())
+	snap := a.get("/r/m/x/rev/"+P, root())
 	if snap.Code != 200 || snap.H.Get("Content-Type") != seal.ContentType {
 		t.Fatalf("A at P after the prune: %d %.200s", snap.Code, snap.Body)
 	}
@@ -95,33 +89,7 @@ func TestV082XTombstoneHorizonPrunedMirroredRead(t *testing.T) {
 		t.Fatalf("A's snapshot header: %+v %v", h, err)
 	}
 	gone("A, pruned", wc, "m")
-	if r := a.get("/r/m/x/rev/"+x1.ID, s.root()); r.Code == 200 {
+	if r := a.get("/r/m/x/rev/"+x1.ID, root()); r.Code == 200 {
 		t.Fatalf("A below the horizon: %d", r.Code)
-	}
-
-	// B's remote branch of m at A's head mirrors it.
-	s.at = a.nsHead("m", s.root())
-	b := newV081B(t, s, a.srv.URL)
-	_, reader := v081Remote(t, b, s, "r")
-	if r := b.get("/r/r/x/rev/"+P, reader); r.Code != 200 || string(r.Body) != string(snap.Body) {
-		t.Fatalf("B at P: %d %.200s, want A's snapshot byte for byte", r.Code, r.Body)
-	}
-
-	// The reader at B: m#1's epoch key, and no way to A.
-	ke, err := wx.Key(ctx, "m#1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	rc, err := plclient.New(b.srv.URL, plclient.WithBearer(reader))
-	if err != nil {
-		t.Fatal(err)
-	}
-	gone("B", rc, "r")
-	d, err := rc.E2EKeys(map[string][]byte{"m#1": ke}).DocE2E(ctx, "r", "x", P)
-	if err != nil {
-		t.Fatalf("the reader's document at P, from B's mirrored snapshot: %v", err)
-	}
-	if got := string(jsonv.Canonical(d.Value)); got != `{"v":2}` {
-		t.Fatalf("the reader's document at P: %s, want {\"v\":2}", got)
 	}
 }

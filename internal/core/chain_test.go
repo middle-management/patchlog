@@ -145,8 +145,8 @@ func TestChainStatementsRecognised(t *testing.T) {
 		}
 		fh.Close()
 	}
-	if sites < 11 {
-		t.Errorf("found %d statements writing namespaces, want at least the 11 there were", sites)
+	if sites < 8 {
+		t.Errorf("found %d statements writing namespaces, want at least the 8 there were", sites)
 	}
 }
 

@@ -140,7 +140,7 @@ func (s *Server) nsRevLog(w http.ResponseWriter, r *http.Request) {
 	lg, err := s.e.NamespaceLog(r.Context(), ns, id, r.URL.Query().Get("since"), s.e.Limits().LogPageSize, creds(r))
 	if err != nil {
 		// A partial reader's range is the filtered one at the current at
-		// (§B.11.9 URLs).
+		// (§7.9 URLs).
 		if s.writeFilteredRedirect(w, err, "/log", keep(r.URL.Query(), "since")) {
 			return
 		}
@@ -204,7 +204,7 @@ func (s *Server) nsPrincipal(w http.ResponseWriter, r *http.Request) {
 
 // nsHeads is GET /ns/{ns}/rev/{id}/heads?after&prefix (§7.4), its prefix
 // a resource name (400 otherwise, before authorisation). A partial
-// reader's is the filtered /heads at the current at (§B.11.9 URLs).
+// reader's is the filtered /heads at the current at (§7.9 URLs).
 func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
 	ns, id := r.PathValue("ns"), r.PathValue("id")
 	if err := validNames(ns, ""); err != nil {

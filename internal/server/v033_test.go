@@ -230,25 +230,6 @@ func TestDraftSchemasConcurrentPurges(t *testing.T) {
 	}
 }
 
-// §G.3: a remote branch whose documents reference a draft fails with 422:
-// its schemas are mirrored only from their own namespaces.
-func TestDraftSchemasRemoteBranch(t *testing.T) {
-	t.Parallel()
-	a, b, _ := pair(t, nil, nil)
-	a.mkNS("schemas", map[string]any{"read": "public"})
-	a.mkNS("main", map[string]any{"read": "public"})
-	expect(t, a.branch("schemas", map[string]any{"name": "schemas-r7", "patches": addDrafts("main-r7")}, "admin"), 201)
-	t1 := a.create("schemas-r7", "team", teamSchema())
-	expect(t, a.branch("main", map[string]any{"name": "main-r7"}, "admin"), 201)
-	expect(t, a.typed("main-r7", "m1", "/r/schemas/team/rev/"+t1), 201)
-	r := b.mkRemote("rel", remoteGenesisChain([]string{"main-r7", "main"}, a.nsHead("main-r7"), nil))
-	expectCode(t, r, 422, "schema_unavailable")
-	expect(t, b.get("/ns/rel"), 404)
-	// Once the schema is in its namespace, the branch can be mirrored.
-	expect(t, a.batchReq("schemas", map[string]any{"items": []any{map[string]any{"resource": "team", "ifNoneMatch": "*", "steps": []any{addRoot(teamSchema())}}}}, "admin"), 201)
-	expect(t, b.mkRemote("rel", remoteGenesisChain([]string{"main-r7", "main"}, a.nsHead("main-r7"), nil)), 201)
-}
-
 // doMulti sends a JSON PATCH with a header repeated once per value.
 func (e *tenv) doMulti(path, bearer string, body any, header string, values []string) *resp {
 	e.t.Helper()

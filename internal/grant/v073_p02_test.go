@@ -136,41 +136,6 @@ func TestV073MaxTTLOnRoot(t *testing.T) {
 	wantStatus(t, err, 403)
 }
 
-// requireAt dates a grant's issuance by the later of its root nbf and exp
-// − maxTtl, of those that exist; with neither the grant fails the scope
-// (§C.4, v0.65), and at is never looked up.
-func TestV073RequireAtNeedsIssuance(t *testing.T) {
-	at := "1" + strings.Repeat("a", 32)
-	f := newFixture(t, map[string]any{"requireAt": true})
-	env := f.env()
-	var issuedAt []time.Time
-	env.CheckAt = func(_, _ any, issued time.Time, _ *time.Duration) error {
-		issuedAt = append(issuedAt, issued)
-		return nil
-	}
-	_, err := Verify(roundtrip(t, mustMint(t, f, map[string]any{"at": at})), env)
-	wantStatus(t, err, 403)
-	if len(issuedAt) != 0 {
-		t.Fatal("at checked against a made-up issuance")
-	}
-	nbf := now.Add(-time.Minute).Truncate(time.Second)
-	if _, err := Verify(roundtrip(t, mustMint(t, f, map[string]any{"at": at, "nbf": ts(-time.Minute)})), env); err != nil {
-		t.Fatal(err)
-	}
-	if len(issuedAt) != 1 || !issuedAt[0].Equal(nbf) {
-		t.Fatalf("issued %v, want the root's nbf %v", issuedAt, nbf)
-	}
-	// A key maxTtl dates it too: exp − maxTtl.
-	f = newFixture(t, map[string]any{"requireAt": true, "maxTtl": "PT2H"})
-	env.Keys = f.keys
-	if _, err := Verify(roundtrip(t, mustMint(t, f, map[string]any{"at": at})), env); err != nil {
-		t.Fatal(err)
-	}
-	if want := now.Add(-time.Hour); len(issuedAt) != 2 || !issuedAt[1].Equal(want) {
-		t.Fatalf("issued %v, want exp − maxTtl %v", issuedAt, want)
-	}
-}
-
 // A root block's revocation id is its grant id (§C.4, v0.71): revoking it
 // revokes every token minted with that root block. A narrowing block's is
 // over its signature, and the root's signature id, its revocation id

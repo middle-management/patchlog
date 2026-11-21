@@ -307,25 +307,6 @@ func TestV039GesturesNotOffered(t *testing.T) {
 	expect(t, e.get("/ns/nope/gestures/"+gA), 404)
 }
 
-// §G.3 (v0.39): a remote branch mirrors its base's gestures with the
-// entries, so its read-through logs serve them as the base does.
-func TestV039RemoteBranchGestures(t *testing.T) {
-	t.Parallel()
-	a, b, _ := pair(t, nil, nil)
-	a.mkNS("main", map[string]any{"read": "public"})
-	r := a.gw("PATCH", "main", "d", "", addRoot(map[string]any{}), map[string]string{"Gesture": gA})
-	expect(t, r, 201)
-	r = a.gw("PATCH", "main", "d", etagOf(r), ops(op("add", "/x", 1.0)), map[string]string{"Gesture": gB, "Undoes": gA})
-	expect(t, r, 201)
-	d1 := etagOf(r)
-	expect(t, b.mkRemote("rel", remoteGenesis("main", a.nsHead("main"), nil)), 201)
-	la := a.get("/r/main/d/rev/" + d1 + "/log").Body
-	lb := b.get("/r/rel/d/rev/" + d1 + "/log").Body
-	if !strings.Contains(string(lb), `"undoes":"`+gA+`"`) || string(la) != string(lb) {
-		t.Fatalf("mirrored log %s, base's %s", lb, la)
-	}
-}
-
 // §7.3, §7.7 (v0.39): long-polls and event streams serve the same entries
 // as log ranges, gestures included.
 func TestV039LiveGestures(t *testing.T) {

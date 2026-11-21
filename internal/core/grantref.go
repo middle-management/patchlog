@@ -11,9 +11,7 @@ package core
 // serve "grant": null instead (ns_log.no_auth, tx.noAuth), which merge
 // tools and the janitor match on the author alone while GET / says
 // "auth": "disabled". Entries the server writes itself (propagated purges,
-// purges applied from a remote base, retention's prunes, rotations) serve
-// no grant at all. Mirrored schema namespaces are not among them: the
-// creating operator's entries are, including theirs (v0.38, remote_branch).
+// retention's prunes, rotations) serve no grant at all.
 // Neither do entries written before grant references (v0.38), which
 // stored nothing to tell them from the server's own.
 

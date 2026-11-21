@@ -48,7 +48,7 @@ func TestV074V01VerifiedGrantWithoutReadIs403(t *testing.T) {
 // and they must pass now with /resource set to each name it fixes.
 func TestV074V01EdgeGrantRulesPerFixedName(t *testing.T) {
 	t.Parallel()
-	f := newAuthFixture(t, nil)
+	f := newAuthFixture(t, nil, noFilteredReads)
 	e := f.tenv
 	test := func(v string) map[string]any { return map[string]any{"op": "test", "path": "/resource", "value": v} }
 	not := func(r any) map[string]any { return map[string]any{"not": r} }

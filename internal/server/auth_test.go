@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/grant"
 )
 
@@ -15,6 +16,10 @@ type authFixture struct {
 	admin, issuer, svc keyPair
 	adminG, issuerG    string
 }
+
+// noFilteredReads turns filtered reads (§7.9) off: a partial reader is
+// then answered as §C.5 answers one without them.
+func noFilteredReads(o *core.Options) { o.NoFilteredReads = true }
 
 func newAuthFixture(t *testing.T, extra map[string]any, opts ...envOpt) *authFixture {
 	e := newAuthEnv(t, opts...)
@@ -420,42 +425,14 @@ func TestAuthBranches(t *testing.T) {
 	expectCode(t, e.do(req{method: "POST", path: "/ns/sec/purge", ifMatch: e.nsHead("sec", f.adminG), bearer: purger}), 403, "forbidden")
 }
 
-// §C.4, §B.11.3: requireAt bounds a grant's `at` by the namespace's maxLag.
-func TestAuthRequireAtMaxLag(t *testing.T) {
-	t.Parallel()
-	cat := newKey("cat")
-	entry := cat.entry("read", "create", "append")
-	entry["requireAt"] = true
-	f := newAuthFixture(t, map[string]any{"maxLag": "PT60S"})
-	e := f.tenv
-	cid := e.configID("sec", f.adminG)
-	expect(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: f.adminG,
-		body: ops(op("add", "/keys/-", entry))}), 201)
+func withOrigin(o string) envOpt { return func(opt *core.Options) { opt.Origin = o } }
 
-	noAt := e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"})
-	expect(t, e.write("PATCH", "sec", "a", "", addRoot(map[string]any{}), noAt), 403)
-
-	// Issuance is the root's nbf, the key setting no maxTtl; without one
-	// the grant fails the scope (§C.4, v0.65).
-	at := e.nsHead("sec", f.adminG)
-	expect(t, e.write("PATCH", "sec", "a", "", addRoot(map[string]any{}), e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": at})), 403)
-	issued := func() map[string]any { return map[string]any{"nbf": e.clock.Now().Format(time.RFC3339)} }
-	g := e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": at}, issued())
-	expect(t, e.write("PATCH", "sec", "b", "", addRoot(map[string]any{}), g), 201)
-
-	// at stops being the head; a grant issued within maxLag of that works…
-	e.clock.Advance(30 * time.Second)
-	expect(t, e.write("PATCH", "sec", "c", "", addRoot(map[string]any{}), g), 201)
-	expect(t, e.write("PATCH", "sec", "c2", "", addRoot(map[string]any{}), e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": at}, issued())), 201)
-	// …one issued beyond it doesn't, and g, issued in time, still does.
-	e.clock.Advance(90 * time.Second)
-	expect(t, e.write("PATCH", "sec", "d", "", addRoot(map[string]any{}), e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": at}, issued())), 403)
-	expect(t, e.write("PATCH", "sec", "e", "", addRoot(map[string]any{}), g), 201)
-	fresh := e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": e.nsHead("sec", f.adminG)}, issued())
-	expect(t, e.write("PATCH", "sec", "d", "", addRoot(map[string]any{}), fresh), 201)
-
-	// maxLag must be a duration.
-	cid = e.configID("sec", f.adminG)
-	expect(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: f.adminG,
-		body: ops(op("replace", "/maxLag", "soon"))}), 422)
+// nsLog returns a namespace's log as maps.
+func (e *tenv) nsLog(ns string, bearer ...string) []map[string]any {
+	e.t.Helper()
+	var out []map[string]any
+	for _, x := range e.get("/ns/"+ns+"/rev/"+e.nsHead(ns, bearer...)+"/log", bearer...).Arr() {
+		out = append(out, x.(map[string]any))
+	}
+	return out
 }

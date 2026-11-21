@@ -143,32 +143,6 @@ func TestNonceRequiredGuarded(t *testing.T) {
 	expectCode(t, e.patchNS("gb", ops(op("add", "/signatures", "optional")), cg), 403, "forbidden")
 }
 
-// §G.3: a remote branch of a base that requires nonces must be created
-// requiring them, and can't turn them off; schema namespaces mirrored for
-// it take their source's setting (§C.7).
-func TestNonceRequiredRemoteBranch(t *testing.T) {
-	t.Parallel()
-	a, b, _ := pair(t, nil, nil)
-	a.mkNS("schemas", map[string]any{"read": "public", "nonce": "required"})
-	s1 := a.create("schemas", "match", map[string]any{"$schema": dialect, "type": "object", "$nonce": seal.NewNonce()})
-	a.mkNS("main", map[string]any{"read": "public", "nonce": "required"})
-	a.create("main", "derby", map[string]any{"$schema": "/r/schemas/match/rev/" + s1, "$nonce": seal.NewNonce()})
-	at := a.nsHead("main")
-
-	r := b.mkRemote("rel", remoteGenesis("main", at, nil))
-	if r.Code != 422 || !strings.Contains(r.String(), "/nonce") {
-		t.Fatalf("remote branch without nonce: %d %s", r.Code, r.Body)
-	}
-	expect(t, b.mkRemote("rel", remoteGenesis("main", at, map[string]any{"nonce": "required"})), 201)
-	if d := b.nsDoc("schemas"); d["nonce"] != "required" {
-		t.Fatalf("mirrored schema namespace %v", d)
-	}
-	h := b.head("rel", "derby")
-	expectCode(t, b.write("PATCH", "rel", "derby", h, ops(op("add", "/x", 1.0))), 422, "nonce")
-	b.appendRev("rel", "derby", h, withNonce(ops(op("add", "/x", 1.0))))
-	expectNonceKept(t, b.patchNS("rel", ops(op("replace", "/nonce", "optional")), ""))
-}
-
 // A sealed namespace that requires nonces: a [] restore, which sealing
 // alone allows, needs a lone fresh $nonce (§C.7, §8.2).
 func TestNonceRequiredSealed(t *testing.T) {

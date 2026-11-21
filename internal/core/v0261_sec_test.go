@@ -1,15 +1,9 @@
 package core
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
-	"errors"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"strings"
-	"sync/atomic"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/dbmigrate"
@@ -24,31 +18,31 @@ import (
 func TestV0261FilteredPurgedHeadsDifferential(t *testing.T) {
 	ctx := context.Background()
 	type world struct {
-		w      *v75World
-		gs, at string
-		bo     string // another partial reader's gs
-		creds  map[string]Credentials
+		w       *v75World
+		vid, at string
+		bo      string // another partial reader's vid
+		creds   map[string]Credentials
 	}
 	mk := func(purge bool) *world {
 		w := newV75World(t, v75Opts{})
 		w.seed()
 		li := w.li()
-		bo := w.catGrant("user:bo", []any{"chiefs"})
+		bo := w.bo()
 		x := &world{w: w}
-		x.gs = v075GS(t, w, li)
-		x.bo = v075GS(t, w, bo)
-		red, st := v76fRedirect(t, w, "matches", x.gs, li)
+		x.vid = v075ViewID(t, w, li)
+		x.bo = v075ViewID(t, w, bo)
+		red, st := v76fRedirect(t, w, "matches", x.vid, li)
 		if red == nil {
 			t.Fatalf("redirect: %d", st)
 		}
 		x.at = red.At
 		x.creds = map[string]Credentials{
-			"none":        {},
-			"garbage":     {Bearer: "not-a-grant"},
-			"other-ns":    w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:x", "ns": []any{"cat-season"}, "can": []any{"read"}}),
-			"no-read":     w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:x", "ns": []any{"matches"}, "can": []any{"create"}}),
-			"li-wrong-gs": li,
-			"bo":          bo,
+			"none":         {},
+			"garbage":      {Bearer: "not-a-grant"},
+			"other-ns":     w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:x", "ns": []any{"cat-season"}, "can": []any{"read"}}),
+			"no-read":      w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:x", "ns": []any{"matches"}, "can": []any{"create"}}),
+			"li-wrong-vid": li,
+			"bo":           bo,
 		}
 		if purge {
 			v077Purge(t, w, "matches")
@@ -56,83 +50,41 @@ func TestV0261FilteredPurgedHeadsDifferential(t *testing.T) {
 		return x
 	}
 	live, purged := mk(false), mk(true)
-	type call func(x *world, c Credentials, gs, at string) error
+	type call func(x *world, c Credentials, vid, at string) error
 	calls := map[string]call{
-		"current": func(x *world, c Credentials, gs, _ string) error {
-			return x.w.e.FilteredCurrent(ctx, "matches", gs, "/heads", c)
+		"current": func(x *world, c Credentials, vid, _ string) error {
+			return x.w.e.FilteredCurrent(ctx, "matches", vid, "/heads", c)
 		},
-		"at": func(x *world, c Credentials, gs, at string) error {
-			_, _, err := x.w.e.FilteredHeads(ctx, "matches", gs, at, "", "", c)
+		"at": func(x *world, c Credentials, vid, at string) error {
+			_, _, err := x.w.e.FilteredHeads(ctx, "matches", vid, at, "", "", c)
 			return err
 		},
-		"bogus-at": func(x *world, c Credentials, gs, _ string) error {
-			_, _, err := x.w.e.FilteredHeads(ctx, "matches", gs, "zzzz", "", "", c)
+		"bogus-at": func(x *world, c Credentials, vid, _ string) error {
+			_, _, err := x.w.e.FilteredHeads(ctx, "matches", vid, "zzzz", "", "", c)
 			return err
 		},
 	}
 	for cn, call := range calls {
 		for who := range live.creds {
-			for _, gsKind := range []string{"li", "bo"} {
-				if who == "bo" && gsKind == "bo" || who == "li-wrong-gs" && gsKind == "li" {
-					continue // the reader's own gs: admitted, 410 is owed
+			for _, viewKind := range []string{"li", "bo"} {
+				if who == "bo" && viewKind == "bo" || who == "li-wrong-vid" && viewKind == "li" {
+					continue // the reader's own vid: admitted, 410 is owed
 				}
 				g := func(x *world) string {
-					if gsKind == "bo" {
+					if viewKind == "bo" {
 						return x.bo
 					}
-					return x.gs
+					return x.vid
 				}
 				el := call(live, live.creds[who], g(live), live.at)
 				ep := call(purged, purged.creds[who], g(purged), purged.at)
 				sl, sp := v75Status(el), v75Status(ep)
-				t.Logf("%-8s %-11s gs=%s: live %d, purged %d", cn, who, gsKind, sl, sp)
+				t.Logf("%-8s %-11s vid=%s: live %d, purged %d", cn, who, viewKind, sl, sp)
 				if sp == 410 {
-					t.Errorf("%s %s with %s's gs: purged answers 410 (%v), the live namespace %d (%v)", cn, who, gsKind, ep, sl, el)
+					t.Errorf("%s %s with %s's vid: purged answers 410 (%v), the live namespace %d (%v)", cn, who, viewKind, ep, sl, el)
 				}
 			}
 		}
-	}
-}
-
-// C4, C-M, C2 (v0.26.1): rawGet follows no redirect, reads at most a small
-// error body and at most limit of a 200. (What B takes of the answers,
-// since v0.78 only a mirrored snapshot's: mirrorSnapshot.)
-func TestV0261RawGet(t *testing.T) {
-	ctx := context.Background()
-	var hit atomic.Int64
-	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hit.Add(1) }))
-	t.Cleanup(other.Close)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/redirect":
-			http.Redirect(w, r, other.URL+"/x", http.StatusFound)
-		case "/error":
-			w.WriteHeader(403)
-			w.Write(bytes.Repeat([]byte(" "), 1<<20))
-		case "/big":
-			w.Write(bytes.Repeat([]byte(" "), 1<<20))
-		case "/pruned":
-			w.WriteHeader(410)
-			io.WriteString(w, `{"code":"pruned"}`)
-		}
-	}))
-	t.Cleanup(srv.Close)
-	ep := RemoteEndpoint{BaseURL: srv.URL, HTTPClient: srv.Client(), Bearer: "grant"}
-	st, _, body, err := rawGet(ctx, ep, srv.URL, "/redirect", nil, 1<<20)
-	if err != nil || st != http.StatusFound || hit.Load() != 0 || len(body) > maxErrBody {
-		t.Fatalf("redirect: %d %v, target hit %d times", st, err, hit.Load())
-	}
-	for _, path := range []string{"/error", "/big"} {
-		st, _, body, err := rawGet(ctx, ep, srv.URL, path, nil, 64<<10)
-		if !errors.Is(err, errTooLarge) || body != nil {
-			t.Fatalf("%s: %d, %d bytes, %v", path, st, len(body), err)
-		}
-	}
-	if _, _, body, err := rawGet(ctx, ep, srv.URL, "/big", nil, 2<<20); err != nil || len(body) != 1<<20 {
-		t.Fatalf("a 200 within its cap: %d bytes, %v", len(body), err)
-	}
-	if st, _, body, err := rawGet(ctx, ep, srv.URL, "/pruned", nil, 1<<20); err != nil || st != 410 || string(body) != `{"code":"pruned"}` {
-		t.Fatalf("410: %d %s %v", st, body, err)
 	}
 }
 

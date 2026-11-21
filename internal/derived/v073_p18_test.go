@@ -14,7 +14,7 @@ import (
 
 // P18, ENC-14 (§E.2.3): with historyEpochs h, a reader gets keys for the
 // current epoch and the h before it, so the per-resource keys a service
-// hands out (catalog /read-grants) cover h+1 epochs. The service's grant
+// hands out cover h+1 epochs. The service's grant
 // has an nbf before the first epoch: without one, or with authentication
 // disabled, /keys gives the current epoch alone (§E.2.3, v0.74).
 func TestV073ResourceKeysHistoryEpochs(t *testing.T) {

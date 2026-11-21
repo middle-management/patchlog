@@ -154,17 +154,3 @@ func TestSuccessor410Sealed(t *testing.T) {
 		t.Fatalf("plain base 410 %v", b)
 	}
 }
-
-// A remote branch reads a moved resource's last document from the chain
-// it mirrors (§G.3), so its 410 names the successor as A's does.
-func TestSuccessor410Remote(t *testing.T) {
-	t.Parallel()
-	a, b, _ := pair(t, nil, nil)
-	a.mkNS("main", map[string]any{"read": "public"})
-	h := a.create("main", "x", map[string]any{"x": 1.0})
-	a.move("main", "x", h, "y", "y")
-	expect(t, b.mkRemote("rel", remoteGenesis("main", a.nsHead("main"), nil)), 201)
-	if got := b.head410("rel", "x"); got["successor"] != "y" || got["tombstone"] != a.head410("main", "x")["tombstone"] {
-		t.Fatalf("remote branch 410 %v", got)
-	}
-}

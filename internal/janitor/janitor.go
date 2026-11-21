@@ -68,9 +68,7 @@
 //     (GET /ns/{ns}/grants/{gid}, §C.3.1) verifies under its pub. A kid is
 //     only a name, so a key removed, or replaced under the same kid as when
 //     a compromised key is rotated, withdraws what it set, as the grant
-//     itself stops working (§C.4). Keys are inherited from local bases
-//     only: the walk stops at a base in another deployment (base.origin),
-//     so a namespace here that shares its name lends none. An entry
+//     itself stops working (§C.4). Keys are inherited from bases. An entry
 //     written while authentication was disabled records "grant": null
 //     (§1): it counts while the deployment still runs disabled, as GET /
 //     says ("auth": "disabled"), since every request then counts as
@@ -316,7 +314,7 @@ func (j *Janitor) walk(ctx context.Context, ns string) ([]candidate, error) {
 	var out []candidate
 	var errs []error
 	for _, b := range brs {
-		if b.Name == "" || b.Purged || b.Remote != nil {
+		if b.Name == "" || b.Purged {
 			continue
 		}
 		cs, err := j.walk(ctx, b.Name)
@@ -512,7 +510,7 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 	}
 	var live []string
 	for _, br := range deps {
-		if br.Name != "" && !br.Purged && br.Remote == nil {
+		if br.Name != "" && !br.Purged {
 			live = append(live, br.Name)
 		}
 	}
@@ -1022,8 +1020,8 @@ func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time
 	b.docs[succ] = nsAt{sh.ID, sdoc.Value}
 	sref, _ := sdoc.Value["base"].(map[string]any)
 	sbase, _ := sref["ns"].(string)
-	if _, remote := sref["origin"]; remote || sbase == "" {
-		return false, "successor " + succ + " is not a branch in this deployment (§7.4)", nil
+	if sbase == "" {
+		return false, "successor " + succ + " is not a branch (§7.4)", nil
 	}
 	chain, err := b.baseChain(ctx)
 	if err != nil {
@@ -1162,14 +1160,13 @@ func parseKeys(v any) map[string]nsKey {
 	return out
 }
 
-// localBase returns the base of a namespace document in this deployment:
-// its name and at, and false for a namespace that isn't a branch, or whose
-// base lives in another deployment (base.origin, §7.6, §G.3).
+// localBase returns the base of a namespace document: its name and at,
+// and false for a namespace that isn't a branch (§7.6).
 func localBase(doc map[string]any) (ns, at string, ok bool) {
 	bref, _ := doc["base"].(map[string]any)
 	ns, _ = bref["ns"].(string)
 	at, _ = bref["at"].(string)
-	if _, remote := bref["origin"]; remote || ns == "" {
+	if ns == "" {
 		return "", "", false
 	}
 	return ns, at, true
@@ -1182,9 +1179,7 @@ const maxDepth = 32
 // keys returns the keys ns accepts now, by kid, as the core does (§C.4,
 // keys follow the base): its base's, recursively, whose entries win over
 // ns's own for a shared kid, then its own, less those it copied from its
-// base at creation and the base has since removed. Only local bases count
-// (§7.6): the walk stops at a namespace whose base has origin, so a local
-// namespace that shares a remote base's name lends no keys.
+// base at creation and the base has since removed (§7.6).
 func (b *branch) keys(ctx context.Context, ns string) (map[string]nsKey, error) {
 	return b.keysAt(ctx, ns, 0)
 }
@@ -1236,7 +1231,7 @@ func (b *branch) copiedKids(ctx context.Context, ns, base, at string) (map[strin
 		return nil, fmt.Errorf("janitor: log of %s, the base of %s: %w", base, ns, err)
 	}
 	for _, e := range entries {
-		if e.Kind != "branch" || e.Name != ns || e.Remote != nil {
+		if e.Kind != "branch" || e.Name != ns {
 			continue
 		}
 		d, err := b.j.c.NSDoc(ctx, base, e.ID)
@@ -1487,7 +1482,7 @@ func (j *Janitor) Run(ctx context.Context) error {
 			return err
 		}
 		for _, b := range brs {
-			if b.Name != "" && !b.Purged && b.Remote == nil {
+			if b.Name != "" && !b.Purged {
 				if err := seed(b.Name); err != nil && !client.IsNotFound(err) && !client.IsAuth(err) {
 					return err
 				}

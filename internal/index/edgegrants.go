@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
@@ -21,22 +20,21 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
-	"github.com/middle-management/patchlog/internal/svcedge"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
-// The service's own edge grants (§A.4: a gs and its URLs are served as in
+// The service's own edge grants (§A.4: a view and its URLs are served as in
 // §B.11.5; §C.5), with Options.EdgeGrants.
 //
 // Results read with a grant in Authorization are never cached at the edge
 // (§9): the grant is one reader's. A private result depends on the
-// reader's subject set alone (its markers, Index.access), so an edge may
-// cache it for every reader of that subject set, given a cookie it can
+// reader's view alone (its markers, Index.access), so an edge may
+// cache it for every reader of that view, given a cookie it can
 // verify that says so. The service mints such cookies itself, with a key
 // and kid of its own that the origin never holds, for the prefixes of a
-// subject set's URLs: /{ns}/g/{gs} for a private namespace's results, gs
-// over the reader's marker there, and /_refs/g/{gs} for the answers
-// across namespaces, gs over its markers in every namespace it may see
+// view's URLs: /{ns}/view/{view} for a private namespace's results, view
+// over the reader's marker there, and /_refs/view/{view} for the answers
+// across namespaces, view over its markers in every namespace it may see
 // that the service has reached (refsReader). The default format is the
 // core's (edge.Cookies), so an edge in front of the service makes the
 // same six checks with the service's kid, which vouches only for those
@@ -48,24 +46,24 @@ import (
 //	DELETE /edge-grants?prefix=…     withdraw them (§C.5.4)
 //
 // A cookie carries only kid, p and exp. A read under one is the subject
-// set's, so the service keeps the markers behind each gs it minted a
-// cookie for (svcedge.Store: edge_subjects), and, for a marker
+// set's, so the service keeps the markers behind each view it minted a
+// cookie for (edgeStore: edge_subjects), and, for a marker
 // reads:{ns}:scope:{digest}, what its digest covers, the rules that limit
 // the reads and the /principal values they refer to (edge_filters,
 // markerRec), from which it filters hits per resource as for any grant
-// with that marker, for a marker reads:{ns}:g:{gs} (§B.11.9) also its
-// subjects (edge_gs), and for every marker, reads:{ns}:{k} included, every
+// with that marker, for a marker reads:{ns}:g:{view} (§7.9) also its
+// subjects (edge_views), and for every marker, reads:{ns}:{k} included, every
 // key a cookie of it was minted under, its kid, the role names its grant
 // read through, its kid's pub and the digest of its whole entry and of
-// those roles' whole definitions (edge_gs_keys, gsKey, entryDigest),
+// those roles' whole definitions (edge_view_keys, viewKey, entryDigest),
 // each until that cookie expires: a cookie is 403 once one of the keys
-// or roles it came from is gone or changes in any member (§A.4 gs: "its
+// or roles it came from is gone or changes in any member (§A.4 view: "its
 // key being the one that verified the grant in {ns}, reads:{ns}:{k} markers
-// included", §B.11.9 gs; readsKeysHold, scopeKeysHold, storedFview), and
+// included", §7.9 view; readsKeysHold, scopeKeysHold, storedFview), and
 // no later exchange vouches for it again: one whose keys or entries
 // differ mints a cookie with another exp (recordCookies). They
 // are kept across restarts and -rebuild until the last such cookie
-// expires; a gs or marker the service doesn't know, minted by another
+// expires; a view or marker the service doesn't know, minted by another
 // instance with its own database, is 401, and the reader exchanges again.
 // Instances on one database share them, and share the exchangeRate
 // buckets too (§B.11.5). A reader of a whole namespace at issue
@@ -78,41 +76,41 @@ import (
 // covers (grantcheck.ReadFilter: its key's scope, its blocks and, if it
 // carries roles, each effective role that lists read, and its
 // /principal), from which hits are filtered per resource as for any grant
-// with that marker; for reads:{ns}:g:{gs} (§B.11.9), also its subjects,
+// with that marker; for reads:{ns}:g:{view} (§7.9), also its subjects,
 // from which item 1 is judged; and for either, from an exchange, the key
-// its grant came from (gsKey), recorded for its cookie (recordCookies;
+// its grant came from (viewKey), recorded for its cookie (recordCookies;
 // keysHold and storedFview judge each key of a cookie). A rule
 // referring to /now gives no marker, so the filter judges a read as the
 // grant's read check does, without a clock.
 type markerRec struct {
 	f        *grantcheck.ReadFilter // nil for reads:{ns}:{k}, which reads whole
 	subjects []string               // g: markers only
-	key      gsKey                  // from an exchange only
+	key      viewKey                // from an exchange only
 	// also are the keys the other grants of one exchange got the same
 	// marker through, recorded beside key (issueEdgeGrants).
-	also []gsKey
+	also []viewKey
 }
 
-// gsKey is a key a g: or scope marker's cookies came from: its kid and
+// viewKey is a key a g: or scope marker's cookies came from: its kid and
 // the names of its grant's read roles, whose rules as of a checkpoint
 // must still digest to the marker's scope subject (g:) or its digest
 // (scope:), and the pub its kid had, which the key with that kid must
-// still have (§B.11.9 gs, §C.4, §A.4; storedFview, scopeKeysHold). A g:
-// marker's gs digests the key too (catvis.KeySubject), but readers whose
+// still have (§7.9 view, §C.4, §A.4; storedFview, scopeKeysHold). A g:
+// marker's view digests the key too (grantcheck.KeySubject), but readers whose
 // grants come from different keys, or from one key before and after its
 // entry changes, may share a marker, and a cookie says only its prefix
-// and exp: the gsKeys of each cookie are kept by its marker and exp
-// (edge_gs_keys), the same for every exchange that minted it
+// and exp: the viewKeys of each cookie are kept by its marker and exp
+// (edge_view_keys), the same for every exchange that minted it
 // (recordCookies), and each must still hold.
 //
 // entry is EntryDigest (entryDigest) of the key's whole entry and of each
 // of roles' whole definitions, as the document the marker is judged by
-// gave them at the exchange (§B.11.9 gs, v0.82: a cookie is 403 where
+// gave them at the exchange (§7.9 view, v0.82: a cookie is 403 where
 // "the key its key: string names, or a key or role they came from, is
-// gone or changes in any member"; §A.4 gs: for every marker, reads:{ns}
+// gone or changes in any member"; §A.4 view: for every marker, reads:{ns}
 // included). "" is a key recorded before entries were kept, or one whose
 // entry couldn't be told at the exchange: it never holds.
-type gsKey struct {
+type viewKey struct {
 	kid   string
 	roles []string
 	pub   string // the key's pub member, as its namespace document gives it
@@ -120,9 +118,9 @@ type gsKey struct {
 	// conf is, at an exchange, the namespace documents entry was drawn
 	// from that the index was found to be behind (exchangeEntry, ahead),
 	// by namespace, each as confPos gives it. recordCookies keeps of them
-	// those the index still hasn't reached (gsKeyRow.pending). chain are
+	// those the index still hasn't reached (viewKeyRow.pending). chain are
 	// the bases of a local branch entry was drawn through, nearest first
-	// (gsKeyRow.chain). Both nil for a key read back from the database.
+	// (viewKeyRow.chain). Both nil for a key read back from the database.
 	conf  map[string]string
 	chain []string
 }
@@ -183,7 +181,7 @@ func (ix *Index) ahead(ctx context.Context, ns, head string) bool {
 	return err == nil
 }
 
-// encodePending and decodePending are gsKeyRow.pending's form: "" for
+// encodePending and decodePending are viewKeyRow.pending's form: "" for
 // none, else the canonical JSON object of namespace to position
 // (confPos).
 func encodePending(p map[string]string) string {
@@ -209,7 +207,7 @@ func decodePending(s string) map[string]string {
 	return out
 }
 
-// entryDigest is EntryDigest of §B.11.9 gs as the reference defines it,
+// entryDigest is EntryDigest of §7.9 view as the reference defines it,
 // here and at the origin alike:
 //
 //	text(trunc160(sha256(canonical({ "key": K, "roles": R }))))
@@ -288,7 +286,7 @@ func (ix *Index) copiedKids(ctx context.Context, cfg *grantcheck.Config) (map[st
 	}
 	entry := ""
 	for _, e := range entries {
-		if e.Kind == "branch" && e.Name == cfg.NS && e.Remote == nil {
+		if e.Kind == "branch" && e.Name == cfg.NS {
 			entry = e.ID
 			break
 		}
@@ -342,12 +340,12 @@ func (ix *Index) entryOfIn(ctx context.Context, cfg *grantcheck.Config, kid stri
 // entryHolds reports whether k, a key a cookie came from, is still, in
 // the document cfg, the key the exchange recorded: there, listing read,
 // with the pub it had, and with its whole entry and each of its roles'
-// whole definitions digesting to k.entry (§B.11.9 gs, v0.82: "gone or
+// whole definitions digesting to k.entry (§7.9 view, v0.82: "gone or
 // changes in any member"), whether or not a scope digest reads the member
-// that changed: a changed sub, groups, attrs, maxTtl, requireAt or can of
+// that changed: a changed sub, groups, attrs, maxTtl, rate or can of
 // the key, or a role's can or rules. A key recorded without its entry or
-// its pub never holds. The key is returned for gsKeyHolds.
-func (ix *Index) entryHolds(ctx context.Context, cfg *grantcheck.Config, k gsKey) (grant.Key, bool, error) {
+// its pub never holds. The key is returned for viewKeyHolds.
+func (ix *Index) entryHolds(ctx context.Context, cfg *grantcheck.Config, k viewKey) (grant.Key, bool, error) {
 	entry, key, ok, err := ix.entryOf(ctx, cfg, k.kid, k.roles)
 	if err != nil || !ok {
 		return key, false, err
@@ -356,14 +354,14 @@ func (ix *Index) entryHolds(ctx context.Context, cfg *grantcheck.Config, k gsKey
 }
 
 // exchangeEntry is the entry digest an exchange records for the key k
-// that verified v in ns, whose access is a (gsKey.entry): of the document
+// that verified v in ns, whose access is a (viewKey.entry): of the document
 // a read under the cookie is judged by, ns's at its head, and for a g:
 // marker the one at its checkpoint (storedFview). It is "", which never
 // holds, so that the reader exchanges again, where it can't vouch that
 // the grant was verified by that very entry: the key that verified v
 // isn't the entry the head's document gives, or a document can't be
 // read. behind reports a cookie that would be 403 at once for a cause
-// that passes (§A.4 gs, v0.85: "An exchange whose cookie would be 403 at
+// that passes (§A.4 view, v0.85: "An exchange whose cookie would be 403 at
 // once, as a key or role its marker draws on has changed since the
 // checkpoint the marker is judged at, answers 503 (behind)"): the
 // checkpoint's document gives the key or a role otherwise than the
@@ -371,7 +369,7 @@ func (ix *Index) entryHolds(ctx context.Context, cfg *grantcheck.Config, k gsKey
 // document moved during the exchange (head is the one read before v was
 // verified), so that what verified v can't be told from what a read is
 // judged by. Before v0.85 either minted a cookie that never held.
-func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, v *grant.Verified, k gsKey) (out gsKey, behind bool) {
+func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, v *grant.Verified, k viewKey) (out viewKey, behind bool) {
 	out = k
 	out.entry = ""
 	cfg, err := ix.checker.Config(ctx, ns)
@@ -393,7 +391,7 @@ func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, 
 		return out, false
 	}
 	if a.cov != nil {
-		doc, err := ix.docAt(ctx, ns, a.cov.cp.reads[ns])
+		doc, err := ix.docAt(ctx, ns, a.cov.cp.at)
 		if err != nil {
 			return out, false
 		}
@@ -422,13 +420,13 @@ func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, 
 }
 
 // errExchangeBehind is an exchange whose cookie would be 403 at once
-// (exchangeEntry): 503 behind, ranked as a requireAt chain that can't be
-// read for now (upstreamBehind, worseUpstream; §A.4 gs, §C.5.2).
+// (exchangeEntry): 503 behind, ranked as any failure to read upstream
+// for now (upstreamBehind, worseUpstream; §A.4 view, §C.5.2).
 var errExchangeBehind = errors.New("the index hasn't applied a change to a key or role the grant reads through")
 
 // markerRecOf is what a's marker stands for, a's grant being v: its
 // filter, the key it came from, for a scope marker as for a g: one (§A.4:
-// a cookie is 403 "where a marker's key, rules or roles would end a gs
+// a cookie is 403 "where a marker's key, rules or roles would end a view
 // cookie"), and a g: marker's subjects.
 func markerRecOf(a *access, v *grant.Verified) *markerRec {
 	rec := &markerRec{f: a.filter} // nil for reads:{ns}:{k}
@@ -444,39 +442,39 @@ func markerRecOf(a *access, v *grant.Verified) *markerRec {
 }
 
 // readsMarker is the marker reads:{ns}:{k} of a reader whose grant would
-// be issued a namespace-wide edge grant in ns (§A.4 gs, v0.85): k is the
-// key: string (catvis.KeySubject, §B.11.9 gs) of the key that verified
+// be issued a namespace-wide edge grant in ns (§A.4 view, v0.85): k is the
+// key: string (grantcheck.KeySubject, §7.9 view) of the key that verified
 // the grant there, by kid and pub, so reads:{ns}:key:{id}. Readers
-// through two keys never share the marker, so neither its gs, its
+// through two keys never share the marker, so neither its view, its
 // results nor its cookie prefix, and a change to one key ends only the
 // cookies minted through it. Before v0.85 it was reads:{ns}, shared by
 // every key's readers; a cookie for that form reads nothing now
 // (markerAccess).
 func readsMarker(ns, kid, pub string) string {
-	return "reads:" + ns + ":" + catvis.KeySubject(kid, pub)
+	return "reads:" + ns + ":" + grantcheck.KeySubject(kid, pub)
 }
 
 // readsPrefix is what every reads:{ns}:{k} marker of ns starts with
 // (readsMarker): no scope or g: marker of any namespace does.
-func readsPrefix(ns string) string { return "reads:" + ns + ":" + catvis.KeyPrefix }
+func readsPrefix(ns string) string { return "reads:" + ns + ":" + grantcheck.KeyPrefix }
 
 // scopeMarker is the marker reads:{ns}:scope:{digest} of a reader of
 // uncovered ns whose reads there have grantcheck.ReadsScope digest d,
 // through the key with kid and pub (§A.4): its digest covers d and the
-// key's key: string (catvis.KeySubject, §B.11.9 gs), so readers through
-// two keys with the same rules never share a marker, its gs, its edge
-// filter or its cookie prefix. A gs's scope: subject is the same digest
-// (§B.11.9 gs: "scope:{digest} of §A.4's marker"), at the origin too.
+// key's key: string (grantcheck.KeySubject, §7.9 view), so readers through
+// two keys with the same rules never share a marker, its view, its edge
+// filter or its cookie prefix. A view's scope: subject is the same digest
+// (§7.9 view: "scope:{digest} of §A.4's marker"), at the origin too.
 func scopeMarker(ns, d, kid, pub string) string {
 	return "reads:" + ns + ":scope:" + scopeKeyDigest(d, kid, pub)
 }
 
 // scopeKeyDigest is scopeMarker's digest: of d and the key's key: string
-// (catvis.ScopeKeyDigest).
-func scopeKeyDigest(d, kid, pub string) string { return catvis.ScopeKeyDigest(d, kid, pub) }
+// (grantcheck.ScopeKeyDigest).
+func scopeKeyDigest(d, kid, pub string) string { return grantcheck.ScopeKeyDigest(d, kid, pub) }
 
 // keyPub is k's pub member as the namespace document gives it, "" if it
-// has none (§B.11.9 gs: "accepted only while the base has it with the
+// has none (§7.9 view: "accepted only while the base has it with the
 // same pub", §C.4), compared as given.
 func keyPub(k grant.Key) string {
 	pub, _ := k.Raw["pub"].(string)
@@ -491,7 +489,7 @@ type keptFilter struct {
 }
 
 // cookieRec is one edge grant an exchange is about to mint: what each
-// marker of its subject set stands for and the keys this exchange
+// marker of its view stands for and the keys this exchange
 // vouches for it with (filters), and when it expires, which recordCookies
 // may move earlier.
 type cookieRec struct {
@@ -503,13 +501,13 @@ type cookieRec struct {
 // from those of other exchanges (recordCookies).
 var errNoSlot = errors.New("no exp left for an edge grant of its own")
 
-// gsKeyRow is a key as edge_gs_keys keeps it: its roles as a JSON array,
+// viewKeyRow is a key as edge_view_keys keeps it: its roles as a JSON array,
 // and pending, the namespace documents its exchange drew on that the
 // index had not applied yet when it was recorded (encodePending), "" for
 // none. A cookie minted while the index is behind was verified against
 // the document at the head: the documents its backlog still brings, up
 // to and including that one, are from before the exchange and end
-// nothing of it (cookieEnds, §B.11.9 gs: "Once an entry after its
+// nothing of it (cookieEnds, §7.9 view: "Once an entry after its
 // exchange changes one of them"). A namespace leaves pending as the
 // index applies the document named. Rows from before v0.86's second
 // migration have none, and are judged by every document.
@@ -518,21 +516,21 @@ var errNoSlot = errors.New("no exp left for an edge grant of its own")
 // as a JSON array, "" for none: a document of one of them is judged for
 // the row whether or not the checker can say, as it is applied, that the
 // branch draws on it.
-type gsKeyRow struct{ kid, roles, pub, entry, pending, chain string }
+type viewKeyRow struct{ kid, roles, pub, entry, pending, chain string }
 
 // recordCookies records what the markers of the edge grants recs, minted
-// at now, stand for (edge_filters, and for g: markers edge_gs), and the
-// keys each cookie came from (edge_gs_keys), and drops what the last edge
+// at now, stand for (edge_filters, and for g: markers edge_views), and the
+// keys each cookie came from (edge_view_keys), and drops what the last edge
 // grant of has expired, from the database and from memory, as
-// svcedge.Store.Record does for subject sets. It sets each rec's exp to
+// edgeStore.Record does for views. It sets each rec's exp to
 // the one its cookie must carry.
 //
 // A cookie carries its prefix and exp alone, so cookies of one marker
 // that expire at the same second are one cookie, judged by the keys
-// recorded for that marker and exp (gsKeysAt), each of which must hold.
+// recorded for that marker and exp (viewKeysAt), each of which must hold.
 // What is recorded there is therefore only ever what every exchange that
 // minted that cookie vouched for, the same keys with the same entries
-// (§A.4 gs, §B.11.9 gs): a row is never changed once written, and an
+// (§A.4 view, §7.9 view): a row is never changed once written, and an
 // exchange whose keys or entries differ from those recorded for its
 // marker and exp, in any of its markers, mints a cookie that expires a
 // second earlier, and so on until it finds a second that is free or
@@ -547,7 +545,7 @@ type gsKeyRow struct{ kid, roles, pub, entry, pending, chain string }
 // A document changed and then changed back gives a key the entry it had,
 // but a cookie minted before the change doesn't hold again: the index
 // ends its rows as it applies the entry that made the change (cookieEnds;
-// §B.11.9 gs, v0.86: "the cookie is 403 from that entry on, even where a
+// §7.9 view, v0.86: "the cookie is 403 from that entry on, even where a
 // later entry undoes the change").
 func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.Time) error {
 	// With the batches' lock: a batch's transaction reads the rows before
@@ -563,7 +561,7 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 	// The first statement writes: the transaction holds the database's
 	// write lock from here, and no other exchange records between the
 	// reads of a slot below and the rows written to it.
-	for _, q := range []string{`DELETE FROM edge_filters WHERE exp <= ?`, `DELETE FROM edge_gs WHERE exp <= ?`, `DELETE FROM edge_gs_keys WHERE exp <= ?`} {
+	for _, q := range []string{`DELETE FROM edge_filters WHERE exp <= ?`, `DELETE FROM edge_views WHERE exp <= ?`, `DELETE FROM edge_view_keys WHERE exp <= ?`} {
 		if _, err := tx.ExecContext(ctx, q, now.Unix()); err != nil {
 			return err
 		}
@@ -577,21 +575,21 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 	}
 	// taken is what each marker's cookies that are still live came from,
 	// by exp, with what this exchange adds.
-	taken := map[string]map[int64][]gsKeyRow{}
-	slots := func(m string) (map[int64][]gsKeyRow, error) {
+	taken := map[string]map[int64][]viewKeyRow{}
+	slots := func(m string) (map[int64][]viewKeyRow, error) {
 		if by, ok := taken[m]; ok {
 			return by, nil
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT exp, kid, roles, pub, entry, pending, chain FROM edge_gs_keys WHERE marker = ? ORDER BY exp, kid, roles, pub`, m)
+		rows, err := tx.QueryContext(ctx, `SELECT exp, kid, roles, pub, entry, pending, chain FROM edge_view_keys WHERE marker = ? ORDER BY exp, kid, roles, pub`, m)
 		if err != nil {
 			return nil, err
 		}
 		defer rows.Close()
-		by := map[int64][]gsKeyRow{}
+		by := map[int64][]viewKeyRow{}
 		for rows.Next() {
 			var (
 				exp int64
-				k   gsKeyRow
+				k   viewKeyRow
 			)
 			if err := rows.Scan(&exp, &k.kid, &k.roles, &k.pub, &k.entry, &k.pending, &k.chain); err != nil {
 				return nil, err
@@ -632,19 +630,19 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 		// What this exchange vouches for, per marker: each key once, in
 		// the order of the rows, and without an entry (which never
 		// holds) where two of its grants found it with different ones.
-		want := map[string][]gsKeyRow{}
+		want := map[string][]viewKeyRow{}
 		for m, f := range rec.filters {
-			var ks []gsKeyRow
-			for _, k := range append([]gsKey{f.key}, f.also...) {
+			var ks []viewKeyRow
+			for _, k := range append([]viewKey{f.key}, f.also...) {
 				pending, err := pendingOf(k.conf)
 				if err != nil {
 					return err
 				}
-				row := gsKeyRow{k.kid, enc(k.roles), k.pub, k.entry, pending, ""}
+				row := viewKeyRow{k.kid, enc(k.roles), k.pub, k.entry, pending, ""}
 				if len(k.chain) > 0 {
 					row.chain = enc(k.chain)
 				}
-				i := slices.IndexFunc(ks, func(o gsKeyRow) bool { return o.kid == row.kid && o.roles == row.roles && o.pub == row.pub })
+				i := slices.IndexFunc(ks, func(o viewKeyRow) bool { return o.kid == row.kid && o.roles == row.roles && o.pub == row.pub })
 				switch {
 				case i < 0:
 					ks = append(ks, row)
@@ -654,7 +652,7 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 					ks[i].pending = ""
 				}
 			}
-			slices.SortFunc(ks, func(a, b gsKeyRow) int {
+			slices.SortFunc(ks, func(a, b viewKeyRow) int {
 				return cmp.Or(strings.Compare(a.kid, b.kid), strings.Compare(a.roles, b.roles), strings.Compare(a.pub, b.pub))
 			})
 			want[m] = ks
@@ -685,23 +683,23 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 				}
 			}
 			if f.subjects != nil {
-				// edge_gs's kid, roles and pub (migrations 005, 006) are the
+				// edge_views's kid, roles and pub (migrations 005, 006) are the
 				// latest exchange's, kept only because they are NOT NULL: a
-				// cookie is judged by the keys in edge_gs_keys (migrations
+				// cookie is judged by the keys in edge_view_keys (migrations
 				// 007, 011).
-				if _, err := tx.ExecContext(ctx, `INSERT INTO edge_gs (marker, subjects, kid, roles, pub, exp) VALUES (?, ?, ?, ?, ?, ?)
+				if _, err := tx.ExecContext(ctx, `INSERT INTO edge_views (marker, subjects, kid, roles, pub, exp) VALUES (?, ?, ?, ?, ?, ?)
 				ON CONFLICT (marker) DO UPDATE SET subjects = excluded.subjects, kid = excluded.kid, roles = excluded.roles, pub = excluded.pub, exp = max(exp, excluded.exp)`,
 					m, enc(f.subjects), f.key.kid, enc(f.key.roles), f.key.pub, exp); err != nil {
 					return err
 				}
 			}
 			// The keys the cookie of m expiring at exp came from
-			// (gsKeysAt): written once, and the same ever after.
+			// (viewKeysAt): written once, and the same ever after.
 			if len(taken[m][exp]) > 0 {
 				continue
 			}
 			for _, k := range want[m] {
-				if _, err := tx.ExecContext(ctx, `INSERT INTO edge_gs_keys (marker, exp, kid, roles, pub, entry, pending, chain) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				if _, err := tx.ExecContext(ctx, `INSERT INTO edge_view_keys (marker, exp, kid, roles, pub, entry, pending, chain) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 					m, exp, k.kid, k.roles, k.pub, k.entry, k.pending, k.chain); err != nil {
 					return err
 				}
@@ -738,7 +736,7 @@ func (ix *Index) recordFilters(ctx context.Context, filters map[string]*markerRe
 // filter is what marker m stands for, recorded when an edge grant for it
 // was minted, by this instance or another on the database. A g: marker
 // without its subjects is unknown. The keys a g: marker's cookies came
-// from are read by gsKeys, never from memory: an exchange at another
+// from are read by viewKeys, never from memory: an exchange at another
 // instance adds to them.
 func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 	ix.fmu.Lock()
@@ -753,7 +751,7 @@ func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 		subjects sql.NullString
 	)
 	if err := ix.db.QueryRowContext(ctx, `SELECT f.filter, f.exp, g.subjects FROM edge_filters f
-		LEFT JOIN edge_gs g ON g.marker = f.marker WHERE f.marker = ?`, m).Scan(&s, &exp, &subjects); err != nil {
+		LEFT JOIN edge_views g ON g.marker = f.marker WHERE f.marker = ?`, m).Scan(&s, &exp, &subjects); err != nil {
 		return nil, false
 	}
 	f, err := grantcheck.DecodeReadFilter(s)
@@ -776,14 +774,14 @@ func (ix *Index) filter(ctx context.Context, m string) (*markerRec, bool) {
 	return rec, true
 }
 
-// gsKeys is every key the live cookies of marker m came from at now
-// (edge_gs_keys), each once, without its entry, recorded by any instance
+// viewKeys is every key the live cookies of marker m came from at now
+// (edge_view_keys), each once, without its entry, recorded by any instance
 // on the database.
-func (ix *Index) gsKeys(ctx context.Context, m string, now time.Time) ([]gsKey, error) {
-	return ix.gsKeyRows(ctx, `SELECT DISTINCT kid, roles, pub, '' FROM edge_gs_keys WHERE marker = ? AND exp > ? ORDER BY kid, roles, pub`, m, now.Unix())
+func (ix *Index) viewKeys(ctx context.Context, m string, now time.Time) ([]viewKey, error) {
+	return ix.viewKeyRows(ctx, `SELECT DISTINCT kid, roles, pub, '' FROM edge_view_keys WHERE marker = ? AND exp > ? ORDER BY kid, roles, pub`, m, now.Unix())
 }
 
-// gsKeysAt is every key the cookie of marker m that expires at exp (a
+// viewKeysAt is every key the cookie of marker m that expires at exp (a
 // Unix time, its claim) came from, recorded by any instance on the
 // database: every exchange that minted that cookie recorded the same
 // (recordCookies), and each must still hold. A cookie minted before migration 011 has none,
@@ -791,20 +789,20 @@ func (ix *Index) gsKeys(ctx context.Context, m string, now time.Time) ([]gsKey, 
 // without its pub has pub "", which no key has: readsKeysHold,
 // scopeKeysHold and storedFview refuse all three, until the reader
 // exchanges again.
-func (ix *Index) gsKeysAt(ctx context.Context, m string, exp int64) ([]gsKey, error) {
-	return ix.gsKeyRows(ctx, `SELECT kid, roles, pub, entry FROM edge_gs_keys WHERE marker = ? AND exp = ? ORDER BY kid, roles, pub`, m, exp)
+func (ix *Index) viewKeysAt(ctx context.Context, m string, exp int64) ([]viewKey, error) {
+	return ix.viewKeyRows(ctx, `SELECT kid, roles, pub, entry FROM edge_view_keys WHERE marker = ? AND exp = ? ORDER BY kid, roles, pub`, m, exp)
 }
 
-func (ix *Index) gsKeyRows(ctx context.Context, q, m string, t int64) ([]gsKey, error) {
+func (ix *Index) viewKeyRows(ctx context.Context, q, m string, t int64) ([]viewKey, error) {
 	rows, err := ix.db.QueryContext(ctx, q, m, t)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []gsKey
+	var out []viewKey
 	for rows.Next() {
 		var (
-			k     gsKey
+			k     viewKey
 			roles string
 		)
 		if err := rows.Scan(&k.kid, &roles, &k.pub, &k.entry); err != nil {
@@ -812,7 +810,7 @@ func (ix *Index) gsKeyRows(ctx context.Context, q, m string, t int64) ([]gsKey, 
 		}
 		var ok bool
 		if k.roles, ok = decodeStrings(roles); !ok {
-			return nil, errors.New("edge_gs_keys: roles of " + m + " aren't a JSON array of strings")
+			return nil, errors.New("edge_view_keys: roles of " + m + " aren't a JSON array of strings")
 		}
 		out = append(out, k)
 	}
@@ -837,29 +835,29 @@ func decodeStrings(s string) ([]string, bool) {
 	return out, true
 }
 
-// isGMarker reports whether m is a marker reads:{ns}:g:{gs} (§A.4).
+// isGMarker reports whether m is a marker reads:{ns}:g:{view} (§A.4).
 func isGMarker(m string) bool {
 	rest, ok := strings.CutPrefix(m, "reads:")
 	if !ok {
 		return false
 	}
-	_, gs, ok := strings.Cut(rest, ":g:")
-	return ok && !strings.Contains(gs, ":")
+	_, vid, ok := strings.Cut(rest, ":g:")
+	return ok && !strings.Contains(vid, ":")
 }
 
-// nsPrefix is the prefix of a subject set's results of ns, refsPrefix of
+// nsPrefix is the prefix of a view's results of ns, refsPrefix of
 // its answers across namespaces: every at, and the head pointer under the
 // prefix (§B.11.5).
-func nsPrefix(ns, gs string) string { return "/" + ns + "/g/" + gs }
-func refsPrefix(gs string) string   { return "/_refs/g/" + gs }
+func nsPrefix(ns, view string) string { return "/" + ns + "/view/" + view }
+func refsPrefix(view string) string   { return "/_refs/view/" + view }
 
-// edgeGS parses one of the service's prefixes, /{ns}/g/{gs} or (ns "")
-// /_refs/g/{gs}: the only prefixes its key vouches for (§C.5.3). A
+// edgeView parses one of the service's prefixes, /{ns}/view/{view} or (ns "")
+// /_refs/view/{view}: the only prefixes its key vouches for (§C.5.3). A
 // namespace named r or ns has none, since its prefix would lie under the
 // core's.
-func edgeGS(p string) (ns, gs string, ok bool) {
+func edgeView(p string) (ns, vid string, ok bool) {
 	segs := strings.Split(p, "/")
-	if len(segs) != 4 || segs[0] != "" || segs[2] != "g" {
+	if len(segs) != 4 || segs[0] != "" || segs[2] != "view" {
 		return "", "", false
 	}
 	if _, err := ids.Parse(segs[3]); err != nil {
@@ -884,30 +882,30 @@ func (ix *Index) edgeClaims(r *http.Request) *edge.Claims {
 	return ix.opt.EdgeGrants.FromRequest(r, ix.opt.Now())
 }
 
-// errUnknownSet is a read under an edge grant whose subject set, or the
+// errUnknownSet is a read under an edge grant whose view, or the
 // filter of one of its markers, the service doesn't know: minted by an
 // instance with another database, or forgotten once expired.
 var errUnknownSet = &grant.AuthError{Status: 401, Msg: "an edge grant for a subject set this service doesn't know: exchange the grant again"}
 
 // cookieAccess is access to private namespace ns under one of the
-// service's edge grants for /{ns}/g/{gs} (ok false without one): the
-// marker its gs stands for, read as a grant with that marker would be.
+// service's edge grants for /{ns}/view/{view} (ok false without one): the
+// marker its view stands for, read as a grant with that marker would be.
 func (ix *Index) cookieAccess(ctx context.Context, ns string, r *http.Request) (*access, bool, error) {
 	cl := ix.edgeClaims(r)
 	if cl == nil {
 		return nil, false, nil
 	}
-	cns, gs, ok := edgeGS(cl.Prefix)
+	cns, vid, ok := edgeView(cl.Prefix)
 	if !ok || cns != ns {
 		return nil, false, nil
 	}
-	subs, ok := ix.edge.Subjects(ctx, gs)
+	subs, ok := ix.edge.Subjects(ctx, cl.Prefix)
 	if !ok || len(subs) != 1 {
 		return nil, true, errUnknownSet
 	}
 	a, err := ix.markerAccess(ctx, ns, subs[0], cl.Exp)
 	if a != nil {
-		a.gs = gs
+		a.vid = vid
 	}
 	return a, true, err
 }
@@ -916,10 +914,10 @@ func (ix *Index) cookieAccess(ctx context.Context, ns string, r *http.Request) (
 // under an edge grant that expires at exp: reads:{ns}:{k} reads it whole,
 // reads:{ns}:scope:… as its filter allows while ns is still uncovered
 // (stillUncovered), reads:{ns}:g:… as its subjects and filter see ns at
-// its current checkpoint, which must still be covered (§B.11.9,
+// its current checkpoint, which must still be covered (§7.9,
 // storedFview), each only while every key that cookie came from, and the
 // roles its grant read through, are as the exchange recorded them (§A.4
-// gs, "reads:{ns}:{k} markers included"; readsKeysHold, scopeKeysHold,
+// view, "reads:{ns}:{k} markers included"; readsKeysHold, scopeKeysHold,
 // storedFview); any other marker reads none of it.
 func (ix *Index) markerAccess(ctx context.Context, ns, m string, exp int64) (*access, error) {
 	switch {
@@ -939,7 +937,7 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string, exp int64) (*ac
 		if err := ix.scopeKeysHold(ctx, ns, m, f, exp); err != nil {
 			return nil, err
 		}
-		return &access{marker: m, filter: f.f, allow: f.f.Allows, cookie: true}, nil
+		return &access{marker: m, filter: f.f, allow: ix.revAllow(ns, f.f), cookie: true}, nil
 	case strings.HasPrefix(m, "reads:"+ns+":g:"):
 		f, ok := ix.filter(ctx, m)
 		if !ok {
@@ -954,7 +952,7 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string, exp int64) (*ac
 			if err := ix.purgedGKeysHold(ctx, ns, m, f, exp); err != nil {
 				return nil, err
 			}
-			a.derive, a.allow = nil, func(string) bool { return false }
+			a.derive, a.allow = nil, func(string, string) bool { return false }
 		case err != nil:
 			return nil, err
 		}
@@ -965,10 +963,10 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string, exp int64) (*ac
 
 // keysHold checks the cookie of marker m of ns that expires at exp
 // against ns's document at its head (its effective keys, §C.4):
-// errRulesChanged unless every key that cookie came from (gsKeysAt) is
+// errRulesChanged unless every key that cookie came from (viewKeysAt) is
 // still there with the pub it had and lists read, with its whole entry
 // and its roles' whole definitions as the exchange recorded them
-// (entryHolds; §B.11.9 gs, v0.82: "gone or changes in any member"), and
+// (entryHolds; §7.9 view, v0.82: "gone or changes in any member"), and
 // passes also, if any. A cookie with no key recorded, minted before
 // migration 011, is refused: the reader exchanges again. A document that
 // can't be read is an error, never a read.
@@ -985,8 +983,8 @@ func (ix *Index) markerAccess(ctx context.Context, ns, m string, exp int64) (*ac
 // key or role changed after its exchange in a document the index never
 // read before the purge still gets the 410 and its head until it
 // expires.
-func (ix *Index) keysHold(ctx context.Context, ns, m string, exp int64, also func(cfg *grantcheck.Config, key grant.Key, k gsKey) bool) error {
-	recorded, err := ix.gsKeysAt(ctx, m, exp)
+func (ix *Index) keysHold(ctx context.Context, ns, m string, exp int64, also func(cfg *grantcheck.Config, key grant.Key, k viewKey) bool) error {
+	recorded, err := ix.viewKeysAt(ctx, m, exp)
 	if err != nil {
 		return err
 	}
@@ -1016,21 +1014,21 @@ func (ix *Index) keysHold(ctx context.Context, ns, m string, exp int64, also fun
 // (§8.5): errRulesChanged for a cookie with no key recorded, or with one
 // recorded without its entry or its pub, which never held or which the
 // last document the index read of the namespace ended (cookieEnds).
-func purgedKeysHold(recorded []gsKey) error {
-	if len(recorded) == 0 || slices.ContainsFunc(recorded, func(k gsKey) bool { return k.entry == "" || k.pub == "" }) {
+func purgedKeysHold(recorded []viewKey) error {
+	if len(recorded) == 0 || slices.ContainsFunc(recorded, func(k viewKey) bool { return k.entry == "" || k.pub == "" }) {
 		return errRulesChanged
 	}
 	return nil
 }
 
 // cookieEnds is what applying a batch of ns ends of the cookies recorded
-// (edge_gs_keys), worked out before the batch's transaction, since it
+// (edge_view_keys), worked out before the batch's transaction, since it
 // reads other namespaces' documents, and written in it (apply).
 //
 // "Once an entry after its exchange changes one of them [the key its key:
 // string names, or a key or role its rules came from], the cookie is 403
 // from that entry on, even where a later entry undoes the change"
-// (SERVICES §B.11.9 gs, §A.4 gs, v0.86; CONFORMANCE Tree 145). A live
+// (SERVICES §7.9 view, §A.4 view, v0.86; CONFORMANCE Tree 145). A live
 // namespace's cookie is judged by the document at its head on every read
 // (keysHold), which sees a change and not a change undone; so every
 // namespace document a batch brings, each config entry's in order, is
@@ -1047,7 +1045,7 @@ func purgedKeysHold(recorded []gsKey) error {
 // Only entries after the exchange count. A cookie minted while the index
 // is behind was verified against the document at the head, which the
 // index reaches later: its row is recorded with that position
-// (gsKeyRow.pending, confPos), and the documents of the backlog, up to
+// (viewKeyRow.pending, confPos), and the documents of the backlog, up to
 // and including the entry at it, are from before the exchange and are
 // not judged for the row, which leaves pending as the batch brings that
 // entry. A position is recorded only where the origin says the index's
@@ -1089,7 +1087,7 @@ type cookieEnds struct {
 	// seen are, per namespace judged, the rows judged. Any other row
 	// recorded since, which no document was judged for, ends (apply):
 	// what can't be told is refused.
-	seen map[string]map[gsKeyRow]rowEnd
+	seen map[string]map[viewKeyRow]rowEnd
 }
 
 // confStep is one entry of a batch of a namespace: its ns_id and, where
@@ -1113,7 +1111,7 @@ type rowEnd struct {
 // position in ce's namespace are skipped, and of the rest each document
 // must still give the row's key and roles (holds). The row ends at the
 // first that doesn't.
-func (ce *cookieEnds) judge(k gsKeyRow, holds func(cfg *grantcheck.Config) bool) rowEnd {
+func (ce *cookieEnds) judge(k viewKeyRow, holds func(cfg *grantcheck.Config) bool) rowEnd {
 	p := decodePending(k.pending)
 	for _, st := range ce.steps {
 		if pos, waits := p[ce.ns]; waits {
@@ -1131,7 +1129,7 @@ func (ce *cookieEnds) judge(k gsKeyRow, holds func(cfg *grantcheck.Config) bool)
 
 // ownHolds judges row k of cfg's namespace by cfg alone, as entryOfIn
 // does for a namespace without a base.
-func ownHolds(cfg *grantcheck.Config, k gsKeyRow) bool {
+func ownHolds(cfg *grantcheck.Config, k viewKeyRow) bool {
 	roles, ok := decodeStrings(k.roles)
 	if !ok {
 		return false
@@ -1156,7 +1154,7 @@ func ownHolds(cfg *grantcheck.Config, k gsKeyRow) bool {
 // cookieEnds judges batch b of ns, and snap, the document a snapshot is
 // taken at, if any.
 func (ix *Index) cookieEnds(ctx context.Context, ns string, b *follow.Batch, snap *client.NSDoc) (*cookieEnds, error) {
-	ce := &cookieEnds{all: b.Replaces(), ns: ns, own: true, seen: map[string]map[gsKeyRow]rowEnd{ns: {}}}
+	ce := &cookieEnds{all: b.Replaces(), ns: ns, own: true, seen: map[string]map[viewKeyRow]rowEnd{ns: {}}}
 	docs := 0
 	step := func(id string, d *client.NSDoc) {
 		st := confStep{id: id}
@@ -1180,7 +1178,7 @@ func (ix *Index) cookieEnds(ctx context.Context, ns string, b *follow.Batch, sna
 	if !b.Partial() {
 		step(b.NewCheckpoint, nil)
 	}
-	q := `SELECT DISTINCT marker, kid, roles, pub, entry, pending, chain FROM edge_gs_keys WHERE entry <> ''`
+	q := `SELECT DISTINCT marker, kid, roles, pub, entry, pending, chain FROM edge_view_keys WHERE entry <> ''`
 	if docs == 0 && !ce.all {
 		// No document to judge: only rows waiting for an entry matter.
 		q += ` AND pending <> ''`
@@ -1189,10 +1187,10 @@ func (ix *Index) cookieEnds(ctx context.Context, ns string, b *follow.Batch, sna
 	if err != nil {
 		return nil, err
 	}
-	live := map[string][]gsKeyRow{}
+	live := map[string][]viewKeyRow{}
 	for rows.Next() {
 		var m string
-		var k gsKeyRow
+		var k viewKeyRow
 		if err := rows.Scan(&m, &k.kid, &k.roles, &k.pub, &k.entry, &k.pending, &k.chain); err != nil {
 			rows.Close()
 			return nil, err
@@ -1214,7 +1212,7 @@ func (ix *Index) cookieEnds(ctx context.Context, ns string, b *follow.Batch, sna
 		if n != ns {
 			var draws bool
 			if cfg, draws = ix.drawsOn(ctx, n, ns); !draws {
-				ks = slices.DeleteFunc(slices.Clone(ks), func(k gsKeyRow) bool { return !k.drawsOn(ns) })
+				ks = slices.DeleteFunc(slices.Clone(ks), func(k viewKeyRow) bool { return !k.drawsOn(ns) })
 				if len(ks) == 0 {
 					continue
 				}
@@ -1223,7 +1221,7 @@ func (ix *Index) cookieEnds(ctx context.Context, ns string, b *follow.Batch, sna
 		}
 		seen := ce.seen[n]
 		if seen == nil {
-			seen = map[gsKeyRow]rowEnd{}
+			seen = map[viewKeyRow]rowEnd{}
 			ce.seen[n] = seen
 		}
 		for _, k := range ks {
@@ -1284,7 +1282,7 @@ func (ix *Index) drawsOn(ctx context.Context, n, ns string) (*grantcheck.Config,
 
 // drawsOn reports whether the row's key was drawn through base ns
 // (chain).
-func (k gsKeyRow) drawsOn(ns string) bool {
+func (k viewKeyRow) drawsOn(ns string) bool {
 	chain, _ := decodeStrings(k.chain)
 	return k.chain != "" && slices.Contains(chain, ns)
 }
@@ -1306,7 +1304,7 @@ func markerNS(m string) (string, bool) {
 // namespace by the batch's documents alone where they say everything
 // (own); one of another namespace that waits for an entry of this one,
 // or whose namespace was judged, by no document, so it ends if the
-// whose own chain names it (gsKeyRow.chain), or whose namespace was
+// whose own chain names it (viewKeyRow.chain), or whose namespace was
 // judged, by no document, so it ends if the batch brings one. What can't
 // be told is refused.
 //
@@ -1318,20 +1316,20 @@ func (ce *cookieEnds) apply(ctx context.Context, tx *sql.Tx) error {
 	if ce == nil {
 		return nil
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT marker, kid, roles, pub, entry, pending, chain FROM edge_gs_keys WHERE entry <> ''`)
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT marker, kid, roles, pub, entry, pending, chain FROM edge_view_keys WHERE entry <> ''`)
 	if err != nil {
 		return err
 	}
 	type change struct {
 		n string
-		k gsKeyRow
+		k viewKeyRow
 		r rowEnd
 	}
 	var todo []change
-	done := map[string]map[gsKeyRow]bool{}
+	done := map[string]map[viewKeyRow]bool{}
 	for rows.Next() {
 		var m string
-		var k gsKeyRow
+		var k viewKeyRow
 		if err := rows.Scan(&m, &k.kid, &k.roles, &k.pub, &k.entry, &k.pending, &k.chain); err != nil {
 			rows.Close()
 			return err
@@ -1341,7 +1339,7 @@ func (ce *cookieEnds) apply(ctx context.Context, tx *sql.Tx) error {
 			continue
 		}
 		if done[n] == nil {
-			done[n] = map[gsKeyRow]bool{}
+			done[n] = map[viewKeyRow]bool{}
 		}
 		done[n][k] = true
 		_, waits := decodePending(k.pending)[ce.ns]
@@ -1372,7 +1370,7 @@ func (ce *cookieEnds) apply(ctx context.Context, tx *sql.Tx) error {
 			set, arg = `pending = ?`, []any{c.r.pending}
 		}
 		arg = append(arg, len(prefix), prefix, c.k.kid, c.k.roles, c.k.pub, c.k.entry, c.k.pending, c.k.chain)
-		if _, err := tx.ExecContext(ctx, `UPDATE edge_gs_keys SET `+set+` WHERE substr(marker, 1, ?) = ? AND kid = ? AND roles = ? AND pub = ? AND entry = ? AND pending = ? AND chain = ?`, arg...); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE edge_view_keys SET `+set+` WHERE substr(marker, 1, ?) = ? AND kid = ? AND roles = ? AND pub = ? AND entry = ? AND pending = ? AND chain = ?`, arg...); err != nil {
 			return err
 		}
 	}
@@ -1380,22 +1378,22 @@ func (ce *cookieEnds) apply(ctx context.Context, tx *sql.Tx) error {
 }
 
 // scopeKeysHold checks a cookie for scope marker m of ns, whose record is
-// rec, as §B.11.9 gs ends a gs cookie (§A.4: "a cookie is 403 until the
+// rec, as §7.9 view ends a view cookie (§A.4: "a cookie is 403 until the
 // reader exchanges again ... where a marker's key, rules or roles would
-// end a gs cookie"): keysHold, each role a key digested still existing
+// end a view cookie"): keysHold, each role a key digested still existing
 // and listing read, and the scope digest over the current rules, with
 // rec's block rules and principal and the key's key: string, still m's
 // (scopeMarker).
 func (ix *Index) scopeKeysHold(ctx context.Context, ns, m string, rec *markerRec, exp int64) error {
-	return ix.keysHold(ctx, ns, m, exp, func(cfg *grantcheck.Config, key grant.Key, k gsKey) bool {
-		return gsKeyHolds(cfg, []grant.Key{key}, rec.f, k, func(d string) bool { return scopeMarker(ns, d, k.kid, k.pub) == m })
+	return ix.keysHold(ctx, ns, m, exp, func(cfg *grantcheck.Config, key grant.Key, k viewKey) bool {
+		return viewKeyHolds(cfg, []grant.Key{key}, rec.f, k, func(d string) bool { return scopeMarker(ns, d, k.kid, k.pub) == m })
 	})
 }
 
 // readsKeysHold checks a cookie for marker reads:{ns}:{k}, m, that expires
-// at exp, as scopeKeysHold checks a scope marker's (§A.4 gs: a cookie is
-// 403 "where a marker's key, rules or roles would end a gs cookie
-// (§B.11.9 gs), its key being the one that verified the grant in {ns},
+// at exp, as scopeKeysHold checks a scope marker's (§A.4 view: a cookie is
+// 403 "where a marker's key, rules or roles would end a view cookie
+// (§7.9 view), its key being the one that verified the grant in {ns},
 // reads:{ns}:{k} markers included"): keysHold. Readers through one key
 // with other read roles, or with its entry as it was before a change,
 // share the marker, never a cookie (recordCookies).
@@ -1407,25 +1405,21 @@ func (ix *Index) readsKeysHold(ctx context.Context, ns, m string, exp int64) err
 // is rec, which has no checkpoint left to be judged at (storedFview): as
 // there, by ns's document at its head (keysHold).
 func (ix *Index) purgedGKeysHold(ctx context.Context, ns, m string, rec *markerRec, exp int64) error {
-	if slices.Contains(rec.subjects, catvis.Partial) {
-		return errPartial
-	}
-	return ix.keysHold(ctx, ns, m, exp, func(cfg *grantcheck.Config, key grant.Key, k gsKey) bool {
-		return gsKeyHolds(cfg, []grant.Key{key}, rec.f, k, func(d string) bool {
-			return slices.Contains(rec.subjects, catvis.ScopePrefix+scopeKeyDigest(d, k.kid, k.pub))
+	return ix.keysHold(ctx, ns, m, exp, func(cfg *grantcheck.Config, key grant.Key, k viewKey) bool {
+		return viewKeyHolds(cfg, []grant.Key{key}, rec.f, k, func(d string) bool {
+			return slices.Contains(rec.subjects, grantcheck.ScopePrefix+scopeKeyDigest(d, k.kid, k.pub))
 		})
 	})
 }
 
 // errCoveredNow refuses a cookie for marker reads:{ns}:scope:… once
-// §B.11.9 covers ns: a partial reader's marker there is reads:{ns}:g:{gs},
+// §7.9 covers ns: a partial reader's marker there is reads:{ns}:g:{view},
 // its hits filtered by visibility (§A.4), which rules alone don't do.
-var errCoveredNow = &grant.AuthError{Status: 403, Msg: "the namespace is read filtered now: exchange the grant again (§B.11.9)"}
+var errCoveredNow = &grant.AuthError{Status: 403, Msg: "the namespace is read filtered now: exchange the grant again (§7.9)"}
 
-// stillUncovered checks that §B.11.9 doesn't cover ns at the index's
+// stillUncovered checks that §7.9 doesn't cover ns at the index's
 // committed checkpoint, as when a scope marker of it was issued: else
-// errCoveredNow; and that ns isn't one a partial reader has no marker in
-// (catalogShaped): else errNoMarker. Before the index's first checkpoint
+// errCoveredNow. Before the index's first checkpoint
 // of a namespace that may be covered once it has, its coverage can't be
 // told: errNotReached, as for a grant (grantAccess). A purged one passes,
 // answered 410 past the read check (§8.5).
@@ -1449,18 +1443,11 @@ func (ix *Index) stillUncovered(ctx context.Context, ns string) error {
 	case cp != nil:
 		return errCoveredNow
 	}
-	// One that could be covered by its shape gives a partial reader no
-	// marker (§A.4), so no cookie of one reads it.
-	if shaped, err := ix.catalogShaped(ctx, ns); err != nil {
-		return err
-	} else if shaped {
-		return errNoMarker
-	}
 	return nil
 }
 
 // refsCookieReader is the reader of /_refs under one of the service's
-// edge grants for /_refs/g/{gs} (ok false without one): its subject set,
+// edge grants for /_refs/view/{view} (ok false without one): its view,
 // whose markers decide which private namespaces it sees and how
 // (markerAccess); every public one is seen too. A namespace a marker
 // names whose document the service can't read is 502, as one a grant
@@ -1470,15 +1457,15 @@ func (ix *Index) refsCookieReader(ctx context.Context, r *http.Request, reached 
 	if cl == nil {
 		return nil, false, nil
 	}
-	cns, gs, ok := edgeGS(cl.Prefix)
+	cns, vid, ok := edgeView(cl.Prefix)
 	if !ok || cns != "" {
 		return nil, false, nil
 	}
-	subs, ok := ix.edge.Subjects(ctx, gs)
+	subs, ok := ix.edge.Subjects(ctx, cl.Prefix)
 	if !ok {
 		return nil, true, errUnknownSet
 	}
-	rd := &refsReader{gs: gs, public: true, allow: map[string]func(string) bool{}, covs: map[string]*access{}}
+	rd := &refsReader{vid: vid, public: true, allow: map[string]allowFunc{}, covs: map[string]*access{}}
 	for _, ns := range ix.refsNamespaces() {
 		if _, ok := reached[ns]; !ok || ix.keys.Skipped(ns) != "" {
 			continue
@@ -1520,18 +1507,18 @@ func (ix *Index) refsCookieReader(ctx context.Context, r *http.Request, reached 
 // purgedRead is the read check of a request of purged namespace ns, whose
 // document the core answered 410 purged (cfgErr): with a grant, or none,
 // the core's (grantcheck.PurgedRead); under one of the service's edge
-// grants for ns's subject set, which the service knows, it passes, and
+// grants for ns's view, which the service knows, it passes, and
 // the head is cfgErr's (§8.5).
 func (ix *Index) purgedRead(ctx context.Context, ns string, r *http.Request, cfgErr error) (string, error) {
 	if cl := ix.edgeClaims(r); cl != nil {
-		if cns, gs, ok := edgeGS(cl.Prefix); ok && cns == ns {
-			subs, known := ix.edge.Subjects(ctx, gs)
+		if cns, _, ok := edgeView(cl.Prefix); ok && cns == ns {
+			subs, known := ix.edge.Subjects(ctx, cl.Prefix)
 			if !known || len(subs) != 1 {
 				return "", errUnknownSet
 			}
 			// Its keys can't be judged again (keysHold): a cookie
 			// recorded with none, or with one that never held, is 403.
-			recorded, err := ix.gsKeysAt(ctx, subs[0], cl.Exp)
+			recorded, err := ix.viewKeysAt(ctx, subs[0], cl.Exp)
 			if err == nil {
 				err = purgedKeysHold(recorded)
 			}
@@ -1561,8 +1548,8 @@ func (ix *Index) serveEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodDelete:
 		// The core's DELETE /edge-grants takes only core prefixes, so the
 		// service withdraws its own (§C.5.3, §C.5.4).
-		svcedge.Withdraw(w, r, ix.opt.EdgeGrants, func(p string) bool { _, _, ok := edgeGS(p); return ok },
-			"/{ns}/g/{gs} or /_refs/g/{gs} (§A.4, §B.11.5)")
+		svcWithdraw(w, r, ix.opt.EdgeGrants, func(p string) bool { _, _, ok := edgeView(p); return ok },
+			"/{ns}/view/{view} or /_refs/view/{view} (§A.4)")
 	default:
 		ix.issueEdgeGrants(w, r)
 	}
@@ -1573,23 +1560,23 @@ func (ix *Index) serveEdgeGrants(w http.ResponseWriter, r *http.Request) {
 const maxPrefixes = 100
 
 // exchanged is what one grant of an exchange gives: its edge grants, the
-// markers behind each gs, what each marker stands for and the key it came
+// markers behind each view, what each marker stands for and the key it came
 // from (markerRec, for every marker), and the exchangeRate bucket of its
 // principal.
 type exchanged struct {
-	issues   []svcedge.Issue
+	issues   []svcIssue
 	subjects map[string][]string
 	filters  map[string]*markerRec
 	bucket   string
 }
 
 // issueEdgeGrants is POST /edge-grants (§A.4, §B.11.5, following §C.5.2's
-// issuance): with the grant in Authorization, or 1 to svcedge.MaxGrants
+// issuance): with the grant in Authorization, or 1 to svcMaxGrants
 // grants as { "grants": [ … ] } in an application/json body (415
-// otherwise, svcedge.Bearers), it answers 200 { prefixes, exp } and one
+// otherwise, svcBearers), it answers 200 { prefixes, exp } and one
 // Set-Cookie per prefix. Each grant gives, for every private namespace
-// the service follows that it names, /{ns}/g/{gs} of the reader's
-// marker there (exchangeGrant), and /_refs/g/{gs} of its markers in those
+// the service follows that it names, /{ns}/view/{view} of the reader's
+// marker there (exchangeGrant), and /_refs/view/{view} of its markers in those
 // the service has reached, each lasting until the grant's exp or the
 // cookies' TTL (15 minutes at most), whichever is sooner. A prefix
 // several grants give gets one cookie, lasting as long as the longest,
@@ -1598,16 +1585,16 @@ type exchanged struct {
 // it answers all or nothing (§C.5.2): a grant over grantSize or
 // rulesPerGrant is 413 limit (§C.8); a grant left with no edge grant is
 // refused 401 if any such is 401, else 403; else, where a namespace
-// document a grant names, or the chain a requireAt key names, can't be
-// read, 502 if any such failure is lasting and 503 behind only if every
-// one is for now (worseUpstream; §C.4, §C.5.2); once none is, a grant left with
+// document a grant names can't be read, 502 if any such failure is
+// lasting and 503 behind only if every one is for now (worseUpstream;
+// §C.5.2); once none is, a grant left with
 // no edge grant whose only refusals are purges is 410 purged, with ns and
 // head naming the first in the order the grants and their root blocks
 // list them (§8.5).
 // More than maxPrefixes prefixes is 400.
 // Once nothing is refused, it draws one token from the exchangeRate
 // bucket of each distinct principal among the grants (ExchangeRate,
-// §6.6), shared with the instances on its database (svcedge.Store), and
+// §6.6), shared with the instances on its database (edgeStore), and
 // is 429 (code "rate", limit "exchangeRate", with Retry-After) while any
 // is empty. While the core's authentication is disabled (§1), it is 404
 // not_offered, before the body is read; it takes no query parameter (400,
@@ -1616,7 +1603,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	// Whether the core's authentication is on is what its root says now
 	// (authOff: read again once CheckerTTL has passed), never what an
-	// earlier read said (§B.11.9 Where, v0.82). While the root can't be
+	// earlier read said (§7.9 Where, v0.82). While the root can't be
 	// read the exchange goes on as with authentication on: it mints only
 	// for grants that verify, and a namespace whose coverage the root
 	// decides answers 503 or 502 for the whole exchange (coverage).
@@ -1630,7 +1617,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "bad_input", "POST /edge-grants takes no query parameters (§7)")
 		return
 	}
-	bearers, refusal := svcedge.Bearers(r, svcedge.DefaultGrantSize)
+	bearers, refusal := svcBearers(r, svcDefaultGrantSize)
 	if refusal != nil {
 		refusal.Write(w)
 		return
@@ -1658,16 +1645,11 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		ex, pn, err := ix.exchangeGrant(ctx, b, reached, now)
 		var le *grantcheck.LimitError
 		var ae *grant.AuthError
-		_, chain := chainErr(err)
 		switch {
 		case errors.As(err, &le):
 			if limit == nil {
 				limit = le
 			}
-		case chain:
-			// A requireAt chain the verifier can't read: 503 or 502,
-			// never a refusal (§C.4, writeUpstreamErr).
-			upErr = worseUpstream(upErr, err)
 		case errors.As(err, &ae):
 			if denied == nil || ae.Status == http.StatusUnauthorized && denied.Status != http.StatusUnauthorized {
 				denied = ae
@@ -1684,7 +1666,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case limit != nil:
-		svcedge.Limit(limit.Limit, limit.Measured, limit.Max).Write(w)
+		svcLimit(limit.Limit, limit.Measured, limit.Max).Write(w)
 		return
 	case denied != nil:
 		code := "forbidden"
@@ -1701,14 +1683,14 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		purged.write(w)
 		return
 	}
-	var issues []svcedge.Issue
+	var issues []svcIssue
 	subjects := map[string][]string{}
 	filters := map[string]*markerRec{}
 	var keys []string
 	for _, ex := range exs {
 		issues = append(issues, ex.issues...)
-		for gs, subs := range ex.subjects {
-			subjects[gs] = subs
+		for vid, subs := range ex.subjects {
+			subjects[vid] = subs
 		}
 		for m, f := range ex.filters {
 			if had, ok := filters[m]; ok {
@@ -1723,7 +1705,7 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 			keys = append(keys, ex.bucket)
 		}
 	}
-	issues = svcedge.Merge(issues)
+	issues = svcMerge(issues)
 	if len(issues) > maxPrefixes {
 		writeErr(w, http.StatusBadRequest, "bad_input", "the grants give more than 100 distinct prefixes (§C.5.2)")
 		return
@@ -1736,19 +1718,18 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "internal", "cannot draw from the exchangeRate buckets")
 		return
 	case wait > 0:
-		svcedge.RateLimited(wait).Write(w)
+		svcRateLimited(wait).Write(w)
 		return
 	}
 	// What each marker stands for, and the keys it came from, per cookie:
 	// recordCookies gives each edge grant the exp that tells it from
 	// every cookie minted for other keys or entries, at most the one it
-	// was to have, which the subject set, the cookie and the answer then
+	// was to have, which the view, the cookie and the answer then
 	// carry.
 	recs := make([]*cookieRec, len(issues))
 	for i, is := range issues {
-		_, gs, _ := edgeGS(is.Prefix)
 		recs[i] = &cookieRec{filters: map[string]*markerRec{}, exp: is.Exp}
-		for _, m := range subjects[gs] {
+		for _, m := range subjects[is.Prefix] {
 			if f, ok := filters[m]; ok {
 				recs[i].filters[m] = f
 			}
@@ -1769,22 +1750,21 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	}
 	for i := range issues {
 		issues[i].Exp = recs[i].exp
-		_, gs, _ := edgeGS(issues[i].Prefix)
-		if err := ix.edge.Record(ctx, gs, subjects[gs], issues[i].Exp, now); err != nil {
+		p := issues[i].Prefix
+		if err := ix.edge.Record(ctx, p, subjects[p], issues[i].Exp, now); err != nil {
 			ix.opt.Logf("index: recording a subject set: %v", err)
 			writeErr(w, http.StatusInternalServerError, "internal", "cannot record the subject set")
 			return
 		}
 	}
-	svcedge.Mint(w, ix.opt.EdgeGrants, now, issues)
+	svcMint(w, ix.opt.EdgeGrants, now, issues)
 }
 
 // worseUpstream is the one of cur and err, failures to read upstream
 // what an exchange needs, that answers it: the first that is lasting
 // (502 upstream), else the first (503 behind), so that an exchange is 503
 // only where every such failure is for now, whatever the order of its
-// grants and of the namespaces each names (§C.4: "503 (behind) while the
-// cause is transient, and 502 (upstream) otherwise"; writeUpstreamErr).
+// grants and of the namespaces each names (writeUpstreamErr).
 func worseUpstream(cur, err error) error {
 	if cur == nil {
 		return err
@@ -1805,8 +1785,8 @@ type purgedNS struct{ ns, head string }
 // every namespace the service follows that the grant names, and whose
 // keys the service doesn't lack, the read check of a query of it
 // (Index.access, grantAccess): a private one where the grant gets a
-// marker gives /{ns}/g/{gs} of the reader's marker there, and the markers
-// of those reached and not skipped give /_refs/g/{gs} over them, as
+// marker gives /{ns}/view/{view} of the reader's marker there, and the markers
+// of those reached and not skipped give /_refs/view/{view} over them, as
 // refsReader computes it. A public namespace needs no edge grant. Each
 // namespace is judged alone (§A.4 Across namespaces: "the service's
 // exchange refusing only as Coverage says"): one the grant gets no marker
@@ -1845,7 +1825,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 	// first 401 answering if nothing is left, else the first 403.
 	deny := func(err error) bool {
 		var ae *grant.AuthError
-		if _, chain := chainErr(err); chain || !errors.As(err, &ae) {
+		if !errors.As(err, &ae) {
 			return false
 		}
 		if denied == nil || ae.Status == http.StatusUnauthorized && denied.Status != http.StatusUnauthorized {
@@ -1910,7 +1890,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			ex.bucket = v.Principal.ID + "\x00" + v.Key.Kid
 		}
 		// Every marker, reads:{ns}:{k} included, records the key that
-		// verified the grant here and its entry (§A.4 gs).
+		// verified the grant here and its entry (§A.4 view).
 		rec := markerRecOf(a, v)
 		var behind bool
 		// With the entry, the documents it was drawn from that the index
@@ -1921,9 +1901,9 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			continue
 		}
 		ex.filters[a.marker] = rec
-		if _, _, ok := edgeGS(nsPrefix(ns, a.gs)); ok {
-			ex.issues = append(ex.issues, svcedge.Issue{Prefix: nsPrefix(ns, a.gs), Exp: exp})
-			ex.subjects[a.gs] = []string{a.marker}
+		if _, _, ok := edgeView(nsPrefix(ns, a.vid)); ok {
+			ex.issues = append(ex.issues, svcIssue{Prefix: nsPrefix(ns, a.vid), Exp: exp})
+			ex.subjects[nsPrefix(ns, a.vid)] = []string{a.marker}
 		}
 		if _, ok := reached[ns]; ok && ix.keys.Skipped(ns) == "" {
 			markers = append(markers, a.marker)
@@ -1936,10 +1916,10 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		return nil, nil, upErr
 	}
 	if len(markers) > 0 {
-		gs := grantcheck.SubjectSetID(markers)
+		vid := grantcheck.ViewID(markers)
 		slices.Sort(markers)
-		ex.issues = append(ex.issues, svcedge.Issue{Prefix: refsPrefix(gs), Exp: refsExp})
-		ex.subjects[gs] = markers
+		ex.issues = append(ex.issues, svcIssue{Prefix: refsPrefix(vid), Exp: refsExp})
+		ex.subjects[refsPrefix(vid)] = markers
 	}
 	switch {
 	case len(ex.issues) > 0:
@@ -2105,18 +2085,21 @@ func grantExp(v *grant.Verified) time.Time {
 }
 
 // initEdge sets up the service's edge grants, with EdgeGrants: its key
-// vouches only for its own prefixes (edgeGS), and their state lives in
-// the database (svcedge.Store, and edge_filters, migration 004).
+// vouches only for its own prefixes (edgeView), and their state lives in
+// the database (edgeStore, and edge_filters, migration 004).
 func (ix *Index) initEdge(ctx context.Context, db *sql.DB) error {
 	ix.filters = map[string]keptFilter{}
 	if ix.opt.EdgeGrants == nil {
 		return nil
 	}
-	ix.opt.EdgeGrants.Vouches = func(p string) bool { _, _, ok := edgeGS(p); return ok }
+	ix.opt.EdgeGrants.Vouches = func(p string) bool { _, _, ok := edgeView(p); return ok }
 	if ix.opt.ExchangeRate.Rate <= 0 || ix.opt.ExchangeRate.Burst < 1 {
-		ix.opt.ExchangeRate = svcedge.DefaultExchangeRate
+		ix.opt.ExchangeRate = DefaultExchangeRate
 	}
-	var err error
-	ix.edge, err = svcedge.NewStore(ctx, db)
-	return err
+	ix.edge = newEdgeStore(db)
+	return nil
 }
+
+// maxChain bounds a branch's chain of bases (the deployment's branch
+// depth is 8 by default, grantcheck's bound 32).
+const maxChain = 32

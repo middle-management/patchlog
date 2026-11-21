@@ -230,33 +230,6 @@ func TestV073SealedEntryCarriesVia(t *testing.T) {
 	}
 }
 
-// §7.1, §G.3 (RH-7): a remote branch mirrors its base's entries with their
-// via, and serves them as the base does.
-func TestV073RemoteMirrorCopiesVia(t *testing.T) {
-	t.Parallel()
-	a := newAuthFixture(t, map[string]any{"read": "public"}, withOrigin(originA)).tenv
-	rt := &route{url: a.srv.URL}
-	b := newEnv(t, withOrigin(originB), withRemote(rt))
-	issuer := newKey("issuer2")
-	expect(t, a.do(req{method: "PATCH", path: "/ns/n", ifNoneMatch: "*", bearer: a.operatorGrant("n"),
-		body: addRoot(map[string]any{"read": "public", "keys": []any{issuer.entry("read", "create", "append")}})}), 201)
-	dg := delegated(t, a, issuer, "user:bob", []string{"n"}, []string{"read", "create", "append"})
-	x1 := a.create("n", "x", map[string]any{"n": 1.0}, dg)
-	x2 := a.appendRev("n", "x", x1, ops(op("replace", "/n", 2.0)), a.grant(issuer, "user:bob", []string{"n"}, []string{"append"}))
-	at := a.nsHead("n")
-	expect(t, b.mkRemote("rel", remoteGenesis("n", at, nil)), 201)
-	lg := b.get("/r/rel/x/rev/" + x2 + "/log").Arr()
-	if len(lg) != 2 {
-		t.Fatalf("mirrored log %v", lg)
-	}
-	if got := viaOf(t, lg[0].(map[string]any)); !slices.Equal(got, []string{"svc:a", "svc:b"}) {
-		t.Errorf("mirrored delegated entry via %v", got)
-	}
-	if got := viaOf(t, lg[1].(map[string]any)); got != nil {
-		t.Errorf("mirrored undelegated entry via %v", got)
-	}
-}
-
 // §7.4, §7.1 Continuations (RH-10): /heads answers { heads, next? }, next
 // the following page's after, absent on the last.
 func TestV073HeadsShape(t *testing.T) {
@@ -479,65 +452,6 @@ func TestV073PrincipalKeyAndOperator(t *testing.T) {
 	b = r.Obj()
 	if _, has := b["key"]; has || b["operator"] != false {
 		t.Fatalf("auth disabled: %s", r.Body)
-	}
-}
-
-// §7.4, §B.6, §H.2 (RH-24): a catalog namespace's /principal gives
-// catalog: trust ([] when absent) and files to a grant with unrestricted
-// read; to any other, files without x- members and trusted in place of
-// trust. Other namespaces have no catalog member.
-func TestV073PrincipalCatalog(t *testing.T) {
-	t.Parallel()
-	files := map[string]any{"ns": "docs", "root": "root", "x-note": "internal"}
-	f := newAuthFixture(t, map[string]any{"catalog": map[string]any{"trust": []any{"docs", "media"}, "mode": "tree", "files": files}})
-	e := f.tenv
-	r := e.principalOf("sec", f.issuerG)
-	expect(t, r, 200)
-	c, _ := r.Obj()["catalog"].(map[string]any)
-	if !slices.Equal(strsOf(c["trust"]), []string{"docs", "media"}) || c["files"].(map[string]any)["x-note"] != "internal" {
-		t.Fatalf("unrestricted reader's catalog %v", c)
-	}
-	if _, has := c["trusted"]; has {
-		t.Fatalf("unrestricted reader gets trusted: %v", c)
-	}
-	// A grant limited to some resources, and one without read.
-	for name, g := range map[string]string{
-		"limited": e.grant(f.issuer, "user:l", []string{"sec"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}}),
-		"no read": e.grant(f.issuer, "user:w", []string{"sec"}, []string{"append"}),
-	} {
-		r := e.principalOf("sec", g)
-		expect(t, r, 200)
-		c, _ := r.Obj()["catalog"].(map[string]any)
-		fl, _ := c["files"].(map[string]any)
-		if _, has := c["trust"]; has || c["trusted"] != true || fl["ns"] != "docs" || fl["root"] != "root" {
-			t.Errorf("%s: catalog %v", name, c)
-		}
-		if _, has := fl["x-note"]; has {
-			t.Errorf("%s: files keeps its x- member: %v", name, fl)
-		}
-	}
-	// files.ns not trusted, and a catalog without trust or files.
-	expect(t, e.patchNS("sec", ops(op("replace", "/catalog/files/ns", "elsewhere")), f.adminG), 201)
-	r = e.principalOf("sec", e.grant(f.issuer, "user:w", []string{"sec"}, []string{"append"}))
-	if c, _ := r.Obj()["catalog"].(map[string]any); c["trusted"] != false {
-		t.Errorf("untrusted files.ns: %v", c)
-	}
-	expect(t, e.patchNS("sec", ops(op("replace", "/catalog", map[string]any{"mode": "dag"})), f.adminG), 201)
-	r = e.principalOf("sec", f.issuerG)
-	if c, _ := r.Obj()["catalog"].(map[string]any); c == nil || c["trust"] == nil || len(strsOf(c["trust"])) != 0 {
-		t.Errorf("catalog without trust: %s", r.Body)
-	}
-	if _, has := r.Obj()["catalog"].(map[string]any)["files"]; has {
-		t.Errorf("catalog without files has files: %s", r.Body)
-	}
-	r = e.principalOf("sec", e.grant(f.issuer, "user:w", []string{"sec"}, []string{"append"}))
-	if c, _ := r.Obj()["catalog"].(map[string]any); c["trusted"] != false {
-		t.Errorf("catalog without files, limited: %v", c)
-	}
-	// Not a catalog.
-	expect(t, e.patchNS("sec", ops(op("remove", "/catalog")), f.adminG), 201)
-	if _, has := e.principalOf("sec", f.issuerG).Obj()["catalog"]; has {
-		t.Error("a namespace without catalog has a catalog member")
 	}
 }
 
@@ -890,40 +804,6 @@ func TestV073InlinePDFSandboxOnlyOff200And206(t *testing.T) {
 		}
 		if r.H.Get("Content-Disposition") != "" || r.H.Get("X-Content-Type-Options") != "nosniff" {
 			t.Errorf("inline PDF %d: %v", c.code, r.H)
-		}
-	}
-}
-
-// §7.4, §C.4 (RH-24): an operator grant reads nothing that needs a grant
-// (any such read under one is 401, whatever its blocks allow), so outside
-// a public namespace /principal gives it the restricted catalog member:
-// files without x- members, and trusted in place of trust. A public
-// namespace's catalog is everyone's to read, so there it gets all of it.
-func TestV073OperatorGrantRestrictedCatalog(t *testing.T) {
-	t.Parallel()
-	files := map[string]any{"ns": "docs", "root": "root", "x-note": "internal"}
-	for _, read := range []string{"grant", "public"} {
-		f := newAuthFixture(t, map[string]any{"read": read, "catalog": map[string]any{"trust": []any{"docs", "media"}, "mode": "tree", "files": files}})
-		e := f.tenv
-		op := mint(t, e.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"sec"}, "can": []any{"read", "config"},
-			"exp": e.clock.Now().Add(time.Hour).Format(time.RFC3339)})
-		if read == "grant" {
-			expect(t, e.get("/r/sec/anything", op), 401) // it can't read
-		}
-		r := e.principalOf("sec", op)
-		expect(t, r, 200)
-		if r.Obj()["operator"] != true {
-			t.Fatalf("not an operator grant: %s", r.Body)
-		}
-		c, _ := r.Obj()["catalog"].(map[string]any)
-		fl, _ := c["files"].(map[string]any)
-		_, trust := c["trust"]
-		_, note := fl["x-note"]
-		switch {
-		case read == "grant" && (trust || note || c["trusted"] != true || fl["ns"] != "docs"):
-			t.Errorf("operator grant, which can't read sec: catalog %v, want files without x- members and trusted", c)
-		case read == "public" && (!trust || !note || c["trusted"] != nil):
-			t.Errorf("operator grant in a public namespace: catalog %v, want trust and files whole", c)
 		}
 	}
 }

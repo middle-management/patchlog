@@ -22,10 +22,6 @@ type RebaseReleaseOptions struct {
 	// successor name instead.
 	Suffix string
 	Names  map[string]string
-	// At is the new release document's combined checkpoint (§B.5), if
-	// known; otherwise it is left out: the successors start at their
-	// bases' current heads, not at one combined checkpoint.
-	At string
 	// Plan options for the replays (Squash is ignored). E2E release
 	// branches need Plan.E2E.
 	Plan Options
@@ -164,7 +160,6 @@ func RebaseRelease(ctx context.Context, c *client.Client, opt RebaseReleaseOptio
 		at, _ := bref["at"].(string)
 		nd.Branches[k] = release.Branch{NS: succ[k], At: at}
 	}
-	nd.At = opt.At
 	rev, err := release.Write(ctx, c, rel.Ref, rel.Head, &nd)
 	if err != nil {
 		return out, err

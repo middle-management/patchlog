@@ -1,7 +1,6 @@
 package server
 
 import (
-	"net/http/httptest"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/core"
@@ -44,25 +43,6 @@ func TestV081RaiseToE2ERefused(t *testing.T) {
 	// Creation at e2e, and other raises, are unchanged.
 	e.mkNS("e", e2eDoc(map[string]any{"read": "grant"}))
 	expect(t, e.patchNS("plain", ops(op("add", "/encryption", map[string]any{"level": "sealed"})), ""), 201)
-}
-
-// Scenario 29: a remote branch's raise to e2e is 422 as in any namespace,
-// refused before its source is read, so a source that doesn't answer
-// changes nothing (§G.5.2).
-func TestV081RemoteRaiseToE2ERefusedWithoutSource(t *testing.T) {
-	t.Parallel()
-	a, b, rt := pair(t, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning}, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning})
-	a.mkNS("m", map[string]any{"read": "public"})
-	a.create("m", "x", map[string]any{"v": 1.0})
-	expect(t, b.mkRemote("r2", remoteGenesis("m", a.nsHead("m"), map[string]any{"encryption": map[string]any{"level": "sealed"}})), 201)
-	down := httptest.NewServer(nil)
-	down.Close()
-	rt.set(down.URL, "")
-	r := b.patchNS("r2", ops(op("replace", "/encryption", map[string]any{"level": "e2e", "epoch": 2.0})), "")
-	expectCode(t, r, 422, "invalid")
-	if p := errPointer(t, r); p != "/encryption" {
-		t.Fatalf("pointer %q: %s", p, r.Body)
-	}
 }
 
 // LegacyE2ERaiseForTests lets the raise through, recording only the

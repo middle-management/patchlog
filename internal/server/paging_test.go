@@ -411,49 +411,6 @@ func testHeadsByteOrder(t *testing.T, opts ...envOpt) {
 	}
 }
 
-// A remote branch (§G.3) mirrors its base and follows the base's log
-// through paged ranges: logs longer than the base's page size on both
-// sides.
-func TestRemoteBranchPaged(t *testing.T) {
-	t.Parallel()
-	a, b, _ := pair(t, []envOpt{withLogPageSize(2)}, []envOpt{withLogPageSize(3)})
-	f := populateA(t, a)
-	// More history than one page for derby's chain.
-	d := f.lateD
-	for i := range 4 {
-		d = a.appendRev("main", "derby", d, ops(op("replace", "/score", strings.Repeat("1", i+1)+"-0")))
-	}
-	at := a.nsHead("main")
-	expect(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 201)
-	if h := b.head("rel", "derby"); h != d {
-		t.Fatalf("derby head %s, want %s", h, d)
-	}
-	// B serves the mirrored chain, page by page, as A does.
-	pa, pb := a.pages("/r/main/derby/rev/"+d+"/log", ""), b.pages("/r/rel/derby/rev/"+d+"/log", "")
-	var la, lb []string
-	for _, p := range pa {
-		la = append(la, entryIDs(p.entries)...)
-	}
-	for _, p := range pb {
-		lb = append(lb, entryIDs(p.entries)...)
-	}
-	if strings.Join(la, ",") != strings.Join(lb, ",") || len(la) != 7 || len(pa) != 4 || len(pb) != 3 {
-		t.Fatalf("derby logs A %v (%d pages), B %v (%d pages)", la, len(pa), lb, len(pb))
-	}
-	// Following: A purges after at; B applies it from A's paged log.
-	for i := range 3 {
-		a.create("main", "n"+string(rune('a'+i)), map[string]any{})
-	}
-	expect(t, a.purge("main", "old", f.o1, "admin"), 204)
-	if err := b.e.SyncRemotes(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	expect(t, b.get("/r/rel/old"), 410)
-	if b.head("rel", "derby") != d {
-		t.Fatal("derby changed")
-	}
-}
-
 // A resource's range in a branch of a branch crosses its bases' chains
 // (§7.6): pages run oldest first across the segments, chained by parent at
 // each fork, from any since (in a base's segment, at a fork, in the

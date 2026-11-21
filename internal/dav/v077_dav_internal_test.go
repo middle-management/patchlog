@@ -54,22 +54,22 @@ func TestV077FailedRead(t *testing.T) {
 	}
 }
 
-// §H.4 "Answers" (v0.85) for a tree or catalog service that gave no
+// §H.4 "Answers" (v0.85) for an upstream that gave no
 // response: 503 with Retry-After where no answer came in time, 502 where
 // there is no connection; neither says the service's address.
 func TestV085Unreached(t *testing.T) {
 	t.Parallel()
-	refused := &url.Error{Op: "Get", URL: "http://tree.internal:8082/cat/roots", Err: errors.New("dial tcp 10.0.0.7:8082: connect: connection refused")}
-	slow := &url.Error{Op: "Get", URL: "http://tree.internal:8082/cat/roots", Err: context.DeadlineExceeded}
+	refused := &url.Error{Op: "Get", URL: "http://core.internal:8080/ns/docs/heads", Err: errors.New("dial tcp 10.0.0.7:8080: connect: connection refused")}
+	slow := &url.Error{Op: "Get", URL: "http://core.internal:8080/ns/docs/heads", Err: context.DeadlineExceeded}
 	for _, c := range []struct {
 		err  error
 		want int
 	}{{refused, http.StatusBadGateway}, {slow, http.StatusServiceUnavailable}, {context.DeadlineExceeded, http.StatusServiceUnavailable}} {
-		de := unreached("catalog cat's tree service", c.err)
+		de := unreached("the core", c.err)
 		if de.status != c.want || (c.want == http.StatusServiceUnavailable) != (de.header.Get("Retry-After") != "") {
 			t.Errorf("unreached(%v) = %d %v, want %d", c.err, de.status, de.header, c.want)
 		}
-		if strings.Contains(de.msg, "tree.internal") || strings.Contains(de.msg, "10.0.0.7") || de.cause == nil {
+		if strings.Contains(de.msg, "core.internal") || strings.Contains(de.msg, "10.0.0.7") || de.cause == nil {
 			t.Errorf("unreached(%v): %q, cause %v", c.err, de.msg, de.cause)
 		}
 	}

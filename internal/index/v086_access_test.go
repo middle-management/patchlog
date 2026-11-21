@@ -1,7 +1,6 @@
 package index_test
 
 import (
-	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -13,7 +12,7 @@ import (
 // Tests for clauses of v0.86 the index already met: scenarios Tree 144
 // and 148, and Access 85.
 
-// TestV086CookiesToldApartByExp (CONFORMANCE Tree 144; SERVICES §A.4 gs,
+// TestV086CookiesToldApartByExp (CONFORMANCE Tree 144; SERVICES §A.4 view,
 // SPEC §C.5.2 Answer: a cookie lasts until its grant's exp "less any
 // whole seconds a minter MAY take off so that cookies for one prefix that
 // it must tell apart differ in exp"; §12.1 behind: "an exchange has no
@@ -85,52 +84,12 @@ func TestV086CookiesToldApartByExp(t *testing.T) {
 	}
 }
 
-// TestV086ExchangeChainUnreadMixed (CONFORMANCE Tree 148; SERVICES §A.4
-// gs: the exchange "refuses only as Coverage, §B.11.9 Where, §C.4's 502
-// and 503 for a requireAt chain it can't read"): one grant names m2,
-// where its key isn't listed, so the index leaves m2 out, and m1, whose
-// key's requireAt chain the index can't read. The exchange is 503 while
-// the cause is transient and 502 otherwise, for the whole exchange:
-// never a cookie that merely lacks m1's marker. With the chain read, the
-// same grant gets a cookie for m1 and none for m2.
-func TestV086ExchangeChainUnreadMixed(t *testing.T) {
-	t.Parallel()
-	w := newV82Chains(t)
-	both := w.ka.Grant(t, w.s.Now(), "user:li", []string{"m2", "m1"}, []string{"read"}, map[string]any{
-		"at":  map[string]any{"ns": "cat-a", "id": must(w.admin.NSHead(context.Background(), "cat-a")).ID},
-		"exp": w.s.Now().Add(10 * time.Minute).Format(time.RFC3339)})
-	r := w.exchange(both)
-	if r.status != 200 || len(r.cookies) == 0 {
-		t.Fatalf("the exchange while the chain is read: %d %v", r.status, r.body)
-	}
-	for _, p := range r.body["prefixes"].([]any) {
-		if strings.HasPrefix(p.(string), "/m2/") {
-			t.Fatalf("the grant, which no key of m2 verifies, has a prefix in m2: %v", r.body)
-		}
-	}
-	for _, c := range []struct {
-		upstream, status int
-		code             string
-	}{{503, 503, "behind"}, {403, 502, "upstream"}} {
-		w.fail.set("/ns/cat-a", c.upstream)
-		w.x.ix.ExpireGrantChecks()
-		r := w.exchange(both)
-		if r.status != c.status || r.body["code"] != c.code || len(r.cookies) != 0 || r.header.Get("Set-Cookie") != "" || r.body["prefixes"] != nil {
-			t.Errorf("cat-a answering the index %d: the exchange is %d %v with %d cookies, want %d %s for the whole exchange and no cookie",
-				c.upstream, r.status, r.body, len(r.cookies), c.status, c.code)
-		}
-		if c.status == 503 && r.header.Get("Retry-After") == "" {
-			t.Errorf("cat-a answering the index %d: no Retry-After", c.upstream)
-		}
-	}
-}
-
 // TestV086OperatorGrantAtTheIndex (CONFORMANCE Access 85; SPEC §C.4
 // Operator grants, v0.86: "Any other request under one, at the origin or
 // a service (§C.6), is 401, as for a key the namespace doesn't list. …
 // Requests that ignore any grant, such as public reads, … ignore it
 // too"). An operator grant, naming the namespace or "*", is 401 at the
-// index's exchange, with no cookie and no subject set, at GET /_refs and
+// index's exchange, with no cookie and no view, at GET /_refs and
 // at a query on a private namespace; a public namespace's query ignores
 // it. The index holds no operator key: it verifies a grant against the
 // namespace's own keys alone.

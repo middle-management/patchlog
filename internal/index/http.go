@@ -22,7 +22,6 @@ import (
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
-	"github.com/middle-management/patchlog/internal/svcedge"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -53,15 +52,12 @@ const minOther = "min names a namespace other than the one queried"
 //	                              tagged idx:{ns} and r:{ns}/{name} per hit)
 //	                              302 → current checkpoint if ns_id is neither
 //	                              current nor kept for this query
-//	GET /{ns}/g/{gs}/at/{ns_id}?… private namespaces: as above, keyed by the
-//	                              reader's subject set gs (§A.4, §B.11.5), the
-//	                              subject set before the checkpoint
-//	GET /{ns}/g/{gs}?…            the head pointer under the subject set's
+//	GET /{ns}/view/{view}/at/{ns_id}?… private namespaces: as above, keyed by the
+//	                              reader's view view (§A.4, §B.11.5), the
+//	                              view before the checkpoint
+//	GET /{ns}/view/{view}?…            the head pointer under the view's
 //	                              prefix, which its edge grants cover
 //	POST, DELETE /edge-grants     the service's own edge grants (edgegrants.go)
-//
-// The forms before v0.51, /g/{gs}/{ns}?… and /g/{gs}/{ns}/at/{ns_id}?…,
-// are moved permanently (301) to /{ns}?… and /{ns}/g/{gs}/at/{ns_id}?….
 //
 // The index holds current state only (§A.3), so results are computed at the
 // current checkpoint, and a redirect to it computes the result there. Every
@@ -81,16 +77,16 @@ const minOther = "min names a namespace other than the one queried"
 // anything else to the current checkpoint.
 //
 // Private namespaces need Authorization: Bearer <grant>, which reads only
-// under its own gs: an at URL of another gs is 403; the head pointer and
-// an at URL without /g/{gs} are redirected into the reader's (with min, by
+// under its own view: an at URL of another view is 403; the head pointer and
+// an at URL without /view/{view} are redirected into the reader's (with min, by
 // the redirect above), private, no-store (§A.4, §B.11.5). A request
 // without Authorization may carry instead an edge grant the service
-// minted for the gs of its URL (Options.EdgeGrants), and is read as that
-// subject set; one with neither is 401.
+// minted for the view of its URL (Options.EdgeGrants), and is read as that
+// view; one with neither is 401.
 //
-// Where §B.11.9 covers a namespace (filtered.go), a partial reader's
-// marker is reads:{ns}:g:{gs}, gs the origin's subject set; its hits are
-// those visible to it (§B.11.9 Visible); and at is the combined
+// Where §7.9 covers a namespace (filtered.go), a partial reader's
+// marker is reads:{ns}:g:{view}, view the origin's view; its hits are
+// those visible to it (§7.9 Visible); and at is the combined
 // checkpoint of every namespace visibility reads there, which its answers
 // list as namespaces and min may name ({ns}:{ns_id}). Its pages are filled
 // to limit, as every reader's are.
@@ -102,7 +98,7 @@ const minOther = "min names a namespace other than the one queried"
 // reads:{ns}:{k}) gets it sealed as one JWE under that epoch's key, when
 // every hit (and, with counts, every hit counted) comes from one epoch,
 // Content-Type application/jose, pl { ns, view } where view is the
-// result's request target (/{ns}/g/{gs}/at/{ns_id}?{query}, the
+// result's request target (/{ns}/view/{view}/at/{ns_id}?{query}, the
 // canonical form). A public namespace's results, which every reader gets,
 // those of a reader whose grant restricts resources, who may hold only
 // per-resource keys, and those mixing epochs are JSON { at, ns, hits,
@@ -141,7 +137,7 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	segs := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	var gs, ns, at string
+	var vid, ns, at string
 	isAt := false
 	switch {
 	case len(segs) == 1 && segs[0] == "_status":
@@ -157,26 +153,14 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(segs) == 3 && segs[1] == "at":
 		ns, at, isAt = segs[0], segs[2], true
 		telemetry.SetRoute(r, "/{ns}/at/{at}")
-	case len(segs) == 3 && segs[1] == "g":
-		// The head pointer under a subject set's prefix, which its edge
-		// grants cover (§B.11.5). No subject set is "g", so the form
-		// before v0.51 below, /g/{gs}/{ns}, never matches here.
-		ns, gs = segs[0], segs[2]
-		telemetry.SetRoute(r, "/{ns}/g/{gs}")
-	case len(segs) == 5 && segs[1] == "g" && segs[3] == "at":
-		ns, gs, at, isAt = segs[0], segs[2], segs[4], true
-		telemetry.SetRoute(r, "/{ns}/g/{gs}/at/{at}")
-	case len(segs) == 3 && segs[0] == "g" && validNS(segs[2]) && oldForm(segs[1]):
-		// Before v0.51 (§A.4): /g/{gs}/{ns}, now the head pointer /{ns}.
-		telemetry.SetRoute(r, "/g/{gs}/{ns}")
-		moved(w, r, "/"+segs[2])
-		return
-	case len(segs) == 5 && segs[0] == "g" && segs[3] == "at" && validNS(segs[2]) && oldForm(segs[1], segs[4]):
-		// Before v0.51: /g/{gs}/{ns}/at/{at}. A namespace named g has
-		// /g/g/{gs}/at/{at}, matched above: no subject set is "g".
-		telemetry.SetRoute(r, "/g/{gs}/{ns}/at/{at}")
-		moved(w, r, "/"+segs[2]+"/g/"+segs[1]+"/at/"+segs[4])
-		return
+	case len(segs) == 3 && segs[1] == "view":
+		// The head pointer under a view's prefix, which its edge grants
+		// cover (§A.4).
+		ns, vid = segs[0], segs[2]
+		telemetry.SetRoute(r, "/{ns}/view/{view}")
+	case len(segs) == 5 && segs[1] == "view" && segs[3] == "at":
+		ns, vid, at, isAt = segs[0], segs[2], segs[4], true
+		telemetry.SetRoute(r, "/{ns}/view/{view}/at/{at}")
 	default:
 		writeErr(w, http.StatusNotFound, "not_found", "not found")
 		return
@@ -193,13 +177,13 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if gs != "" {
-		if _, err := ids.Parse(gs); err != nil {
-			writeErr(w, http.StatusNotFound, "not_found", "malformed subject set")
+	if vid != "" {
+		if _, err := ids.Parse(vid); err != nil {
+			writeErr(w, http.StatusNotFound, "not_found", "malformed view")
 			return
 		}
 	}
-	ix.serve(w, r, gs, ns, at, isAt)
+	ix.serve(w, r, vid, ns, at, isAt)
 }
 
 // access is the outcome of the read check for one request.
@@ -208,17 +192,17 @@ type access struct {
 	v      *grant.Verified // nil under an edge grant (cookie)
 	all    bool            // reads every resource: no per-resource filtering
 	marker string          // what the reader's answers depend on (private only, §A.4)
-	gs     string          // subject-set id over marker (private only)
+	vid    string          // subject-set id over marker (private only)
 	// allow is the per-resource read check of a reader that isn't all:
 	// the grant's, or under an edge grant the filter its marker stands
-	// for (markerRec), or for a partial reader of a namespace §B.11.9
+	// for (markerRec), or for a partial reader of a namespace §7.9
 	// covers, visibility (cov).
-	allow func(resource string) bool
+	allow allowFunc
 	// filter is what a scope marker stands for, which an edge grant
 	// minted for it authorises from (markerRec).
 	filter *grantcheck.ReadFilter
 	cookie bool // read under one of the service's edge grants
-	// cov is a partial reader's view of a namespace §B.11.9 covers, at
+	// cov is a partial reader's view of a namespace §7.9 covers, at
 	// the checkpoint its answers are at (filtered.go), and derive computes
 	// it at another: from the grant, or from what a cookie's marker
 	// stands for. Both are nil for any other reader.
@@ -232,15 +216,14 @@ type access struct {
 
 // writeLimit answers a grant over grantSize or rulesPerGrant, which the
 // checker decodes as a *grantcheck.LimitError, as the origin answers it:
-// 413, code limit, naming the limit (§C.8), as the tree and catalog
-// services do (§C.6); a public namespace's reads ignore the grant, so
+// 413, code limit, naming the limit (§C.8); a public namespace's reads ignore the grant, so
 // this comes up only where one is used. It reports whether it answered.
 func writeLimit(w http.ResponseWriter, err error) bool {
 	var le *grantcheck.LimitError
 	if !errors.As(err, &le) {
 		return false
 	}
-	svcedge.Limit(le.Limit, le.Measured, le.Max).Write(w)
+	svcLimit(le.Limit, le.Measured, le.Max).Write(w)
 	return true
 }
 
@@ -394,7 +377,7 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 	if ok, _ := v.Allows("read"); !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
 	}
-	// Results are keyed by a subject set over the reader's marker (§A.4,
+	// Results are keyed by a view over the reader's marker (§A.4,
 	// as /_refs computes it, §B.11.5): reads:{ns}:{k}, k the key: string
 	// of the key that verified the grant (readsMarker, v0.85), for a
 	// grant that would be issued a namespace-wide edge grant (§C.5.2),
@@ -404,8 +387,8 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 	// allow, digest covering those rules, the /principal values they
 	// refer to (grantcheck.ReadsScope) and its key's key: string
 	// (scopeMarker), so readers limited alike through one key share them;
-	// and where §B.11.9 covers ns, reads:{ns}:g:{gs} for such a
-	// partial reader, gs being the origin's, its hits filtered by
+	// and where §7.9 covers ns, reads:{ns}:g:{view} for such a
+	// partial reader, view being the origin's, its hits filtered by
 	// visibility (filtered.go). Where those rules refer to /now the
 	// namespace counts as unreadable: a result at an at can't change with
 	// the clock.
@@ -430,7 +413,7 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 	filter := grantcheck.FilterOf(v)
 	filter.Steps = ix.opt.ValidationSteps // each item's validation steps (§6.6)
 	a := &access{v: v, filter: filter,
-		derive: func(_ context.Context, cp *fcp) (*fview, error) { return grantFview(cp, v, ix.opt.ValidationSteps) }}
+		derive: func(_ context.Context, cp *fcp) (*fview, error) { return ix.grantFview(cp, v, ix.opt.ValidationSteps) }}
 	switch err := ix.cover(ctx, a, ns, ""); {
 	case err == nil:
 		return a, nil
@@ -440,27 +423,30 @@ func (ix *Index) grantAccess(ctx context.Context, ns string, v *grant.Verified) 
 		if may, err := ix.mayBeCovered(ctx, ns); err != nil || may {
 			return nil, errors.Join(errNotReached, err)
 		}
-	case errors.Is(err, errUncovered):
-		// One that could be covered by its shape but isn't gives a
-		// partial reader no marker (§A.4): never hits by rules alone.
-		if shaped, err := ix.catalogShaped(ctx, ns); err != nil {
-			return nil, err
-		} else if shaped {
-			return nil, errNoMarker
-		}
-	case errors.Is(err, errPurgedNS):
+	case errors.Is(err, errUncovered), errors.Is(err, errPurgedNS):
 	default:
 		return nil, err
 	}
 	a.derive = nil
 	a.marker = scopeMarker(ns, digest, v.Key.Kid, keyPub(*v.Key))
-	a.allow = func(resource string) bool { return ix.checker.AllowsRead(v, resource) }
+	a.allow = ix.revAllow(ns, filter)
 	return marked(a), nil
 }
 
-// marked sets a's gs, the subject set of its marker alone.
+// marked sets a's view, its grant's §7.9 view in the namespace
+// (§A.4 Private namespaces): of its key: string alone for a reader that
+// reads it whole, with scope:{digest} too for one that reads it in part.
+// Readers alike through one key share it, and so their results.
 func marked(a *access) *access {
-	a.gs = grantcheck.SubjectSetID([]string{a.marker})
+	if a.v == nil {
+		a.vid = grantcheck.ViewID([]string{a.marker})
+		return a
+	}
+	d, scoped := "", !a.all
+	if scoped {
+		d, _ = grantcheck.ReadsScope(a.v)
+	}
+	a.vid = grantcheck.ViewID(grantcheck.ViewSubjects(d, a.v.Key.Kid, keyPub(*a.v.Key), scoped))
 	return a
 }
 
@@ -477,10 +463,10 @@ func base(a *access, ns string) string {
 	if a.public {
 		return "/" + ns
 	}
-	return "/" + ns + "/g/" + a.gs
+	return "/" + ns + "/view/" + a.vid
 }
 
-func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string, isAt bool) {
+func (ix *Index) serve(w http.ResponseWriter, r *http.Request, vid, ns, at string, isAt bool) {
 	ctx := r.Context()
 	vals := r.URL.Query()
 	q, err := ParseQuery(vals)
@@ -547,9 +533,9 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		writeBehind(w, "the index cannot obtain the keys of the namespace yet")
 		return
 	}
-	// A partial reader of a namespace §B.11.9 covers reads at the combined
+	// A partial reader of a namespace §7.9 covers reads at the combined
 	// checkpoint with ns at its committed checkpoint (filtered.go): cur
-	// below is that at, the reader's gs that at's.
+	// below is that at, the reader's view that at's.
 	if a.cov != nil {
 		if err := ix.cover(ctx, a, ns, head); err != nil {
 			ix.writeCoverErr(w, ns, err)
@@ -563,7 +549,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		} else {
 			// A pointer depends on the caller's grant: no cache keeps
 			// it, behind a verifying edge or not, and one that adds
-			// /g/{gs} is private, no-store (§A.4, §B.11.5).
+			// /view/{view} is private, no-store (§A.4, §B.11.5).
 			w.Header().Set("Cache-Control", ccPrivatePtr)
 			w.Header().Set("CDN-Cache-Control", "no-store")
 			w.Header().Set("Surrogate-Control", "no-store")
@@ -571,36 +557,36 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		}
 	}
 	// An older at whose checkpoint the index still holds is read at the
-	// reader's gs as of that at (§B.11.9, §B.11.5: a grant reads at its own
-	// gs as of the URL's at): where that is the URL's gs, old is the
+	// reader's view as of that at (§7.9, §B.11.5: a grant reads at its own
+	// view as of the URL's at): where that is the URL's view, old is the
 	// reader's view there, and the URL is the reader's own, answered as
 	// any older at is below: its kept result, else a redirect to the
 	// current at.
 	var old *access
-	if isAt && a.cov != nil && gs != "" && gs != a.gs && at != a.cov.cp.at {
+	if isAt && a.cov != nil && vid != "" && vid != a.vid && at != a.cov.cp.at {
 		if cp := ix.keptCP(ns, at); cp != nil {
-			if b := a.at(ctx, ns, cp); b != nil && b.gs == gs {
+			if b := a.at(ctx, ns, cp); b != nil && b.vid == vid {
 				old = b
 			}
 		}
 	}
-	// The reader's URL space: public, or keyed by its subject set. The
+	// The reader's URL space: public, or keyed by its view. The
 	// head pointer /{ns} is everyone's, and redirects there below. A grant
-	// reads only at its own gs (§A.4, §B.11.5), as of the URL's at (old):
-	// an at URL of another subject set is 403, with or without min, never
+	// reads only at its own view (§A.4, §B.11.5), as of the URL's at (old):
+	// an at URL of another view is 403, with or without min, never
 	// redirected. An at URL
-	// without /g/{gs} of a private namespace, or one with it of a public
+	// without /view/{view} of a private namespace, or one with it of a public
 	// one, which no grant decides, is redirected to the same at in the
 	// reader's space; with min, the redirects below land there, without
 	// min (§A.5).
-	if !isAt && gs != "" && gs != a.gs && !a.public {
-		// The head pointer under another subject set's prefix (§B.11.5).
+	if !isAt && vid != "" && vid != a.vid && !a.public {
+		// The head pointer under another view's prefix (§B.11.5).
 		w.Header().Set("Cache-Control", "no-store")
 		writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
 		return
 	}
-	if isAt && gs != a.gs && old == nil {
-		if gs != "" && !a.public {
+	if isAt && vid != a.vid && old == nil {
+		if vid != "" && !a.public {
 			w.Header().Set("Cache-Control", "no-store")
 			writeErr(w, http.StatusForbidden, "forbidden", "the grant reads only at its own subject set")
 			return
@@ -623,7 +609,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	}
 	target := func(id string) string { return targetOf(vals, id) }
 	// atA and atTarget are the reader's view at the URL's at and this
-	// query's canonical URL there: old's where the reader's gs there
+	// query's canonical URL there: old's where the reader's view there
 	// differs from its current one.
 	atA, atTarget := a, target(at)
 	if old != nil {
@@ -908,7 +894,7 @@ func (ix *Index) afterPurge(w http.ResponseWriter, r *http.Request, ns string, v
 }
 
 // errMoving is a namespace whose checkpoint moved each time a partial
-// reader's view was computed for it (§B.11.9, answer): behind, for now.
+// reader's view was computed for it (§7.9, answer): behind, for now.
 var errMoving = errors.New("the index is applying the namespace's log: try again")
 
 // errVisibility wraps a failure to compute a partial reader's view
@@ -916,18 +902,12 @@ var errMoving = errors.New("the index is applying the namespace's log: try again
 var errVisibility = errors.New("visibility")
 
 // writeAccessErr answers err, a failed read check (Index.access,
-// refsReader): 413 for a grant over a limit (writeLimit); a requireAt
-// chain the verifier can't read, whatever else err is, as
-// writeUpstreamErr answers it (§C.4: "never 403"); a grant every
+// refsReader): 413 for a grant over a limit (writeLimit); a grant every
 // namespace of which it names is purged 410 (purgedNS); a refusal as such,
 // no-store; a namespace not reached yet behind; anything else as
 // writeUpstreamErr answers it, with msg.
 func (ix *Index) writeAccessErr(w http.ResponseWriter, what string, err error, msg string) {
 	if writeLimit(w, err) {
-		return
-	}
-	if _, ok := chainErr(err); ok {
-		ix.writeUpstreamErr(w, what, err, msg)
 		return
 	}
 	var pn *purgedNS
@@ -953,49 +933,19 @@ func (ix *Index) writeAccessErr(w http.ResponseWriter, what string, err error, m
 	ix.writeUpstreamErr(w, what, err, msg)
 }
 
-// chainUnreadable is an error of a grant check that couldn't read the
-// chain a requireAt key names (§C.4 requireAt), its ChainUnreadable
-// telling whether the cause is transient (a transport error, a deadline,
-// a 5xx, 408 or 429). grantcheck's chain error has this method; the index
-// matches it by the method alone.
-type chainUnreadable interface{ ChainUnreadable() bool }
-
-// chainErr reports whether err is a requireAt chain the verifier couldn't
-// read (ok), and whether for now (transient).
-func chainErr(err error) (transient, ok bool) {
-	var c chainUnreadable
-	if !errors.As(err, &c) {
-		return false, false
-	}
-	return c.ChainUnreadable(), true
-}
-
-// Answers to a requireAt chain the verifier can't read (§C.4: "503
-// (behind) while the cause is transient (§A.1), and 502 (upstream)
-// otherwise, naming no namespace, never 403"), and to a namespace
-// visibility reads not followed yet (§A.4 Private namespaces: 503 behind;
-// /principal hides catalog.trust, §7.4, so it names none either).
-const (
-	msgChainBehind   = "the chain a requireAt key names cannot be read yet (§C.4)"
-	msgChainUpstream = "cannot read the chain a requireAt key names (§C.4)"
-	msgMemberBehind  = "a namespace visibility reads is not reached yet (§A.4)"
-	// The core's root, which says whether authentication is on (§B.11.9
-	// Where), for now (rootErr).
-	msgRootBehind = "the index cannot read the core's configuration yet (§B.11.9)"
-)
+// msgRootBehind answers the core's root, which says whether
+// authentication is on (§7.9 Where), unreadable for now (rootErr).
+const msgRootBehind = "the index cannot read the core's configuration yet (§7.9)"
 
 // writeCoverErr answers a failure to compute a partial reader's view of a
-// namespace §B.11.9 covers (Index.cover): a refusal as such, no-store;
+// namespace §7.9 covers (Index.cover): a refusal as such, no-store;
 // one of a namespace not reached yet, or purged meanwhile, behind; and a
 // namespace whose state visibility reads the service can't read, 502, or
 // 503 behind while only the keys to open a sealed one's documents can't be
 // fetched yet (writeUpstreamErr).
 func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 	var ae *grant.AuthError
-	_, chain := chainErr(err)
 	switch {
-	case chain:
-		ix.writeUpstreamErr(w, "visibility in "+ns, err, "cannot read a namespace visibility reads (§B.11.9)")
 	case errors.As(err, &ae):
 		code := "forbidden"
 		if ae.Status == 401 {
@@ -1007,24 +957,15 @@ func (ix *Index) writeCoverErr(w http.ResponseWriter, ns string, err error) {
 	case errors.Is(err, errNotReached), errors.Is(err, errPurgedNS), errors.Is(err, errMoving):
 		writeBehind(w, "the index has not reached the namespace's checkpoint yet")
 	default:
-		ix.writeUpstreamErr(w, "visibility in "+ns, err, "cannot read a namespace visibility reads (§B.11.9)")
+		ix.writeUpstreamErr(w, "visibility in "+ns, err, "cannot read a namespace visibility reads (§7.9)")
 	}
 }
 
 // upstreamBehind reports whether err, a failure to read upstream what
 // answering needs, is one for now, answered 503 behind with msg, rather
-// than 502 upstream (writeUpstreamErr, worseUpstream): a requireAt chain
-// unreadable for a transient cause, a namespace visibility reads not
-// followed yet, the core's root or a sealed namespace's keys that can't
-// be fetched for now.
+// than 502 upstream (writeUpstreamErr, worseUpstream): the core's root
+// or a sealed namespace's keys that can't be fetched for now.
 func upstreamBehind(err error) (msg string, behind bool) {
-	if transient, ok := chainErr(err); ok {
-		return msgChainBehind, transient
-	}
-	if errors.Is(err, errMemberBehind) {
-		// A namespace visibility reads not followed yet (members.go).
-		return msgMemberBehind, true
-	}
 	if errors.Is(err, errExchangeBehind) {
 		return "the index has not reached a change to a key or role the grant reads through: exchange it again (§A.4)", true
 	}
@@ -1040,7 +981,7 @@ func upstreamBehind(err error) (msg string, behind bool) {
 
 // writeUpstreamErr answers err, a failure to read upstream what answering
 // needs, 502 upstream with msg, or msgGrantLacks where the index's own
-// grant can't read a namespace that decides §B.11.9 coverage
+// grant can't read a namespace that decides §7.9 coverage
 // (errGrantLacks); the log names it. A failure to fetch the key that opens
 // a sealed namespace's documents (client.ErrKeyFetch) that leaves the
 // service lacking it as configured (lacksKey: a 4xx from /keys other than
@@ -1048,21 +989,12 @@ func upstreamBehind(err error) (msg string, behind bool) {
 // lacks the keys"), and one for now (a 5xx, a 408, a 429, the core
 // unreachable) is 503
 // behind, with Retry-After (scenario 100: "While those keys only can't
-// yet be fetched → 503 behind", §12.1), as is a namespace visibility reads
-// whose follower holds no checkpoint yet (errMemberBehind, members.go),
-// whose name only the log gives (msgMemberBehind). A requireAt chain the
-// verifier can't read (chainErr) is 503 behind while the cause is
-// transient, else 502 upstream, each with a fixed message naming no
-// namespace (§C.4). Every read check and view this service answers 502
+// yet be fetched → 503 behind", §12.1). Every read check and view this service answers 502
 // for passes through here, so each gets the same answer.
 func (ix *Index) writeUpstreamErr(w http.ResponseWriter, what string, err error, msg string) {
 	ix.opt.Logf("index: %s: %v", what, err)
 	if msg, behind := upstreamBehind(err); behind {
 		writeBehind(w, msg)
-		return
-	}
-	if _, ok := chainErr(err); ok {
-		writeErr(w, http.StatusBadGateway, "upstream", msgChainUpstream)
 		return
 	}
 	var gl *errGrantLacks
@@ -1161,7 +1093,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		keys[epoch] = k
 		return k, false, nil
 	}
-	var allow func(string) bool
+	var allow allowFunc
 	if !a.all {
 		allow = a.allow
 	}
@@ -1192,19 +1124,13 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	if err != nil {
 		return derived.Stored{}, "", err
 	}
-	// A partial reader where §B.11.9 covers ns: the view must be at the
+	// A partial reader where §7.9 covers ns: the view must be at the
 	// checkpoint the read transaction held (an apply may have committed
 	// since it was computed), and the answer is at its combined at.
 	var cp *fcp
 	for try := 0; a.cov != nil; try++ {
 		if at == a.cov.cp.ids[ns] {
 			cp, at = a.cov.cp, a.cov.cp.at
-			if g := cp.gens; g != nil {
-				// The view read other namespaces before gen was taken
-				// (serve's cover): kept only if no purge since carried
-				// its tags (fcp.gens).
-				gen, sgen = min(gen, g.kept), min(sgen, g.sealed)
-			}
 			break
 		}
 		if try == 2 {
@@ -1490,7 +1416,7 @@ func resultTags(ns string, res *Result, cp *fcp) string {
 // holds, and returns the result with that checkpoint. Its paths are judged
 // by the schemas of the namespace's documents there that the reader may
 // see (allow, nil for all).
-func (ix *Index) query(ctx context.Context, ns string, q *Query, allow func(string) bool) (*Result, string, error) {
+func (ix *Index) query(ctx context.Context, ns string, q *Query, allow allowFunc) (*Result, string, error) {
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, "", err
@@ -1531,7 +1457,7 @@ func (ix *Index) committed(ctx context.Context, ns string) (string, bool, error)
 // keeps results for, which redirects to the current checkpoint anyway
 // (§A.4), and a redirect to it would not be answered (bounded redirects).
 //
-// A partial reader's at where §B.11.9 covers ns is a combined checkpoint:
+// A partial reader's at where §7.9 covers ns is a combined checkpoint:
 // its kept result lists what it covers as namespaces, as /_refs' answers
 // do (refsIncludes).
 func (ix *Index) atIncludes(ctx context.Context, a *access, ns, at string, mins []MinRef, url string) bool {
@@ -1564,7 +1490,7 @@ func (ix *Index) atIncludes(ctx context.Context, a *access, ns, at string, mins 
 
 // judgeMins judges the mins of a query of ns (a bare one names ns, and is
 // set to) before any is waited for (§A.5): this URL's checkpoint covers ns
-// alone, or, for a partial reader where §B.11.9 covers ns, the namespaces
+// alone, or, for a partial reader where §7.9 covers ns, the namespaces
 // its combined checkpoint covers (judgeMinsIn, §A.4), so a min naming any
 // other namespace is refused, whether the service follows it, the reader
 // may see it, it is purged or its keys can't be had, before any of that
@@ -1589,7 +1515,7 @@ func judgeMinsIn(ns string, mins []MinRef, covers func(string) bool) (refused []
 }
 
 // covers reports whether a's answers are at a combined checkpoint that
-// covers ns (§A.4, §B.11.9), a partial reader's of a covered namespace.
+// covers ns (§A.4, §7.9), a partial reader's of a covered namespace.
 func (a *access) covers(ns string) bool {
 	if a == nil || a.cov == nil {
 		return false
@@ -1622,7 +1548,7 @@ func (ix *Index) waitMins(ctx context.Context, mins []MinRef) bool {
 }
 
 // waitMember is waitMin for a namespace a combined checkpoint covers that
-// the index doesn't follow (§A.4, §B.11.9, filtered.go): it is taken at
+// the index doesn't follow (§A.4, §7.9, filtered.go): it is taken at
 // its head, so min is reached once the head is min or the core's log
 // places min before it (since=min is accepted only if min is in the chain
 // up to it, §7.1). The head is read again while waiting, and the grant
@@ -1743,33 +1669,6 @@ func writePurged(w http.ResponseWriter, head string) {
 func redirect(w http.ResponseWriter, loc string) {
 	w.Header().Set("Location", loc)
 	w.WriteHeader(http.StatusFound)
-}
-
-// oldForm reports whether the subject set and checkpoints of a URL of a
-// form before v0.51 are well formed, so that, with a valid namespace name,
-// the URL moved names nothing but them.
-func oldForm(gs string, ats ...string) bool {
-	if _, err := ids.Parse(gs); err != nil {
-		return false
-	}
-	for _, at := range ats {
-		if _, err := ids.Parse(at); err != nil {
-			return false
-		}
-	}
-	return true
-}
-
-// moved answers a URL of a form before v0.51 (§A.4) with a permanent
-// redirect to path, the same query kept: the redirect depends on the URL
-// alone, so it reveals nothing, and the URL it names checks the reader.
-func moved(w http.ResponseWriter, r *http.Request, path string) {
-	if r.URL.RawQuery != "" {
-		path += "?" + r.URL.RawQuery
-	}
-	w.Header().Set("Cache-Control", "public, max-age=86400")
-	w.Header().Set("Location", path)
-	w.WriteHeader(http.StatusMovedPermanently)
 }
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {

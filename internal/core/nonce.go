@@ -11,9 +11,7 @@ import (
 // whatever the patch set's origin (fast-forwards and imports included).
 // Deletes, and config, branch and prune writes, are exempt. A branch
 // copies the setting and can't turn it off, a base can't start requiring
-// nonces while a dependent doesn't (§7.4), and a remote branch of a base
-// whose current document requires them must be created requiring them
-// (§G.3).
+// nonces while a dependent doesn't (§7.4).
 
 // checkRequiredNonces is the check of gate step 3 (§6.2) for an item of a
 // namespace that requires nonces: each create, append or restore must
@@ -42,8 +40,7 @@ func checkRequiredNonces(s *itemState) *Error {
 // nil for a branch being created, which copies the setting; a branch made
 // before its base set it never had it on, so leaving it off turns nothing
 // off. base is the branch's base, nil for a namespace that isn't a branch.
-// A remote branch's shadow holds what its base required when the branch
-// was created (insertShadow). The refusal is 422 invalid with errors
+// The refusal is 422 invalid with errors
 // pointing at /nonce, as for the other branch fields (§7.4).
 func (t *tx) checkNonceBase(cur, cfg *Config, base *nsRow) *Error {
 	if base != nil && !cfg.NonceRequired && (cur == nil || cur.NonceRequired) && t.config(base.configSeq).NonceRequired {
@@ -80,22 +77,4 @@ func (t *tx) nonceDependents(n *nsRow) []string {
 		}
 	}
 	return out
-}
-
-// requireNonces turns on the nonce requirement of a schema namespace that
-// mirrorSchemas created for a remote branch, whose source requires nonces:
-// it starts optional, since its history keeps its ids, and takes the
-// setting with a config write once that history is in, so later writes
-// there stay exportable (§C.7, §G.3). author is the creating operator, as
-// for the namespace's other entries.
-func (t *tx) requireNonces(n *nsRow, author int64) {
-	cur := t.config(n.configSeq)
-	if cur.level == levelE2E {
-		return // not allowed there (§C.7)
-	}
-	cc := &ConfigChange{IfMatch: t.configID(n.configSeq).String(), Patches: []any{map[string]any{"op": "add", "path": "/nonce", "value": "required"}}}
-	p, err := t.planConfig(n, cur, &actor{star: true}, cc, false)
-	t.must(err)
-	seq := t.insertConfig(n, p, author)
-	t.appendNS(n, map[string]any{"kind": "config", "target": p.id.String()}, nil, &seq, seq, author)
 }

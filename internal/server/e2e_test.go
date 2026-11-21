@@ -410,8 +410,8 @@ func TestE2EPruneRetention(t *testing.T) {
 	g0 := etagOf(g.writeRaw("e", "p", "", sealed(t, gk, "e#1", "e", "p", "", addRoot(map[string]any{"n": 0.0})), g.writerG))
 	g1 := etagOf(g.writeRaw("e", "p", g0, sealed(t, gk, "e#1", "e", "p", g0, ops(op("replace", "/n", 1.0))), g.writerG))
 	g.clock.Advance(10 * time.Minute)
-	gs, _ := seal.SealSnapshot(gk, "e#1", "e", "p", g1, map[string]any{"n": 1.0})
-	expectCode(t, g.prune("e", "p", map[string]any{"horizon": g1, "snapshot": gs}, g.adminG), 422, "invalid")
+	vid, _ := seal.SealSnapshot(gk, "e#1", "e", "p", g1, map[string]any{"n": 1.0})
+	expectCode(t, g.prune("e", "p", map[string]any{"horizon": g1, "snapshot": vid}, g.adminG), 422, "invalid")
 }
 
 func TestE2EEpochsBranchesLevels(t *testing.T) {
@@ -493,9 +493,4 @@ func TestE2EEpochsBranchesLevels(t *testing.T) {
 	plG := e.grant(f.admin, "user:admin", []string{"pl"}, allVerbs)
 	expectCode(t, e.branch("pl", map[string]any{"name": "plb", "patches": ops(op("add", "/encryption", map[string]any{"level": "e2e"}))}, plG), 422, "invalid")
 	expectCode(t, e.patchNS("e", ops(op("replace", "/encryption", map[string]any{"level": "sealed", "epoch": 2.0})), f.adminG), 422, "invalid")
-
-	// Remote branches of an e2e namespace may register; B keeps them e2e
-	// (§G.5.2, remote_enc_test.go).
-	exp := e.grant(f.admin, "user:admin", []string{"e"}, []string{"read", "export"})
-	expect(t, e.register("e", "rel", e.nsHead("e", exp), "", exp), 201)
 }

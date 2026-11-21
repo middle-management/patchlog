@@ -11,19 +11,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/index"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // V82-05 (v0.82), SVC-10: an index cookie ends on any change to the entry
 // of the key that verified its grant, or to a role it read through,
-// reads:{ns} markers included (SERVICES §A.4 gs, §B.11.9 gs; CONFORMANCE
+// reads:{ns} markers included (SERVICES §A.4 view, §7.9 view; CONFORMANCE
 // scenario 120).
 
 // newV82Whole is newV77Docs's setup with keys k1 and k2 that have no
@@ -47,17 +45,23 @@ func newV82Whole(t *testing.T) *v77docs {
 	d.x = startSvcWith(t, s.Client(t, client.WithBearer(d.admin.Grant(t, s.Now(), "svc:indexer", []string{"docs"}, []string{"read"}))),
 		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"docs"}, untyped: true, now: s.Now},
 		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate, ev
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate, ev
 		})
 	d.x.caughtUp("docs")
 	return d
 }
 
-// readsGS is the gs of a reader of private ns whole through key k: the
-// subject set of its one marker, reads:{ns}:{k}, k's key: string by kid
-// and pub (§A.4 gs, v0.85).
-func readsGS(ns string, k clienttest.Key) string {
-	return grantcheck.SubjectSetID([]string{"reads:" + ns + ":" + catvis.KeySubject(k.Kid, k.Pub)})
+// readsView is the view of a reader of private ns whole through key k: the
+// view of its one marker, reads:{ns}:{k}, k's key: string by kid
+// and pub (§A.4 view, v0.85).
+func readsView(ns string, k clienttest.Key) string {
+	return grantcheck.ViewID([]string{grantcheck.KeySubject(k.Kid, k.Pub)})
+}
+
+// readsRefsView is the /_refs view of a reader of ns whole through k
+// alone, over its marker there.
+func readsRefsView(ns string, k clienttest.Key) string {
+	return grantcheck.ViewID([]string{"reads:" + ns + ":" + grantcheck.KeySubject(k.Kid, k.Pub)})
 }
 
 // v82Grant is k's grant for sub with the role reader, expiring exp from
@@ -93,14 +97,14 @@ const (
 	v82Refuse = "Forbidden,Forbidden"
 )
 
-// TestV082ReadsCookieEndsOnKeyChange (SVC-10; §A.4 gs: a cookie is 403
-// "where a marker's key, rules or roles would end a gs cookie (§B.11.9
-// gs), its key being the one that verified the grant in {ns}, reads:{ns}
-// markers included"; §B.11.9 gs: "gone or changes in any member";
+// TestV082ReadsCookieEndsOnKeyChange (SVC-10; §A.4 view: a cookie is 403
+// "where a marker's key, rules or roles would end a view cookie (§7.9
+// view), its key being the one that verified the grant in {ns}, reads:{ns}
+// markers included"; §7.9 view: "gone or changes in any member";
 // scenario 120): li reads docs whole through k1, so her cookie's marker is
 // reads:docs. Once docs changes any member of k1 (its groups scope, its
 // sub scope, its maxTtl, its pub), removes it, or changes the role she
-// read through, her cookie is 403 at /docs/g/{gs}, at the at URL it was
+// read through, her cookie is 403 at /docs/view/{view}, at the at URL it was
 // answered at, and at /_refs, until she exchanges again; a change to
 // another key or role leaves it read. Before v0.82 a reads:{ns} cookie
 // was never checked and read the namespace whole until it expired.
@@ -175,8 +179,8 @@ func TestV082ReadsCookieEndsOnKeyChange(t *testing.T) {
 func TestV082CookieWithoutEntry(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct{ name, q string }{
-		{"no entry", `UPDATE edge_gs_keys SET entry = ''`},
-		{"no row", `DELETE FROM edge_gs_keys`},
+		{"no entry", `UPDATE edge_view_keys SET entry = ''`},
+		{"no row", `DELETE FROM edge_view_keys`},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -188,7 +192,7 @@ func TestV082CookieWithoutEntry(t *testing.T) {
 				t.Fatalf("under the cookie: %s", got)
 			}
 			if n := must(d.x.ix.ExecForTest(context.Background(), c.q)); n == 0 {
-				t.Fatal("no edge_gs_keys row for a reads:docs marker")
+				t.Fatal("no edge_view_keys row for a reads:docs marker")
 			}
 			if got := v82Status(t, d.x, paths, cookies); got != v82Refuse {
 				t.Errorf("under a cookie recorded without its key's entry: %s, want 403", got)
@@ -201,9 +205,9 @@ func TestV082CookieWithoutEntry(t *testing.T) {
 	}
 }
 
-// TestV082CookieWindowOtherReaders (SVC-10; §A.4 gs, v0.85, scenario 76:
+// TestV082CookieWindowOtherReaders (SVC-10; §A.4 view, v0.85, scenario 76:
 // "Two readers of private docs with namespace-wide read, through keys k1
-// and k2 → GET /_refs → different gs, as their markers are
+// and k2 → GET /_refs → different view, as their markers are
 // reads:docs:{k}. k1's groups scope changes → only the k1 reader's cookie
 // is 403, until she exchanges again; another reader's exchange through
 // k1 doesn't revive it"). Readers of docs whole through one key share the
@@ -212,7 +216,7 @@ func TestV082CookieWithoutEntry(t *testing.T) {
 // keeps the keys per marker and exp, and gives a cookie through a key
 // whose entry has changed another exp:
 //
-//   - al and bo read through k1, cy and di through k2: two gs, each
+//   - al and bo read through k1, cy and di through k2: two view, each
 //     pair's prefixes the same, whatever its grants' exps;
 //   - once k1's sub scope changes, al's and bo's cookies are 403; cy's
 //     and di's, through k2, still read;
@@ -223,7 +227,7 @@ func TestV082CookieWithoutEntry(t *testing.T) {
 //     another: the one she held stays 403.
 //
 // Before v0.85 the marker was reads:docs for every key, and all four
-// shared one gs.
+// shared one view.
 func TestV082CookieWindowOtherReaders(t *testing.T) {
 	t.Parallel()
 	d := newV82Whole(t)
@@ -238,8 +242,7 @@ func TestV082CookieWindowOtherReaders(t *testing.T) {
 	p2, cyC := d.exchange(cy)
 	pDi, diC := d.exchange(di)
 	for ns, k := range map[string]clienttest.Key{"docs": d.k1, "_refs": d.k1} {
-		gs := readsGS("docs", k)
-		if want := map[string]string{"docs": "/docs/g/" + gs, "_refs": "/_refs/g/" + gs}[ns]; p1[ns] != want || pBo[ns] != want {
+		if want := map[string]string{"docs": "/docs/view/" + readsView("docs", k), "_refs": "/_refs/view/" + readsRefsView("docs", k)}[ns]; p1[ns] != want || pBo[ns] != want {
 			t.Fatalf("al's and bo's %s prefixes, through k1: %s, %s, want %s", ns, p1[ns], pBo[ns], want)
 		}
 	}
@@ -296,7 +299,7 @@ func TestV082CookieWindowOtherReaders(t *testing.T) {
 	}
 }
 
-// TestV082ExchangeTwoKeysOneMarker (SVC-10; §A.4 gs, v0.85): one exchange
+// TestV082ExchangeTwoKeysOneMarker (SVC-10; §A.4 view, v0.85): one exchange
 // with two grants, through k1 and k2, gives each key's marker its own
 // prefixes and cookies: a change to one key ends its cookies alone.
 // Before v0.85 both shared reads:docs and one cookie, which either
@@ -315,8 +318,7 @@ func TestV082ExchangeTwoKeysOneMarker(t *testing.T) {
 			}
 			var paths [2][]string
 			for j, k := range []clienttest.Key{d.k1, d.k2} {
-				gs := readsGS("docs", k)
-				paths[j] = v82Paths(map[string]string{"docs": "/docs/g/" + gs, "_refs": "/_refs/g/" + gs})
+				paths[j] = v82Paths(map[string]string{"docs": "/docs/view/" + readsView("docs", k), "_refs": "/_refs/view/" + readsRefsView("docs", k)})
 				if got := v82Status(t, d.x, paths[j], r.cookies); got != v82Reads {
 					t.Fatalf("under k%d's cookies: %s", j+1, got)
 				}
@@ -332,7 +334,7 @@ func TestV082ExchangeTwoKeysOneMarker(t *testing.T) {
 	}
 }
 
-// TestV082ScopeCookieEndsOnAnyMember (SVC-10; §B.11.9 gs, v0.82: "or a
+// TestV082ScopeCookieEndsOnAnyMember (SVC-10; §7.9 view, v0.82: "or a
 // key or role they came from, is gone or changes in any member"): li's
 // cookie for a scope marker, through k1 with the role reader, is 403 once
 // docs changes a member of k1 that its scope digest doesn't read (its sub
@@ -354,7 +356,7 @@ func TestV082ScopeCookieEndsOnAnyMember(t *testing.T) {
 			d := newV77Docs(t)
 			li := d.reader(d.k1)
 			prefixes, cookies := d.exchange(li)
-			if !strings.HasPrefix(prefixes["docs"], "/docs/g/") {
+			if !strings.HasPrefix(prefixes["docs"], "/docs/view/") {
 				t.Fatalf("prefixes %v", prefixes)
 			}
 			paths := v82Paths(prefixes)
@@ -376,9 +378,9 @@ func TestV082ScopeCookieEndsOnAnyMember(t *testing.T) {
 	}
 }
 
-// TestV082GCookieEndsOnAnyMember (SVC-10; §B.11.9 gs, v0.82): a partial
-// reader's cookie for reads:matches:g:{gs}, through catalog-01 with the
-// role reader, is 403 once matches changes catalog-01's maxTtl, which no
+// TestV082GCookieEndsOnAnyMember (SVC-10; §7.9 view, v0.82): a partial
+// reader's cookie for reads:matches:g:{view}, through reader-01 with the
+// role reader, is 403 once matches changes reader-01's maxTtl, which no
 // scope digest reads, or gives reader another verb, judged by matches's
 // document at the checkpoint, until the reader exchanges again.
 func TestV082GCookieEndsOnAnyMember(t *testing.T) {
@@ -387,7 +389,7 @@ func TestV082GCookieEndsOnAnyMember(t *testing.T) {
 		name string
 		op   map[string]any
 	}{
-		{"catalog-01's maxTtl", map[string]any{"op": "replace", "path": "/keys/1/maxTtl", "value": "PT20M"}},
+		{"reader-01's maxTtl", map[string]any{"op": "replace", "path": "/keys/1/maxTtl", "value": "PT20M"}},
 		{"reader gains a verb", map[string]any{"op": "replace", "path": "/roles/reader/can", "value": []any{"read", "append"}}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -455,7 +457,7 @@ func TestV082BranchCookieFollowsBaseKey(t *testing.T) {
 	x := startSvcWith(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", both, []string{"read"}))),
 		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"docs"}, untyped: true, branches: true, now: s.Now},
 		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate
+			o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate
 		})
 	x.caughtUp("docs")
 	x.caughtUp("docs-b")
@@ -496,7 +498,7 @@ func TestV082BranchCookieFollowsBaseKey(t *testing.T) {
 	}
 }
 
-// TestV082StarKeyCookie (SVC-10; §A.4 gs): a whole reader through a key
+// TestV082StarKeyCookie (SVC-10; §A.4 view): a whole reader through a key
 // that grants every verb ("*") reads under her reads:docs cookie, whose
 // key is recorded as any other's; it is 403 once that key changes in any
 // member, until she exchanges again.

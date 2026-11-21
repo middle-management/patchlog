@@ -49,7 +49,7 @@ func countDepth(t *testing.T, depth int, path depthPath) depthCounts {
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
 	opt := Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, Limits: lim, Purger: discardPurger{},
-		RetentionInterval: -1, BlobSweepInterval: -1, RepurgeInterval: -1, Remote: RemoteOptions{FollowInterval: -1}}
+		RetentionInterval: -1, BlobSweepInterval: -1, RepurgeInterval: -1}
 	if path.optimistic {
 		opt.LockedCheckBytes = -1
 	}

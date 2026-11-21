@@ -27,7 +27,7 @@ func TestV082XGatewayAtATombstone(t *testing.T) {
 	var mu sync.Mutex
 	asked := map[string]int{} // GETs of /rev/{id} the core answered, by status
 	var tomb string
-	e := newEnv(t, []string{"docs"}, nil, nil, func(c *clienttest.Options, _ *dav.Options) {
+	e := newEnv(t, []string{"docs"}, nil, func(c *clienttest.Options, _ *dav.Options) {
 		c.Wrap = func(h http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				mu.Lock()
@@ -45,6 +45,7 @@ func TestV082XGatewayAtATombstone(t *testing.T) {
 			})
 		}
 	})
+
 	P := e.create("docs", "x", map[string]any{"a": "1"})
 	if tag := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").header.Get("ETag"); tag != `"`+P+`"` {
 		t.Fatalf("x's ETag %s, want P %s", tag, P)

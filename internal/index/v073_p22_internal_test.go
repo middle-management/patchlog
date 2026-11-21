@@ -31,7 +31,7 @@ func TestV073StrictMins(t *testing.T) {
 
 // TestV073DropWholePublic (ENC-33, §E.2.6): opening the index drops the
 // stored results sealed whole at a public URL, as before v0.73, with their
-// tags, and keeps every other: a whole JWE at a private one (/g/{gs}, a
+// tags, and keeps every other: a whole JWE at a private one (/view/{view}, a
 // namespace named g included), a public URL's JSON, /_refs answers.
 func TestV073DropWholePublic(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "s.db")
@@ -45,9 +45,9 @@ func TestV073DropWholePublic(t *testing.T) {
 		{"/ps/at/" + id + "?q=x", "ps", false, false},
 		{"/g/at/" + id + "?q=x", "g", false, false},
 		{"/ps/at/" + id + "?q=y", "ps", true, true},
-		{"/ps/g/" + id + "/at/" + id + "?q=x", "ps", false, true},
-		{"/g/g/" + id + "/at/" + id + "?q=x", "g", false, true},
-		{"/_refs/g/" + id + "/at/" + id + "?to=x", "/_refs/g/" + id, true, true},
+		{"/ps/view/" + id + "/at/" + id + "?q=x", "ps", false, true},
+		{"/g/view/" + id + "/at/" + id + "?q=x", "g", false, true},
+		{"/_refs/view/" + id + "/at/" + id + "?to=x", "/_refs/view/" + id, true, true},
 	}
 	for _, r := range rows {
 		if _, err := ix.sealed.Put(ctx, r.view, r.scope, id, derived.Stored{Body: []byte("b"), JSON: r.json, Tags: "idx:" + r.scope}); err != nil {

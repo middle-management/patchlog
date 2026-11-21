@@ -11,7 +11,7 @@ import (
 )
 
 // V81-02 (v0.78, v0.81): a rule referring to /now never passes for a
-// read (§C.2 item 5); filtered reads cover no branch (§B.11.9 Where); the
+// read (§C.2 item 5); filtered reads cover no branch (§7.9 Where); the
 // first namespace entry's prev is "" (§7.4).
 
 // v081NowEnv is a private namespace dl with a * key k and a key dk whose
@@ -62,9 +62,9 @@ func TestV081AccessNowDeadline(t *testing.T) {
 
 // Grant scope 2 (§C.2 item 5, §2.1): roles B (an office-hours rule on
 // /now, no /resource rule) and A (not /resource = "secret"), in hours or
-// out: the namespace log is 403. B never counts for read, and A's
-// /resource rule keeps it from counting where unrestricted read is needed.
-// A alone still reads x.
+// out: B never counts for read, and A's /resource rule keeps it from
+// counting where unrestricted read is needed: the namespace log redirects
+// to the partial reader's filtered form (§7.9). A alone still reads x.
 func TestV081AccessNowOfficeHoursRole(t *testing.T) {
 	t.Parallel()
 	e := newAuthEnv(t)
@@ -85,8 +85,9 @@ func TestV081AccessNowOfficeHoursRole(t *testing.T) {
 	onlyB := e.grant(rk, "user:r", []string{"oh"}, []string{"read"}, map[string]any{"roles": []any{"B"}, "exp": day})
 	for _, at := range []time.Duration{0, 3 * time.Hour} {
 		e.clock.Advance(at)
-		expect(t, e.get("/ns/oh/log", both), 403)
-		expect(t, e.get("/ns/oh/rev/"+e.nsHead("oh", admin)+"/heads", both), 403)
+		// A partial reader through A (§7.9): redirected to its view.
+		expect(t, e.get("/ns/oh/log", both), 302)
+		expect(t, e.get("/ns/oh/rev/"+e.nsHead("oh", admin)+"/heads", both), 302)
 		expect(t, e.get("/r/oh/x", onlyB), 404)
 		expect(t, e.get("/r/oh/x", both), 302)
 	}
@@ -198,7 +199,7 @@ func TestV081AccessNowKeysE3Public(t *testing.T) {
 	}
 }
 
-// §C.2 item 5, §B.11.9 Partial reader (ACCESS-2): a grant with a block
+// §C.2 item 5, §7.9 Partial reader (ACCESS-2): a grant with a block
 // rule on /now is no partial reader. At an unfiltered URL of covered
 // matches it is 403 at once, never a 302 to a filtered URL; and on a
 // purged matches its gestures listing is 403, not the 410 of a read that
@@ -223,10 +224,10 @@ func TestV081AccessNowNoPartialReader(t *testing.T) {
 	expectCode(t, w.get("/ns/matches/gestures/"+gA, w.li()), 410, "purged")
 }
 
-// TDA 63 (§B.11.9 Where, §C.5.2; v0.78): li's grant names matches-r7, a
+// TDA 63 (§7.9 Where, §C.5.2; v0.78): li's grant names matches-r7, a
 // branch of covered matches: its filtered URLs are 403, and 401 with
 // neither a grant nor a cookie; POST /edge-grants naming only matches-r7
-// is 403 with no /ns/matches-r7/g/ prefix. An unrestricted reader of
+// is 403 with no /ns/matches-r7/view/ prefix. An unrestricted reader of
 // matches-r7 reads final, unfiltered.
 func TestV081AccessBranchUncovered(t *testing.T) {
 	t.Parallel()
@@ -235,11 +236,11 @@ func TestV081AccessBranchUncovered(t *testing.T) {
 	expect(t, w.do(req{method: "POST", path: "/ns/matches/branches", ifNoneMatch: "*", bearer: w.admin,
 		body: map[string]any{"name": "matches-r7", "at": w.nsHead("matches", w.admin), "patches": []any{}}}), 201)
 	w.put("matches-r7", "final", map[string]any{"title": "final"})
-	gs, at := w.filtered(w.li())
+	vid, at := w.filtered(w.li())
 	li := w.grant(w.cat, "user:li", []string{"matches-r7"}, []string{"read"}, map[string]any{"groups": []any{"editors", "interns"},
-		"roles": []any{"reader"}, "at": map[string]any{"ns": "cat-season", "id": w.nsHead("cat-season", w.admin)},
-		"exp": w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)})
-	base := "/ns/matches-r7/g/" + gs
+		"roles": []any{"reader"},
+		"exp":   w.clock.Now().Add(10 * time.Minute).Format(time.RFC3339)})
+	base := "/ns/matches-r7/view/" + vid
 	for _, path := range []string{base + "/heads", base + "/at/" + at + "/heads", base + "/at/" + at + "/log"} {
 		expect(t, w.get(path, li), 403)
 		expect(t, w.get(path), 401)
@@ -248,7 +249,7 @@ func TestV081AccessBranchUncovered(t *testing.T) {
 	r := w.do(req{method: "POST", path: "/edge-grants", bearer: li})
 	expect(t, r, 403)
 	for _, c := range r.H.Values("Set-Cookie") {
-		if strings.Contains(c, "/ns/matches-r7/g/") {
+		if strings.Contains(c, "/ns/matches-r7/view/") {
 			t.Fatalf("a g cookie: %s", c)
 		}
 	}
@@ -282,8 +283,8 @@ func TestV081AccessFirstPrev(t *testing.T) {
 		t.Fatalf("second entry's prev %v, want %v", m2["prev"], m["id"])
 	}
 	li := w.li()
-	gs, at := w.filtered(li)
-	fm := first(w.get("/ns/matches/g/"+gs+"/at/"+at+"/log", li))
+	vid, at := w.filtered(li)
+	fm := first(w.get("/ns/matches/view/"+vid+"/at/"+at+"/log", li))
 	if p, ok := fm["prev"]; !ok || p != "" {
 		t.Fatalf("first filtered entry %v: prev %v %v, want \"\"", fm, p, ok)
 	}

@@ -6,16 +6,75 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/files"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schemaimport"
 )
 
-// schemaCmd is patchlog schema import.
+// schemaCmd is patchlog schema import and patchlog schema file.
 type schemaCmd struct {
 	Import *schemaImportCmd `arg:"subcommand:import" help:"import external JSON Schemas into a namespace as schema resources"`
+	File   *schemaFileCmd   `arg:"subcommand:file" help:"print the file schema of file trees (TOOLS §H.2), or create it in the deployment"`
+}
+
+// schemaFileCmd prints the file schema of file trees (TOOLS §H.2: a file
+// or folder is { $schema, folder, name, content? }, /folder and /name
+// facets, /name a sort key), or, with --create, writes it at --resource,
+// where gateways and the index look for it (§H.3).
+type schemaFileCmd struct {
+	toolArgs
+	Create   bool   `arg:"--create" help:"create it at --resource (or set it there, where another document is), rather than print it"`
+	Resource string `arg:"--resource" default:"/r/schemas/file" placeholder:"/r/NS/NAME" help:"where the file schema is kept (patchlog dav --file-schema)"`
+}
+
+func (a *schemaFileCmd) run(string) { runClient(a) }
+
+func (a *schemaFileCmd) exec(ctx context.Context, out, errw io.Writer) error {
+	if !a.Create {
+		_, err := out.Write(files.SchemaJSON())
+		return err
+	}
+	ns, name, err := resourceArg(strings.TrimPrefix(a.Resource, "/r/"))
+	if err != nil {
+		return fmt.Errorf("--resource: %w", err)
+	}
+	c := a.writer()
+	sch := files.Schema()
+	h, err := c.Head(ctx, ns, name)
+	if err != nil {
+		return err
+	}
+	var id string
+	switch h.State {
+	case client.NotFound:
+		res, err := c.CreateDoc(ctx, ns, name, sch)
+		if err != nil {
+			return err
+		}
+		id = res.ID
+	case client.Live:
+		d, err := c.Doc(ctx, ns, name, h.ID)
+		if err != nil {
+			return err
+		}
+		id = h.ID
+		if !jsonv.Equal(d.Value, sch) {
+			res, err := c.Append(ctx, ns, name, h.ID, []any{map[string]any{"op": "replace", "path": "", "value": sch}})
+			if err != nil {
+				return err
+			}
+			id = res.ID
+		}
+	default:
+		return fmt.Errorf("%s/%s is %s: it can't hold the file schema", ns, name, h.State)
+	}
+	fmt.Fprintf(out, "/r/%s/%s/rev/%s\n", ns, name, id)
+	return nil
 }
 
 // schemaImportCmd imports external JSON Schemas into a namespace as schema

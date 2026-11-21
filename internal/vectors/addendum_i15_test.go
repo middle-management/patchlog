@@ -127,11 +127,14 @@ func sha256Hex(b []byte) string {
 // I.15 (TOOLS §F.9): plan digests. The release path is the release
 // document's revision, its genesis id computed as the client computes a
 // write's (§3.3). Plan 1 goes through merge.PlanObject, as a release's
-// digest is built, and merge.PlanDigest. Plan 2's batches carry config,
-// which no release batch of the reference does (PlanObject builds none,
-// questions Q30): its items go through PlanObject, the second batch's
-// precondition on the first batch's result included, and the config
-// members are added by hand. The fresh-nonce stripping (merge's
+// digest is built (one content batch, step 2), and merge.PlanDigest. Plan
+// 2 is two batches into one namespace from one branch, both with source,
+// as a branch holding schemas and content merges in steps 1 and 2 (v0.87,
+// the vector unchanged since v0.86). Its batches carry config, which no
+// release batch of the reference does (PlanObject builds none, questions
+// Q30): its items go through PlanObject, the second batch's precondition
+// on the first batch's result included, and the config members are added
+// by hand. The fresh-nonce stripping (merge's
 // digestSteps) is unexported and not reachable from here; the spec's
 // account of which ops it strips is checked through PlanDigest instead:
 // keeping them gives the digest the spec calls wrong.
@@ -145,7 +148,7 @@ func TestI15PlanDigests(t *testing.T) {
 	}
 	release := "/r/releases/release-7/rev/" + gen
 
-	st := &merge.ReleaseStep{Step: 3, Key: "matches", Resources: []string{"derby"}}
+	st := &merge.ReleaseStep{Step: merge.StepContent, Key: "matches", Resources: []string{"derby"}}
 	plan, err := merge.PlanObject(release, []*merge.ReleaseBranch{{Key: "matches", NS: "matches-r7", Target: "matches", At: nsID2}},
 		[]*merge.ReleaseStep{st}, map[*merge.ReleaseStep][]any{st: {
 			map[string]any{"resource": "derby", "ifMatch": idG, "steps": []any{ops(patches2)}},
@@ -170,15 +173,15 @@ func TestI15PlanDigests(t *testing.T) {
 			derby1 = ops(p.Restore)
 		}
 		b := &merge.ReleaseBranch{Key: "cat", NS: "cat-season-r7", Target: "cat-season", At: "1vmctae4vewju6nvxi374rkrkmyzpdrif"}
-		s2 := &merge.ReleaseStep{Step: 2, Key: "cat", Resources: []string{"derby", "final"}}
-		s4 := &merge.ReleaseStep{Step: 4, Key: "cat", Resources: []string{"derby", "semi"}}
+		s2 := &merge.ReleaseStep{Step: merge.StepSchemas, Key: "cat", Resources: []string{"derby", "final"}}
+		s4 := &merge.ReleaseStep{Step: merge.StepContent, Key: "cat", Resources: []string{"derby", "semi"}}
 		plan, err := merge.PlanObject(release, []*merge.ReleaseBranch{b}, []*merge.ReleaseStep{s2, s4}, map[*merge.ReleaseStep][]any{
 			s2: {
 				map[string]any{"resource": "derby", "ifMatch": idG, "steps": derby0},
 				map[string]any{"resource": "final", "ifNoneMatch": "*", "steps": []any{[]any{map[string]any{"op": "add", "path": "", "value": final}}}},
 			},
 			s4: {
-				map[string]any{"resource": "derby", "after": map[string]any{"step": 2.0, "key": "cat", "item": "derby"}, "steps": []any{derby1}},
+				map[string]any{"resource": "derby", "after": map[string]any{"step": float64(merge.StepSchemas), "key": "cat", "item": "derby"}, "steps": []any{derby1}},
 				map[string]any{"resource": "semi", "ifMatch": idC, "steps": []any{[]any{map[string]any{"op": "add", "path": "/$nonce", "value": "not-a-fresh-nonce"}}}},
 			},
 		})

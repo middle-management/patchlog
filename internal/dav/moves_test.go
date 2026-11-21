@@ -1,7 +1,6 @@
 package dav_test
 
 import (
-	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +19,7 @@ import (
 // required, every write carries a fresh one.
 func TestFlatMoves(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs", "other", "priv"}, nil, map[string]map[string]any{"priv": {"nonce": "required"}})
+	e := newEnv(t, []string{"docs", "other", "priv"}, map[string]map[string]any{"priv": {"nonce": "required"}})
 	e.create("docs", "a", map[string]any{"v": 1.0, "list": []any{"x"}})
 	nsBefore := must(e.c.NSHead(e.ctx, "docs")).ID
 	e.expect(e.do("MOVE", "/docs/a.json", "", "Destination", "/docs/c.json"), 201, "MOVE a JSON file")
@@ -94,7 +93,7 @@ func TestFlatMoves(t *testing.T) {
 // Nothing is written.
 func TestFlatMovesRefused(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	ra := e.create("docs", "arr", []any{1.0})
 	e.expect(e.do("MOVE", "/docs/arr.json", "", "Destination", "/docs/b.json"), 403, "an array")
 	rj := e.create("docs", "j", map[string]any{"v": 1.0})
@@ -131,7 +130,7 @@ func TestFlatMovesRefused(t *testing.T) {
 // the flat view.
 func TestMoveOntoExisting(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	r0 := e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/b", "theirs"))
@@ -187,7 +186,7 @@ func TestMoveOntoExisting(t *testing.T) {
 func TestAsideWindow(t *testing.T) {
 	t.Parallel()
 	c := newClock()
-	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.Now = c.now })
+	e := newEnv(t, []string{"docs"}, nil, func(_ *clienttest.Options, o *dav.Options) { o.Now = c.now })
 	e.create("docs", "x", map[string]any{"a": "1"})
 	body := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.expect(e.do("MOVE", "/docs/x.json", "", "Destination", "/docs/x.json~"), 201, "MOVE to backup")
@@ -198,132 +197,4 @@ func TestAsideWindow(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/x.json", edit(t, body, `"1"`, `"3"`), "If-None-Match", "*"), 412, "create-only PUT 31 s after")
 	_, doc := e.load("docs", "x")
 	sameJSON(t, doc, map[string]any{"a": "2"})
-}
-
-// A DELETE of a file, then a MOVE of another file onto its path (rclone's
-// mount without a cache saves through a temporary file so, and in a tree
-// or under a resource name the temporary file is a file of its own; sed
-// -i's is a scratch file since v0.56, §H.6): the write restores the
-// deleted file (§H.6), its placement and its item, or
-// its resource, rebased on its last live document, so it keeps its
-// history and others' edits; then the temporary file is deleted. One the
-// core refuses puts the deleted file back as it was.
-func TestDeleteThenMoveOnto(t *testing.T) {
-	t.Parallel()
-	e := treeDocsEnv(t)
-	buf := e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET").body
-	e.theirs("matches", "derby", map[string]any{"op": "add", "path": "/venue", "value": "theirs"})
-	e.expect(e.do("PUT", "/cat/Season/sedAb12Cd", edit(t, buf, `"Derby"`, `"Derby (sed)"`)), 201, "PUT the temporary file, sed -i's, a scratch file (§H.6)")
-	e.expect(e.do("DELETE", "/cat/Season/derby.json", ""), 204, "DELETE the original")
-	e.expect(e.do("MOVE", "/cat/Season/sedAb12Cd", "", "Destination", "/cat/Season/derby.json", "Overwrite", "F"), 201, "MOVE onto the name")
-	if h, _ := e.load("cat", "matches.derby"); h.State != client.Live {
-		t.Fatalf("the placement is %v", h.State)
-	}
-	_, doc := e.load("matches", "derby")
-	sameJSON(t, doc, map[string]any{"title": "Derby (sed)", "venue": "theirs"})
-	sameStrings(t, "Season", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
-
-	// A temporary file whose name isn't scratch is a file of the tree,
-	// its own placement and item: moved onto the path, it restores the
-	// deleted file the same way, and is deleted.
-	buf = e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET").body
-	e.theirs("matches", "derby", replace("/venue", "theirs again"))
-	e.expect(e.do("PUT", "/cat/Season/derby.tmp", edit(t, buf, `"Derby (sed)"`, `"Derby (tmp)"`)), 201, "PUT the temporary file, a file of the tree")
-	if h, _ := e.load("cat", "matches.derby"); h.State != client.Live {
-		t.Fatalf("the placement is %v", h.State)
-	}
-	e.expect(e.do("DELETE", "/cat/Season/derby.json", ""), 204, "DELETE the original")
-	e.expect(e.do("MOVE", "/cat/Season/derby.tmp", "", "Destination", "/cat/Season/derby.json", "Overwrite", "F"), 201, "MOVE onto the name")
-	if h, _ := e.load("cat", "matches.derby"); h.State != client.Live {
-		t.Fatalf("the placement is %v", h.State)
-	}
-	_, doc = e.load("matches", "derby")
-	sameJSON(t, doc, map[string]any{"title": "Derby (tmp)", "venue": "theirs again"})
-	sameStrings(t, "Season", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
-
-	// The flat view, a temporary file with a resource name.
-	e.create("docs", "cup", map[string]any{"title": "Cup", "n": "1"})
-	buf = e.expect(e.do("GET", "/docs/cup.json", ""), 200, "GET").body
-	e.theirs("docs", "cup", replace("/n", "theirs"))
-	e.expect(e.do("PUT", "/docs/cup.tmp.json", edit(t, buf, `"Cup"`, `"Cup (tmp)"`)), 201, "PUT the temporary file")
-	e.expect(e.do("DELETE", "/docs/cup.json", ""), 204, "DELETE the original")
-	e.expect(e.do("MOVE", "/docs/cup.tmp.json", "", "Destination", "/docs/cup.json", "Overwrite", "F"), 201, "MOVE onto the name")
-	_, doc = e.load("docs", "cup")
-	sameJSON(t, doc, map[string]any{"title": "Cup (tmp)", "n": "theirs"})
-	if h, _ := e.load("docs", "cup.tmp"); h.State != client.Tombstoned || h.Successor != "" {
-		t.Fatalf("cup.tmp: %+v", h)
-	}
-
-	// Refused (a conflict): the original is put back as it was.
-	e.create("docs", "lid", map[string]any{"title": "Lid"})
-	buf = e.expect(e.do("GET", "/docs/lid.json", ""), 200, "GET").body
-	e.theirs("docs", "lid", replace("/title", "theirs"))
-	e.expect(e.do("PUT", "/docs/lid.tmp.json", edit(t, buf, `"Lid"`, `"Lid (tmp)"`)), 201, "PUT the temporary file")
-	e.expect(e.do("DELETE", "/docs/lid.json", ""), 204, "DELETE the original")
-	r := e.expect(e.do("MOVE", "/docs/lid.tmp.json", "", "Destination", "/docs/lid.json", "Overwrite", "F"), 409, "MOVE of a conflicting version")
-	if !strings.Contains(r.body, "restored") {
-		t.Fatalf("409 %q", r.body)
-	}
-	now, doc := e.load("docs", "lid")
-	sameJSON(t, doc, map[string]any{"title": "theirs"})
-	if now.State != client.Live || len(must(e.c.Log(e.ctx, "docs", "lid", "", ""))) != 4 {
-		t.Fatalf("lid isn't restored as it was: %+v", now)
-	}
-	sameJSON(t, e.lastEntry("docs", "lid").Patches, []any{})
-	if h, _ := e.load("docs", "lid.tmp"); h.State != client.Live {
-		t.Fatalf("the temporary file is %v after the refused MOVE", h.State)
-	}
-}
-
-// A MOVE onto an existing file, or across trees or namespaces, deletes
-// only the revision of the source it copied (§H.5): someone else's edit of
-// the source made while the copy is written isn't tombstoned unseen; the
-// MOVE is a 409, the target holding the version moved and the source as
-// it is now.
-func TestMoveSourceChanged(t *testing.T) {
-	t.Parallel()
-	h := &hook{}
-	e := newEnv(t, []string{"docs", "other", "matches"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("matches")}}, withHook(h))
-	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
-	theirs := func(ns, name string) func() {
-		return func() { e.theirs(ns, name, map[string]any{"op": "add", "path": "/theirs", "value": "important"}) }
-	}
-	check := func(ns, name, what string) {
-		t.Helper()
-		hd, doc := e.load(ns, name)
-		if hd.State != client.Live || doc.(map[string]any)["theirs"] != "important" {
-			t.Fatalf("%s: the source %v %v", what, hd.State, doc)
-		}
-	}
-	e.create("docs", "a", map[string]any{"v": "a"})
-	e.create("docs", "b", map[string]any{"v": "b"})
-	h.set(at("PATCH", "/r/docs/b"), theirs("docs", "a"))
-	e.expect(e.do("MOVE", "/docs/a.json", "", "Destination", "/docs/b.json"), 409, "MOVE onto, the source edited meanwhile")
-	check("docs", "a", "onto")
-	_, b := e.load("docs", "b")
-	sameJSON(t, b, map[string]any{"v": "a"})
-
-	e.create("docs", "c", map[string]any{"v": "c"})
-	h.set(func(r *http.Request) bool {
-		return r.URL.Path == "/r/other/c" && r.Method != "GET" && r.Method != "HEAD"
-	}, theirs("docs", "c"))
-	e.expect(e.do("MOVE", "/docs/c.json", "", "Destination", "/other/c.json"), 409, "MOVE across, the source edited meanwhile")
-	check("docs", "c", "across")
-
-	e.create("matches", "derby", map[string]any{"title": "Derby"})
-	e.create("cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "root")})
-	e.create("matches", "cup", map[string]any{"title": "Cup"})
-	e.create("cat", "matches.cup", map[string]any{"title": "cup.json", "parents": parents("cat", "root")})
-	h.set(at("PATCH", "/r/matches/cup"), theirs("matches", "derby"))
-	e.expect(e.do("MOVE", "/cat/derby.json", "", "Destination", "/cat/cup.json"), 409, "a tree's MOVE onto, the source edited meanwhile")
-	check("matches", "derby", "a tree's onto")
-	if hn, _ := e.load("cat", "matches.derby"); hn.State != client.Live {
-		t.Fatalf("the source's placement %v", hn.State)
-	}
-	h.set(func(r *http.Request) bool {
-		return r.URL.Path == "/r/docs/d" && r.Method != "GET" && r.Method != "HEAD"
-	}, theirs("matches", "derby"))
-	e.expect(e.do("MOVE", "/cat/derby.json", "", "Destination", "/docs/d.json"), 409, "a tree's MOVE across, the source edited meanwhile")
-	check("matches", "derby", "a tree's across")
-	sameStrings(t, "tree", names(e.propfind("/cat/"), "/cat/"), []string{"cup.json", "derby.json"})
 }

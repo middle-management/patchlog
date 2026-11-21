@@ -36,8 +36,7 @@ import (
 // Unix seconds, the key's name and the prefix. The origin's key vouches
 // only for the core prefixes (ParsePrefix); a service's key, with
 // Cookies.Vouches set, only for prefixes under a root of its own, never
-// under /r/ or /ns/, such as a catalog service's /{catalog}/g/{gs}
-// (§B.11.5). So a cookie one mints never covers the other's URLs, even
+// under /r/ or /ns/, such as the index's /{ns}/view/{view} (§A.4). So a cookie one mints never covers the other's URLs, even
 // under the other's key. A verifying edge holding the
 // key checks a request as Check does; without one the origin checks it
 // itself. The key is the minter's, given on its own, which the edge holds
@@ -179,7 +178,7 @@ func KeyFromSecret(secret []byte) []byte {
 
 // CookieKey is the edge-grant key derived from v's secret (KeyFromSecret),
 // nil without a Verifier. Every holder of the edge secret can derive it,
-// the catalog service and the search index included, and mint core
+// the search index included, and mint core
 // cookies with it, so the origin never signs with it by default: only
 // when the deployment names it (patchlog serve --edge-grant-key
 // KID=edge-secret), to migrate to key files of the origin's own. A
@@ -338,28 +337,28 @@ func ParsePrefix(p string) (ns, resource string, ok bool) {
 }
 
 // Prefix is a core prefix (§2.1 Edge prefix): /r/{ns}/{name} (Resource
-// set), /r/{ns} or /ns/{ns}, or /ns/{ns}/g/{gs} (GS set), a filtered
-// namespace's prefix (§B.11.9).
-type Prefix struct{ NS, Resource, GS string }
+// set), /r/{ns} or /ns/{ns}, or /ns/{ns}/view/{view} (View set), a
+// partial reader's view (§7.9).
+type Prefix struct{ NS, Resource, View string }
 
 // ParseCorePrefix parses every core prefix the origin's key vouches for:
-// ParsePrefix's, and /ns/{ns}/g/{gs} with gs an id in its canonical text
-// (§3.2), so g/all, which is a service's (§B.11.5), is refused. Only
-// callers that tell a GS prefix from /ns/{ns} use it: ParsePrefix keeps
-// refusing the g form, so no older caller takes it for the namespace's.
+// ParsePrefix's, and /ns/{ns}/view/{view} with view an id in its
+// canonical text (§3.2). Only callers that tell a view prefix from
+// /ns/{ns} use it: ParsePrefix keeps refusing the view form, so no caller
+// takes it for the namespace's.
 func ParseCorePrefix(p string) (Prefix, bool) {
 	if ns, res, ok := ParsePrefix(p); ok {
 		return Prefix{NS: ns, Resource: res}, true
 	}
 	s := strings.Split(p, "/")
-	if len(s) != 5 || s[0] != "" || s[1] != "ns" || !nsNameRe.MatchString(s[2]) || s[3] != "g" {
+	if len(s) != 5 || s[0] != "" || s[1] != "ns" || !nsNameRe.MatchString(s[2]) || s[3] != "view" {
 		return Prefix{}, false
 	}
 	id, err := ids.Parse(s[4])
 	if err != nil || id.String() != s[4] {
 		return Prefix{}, false
 	}
-	return Prefix{NS: s[2], GS: s[4]}, true
+	return Prefix{NS: s[2], View: s[4]}, true
 }
 
 // Covers reports whether a request path lies under prefix: the prefix

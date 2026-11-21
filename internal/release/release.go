@@ -4,17 +4,17 @@
 //
 //	// /r/releases/release-7
 //	{ "name": "release-7",
-//	  "at": "1c…",                                   // optional: combined checkpoint the branches started from (§B.5)
-//	  "branches": { "matches":    { "ns": "matches-r7",    "at": "1k…" },
-//	                "cat-season": { "ns": "cat-season-r7", "at": "1m…" },
-//	                "schemas":    { "ns": "schemas-r7",    "at": "1d…" } },
+//	  "branches": { "matches": { "ns": "matches-r7", "at": "1k…" },
+//	                "schemas": { "ns": "schemas-r7", "at": "1d…" } },
 //	  "on": "/r/releases/release-6/rev/1x…",          // optional: the release this one builds on
 //	  "owners": ["user:anna"] }
 //
-// The core never reads a release document. Tools that act on one (the
-// merge service, previews, grant issuers, the janitor) check for
-// themselves, under their own authority, what they are about to do: a
-// release document only says which branches go together.
+// Each branch's own at is authoritative; the branches SHOULD start from
+// heads that were current together. The core never reads a release
+// document, and it authorises nothing: tools that act on one (the merge
+// service, previews, grant issuers, the janitor) check for themselves,
+// under their own authority, what they are about to do. A release
+// document only says which branches go together.
 //
 // Keys of branches are the namespaces paths name (the bases, or for a
 // release built on another one, the namespaces of the earlier release's
@@ -49,10 +49,6 @@ type Branch struct {
 // Doc is a release document.
 type Doc struct {
 	Name string `json:"name"`
-	// At is the combined checkpoint the branches started from (§B.5),
-	// optional, and dropped after a rebase. Each branch's own at is
-	// authoritative (§F.9 Starting); tools never use this one in its place.
-	At string `json:"at,omitempty"`
 	// Branches maps the namespace paths name to its branch.
 	Branches map[string]Branch `json:"branches"`
 	// On is the release this one builds on: a pinned link
@@ -69,7 +65,7 @@ var (
 )
 
 // known are the fields Doc models.
-var known = map[string]bool{"name": true, "at": true, "branches": true, "on": true, "owners": true}
+var known = map[string]bool{"name": true, "branches": true, "on": true, "owners": true}
 
 // Parse reads a release document from its JSON value (as client.Doc.Value
 // holds it) and validates it.
@@ -91,7 +87,7 @@ func Parse(v any) (*Doc, error) {
 		}
 		return s
 	}
-	d.Name, d.At, d.On = str("name"), str("at"), str("on")
+	d.Name, d.On = str("name"), str("on")
 	if bs, present := m["branches"]; present {
 		bm, ok := bs.(map[string]any)
 		if !ok {
@@ -151,9 +147,6 @@ func (d *Doc) Validate() error {
 	var errs []string
 	if !nameRe.MatchString(d.Name) {
 		errs = append(errs, fmt.Sprintf("name %q is not a valid name", d.Name))
-	}
-	if d.At != "" && !validID(d.At) {
-		errs = append(errs, "at is not an id")
 	}
 	if len(d.Branches) == 0 {
 		errs = append(errs, "branches must list at least one branch")
@@ -225,7 +218,7 @@ func (d *Doc) KeyOf(branch string) string {
 }
 
 // Aliases maps each key to its branch: what a release preview follows in
-// place of the key (§B.5).
+// place of the key (§F.9: previews follow the listed branches).
 func (d *Doc) Aliases() map[string]string {
 	out := map[string]string{}
 	for k, b := range d.Branches {
@@ -241,9 +234,6 @@ func (d *Doc) Value() map[string]any {
 		m[k] = v
 	}
 	m["name"] = d.Name
-	if d.At != "" {
-		m["at"] = d.At
-	}
 	bs := map[string]any{}
 	for k, b := range d.Branches {
 		o := map[string]any{"ns": b.NS}

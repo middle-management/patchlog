@@ -453,28 +453,6 @@ func TestV073P15SourceOwnOrigin(t *testing.T) {
 	}
 }
 
-// §6.2 step 3, §G.3 (GB-8): a remote branch folds what it reads through
-// from its base's deployment as that deployment applied it: a genesis
-// onto the document null.
-func TestV073P15RemoteGenesisOnNull(t *testing.T) {
-	t.Parallel()
-	a, b, _ := pair(t, nil, nil)
-	a.mkNS("main", map[string]any{"read": "public"})
-	r := a.write("PATCH", "main", "p", "", ops(op("test", "", nil), op("add", "", map[string]any{"n": 1.0}), op("add", "/m", 2.0)))
-	expect(t, r, 201)
-	p0 := etagOf(r)
-	a.appendRev("main", "p", p0, ops(op("replace", "/n", 3.0)))
-	expect(t, b.mkRemote("rel", remoteGenesis("main", a.nsHead("main"), nil)), 201)
-	if d := b.doc("rel", "p"); string(canonical(d)) != `{"m":2,"n":3}` {
-		t.Fatalf("read through: %v", d)
-	}
-	g := b.get("/r/rel/p/rev/" + p0)
-	expect(t, g, 200)
-	if string(canonical(g.Obj())) != `{"m":2,"n":1}` {
-		t.Fatalf("genesis read through: %s", g.Body)
-	}
-}
-
 // §6.2 step 3, §8.6 (GB-8): a pruned range whose genesis applies to the
 // document null archives, verifies and restores, its snapshots rebuilt by
 // folding the genesis onto null.
@@ -698,29 +676,6 @@ func TestV073P15DryRunPurgedFrozen(t *testing.T) {
 		if _, has := r.Obj()["items"]; has {
 			t.Fatalf("answered with items: %s", r.Body)
 		}
-	}
-}
-
-// §12.1 (GB-56): a remote registration's renewal (If-Match) with no
-// registration to renew is 412 stale without head, not head: null; one
-// that has a registration names its latest entry (§G.3).
-func TestV073P15RegistrationStaleWithoutHead(t *testing.T) {
-	t.Parallel()
-	a := newEnv(t, withOrigin(originA))
-	a.mkNS("main", map[string]any{"read": "public"})
-	a.create("main", "p", map[string]any{"n": 0.0})
-	at := a.nsHead("main")
-	r := a.register("main", "rel", at, hashID(t, "", []byte("x")), "b")
-	expectCode(t, r, 412, "stale")
-	if v, has := r.Obj()["head"]; has {
-		t.Fatalf("412 without a registration carries head %v: %s", v, r.Body)
-	}
-	reg := a.register("main", "rel", at, "", "b")
-	expect(t, reg, 201)
-	r = a.register("main", "rel", at, hashID(t, "", []byte("x")), "b")
-	expectCode(t, r, 412, "stale")
-	if h := r.Str("head"); h == "" || h != reg.Str("ns_id") {
-		t.Fatalf("412 with a registration: head %q, its entry %q: %s", h, reg.Str("ns_id"), r.Body)
 	}
 }
 

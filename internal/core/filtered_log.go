@@ -3,13 +3,15 @@ package core
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // nsLogCols are the ns_log columns a namespace log page reads (scanNSLogRow).
-const nsLogCols = `seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures, via`
+const nsLogCols = `seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures, via, target_seq`
 
 // nsLogRow is an ns_log row as a log page reads it.
 type nsLogRow struct {
@@ -23,13 +25,14 @@ type nsLogRow struct {
 	noAuth  sql.NullInt64
 	meta    sql.NullString
 	via     sql.NullString
+	target  sql.NullInt64  // the revision a single entry moves to, a prune's horizon
 	m       map[string]any // body, parsed
 }
 
 // scanNSLogRow scans the row nsLogCols selects, its body parsed.
 func (t *tx) scanNSLogRow(rows *sql.Rows) nsLogRow {
 	var r nsLogRow
-	t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta, &r.via))
+	t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta, &r.via, &r.target))
 	r.m = jsonv.MustParse([]byte(r.body)).(map[string]any)
 	return r
 }
@@ -81,19 +84,22 @@ func (t *tx) decorateNSEntry(r *nsLogRow, prev string) map[string]any {
 const filteredLogChunk = 256
 
 // filteredRange is a page of n's log after since up to toSeq as fv sees it
-// (§B.11.9 Log entries, Log ranges): Status 404 for a since not in the
+// (§7.9 Log entries, Log ranges): Status 404 for a since not in the
 // chain up to toSeq, as unfiltered (§7.1); otherwise 200 with the page's
-// visible entries, possibly none. A page counts a batch as its visible
-// items, a config-only batch and every other entry, hidden or dropped
-// included, as one, ending before an entry that would take it past limit
-// (0: no bound) but scanning at least one; Last is the last entry scanned,
-// visible or not, and More whether the range goes on past it, so the next
-// page's since is Last. An entry's prev is the entry before it in the
-// chain, hidden or not. Purged is whether the range ends with n's purge-ns
-// entry, not whether n is purged now: a live read's toSeq is its
-// admission's checkpoint, and a purge committed since is past it, so its
-// page doesn't end the stream (§7.3, §8.5). Covered namespaces are neither
-// sealed nor e2e, so nothing is sealed.
+// shown entries, possibly none. A page counts a batch as its shown items
+// (at least one), and every other entry, dropped ones included, as one,
+// ending before an entry that would take it past limit (0: no bound) but
+// scanning at least one; Last is the last entry scanned, shown or not,
+// and More whether the range goes on past it, so the next page's since is
+// Last. An entry's prev is the entry before it in the chain, shown or
+// not. Purged is whether the range ends with n's purge-ns entry, not
+// whether n is purged now: a live read's toSeq is its admission's
+// checkpoint, and a purge committed since is past it, so its page doesn't
+// end the stream (§7.3, §8.5). Covered namespaces are neither sealed nor
+// e2e, so nothing is sealed.
+//
+// What an entry shows is a function of the log alone (filterEntry), never
+// of the pages before it, so a range reads the same in any pages.
 func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit int) *Log {
 	out := &Log{Public: t.cachePublic(n), Purged: n.purged && n.headSeq.Valid && toSeq == n.headSeq.Int64}
 	var fromSeq int64
@@ -124,14 +130,14 @@ func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit
 		}
 		for i := range rs {
 			r := &rs[i]
-			shown, u, names := t.filterEntry(fv, r.m)
-			if limit > 0 && scanned > 0 && units+u > limit {
+			f := t.filterEntry(n, fv, r)
+			if limit > 0 && scanned > 0 && units+f.units > limit {
 				out.More = true
 				return out
 			}
-			scanned, units, at = scanned+1, units+u, r.seq
+			scanned, units, at = scanned+1, units+f.units, r.seq
 			id := ids.FromBytes(r.id).String()
-			if shown {
+			if f.shown {
 				prev := ""
 				if r.prev != nil {
 					if i > 0 && rs[i-1].seq == *r.prev {
@@ -140,10 +146,17 @@ func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit
 						prev = t.nsLogID(*r.prev).String()
 					}
 				}
-				m := t.decorateNSEntry(r, prev)
-				if g, ok := m["gestures"].(map[string]any); ok && names != nil {
-					// A batch's, from its row's metadata (§7.4).
-					narrowNames(m, "gestures", g, names)
+				var m map[string]any
+				if f.hidden {
+					// A stand-in carries nothing of the entry but its
+					// place (§7.9 Log entries).
+					m = map[string]any{"id": id, "prev": prev, "kind": "hidden", "resource": r.m["resource"]}
+				} else {
+					m = t.decorateNSEntry(r, prev)
+					if g, ok := m["gestures"].(map[string]any); ok && f.names != nil {
+						// A batch's, from its row's metadata (§7.4).
+						narrowNames(m, "gestures", g, f.names)
+					}
 				}
 				out.Entries = append(out.Entries, m)
 			}
@@ -154,64 +167,132 @@ func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit
 	return out
 }
 
-// filterEntry judges a log entry's body m for fv (§B.11.9 Log entries),
-// narrowing a batch in place, and returns whether it is shown, the units it
-// counts for on a page (Log ranges) and, for a batch, its visible names,
-// which its gestures, metadata outside the body, are narrowed to:
+// entryFilter is what filterEntry decides for one entry.
+type entryFilter struct {
+	shown  bool
+	hidden bool // shown as a hidden stand-in
+	units  int
+	// names, for a batch, are the resources of its items shown as head
+	// or tombstone, which its gestures and source.ids are narrowed to.
+	names map[string]bool
+}
+
+// filterEntry judges a log entry r for fv (§7.9 Log entries), narrowing a
+// batch's body in place:
 //
-//   - head, tombstone, purge and prune when their resource is visible;
-//   - config and purge-ns always;
-//   - a batch with only its visible entries, and its config entry, its
-//     gestures and source.ids without hidden names; one with neither is
-//     dropped, and one with only its config entry kept as config-only;
-//   - branch never, as one answer serves its whole gs, nor any other
-//     kind, remote ones included.
-func (t *tx) filterEntry(fv *fview, m map[string]any) (bool, int, map[string]bool) {
+//   - a head when its revision is visible, a tombstone when the document
+//     it deleted is (visible judges a tombstone so); one not shown whose
+//     resource's previous head or tombstone entry was shown as itself
+//     (shownAsItself) as a hidden stand-in, any other dropped;
+//   - a prune when its target's document is visible, a purge when the
+//     rules that don't refer to /doc allow reading its resource
+//     (fview.purgeShown);
+//   - config and purge-ns always, branch never, as one answer serves
+//     every reader of the view, nor any other kind;
+//   - a batch with only its shown entries, a hidden one as {kind:
+//     "hidden", resource}, and its gestures and source.ids for the items
+//     shown as head or tombstone only, each left out if empty; one with
+//     nothing shown dropped, so kept config-only where it has a config
+//     entry.
+func (t *tx) filterEntry(n *nsRow, fv *fview, r *nsLogRow) entryFilter {
+	m := r.m
+	name, _ := m["resource"].(string)
 	switch m["kind"] {
 	case "config", "purge-ns":
-		return true, 1, nil
-	case "head", "tombstone", "purge", "prune":
-		name, ok := m["resource"].(string)
-		return ok && t.fvVisible(fv, name), 1, nil
+		return entryFilter{shown: true, units: 1}
+	case "head", "tombstone":
+		res, target := t.movedBy(n, r.seq, name)
+		if fv.visible(t, name, target) {
+			return entryFilter{shown: true, units: 1}
+		}
+		if t.shownAsItself(n, fv, name, res, r.seq) {
+			return entryFilter{shown: true, hidden: true, units: 1}
+		}
+		return entryFilter{units: 1}
+	case "prune":
+		var target *revRow
+		if r.target.Valid {
+			target = t.rev(r.target.Int64)
+		}
+		return entryFilter{shown: fv.visible(t, name, target), units: 1}
+	case "purge":
+		return entryFilter{shown: fv.purgeShown(name), units: 1}
 	case "batch":
 	default:
-		return false, 1, nil
+		return entryFilter{units: 1}
 	}
 	es, _ := m["entries"].([]any)
 	kept := []any{}
-	visible := map[string]bool{}
-	config := false
+	names := map[string]bool{}
 	for _, x := range es {
 		em, _ := x.(map[string]any)
-		name, isRes := em["resource"].(string)
+		ename, isRes := em["resource"].(string)
 		switch {
 		case em == nil:
 		case !isRes && em["kind"] == "config":
-			config = true
 			kept = append(kept, em)
-		case isRes && t.fvVisible(fv, name):
-			visible[name] = true
-			kept = append(kept, em)
+		case isRes && (em["kind"] == "head" || em["kind"] == "tombstone"):
+			res, target := t.movedBy(n, r.seq, ename)
+			switch {
+			case fv.visible(t, ename, target):
+				names[ename] = true
+				kept = append(kept, em)
+			case t.shownAsItself(n, fv, ename, res, r.seq):
+				kept = append(kept, map[string]any{"kind": "hidden", "resource": ename})
+			}
 		}
 	}
-	if len(visible) == 0 && !config {
-		return false, 1, nil
+	if len(kept) == 0 {
+		return entryFilter{units: 1}
 	}
 	m["entries"] = kept
 	if src, ok := m["source"].(map[string]any); ok {
 		if ids, ok := src["ids"].(map[string]any); ok {
-			narrowNames(src, "ids", ids, visible)
+			narrowNames(src, "ids", ids, names)
 		}
 	}
-	return true, max(len(visible), 1), visible
+	return entryFilter{shown: true, units: len(kept), names: names}
+}
+
+// movedBy is the resources row of name in n and the revision or tombstone
+// the entry at ns_log seq moved its head to (head_history), nil for none.
+func (t *tx) movedBy(n *nsRow, seq int64, name string) (int64, *revRow) {
+	r := t.resource(n.id, name)
+	if r == nil {
+		return 0, nil
+	}
+	var target int64
+	err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq = ?`, r.id, seq).Scan(&target)
+	if errors.Is(err, sql.ErrNoRows) {
+		return r.id, nil
+	}
+	t.must(err)
+	return r.id, t.rev(target)
+}
+
+// shownAsItself reports whether the previous head or tombstone entry of
+// resource row res before ns_log seq was shown to fv as itself: whether
+// the revision or tombstone it moved the head to is visible (§7.9 Log
+// entries; a hidden stand-in doesn't count).
+func (t *tx) shownAsItself(n *nsRow, fv *fview, name string, res, seq int64) bool {
+	if res == 0 {
+		return false
+	}
+	var target int64
+	err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq < ? ORDER BY ns_seq DESC LIMIT 1`, res, seq).Scan(&target)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false
+	}
+	t.must(err)
+	return fv.visible(t, name, t.rev(target))
 }
 
 // narrowNames leaves in parent[key], a map by resource name, only the
-// names in visible, and drops it if none is left.
-func narrowNames(parent map[string]any, key string, byName map[string]any, visible map[string]bool) {
+// names in shown, and drops it if none is left.
+func narrowNames(parent map[string]any, key string, byName map[string]any, shown map[string]bool) {
 	out := map[string]any{}
 	for name, v := range byName {
-		if visible[name] {
+		if shown[name] {
 			out[name] = v
 		}
 	}
@@ -222,22 +303,126 @@ func narrowNames(parent map[string]any, key string, byName map[string]any, visib
 	parent[key] = out
 }
 
-// FilteredLog serves GET /ns/{ns}/g/{gs}/at/{at}/log?since= (§B.11.9 Log
+// FilteredLog serves GET /ns/{ns}/view/{view}/at/{at}/log?since= (§7.9 Log
 // ranges): a page of the range after since up to {ns}'s ns_id in at, the
 // range's end, which answers carry as X-Namespace-Revision (info), filtered
 // as filteredRange says, limit units a page. A purged namespace's range
 // stays readable and ends with its purge-ns entry (§8.5). An at it can't
 // answer is a *FilteredRedirect to the current one.
-func (e *Engine) FilteredLog(ctx context.Context, ns, gs, at, since string, limit int, cred Credentials) (lg *Log, info *FilteredInfo, err error) {
-	err = e.filteredRead(ctx, func(t *tx) error {
-		n, fv, err := t.filteredAtView(ns, gs, at, cred)
+func (e *Engine) FilteredLog(ctx context.Context, ns, view, at, since string, limit int, cred Credentials) (lg *Log, info *FilteredInfo, err error) {
+	err = e.read(ctx, func(t *tx) error {
+		n, fv, err := t.filteredAtView(ns, view, at, cred)
 		if err != nil {
 			return err
 		}
-		info = filteredInfo(n, fv)
-		lg = t.filteredRange(n, fv, since, fv.CP().seqs[n.name], limit)
+		info = filteredInfo(fv)
+		lg = t.filteredRange(n, fv, since, fv.CP().seq, limit)
 		lg.Until = t.admittedUntil(n, cred, fv.a)
 		return nil
 	})
 	return lg, info, err
+}
+
+// judgeEntries judges a resource log's entries for a reader whose rules
+// refer to /doc (§C.2 item 5, §7.9 Log entries). A partial reader of a
+// namespace §7.9 covers sees its visible revisions, without patches where
+// the parent is hidden, and as {id, parent, kind: "hidden"} each hidden
+// one whose parent is visible; any other is dropped. Any other reader
+// reads the range only where each entry passes and each entry's parent
+// too, as patches show it: ok is false otherwise, a read-rule failure.
+func (t *tx) judgeEntries(n *nsRow, a *actor, name string, entries []LogEntry) (out []map[string]any, ok bool) {
+	partial := t.readsPartially(n, a)
+	parentOf := func(r *revRow) (*revRow, bool) {
+		if !r.parentSeq.Valid {
+			return nil, false
+		}
+		return t.rev(r.parentSeq.Int64), true
+	}
+	for _, e := range entries {
+		vis := t.mayReadRow(a, n, name, e.row)
+		p, hasParent := parentOf(e.row)
+		pvis := hasParent && t.mayReadRow(a, n, name, p)
+		if !partial {
+			if !vis || hasParent && !pvis {
+				return nil, false
+			}
+			out = append(out, e.value())
+			continue
+		}
+		switch {
+		case vis:
+			m := e.value()
+			if hasParent && !pvis {
+				delete(m, "patches")
+			}
+			out = append(out, m)
+		case pvis:
+			out = append(out, map[string]any{"id": e.ID, "parent": e.Parent, "kind": "hidden"})
+		}
+	}
+	return out, true
+}
+
+// seesKeptRange judges, for a whose reads of n are judged per revision,
+// the kept part of a pruned range of name ending at to (ResourceLog): the
+// revisions from to down to the first revision pruning left without its
+// patch set, the horizon, as judgeEntries judges a range. seen reports
+// whether a may read any of them, all whether it may read every one.
+func (t *tx) seesKeptRange(n *nsRow, a *actor, name string, to *revRow) (seen, all bool) {
+	all = true
+	for r := to; r != nil; {
+		if t.mayReadRow(a, n, name, r) {
+			seen = true
+		} else {
+			all = false
+		}
+		if r.kind == kindRev && !r.patches.Valid || !r.parentSeq.Valid {
+			break
+		}
+		r = t.rev(r.parentSeq.Int64)
+	}
+	return seen, all
+}
+
+// seesAnyEntry reports whether a, whose reads of n are judged per
+// revision, may read any of entries, revisions or tombstones of name.
+func (t *tx) seesAnyEntry(n *nsRow, a *actor, name string, entries []LogEntry) bool {
+	for _, e := range entries {
+		if t.mayReadRow(a, n, name, e.row) {
+			return true
+		}
+	}
+	return false
+}
+
+// readsPartially reports whether a reads n as a partial reader at a
+// resource's URLs (judgeEntries): hidden entries are left out of a range,
+// rather than refusing it.
+func (t *tx) readsPartially(n *nsRow, a *actor) bool {
+	return a.view == "" && a.verified != nil && t.filteredScope(n) != nil && t.partialReader(a)
+}
+
+// judgePruneEvents leaves out of a resource stream's events (resourceEvents)
+// the prune events whose target a reads by its rules on /doc can't read
+// (§7.9 Log entries: "its purge and prune events as the namespace log
+// shows them").
+func (t *tx) judgePruneEvents(n *nsRow, a *actor, name string, es []map[string]any) []map[string]any {
+	var head *revRow
+	out := es[:0]
+	for _, m := range es {
+		if m["kind"] == "prune" {
+			if head == nil {
+				head = t.resolve(n, name, nil).head
+			}
+			var row *revRow
+			if id, err := ids.Parse(fmt.Sprint(m["target"])); err == nil && head != nil {
+				row = t.findInAncestry(head, id)
+			}
+			if !t.mayReadRow(a, n, name, row) {
+				continue
+			}
+		}
+		out = append(out, m)
+	}
+	return out
 }

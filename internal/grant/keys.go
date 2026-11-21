@@ -24,8 +24,6 @@ type Key struct {
 	Rules             []any
 	ReadScopeResource bool
 	Rate              *Rate
-	RequireAt         any // nil, true or a namespace name
-	MaxLag            *time.Duration
 	Raw               map[string]any
 }
 
@@ -82,7 +80,7 @@ func SubPattern(s string) (*regexp.Regexp, error) {
 	return pattern.Compile(`^(?:` + s + `)$`)
 }
 
-var keyFields = map[string]bool{"kid": true, "alg": true, "pub": true, "can": true, "maxTtl": true, "sub": true, "groups": true, "roles": true, "attrs": true, "rules": true, "readScope": true, "rate": true, "requireAt": true, "maxLag": true}
+var keyFields = map[string]bool{"kid": true, "alg": true, "pub": true, "can": true, "maxTtl": true, "sub": true, "groups": true, "roles": true, "attrs": true, "rules": true, "readScope": true, "rate": true}
 
 // ParseKeys parses and validates the namespace document's "keys" value.
 // nil (absent) yields no keys.
@@ -153,9 +151,6 @@ func parseKey(e any) (Key, error) {
 	if k.MaxTTL, err = durField(m, "maxTtl"); err != nil {
 		return k, err
 	}
-	if k.MaxLag, err = durField(m, "maxLag"); err != nil {
-		return k, err
-	}
 	if v, ok := m["sub"]; ok {
 		s, ok := v.(string)
 		if !ok {
@@ -218,21 +213,6 @@ func parseKey(e any) (Key, error) {
 			return k, errors.New("rate needs rate > 0 and burst >= 1")
 		}
 		k.Rate = &Rate{Rate: r, Burst: b}
-	}
-	if v, ok := m["requireAt"]; ok {
-		switch x := v.(type) {
-		case bool:
-			if x {
-				k.RequireAt = true
-			}
-		case string:
-			if x == "" {
-				return k, errors.New("requireAt must be true or a namespace name")
-			}
-			k.RequireAt = x
-		default:
-			return k, errors.New("requireAt must be true or a namespace name")
-		}
 	}
 	return k, nil
 }

@@ -381,8 +381,7 @@ func leftOutErr(opt RebaseOptions, names []string, switched bool) error {
 		ErrLeftOut, strings.Join(names, ", "), opt.New, opt.Branch, opt.Branch)
 }
 
-// baseChain lists ns and the namespaces up its base chain, nearest first
-// (local bases only: a remote base ends it).
+// baseChain lists ns and the namespaces up its base chain, nearest first.
 func baseChain(ctx context.Context, c *client.Client, ns string) ([]string, error) {
 	chain := []string{ns}
 	for i := 0; i < 64; i++ {
@@ -396,7 +395,7 @@ func baseChain(ctx context.Context, c *client.Client, ns string) ([]string, erro
 		}
 		b, _ := d.Value["base"].(map[string]any)
 		next, _ := b["ns"].(string)
-		if _, remote := b["remote"]; next == "" || remote || slicesContains(chain, next) {
+		if next == "" || slicesContains(chain, next) {
 			break
 		}
 		chain = append(chain, next)

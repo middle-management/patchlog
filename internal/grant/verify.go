@@ -2,7 +2,6 @@ package grant
 
 import (
 	"crypto/ed25519"
-	"errors"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -52,65 +51,6 @@ type Env struct {
 	// bootstrapping). Only grants they sign may name "*" in ns.
 	Operator      bool
 	ValidateAttrs func(schema any, attrs map[string]any) error
-	// CheckAt checks a key's requireAt (§C.4): at must be an ns_id in the
-	// chain requireAt names (true: this namespace), and must have been that
-	// namespace's head at some point within maxLag before issued, the
-	// grant's issuance (see Issued). maxLag is the namespace document's
-	// (DefaultMaxLag when absent), or keyMaxLag when that is stricter (see
-	// EffectiveMaxLag). A non-nil error refuses the grant (403), except a
-	// ChainUnreadableError, which Verify returns as is (§C.4 requireAt).
-	CheckAt func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error
-}
-
-// ChainUnreadableError is a CheckAt error that couldn't read the chain a
-// requireAt key names, which is no refusal (§C.4 requireAt): its verifier
-// answers 503 behind while the cause is transient (§A.1), 502 upstream
-// otherwise, naming no namespace, never 403. ChainUnreadable reports
-// which. internal/grantcheck's ChainError is one; callers match it with
-// errors.As against an interface with that one method.
-type ChainUnreadableError interface {
-	error
-	ChainUnreadable() (transient bool)
-}
-
-// DefaultMaxLag is a namespace's maxLag when its document sets none (§C.4).
-const DefaultMaxLag = 60 * time.Second
-
-// EffectiveMaxLag is the maxLag that applies to at: the namespace's
-// (DefaultMaxLag if nil) or the key's, whichever is smaller (§C.4).
-func EffectiveMaxLag(nsMaxLag, keyMaxLag *time.Duration) time.Duration {
-	lag := DefaultMaxLag
-	if nsMaxLag != nil {
-		lag = *nsMaxLag
-	}
-	if keyMaxLag != nil && *keyMaxLag < lag {
-		lag = *keyMaxLag
-	}
-	return lag
-}
-
-// Issued is when a grant counts as issued for requireAt (§C.4): the later
-// of the root block's nbf and exp − maxTtl, of those that exist (exp −
-// maxTtl only when the key sets maxTtl). ok is false when neither exists:
-// the grant then fails the key scope, since nothing bounds how long ago it
-// was issued.
-func Issued(root Block, key *Key) (issued time.Time, ok bool) {
-	if root.Nbf != nil {
-		issued, ok = *root.Nbf, true
-	}
-	if key != nil && key.MaxTTL != nil && root.Exp != nil {
-		if s := root.Exp.Add(-*key.MaxTTL); !ok || s.After(issued) {
-			issued, ok = s, true
-		}
-	}
-	return issued, ok
-}
-
-// HeadWithin reports whether a revision was its namespace's head at some
-// point within lag before issued, or later: next is when its successor was
-// written (nil while it is still the head).
-func HeadWithin(next *time.Time, issued time.Time, lag time.Duration) bool {
-	return next == nil || !next.Before(issued.Add(-lag))
 }
 
 // Verified is the result of a successful verification.
@@ -136,18 +76,12 @@ type Verified struct {
 	roles Roles
 }
 
-// RequireAtRefusal is the message of the 403 for an at that the chain a
-// requireAt key names, read, rejects (§C.4): the same for every cause.
-const RequireAtRefusal = "at rejected by requireAt"
-
 // Verify checks a decoded grant against the configuration in force (§C.2,
 // §C.4), in the order of §C.2: first that every block carrying ns names
 // env.NS (403, before anything is verified), then the signature chain,
 // times, revocation and "*" in ns outside an operator grant (401: no usable
 // grant), then the key scope (403), readScope included, so the core and the
-// services that verify grants (grantcheck) refuse the same grants. A
-// requireAt chain env.CheckAt can't read is its ChainUnreadableError, not
-// a refusal (§C.4).
+// services that verify grants (grantcheck) refuse the same grants.
 func Verify(g *Grant, env Env) (*Verified, error) {
 	if g == nil || len(g.Blocks) == 0 {
 		return nil, unauth("missing grant")
@@ -200,7 +134,7 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 	}
 
 	// Key scope, its parts in the order can, sub, maxTtl, groups, roles,
-	// attrs, requireAt and maxLag, then readScope, the first that fails
+	// and attrs, then readScope, the first that fails
 	// giving the answer (§C.2 item 3). Only the root block's can is the
 	// issuer's (§C.4): a narrowing block's verbs outside the key's can
 	// narrow nothing more, since verbs are intersected below (§C.1).
@@ -241,31 +175,6 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 			return nil, forbid("attrs not allowed by key %q: %v", key.Kid, err)
 		}
 	}
-	if key.RequireAt != nil {
-		if root.At == nil {
-			return nil, forbid("key %q requires at", key.Kid)
-		}
-		issued, ok := Issued(root, key)
-		if !ok {
-			return nil, forbid("key %q requires at, and the grant has neither nbf nor a key maxTtl to date its issuance (§C.4)", key.Kid)
-		}
-		if env.CheckAt == nil {
-			return nil, forbid("cannot check at")
-		}
-		if err := env.CheckAt(key.RequireAt, root.At, issued, key.MaxLag); err != nil {
-			var cu ChainUnreadableError
-			if errors.As(err, &cu) {
-				return nil, err
-			}
-			// One text, whatever a readable chain rejected at for (not
-			// in it, not its head within maxLag): the refusal names no
-			// namespace and carries none of the checker's detail, since
-			// the chain a key names may be one the caller can't see
-			// (§C.4, §C.5.2).
-			return nil, forbid(RequireAtRefusal)
-		}
-	}
-
 	// Effective roles (§2.1), for a grant that carries roles, one with a
 	// block listing roles: the root block's (none if it lists none) that
 	// every narrowing block listing roles keeps and the configuration

@@ -48,7 +48,7 @@ func loadI25(t *testing.T) (time.Duration, []struct {
 // §I.25: at the default 20 s interval, each path's phase is the first 8
 // bytes of its SHA-256, big-endian, modulo 20,000 ms; interval n of the
 // log starts at epoch + phase + n × interval (§7.7), which is where its
-// cursor changes. The last path's gs is I.8's.
+// cursor changes. The last path's view is I.8's.
 func TestI25LongPollPhases(t *testing.T) {
 	t.Parallel()
 	interval, rows := loadI25(t)
@@ -75,9 +75,9 @@ func TestI25LongPollPhases(t *testing.T) {
 			}
 		}
 	}
-	gs := grantcheck.SubjectSetID([]string{"group:match-desk", "user:anna"}) // I.8's
-	if want := "/ns/matches/g/" + gs + "/log"; rows[3].Path != want {
-		t.Errorf("the last path %s, want I.8's gs: %s", rows[3].Path, want)
+	vid := grantcheck.ViewID([]string{"group:match-desk", "user:anna"}) // I.8's
+	if want := "/ns/matches/view/" + vid + "/log"; rows[3].Path != want {
+		t.Errorf("the last path %s, want I.8's vid: %s", rows[3].Path, want)
 	}
 }
 

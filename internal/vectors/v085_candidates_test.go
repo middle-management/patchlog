@@ -10,7 +10,7 @@ package vectors_test
 // the writer as contested, never a candidate overwritten with ours.
 //
 // These are the computed values. What a deployment answers with them, the
-// bundle Reader's verdict on C.5's rows and an index serving C.4's gs, is
+// bundle Reader's verdict on C.5's rows and an index serving C.4's view, is
 // in v085_pending_test.go.
 
 import (
@@ -22,7 +22,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -33,11 +32,11 @@ import (
 // candidatesFile is testdata/candidates.json.
 type candidatesFile struct {
 	C4 struct {
-		Kid, Pub, KeySubject, Marker, GS string
-		View, ViewKeyKn                  string
-		Header, Plaintext, JWE           string
-		PaddedJWE                        string
-		PlaintextBytes, PaddedBytes      int
+		Kid, Pub, KeySubject, ViewID string
+		View, ViewKeyKn              string
+		Header, Plaintext, JWE       string
+		PaddedJWE                    string
+		PlaintextBytes, PaddedBytes  int
 	} `json:"C.4"`
 	C5 struct {
 		Rows []struct{ Change, SHA256, Rule string }
@@ -55,13 +54,13 @@ func loadCandidates(t *testing.T) candidatesFile {
 	return f
 }
 
-// C.4 (SERVICES §E.2.6 Whole-response sealing, §A.4, §B.11.9 gs): the
+// C.4 (SERVICES §E.2.6 Whole-response sealing, §A.4, §7.9 view): the
 // key: string of demo's key ops-2026 with I.14's pub, as the reference
-// binds a gs to a key (catvis.KeySubject: canonical([kid, pub]), pub the
+// binds a view to a key (grantcheck.KeySubject: canonical([kid, pub]), pub the
 // key entry's base64url string, the reading the candidates call
-// underdetermined); the marker reads:demo:{key: string} and the gs over
-// that one marker (grantcheck.SubjectSetID); the view of §I.23's query at
-// ns_id₂ under that gs; the view key of K_n (seal.ViewKey); and the whole
+// underdetermined); the view of that one subject (grantcheck.ViewID,
+// v0.87: no scope: subject for unrestricted read); §I.23's query at ns_id₂
+// under that view; the view key of K_n (seal.ViewKey); and the whole
 // response sealed under it with the pl of derived.View, kid demo#3 and the
 // IV c0 … cb, unpadded and padded, each JWE in full. derived.SealView,
 // which draws its own IV, gives the same header and plaintext, and
@@ -72,20 +71,17 @@ func TestV085C4WholeResponse(t *testing.T) {
 	t.Parallel()
 	p := loadCandidates(t).C4
 	i23 := loadAddendumI(t).I23
-	ks := catvis.KeySubject(p.Kid, p.Pub)
+	ks := grantcheck.KeySubject(p.Kid, p.Pub)
 	if ks != p.KeySubject {
 		t.Errorf("the key: string of %s is %s, want %s", p.Kid, ks, p.KeySubject)
 	}
-	marker := "reads:demo:" + ks
-	if marker != p.Marker {
-		t.Errorf("the marker is %s, want %s", marker, p.Marker)
-	}
-	gs := grantcheck.SubjectSetID([]string{marker})
-	if gs != p.GS {
-		t.Errorf("the gs over %s is %s, want %s", marker, gs, p.GS)
+	// A grant with unrestricted read has no scope: subject (§7.9 view).
+	vid := grantcheck.ViewID(grantcheck.ViewSubjects("", p.Kid, p.Pub, false))
+	if vid != p.ViewID {
+		t.Errorf("the view of [%s] is %s, want %s", ks, vid, p.ViewID)
 	}
 	cq := derived.CanonicalQuery(url.Values{"q": {i23.Q}, "sort": {i23.Sort}, "min": {nsID2}}, "min")
-	view := "/demo/g/" + gs + "/at/" + nsID2 + cq
+	view := "/demo/view/" + vid + "/at/" + nsID2 + cq
 	if view != p.View {
 		t.Fatalf("view\n%s\nwant\n%s", view, p.View)
 	}
@@ -158,7 +154,7 @@ func TestV085C4WholeResponse(t *testing.T) {
 		if got, err := derived.OpenView(c.jwe, keyOf, v); err != nil || !bytes.Equal(got, c.want) {
 			t.Errorf("%s opens to %s %v", what, got, err)
 		}
-		// At I.8's gs, §I.23's view, it is another URL's.
+		// At I.8's view, §I.23's view, it is another URL's.
 		if got, err := derived.OpenView(c.jwe, keyOf, derived.View{NS: "demo", Target: i23.View}); err == nil {
 			t.Errorf("%s opened at §I.23's view: %s", what, got)
 		}

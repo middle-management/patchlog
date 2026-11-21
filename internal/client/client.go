@@ -415,8 +415,38 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, rq *
 	if err != nil {
 		return nil, err
 	}
-	return &response{status: res.StatusCode, header: res.Header, body: b, method: method, path: path}, nil
+	r := &response{status: res.StatusCode, header: res.Header, body: b, method: method, path: path}
+	if loc, ok := c.viewContent(r, method, path); ok {
+		// A partial reader's read of a resource's immutable URL is
+		// served under its view (§7.9 Content): followed once, on this
+		// origin, with the same credentials and query.
+		return c.do(ctx, method, loc, q, rq)
+	}
+	return r, nil
 }
+
+// viewContent reports whether r, a GET or HEAD of path, is a 302 to the
+// form of path under a view of this origin (§7.9 Content,
+// /ns/{ns}/view/{view}/r/{name}/…, path being /r/{ns}/{name}/…), and
+// returns that path.
+func (c *Client) viewContent(r *response, method, path string) (string, bool) {
+	if r.status != 302 || method != "GET" && method != "HEAD" || !strings.HasPrefix(path, "/r/") {
+		return "", false
+	}
+	segs := strings.SplitN(path, "/", 4) // "", "r", ns, rest
+	if len(segs) != 4 {
+		return "", false
+	}
+	loc := c.location(r)
+	m := viewContentRe.FindStringSubmatch(loc)
+	if m == nil || m[1] != segs[2] || m[2] != "/r/"+segs[3] {
+		return "", false
+	}
+	return loc, true
+}
+
+// viewContentRe is a resource's immutable URL under a view (§7.9 Content).
+var viewContentRe = regexp.MustCompile(`^/ns/([a-z0-9][a-z0-9_-]{0,63})/view/1[a-z2-7]{32}(/r/.+)$`)
 
 func (c *Client) setAuth(hr *http.Request) {
 	if c.bearer != "" {

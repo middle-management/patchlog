@@ -2,7 +2,7 @@ vcl 4.1;
 # A local CDN for the compose stack (docs/SPEC.md §9). One varnishd listens
 # once per origin and picks the backend by listener name:
 #
-#   varnishd -a core=:8080 -a search=:8081 -a tree=:8082 -f default.vcl
+#   varnishd -a core=:8080 -a search=:8081 -f default.vcl
 #
 # What it does:
 #
@@ -84,15 +84,6 @@ backend search {
 	.probe = service_up;
 }
 
-backend tree {
-	.host = "tree";
-	.port = "8082";
-	.connect_timeout = 2s;
-	.first_byte_timeout = 75s;
-	.between_bytes_timeout = 75s;
-	.probe = service_up;
-}
-
 # Who may purge: loopback and the private ranges Docker networks use. From
 # the host, published ports arrive from the bridge's gateway, so the host
 # can purge too (handy for experiments; this is a development CDN).
@@ -108,8 +99,6 @@ acl purgers {
 sub vcl_recv {
 	if (local.socket == "search") {
 		set req.backend_hint = search;
-	} elsif (local.socket == "tree") {
-		set req.backend_hint = tree;
 	} else {
 		set req.backend_hint = core;
 	}

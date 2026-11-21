@@ -7,7 +7,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 )
 
-// Branch fixtures. Since v0.78 no branch is covered (§B.11.9 Where); the
+// Branch fixtures. Since v0.78 no branch is covered (§7.9 Where); the
 // v0.76 tests of covered branches are gone with it.
 
 // cover76Branch is newV75X with branches, matches-r7 cut from matches and

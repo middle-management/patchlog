@@ -25,15 +25,15 @@ import (
 //     base that receives a branch entry, every branch a purge has
 //     something to do in (the ones that hold the purged name or see it:
 //     a branch that does neither is skipped and stays unlocked, see
-//     nspurge.go) and every remote shadow it reaches, a sweep of expired
+//     nspurge.go), a sweep of expired
 //     pending blobs;
 //   - shared on the namespace a resource write or batch (without a config
 //     change) appends to (nsForResources), or a blob upload adds a pending
 //     entry to, and on every other namespace
 //     whose state a decision read (nsByName, nsByID): the bases whose keys
 //     and revocations a branch write re-checks (§C.4), the namespaces its
-//     $schema and $ref resolve into (§6.1), a requireAt's or a batch
-//     source's namespace. A schema purge, a base revocation, a config
+//     $schema and $ref resolve into (§6.1), a batch source's
+//     namespace. A schema purge, a base revocation, a config
 //     change, a frozen or purged flag therefore can't commit between a
 //     write's check and its insert, and READ COMMITTED is enough: every
 //     read of a namespace happens after its lock is held.
@@ -376,8 +376,8 @@ func (t *tx) lockLogs(nss ...int64) {
 		t.logPlan[lockKey(ns)] = true
 	}
 	// lockLog takes every planned lock with the one it is asked for: one
-	// not held yet, or it would take none (a second purge of a
-	// transaction that follows a remote base, whose first log is held).
+	// not held yet, or it would take none (a second purge in one
+	// transaction, whose first log is held).
 	for _, ns := range nss {
 		if !t.logLocks[lockKey(ns)] && t.locks[lockKey(ns)] != lockExclusive {
 			t.lockLog(ns)
@@ -505,8 +505,7 @@ func retryable(err error) bool {
 // --- leader -------------------------------------------------------------------
 
 // leader reports whether this instance runs the background loops that must
-// run once per deployment (retention, epoch rotation, following remote
-// bases): on Postgres, the instance holding the session-level advisory
+// run once per deployment (retention, epoch rotation): on Postgres, the instance holding the session-level advisory
 // lock (leaderClass, 0) on a connection it keeps; on SQLite, always. An
 // instance that loses its connection loses the lock, and another one
 // takes over at its next tick.

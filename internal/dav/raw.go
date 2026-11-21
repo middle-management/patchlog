@@ -200,6 +200,9 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 		if o.fresh && h.State != client.NotFound {
 			return false, taken(ns, name)
 		}
+		if in.tree && h.State != client.Live && h.State != client.Purged {
+			return false, treeGone(st.path)
+		}
 		switch h.State {
 		case client.Purged:
 			return false, purgedErr(ns, name)
@@ -233,7 +236,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 			ps := merge.Diff(refOf(cur.value), refOf(b.ref))
 			paths := writesOf(refOf(cur.value), ps)
 			ps = withNonce(in, cur.value, ps)
-			res, err := st.tk.c.Append(ctx, ns, name, h.ID, ps)
+			res, err := st.appendFile(ctx, in, ns, name, h.ID, ps)
 			switch {
 			case client.IsStale(err):
 				return true, nil

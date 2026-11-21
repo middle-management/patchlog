@@ -114,7 +114,6 @@ type NSEntry struct {
 	Name      string         // branch: the branch's name
 	At        string         // branch: the base's ns_id it starts at
 	Target    string         // revision, tombstone, config revision or horizon id
-	Remote    map[string]any // branch: a remote branch registration (§G.3)
 	Entries   []NSEntry      // batch: config entry first, then resource entries
 	Source    map[string]any // batch: optional provenance
 	HasSource bool
@@ -190,7 +189,6 @@ func ParseNSEntry(v any) (NSEntry, error) {
 	if via := strList(m["via"]); len(via) > 0 {
 		e.Via = via
 	}
-	e.Remote, _ = m["remote"].(map[string]any)
 	e.Forced, _ = m["forced"].(bool)
 	e.Gesture, e.Undoes = str(m, "gesture"), str(m, "undoes")
 	if gm, ok := m["gestures"].(map[string]any); ok {
@@ -397,9 +395,7 @@ func headsQuery(prefix, after string) url.Values {
 // must start with prefix, and next.
 func parseHeads(r *response, prefix string) (items []HeadItem, next string, err error) {
 	m := r.obj()
-	// { heads, next? } (§7.4); servers before v0.65 answer { items, next? },
-	// and a remote branch reads its base's pages from whatever version its
-	// deployment runs (§G.3).
+	// { heads, next? } (§7.4); servers before v0.65 answer { items, next? }.
 	arr, ok := m["heads"].([]any)
 	if !ok {
 		arr, _ = m["items"].([]any)
@@ -425,8 +421,8 @@ type Namespace struct {
 	// namespace: the base's branch entry for a local branch, otherwise
 	// its chain's first.
 	Created string
-	// Base is the namespace document's base (§7.6) without chain: { ns,
-	// at }, with origin for a remote branch. nil unless a branch.
+	// Base is the namespace document's base (§7.6): { ns, at }. nil unless
+	// a branch.
 	Base   map[string]any
 	Frozen bool
 	Purged bool
@@ -498,23 +494,12 @@ type Branch struct {
 	Frozen    bool
 	Purged    bool
 	Successor string
-	Remote    map[string]any // remote branch registrations (§G.3)
 	// Drafts is the branch's drafts.for (§7.4), nil without drafts.
 	Drafts []string
 	Raw    map[string]any
 }
 
-// Key is the row's key in /branches (§7.4): a local branch's name, or a
-// remote one's {origin}/{ns}.
-func (b Branch) Key() string {
-	if b.Remote != nil {
-		return str(b.Remote, "origin") + "/" + str(b.Remote, "ns")
-	}
-	return b.Name
-}
-
-// Branches lists a namespace's direct branches and unexpired remote
-// branch registrations (§7.4), iterating all pages of BranchesPage.
+// Branches lists a namespace's direct branches (§7.4), iterating all pages of BranchesPage.
 func (c *Client) Branches(ctx context.Context, ns string) ([]Branch, error) {
 	var all []Branch
 	after := ""
@@ -535,7 +520,7 @@ func (c *Client) Branches(ctx context.Context, ns string) ([]Branch, error) {
 }
 
 // BranchesPage is one page of GET /ns/{ns}/branches?after={key} (§7.4):
-// rows in ascending byte order of key (Branch.Key), strictly after after,
+// rows in ascending byte order of name, strictly after after,
 // and next, the after of the following page, "" on the last. A server
 // before v0.86 answers a bare array, which is an error here.
 func (c *Client) BranchesPage(ctx context.Context, ns, after string) (page []Branch, next string, err error) {
@@ -561,9 +546,8 @@ func (c *Client) BranchesPage(ctx context.Context, ns, after string) (page []Bra
 		b := Branch{Name: str(m, "name"), At: str(m, "at"), Successor: str(m, "successor"), Raw: m}
 		b.Frozen, _ = m["frozen"].(bool)
 		b.Purged, _ = m["purged"].(bool)
-		b.Remote, _ = m["remote"].(map[string]any)
 		b.Drafts = draftsFor(m["drafts"])
-		k := b.Key()
+		k := b.Name
 		if k <= last {
 			return nil, "", fmt.Errorf("client: %s: row %q outside the page asked for (§7.4)", r.path, k)
 		}

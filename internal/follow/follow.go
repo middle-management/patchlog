@@ -890,7 +890,7 @@ func (n *nsFollower) apply(ctx context.Context, b *Batch) error {
 			st.Successor, _ = u.Config.Value["successor"].(string)
 			f.state(st)
 		}
-		if f.opt.branches && u.Entry.Kind == "branch" && u.Entry.Remote == nil && u.Entry.Name != "" {
+		if f.opt.branches && u.Entry.Kind == "branch" && u.Entry.Name != "" {
 			e := u.Entry
 			n.startBranch(ctx, e.Name, &e)
 		}

@@ -3,8 +3,6 @@ package dav
 import (
 	"context"
 	"errors"
-	"fmt"
-	"slices"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -30,6 +28,14 @@ type docEntry struct {
 	// sealed: the core served it sealed (application/jose, Addendum E),
 	// which this server, holding no keys, doesn't offer (§H.7).
 	sealed bool
+	// tree: a document of a file tree (§H.2), whose file is its content:
+	// value, rendered, raw and file are content's (contentEntry), and whole
+	// is the document; folder and name are its place, and isFolder says it
+	// has no content. A document without a string folder and name has no
+	// place (placed false), and is in no folder.
+	tree, placed, isFolder bool
+	whole                  any
+	folder, name           string
 }
 
 // newEntry is the entry of document v, read or written at modified.
@@ -37,6 +43,57 @@ func newEntry(v any, modified time.Time) *docEntry {
 	e := &docEntry{value: v, modified: modified, raw: rawRefOf(v, client.RawBlobOf(v))}
 	e.file, e.rendered = files.Show(v)
 	return e
+}
+
+// treeEntry is the entry of document v of a file tree (§H.2), read or
+// written at modified: its file is content, of which "everything this
+// addendum says of a file's document" holds, paths included; $nonce and
+// $successor stay at the document's top level.
+func treeEntry(v any, modified time.Time) *docEntry {
+	m, _ := v.(map[string]any)
+	content, has := m["content"]
+	e := contentEntry(content, modified)
+	e.tree, e.whole, e.isFolder = true, v, !has
+	e.folder, _ = m["folder"].(string)
+	e.name, _ = m["name"].(string)
+	_, fok := m["folder"].(string)
+	_, nok := m["name"].(string)
+	e.placed = fok && nok
+	if e.isFolder {
+		e.value, e.raw, e.rendered = nil, nil, nil
+	}
+	return e
+}
+
+// contentEntry is the entry of a tree file's content: a raw file where it
+// is a blob reference, else a JSON file whose rendering is content's own
+// (§H.1, §H.2: the document's top-level $nonce and $successor aren't in
+// it, as they aren't in content).
+func contentEntry(content any, modified time.Time) *docEntry {
+	e := &docEntry{value: content, modified: modified, tree: true, placed: true}
+	if bid := client.RawBlobOf(content); bid != "" {
+		e.raw = rawRefOf(content, bid)
+	}
+	e.file, e.rendered = files.Show(content)
+	return e
+}
+
+// entryOf is the entry of document v of namespace ns as this server shows
+// it: a tree's (treeEntry) or a flat namespace's (newEntry).
+func (s *Server) entryOf(ns string, v any, modified time.Time) *docEntry {
+	if s.trees[ns] {
+		return treeEntry(v, modified)
+	}
+	return newEntry(v, modified)
+}
+
+// root is e's document as the core holds it: its whole document in a
+// tree, else its value.
+func (e *docEntry) root() any {
+	if e.tree {
+		return e.whole
+	}
+	return e.value
 }
 
 // fileMeta is what a listing shows of a revision's file (§H.3), read from
@@ -88,7 +145,7 @@ func (s *Server) doc(ctx context.Context, tk *token, ns, name, rev string) (*doc
 		case err != nil:
 			return nil, err
 		default:
-			e = newEntry(d.Value, d.Modified)
+			e = s.entryOf(ns, d.Value, d.Modified)
 		}
 		s.keep(k, e)
 		return e, nil
@@ -145,37 +202,19 @@ func (s *Server) keep(k string, e *docEntry) {
 // frozen, whether writes add a fresh $nonce (§C.7) and whether the
 // namespace requires one, the limits in force (§6.6, the deployment's
 // defaults and maximums applied; 0 where not known), and the verbs the
-// grant allows there (can, nil where not known); and, of a catalog, its
-// trust list (§B.3) and file tree (§H.2), as GET /ns/{ns}/principal's
-// catalog gives them to the token's grant (§7.4, §H.7 "Limited grants"),
-// else its document.
+// grant allows there (can, nil where not known).
 type nsInfo struct {
-	can           map[string]bool
-	sealed        bool
-	frozen        bool // §8.4: it takes no writes, a DELETE neither
-	nonce         bool
-	nonceRequired bool
-	// trust is a catalog's catalog.trust, where trustKnown; to a grant
-	// without unrestricted read of the catalog /principal says only
-	// whether files.ns is trusted (trusted), and trust holds files.ns if
-	// it is
-	trust                 []string
-	trustKnown            bool
-	files                 *treeFiles
-	notTree               string // why a catalog makes no file tree, where that is known
-	titled                bool   // a catalog's catalog.title is set: listings carry its items' titles (§B.5)
-	readErr               error  // the core's refusal of a catalog's document to the token (a 401, 403, 404)
+	can                   map[string]bool
+	sealed                bool
+	frozen                bool // §8.4: it takes no writes, a DELETE neither
+	nonce                 bool
+	nonceRequired         bool
 	patchSetSize, docSize int
 	opsPerSet, blobSize   int
-}
-
-// trusts reports whether catalog info in trusts content namespace ns, as
-// far as the token is told (trust): a grant told only whether files.ns is
-// trusted (§7.4) knows nothing of other namespaces, and a tree service
-// shows it placements of trusted namespaces only (§B.5), so unknown is
-// true.
-func (in nsInfo) trusts(ns string) bool {
-	return !in.trustKnown && (in.files == nil || ns != in.files.ns) || slices.Contains(in.trust, ns)
+	// tree: a file tree's (§H.2), whose files' patch sets are content's,
+	// sent under /content, and whose documents are objects, which carry a
+	// $nonce whatever their content (withNonce)
+	tree bool
 }
 
 // writerAt is §7.4's writer block of a namespace as a token was given it,
@@ -183,57 +222,12 @@ func (in nsInfo) trusts(ns string) bool {
 type writerAt struct {
 	w   client.WriterInfo
 	can []string // the verbs the grant allows there (§7.4 can); nil if not said
-	// cat is what it says of a catalog namespace (§7.4 catalog), nil if
-	// nothing; v056: the answer is from a core that says it (it says
-	// operator), so nothing means no catalog
-	cat  *client.CatalogInfo
-	v056 bool
-	err  error
-	at   time.Time
-}
-
-// nsDocAt is what a namespace's document said to a token, at at.
-type nsDocAt struct {
-	trust   []string
-	files   *treeFiles
-	notTree string
-	titled  bool
-	readErr error
-	at      time.Time
-}
-
-// treeFiles is a catalog's catalog.files (§H.2): the content namespace
-// new files are created in, the folder node whose children are the
-// tree's top level, and the schemas new folder and placement nodes
-// carry as $schema ("" for none).
-type treeFiles struct {
-	ns, root, folder, placement string
-}
-
-// filesOf reads catalog.files from a namespace document's catalog
-// object, or says why it makes no file tree.
-func filesOf(cat map[string]any) (*treeFiles, string) {
-	m, ok := cat["files"].(map[string]any)
-	if !ok {
-		return nil, "its namespace document has no catalog.files (§H.2, §7.4), so it isn't a file tree: its placements have no file names to show"
-	}
-	f := &treeFiles{}
-	f.ns, _ = m["ns"].(string)
-	f.root, _ = m["root"].(string)
-	f.folder, _ = m["folder"].(string)
-	f.placement, _ = m["placement"].(string)
-	switch {
-	case !client.ValidNSName(f.ns):
-		return nil, fmt.Sprintf("its catalog.files.ns, %q, isn't a namespace name (§3.6)", f.ns)
-	case !folderName(f.root):
-		return nil, fmt.Sprintf("its catalog.files.root, %q, can't name a folder node: a resource name without a dot (§3.6, §B.2)", f.root)
-	}
-	return f, ""
+	err error
+	at  time.Time
 }
 
 // nsInfo returns what writes to ns need (nsInfo) as tk is given it:
-// §7.4's writer block, asked at most every writerTTL, and a catalog's
-// document, read at most every 30 seconds. Writer settings tk isn't given
+// §7.4's writer block, asked at most every writerTTL. Writer settings tk isn't given
 // (GET /ns/{ns}/principal refused) mean a fresh $nonce on every write
 // (client.NeedsNonce, §C.7).
 func (s *Server) nsInfo(ctx context.Context, tk *token, ns string) nsInfo {
@@ -289,20 +283,18 @@ func (tk *token) keepWriter(ns string, pi *client.PrincipalInfo, now time.Time) 
 
 // writerOf is what nsInfo keeps of principal answer pi, given at now.
 func writerOf(pi *client.PrincipalInfo, now time.Time) writerAt {
-	wa := writerAt{w: pi.Writer, at: now, cat: pi.Catalog}
+	wa := writerAt{w: pi.Writer, at: now}
 	if _, said := pi.Raw["can"].([]any); said {
 		wa.can = append([]string{}, pi.Can...)
 	}
-	_, wa.v056 = pi.Raw["operator"].(bool)
 	return wa
 }
 
-// forgetNS drops what tk was given of ns (its writer block, its
-// document), so the next nsInfo asks again.
+// forgetNS drops what tk was given of ns (its writer block), so the next
+// nsInfo asks again.
 func (tk *token) forgetNS(ns string) {
 	tk.mu.Lock()
 	delete(tk.writers, ns)
-	delete(tk.docs, ns)
 	tk.mu.Unlock()
 }
 
@@ -333,7 +325,7 @@ func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, e
 		pi, err := tk.c.NSPrincipal(ctx, ns)
 		switch {
 		case transient(err):
-			return nsInfo{nonce: true}, err
+			return nsInfo{nonce: true, tree: s.trees[ns]}, err
 		case err != nil:
 			wa = writerAt{err: err, at: now}
 		default:
@@ -344,7 +336,7 @@ func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, e
 		tk.writers[ns] = wa
 		tk.mu.Unlock()
 	}
-	in := nsInfo{nonce: true}
+	in := nsInfo{nonce: true, tree: s.trees[ns]}
 	if wa.err == nil {
 		w := wa.w
 		in.sealed = w.Level == "sealed" || w.Level == "e2e"
@@ -361,76 +353,7 @@ func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, e
 			}
 		}
 	}
-	if s.cats[ns] {
-		d, err := s.nsDoc(ctx, tk, ns)
-		if err != nil {
-			return nsInfo{nonce: true}, err
-		}
-		in.titled, in.readErr = d.titled, d.readErr
-		switch c := wa.cat; {
-		case d.readErr == nil:
-			// The document, read whole: what /principal says to a grant
-			// with unrestricted read of it.
-			in.trust, in.trustKnown, in.files, in.notTree = d.trust, true, d.files, d.notTree
-		case wa.err == nil && c != nil:
-			// What /principal says the catalog is (§7.4): every grant the
-			// ns check passes learns its file tree and trust, to one
-			// without unrestricted read files without x- members and
-			// whether files.ns is trusted only (§H.7 "Limited grants").
-			in.files, in.notTree = filesOf(map[string]any{"files": c.Files})
-			switch {
-			case c.Trust != nil:
-				in.trust, in.trustKnown = c.Trust, true
-			case c.Trusted != nil && *c.Trusted && in.files != nil:
-				in.trust = []string{in.files.ns}
-			}
-		case wa.err == nil && wa.v056:
-			in.notTree = "its namespace document has no catalog (§B.6, §7.4), so it isn't a file tree"
-		}
-	}
 	return in, nil
-}
-
-// nsDoc returns what ns's document says, read with tk's grant at most
-// every 30 seconds: a catalog's trust list and file tree, and whether tk
-// reads it (readErr). A failure for now (transient) is the error.
-func (s *Server) nsDoc(ctx context.Context, tk *token, ns string) (nsDocAt, error) {
-	now := s.opt.Now()
-	tk.mu.Lock()
-	d, ok := tk.docs[ns]
-	tk.mu.Unlock()
-	if ok && now.Sub(d.at) < 30*time.Second {
-		return d, nil
-	}
-	d = nsDocAt{at: now}
-	h, err := tk.c.NSHead(ctx, ns)
-	var doc *client.NSDoc
-	if err == nil {
-		doc, err = tk.c.NSDoc(ctx, ns, h.ID)
-	}
-	switch {
-	case errors.Is(err, client.ErrNoKeys):
-		// Sealed (§H.7): its writer block says so.
-		d.readErr = err
-	case transient(err):
-		return nsDocAt{}, err
-	case err != nil:
-		d.readErr = err
-	default:
-		cat, _ := doc.Value["catalog"].(map[string]any)
-		ts, _ := cat["trust"].([]any)
-		for _, t := range ts {
-			if t, ok := t.(string); ok {
-				d.trust = append(d.trust, t)
-			}
-		}
-		d.files, d.notTree = filesOf(cat)
-		_, d.titled = cat["title"]
-	}
-	tk.mu.Lock()
-	tk.docs[ns] = d
-	tk.mu.Unlock()
-	return d, nil
 }
 
 // headDoc is a live resource's head, the time it was written where a

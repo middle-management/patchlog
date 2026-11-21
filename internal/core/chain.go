@@ -9,8 +9,8 @@ import (
 // A branch's chain of bases, read once per transaction.
 //
 // A request in a branch of a branch of … asks for its bases again and
-// again: the keys and revocations that follow each base (§C.4), whether a
-// base is a remote one's shadow, the root its drafts serve, every name it
+// again: the keys and revocations that follow each base (§C.4), the root
+// its drafts serve, every name it
 // reads through. One statement per base and use made a request cost in
 // proportion to the branch's depth. A transaction now reads the chain in
 // one recursive statement and keeps it until it ends, in two forms:
@@ -52,10 +52,6 @@ import (
 // a base's namespace document takes effect with the next transaction of
 // any instance, as before.
 //
-// The rows kept end at the first remote shadow of the chain (§G.3), which
-// they include: keys and revocations stop there, and what reads on through
-// it asks for the next stretch from there.
-//
 // nsByID is unchanged: in a write transaction it reads the row again, for
 // the callers that read a namespace after changing it or need its head.
 
@@ -67,7 +63,6 @@ type nsLink struct {
 }
 
 func (l nsLink) isBranch() bool { return l.base.Valid }
-func (l nsLink) isShadow() bool { return strings.HasPrefix(l.name, "~") }
 
 func linkOf(n *nsRow) nsLink { return nsLink{n.id, n.name, n.base} }
 
@@ -100,8 +95,7 @@ func (t *tx) link(id int64) nsLink {
 	return l
 }
 
-// readChain reads the chain of bases from id up, through remote shadows
-// too: the links, and where rows change only by this transaction's own
+// readChain reads the chain of bases from id up: the links, and where rows change only by this transaction's own
 // statements (snapshotRows) the rows as well, which costs nothing more.
 func (t *tx) readChain(id int64) {
 	cols, colsN := `ns, name, base`, `n.ns, n.name, n.base`
@@ -259,8 +253,7 @@ func (t *tx) base(n *nsRow) *nsRow {
 	return b
 }
 
-// keepChain reads and keeps the rows of the chain from id up to its root
-// or its first remote shadow.
+// keepChain reads and keeps the rows of the chain from id up to its root.
 func (t *tx) keepChain(id int64) {
 	if t.snapshotRows() {
 		t.readChain(id)
@@ -272,7 +265,7 @@ func (t *tx) keepChain(id int64) {
 	for l := t.link(id); ; l = t.link(l.base.Int64) {
 		ids = append(ids, l.id)
 		want[lockKey(l.id)] = lockShared
-		if !l.isBranch() || l.isShadow() {
+		if !l.isBranch() {
 			break
 		}
 	}
@@ -297,7 +290,7 @@ func (t *tx) seedResources(base *nsRow, name string) {
 		return
 	}
 	ids := []int64{base.id}
-	for l := linkOf(base); l.isBranch() && !l.isShadow(); {
+	for l := linkOf(base); l.isBranch(); {
 		n, ok := t.keptRow(l.base.Int64)
 		if !ok {
 			break

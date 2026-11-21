@@ -28,7 +28,7 @@ func TestCacheDropV073P37(t *testing.T) {
 	for _, v := range []struct {
 		view string
 		json bool
-	}{{"/n/at/1", false}, {"/n/g/x/at/1", false}, {"/n/at/1?q=a", true}} {
+	}{{"/n/at/1", false}, {"/n/view/x/at/1", false}, {"/n/at/1?q=a", true}} {
 		if _, err := c.Put(ctx, v.view, "n", "1", Stored{Body: []byte(v.view), JSON: v.json, Tags: "idx:n"}); err != nil {
 			t.Fatal(err)
 		}
@@ -41,7 +41,7 @@ func TestCacheDropV073P37(t *testing.T) {
 		if _, ok := c.Get(ctx, "/n/at/1"); ok {
 			t.Error("a dropped view is still stored")
 		}
-		for _, v := range []string{"/n/g/x/at/1", "/n/at/1?q=a"} {
+		for _, v := range []string{"/n/view/x/at/1", "/n/at/1?q=a"} {
 			if _, ok := c.Get(ctx, v); !ok {
 				t.Errorf("%s was dropped", v)
 			}

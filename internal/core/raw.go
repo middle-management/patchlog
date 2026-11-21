@@ -35,8 +35,12 @@ func (e *Engine) ResourceRaw(ctx context.Context, ns, name, id string, cred Cred
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, name); err != nil {
+		a, err := t.reader(n, cred, name)
+		if err != nil {
 			return err
+		}
+		if t.readsByDoc(n, a) && (n.purged || t.nsLevel(n) >= levelSealed) {
+			return notFound() // judged with a null document (§6.4.1)
 		}
 		if n.purged {
 			return t.purgedRead(n)
@@ -52,15 +56,18 @@ func (e *Engine) ResourceRaw(ctx context.Context, ns, name, id string, cred Cred
 	if err != nil {
 		return nil, err
 	}
+	// …/rev/{id}/raw of a partial reader is served under its view; /raw
+	// names no revision and stays at its own URL (§7.9 Content).
+	content := "/rev/" + id + "/raw"
 	if id == "" {
 		h, err := e.ResourceHead(ctx, ns, name, cred)
 		if err != nil || h.State != Live {
 			out.Head = h
 			return out, err
 		}
-		out.Head, id = h, h.Head
+		out.Head, id, content = h, h.Head, ""
 	}
-	rev, err := e.ResourceRev(ctx, ns, name, id, cred)
+	rev, err := e.resourceRev(ctx, ns, name, id, cred, content)
 	if err != nil {
 		return nil, err
 	}

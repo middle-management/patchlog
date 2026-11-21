@@ -1,6 +1,5 @@
-// Package derived is what the consumer services (the index of Addendum A,
-// the tree and catalog services of Addendum B) share for encrypted source
-// namespaces (Addendum E): reading them with keys, and sealing the views
+// Package derived is what the consumer services (the index of Addendum A
+// and the WebDAV gateway) share for encrypted source namespaces (Addendum E): reading them with keys, and sealing the views
 // they derive from them (§E.2.5, §E.2.6, §E.3.2).
 //
 // Reading. A sealed (E2) namespace is read with the service's own grant and

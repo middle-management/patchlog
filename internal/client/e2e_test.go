@@ -43,7 +43,7 @@ func testE2EClient(t *testing.T) {
 		"encryption": map[string]any{"level": "e2e"}}))
 	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "schemas"))).CreateNamespace(ctx, "schemas", map[string]any{"read": "public", "keys": []any{admin.Entry("*")}}))
 
-	all := []string{"read", "create", "append", "restore", "delete", "config", "branch", "purge", "prune", "export"}
+	all := []string{"read", "create", "append", "restore", "delete", "config", "branch", "purge", "prune"}
 	adminJWK, adminPriv, _ := seal.GenerateRecipient()
 	writerJWK, writerPriv, _ := seal.GenerateRecipient()
 	readerJWK, readerPriv, _ := seal.GenerateRecipient()

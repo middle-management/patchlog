@@ -4,40 +4,36 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/middle-management/patchlog/internal/core"
 )
 
-// v82encFilteredLog is the gs and at a partial reader's unfiltered log of
+// v82encFilteredLog is the view and at a partial reader's unfiltered log of
 // matches redirects to. A purged namespace's log still redirects, where
-// its /heads no longer does (§B.11.9 Purged namespaces).
-func v82encFilteredLog(w *v75s, bearer string) (gs, at string) {
+// its /heads no longer does (§7.9 Purged namespaces).
+func v82encFilteredLog(w *v75s, bearer string) (vid, at string) {
 	w.t.Helper()
 	r := w.get("/ns/matches/rev/"+w.nsHead("matches", w.admin)+"/log", bearer)
 	expect(w.t, r, 302)
 	loc := r.H.Get("Location")
 	parts := strings.Split(strings.SplitN(loc, "?", 2)[0], "/")
-	if len(parts) != 8 || parts[3] != "g" || parts[5] != "at" || parts[7] != "log" {
+	if len(parts) != 8 || parts[3] != "view" || parts[5] != "at" || parts[7] != "log" {
 		w.t.Fatalf("Location %q", loc)
 	}
 	return parts[4], parts[6]
 }
 
-// ACC-8a (SERVICES §B.11.9 Purged namespaces, SPEC §8.5; scenario 124):
+// ACC-8a (SERVICES §7.9 Purged namespaces, SPEC §8.5; scenario 124):
 // a partial reader's unfiltered /heads of a covered namespace that is
-// purged is 410 purged, with head, at once: no 302 and no Location, and
-// no at is recorded. The read check comes first: without a grant 401, and
+// purged is 410 purged, with head, at once: no 302 and no Location. The read check comes first: without a grant 401, and
 // a grant whose read is refused 403, neither with head. The unfiltered
 // log of the purged namespace still redirects.
 func TestV082PurgedHeadsPartialReader410(t *testing.T) {
 	t.Parallel()
-	var path string
-	w := newV75s(t, v75sOpts{env: []envOpt{withFileDB(t), func(o *core.Options) { path = o.Path }}})
+	w := newV75s(t, v75sOpts{})
 	w.seed([]string{"derby"}, nil, []string{"derby"})
 	li := w.li()
 	// Before the purge: the 302 to the filtered form, as ever.
 	before := w.nsHead("matches", w.admin)
-	if r := w.get("/ns/matches/rev/"+before+"/heads", li); r.Code != 302 || !strings.Contains(r.H.Get("Location"), "/ns/matches/g/") {
+	if r := w.get("/ns/matches/rev/"+before+"/heads", li); r.Code != 302 || !strings.Contains(r.H.Get("Location"), "/ns/matches/view/") {
 		t.Fatalf("before the purge: %d %v", r.Code, r.H)
 	}
 	opg := mint(t, w.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"matches"}, "can": []any{"purge-ns"},
@@ -45,8 +41,6 @@ func TestV082PurgedHeadsPartialReader410(t *testing.T) {
 	expect(t, w.patchNS("matches", ops(op("add", "/frozen", true)), w.admin), 201)
 	expect(t, w.do(req{method: "POST", path: "/ns/matches/purge?force=1", ifMatch: w.nsHead("matches", w.admin), bearer: opg}), 204)
 	purgeNS := w.nsHead("matches", w.admin)
-	db, pg := v0261DB(t, path)
-	ats := v0261Count(t, db, pg, `SELECT COUNT(*) FROM filtered_ats`)
 	bogus := "1nyv2d2ibcop4nnp4k5niguadz7lvyjad"
 	for _, id := range []string{purgeNS, before, bogus} {
 		r := w.get("/ns/matches/rev/"+id+"/heads", li)
@@ -60,9 +54,6 @@ func TestV082PurgedHeadsPartialReader410(t *testing.T) {
 		if string(u.Body) != string(r.Body) || u.H.Get("Cache-Control") != r.H.Get("Cache-Control") {
 			t.Fatalf("/heads at %s: partial %v %s, unrestricted %v %s", id, r.H, r.Body, u.H, u.Body)
 		}
-	}
-	if n := v0261Count(t, db, pg, `SELECT COUNT(*) FROM filtered_ats`); n != ats {
-		t.Fatalf("the 410 recorded an at: %d rows, were %d", n, ats)
 	}
 	// The read check first.
 	if r := w.get("/ns/matches/rev/"+purgeNS+"/heads", ""); r.Code != 401 || r.Obj()["head"] != nil {
@@ -80,6 +71,6 @@ func TestV082PurgedHeadsPartialReader410(t *testing.T) {
 	}
 	// The unfiltered log still redirects, and the filtered /heads it
 	// leads to answers the same 410.
-	gs, at := v82encFilteredLog(w, li)
-	expectCode(t, w.get("/ns/matches/g/"+gs+"/at/"+at+"/heads", li), 410, "purged")
+	vid, at := v82encFilteredLog(w, li)
+	expectCode(t, w.get("/ns/matches/view/"+vid+"/at/"+at+"/heads", li), 410, "purged")
 }

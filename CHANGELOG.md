@@ -2,6 +2,60 @@
 
 ## Unreleased
 
+Spec v0.87: catalogs, the tree service and remote branches go; filtered reads move into the
+core, decided by the grant's own read rules. About 86,000 lines are removed and 13,000 added.
+
+- **Removed: catalogs and the tree service** (the former SERVICES Addendum B), with
+  `requireAt`, `maxLag` and a grant's `at`; the namespace document's `catalog`, `catalogs` and
+  `maxLag` members, which are now refused as unknown; `catalog` in `/principal`; the tree
+  proxy; `patchlog tree`; and the catalog flags of `serve`, `index`, `release` and `dav`. The
+  index mints its own edge cookies, which the tree service's edge code did before.
+- **Removed: remote branches and the `export` verb** (the former §G.3 and §G.5.2), with
+  `remoteRegistration`, the registration endpoint and the `serve --remote-*` flags. A key or
+  grant listing `export` is refused as an unknown verb. `GET /ns/{ns}/branches` lists local
+  branches only. Bundles (`patchlog export`, `import`, `bundle`) are unchanged.
+- **Filtered reads are in the core (§7.9),** at `/ns/{ns}/view/{view}/at/{ns_id}/heads` and
+  `…/log`, `/ns/{ns}/view/{view}/log` and `…/events`, and a resource's revisions, `/raw` and
+  blobs under the same prefix. A partial reader is one whose read rules test `/doc` or an
+  unfixed `/resource`. `view` is the hash of `scope:` and `key:` alone, so readers with the
+  same rules share a view's answers at the CDN. A document leaving a view shows as a `hidden`
+  entry. The client follows a partial reader's `302` to the view and, after a `hidden` entry or
+  on first seeing a resource mid-history, fetches the document instead of folding patches.
+- **Every read is judged per revision.** Read envelopes carry `doc`, the revision's document
+  (a tombstone's is the document it deleted; purged, pruned and never judged, sealed and
+  end-to-end revisions have `null`), so a read rule may test `/doc/folder`. A revision's
+  answer under a reader's rules is kept, also once pruning drops the document. Blobs are
+  judged by the revisions that reference them.
+- **A grant that may read but can't read a resource's head can't write it** (§6.2 step 2.2):
+  `403` before preconditions, dry runs and failure reports included.
+- **Imports follow the purges of trusted origins** (§G.1). `serve --follow-purges-from ORIGIN`
+  (repeatable, with `--follow-purges-bearer`, `--follow-purges-url` and
+  `--follow-purges-interval`, default 5 minutes) reads each trusted origin's namespace log from
+  the first import's `source.at`, and applies each `purge` of an imported name, and each
+  `purge-ns` to every imported name, as a local purge does. These entries are written by the
+  server, without `grant` or `via`. A purge refused as `in_use` waits for an operator and is
+  retried at every follow.
+- **WebDAV file trees on documents** (TOOLS Addendum H). `patchlog dav --tree NS --index URL`
+  serves a namespace's `{folder, name, content}` documents as a tree, listed through the index.
+  A rename or move is a `replace` of `folder` and `name`, and names a lagging index returns are
+  checked against the documents before any write. `patchlog schema file` prints the file
+  schema, and `--create` writes it.
+- **Releases in three steps** (TOOLS §F.9): schemas, content, then an optional publishing step
+  (`merge release plan --publish PTR`) that sets a field such as `published` last. The plan is
+  stored before the first batch and a stopped merge resumes from it. The plan digest is
+  `{release, batches}`.
+- **Migrations:**
+  - **Core, Postgres:** `026`–`029`.
+  - **Core, SQLite:** `025`–`028`.
+
+  Between them, they:
+  - drop the remote-branch tables and the old checkpoint store of filtered reads;
+  - add `read_judged` and the per-view records;
+  - add the purge follows.
+
+  **Index, SQLite:** `014`–`017`. The catalog's and tree service's own databases are no longer
+  used.
+
 - **A purge doesn't read the branches it has no work in.** A purge in a base looked every
   branch below it up by key, to learn whether it held the purged document or might read it
   through: about 0.005 ms a branch, 54 ms on Postgres with 10,000 branches that didn't see

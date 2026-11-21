@@ -275,7 +275,7 @@ func TestI22SealedEventsServed(t *testing.T) {
 }
 
 // I.23 (SERVICES §E.2.6, §A.5): the view string an index on its own origin
-// serves demo at, for I.8's gs (an input only: no index serves a whole
+// serves demo at, for I.8's view (an input only: no index serves a whole
 // reader there) and ns_id₂ and the query q = "a b", sort = "/title", built
 // as the index builds it (the path, then derived.CanonicalQuery without
 // min); the view key of K_r (seal.ViewKey); the hit's values sealed under
@@ -287,10 +287,10 @@ func TestI22SealedEventsServed(t *testing.T) {
 func TestI23ViewKey(t *testing.T) {
 	t.Parallel()
 	p := loadAddendumI(t).I23
-	gs := grantcheck.SubjectSetID([]string{"group:match-desk", "user:anna"}) // I.8's
-	// The premise is illustrative, like §I.19's plaintexts: I.8's gs is a
+	vid := grantcheck.ViewID([]string{"group:match-desk", "user:anna"}) // I.8's
+	// The premise is illustrative, like §I.19's plaintexts: I.8's view is a
 	// set of two principals, and the reference serves a response sealed
-	// whole only at a gs every reader of which reads the namespace whole,
+	// whole only at a view every reader of which reads the namespace whole,
 	// that of a reads:demo:{k} marker (SERVICES §E.2.6 Whole-response
 	// sealing, §A.4; v0.85), which is no set of principals. The bytes
 	// don't depend on it.
@@ -299,7 +299,7 @@ func TestI23ViewKey(t *testing.T) {
 	if cq != "?"+p.CanonicalQuery {
 		t.Errorf("the canonical query is %s, want ?%s", cq, p.CanonicalQuery)
 	}
-	view := "/demo/g/" + gs + "/at/" + nsID2 + cq
+	view := "/demo/view/" + vid + "/at/" + nsID2 + cq
 	if view != p.View {
 		t.Fatalf("view\n%s\nwant\n%s", view, p.View)
 	}

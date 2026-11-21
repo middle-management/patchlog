@@ -219,7 +219,7 @@ func (e *Engine) ApplyRetention(ctx context.Context) (*RetentionReport, error) {
 	type target struct{ ns, name string }
 	var targets []target
 	err := e.read(ctx, func(t *tx) error {
-		rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND base IS NULL AND name NOT LIKE '~%' ORDER BY name`)
+		rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND base IS NULL ORDER BY name`)
 		t.must(err)
 		var all []*nsRow
 		for rows.Next() {
@@ -274,7 +274,7 @@ func (e *Engine) ApplyRetention(ctx context.Context) (*RetentionReport, error) {
 
 func (t *tx) applyRetention(nsName, name string) (checked, pruned bool, err error) {
 	n := t.nsForWrite(nsName)
-	if n == nil || n.purged || n.isBranch() || n.isShadow() {
+	if n == nil || n.purged || n.isBranch() {
 		return false, false, nil
 	}
 	cfg := t.config(n.configSeq)

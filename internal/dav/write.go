@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -55,7 +56,7 @@ func dropNonce(doc any) any {
 // (§C.7), to doc, the document they result in, if its root is an object
 // that can carry one (nil: unknown, taken as one).
 func withNonce(in nsInfo, doc any, patches []any) []any {
-	if _, obj := doc.(map[string]any); !in.nonce || doc != nil && !obj {
+	if _, obj := doc.(map[string]any); !in.nonce || doc != nil && !obj && !in.tree {
 		return patches
 	}
 	return append(patches, map[string]any{"op": "add", "path": seal.NoncePath, "value": seal.NewNonce()})
@@ -65,7 +66,7 @@ func withNonce(in nsInfo, doc any, patches []any) []any {
 // required (§C.7): its root must be an object, which carries $nonce
 // (§H.1).
 func rootRefused(in nsInfo, ns string, v any) error {
-	if _, obj := v.(map[string]any); obj || !in.nonceRequired {
+	if _, obj := v.(map[string]any); obj || !in.nonceRequired || in.tree {
 		return nil
 	}
 	return fail(http.StatusUnprocessableEntity, "namespace %s requires a fresh $nonce in every write (§C.7), which a JSON file carries at its root, so its root must be an object, not %s (§H.1); nothing was written", ns, jsonKind(v))
@@ -146,6 +147,8 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 			return false, taken(ns, name)
 		case h.State == client.Purged:
 			return false, purgedErr(ns, name)
+		case in.tree && h.State != client.Live:
+			return false, treeGone(st.path)
 		case h.State == client.Live:
 			if o.pre && st.noneMatch {
 				return false, fail(http.StatusPreconditionFailed, "%s/%s exists (If-None-Match: *)", ns, name)
@@ -429,10 +432,10 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	if whole {
 		ps = wholeDoc(in, cur.value, out)
 	}
-	res, err := st.tk.c.Append(ctx, ns, name, head, ps)
+	res, err := st.appendFile(ctx, in, ns, name, head, ps)
 	if atHead && !whole && setTooLarge(err) {
 		ps = wholeDoc(in, cur.value, out)
-		res, err = st.tk.c.Append(ctx, ns, name, head, ps)
+		res, err = st.appendFile(ctx, in, ns, name, head, ps)
 	}
 	err = tooLarge(err, atHead)
 	switch {
@@ -837,7 +840,10 @@ func (st *reqState) spans(ctx context.Context, ns, name, headRev string, cs []ca
 		case err != nil:
 			return nil, saveRead(err)
 		}
-		ws := logWrites(base.value, es)
+		ws := logWrites(base.root(), es)
+		if base.tree {
+			ws = contentWrites(ws)
+		}
 		// Each candidate's span is that of the entries after its
 		// revision: from the last entry back.
 		var acc span
@@ -1144,6 +1150,13 @@ func graft(doc, src any, p pointer.Pointer) (any, bool) {
 // replaces the whole document, so its parent is any object.
 func (st *reqState) wrote(ns, name string, parent any, ps []any, paths []pointer.Pointer, res *client.WriteResult, v any, body []byte, same func(doc any) bool) bool {
 	var doc any
+	tree := st.s.trees[ns]
+	if tree {
+		// A tree file's patch set is its content's, but for the $nonce
+		// the document carries (withNonce): what it holds now is parent
+		// with the rest applied.
+		ps = slices.DeleteFunc(slices.Clone(ps), nonceOp)
+	}
 	if ops, err := patch.Parse(ps); err == nil {
 		doc, _, err = patch.Apply(parent, true, ops, patch.Options{})
 		if err != nil {
@@ -1160,8 +1173,14 @@ func (st *reqState) wrote(ns, name string, parent any, ps []any, paths []pointer
 		if res.Entry != nil {
 			created, _ = time.Parse(time.RFC3339Nano, res.Entry.Created)
 		}
-		e = newEntry(doc, created)
-		st.s.keep(docKey(ns, name, res.ID), e)
+		if tree {
+			// The content alone: the document, its place included, is read
+			// when needed, not kept from here.
+			e = contentEntry(doc, created)
+		} else {
+			e = newEntry(doc, created)
+			st.s.keep(docKey(ns, name, res.ID), e)
+		}
 	}
 	if exact {
 		r.raw = keepRaw(body, e.rendered)
@@ -1286,12 +1305,6 @@ func (st *reqState) undoOwnDelete(ctx context.Context, t target, err error) erro
 	}
 	if t.rawName != "" {
 		todo = append(todo, res{t.docNS, t.rawName})
-	}
-	if d, ok := st.p.treeDeleted(t.path, st.s.opt.Now()); ok && t.kind == kNewNode && d.cat == t.ns {
-		todo = append(todo, res{d.cat, d.node})
-		if d.itemTomb != "" {
-			todo = append(todo, res{d.itemNS, d.itemName})
-		}
 	}
 	for _, r := range todo {
 		if !st.p.deletedOwn(r.ns, r.name, "", st.s.opt.Now()) {

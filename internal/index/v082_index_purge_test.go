@@ -11,13 +11,13 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/index"
 	"github.com/middle-management/patchlog/internal/seal"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // V82-05 (v0.82), SVC-10 and SPEC §8.5: the 410 of a purged namespace,
 // with the purge's head, is for a request that passes the read check. A
-// cookie that had ended (SERVICES §A.4 gs, §B.11.9 gs), or that no key
+// cookie that had ended (SERVICES §A.4 view, §7.9 view), or that no key
 // was recorded for with its entry, doesn't pass it once the namespace is
 // purged either: it is 403 as before, and a cookie that held is 410.
 
@@ -38,12 +38,12 @@ func v82Plant(t *testing.T, x *svc, how string) {
 	ctx := context.Background()
 	switch how {
 	case "no row": // as every cookie minted before migration 011
-		if n := must(x.ix.ExecForTest(ctx, `DELETE FROM edge_gs_keys`)); n == 0 {
-			t.Fatal("no edge_gs_keys row")
+		if n := must(x.ix.ExecForTest(ctx, `DELETE FROM edge_view_keys`)); n == 0 {
+			t.Fatal("no edge_view_keys row")
 		}
 	case "no entry": // an exchange that couldn't vouch for its key's entry
-		if n := must(x.ix.ExecForTest(ctx, `UPDATE edge_gs_keys SET entry = ''`)); n == 0 {
-			t.Fatal("no edge_gs_keys row")
+		if n := must(x.ix.ExecForTest(ctx, `UPDATE edge_view_keys SET entry = ''`)); n == 0 {
+			t.Fatal("no edge_view_keys row")
 		}
 	}
 }
@@ -95,7 +95,7 @@ func TestV082EndedCookiePurged(t *testing.T) {
 }
 
 // TestV082EndedGCookiePurged: the same for a cookie of
-// reads:matches:g:{gs} (§B.11.9), which has no checkpoint left to be
+// reads:matches:g:{view} (§7.9), which has no checkpoint left to be
 // judged at once matches is purged: by the document matches had.
 func TestV082EndedGCookiePurged(t *testing.T) {
 	t.Parallel()
@@ -152,7 +152,7 @@ func TestV082EndedCookieSealedPurged(t *testing.T) {
 				client.WithKeys(client.NewKeys(priv)))
 			x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, untyped: true, now: s.Now}, func(o *indexOpts) {
 				o.Recipient = priv
-				o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate
+				o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate
 			})
 			x.caughtUp("sec")
 			r := p37Do(t, x, "POST", "/edge-grants", k.Grant(t, s.Now(), "user:r", []string{"sec"}, []string{"read"}), "", nil, "")
@@ -161,7 +161,7 @@ func TestV082EndedCookieSealedPurged(t *testing.T) {
 			}
 			var path string
 			for _, p := range r.body["prefixes"].([]any) {
-				if strings.HasPrefix(p.(string), "/sec/g/") {
+				if strings.HasPrefix(p.(string), "/sec/view/") {
 					path = p.(string) + "?q=secret"
 				}
 			}

@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/middle-management/patchlog/internal/catvis"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
@@ -17,15 +16,15 @@ import (
 func v077xCookie(t *testing.T, w *v75World, cred Credentials) (Credentials, string) {
 	t.Helper()
 	res, err := w.e.IssueEdgeGrants(context.Background(), []string{cred.Bearer})
-	if err != nil || len(res.Grants) != 1 || res.Grants[0].GS == "" {
+	if err != nil || len(res.Grants) != 1 || res.Grants[0].View == "" {
 		t.Fatalf("exchange: %+v %v", res, err)
 	}
 	g := res.Grants[0]
-	return Credentials{Edge: &EdgeGrant{NS: g.NS, GS: g.GS, Prefix: "/ns/" + g.NS + "/g/" + g.GS, Exp: w.now().Add(10 * time.Minute)}}, g.GS
+	return Credentials{Edge: &EdgeGrant{NS: g.NS, View: g.View, Prefix: "/ns/" + g.NS + "/view/" + g.View, Exp: w.now().Add(10 * time.Minute)}}, g.View
 }
 
-// Tree-derived access 111: li through access-02, bo through catalog-01,
-// same deciding subjects and rules -> different gs. access-02's pub then
+// Access 111: li through access-02, bo through reader-01,
+// same deciding subjects and rules -> different view. access-02's pub then
 // changes and a third reader exchanges under the new key -> li's old
 // cookie at a later at -> 403; her exchange under the old grant -> 401.
 func TestV077XconfScenario111(t *testing.T) {
@@ -33,28 +32,28 @@ func TestV077XconfScenario111(t *testing.T) {
 	a2Pub, a2Priv := grant.GenerateKey()
 	w := newV75World(t, v75Opts{matches: func(doc map[string]any) {
 		doc["keys"] = append(doc["keys"].([]any), map[string]any{"kid": "access-02", "alg": "ed25519", "pub": a2Pub,
-			"can": []any{"read"}, "requireAt": "cat-season", "maxTtl": "PT15M",
+			"can": []any{"read"}, "maxTtl": "PT15M",
 			"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}}})
 	}})
 	w.seed()
 	grantBy := func(priv []byte, kid, sub string) Credentials {
 		return w.cred(priv, map[string]any{"kid": kid, "sub": sub, "groups": []any{"editors", "interns"}, "roles": []any{"reader"},
-			"ns": []any{"matches"}, "can": []any{"read"}, "at": map[string]any{"ns": "cat-season", "id": w.head("cat-season")},
+			"ns": []any{"matches"}, "can": []any{"read"},
 			"exp": w.now().Add(10 * time.Minute).UTC().Format(time.RFC3339)})
 	}
 	li := grantBy(a2Priv, "access-02", "user:li")
-	bo := grantBy(w.catPriv, "catalog-01", "user:li")
-	liCookie, liGS := v077xCookie(t, w, li)
-	_, boGS := v077xCookie(t, w, bo)
-	if liGS == boGS {
-		t.Fatalf("same gs %s through two keys", liGS)
+	bo := grantBy(w.catPriv, "reader-01", "user:li")
+	liCookie, liView := v077xCookie(t, w, li)
+	_, boView := v077xCookie(t, w, bo)
+	if liView == boView {
+		t.Fatalf("same vid %s through two keys", liView)
 	}
 	newPub, newPriv := grant.GenerateKey()
 	w.patchConfig("matches", map[string]any{"op": "replace", "path": "/keys/2/pub", "value": newPub})
 	third := grantBy(newPriv, "access-02", "user:zed")
 	v077xCookie(t, w, third)
 	w.put("matches", "later", map[string]any{"title": "x"})
-	if red, st := v76fRedirect(t, w, "matches", liGS, liCookie); st != 403 {
+	if red, st := v76fRedirect(t, w, "matches", liView, liCookie); st != 403 {
 		t.Errorf("li's old cookie after access-02's pub changed: %+v %d, want 403", red, st)
 	}
 	if _, err := w.e.IssueEdgeGrants(context.Background(), []string{li.Bearer}); v75Status(err) != 401 {
@@ -62,26 +61,26 @@ func TestV077XconfScenario111(t *testing.T) {
 	}
 }
 
-// Tree-derived access 112 (key half): matches keeps catalog-01 but drops
+// Tree-derived access 112 (key half): matches keeps reader-01 but drops
 // read from its can -> li on her cookie at a later at -> 403.
 func TestV077XconfScenario112Key(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
 	w.seed()
-	cookie, gs := v077xCookie(t, w, w.li())
-	if red, st := v76fRedirect(t, w, "matches", gs, cookie); red == nil {
+	cookie, vid := v077xCookie(t, w, w.li())
+	if red, st := v76fRedirect(t, w, "matches", vid, cookie); red == nil {
 		t.Fatalf("before: %d", st)
 	}
 	w.patchConfig("matches", map[string]any{"op": "replace", "path": "/keys/1/can", "value": []any{"create"}})
-	if red, st := v76fRedirect(t, w, "matches", gs, cookie); st != 403 {
-		t.Errorf("after catalog-01 lost read: %+v %d, want 403", red, st)
+	if red, st := v76fRedirect(t, w, "matches", vid, cookie); st != 403 {
+		t.Errorf("after reader-01 lost read: %+v %d, want 403", red, st)
 	}
 }
 
 // Tree-derived access 113 (origin half): after matches-r7 is created,
-// matches edits only catalog-01's maxTtl -> a partial reader of the branch
-// -> filtered /heads 403; the exchange gives no /ns/matches-r7/g/{gs}.
-// Since v0.78 no branch is covered (§B.11.9 Where), before the edit too.
+// matches edits only reader-01's maxTtl -> a partial reader of the branch
+// -> filtered /heads 403; the exchange gives no /ns/matches-r7/view/{view}.
+// Since v0.78 no branch is covered (§7.9 Where), before the edit too.
 func TestV077XconfScenario113(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -94,16 +93,16 @@ func TestV077XconfScenario113(t *testing.T) {
 	if _, st := v76fRedirect(t, w, "matches-r7", "", r7); st != 403 {
 		t.Fatalf("branch before: %d, want 403", st)
 	}
-	gs := v075GS(t, w, w.li())
+	vid := v075ViewID(t, w, w.li())
 	w.patchConfig("matches", map[string]any{"op": "replace", "path": "/keys/1/maxTtl", "value": "PT14M"})
-	if st := v75Status(w.e.FilteredCurrent(ctx, "matches-r7", gs, "/heads", r7)); st != 403 {
+	if st := v75Status(w.e.FilteredCurrent(ctx, "matches-r7", vid, "/heads", r7)); st != 403 {
 		t.Errorf("branch after maxTtl edit: %d, want 403", st)
 	}
 	res, err := w.e.IssueEdgeGrants(ctx, []string{r7.Bearer})
 	if err == nil {
 		for _, g := range res.Grants {
 			for _, p := range g.Prefixes() {
-				if len(p) > len("/ns/matches-r7/g/") && p[:len("/ns/matches-r7/g/")] == "/ns/matches-r7/g/" {
+				if len(p) > len("/ns/matches-r7/view/") && p[:len("/ns/matches-r7/view/")] == "/ns/matches-r7/view/" {
 					t.Errorf("exchange still gives %s", p)
 				}
 			}
@@ -111,25 +110,7 @@ func TestV077XconfScenario113(t *testing.T) {
 	}
 }
 
-// Tree-derived access 122 (origin half): matches removes its only
-// requireAt "cat-season" key -> a partial reader of cat-season -> filtered
-// /heads -> 403.
-func TestV077XconfScenario122(t *testing.T) {
-	t.Parallel()
-	w := newV75World(t, v75Opts{})
-	w.seed()
-	cr := w.catReader("user:li", "editors")
-	red, st := v76fRedirect(t, w, "cat-season", "", cr)
-	if red == nil {
-		t.Fatalf("before: %d", st)
-	}
-	w.patchConfig("matches", map[string]any{"op": "remove", "path": "/keys/1"})
-	if st := v75Status(w.e.FilteredCurrent(context.Background(), "cat-season", red.GS, "/heads", cr)); st != 403 {
-		t.Errorf("after the key went: %d, want 403", st)
-	}
-}
-
-// Grant scope 63 and 64: private namespace naming no catalog. A grant
+// Grant scope 63 and 64: a private namespace. A grant
 // fixed to derby -> namespace log or events -> 403, never 404; a grant
 // whose block rule is not /resource = "secret" -> /r/priv/secret 404,
 // events 403.
@@ -165,24 +146,9 @@ func TestV077XconfGrantScope63And64(t *testing.T) {
 	if _, err := w.e.ResourceHead(ctx, "priv", "secret", notSecret); v75Status(err) != 404 {
 		t.Errorf("64: /r/priv/secret: %v, want 404", err)
 	}
-	if _, err := w.e.NamespaceEvents(ctx, "priv", "", 0, notSecret); v75Status(err) != 403 {
-		t.Errorf("64: events: %v, want 403", err)
-	}
-}
-
-// §B.11.9 Deleted resources (v0.77): "a tombstoned one's $access decides
-// subjects here (§B.11.5) until it is purged": a group only a tombstoned
-// node's $access names is a deciding subject of filtered reads.
-func TestV077XconfTombstonedNodeDecides(t *testing.T) {
-	t.Parallel()
-	w := newV75World(t, v75Opts{})
-	w.seed()
-	w.put("cat-season", "gone", map[string]any{"parents": v75Parents("root"), "$access": map[string]any{"group:x-del": []any{"reader"}}})
-	w.del("cat-season", "gone")
-	with := w.catGrant("user:li", []any{"editors", "x-del"})
-	without := w.catGrant("user:li", []any{"editors"})
-	if v075GS(t, w, with) == v075GS(t, w, without) {
-		t.Errorf("a group only a tombstoned node's $access names doesn't decide")
+	// A partial reader (§7.9): redirected to its filtered events.
+	if _, err := w.e.NamespaceEvents(ctx, "priv", "", 0, notSecret); func() bool { _, ok := err.(*FilteredRedirect); return !ok }() {
+		t.Errorf("64: events: %v, want a redirect", err)
 	}
 }
 
@@ -209,9 +175,9 @@ func TestV077XconfScenario118(t *testing.T) {
 	}
 }
 
-// Cross-review (conformance lens), §B.11.9 gs: a gs's subjects carry "the
+// Cross-review (conformance lens), §7.9 view: a view's subjects carry "the
 // string scope:{digest} of §A.4's marker for {ns}", whose digest covers
-// the rules and the key's key: string (catvis.ScopeKeyDigest), not the
+// the rules and the key's key: string (grantcheck.ScopeKeyDigest), not the
 // rules' digest alone.
 func TestV077XrevGSScopeSubjectIsMarkerDigest(t *testing.T) {
 	t.Parallel()
@@ -229,11 +195,11 @@ func TestV077XrevGSScopeSubjectIsMarkerDigest(t *testing.T) {
 			t.Fatal("li's reads refer to /now")
 		}
 		fv := v075View(t, t2, "matches", li)
-		want := catvis.ScopePrefix + catvis.ScopeKeyDigest(d, a.verified.Key.Kid, keyPub(*a.verified.Key))
+		want := grantcheck.ScopePrefix + grantcheck.ScopeKeyDigest(d, a.verified.Key.Kid, keyPub(*a.verified.Key))
 		if !slices.Contains(fv.subjects, want) {
 			t.Errorf("subjects %v, want %s, §A.4's marker digest", fv.subjects, want)
 		}
-		if slices.Contains(fv.subjects, catvis.ScopePrefix+d) {
+		if slices.Contains(fv.subjects, grantcheck.ScopePrefix+d) {
 			t.Errorf("subjects %v carry the rules' digest alone", fv.subjects)
 		}
 	})

@@ -154,25 +154,6 @@ func TestV086LevelHeldThroughChainOfBases(t *testing.T) {
 	}
 }
 
-// v0.86 §7.1: the chain is the local one. A remote base (base.origin) is a
-// namespace of another deployment, and the level this client holds for a
-// namespace of that name here says nothing of it: a remote z isn't held
-// to it. (Scenario 94's last sentence, "a remote Z that lags behind N's
-// raise fails closed meanwhile", is left to an answer on how a level held
-// in one deployment is keyed for another: docs/SPEC-FEEDBACK.md.)
-func TestV086RemoteBaseIsNotInTheLocalChain(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	st := newE3Stub(t)
-	b := v86Base("n")
-	b["origin"] = "https://a.example"
-	v86NS(st, "z", map[string]any{"base": b, "encryption": map[string]any{"level": "at-rest"}})
-	c, _ := client.New(st.server().URL, client.WithExpectedLevel("n", "sealed"))
-	if lv, err := c.EncryptionLevel(ctx, "z"); err != nil || lv != "at-rest" || c.HeldLevel("z") != "at-rest" {
-		t.Fatalf("a remote branch of another deployment's n: %q %v, held %q", lv, err, c.HeldLevel("z"))
-	}
-}
-
 // v0.86 scenario 94 ("A client that holds sealed for N … answered with a
 // plaintext 200 … → refused"): a holder of sealed refuses a document's
 // 200 that isn't application/jose, in the namespace itself as in its

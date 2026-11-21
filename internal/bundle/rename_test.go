@@ -14,7 +14,6 @@ import (
 	"github.com/middle-management/patchlog/internal/annot"
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/client"
-	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schema"
@@ -558,72 +557,6 @@ func TestRenamedImportOntoBranch(t *testing.T) {
 				if dst.head(ns, "a").ID != s.a3 {
 					t.Fatalf("the branch's base %s changed", ns)
 				}
-			}
-		})
-	}
-}
-
-// §G.4.4 Renaming, onto a remote branch (§G.3) of the bundle's origin:
-// one whose base is src, or whose base.chain reaches it, is a branch of
-// src, so mapping onto it isn't a rename; one of another namespace is.
-func TestRenamedImportOntoRemoteBranch(t *testing.T) {
-	t.Parallel()
-	s := newCloneSource(t)
-	at := must(s.d.c.NSHead(ctx, "s-data")).ID
-	a4 := s.d.append("s-data", "a", op("replace", "/pin", rev("s-data", "b", s.b1)), op("replace", "/live", "/r/s-data/a"))
-	b, _ := exportFrom(t, s.d, bundle.ExportOptions{Select: []string{"s-data"}})
-	must(s.d.c.CreateBranch(ctx, "s-data", client.BranchRequest{Name: "wip", At: at}))
-	wipAt := must(s.d.c.NSHead(ctx, "wip")).ID
-	schemasAt := must(s.d.c.NSHead(ctx, "s-schemas")).ID
-	remote := func(o *core.Options) {
-		o.Remote = core.RemoteOptions{FollowInterval: -1, Resolve: func(origin string) (core.RemoteEndpoint, error) {
-			if origin != stagingOrigin {
-				return core.RemoteEndpoint{}, errors.New("unknown origin " + origin)
-			}
-			return core.RemoteEndpoint{BaseURL: s.d.url}, nil
-		}}
-	}
-	for _, tc := range []struct {
-		name, base, at string
-		chain          []string // rel's base.chain, as the target checks and records it
-		renamed        bool
-	}{
-		{"remote branch", "s-data", at, []string{"s-data"}, false},
-		{"remote branch of a branch", "wip", wipAt, []string{"wip", "s-data"}, false},
-		{"remote branch of another namespace", "s-schemas", schemasAt, []string{"s-schemas"}, true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			dst := newDeployment(t, cmsOrigin, remote)
-			// s-data/a's $schema pins s-schemas/item, which the target needs.
-			importB(t, dst, s.schema, bundle.ImportOptions{})
-			// The genesis gives base.chain (§G.3), which the target checks.
-			chain := make([]any, len(tc.chain))
-			for i, ns := range tc.chain {
-				chain[i] = ns
-			}
-			dst.ns("rel", map[string]any{"read": "public", "base": map[string]any{"origin": stagingOrigin, "ns": tc.base, "at": tc.at, "chain": chain}})
-			base, _ := dst.nsDoc("rel")["base"].(map[string]any)
-			if chain, _ := base["chain"].([]any); !slices.EqualFunc(chain, tc.chain, func(x any, ns string) bool { return x == ns }) {
-				t.Fatalf("rel's base %v", base)
-			}
-			rep := importB(t, dst, b, bundle.ImportOptions{NSMap: map[string]string{"s-data": "rel"}})
-			got := dst.doc("rel", "a")
-			if tc.renamed {
-				if rep.Renamed["s-data"] != "rel" || !rep.Doc("s-data/a").Renamed || dst.head("rel", "a").ID == a4 ||
-					got["pin"] != rev("rel", "b", s.b1) || got["live"] != "/r/rel/a" {
-					t.Fatalf("renamed %v, rel/a %+v: %v", rep.Renamed, rep.Doc("s-data/a"), got)
-				}
-				return
-			}
-			if len(rep.Renamed) != 0 {
-				t.Fatalf("renamed %v", rep.Renamed)
-			}
-			if d := rep.Doc("s-data/a"); d.Class != "fast-forward" || d.Renamed || dst.head("rel", "a").ID != a4 {
-				t.Fatalf("rel/a %+v", d)
-			}
-			if got["pin"] != rev("s-data", "b", s.b1) || got["live"] != "/r/s-data/a" {
-				t.Fatalf("rel/a %v", got)
 			}
 		})
 	}

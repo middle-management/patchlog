@@ -27,7 +27,7 @@ func (c *Client) logPage(ctx context.Context, path, since, to string, decode fun
 	return c.logPageMode(ctx, path, since, to, false, decode)
 }
 
-// filteredLogPage fetches one page of a filtered range (§B.11.9 Log
+// filteredLogPage fetches one page of a filtered range (§7.9 Log
 // ranges), whose end the client learns from the answer's
 // X-Namespace-Revision rather than the URL: a page holds only the visible
 // entries among those it scanned, possibly none, and X-Log-Next names the
@@ -68,7 +68,7 @@ func (c *Client) logPageMode(ctx context.Context, path, since, to string, filter
 	}
 	if filtered {
 		if next == since && next != "" {
-			return "", fmt.Errorf("client: %s: X-Log-Next %s doesn't move past since (§B.11.9)", r.path, next)
+			return "", fmt.Errorf("client: %s: X-Log-Next %s doesn't move past since (§7.9)", r.path, next)
 		}
 		return next, nil
 	}

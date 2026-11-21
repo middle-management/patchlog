@@ -3,7 +3,6 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 )
 
@@ -45,20 +44,6 @@ func TestDavWarnings(t *testing.T) {
 		}
 		if got := loose(fi); got != want {
 			t.Errorf("loose(%v) = %v", mode, got)
-		}
-	}
-}
-
-// -tree-url takes a default tree service and catalogs' own, as serve's
-// does.
-func TestDavTreeURLs(t *testing.T) {
-	def, per, err := treeServices([]string{"http://tree:8082", "cat=http://tree-cat:8082/x", "dag=https://t.example"})
-	if err != nil || def != "http://tree:8082" || !reflect.DeepEqual(per, map[string]string{"cat": "http://tree-cat:8082/x", "dag": "https://t.example"}) {
-		t.Fatalf("%q %v %v", def, per, err)
-	}
-	for _, bad := range [][]string{{"http://a", "http://b"}, {"cat=http://a", "cat=http://b"}} {
-		if _, _, err := treeServices(bad); err == nil {
-			t.Errorf("%q taken", bad)
 		}
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
@@ -20,7 +21,7 @@ func TestLogPageReadsItsRows(t *testing.T) {
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e, err := Open(Options{Path: pgtest.FreshDB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.FreshDB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1,
 		Limits: lim, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
@@ -106,7 +107,7 @@ func TestLogPageReadsItsRows(t *testing.T) {
 // a range answering rows that aren't ancestors of its id.
 func TestLogPageBrokenChain(t *testing.T) {
 	t.Parallel()
-	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1,
 		Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
@@ -165,7 +166,7 @@ func TestLogPageBrokenChain(t *testing.T) {
 // statistics; on Postgres the indexes exist, the plan depends on the data.
 func TestNSLogQueriesUseIndexes(t *testing.T) {
 	t.Parallel()
-	e, err := Open(Options{Path: pgtest.FreshDB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.FreshDB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1,
 		Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
@@ -214,7 +215,7 @@ func TestNSLogPageItems(t *testing.T) {
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e, err := Open(Options{Path: pgtest.FreshDB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: pgtest.FreshDB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1,
 		Limits: lim, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
@@ -272,4 +273,12 @@ func TestNSLogPageItems(t *testing.T) {
 	if got := fmt.Sprint(pages); got != "[[1 1] [3 1] [6] [1]]" || total != 6 {
 		t.Fatalf("pages %s, %d entries", got, total)
 	}
+}
+
+func mustID(s string) ids.ID {
+	id, err := ids.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return id
 }

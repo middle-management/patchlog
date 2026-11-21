@@ -55,9 +55,8 @@
     <button class="tab" role="tab" data-tab="batch" aria-selected="false">Batch</button>
     <button class="tab" role="tab" data-tab="live" aria-selected="false">Live <span id="liveDot" class="dot" hidden></span></button>
     <div class="menu tab-more">
-      <button id="moreBtn" class="more-btn" aria-haspopup="true" aria-expanded="false" aria-controls="moreMenu" title="Catalog, Search, Schemas, Keys"><span id="moreLabel">More</span><span id="moreDot" class="dot" title="This browser holds an identity (Keys)" hidden></span> &#9662;</button>
+      <button id="moreBtn" class="more-btn" aria-haspopup="true" aria-expanded="false" aria-controls="moreMenu" title="Search, Schemas, Keys"><span id="moreLabel">More</span><span id="moreDot" class="dot" title="This browser holds an identity (Keys)" hidden></span> &#9662;</button>
       <div id="moreMenu" class="menu-list" hidden>
-        <button class="tab" role="tab" data-tab="cat" aria-selected="false">Catalog <span class="svc" hidden></span></button>
         <button class="tab" role="tab" data-tab="sr" aria-selected="false">Search <span class="svc" hidden></span></button>
         <button class="tab" role="tab" data-tab="si" aria-selected="false">Schemas <span class="svc" hidden></span></button>
         <button class="tab" role="tab" data-tab="keys" aria-selected="false">Keys <span id="idDot" class="dot" hidden></span></button>
@@ -68,7 +67,7 @@
 
   <!-- ============ Start: no namespace selected ============ -->
   <section id="startPanel" class="start" role="tabpanel" aria-labelledby="startTab" hidden>
-    <div class="start-head"><h2>Start with a namespace</h2><span class="muted">Namespace, Resource, History, Batch and Live work on one namespace. Catalog, Search, Schemas and Keys are under More.</span></div>
+    <div class="start-head"><h2>Start with a namespace</h2><span class="muted">Namespace, Resource, History, Batch and Live work on one namespace. Search, Schemas and Keys are under More.</span></div>
     <div class="start-grid">
       <div class="start-opt">
         <h3>Open a namespace</h3>
@@ -301,73 +300,6 @@
     <div class="card" data-card="live.feed" data-open>
       <header><h2>Live feed</h2><span id="feedCount" class="muted small"></span><button id="feedClear" class="tiny">Clear</button></header>
       <ul id="feed" class="feed"><li class="muted">No events yet.</li></ul>
-    </div>
-  </section>
-
-  <!-- ============ Catalog ============ -->
-  <section id="tab-cat" class="grid" role="tabpanel" hidden>
-    <div class="card wide" data-card="cat.pick" data-open>
-      <header><h2>Catalog</h2><span class="muted small">Addendum B &middot; folders and placements in a catalog namespace</span></header>
-      <div class="row">
-        <label for="catPick">Catalog</label>
-        <select id="catPick" class="mono" title="namespaces with a catalog config (§B.6): the tree service's catalogs, the proxy's mappings, and namespaces you have used"><option value="">&mdash;</option></select>
-        <label for="catNs">namespace</label>
-        <input id="catNs" class="mono" list="catNsList" placeholder="cat" autocomplete="off" spellcheck="false">
-        <datalist id="catNsList"></datalist>
-        <button id="catLoad" class="primary">Load</button>
-        <button id="catRefresh" class="tiny">Refresh</button>
-      </div>
-      <div id="catStatus" class="muted">Load a catalog namespace (the demo stack seeds <code>cat</code>, a tree, <code>topics</code>, a DAG, and <code>drive</code>, a file tree).</div>
-    </div>
-
-    <div class="card" data-card="cat.tree" data-open>
-      <header><h2>Tree</h2><span id="catTreeMeta" class="muted small"></span></header>
-      <div id="catTree" class="cat-tree"><p class="muted">&mdash;</p></div>
-      <p class="note help">Click a node to select it; item names open the item in the Resource tab. <span class="badge info">subject: role</span> chips are the effective roles derived in this browser from <code>$access</code> on the node and its ancestors (&sect;B.11.2); bold ones are assigned on the node itself. <span class="badge">move</span>/<span class="badge">place</span> mark tree powers where a role granting them is assigned (they are never inherited).</p>
-    </div>
-
-    <div class="card" data-card="cat.sel" data-open>
-      <header><h2>Selected node</h2><span id="catSelMeta" class="muted small"></span></header>
-      <div id="catSel" class="muted">Select a node in the tree.</div>
-    </div>
-
-    <div class="card wide" data-card="cat.place">
-      <header><h2>Place item</h2><span class="muted small">PATCH /r/{catalog}/{ns}.{name} &middot; If-None-Match: *</span></header>
-      <div class="row"><label for="catPItem">Item</label><input id="catPItem" class="mono" list="catItemList" placeholder="/r/demo/derby" autocomplete="off" spellcheck="false"><datalist id="catItemList"></datalist></div>
-      <div class="row"><label for="catPParent">Folder</label><select id="catPParent"></select><input id="catPOrder" class="mono" placeholder="order (optional)" spellcheck="false"></div>
-      <textarea id="catPAccess" class="code" rows="2" spellcheck="false" data-json placeholder='optional $access to share this one item, e.g. {"user:li":["reader"]}'></textarea>
-      <div class="row"><button id="catPCreate" class="primary">Place</button></div>
-      <p class="note help">The placement's name is the item, <code>{ns}.{name}</code>, so an item is placed at most once per catalog (&sect;B.2). A placement may name an item that does not exist yet; it is dangling until it does. Placements carry a fresh <code>$nonce</code> (&sect;B.11.4).</p>
-    </div>
-
-    <div class="card wide" data-card="cat.folder">
-      <header><h2>New folder</h2><span class="muted small">PATCH /r/{catalog}/{name} &middot; If-None-Match: *</span></header>
-      <div class="row"><label for="catFName">Name</label><input id="catFName" class="mono" placeholder="season-2027 (no dot)" autocomplete="off" spellcheck="false"></div>
-      <div class="row"><label for="catFTitle">Title</label><input id="catFTitle" placeholder="Season 2027" autocomplete="off"></div>
-      <div class="row"><label for="catFParent">Parent</label><select id="catFParent"></select><input id="catFOrder" class="mono" placeholder="order (optional)" spellcheck="false"></div>
-      <textarea id="catFAccess" class="code" rows="2" spellcheck="false" data-json placeholder='optional $access, e.g. {"group:match-desk":["desk"]}'></textarea>
-      <div class="row"><button id="catFCreate" class="primary">Create folder</button></div>
-    </div>
-
-    <div class="card wide" data-card="cat.move">
-      <header><h2>Move / reorder / remove</h2><span class="muted small">PATCH or DELETE /r/{catalog}/{node}</span></header>
-      <div class="row"><label for="catMoveTo">New parent(s)</label><select id="catMoveTo" multiple size="4"></select></div>
-      <div class="row"><label for="catMoveOrder">Order</label><input id="catMoveOrder" class="mono" placeholder="fractional key, e.g. a1V (optional)" spellcheck="false"></div>
-      <div class="row">
-        <button id="catMove" class="primary" title="replace /parents (or only /parents/0/order when the parent stays)">Move</button>
-        <button id="catRemove" class="danger" title="DELETE the node with If-Match: its head">Remove from catalog&hellip;</button>
-      </div>
-      <p class="note help">A move is one write to the moving node, guarded by <code>If-Match</code> (&sect;B.2). Removing a placement leaves the content untouched; removing a folder does not cascade, its children become orphans (&sect;B.7).</p>
-    </div>
-
-    <div class="card wide" data-card="cat.out">
-      <header><h2>Last catalog write</h2></header>
-      <div id="catOut" class="muted">Writes go to the catalog namespace through the core API and also appear in the inspector.</div>
-    </div>
-
-    <div class="card wide" data-card="cat.problems">
-      <header><h2>Problems</h2><span id="catProbMeta" class="muted small"></span></header>
-      <div id="catProblems" class="muted">&mdash;</div>
     </div>
   </section>
 

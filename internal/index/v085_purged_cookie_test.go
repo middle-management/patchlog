@@ -11,8 +11,8 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/index"
 	"github.com/middle-management/patchlog/internal/seal"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // Scenario 135 (SERVICES §A.4 Unavailable namespaces, v0.85: purged,
@@ -43,7 +43,7 @@ func TestV085EndedCookieSealedPurged(t *testing.T) {
 		client.WithKeys(client.NewKeys(priv)))
 	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, untyped: true, now: s.Now}, func(o *indexOpts) {
 		o.Recipient = priv
-		o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), svcedge.DefaultExchangeRate
+		o.EdgeGrants, o.ExchangeRate = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate
 	})
 	x.caughtUp("sec")
 	reader := k.Grant(t, s.Now(), "user:r", []string{"sec"}, []string{"read"})
@@ -54,7 +54,7 @@ func TestV085EndedCookieSealedPurged(t *testing.T) {
 			t.Fatalf("exchange: %d %v", r.status, r.body)
 		}
 		for _, p := range r.body["prefixes"].([]any) {
-			if strings.HasPrefix(p.(string), "/sec/g/") {
+			if strings.HasPrefix(p.(string), "/sec/view/") {
 				return p.(string) + "?q=secret", r.cookies
 			}
 		}

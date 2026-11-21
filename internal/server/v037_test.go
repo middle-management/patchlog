@@ -3,17 +3,13 @@ package server
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
 	plclient "github.com/middle-management/patchlog/internal/client"
-	"github.com/middle-management/patchlog/internal/core"
 )
 
 // §7.4: PATCH /ns/{ns} answers 201 with X-Config-Revision,
@@ -211,46 +207,6 @@ func TestV037DevConformance(t *testing.T) {
 	}
 }
 
-// §7.4, §G.3 (v0.38): a deployment that reads another's namespace
-// documents, as a remote branch reads its base's, ignores members it
-// doesn't define: it never refuses for an unknown member, or for the spec
-// version A publishes alone, later, malformed or absent.
-func TestV037RemoteSpecVersion(t *testing.T) {
-	t.Parallel()
-	a, b, rt := pair(t, nil, nil)
-	f := populateA(t, a)
-	ours := []byte(`"spec":"` + core.SpecVersion + `"`)
-	for i, c := range []struct {
-		spec   string
-		member string // added to the base's namespace document as of at
-	}{
-		{`"spec":"0.86"`, `"wardens":[]`},
-		{`"spec":"0.38-rc"`, `"wardens":[]`},
-		{`"spec":"99.0"`, ""},
-		{`"spec":"0.38.1"`, `"x-team":"a"`},
-		{`"spec":"0.36"`, `"wardens":[]`},
-		{`"spec":"0.38"`, `"policy":{"embargo":true}`},
-		{"", `"wardens":[]`}, // a deployment from before v0.37
-	} {
-		c := c
-		rt.set(tamperPaths(t, a, func(path string, body []byte) []byte {
-			switch {
-			case path == "/" && c.spec == "":
-				return bytes.Replace(body, append([]byte(","), ours...), nil, 1)
-			case path == "/":
-				return bytes.Replace(body, ours, []byte(c.spec), 1)
-			case strings.HasPrefix(path, "/ns/main/rev/") && strings.Count(path, "/") == 4:
-				if c.member != "" && path == "/ns/main/rev/"+f.at {
-					body = append([]byte("{"+c.member+","), bytes.TrimPrefix(body, []byte("{"))...)
-				}
-			}
-			return body
-		}), "")
-		name := fmt.Sprintf("rel%d", i)
-		expect(t, b.mkRemote(name, remoteGenesis("main", f.at, nil)), 201)
-	}
-}
-
 // tamperPaths is tamper with the request path passed to rewrite.
 func tamperPaths(t *testing.T, a *tenv, rewrite func(path string, body []byte) []byte) string {
 	t.Helper()
@@ -275,38 +231,4 @@ func tamperPaths(t *testing.T, a *tenv, rewrite func(path string, body []byte) [
 	}))
 	t.Cleanup(p.Close)
 	return p.URL
-}
-
-// §7.4: a remote branch's own first config entry is written on the
-// request and records the operator's grant, as do the schema namespaces it
-// mirrors (v0.38). At the source,
-// registration entries record the registrant's grant.
-func TestV037RemoteGrants(t *testing.T) {
-	t.Parallel()
-	var bPriv ed25519.PrivateKey
-	a, b, _ := pair(t, nil, []envOpt{withAuth(&bPriv)})
-	b.opPriv = bPriv
-	f := populateA(t, a)
-	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
-	lg := b.get("/ns/rel/rev/" + b.nsHead("rel") + "/log").Arr()
-	if len(lg) != 1 || !strings.HasPrefix(entryRef(t, lg[0]), "op:root operator 1") {
-		t.Fatalf("remote branch log %v", lg)
-	}
-	sl := b.get("/ns/schemas/rev/" + b.nsHead("schemas") + "/log").Arr()
-	if len(sl) < 2 {
-		t.Fatalf("mirrored schemas log %v", sl)
-	}
-	for _, x := range sl {
-		if !strings.HasPrefix(entryRef(t, x), "op:root operator 1") || x.(map[string]any)["author"] != "op:root" {
-			t.Fatalf("mirrored schema entry %v", x)
-		}
-	}
-
-	fa := newAuthFixture(t, nil, withOrigin(originA))
-	reg := fa.grant(fa.admin, "user:b", []string{"sec"}, []string{"read", "export"})
-	expect(t, fa.register("sec", "rel", fa.nsHead("sec", fa.adminG), "", reg), 201)
-	al := fa.get("/ns/sec/rev/"+fa.nsHead("sec", fa.adminG)+"/log", fa.adminG).Arr()
-	if last := al[len(al)-1].(map[string]any); last["remote"] == nil || entryRef(t, last) != grantRef(t, reg) {
-		t.Fatalf("registration entry %v", last)
-	}
 }

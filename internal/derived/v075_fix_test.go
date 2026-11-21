@@ -34,7 +34,7 @@ func openWAL(t *testing.T) (*sql.DB, *Cache) {
 func TestV075CacheGetDuringPurge(t *testing.T) {
 	ctx := context.Background()
 	db, c := openWAL(t)
-	const view = "/cat/g/all/at/1/children?of=old"
+	const view = "/cat/view/all/at/1/children?of=old"
 	if _, err := c.Put(ctx, view, "cat", "1", Stored{Body: []byte("old"), Tags: "ns:cat"}); err != nil {
 		t.Fatal(err)
 	}
@@ -77,11 +77,11 @@ func TestV075CachePutAfterPurge(t *testing.T) {
 	if err := c.Purge(ctx, db, []string{"ns:cat"}); err != nil {
 		t.Fatal(err)
 	}
-	st, err := c.PutSince(ctx, "/cat/g/all/at/1", "cat", "1", gen, Stored{Body: []byte("stale"), Tags: "ns:cat,r:cat/old"})
+	st, err := c.PutSince(ctx, "/cat/view/all/at/1", "cat", "1", gen, Stored{Body: []byte("stale"), Tags: "ns:cat,r:cat/old"})
 	if err != nil || string(st.Body) != "stale" {
 		t.Fatalf("served: %q %v", st.Body, err)
 	}
-	if st, ok := c.Get(ctx, "/cat/g/all/at/1"); ok {
+	if st, ok := c.Get(ctx, "/cat/view/all/at/1"); ok {
 		t.Fatalf("stored though read before a purge of its tags: %q", st.Body)
 	}
 	if _, err := c.PutSince(ctx, "/other/at/1", "other", "1", gen, Stored{Body: []byte("O"), Tags: "ns:other"}); err != nil {
@@ -89,7 +89,7 @@ func TestV075CachePutAfterPurge(t *testing.T) {
 	}
 	// A restart: only the database.
 	c2 := NewCache(0, db)
-	if st, ok := c2.Get(ctx, "/cat/g/all/at/1"); ok {
+	if st, ok := c2.Get(ctx, "/cat/view/all/at/1"); ok {
 		t.Fatalf("persisted though read before a purge of its tags: %q", st.Body)
 	}
 	if st, ok := c2.Get(ctx, "/other/at/1"); !ok || string(st.Body) != "O" {

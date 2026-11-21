@@ -36,6 +36,10 @@ func sourceCreds(r *http.Request) []core.Credentials {
 }
 
 func creds(r *http.Request) core.Credentials {
+	if v, ok := r.Context().Value(viewedKey{}).(*viewed); ok {
+		// Admitted at a view's content URL (viewContent, §7.9).
+		return v.cred
+	}
 	c := core.Credentials{Author: r.Header.Get("X-Author")}
 	if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
 		c.Bearer = strings.TrimSpace(a[len("Bearer "):])
@@ -495,9 +499,9 @@ func validID(s string) bool {
 
 // idSegments are the path wildcards that hold ids (§3.2): a revision's or
 // namespace revision's {id}, a grant's {gid}, a blob's {bid}, and a
-// filtered read's subject set {gs} and checkpoint {at} (§B.11.9), for
+// filtered read's view {view} and checkpoint {at} (§7.9), for
 // which "all", a service's, is no id either.
-var idSegments = map[string]bool{"{id}": true, "{gid}": true, "{bid}": true, "{gs}": true, "{at}": true}
+var idSegments = map[string]bool{"{id}": true, "{gid}": true, "{bid}": true, "{view}": true, "{at}": true}
 
 // checkIDs answers 400 bad_input for an id not in text form (§3.2) in the
 // URL routed to pattern, in since, or in an event stream's Last-Event-ID

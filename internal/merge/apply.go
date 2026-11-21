@@ -112,27 +112,6 @@ func (p *Plan) Resolve(name string, steps ...client.Step) error {
 	return nil
 }
 
-// Force resolves a resource whatever its classification: a resource that
-// classifies as merged or behind (e.g. through the merge point of an
-// earlier batch that recorded only part of it, the first half of a node a
-// release merges in two halves, §F.9) gets an item too, with the
-// resolution written against the target's current head.
-func (p *Plan) Force(name string, steps ...client.Step) error {
-	r := p.Resource(name)
-	if r == nil {
-		return fmt.Errorf("merge: %s is not in the plan", name)
-	}
-	r.forced = true
-	r.forceClass()
-	return p.Resolve(name, steps...)
-}
-
-func (r *Resource) forceClass() {
-	if r.forced && (r.Class == Merged || r.Class == Behind) && r.Base != "" {
-		r.Class, r.IfMatch, r.IfNoneMatch, r.Conflicts = Replay, r.Base, false, nil
-	}
-}
-
 func (p *Plan) applyResolution(r *Resource, steps []client.Step) {
 	r.resolution, r.resolvedAt = steps, r.Base
 	r.Expected, r.Squashed = nil, false
@@ -252,7 +231,7 @@ func (p *Plan) batch() (client.BatchRequest, error) {
 func (p *Plan) empty(req client.BatchRequest) bool { return len(req.Items) == 0 && req.Config == nil }
 
 // batchClient is the client batches are submitted with: Options.BatchClient
-// if set (e.g. under a catalog service's merge grant, §F.8), else the
+// if set (e.g. under a grant narrowed to the batch, §F.8), else the
 // plan's.
 func (p *Plan) batchClient() *client.Client {
 	if p.opt.BatchClient != nil {
@@ -423,7 +402,7 @@ func (p *Plan) Apply(ctx context.Context) (*Result, error) {
 			return out, p.checkIDs(res)
 		}
 		ae, ok := client.AsAPIError(err)
-		if !ok || (ae.Status != 412 && ae.Status != 410) || attempt > p.opt.MaxRetries {
+		if !ok || (ae.Status != 412 && ae.Status != 410) || attempt > p.opt.MaxRetries || p.opt.noRetry {
 			return nil, err
 		}
 		items := p.Items()

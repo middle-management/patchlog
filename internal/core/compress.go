@@ -31,8 +31,8 @@ package core
 // does to store the byte, so it pays only outside the serialised write:
 // packPlan compresses a checked write's patch sets in the check phase of
 // D.3, after its read transaction (checkOutside). A path without
-// precomputed bytes (the whole gate in the lock, config batches, remote
-// branches, restores, prunes) stores canonical JSON as before.
+// precomputed bytes (the whole gate in the lock, config batches,
+// restores, prunes) stores canonical JSON as before.
 //
 // Ids, limits and D.4's snapshot cadence are over the canonical bytes,
 // computed before anything is stored; nothing hashes or serves the stored

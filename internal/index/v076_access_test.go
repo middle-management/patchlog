@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
-	"github.com/middle-management/patchlog/internal/svcedge"
+	"github.com/middle-management/patchlog/internal/index"
 )
 
 // V76-02 (v0.76): the index's markers are per namespace (§A.4 Across
@@ -21,13 +21,13 @@ import (
 // "the service's exchange refusing only as Coverage says", Coverage: "Only
 // a reader who may see none of the namespaces gets 401 or 403"): a grant
 // naming pa, which it reads, and pb, where it verifies but its key doesn't
-// sign read, is exchanged for /pa/g/{gs} and /_refs/g/{gs over pa's
-// marker} alone, the gs a query of /_refs redirects it to. Before v0.76
+// sign read, is exchanged for /pa/view/{view} and /_refs/view/{view over pa's
+// marker} alone, the view a query of /_refs redirects it to. Before v0.76
 // the 403 in pb refused the whole exchange.
 func TestV076AccessExchangePerNamespace(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	w := p37Setup(t, index.DefaultExchangeRate)
 	op := w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "user:root", []string{"pb"}, []string{"read", "config"})))
 	must(op.PatchConfig(ctx, "pb", must(op.NSHead(ctx, "pb")).Config, []any{map[string]any{"op": "replace", "path": "/keys/1", "value": w.issuer.Entry("append")}}))
 	w.x.caughtUp("pb")
@@ -37,12 +37,12 @@ func TestV076AccessExchangePerNamespace(t *testing.T) {
 		t.Fatalf("a query of pb, which amy's grant doesn't read: %d %v", r.status, r.body)
 	}
 	prefixes, cookies := w.exchange(t, w.x, amy)
-	if _, ok := prefixes["pb"]; ok || prefixes["pa"] != "/pa/g/"+w.x.gsOf("pa", amy) || len(prefixes) != 2 {
-		t.Fatalf("prefixes %v, want /pa/g/%s and /_refs/g/… alone", prefixes, w.x.gsOf("pa", amy))
+	if _, ok := prefixes["pb"]; ok || prefixes["pa"] != "/pa/view/"+w.x.viewOf("pa", amy) || len(prefixes) != 2 {
+		t.Fatalf("prefixes %v, want /pa/view/%s and /_refs/view/… alone", prefixes, w.x.viewOf("pa", amy))
 	}
-	_, gs, _ := w.x.refsPointer("?to="+url.QueryEscape("/r/target/x"), amy)
-	if prefixes["_refs"] != "/_refs/g/"+gs || gs != readsGS("pa", w.issuer) {
-		t.Errorf("/_refs prefix %s, want /_refs/g/%s, over pa's marker alone", prefixes["_refs"], gs)
+	_, vid, _ := w.x.refsPointer("?to="+url.QueryEscape("/r/target/x"), amy)
+	if prefixes["_refs"] != "/_refs/view/"+vid || vid != readsRefsView("pa", w.issuer) {
+		t.Errorf("/_refs prefix %s, want /_refs/view/%s, over pa's marker alone", prefixes["_refs"], vid)
 	}
 	if got, _ := p37Follow(t, w.x, prefixes["pa"], cookies, ""); got.status != 200 || strings.Join(p37Hits(got.body), ",") != "a,b" {
 		t.Errorf("pa under the cookie: %d %v", got.status, got.body)
@@ -73,7 +73,7 @@ func TestV076AccessExchangePerNamespace(t *testing.T) {
 // whose rules fix /resource and pass for none of the names they fix has
 // no marker in pa: a query of pa is 403, and /_refs, which it names pa
 // alone for, leaves pa out, answering as for no grant. Before
-// v0.76 the query was redirected to an empty answer under its own gs, and
+// v0.76 the query was redirected to an empty answer under its own view, and
 // /_refs counted pa as seen.
 func TestV076AccessFixedNames(t *testing.T) {
 	t.Parallel()
@@ -84,11 +84,11 @@ func TestV076AccessFixedNames(t *testing.T) {
 		t.Errorf("a query of pa: %d %v %v", r.status, r.body, r.header)
 	}
 	// On /_refs pa is left out: what is left is pub, which everyone
-	// sees, at the empty set's gs.
+	// sees, at the empty set's view.
 	q := "?to=" + url.QueryEscape("/r/target/x")
-	_, pubGs, _ := w.x.refsPointer(q, "")
-	if _, gs, loc := w.x.refsPointer(q, none); gs != pubGs {
-		t.Errorf("/_refs naming pa alone: gs %s, want the empty set's %s", gs, pubGs)
+	_, pubView, _ := w.x.refsPointer(q, "")
+	if _, vid, loc := w.x.refsPointer(q, none); vid != pubView {
+		t.Errorf("/_refs naming pa alone: vid %s, want the empty set's %s", vid, pubView)
 	} else if ns := v75Namespaces(t, w.x.search(loc, none)); len(ns) != 1 || ns["pub"] == "" {
 		t.Errorf("/_refs naming pa alone covers %v, want pub alone", ns)
 	}
@@ -100,8 +100,8 @@ func TestV076AccessFixedNames(t *testing.T) {
 }
 
 // TestV076AccessForeignRefsVerified (FSVC-4; changelog v0.76 "a grant at
-// another gs's /_refs URL is 403, not 401"; §B.11.5 keeps 401 for a
-// request without a grant that verifies): at another subject set's /_refs
+// another view's /_refs URL is 403, not 401"; §B.11.5 keeps 401 for a
+// request without a grant that verifies): at another view's /_refs
 // URL, a grant that verifies only in pub, a public namespace the service
 // follows, is 403, no-store, not 401; a grant naming no namespace the
 // service follows, one that doesn't decode, and none at all stay 401.
@@ -113,7 +113,7 @@ func TestV076AccessForeignRefsVerified(t *testing.T) {
 	_, _, bobLoc := w.x.refsPointer(q, w.bob)
 	pub := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"pub"}, []string{"read"})
 	if r := w.x.raw(bobLoc, pub); r.status != 403 || r.body["code"] != "forbidden" || r.header.Get("Cache-Control") != "no-store" || r.header.Get("WWW-Authenticate") != "" {
-		t.Errorf("a grant verifying in pub alone, at bob's gs: %d %v %v", r.status, r.body, r.header)
+		t.Errorf("a grant verifying in pub alone, at bob's vid: %d %v %v", r.status, r.body, r.header)
 	}
 	for name, tok := range map[string]string{
 		"naming no followed namespace": w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"elsewhere"}, []string{"read"}),
@@ -121,7 +121,7 @@ func TestV076AccessForeignRefsVerified(t *testing.T) {
 		"none":                         "",
 	} {
 		if r := w.x.raw(bobLoc, tok); r.status != 401 || r.body["code"] != "unauthenticated" || r.header.Get("WWW-Authenticate") != "Bearer" {
-			t.Errorf("%s, at bob's gs: %d %v %v", name, r.status, r.body, r.header)
+			t.Errorf("%s, at bob's vid: %d %v %v", name, r.status, r.body, r.header)
 		}
 	}
 }
@@ -138,7 +138,7 @@ func TestV076AccessForeignRefsVerified(t *testing.T) {
 func TestV076AccessExchangePurged(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	w := p37Setup(t, index.DefaultExchangeRate)
 	op := w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "user:root", []string{"pa", "pb"}, []string{"read", "config", "purge-ns"})))
 	cfg := must(op.NSHead(ctx, "pb")).Config
 	must(op.PatchConfig(ctx, "pb", cfg, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
@@ -149,11 +149,11 @@ func TestV076AccessExchangePurged(t *testing.T) {
 		return w.x.raw("/pb?limit=5", amy).status == 410
 	})
 	prefixes, cookies := w.exchange(t, w.x, amy)
-	if _, ok := prefixes["pb"]; ok || prefixes["pa"] != "/pa/g/"+w.x.gsOf("pa", amy) || len(prefixes) != 2 {
-		t.Fatalf("prefixes %v, want /pa/g/%s and /_refs/g/… alone", prefixes, w.x.gsOf("pa", amy))
+	if _, ok := prefixes["pb"]; ok || prefixes["pa"] != "/pa/view/"+w.x.viewOf("pa", amy) || len(prefixes) != 2 {
+		t.Fatalf("prefixes %v, want /pa/view/%s and /_refs/view/… alone", prefixes, w.x.viewOf("pa", amy))
 	}
-	if prefixes["_refs"] != "/_refs/g/"+readsGS("pa", w.issuer) {
-		t.Errorf("/_refs prefix %s, want the gs over pa's marker alone", prefixes["_refs"])
+	if prefixes["_refs"] != "/_refs/view/"+readsRefsView("pa", w.issuer) {
+		t.Errorf("/_refs prefix %s, want the vid over pa's marker alone", prefixes["_refs"])
 	}
 	if got, _ := p37Follow(t, w.x, prefixes["pa"], cookies, ""); got.status != 200 || strings.Join(p37Hits(got.body), ",") != "a,b" {
 		t.Errorf("pa under the cookie: %d %v", got.status, got.body)

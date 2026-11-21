@@ -257,16 +257,16 @@ func TestV051EdgeGrantsOverCapCheaply(t *testing.T) {
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	names := edgeNames("n", 800)
-	gs := make([]string, 50)
-	for i := range gs {
-		gs[i] = e.grant(f.issuer, fmt.Sprintf("user:x%d", i), []string{"sec"}, []string{"read"},
+	vid := make([]string, 50)
+	for i := range vid {
+		vid[i] = e.grant(f.issuer, fmt.Sprintf("user:x%d", i), []string{"sec"}, []string{"read"},
 			map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": names}}}})
 	}
-	if len(gs[0]) > 8<<10 {
-		t.Fatalf("grant of %d bytes", len(gs[0]))
+	if len(vid[0]) > 8<<10 {
+		t.Fatalf("grant of %d bytes", len(vid[0]))
 	}
 	start := time.Now()
-	r := e.issueGrants(gs...)
+	r := e.issueGrants(vid...)
 	if took := time.Since(start); r.Code != 400 || took > 5*time.Second {
 		t.Fatalf("%d in %v", r.Code, took)
 	}

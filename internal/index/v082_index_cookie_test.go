@@ -8,10 +8,10 @@ import (
 	"time"
 )
 
-// V82-05 (v0.82), SVC-10 (SERVICES §A.4 gs: "A cookie is 403 until the
+// V82-05 (v0.82), SVC-10 (SERVICES §A.4 view: "A cookie is 403 until the
 // reader exchanges again ... where a marker's key, rules or roles would
-// end a gs cookie, its key being the one that verified the grant in
-// {ns}, reads:{ns} markers included"; §B.11.9 gs): a cookie carries its
+// end a view cookie, its key being the one that verified the grant in
+// {ns}, reads:{ns} markers included"; §7.9 view): a cookie carries its
 // prefix and exp alone, so an exchange whose keys or entries differ from
 // those its marker's cookie of that exp came from mints one with another
 // exp. No exchange vouches again for a cookie that ended, and none is
@@ -115,7 +115,7 @@ func TestV082CookieNeverCuredOneReader(t *testing.T) {
 // TestV082ScopeCookieRevivedByAnotherReader: the same for a scope
 // marker (newV77Docs: k1's grants read docs in part, under
 // reads:docs:scope:{digest}): readers with the same rules and key share
-// the marker and, with the same exp, the edge_gs_keys row.
+// the marker and, with the same exp, the edge_view_keys row.
 func TestV082ScopeCookieRevivedByAnotherReader(t *testing.T) {
 	t.Parallel()
 	d := newV77Docs(t)
@@ -150,9 +150,9 @@ func TestV082ScopeCookieRevivedByAnotherReader(t *testing.T) {
 }
 
 // TestV082GCookieNotRevivedByAnotherReader: the same for a g: marker
-// (§B.11.9 gs). al and bo, in the same groups through catalog-01, share
-// reads:matches:g:{gs} and, their grants expiring together, a cookie.
-// matches changes catalog-01's maxTtl, which neither the gs nor the
+// (§7.9 view). al and bo, in the same groups through reader-01, share
+// reads:matches:g:{view} and, their grants expiring together, a cookie.
+// matches changes reader-01's maxTtl, which neither the view nor the
 // scope digest reads: the cookie is 403, bo's exchange gives him another
 // for the same prefix, and the one al holds stays 403 until she
 // exchanges, for another of her own.
@@ -167,11 +167,11 @@ func TestV082GCookieNotRevivedByAnotherReader(t *testing.T) {
 			t.Fatalf("exchange: %d %v", r.status, r.body)
 		}
 		for _, p := range r.body["prefixes"].([]any) {
-			if strings.HasPrefix(p.(string), "/matches/g/") {
+			if strings.HasPrefix(p.(string), "/matches/view/") {
 				return p.(string) + "?q=derby", r.cookies
 			}
 		}
-		t.Fatalf("no /matches/g/ prefix: %v", r.body)
+		t.Fatalf("no /matches/view/ prefix: %v", r.body)
 		return "", nil
 	}
 	status := func(path string, c []*http.Cookie) int {
@@ -202,7 +202,7 @@ func TestV082GCookieNotRevivedByAnotherReader(t *testing.T) {
 	w.x.caughtUp("matches")
 	w.x.ix.ExpireGrantChecks()
 	if got := status(path, alC); got != 403 {
-		t.Fatalf("al under her cookie once catalog-01's maxTtl changed: %d", got)
+		t.Fatalf("al under her cookie once reader-01's maxTtl changed: %d", got)
 	}
 	boPath, boC = exchange(bo)
 	if boPath != path || value(path, boC) == value(path, alC) {

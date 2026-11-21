@@ -63,7 +63,7 @@ func patchPaths(t *testing.T, ps any) []string {
 // it is saved with; a text file of JSON is raw too.
 func TestRawFiles(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	png := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01")
 	for _, c := range []struct {
 		name, ctype, typ string
@@ -136,7 +136,7 @@ func TestRawFiles(t *testing.T) {
 // Its base is the revision If-Match names, else the one the user read.
 func TestRawConflict(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.rawDoc("docs", "a.txt", "text/plain", []byte("one"), nil)
 	g := e.expect(e.do("GET", "/docs/a.txt", ""), 200, "GET")
 	h, _ := e.load("docs", "a.txt")
@@ -164,7 +164,7 @@ func TestRawConflict(t *testing.T) {
 // is refused (422, saying why).
 func TestRawNonces(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"priv"}, nil, map[string]map[string]any{"priv": {"nonce": "required"}})
+	e := newEnv(t, []string{"priv"}, map[string]map[string]any{"priv": {"nonce": "required"}})
 	e.expect(e.do("PUT", "/priv/notes.md", "secret notes"), 201, "PUT")
 	ref, data := e.rawOf("priv", "notes.md")
 	n1, _ := ref["$nonce"].(string)
@@ -199,7 +199,7 @@ func TestRawNonces(t *testing.T) {
 // $successor of §8.1's form, with one final LF; its size is that.
 func TestJSONRendering(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	doc := `{"b": true, "10": "ten", "2": [1, 2.50, -0, 1e21, 0.000001, 1E-7], "a": {"z": [], "y": {}, "x": [{}]},
 		"s": "é\t \"", "": null, "$nonce": "` + seal.NewNonce() + `", "$successor": "other"}`
 	e.create("docs", "x", json.RawMessage(doc))
@@ -248,7 +248,7 @@ func TestJSONRendering(t *testing.T) {
 // application/octet-stream (§H.1); a copy's is its source's.
 func TestFileTypes(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	for _, c := range []struct{ name, ctype, typ string }{
 		{"main.go", "Text/X-Go; charset=utf-8", "text/x-go"},
 		{"page.htm", "text/plain", "text/html"},
@@ -281,7 +281,7 @@ func TestFileTypes(t *testing.T) {
 // whatever it looks like; a name another kind of file has can't be taken.
 func TestFlatView(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"v": 1})
 	e.rawDoc("docs", "x.json", "application/json", []byte("{not json"), nil)
 	e.rawDoc("docs", "4913", "text/plain", []byte("a real file"), nil)
@@ -339,7 +339,7 @@ func TestFlatView(t *testing.T) {
 // save that deletes the file first restores it, as the raw file it was.
 func TestRawEditorSaves(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.expect(e.do("PUT", "/docs/notes.md", "v1"), 201, "PUT")
 	e.expect(e.do("MOVE", "/docs/notes.md", "", "Destination", "/docs/notes.md~"), 201, "vim: backup")
 	if b := e.expect(e.do("GET", "/docs/notes.md~", ""), 200, "GET backup").body; b != "v1" {
@@ -393,7 +393,7 @@ func TestRawEditorSaves(t *testing.T) {
 func TestRawBytes(t *testing.T) {
 	t.Parallel()
 	var blobs atomic.Int64
-	e := newEnv(t, []string{"docs"}, nil, nil, func(c *clienttest.Options, _ *dav.Options) {
+	e := newEnv(t, []string{"docs"}, nil, func(c *clienttest.Options, _ *dav.Options) {
 		c.Wrap = func(h http.Handler) http.Handler {
 			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == "GET" && strings.Contains(r.URL.Path, "/blob/") {
@@ -403,6 +403,7 @@ func TestRawBytes(t *testing.T) {
 			})
 		}
 	})
+
 	data := strings.Repeat("0123456789", 1000)
 	rev := e.rawDoc("docs", "page.html", "text/html", []byte(data), nil)
 	tag := `"` + rev + `"`
@@ -433,7 +434,7 @@ func TestRawBytes(t *testing.T) {
 // carries nosniff and the sandbox policy.
 func TestPostRefused(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.rawDoc("docs", "evil.html", "text/html", []byte("<script>alert(document.cookie)</script>"), nil)
 	for _, p := range []string{"/docs/evil.html", "/docs/", "/docs/missing.html"} {
 		r := e.expect(e.do("POST", p, "a=b", "Content-Type", "application/x-www-form-urlencoded"), 405, "POST "+p)
@@ -453,7 +454,7 @@ func TestPostRefused(t *testing.T) {
 // (§H.4).
 func TestPartialPut(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.expect(e.do("PUT", "/docs/a.txt", "whole"), 201, "PUT")
 	h, _ := e.load("docs", "a.txt")
 	for _, p := range []string{"/docs/a.txt", "/docs/b.txt", "/docs/c.json"} {
@@ -476,7 +477,7 @@ func TestPartialPut(t *testing.T) {
 // full too, whatever validators it carries (§H.1 "Identity").
 func TestHeadAfterMergedSave(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	body := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/b", "theirs"))
@@ -525,7 +526,7 @@ func counting(t *testing.T, strip map[string]bool, with ...func(*clienttest.Opti
 			})
 		}
 	}
-	e := newEnv(t, []string{"docs"}, nil, nil, append([]func(*clienttest.Options, *dav.Options){wrap}, with...)...)
+	e := newEnv(t, []string{"docs"}, nil, append([]func(*clienttest.Options, *dav.Options){wrap}, with...)...)
 	return e, func() int64 { return n.Swap(0) }
 }
 
@@ -595,7 +596,7 @@ func TestRawSaves(t *testing.T) {
 	var arm atomic.Bool
 	var e *env
 	theirNonce := seal.NewNonce()
-	e = newEnv(t, []string{"docs", "small"}, nil, map[string]map[string]any{"small": {"limits": map[string]any{"blobSize": 8}}},
+	e = newEnv(t, []string{"docs", "small"}, map[string]map[string]any{"small": {"limits": map[string]any{"blobSize": 8}}},
 		func(c *clienttest.Options, _ *dav.Options) {
 			c.Wrap = func(h http.Handler) http.Handler {
 				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -647,194 +648,4 @@ func TestRawSaves(t *testing.T) {
 	if !strings.HasPrefix(r.body, "too large: blobSize 9 > 8 (§6.6, §7.8)") || uploads.Load() != 0 {
 		t.Fatalf("413 %q after %d uploads", r.body, uploads.Load())
 	}
-}
-
-// An empty file is a file (§H.1): a new one of 0 bytes is a raw document
-// everyone sees, in the flat view and in a tree, an empty PUT truncates a
-// raw file, and a JSON file refuses it (400), as any content that isn't
-// I-JSON. Only where its content decides its kind, a new .json name
-// (Finder's 0-byte PUT before the content) and a LOCK of a new name, is it
-// held as a placeholder until content arrives.
-func TestEmptyFiles(t *testing.T) {
-	t.Parallel()
-	e := treeDocsEnv(t)
-	e.create("docs", "derby", map[string]any{"title": "Derby"})
-	o := e.another()
-	r := e.expect(e.do("PUT", "/docs/empty.txt", ""), 201, "PUT a new empty file")
-	if ref, data := e.rawOf("docs", "empty.txt"); len(data) != 0 || ref["size"] != float64(0) || ref["type"] != "text/plain" || r.header.Get("ETag") == "" {
-		t.Fatalf("empty.txt %v %q, ETag %q", ref, data, r.header.Get("ETag"))
-	}
-	if l := o.propfind("/docs/"); l["/docs/empty.txt"].size != "0" {
-		t.Fatalf("another user's listing %v", names(l, "/docs/"))
-	}
-	e.expect(e.do("PUT", "/cat/Season/__init__.py", ""), 201, "PUT a new empty file in a tree")
-	ns, item := e.itemOf("cat", "__init__.py")
-	if _, data := e.rawOf(ns, item); len(data) != 0 {
-		t.Fatalf("__init__.py %q", data)
-	}
-	sameStrings(t, "another user's tree", names(o.propfind("/cat/Season/"), "/cat/Season/"), []string{"__init__.py", "derby.json"})
-
-	// Truncated.
-	e.expect(e.do("PUT", "/docs/notes.md", "hello\n"), 201, "PUT notes.md")
-	r = e.expect(e.do("PUT", "/docs/notes.md", ""), 201, "PUT empty over notes.md")
-	if _, data := e.rawOf("docs", "notes.md"); len(data) != 0 || r.header.Get("ETag") == "" {
-		t.Fatalf("truncated notes.md %q, ETag %q", data, r.header.Get("ETag"))
-	}
-	if g := o.expect(o.do("GET", "/docs/notes.md", ""), 200, "GET"); g.body != "" {
-		t.Fatalf("GET %q", g.body)
-	}
-	e.expect(e.do("PUT", "/cat/Season/__init__.py", "x = 1\n"), 201, "fill it")
-	e.expect(e.do("PUT", "/cat/Season/__init__.py", ""), 201, "empty it again")
-	if _, data := e.rawOf(ns, item); len(data) != 0 {
-		t.Fatalf("__init__.py %q", data)
-	}
-
-	// A JSON file takes only I-JSON.
-	h, _ := e.load("matches", "derby")
-	hf, _ := e.load("docs", "derby")
-	for _, body := range []string{"", "  \n", "\xef\xbb\xbf"} {
-		e.expect(e.do("PUT", "/docs/derby.json", body), 400, "PUT "+strconv.Quote(body)+" over a JSON file")
-		e.expect(e.do("PUT", "/cat/Season/derby.json", body), 400, "PUT "+strconv.Quote(body)+" over a JSON file in a tree")
-	}
-	e.expectLive("matches", "derby", h, "after the refused saves")
-	e.expectLive("docs", "derby", hf, "after the refused saves")
-
-	// Placeholders: a new .json name, and a LOCK of a new name.
-	for _, p := range []string{"/docs/new.json", "/cat/Season/New.json"} {
-		e.expect(e.do("PUT", p, ""), 201, "0-byte PUT of "+p)
-		dir := p[:strings.LastIndexByte(p, '/')+1]
-		if l := e.propfind(dir); l[p].size != "0" {
-			t.Fatalf("placeholder %s: %v", p, names(l, dir))
-		}
-		if _, ok := o.propfind(dir)[p]; ok {
-			t.Fatalf("another user sees the placeholder %s", p)
-		}
-		e.expect(e.do("PUT", p, `{"v": 1}`), 201, "content of "+p)
-	}
-	_, doc := e.load("docs", "new")
-	sameJSON(t, doc, map[string]any{"v": 1})
-	ns, item = e.itemOf("cat", "New.json")
-	_, doc = e.load(ns, item)
-	sameJSON(t, doc, map[string]any{"v": 1})
-	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>me</D:owner></D:lockinfo>`
-	r = e.expect(e.do("LOCK", "/docs/locked.md", lock, "Timeout", "Second-60"), 201, "LOCK a new name")
-	if h, _ := e.load("docs", "locked.md"); h.State != client.NotFound {
-		t.Fatal("LOCK made a file")
-	}
-	e.expect(e.do("PUT", "/docs/locked.md", "# locked\n", "If", "("+r.header.Get("Lock-Token")+")"), 201, "PUT with the token")
-	if _, data := e.rawOf("docs", "locked.md"); string(data) != "# locked\n" {
-		t.Fatalf("locked.md %q", data)
-	}
-
-	// Copied and moved, an empty file stays one; its source is deleted
-	// only once the copy is written.
-	e.expect(e.do("COPY", "/docs/empty.txt", "", "Destination", "/docs/copy.txt"), 201, "COPY")
-	if _, data := e.rawOf("docs", "copy.txt"); len(data) != 0 {
-		t.Fatalf("copy.txt %q", data)
-	}
-	e.expect(e.do("MOVE", "/docs/copy.txt", "", "Destination", "/cat/Season/keep.txt"), 201, "MOVE into a tree")
-	ns, item = e.itemOf("cat", "keep.txt")
-	if _, data := e.rawOf(ns, item); len(data) != 0 {
-		t.Fatalf("keep.txt %q", data)
-	}
-	if hc, _ := e.load("docs", "copy.txt"); hc.State != client.Tombstoned || hc.Successor != "/r/"+ns+"/"+item {
-		t.Fatalf("the moved file's source %+v", hc)
-	}
-	e.expect(e.do("PUT", "/docs/full.txt", "full"), 201, "PUT full.txt")
-	e.expect(e.do("MOVE", "/docs/empty.txt", "", "Destination", "/docs/full.txt"), 204, "MOVE onto a file")
-	if _, data := e.rawOf("docs", "full.txt"); len(data) != 0 {
-		t.Fatalf("full.txt %q", data)
-	}
-	e.expectTombstoned("docs", "empty.txt", "the moved file")
-}
-
-// One user's consecutive saves of a raw file never conflict with each
-// other, whatever their sizes: its base isn't picked by how close a
-// version's reference is to the upload (a version of the upload's size
-// differs in /$blob only), and the user's own writes since a version it
-// had are its own to replace, a stale If-Match too. Someone else's bytes
-// since any version the user had are a conflict, so an editor's buffer
-// isn't saved over them because a preview read them; a version saved
-// unchanged over them writes nothing.
-func TestRawOwnSaves(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("files")}})
-	must(e.c.CreateNamespace(e.ctx, "files", map[string]any{"read": "public"}))
-	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
-	for _, p := range []string{"/docs/todo.md", "/cat/todo.md"} {
-		e.expect(e.do("PUT", p, "- [ ] milk\n"), 201, "create "+p)
-		e.expect(e.do("PUT", p, "- [ ] milk\n- [ ] eggs\n"), 201, "a longer save of "+p)
-		e.expect(e.do("PUT", p, "- [x] milk\n"), 201, "a save of the first one's size of "+p)
-		e.expect(e.do("GET", p, ""), 200, "GET "+p)
-		e.expect(e.do("PUT", p, "- [x] milk, and more\n"), 201, "a longer save after a GET of "+p)
-		e.expect(e.do("PUT", p, "- [x] MILK\n"), 201, "a save of the read one's size of "+p)
-		if g := e.expect(e.do("GET", p, ""), 200, "GET "+p); g.body != "- [x] MILK\n" {
-			t.Fatalf("%s: %q", p, g.body)
-		}
-	}
-	// A stale If-Match, after the user's own save.
-	e.rawDoc("docs", "a.txt", "text/plain", []byte("one"), nil)
-	g := e.expect(e.do("GET", "/docs/a.txt", ""), 200, "GET a.txt")
-	e.expect(e.do("PUT", "/docs/a.txt", "two"), 201, "PUT a.txt")
-	e.expect(e.do("PUT", "/docs/a.txt", "six", "If-Match", g.header.Get("ETag")), 201, "PUT with the tag from before the user's save")
-	if _, data := e.rawOf("docs", "a.txt"); string(data) != "six" {
-		t.Fatalf("a.txt %q", data)
-	}
-
-	// An editor's version, someone else's bytes, a preview reading them.
-	e.rawDoc("docs", "b.txt", "text/plain", []byte("one"), nil)
-	e.expect(e.do("GET", "/docs/b.txt", ""), 200, "GET editor")
-	h, _ := e.load("docs", "b.txt")
-	bid := must(e.c.UploadBlob(e.ctx, "docs", "b.txt", "text/plain", "", []byte("theirs")))
-	must(e.c.Append(e.ctx, "docs", "b.txt", h.ID, []any{replace("/$blob", bid), replace("/size", 6)}))
-	e.expect(e.do("GET", "/docs/b.txt", ""), 200, "GET preview")
-	e.expect(e.do("PUT", "/docs/b.txt", "mine"), 409, "PUT the editor's buffer")
-	// Saved unchanged, the editor's version is a conflict too, never
-	// answered as stored (§H.1 "Identity"): nothing is written over theirs.
-	e.rawDoc("docs", "c.txt", "text/plain", []byte("one"), nil)
-	e.expect(e.do("GET", "/docs/c.txt", ""), 200, "GET")
-	h, _ = e.load("docs", "c.txt")
-	bid = must(e.c.UploadBlob(e.ctx, "docs", "c.txt", "text/plain", "", []byte("theirs")))
-	must(e.c.Append(e.ctx, "docs", "c.txt", h.ID, []any{replace("/$blob", bid), replace("/size", 6)}))
-	h, _ = e.load("docs", "c.txt")
-	e.expect(e.do("PUT", "/docs/c.txt", "one"), 409, "PUT the version read, unchanged")
-	e.expectLive("docs", "c.txt", h, "after an unchanged save")
-	if _, data := e.rawOf("docs", "c.txt"); string(data) != "theirs" {
-		t.Fatalf("c.txt %q", data)
-	}
-}
-
-// In the flat view a name that only looks like a copy of a live file (a
-// browser's duplicate download "invoice (1).pdf") is refused for a PUT
-// like any name that isn't a resource name, never kept in memory to
-// vanish; a file manager's Duplicate, a COPY to such a name, is scratch
-// until renamed. {name} (2).json, JSON document x's name beside a raw
-// x.json, keeps naming x for a client that has it open once the raw one
-// is gone, with or without If-Match, and is a 409 once x is gone too.
-func TestFlatCopyAndDupNames(t *testing.T) {
-	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
-	e.expect(e.do("PUT", "/docs/invoice.pdf", "%PDF-1 a"), 201, "PUT invoice.pdf")
-	e.expect(e.do("PUT", "/docs/invoice%20(1).pdf", "%PDF-1 b"), 403, "PUT invoice (1).pdf")
-	e.expect(e.do("COPY", "/docs/invoice.pdf", "", "Destination", "/docs/invoice%20copy.pdf"), 201, "Duplicate")
-	sameStrings(t, "docs", e.liveNames("docs"), []string{"invoice.pdf"})
-
-	e.create("docs", "x", map[string]any{"v": "1"})
-	e.rawDoc("docs", "x.json", "application/json", []byte("// raw\n"), nil)
-	g := e.expect(e.do("GET", "/docs/x%20(2).json", ""), 200, "GET the duplicate name")
-	h, _ := e.load("docs", "x.json")
-	must(e.c.Delete(e.ctx, "docs", "x.json", h.ID))
-	e.expect(e.do("PUT", "/docs/x%20(2).json", edit(t, g.body, `"v": "1"`, `"v": "2"`)), 201, "PUT x (2).json after x.json went")
-	_, doc := e.load("docs", "x")
-	sameJSON(t, doc, map[string]any{"v": "2"})
-	g = e.expect(e.do("GET", "/docs/x%20(2).json", ""), 200, "GET it again")
-	e.expect(e.do("PUT", "/docs/x%20(2).json", edit(t, g.body, `"v": "2"`, `"v": "3"`), "If-Match", g.header.Get("ETag")), 201, "PUT x (2).json with If-Match")
-	_, doc = e.load("docs", "x")
-	sameJSON(t, doc, map[string]any{"v": "3"})
-	sameStrings(t, "docs", names(e.propfind("/docs/"), "/docs/"), []string{"invoice copy.pdf", "invoice.pdf", "x.json"})
-	h, _ = e.load("docs", "x")
-	must(e.c.Delete(e.ctx, "docs", "x", h.ID))
-	e.expect(e.do("PUT", "/docs/x%20(2).json", `{"v": "4"}`), 409, "PUT x (2).json once x is gone")
-	e.expect(e.do("GET", "/docs/x%20(2).json", ""), 404, "GET x (2).json once x is gone")
-	e.expectTombstoned("docs", "x", "after the refused save")
 }

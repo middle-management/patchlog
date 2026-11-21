@@ -146,7 +146,7 @@ func TestGesturesE2E(t *testing.T) {
 	opc := s.Client(t, client.WithBearer(s.OperatorGrant(t, "e")))
 	must(opc.CreateNamespace(ctx, "e", map[string]any{"keys": []any{admin.Entry("*")}, "encryption": map[string]any{"level": "e2e"}}))
 	jwk, priv, _ := seal.GenerateRecipient()
-	all := []string{"read", "create", "append", "restore", "delete", "config", "branch", "purge", "prune", "export"}
+	all := []string{"read", "create", "append", "restore", "delete", "config", "branch", "purge", "prune"}
 	ac := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:admin", []string{"e"}, all, map[string]any{"enc": jwk})))
 	x := ac.E2E(priv)
 	must(x.InitKeyring(ctx, "e"))

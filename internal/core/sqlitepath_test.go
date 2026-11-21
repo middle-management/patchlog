@@ -22,7 +22,7 @@ func TestSQLitePathOpensThatFile(t *testing.T) {
 	path := filepath.Join(dir, "a#00?b.db")
 	open := func() *Engine {
 		t.Helper()
-		e, err := Open(Options{Path: path, BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}})
+		e, err := Open(Options{Path: path, BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Purger: discardPurger{}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -78,8 +78,7 @@ func TestSQLiteLegacyPathRefused(t *testing.T) {
 	dir := t.TempDir()
 	path, old := filepath.Join(dir, "x.db#prod"), filepath.Join(dir, "x.db")
 	blobDir := path + ".blobs"
-	opts := Options{Path: old, BlobDir: blobDir, AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1,
-		Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}}
+	opts := Options{Path: old, BlobDir: blobDir, AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1, Purger: discardPurger{}}
 	// The layout "-db x.db#prod" gave before.
 	e, err := Open(opts)
 	if err != nil {

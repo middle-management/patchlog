@@ -389,13 +389,13 @@
   "q": "a b",
   "sort": "/title",
   "canonicalQuery": "q=a%20b&sort=%2Ftitle",
-  "view": "/demo/g/17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm/at/1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm?q=a%20b&sort=%2Ftitle",
-  "viewKeyKr": "4a9740243099b77c664dee6d8e810508baf276d8b726ca0b338c98caa9ac6219",
+  "view": "/demo/view/17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm/at/1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm?q=a%20b&sort=%2Ftitle",
+  "viewKeyKr": "e3fdb292d5cae0f7a6829614b3a3c5a0a5e573246a039d90c89e6b30616219d5",
   "item": {
-   "header": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"name\":\"derby\",\"ns\":\"demo\",\"view\":\"/demo/g/17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm/at/1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm?q=a%20b&sort=%2Ftitle\"}}",
+   "header": "{\"alg\":\"dir\",\"enc\":\"A256GCM\",\"kid\":\"demo#3\",\"pl\":{\"name\":\"derby\",\"ns\":\"demo\",\"view\":\"/demo/view/17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm/at/1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm?q=a%20b&sort=%2Ftitle\"}}",
    "plaintext": "{\"/title\":[\"Hello\"],\"score\":1.5}",
-   "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIiwidmlldyI6Ii9kZW1vL2cvMTdpMnJxenN2M28yaTV2bGZoc2tsbzZmdTIyam5xd3RtL2F0LzFwYTJuaDZpdzJ5ZDJkanFmeTJ3cnN6ZDVrZ2xmcHh2bT9xPWElMjBiJnNvcnQ9JTJGdGl0bGUifX0..wMHCw8TFxsfIycrL.TZJpva2ZV7PahdlmA_E0rJj0WDX9xRfnqBGhzj3GRJY.QtG0R9eNAARRKqqGNvJIhg",
-   "paddedTag": "aI4EZpDID0edvKf5GA7Sxw"
+   "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIiwidmlldyI6Ii9kZW1vL3ZpZXcvMTdpMnJxenN2M28yaTV2bGZoc2tsbzZmdTIyam5xd3RtL2F0LzFwYTJuaDZpdzJ5ZDJkanFmeTJ3cnN6ZDVrZ2xmcHh2bT9xPWElMjBiJnNvcnQ9JTJGdGl0bGUifX0..wMHCw8TFxsfIycrL.a-vVzxqEqGtOcJAm8NTR6ugD3e09wWXGas7BqkCExdg.hKn1d7GAO_p1H2JmXb6J6g",
+   "paddedTag": "2ZZsCDc80ADzJQXXG0J04g"
   },
   "served": "{\"id\":\"1sywh54kpo3c4ezn2znktvl3avge4zl5d\",\"resource\":\"derby\",\"sealed\":\"%s\",\"url\":\"/r/demo/derby/rev/1sywh54kpo3c4ezn2znktvl3avge4zl5d\"}",
   "rejected": "A JWE whose `pl.view` is the same target with `+` for the space, lowercase hex (`%2ftitle`) or the parameters in another order, or with a scheme and host, doesn't match the URL fetched, and the reader rejects it. No `view` has a `min`: a `200` is never served at a URL with one (§A.5)."
@@ -439,9 +439,9 @@
     "phaseMs": 18318
    },
    {
-    "path": "/ns/matches/g/17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm/log",
-    "first8": "557cd01ce3897ae3",
-    "phaseMs": 15523
+    "path": "/ns/matches/view/17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm/log",
+    "first8": "e0ffbec41992c73a",
+    "phaseMs": 12058
    }
   ]
  }

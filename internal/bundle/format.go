@@ -254,8 +254,7 @@ type Line struct {
 }
 
 // NSRef names a namespace in the form of the `written` member (§G.4.1): a
-// name, or with Origin set a namespace of another deployment, as a remote
-// branch's base is.
+// name, or with Origin set a namespace of another deployment.
 type NSRef struct{ Origin, NS string }
 
 // IsZero reports an unset reference.

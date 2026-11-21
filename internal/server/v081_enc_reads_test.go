@@ -11,7 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// ACCESS-9 (v0.78; §B.11.9 Answers, CONFORMANCE TDA 68): filtered reads
+// ACCESS-9 (v0.78; §7.9 Answers, CONFORMANCE TDA 68): filtered reads
 // cover no branch, so a partial reader's /branches is 403, whatever
 // branches its grant names; an unrestricted reader's is unchanged.
 func TestV081BranchesPartial403(t *testing.T) {

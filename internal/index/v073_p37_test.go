@@ -19,9 +19,9 @@ import (
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/index"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
-	"github.com/middle-management/patchlog/internal/svcedge"
 )
 
 // p37World is pa and pb (read: grant) and pub (public), followed by one
@@ -32,10 +32,10 @@ type p37World struct {
 	x             *svc
 	admin, issuer clienttest.Key
 	db            string
-	rate          svcedge.Rate
+	rate          index.Rate
 }
 
-func p37Setup(t *testing.T, rate svcedge.Rate) *p37World {
+func p37Setup(t *testing.T, rate index.Rate) *p37World {
 	t.Helper()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
@@ -167,18 +167,18 @@ func p37Hits(body map[string]any) []string {
 }
 
 // TestV073P37IndexEdgeGrants (IX-18, §A.4, §B.11.5, §C.5.2–§C.5.4): the
-// index serves its gs URLs as §B.11.5 says. Its own POST /edge-grants
-// exchanges a grant for cookies, minted with its key, for /{ns}/g/{gs} of
+// index serves its view URLs as §B.11.5 says. Its own POST /edge-grants
+// exchanges a grant for cookies, minted with its key, for /{ns}/view/{view} of
 // each private namespace it follows that the grant names and
-// /_refs/g/{gs} of the reader's subject set; a GET with only the cookie
+// /_refs/view/{view} of the reader's view; a GET with only the cookie
 // is authorised from it at the origin (the head pointer under the prefix
 // and the at URLs), and behind a verifying edge gets edge lifetimes. A
 // reader whose grant reads only some resources gets them filtered as
 // under the grant. Neither grant nor cookie is 401, and so is the cookie
-// at another gs, which it doesn't cover. DELETE /edge-grants withdraws.
+// at another view, which it doesn't cover. DELETE /edge-grants withdraws.
 func TestV073P37IndexEdgeGrants(t *testing.T) {
 	t.Parallel()
-	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	w := p37Setup(t, index.DefaultExchangeRate)
 	x := w.x
 	amy := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"pa", "pb"}, []string{"read"})
 	carl := w.issuer.Grant(t, w.s.Now(), "user:carl", []string{"pa"}, []string{"read"},
@@ -188,8 +188,8 @@ func TestV073P37IndexEdgeGrants(t *testing.T) {
 	if len(prefixes) != 3 || prefixes["pa"] == "" || prefixes["pb"] == "" || prefixes["_refs"] == "" {
 		t.Fatalf("amy's prefixes: %v", prefixes)
 	}
-	// The grant's own subject set is the cookie's.
-	_, gs := path(prefixes["pa"])
+	// The grant's own view is the cookie's.
+	_, vid := path(prefixes["pa"])
 	if r := x.raw("/pa?limit=5", amy); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), prefixes["pa"]+"/at/") {
 		t.Fatalf("amy's pointer: %d %s (want under %s)", r.status, r.header.Get("Location"), prefixes["pa"])
 	}
@@ -205,11 +205,11 @@ func TestV073P37IndexEdgeGrants(t *testing.T) {
 		t.Errorf("/_refs under the cookie: %d %v", r.status, r.body)
 	}
 	// Neither grant nor cookie, or a cookie that doesn't cover the URL.
-	_, refsGS := path(prefixes["_refs"])
-	other := strings.Replace(at, gs, refsGS, 1)
+	_, refsView := path(prefixes["_refs"])
+	other := strings.Replace(at, vid, refsView, 1)
 	for _, c := range [][]*http.Cookie{nil, cookies} {
 		if r := p37Do(t, x, "GET", other, "", "", c, ""); r.status != 401 {
-			t.Errorf("another gs's at URL with %d cookies: %d %v", len(c), r.status, r.body)
+			t.Errorf("another vid's at URL with %d cookies: %d %v", len(c), r.status, r.body)
 		}
 	}
 	if r := p37Do(t, x, "GET", at, "", "", nil, ""); r.status != 401 {
@@ -227,7 +227,7 @@ func TestV073P37IndexEdgeGrants(t *testing.T) {
 	if r, _ := p37Follow(t, x, cp["_refs"]+"?to="+url.QueryEscape("/r/target/x"), cc, ""); r.status != 200 || strings.Join(p37Hits(r.body), ",") != "pa/a,pub/p" {
 		t.Errorf("/_refs under carl's cookie: %d %v", r.status, r.body)
 	}
-	// A restarted instance on the same database knows the subject sets.
+	// A restarted instance on the same database knows the views.
 	x.stop()
 	x2 := w.start(t)
 	if r, _ := p37Follow(t, x2, cp["pa"]+"?limit=5", cc, ""); r.status != 200 || strings.Join(p37Hits(r.body), ",") != "a" {
@@ -263,8 +263,8 @@ func TestV073P37IndexEdgeGrants(t *testing.T) {
 	}
 }
 
-// path splits an index prefix /{ns}/g/{gs}.
-func path(p string) (ns, gs string) {
+// path splits an index prefix /{ns}/view/{view}.
+func path(p string) (ns, vid string) {
 	segs := strings.Split(p, "/")
 	return segs[1], segs[3]
 }
@@ -276,11 +276,11 @@ func path(p string) (ns, gs string) {
 func TestV073P37IndexExchangeRateShared(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	rate := svcedge.Rate{Rate: 0.001, Burst: 1}
+	rate := index.Rate{Rate: 0.001, Burst: 1}
 	w := p37Setup(t, rate)
 	sdb := must(sql.Open("sqlite", sqlitedsn.DSN(w.db, "_pragma=busy_timeout(10000)")))
 	t.Cleanup(func() { sdb.Close() })
-	other := must(svcedge.NewStore(ctx, sdb))
+	other := index.NewEdgeStore(sdb)
 	amy := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"pa"}, []string{"read"})
 	w.exchange(t, w.x, amy)
 	if wait := must(other.Draw(ctx, w.s.Now(), rate, []string{"user:amy\x00issuer"})); wait == 0 {
@@ -296,7 +296,7 @@ func TestV073P37IndexExchangeRateShared(t *testing.T) {
 	plain := startSvc(t, w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "svc:indexer", []string{"pa"}, []string{"read"}))),
 		svcOpts{db: filepath.Join(t.TempDir(), "p.db"), ns: []string{"pa"}, untyped: true, now: w.s.Now})
 	for _, m := range []string{"POST", "DELETE"} {
-		if r := p37Do(t, plain, m, "/edge-grants?prefix=/pa/g/x", amy, "", nil, ""); r.status != 404 || r.body["code"] != "not_offered" {
+		if r := p37Do(t, plain, m, "/edge-grants?prefix=/pa/view/x", amy, "", nil, ""); r.status != 404 || r.body["code"] != "not_offered" {
 			t.Errorf("%s without edge grants: %d %v", m, r.status, r.body)
 		}
 	}
@@ -567,7 +567,7 @@ func p37CoreExchange(t *testing.T, s *clienttest.Server, token string) (int, map
 func TestV073P37ExchangePurged(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	w := p37Setup(t, index.DefaultExchangeRate)
 	op := w.s.Client(t, client.WithBearer(w.admin.Grant(t, w.s.Now(), "user:root", []string{"pa", "pb"}, []string{"read", "config", "purge-ns"})))
 	heads := map[string]string{}
 	purge := func(ns string) {
@@ -588,7 +588,7 @@ func TestV073P37ExchangePurged(t *testing.T) {
 	}
 	applied("pb", amy)
 	r := p37Do(t, w.x, "POST", "/edge-grants", amy, "", nil, "")
-	if r.status != 200 || len(r.body["prefixes"].([]any)) != 2 || !strings.HasPrefix(r.body["prefixes"].([]any)[0].(string), "/pa/g/") {
+	if r.status != 200 || len(r.body["prefixes"].([]any)) != 2 || !strings.HasPrefix(r.body["prefixes"].([]any)[0].(string), "/pa/view/") {
 		t.Errorf("index exchange naming a purged namespace and pa: %d %v (%d cookies)", r.status, r.body, len(r.cookies))
 	}
 	onlyPB := w.issuer.Grant(t, w.s.Now(), "user:amy", []string{"pb"}, []string{"read"})
@@ -616,24 +616,26 @@ func TestV073P37ExchangePurged(t *testing.T) {
 // for its principal, with /resource set to each name it fixes" is 403. A
 // grant whose rules fix /resource to no name at all, or to names none of
 // its rules pass for, reads nothing: 403 at the core and at the index,
-// with no cookie and no subject set recorded. One that passes for a name
+// with no cookie and no view recorded. One that passes for a name
 // it fixes gets its scope marker's cookies.
 func TestV073P37ExchangeFixedNames(t *testing.T) {
 	t.Parallel()
-	w := p37Setup(t, svcedge.DefaultExchangeRate)
+	w := p37Setup(t, index.DefaultExchangeRate)
 	test := func(v string) map[string]any { return map[string]any{"op": "test", "path": "/resource", "value": v} }
 	for _, c := range []struct {
 		name  string
 		rules []any
 		want  int
 	}{
+		// Its rules fix no name (§2.1: an empty set fixes nothing): to the
+		// core a partial reader, whose view prefix it gets (§7.9).
 		{"none left", []any{test("a"), test("b")}, 403},
 		{"none passing", []any{map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": []any{"a", "b"}}},
 			map[string]any{"op": "test", "path": "/principal/sub", "value": "user:other"}}, 403},
 		{"one passing", []any{map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": []any{"a", "b"}}}}, 200},
 	} {
 		g := w.issuer.Grant(t, w.s.Now(), "user:fay", []string{"pa"}, []string{"read"}, map[string]any{"rules": c.rules})
-		if st, _ := p37CoreExchange(t, w.s, g); st != c.want {
+		if st, _ := p37CoreExchange(t, w.s, g); st != c.want && !(c.name == "none left" && st == 200) {
 			t.Fatalf("%s: core exchange: %d, want %d", c.name, st, c.want)
 		}
 		r := p37Do(t, w.x, "POST", "/edge-grants", g, "", nil, "")

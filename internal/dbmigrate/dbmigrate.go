@@ -3,9 +3,9 @@
 // numbered migrations in its own migrations directory, one subdirectory
 // per dialect it supports (migrations/sqlite, migrations/postgres),
 // embedded in the binary, and applies them under a namespace of its own,
-// so several packages' tables share a database (the tree service's holds
-// the tree's, the catalog's, the sealed-view cache's and the repurge
-// queue's) with independent histories.
+// so several packages' tables share a database (the index's holds its
+// own, the edge store's and the repurge queue's) with independent
+// histories.
 //
 // Seeds, rows the code expects to exist, are SQL too: migrations/seed/
 // <dialect>.sql, run after the migrations on every start, so they must be

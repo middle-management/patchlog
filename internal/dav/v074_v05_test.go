@@ -22,7 +22,7 @@ import (
 // find out where the file went. No new file is made over it.
 func TestV074SealedMovedAway(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, nil, nil)
+	e := newEnv(t, []string{"docs"}, nil)
 	srv := must(dav.New(e.opt))
 	g := *e
 	g.dav = newTestServer(t, srv)
