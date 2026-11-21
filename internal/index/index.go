@@ -90,6 +90,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/repurge"
+	"github.com/middle-management/patchlog/internal/rules"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
@@ -172,8 +173,10 @@ type Options struct {
 	// item filtered by a grant may take in its rules' schema tests (§6.6
 	// Validation work, §12.2 validationSteps): a check that needs more
 	// fails, and the item is left out. It is the origin deployment's
-	// limit, which no namespace document carries, so the service is told
-	// it; zero, or less, means §12.2's default of 5,000,000.
+	// limit, which GET /ns/{ns}/principal gives the service's own grant in
+	// writer.limits (SERVICES §A.4, v0.88): zero, or less, means the
+	// origin's, read so from a namespace followed when the index opens,
+	// or §12.2's default of 5,000,000 where none gives it.
 	ValidationSteps int
 	// Logf logs; default log.Printf.
 	Logf func(format string, args ...any)
@@ -261,6 +264,27 @@ type Index struct {
 	testBeforeAnswer func()
 }
 
+// originValidationSteps is the origin's validationSteps, as GET
+// /ns/{ns}/principal gives the index's own grant in writer.limits for the
+// first of nss that answers (SERVICES §A.4, §7.4): a deployment-only
+// limit, the same in every namespace. Where none gives it, §12.2's
+// default, logged.
+func originValidationSteps(ctx context.Context, c *client.Client, nss []string, logf func(string, ...any)) int {
+	var last error
+	for _, ns := range nss {
+		info, err := c.NSPrincipal(ctx, ns)
+		if err != nil {
+			last = err
+			continue
+		}
+		if n, ok := info.Writer.Size("validationSteps"); ok && n > 0 {
+			return int(n)
+		}
+	}
+	logf("index: the origin's validationSteps not read from /principal (%v): using §12.2's default, %d", last, rules.DefaultValidationSteps)
+	return rules.DefaultValidationSteps
+}
+
 // Open opens (creating or, with Rebuild, recreating) the index database and
 // reads the core's origin.
 func Open(ctx context.Context, opt Options) (*Index, error) {
@@ -288,6 +312,9 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 	origin, err := opt.Client.Origin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("index: reading the core's origin: %w", err)
+	}
+	if opt.ValidationSteps <= 0 {
+		opt.ValidationSteps = originValidationSteps(ctx, opt.Client, opt.Namespaces, opt.Logf)
 	}
 	// A database that an earlier release kept under another name (see
 	// sqlitedsn.Legacy) must be moved first, not replayed into a new one.

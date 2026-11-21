@@ -4075,9 +4075,10 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   check with its usual refusal (`404` for a resource of a private namespace, `403` for the
   namespace's log, an exchange, a key request and branching) or leaves the item out; a test
   cut short never passes, under a `not` either. A key scope's `attrs` schema is held to the
-  same count. The index applies it per read check
-  and per item too; the limit is in no namespace document, so it takes
-  `--max-validation-steps` itself (default 5,000,000) and should be given the origin's.
+  count, that of the check it is verified for (v0.88). A read request has one budget for all
+  its checks (v0.88). The index applies it per read check and per item too; the limit is in
+  no namespace document, so the index reads the origin's from `GET /ns/{ns}/principal`'s
+  `writer.limits` when it opens (v0.88), unless `--max-validation-steps` overrides it.
   Annotation walks are not counted.
 - **A patch to a typed document is validated where it changes it**, when this instance has
   validated the document it applies to against the same schema revision: the changed values,
