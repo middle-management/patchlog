@@ -159,6 +159,10 @@ func countCheck(t *testing.T, tx bool) checkCounts {
 	// Revisions not read before, so not in the read cache: the head, and
 	// one below it.
 	out.revHead = count("rev head", func() { rev("r", h3) })
+	// A read of the head whose document the cache dropped ran again in a
+	// transaction, and the namespace backs off: the next read would go
+	// straight to one, with no abandoned statement to discount.
+	e.lone.m.Delete("n")
 	out.revOld = count("rev old", func() { rev("r", head) })
 	return out
 }
