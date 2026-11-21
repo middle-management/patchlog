@@ -241,12 +241,11 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 			m := rules.Budget(t.e.opt.MaxValidationSteps)
 			err := validateAttrs(schema, attrs, m)
 			attrsSteps, attrsOver = m.Steps, m.Over
-			if m.Over {
-				// Ran out: every check of the grant counts that against
-				// its budget (chargeAttrs), so a write's step 1 runs out,
-				// answered after any check that fails outright, and a
-				// read check fails with its usual refusal (§6.6). Where
-				// verification alone decides, it is refused (attrsOver).
+			if m.Over && t.stepOneAttrs {
+				// Ran out in a write's check: its step 1 counts that
+				// against its budget (chargeAttrs) and runs out, answered
+				// after any check that fails outright (§6.6). Anywhere
+				// else the grant is refused, fail closed.
 				return nil
 			}
 			return err

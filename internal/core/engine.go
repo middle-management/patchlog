@@ -728,6 +728,10 @@ type tx struct {
 	// while it is set (readScope), nil outside one: every read check then
 	// gets a fresh budget.
 	readMeter *writeMeter
+	// stepOneAttrs is set while a resource write or batch is checked
+	// (checkItems): an attrs check that runs out then is its step-1
+	// run-out (chargeAttrs); anywhere else it refuses the grant.
+	stepOneAttrs bool
 	// judged are the per-revision read answers this transaction gave that
 	// read_judged doesn't hold yet (judge, flushJudged).
 	judged []judgedRow

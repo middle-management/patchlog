@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/core"
@@ -68,6 +69,78 @@ func TestV088AttrsSchemaCountsAgainstTheCheck(t *testing.T) {
 	}
 	expect(t, e.get("/ns/at/principal", g(half)), 200)
 	expectCode(t, e.get("/ns/at/principal", g(over)), 403, "forbidden")
+	// Nor does an exchange give it a cookie.
+	if r := e.do(req{method: "POST", path: "/edge-grants", bearer: g(over)}); r.Code == 200 {
+		t.Fatalf("an exchange for a grant whose attrs check runs out: %d %v %s", r.Code, r.H.Values("Set-Cookie"), r.Body)
+	}
+}
+
+// v0.88 §6.6 Validation work ("Each read request … gets one budget,
+// shared by every check it makes … A paged read that runs out after its
+// first entry ends its page there instead"): a gestures listing for a
+// grant whose /resource rule takes a large share of validationSteps per
+// name ends each page where the request's budget runs out, with
+// X-Log-Next on it, and paging through gives every entry once. Until
+// v0.88 each name's check had a budget of its own.
+func TestV088PageEndsWhereTheBudgetRunsOut(t *testing.T) {
+	t.Parallel()
+	steps := 3000
+	f := newAuthFixture(t, nil, func(o *core.Options) { o.MaxValidationSteps = steps })
+	e := f.tenv
+	names := []string{"a", "b", "c", "d"}
+	for _, n := range names {
+		expect(t, e.do(req{method: "PATCH", path: "/r/sec/" + n, ifNoneMatch: "*", body: addRoot(map[string]any{}), bearer: f.adminG, hdr: map[string]string{"Gesture": gA}}), 201)
+	}
+	// About 1,000 steps a name: two or so fit in a request, never four.
+	slow := e.grant(f.issuer, "user:s", []string{"sec"}, []string{"read"},
+		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": doubling(8)}}})
+	var got []string
+	next, pages := "", 0
+	for {
+		p := "/ns/sec/gestures/" + gA
+		if next != "" {
+			p += "?after=" + next
+		}
+		r := e.get(p, slow)
+		expect(t, r, 200)
+		if len(r.Arr()) == 0 {
+			t.Fatalf("page %d empty: %s", pages, r.Body)
+		}
+		for _, x := range r.Arr() {
+			got = append(got, x.(map[string]any)["resource"].(string))
+		}
+		pages++
+		if next = r.H.Get("X-Log-Next"); next == "" || pages > 8 {
+			break
+		}
+	}
+	if pages < 2 || strings.Join(got, ",") != strings.Join(names, ",") {
+		t.Fatalf("%d pages listing %v, want several pages listing %v once each", pages, got, names)
+	}
+}
+
+// v0.88 §6.6 Validation work ("So does each read check a write makes"): a
+// batch's step-2.2 read checks, made while its steps run in a read
+// transaction, each have a budget of their own, not the request's one:
+// four items whose checks each take about 1,000 of 3,000 steps pass.
+func TestV088WriteReadChecksOwnBudgets(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil, func(o *core.Options) { o.MaxValidationSteps = 3000 })
+	e := f.tenv
+	names := []string{"a", "b", "c", "d"}
+	heads := map[string]string{}
+	for _, n := range names {
+		r := e.do(req{method: "PATCH", path: "/r/sec/" + n, ifNoneMatch: "*", body: addRoot(map[string]any{}), bearer: f.adminG})
+		expect(t, r, 201)
+		heads[n] = etagOf(r)
+	}
+	slow := e.grant(f.issuer, "user:s", []string{"sec"}, []string{"read", "append"},
+		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": doubling(8)}}})
+	var items []any
+	for _, n := range names {
+		items = append(items, map[string]any{"resource": n, "ifMatch": heads[n], "steps": []any{ops(op("add", "/x", 1.0))}})
+	}
+	expect(t, e.batchReq("sec", map[string]any{"items": items}, slow), 201)
 }
 
 // v0.88 §8.5 item 4, §6.1 ("dependents (§7.4, §8.5) list the dependents

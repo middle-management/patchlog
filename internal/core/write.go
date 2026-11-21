@@ -510,6 +510,12 @@ type writePlan struct {
 // returns a plan to insert, or a final result (an idempotent retry, a dry
 // run), or an error.
 func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun, rateDrawn bool) (*writePlan, *WriteResult, error) {
+	// Each read check a write makes has a budget of its own (§6.6), also
+	// where its steps run in a read transaction (checkOutside, dry runs),
+	// which would otherwise share the request's.
+	prevRead, prevWrite := t.readMeter, t.stepOneAttrs
+	t.readMeter, t.stepOneAttrs = nil, true
+	defer func() { t.readMeter, t.stepOneAttrs = prevRead, prevWrite }()
 	// A config change locks the namespace exclusively; resource writes
 	// alone lock it shared (pglock.go).
 	t.reqCreds = req.anyCreds()
