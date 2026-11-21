@@ -748,9 +748,17 @@ time only): the consumers read the revision each namespace entry names
   group commit workers wait in the same queue: each spent about 90% of its time waiting for a
   connection, so groups of about 30 writes (of `--group-commit` 32) committed about 100 times a
   second in all, about 3,000 writes. Postgres did little: about 2.5 ms of statements per group.
-  A larger pool (a GOMAXPROCS above the vCPUs, since `pool_max_conns` can't raise it), or a
-  connection the group commit workers don't queue for, should raise the limit; a run with
-  GOMAXPROCS 16 will tell.
+- **A pool of 64 raised the limit to about 4,600 writes a second.** With GOMAXPROCS 16 on the
+  core (`pool_max_conns` can't raise the pool), four namespaces wrote their full 3,992 a second,
+  and eight and sixteen 4,611 and 4,602 (write p99 376 and 861 ms); a quiet namespace beside
+  three busy ones stayed at p99 45 ms. RDS CPU peaked at 75%, the core's at 71%.
+- **The next limit is the rate-limit draw.** A write's check (D.3) draws its tokens (`rateLimit`,
+  `bucketStore.draw`) inside its read transaction, so it holds a main-pool connection, idle in a
+  transaction, while it waits for one of the bucket pool's 16 and then for its buckets' rows.
+  With one writer principal every draw locks the same row: `rate_draw`'s mean rose from 0.4 to
+  1.9 ms, and Postgres showed row-lock waits (`Lock:tuple`, `Lock:transactionid`). Drawing
+  outside the check's transaction would free the connection; a principal writing across many
+  namespaces still serialises on its row.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
