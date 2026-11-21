@@ -3,6 +3,8 @@ package server
 import (
 	"testing"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/core"
 )
 
 // v0.88 §7.9 Partial reader, §9 ("a /ns/{ns} cookie's reads at view URLs"),
@@ -25,6 +27,32 @@ func TestV088FullReaderCookieAtViewURLs(t *testing.T) {
 		r := w.do(req{method: "GET", path: p, hdr: cookieHdr(c)})
 		expect(t, r, 200)
 		expectPrivateNoStore(t, r)
+	}
+}
+
+// v0.88 §7.9 URLs ("Ranges are immutable but for purges and archive
+// restores since", tagged as their unfiltered forms, ns:{ns}): once a
+// view has been recorded in matches, a resource purge there purges
+// ns:matches, which its filtered ranges carry, besides the purge's own
+// tags; a namespace no view was recorded for keeps ns:{ns}. (Restores are
+// in core, TestV088RestoreTagsFilteredRanges.)
+func TestV088PurgeTagsFilteredRanges(t *testing.T) {
+	rec := &recPurger{}
+	w := newV75s(t, v75sOpts{env: []envOpt{func(o *core.Options) { o.Purger = rec }}})
+	adminP := w.grant(w.k, "user:root", []string{"matches"}, []string{"read", "create", "append", "purge"})
+	x := w.v87Doc("matches", "x", map[string]any{"team": "a"})
+	rec.take()
+	expect(t, w.purge("matches", "x", x, adminP), 204)
+	if calls := rec.take(); purged(calls, "ns:matches") || !purged(calls, "r:matches/x") {
+		t.Fatalf("a purge with no view recorded: %v, want r:matches/x without ns:matches", calls)
+	}
+	w.seed(nil, nil, []string{"derby"})
+	w.cookie(w.li())
+	y := w.v87Doc("matches", "y", map[string]any{"team": "a"})
+	rec.take()
+	expect(t, w.purge("matches", "y", y, adminP), 204)
+	if calls := rec.take(); !purged(calls, "ns:matches") {
+		t.Fatalf("a purge once a view is recorded: %v, want ns:matches among them", calls)
 	}
 }
 

@@ -652,6 +652,9 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 		}
 		if out.Restored > 0 {
 			t.flushDocs = true
+			// Documents back: revisions judged hidden for want of one
+			// are judged again (§7.9 Cost, §8.6).
+			t.tagFilteredRanges(n)
 		}
 		if !own.horizonSeq.Valid {
 			// Cleared before: every document is stored.

@@ -987,6 +987,7 @@ func (t *tx) purgeApply(p *purgePlan, author int64, forced bool) ids.ID {
 		for _, a := range batch {
 			appended[a.n.id] = true
 			t.tags = append(t.tags, "r:"+a.n.name+"/"+p.name, "heads:"+a.n.name)
+			t.tagFilteredRanges(a.n)
 		}
 		t.flushDocs = true
 	}
@@ -1015,6 +1016,7 @@ func (t *tx) purgeApply(p *purgePlan, author int64, forced bool) ids.ID {
 			// digest (NamespaceHeads): every branch the purge reaches purges
 			// its own.
 			t.tags = append(t.tags, "r:"+n.name+"/"+p.name, "heads:"+n.name)
+			t.tagFilteredRanges(n)
 			t.flushDocs = true
 		}
 		if n.id == p.root.id {
