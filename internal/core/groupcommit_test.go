@@ -622,7 +622,7 @@ func groupWaitsOn(e *Engine, ns string, pid int) bool {
 	}
 	var n int
 	e.db.QueryRow(`SELECT COUNT(*) FROM pg_stat_activity
-		WHERE datname = current_database() AND wait_event_type = 'Lock' AND query NOT LIKE '%rate_draw(%'
+		WHERE datname = current_database() AND wait_event_type = 'Lock' AND query NOT LIKE '%rate_draw%'
 		AND $1 = ANY (pg_blocking_pids(pid))`, pid).Scan(&n)
 	return n > 0
 }

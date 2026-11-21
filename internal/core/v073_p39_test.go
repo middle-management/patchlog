@@ -58,12 +58,13 @@ func TestV073P39GroupBlockedIgnoresRateDraws(t *testing.T) {
 		})
 		close(done)
 	}()
-	// The first draw waits for the held row, the other for the first.
+	// The first draw waits for the held row, the other for the first, or
+	// both in one batch (ratebuckets.go, draw) for the held row.
 	within(t, 10*time.Second, "both draws wait for the bucket row", func() bool {
 		var w, held int
 		e.db.QueryRow(`SELECT COUNT(*), COUNT(*) FILTER (WHERE $1 = ANY (pg_blocking_pids(pid))) FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%rate_draw(%'`, pid).Scan(&w, &held)
-		return w == n && held > 0
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%rate_draw%'`, pid).Scan(&w, &held)
+		return w > 0 && held > 0 && e.rate.store.drawing.Load() == n
 	})
 	if waiting(e) == 0 {
 		t.Fatal("no lock wait while the draws wait")
@@ -245,7 +246,7 @@ func TestV073P39LostRaceWaitsForTheGroup(t *testing.T) {
 			if !waitFor(10*time.Second, func() bool {
 				var n int
 				a.db.QueryRow(`SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database()
-					AND wait_event_type = 'Lock' AND query LIKE '%rate_draw(%' AND $1 = ANY (pg_blocking_pids(pid))`, pid).Scan(&n)
+					AND wait_event_type = 'Lock' AND query LIKE '%rate_draw%' AND $1 = ANY (pg_blocking_pids(pid))`, pid).Scan(&n)
 				return n > 0
 			}) {
 				t.Error("no draw waited for x's bucket row")
