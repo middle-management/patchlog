@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -463,6 +464,22 @@ func (t *tx) ownDraws(n *nsRow, cfg *Config, a *actor, resources []string, items
 		if d.name != "ratePerNamespace" {
 			out = append(out, d)
 		}
+	}
+	return out
+}
+
+// joinDraws is the draws of a and b as one admission, the costs of draws
+// on one bucket added up, so that a request drawing for two reasons is
+// refused or admitted at once (admit).
+func joinDraws(a, b []draw) []draw {
+	out := append([]draw(nil), a...)
+	for _, d := range b {
+		i := slices.IndexFunc(out, func(o draw) bool { return o.key == d.key })
+		if i < 0 {
+			out = append(out, d)
+			continue
+		}
+		out[i].cost += d.cost
 	}
 	return out
 }

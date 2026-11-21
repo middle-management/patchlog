@@ -6,6 +6,27 @@ import (
 	"github.com/middle-management/patchlog/internal/core"
 )
 
+// v0.88 §6.6 Cost ("Its config change, if any, costs what a config write
+// does, drawn once the change passes its own step 1, even where an item
+// then fails step 1"), LIM-3: a batch whose config change passes its step
+// 1 and whose item fails step 1 outright (a verb the grant lacks) is 403
+// and still draws the change's token, so bob's next config write is 429.
+// Until v0.88 such a batch drew nothing.
+func TestV088BatchConfigChangeDrawsDespiteItem(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, map[string]any{"limits": map[string]any{
+		"ratePerPrincipal": map[string]any{"rate": 0.001, "burst": 1}}})
+	e := f.tenv
+	bob := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read", "config"})
+	batch := map[string]any{
+		"config": map[string]any{"ifMatch": e.configID("sec", f.adminG), "patches": ops(op("add", "/x-a", 1.0))},
+		"items":  []any{map[string]any{"resource": "b", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{"b": true})}}}}
+	expect(t, e.batchReq("sec", batch, bob), 403)
+	r := e.batchReq("sec", map[string]any{"config": map[string]any{
+		"ifMatch": e.configID("sec", f.adminG), "patches": ops(op("add", "/x-b", 1.0))}}, bob)
+	expectCode(t, r, 429, "rate")
+}
+
 // v0.88 §6.6 ("Every bucket but exchangeRate's is also the namespace's
 // own, so a key listed in two namespaces has buckets in each"), §C.5.2
 // Rate ("keyed by root sub and the verifying key's thumbprint, across
