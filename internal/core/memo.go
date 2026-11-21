@@ -3,6 +3,8 @@ package core
 import (
 	"database/sql"
 	"sync"
+
+	"github.com/middle-management/patchlog/internal/ids"
 )
 
 // Fewer round trips per write (Postgres, where each statement is one).
@@ -58,9 +60,23 @@ type memo struct {
 	// writer. What the transaction writes itself, or a lock it takes,
 	// forgets the row like any other.
 	schemaNS map[string]nsRow
+	// byID is revision rows by resource and id (revByID): the
+	// idempotent-retry lookup (§7.2), nil when there is none.
+	byID map[revIDKey]*revRow
+	// idSeq is the seq of a revision by resource and id whose row hasn't
+	// been read (lookupResource), for revByID.
+	idSeq map[revIDKey]int64
+	// views are resources as resolve saw them now, in namespaces of their
+	// own rows (memoView).
+	views map[resKey]*view
 }
 
 type headAtKey struct{ res, asOf int64 }
+
+type revIDKey struct {
+	res int64
+	id  ids.ID
+}
 
 // inserted remembers a revision row the transaction inserted: its own, so
 // valid until the transaction ends (nothing changes a row it just

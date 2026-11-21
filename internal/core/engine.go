@@ -322,6 +322,9 @@ type Engine struct {
 	// arguments (tests that count statements). It is set right after Open,
 	// with no background loop running.
 	onStatement func(q string, args []any)
+	// onReadTx, if set, is called as a read transaction begins: with its
+	// rollback, two round trips on Postgres that onStatement doesn't see.
+	onReadTx func()
 	// purgeHoldersMax, if not 0, replaces the constant of that name for a
 	// test: negative, every purge searches level by level (purgeLevels).
 	purgeHoldersMax int
@@ -335,6 +338,11 @@ type Engine struct {
 	noSolo      bool
 	groupStart  func(t *tx, size int)
 	groupMember func(t *tx, i int)
+	// lone backs off readOne's reads without a transaction in namespaces
+	// whose reads needed one (readone.go); noLone, for tests, makes
+	// readOne always read in a transaction.
+	lone   loneGate
+	noLone bool
 	// started is when the engine opened; firstEntry the created time of
 	// the deployment's first namespace entry, once known (operatorkeys.go).
 	started      time.Time
@@ -746,6 +754,10 @@ type tx struct {
 	// buckets, checkOutside), records the rate-limit draws instead of
 	// making them (admit).
 	drawLater *drawLater
+	// solo marks a read run without a transaction (readOne), and
+	// soloUsed that it has run its one statement, soloRows its rows.
+	solo, soloUsed bool
+	soloRows       *sql.Rows
 	// memo and dirty: rows read in this transaction, and whether it has
 	// written (memo.go).
 	memo  memo
@@ -851,6 +863,9 @@ func (e *Engine) read1(ctx context.Context, f func(t *tx) error) (err error) {
 		// A read sees one snapshot, as in SQLite's WAL mode: READ
 		// COMMITTED would see each statement's own.
 		opts.Isolation = sql.LevelRepeatableRead
+	}
+	if h := e.onReadTx; h != nil {
+		h()
 	}
 	sqlTx, err := e.db.BeginTx(ctx, opts)
 	if err != nil {
@@ -1181,7 +1196,39 @@ func (t *tx) nsForResources(name string) *nsRow {
 	return n
 }
 
+// nsForItem is nsForResources for a write of one item, s: the
+// namespace's row is read with the item's resource, the resource's head
+// and the revision the idempotent-retry lookup looks for (§7.2), in one
+// statement (lookupResource). The check reads them all as of the same
+// snapshot as before, and records the namespace row as a dependency
+// (writeDeps); the item's resource is recorded by the plan's view
+// (recheck).
+func (t *tx) nsForItem(name string, s *itemState) *nsRow {
+	var want *ids.ID
+	if exp, ok := expectedIDs(s); ok {
+		want = &exp[len(exp)-1]
+	}
+	n := t.nsByNameWith(name, lockShared, func() *nsRow { return t.lookupResource(name, s.Resource, want, false) })
+	if n != nil && t.locking() {
+		t.sharedNS = n.id
+	}
+	return n
+}
+
 func (t *tx) nsByNameLocked(name string, mode lockMode) *nsRow {
+	return t.nsByNameWith(name, mode, func() *nsRow {
+		n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE name = ?`, name))
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		t.must(err)
+		return n
+	})
+}
+
+// nsByNameWith is nsByNameLocked reading the row with read, after the
+// lock.
+func (t *tx) nsByNameWith(name string, mode lockMode, read func() *nsRow) *nsRow {
 	if strings.HasPrefix(name, "~") {
 		return nil
 	}
@@ -1202,11 +1249,10 @@ func (t *tx) nsByNameLocked(name string, mode lockMode) *nsRow {
 		}
 		t.lockNS(id, mode)
 	}
-	n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE name = ?`, name))
-	if errors.Is(err, sql.ErrNoRows) {
+	n := read()
+	if n == nil {
 		return nil
 	}
-	t.must(err)
 	t.deps.addNS(n)
 	return n
 }

@@ -100,6 +100,9 @@ func (c *stmtCache) close() {
 // through here.
 
 func (t *tx) QueryRow(q string, args ...any) *sql.Row {
+	if t.solo {
+		return t.soloQueryRow(q, args)
+	}
 	if h := t.e.onStatement; h != nil && t.oracle == 0 {
 		h(q, args)
 	}
@@ -116,6 +119,9 @@ func (t *tx) QueryRow(q string, args ...any) *sql.Row {
 }
 
 func (t *tx) Query(q string, args ...any) (*sql.Rows, error) {
+	if t.solo {
+		return t.soloQuery(q, args)
+	}
 	if h := t.e.onStatement; h != nil && t.oracle == 0 {
 		h(q, args)
 	}
@@ -132,6 +138,9 @@ func (t *tx) Query(q string, args ...any) (*sql.Rows, error) {
 }
 
 func (t *tx) Exec(q string, args ...any) (sql.Result, error) {
+	if t.solo {
+		panic(errNeedsTx) // a read writes nothing
+	}
 	if h := t.e.onStatement; h != nil && t.oracle == 0 {
 		h(q, args)
 	}
