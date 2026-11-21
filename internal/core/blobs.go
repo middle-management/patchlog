@@ -1224,8 +1224,8 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 		}
 		byDoc := t.readsByDoc(n, a)
 		if n.purged {
-			if byDoc {
-				return notFound() // judged with a null document (§6.4.1)
+			if byDoc && !t.purgedReadable(a, n, name) {
+				return notFound() // judged with /doc rules set aside (§6.4.1, §8.5)
 			}
 			return t.purgedRead(n)
 		}
@@ -1235,7 +1235,7 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 			out.Status = 404
 			return nil
 		}
-		if byDoc && !t.mayReadBlob(a, n, name, bid) {
+		if byDoc && !t.mayReadBlob(a, n, name, bid) && !(t.resolve(n, name, nil).state == Purged && t.purgedReadable(a, n, name)) {
 			// Judged with the documents that reference it (§7.8, §6.4.1).
 			return notFound()
 		}

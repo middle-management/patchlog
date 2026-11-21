@@ -206,7 +206,7 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 			// Judged with the head's document (§C.2 item 5), a purged
 			// namespace's or resource's being null: answered as a read the
 			// reader may not make where the rules don't allow it (§7).
-			if n.purged || !t.mayReadRow(a, n, name, t.resolve(n, name, nil).head) {
+			if !t.headReadable(a, n, name) {
 				return notFound()
 			}
 		}
@@ -355,8 +355,8 @@ func (e *Engine) resourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		byDoc := !referrer && t.readsByDoc(n, a)
 		if n.purged {
-			if byDoc {
-				return notFound() // judged with a null document (§6.4.1)
+			if byDoc && !t.purgedReadable(a, n, name) {
+				return notFound() // judged with /doc rules set aside (§6.4.1, §8.5)
 			}
 			return t.purgedRead(n)
 		}
@@ -380,9 +380,10 @@ func (e *Engine) resourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		v := t.resolve(n, name, nil)
 		if v.state == Purged {
-			if byDoc {
-				// Judged with a null document (§6.4.1), and answered as
-				// an id the resource doesn't have, headers included.
+			if byDoc && !t.purgedReadable(a, n, name) {
+				// Judged with its rules on /doc set aside (§6.4.1, §8.3),
+				// and answered as an id the resource doesn't have,
+				// headers included.
 				out.Status = 404
 				return nil
 			}
@@ -632,8 +633,8 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 		}
 		byDoc := t.readsByDoc(n, a)
 		if n.purged {
-			if byDoc {
-				return notFound() // judged with null documents (§6.4.1)
+			if byDoc && !t.purgedReadable(a, n, name) {
+				return notFound() // judged with /doc rules set aside (§6.4.1, §8.5)
 			}
 			return t.purgedRead(n)
 		}
@@ -647,8 +648,8 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 		out = &Log{Public: t.cachePublic(n), Until: t.admittedUntil(n, cred, a)}
 		v := t.resolve(n, name, nil)
 		if v.state == Purged {
-			if byDoc {
-				return notFound() // judged with null documents (§6.4.1)
+			if byDoc && !t.purgedReadable(a, n, name) {
+				return notFound() // judged with /doc rules set aside (§6.4.1, §8.3)
 			}
 			out.Status = 410
 			return nil
