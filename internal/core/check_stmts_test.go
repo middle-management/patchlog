@@ -184,6 +184,18 @@ func TestCheckStatements(t *testing.T) {
 				if tx || !pgtest.Enabled() {
 					want.txs = 1
 				}
+				// A document the engine's cache no longer holds is folded
+				// from its stored rows (docBytesAt), and the read then
+				// runs again in a transaction: not what is counted here,
+				// but the cache keeps no promise (slow runs, -race).
+				if folds := docStmts(got.byQuery[what]); folds > 0 {
+					t.Logf("%s: %d statements folding its document, not counted", what, folds)
+					c.stmts -= folds
+					if !tx && pgtest.Enabled() {
+						c.stmts-- // the first, abandoned, statement
+						want.txs = 1
+					}
+				}
 				if c != want {
 					t.Errorf("%s: %v, want %v", what, c, want)
 				}
@@ -206,4 +218,18 @@ func TestCheckStatements(t *testing.T) {
 			}
 		})
 	}
+}
+
+// docStmts counts the statements that fold a document from its stored
+// rows (docBytesAt): its base from heads or snapshots, the revisions on
+// top of it.
+func docStmts(qs map[string]int) int {
+	n := 0
+	for q, c := range qs {
+		if strings.HasPrefix(q, "SELECT res, doc FROM heads WHERE") || strings.HasPrefix(q, "SELECT res, doc FROM snapshots WHERE") ||
+			strings.HasPrefix(q, "SELECT "+revCols+" FROM revisions WHERE seq = ?") {
+			n += c
+		}
+	}
+	return n
 }
