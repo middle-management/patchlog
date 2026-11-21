@@ -234,15 +234,26 @@ func (e *Engine) checkOutside(ctx context.Context, req Request, items []Item, so
 		var res *WriteResult
 		var later *drawLater
 		var now time.Time
+		// Whether the check drew its tokens: from the engine's own buckets
+		// at once, so a check run again (readOne) doesn't draw them twice;
+		// on the store's, only recorded (later), so one run again records
+		// them afresh.
+		drawn := false
 		// The read transaction is closed before the write lock is taken, so
 		// the single connection of :memory: is never held while waiting.
-		err := e.read(ctx, func(t *tx) error {
+		// On Postgres a check of one statement runs without one (readOne).
+		err := e.readOne(ctx, req.NS, func(t *tx) error {
 			t.deps = newWriteDeps()
 			deps = t.deps
+			if later != nil {
+				drawn = false
+			}
+			later = nil
 			if e.rate.store != nil && !rateDrawn {
 				later = &drawLater{}
 				t.drawLater = later
 			}
+			t.rateDrawn = &drawn
 			now = t.now
 			p, r, err := t.checkItems(req, items, nil, source, isBatch, false, rateDrawn)
 			plan, res = p, r

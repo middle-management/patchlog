@@ -766,7 +766,7 @@ time only): the consumers read the revision each namespace entry names
   with about 40 sessions idle in a check's transaction, and the core's instance at 79% CPU, much
   of it garbage collection. So past a larger pool and the draw moved out of the check, the
   core's CPU is next on a 4-vCPU instance; more instances share the work (D.8).
-- **Since these runs** (not yet measured again):
+- **Changed after those runs** (93149318, measured below):
   - `pool_max_conns=N` sets the main pool to `N` connections, above 4 per GOMAXPROCS too, and
     the bucket pool to a quarter of `N`.
   - A write's draw is made after its check's read transaction, so it holds no main-pool
@@ -793,6 +793,27 @@ time only): the consumers read the revision each namespace entry names
   namespace, resource and head reads, the retry lookup of §7.2, rollback), each a statement
   through pgx and TLS (TLS writes 8–9% in all). Followers' revision reads took 10–15%, group
   commits 9%, garbage collection 11%. Fewer round trips in the check would save the most.
+- **Since these runs** (not yet measured again):
+  - A write's check is one round trip, not six: its namespace, resource, head and the retry
+    lookup of §7.2 are one statement (the lookup returns no row almost always), and a check
+    that needs only that statement runs without a transaction (no begin, no rollback), so its
+    connection is held for the statement alone, not idle in a transaction while the core works
+    on the check. A check that needs more (a branch's bases, a document or schema not cached,
+    an idempotent retry) runs again in a read transaction. The same holds for followers'
+    revision reads (`resourceRev`): one round trip instead of five, or seven below the head.
+    `purgedItems` and the rest of step 2 repeated no statements (the transaction kept the
+    rows) but resolved each item again; they now share one view. On a local Postgres 16, a
+    check took about 175 µs of the core's CPU instead of 270, a revision read about 150 instead
+    of 240 (`BenchmarkCheckAppend`, `BenchmarkRevUncached`, `cpu-ns/op` at `-cpu 1`); over TLS
+    to RDS the saved round trips cost more.
+  - Concurrent rate-limit draws batch, as group commit's writes do (`bucketStore.draw`,
+    `rate_draws`). Up to one draw statement runs on each of the bucket pool's connections, and
+    the draws queued meanwhile go in the next one, which locks each bucket's row once for all
+    of them and judges them in turn. A principal writing to every namespace locked its row
+    once per write before; now once per batch, and no draw waits for a connection of the
+    bucket pool. To measure it again: doors' `ec2-sources.sh` with `MODE=namespaces
+    DB_CLASS=db.m7g.2xlarge FETCHES=8 STORE_POOL_CONNS=64 PRINCIPALS="one namespace"
+    PROFILE=1`, without `--local-rate-buckets`.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.

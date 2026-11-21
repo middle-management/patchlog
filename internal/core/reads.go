@@ -332,12 +332,23 @@ func (e *Engine) resourceRev(ctx context.Context, ns, name, id string, cred Cred
 	var out *Rev
 	var job *sealJob
 	var nsRowID int64
-	err := e.read(ctx, func(t *tx) error {
-		n := t.nsByName(ns)
+	// Usually a single statement: on Postgres without a transaction
+	// (readOne), and so run again in one when it needs more.
+	err := e.readOne(ctx, ns, func(t *tx) error {
+		public, cached, plain = false, false, false
+		out, job, nsRowID = nil, nil, 0
+		rid, perr := ids.Parse(id)
+		var n *nsRow
+		if perr == nil {
+			// With the resource, its head and the revision, in one
+			// statement (lookupResource).
+			n = t.nsByNameWith(ns, lockShared, func() *nsRow { return t.lookupResource(ns, name, &rid, true) })
+		} else {
+			n = t.nsByName(ns)
+		}
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		rid, perr := ids.Parse(id)
 		referrer := false
 		a, aerr := t.reader(n, cred, name)
 		if aerr != nil {

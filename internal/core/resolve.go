@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -75,6 +76,206 @@ func (t *tx) memoRes(k resKey, r *resRow) {
 		t.memo.res = map[resKey]*resRow{}
 	}
 	t.memo.res[k] = r
+	delete(t.memo.views, k)
+}
+
+// memoRev remembers a revision row (rev).
+func (t *tx) memoRev(r *revRow) {
+	if t.memo.rev == nil {
+		t.memo.rev = map[int64]revRow{}
+	}
+	t.memo.rev[r.seq] = *r
+	t.knowRevID(r.seq, r.id)
+}
+
+// revByID returns the revision of resource res with id, or nil: the
+// idempotent-retry lookup's (§7.2) and the first segment of a revision
+// read's (findInAncestry). The transaction remembers the answer, absence
+// included (memo.byID), which lookupResource may already have read.
+func (t *tx) revByID(res int64, id ids.ID) *revRow {
+	k := revIDKey{res, id}
+	if r, ok := t.memo.byID[k]; ok {
+		if r == nil {
+			return nil
+		}
+		c := *r
+		return &c
+	}
+	var r *revRow
+	if seq, ok := t.memo.idSeq[k]; ok {
+		// Found by lookupResource, which read only its seq.
+		r = t.rev(seq)
+	} else {
+		var err error
+		r, err = scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, res, id[:]))
+		if errors.Is(err, sql.ErrNoRows) {
+			r = nil
+		} else {
+			t.must(err)
+		}
+	}
+	t.memoByID(k, r)
+	if r == nil {
+		return nil
+	}
+	c := *r
+	return &c
+}
+
+func (t *tx) memoByID(k revIDKey, r *revRow) {
+	if t.memo.byID == nil {
+		t.memo.byID = map[revIDKey]*revRow{}
+	}
+	t.memo.byID[k] = r
+}
+
+// lookupResource reads namespace name with, in the same statement, its
+// own row of resource res (or its absence), that row's head revision, and
+// if want isn't nil the revision of that row's resource with id want (or
+// its absence): what a write's check of one item reads (the target, the
+// item's resource as resolve sees it, the idempotent-retry lookup of
+// §7.2) and a revision read. It fills the transaction's memo, so resolve,
+// replay and findInAncestry answer from it, and returns the namespace row,
+// or nil. On Postgres each statement is a round trip: separately they were
+// four.
+//
+// Of the revision with id want it reads the whole row if full (a revision
+// read, which serves it), else only its seq (a check, whose retry lookup
+// rarely finds one; revByID reads the row then). Fewer columns cost less
+// to decode: pgx allocates afresh for each result of more than 16.
+//
+// A namespace read through a base isn't helped below its own row (resolve
+// reads the base's rows as before), but costs no more.
+func (t *tx) lookupResource(name, res string, want *ids.ID, full bool) *nsRow {
+	var idArg any
+	if want != nil {
+		idArg = want[:]
+	}
+	var nr nullRes
+	var hr, xr nullRev
+	var xseq sql.NullInt64
+	n := &nsRow{}
+	var cfg sql.NullInt64
+	dest := make([]any, 0, 9+9+2*16)
+	dest = append(dest, &n.id, &n.name, &n.base, &n.baseAt, &n.baseConfigSeq, &n.frozen, &n.purged, &n.headSeq, &cfg)
+	dest = nr.dest(dest)
+	dest = hr.dest(dest)
+	if full {
+		dest = xr.dest(dest)
+	} else {
+		dest = append(dest, &xseq)
+	}
+	q := lookupSQL[b2i(full)][b2i(t.e.pg)]
+	var row *sql.Row
+	if full {
+		row = t.QueryRow(q, res, idArg, name)
+	} else {
+		// The seq's subquery comes first, in the columns.
+		row = t.QueryRow(q, idArg, res, name)
+	}
+	err := row.Scan(dest...)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	t.must(err)
+	n.configSeq = cfg.Int64
+	r := nr.row()
+	t.memoRes(resKey{n.id, res}, r)
+	if h := hr.row(); h != nil {
+		t.memoRev(h)
+	}
+	if r != nil && want != nil {
+		k := revIDKey{r.id, *want}
+		switch {
+		case full:
+			t.memoByID(k, xr.row())
+		case xseq.Valid:
+			if t.memo.idSeq == nil {
+				t.memo.idSeq = map[revIDKey]int64{}
+			}
+			t.memo.idSeq[k] = xseq.Int64
+		default:
+			t.memoByID(k, nil)
+		}
+	}
+	return n
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// lookupSQL are lookupResource's statements, by full and Postgres (their
+// placeholders in a different order: lookupResource): a
+// namespace, a resource and its head (n, r, h), and the revision with an
+// id (x, its seq or its row), the last three possibly NULL. That revision
+// is at most one row, as revByID's QueryRow: LATERAL on Postgres, a scalar
+// subquery in SQLite (which has no LATERAL).
+var lookupSQL = func() (q [2][2]string) {
+	cols := func(alias, list string) string {
+		var out []string
+		for _, c := range strings.Split(list, ",") {
+			out = append(out, alias+"."+strings.TrimSpace(c))
+		}
+		return strings.Join(out, ", ")
+	}
+	common := cols("n", nsCols) + ", " + cols("r", resCols) + ", " + cols("h", revCols)
+	from := ` FROM namespaces n
+		LEFT JOIN resources r ON r.ns = n.ns AND r.name = ?
+		LEFT JOIN revisions h ON h.seq = r.head_seq`
+	byID := `SELECT seq FROM revisions WHERE res = r.res AND id = ? LIMIT 1`
+	for pg := 0; pg < 2; pg++ {
+		q[0][pg] = `SELECT ` + common + `, (` + byID + `)` + from + ` WHERE n.name = ?`
+	}
+	q[1][1] = `SELECT ` + common + `, ` + cols("x", revCols) + from + `
+		LEFT JOIN LATERAL (SELECT ` + revCols + ` FROM revisions WHERE res = r.res AND id = ? LIMIT 1) x ON true
+		WHERE n.name = ?`
+	q[1][0] = `SELECT ` + common + `, ` + cols("x", revCols) + from + `
+		LEFT JOIN revisions x ON x.seq = (` + byID + `)
+		WHERE n.name = ?`
+	return q
+}()
+
+// nullRes scans a resources row that may be all NULL (an outer join).
+type nullRes struct {
+	id, ns, headSeq, state, horizonSeq, snapRevs, snapBytes sql.NullInt64
+	name, keep                                              sql.NullString
+}
+
+func (n *nullRes) dest(d []any) []any {
+	return append(d, &n.id, &n.ns, &n.name, &n.headSeq, &n.state, &n.horizonSeq, &n.keep, &n.snapRevs, &n.snapBytes)
+}
+
+func (n *nullRes) row() *resRow {
+	if !n.id.Valid {
+		return nil
+	}
+	return &resRow{id: n.id.Int64, ns: n.ns.Int64, name: n.name.String, headSeq: n.headSeq, state: int(n.state.Int64),
+		horizonSeq: n.horizonSeq, keep: n.keep, snapRevs: n.snapRevs, snapBytes: n.snapBytes}
+}
+
+// nullRev scans a revisions row that may be all NULL (an outer join).
+type nullRev struct {
+	seq, res, parentSeq, kind, author, created, size sql.NullInt64
+	first                                            sql.NullBool
+	id, grantID, digest                              []byte
+	patches, via, signature, gesture, undoes         sql.NullString
+}
+
+func (n *nullRev) dest(d []any) []any {
+	return append(d, &n.seq, &n.res, &n.id, &n.parentSeq, &n.first, &n.kind, &n.patches, &n.author, &n.via, &n.grantID, &n.signature, &n.created, &n.gesture, &n.undoes, &n.size, &n.digest)
+}
+
+func (n *nullRev) row() *revRow {
+	if !n.seq.Valid {
+		return nil
+	}
+	return &revRow{seq: n.seq.Int64, res: n.res.Int64, id: ids.FromBytes(n.id), parentSeq: n.parentSeq, first: n.first.Bool,
+		kind: int(n.kind.Int64), patches: n.patches, author: n.author.Int64, via: n.via, grantID: n.grantID,
+		signature: n.signature, created: n.created.Int64, gesture: n.gesture, undoes: n.undoes, size: n.size, digest: n.digest}
 }
 
 // prefetchResources reads the rows of several resources of a namespace in
@@ -260,11 +461,7 @@ func (t *tx) rev(seq int64) *revRow {
 	}
 	r, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE seq = ?`, seq))
 	t.must(err)
-	if t.memo.rev == nil {
-		t.memo.rev = map[int64]revRow{}
-	}
-	t.memo.rev[seq] = *r
-	t.knowRevID(seq, r.id)
+	t.memoRev(r)
 	return r
 }
 
@@ -307,6 +504,13 @@ func (v *view) readThrough() bool { return v.own == nil || v.own.headSeq.Valid =
 // where it would read an entry for it through, and lists it with its head
 // as of at (§8.3, invariant 7); head_history rows outlive the purge.
 func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
+	if asOf == nil {
+		// A write's check resolves each item's resource at each sub-step
+		// of step 2 (purgedItems, settle, readsWrittenHead, precondition).
+		if v, ok := t.memo.views[resKey{n.id, name}]; ok && v.ns == n {
+			return v
+		}
+	}
 	v := &view{ns: n, name: name}
 	r := t.resource(n.id, name)
 	v.own = r
@@ -317,6 +521,7 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 			if r.headSeq.Valid {
 				v.head = t.rev(r.headSeq.Int64)
 			}
+			t.memoView(v)
 			return v
 		}
 		var headSeq int64
@@ -346,6 +551,9 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 			default:
 				v.state = Live
 			}
+			if asOf == nil {
+				t.memoView(v)
+			}
 			return v
 		}
 	}
@@ -368,6 +576,18 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 	}
 	v.state = NotFound
 	return v
+}
+
+// memoView remembers the view resolve returned for a resource of the
+// namespace's own, now: it depends only on the resource's row, which the
+// transaction remembers as long (memoRes forgets the view with it), and
+// on immutable revision rows. Views read through a base aren't kept.
+// Callers don't change a view they are given.
+func (t *tx) memoView(v *view) {
+	if t.memo.views == nil {
+		t.memo.views = map[resKey]*view{}
+	}
+	t.memo.views[resKey{v.ns.id, v.name}] = v
 }
 
 // segment is a stretch of one resource's chain: rows of res with seq ≤ max.
@@ -393,9 +613,21 @@ func (t *tx) ancestry(head *revRow) []segment {
 }
 
 // findInAncestry returns the row with id in the ancestry of head, or nil.
+// The head's own resource first: locate would find it there before any
+// foreign parent, and a read of a recent revision then costs no walk of
+// the chain (or, after lookupResource, no statement at all).
 func (t *tx) findInAncestry(head *revRow, id ids.ID) *revRow {
 	if head.id == id {
 		return head
+	}
+	if r := t.revByID(head.res, id); r != nil && r.seq <= head.seq {
+		return r
+	} else if r == nil {
+		// Not in the head's resource at all: in a foreign parent's, if
+		// anywhere.
+		segs := t.ancestry(head)
+		_, r := t.locate(segs[1:], id)
+		return r
 	}
 	_, r := t.locate(t.ancestry(head), id)
 	return r

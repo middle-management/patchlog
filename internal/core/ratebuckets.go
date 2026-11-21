@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"math/rand/v2"
 	"slices"
@@ -50,6 +51,15 @@ import (
 //
 // SQLite, written by one instance, keeps the buckets in memory
 // (rateLimiter), as does an instance on Postgres with LocalRateBuckets.
+//
+// Concurrent draws batch (draw, drawBatch), as group commit's writes do:
+// with every connection of the bucket pool drawing, the draws queued
+// meanwhile go in one statement, rate_draws (migration
+// 030_rate_draws_batched), which locks the rows of all their buckets
+// once, in key order, and judges the requests in queue order, each as
+// rate_draw would have after the ones before it. One draw per write, each
+// a round trip and a lock of its buckets' rows, was what bounded writes on
+// one database (docs/CAPACITY.md, "Several namespaces on one database").
 
 // bucketStore draws on the buckets of rate_buckets (Postgres).
 type bucketStore struct {
@@ -67,6 +77,23 @@ type bucketStore struct {
 	// stopped counts the checks that stopped at a draw on a bucket known
 	// empty and were admitted, so ran again (checkOutside; tests).
 	stopped atomic.Int64
+	// batches counts the batches of more than one draw (drawsSQL), and
+	// batched the draws in them (tests).
+	batches, batched atomic.Int64
+	// drawing counts the draws taken for a batch and not yet answered
+	// (tests).
+	drawing atomic.Int64
+
+	// qmu guards the queue of draws (draw): queue holds the draws no
+	// batch has taken yet, running counts the goroutines that run batches
+	// (drain), at most slots, the bucket pool's size, and qclosed that
+	// the store is closed; drains waits for them.
+	qmu     sync.Mutex
+	queue   []*drawReq
+	running int
+	slots   int
+	qclosed bool
+	drains  sync.WaitGroup
 	// empty holds, by key, the buckets this instance's last draw on found
 	// empty, until when (Unix microseconds) they stay so if no other
 	// instance's draws refill them: knownEmpty.
@@ -86,18 +113,22 @@ func openBucketStore(url string) (*bucketStore, error) {
 	cfg.RuntimeParams["synchronous_commit"] = "off"
 	db := stdlib.OpenDB(*cfg)
 	pool.sizeSide(db)
-	return &bucketStore{db: db}, nil
+	return &bucketStore{db: db, slots: pool.sideSize()}, nil
 }
 
 // The bucket pool is a quarter of the main pool's size, at least two
-// (pgPool.sideSize): a draw is one short statement, a fraction of the
-// round trips of the write that waits for it, and draws on one bucket
-// queue on its row lock whatever the pool's size: more connections would
-// only hold more of the server's max_connections, which every instance's
-// pools share.
+// (pgPool.sideSize), and runs as many batches at once (draw): a draw is
+// one short statement, a fraction of the round trips of the write that
+// waits for it, and batches on one bucket queue on its row lock whatever
+// the pool's size: more connections would only hold more of the server's
+// max_connections, which every instance's pools share.
 
-// close waits for a running sweep and closes the pool.
+// close waits for the running batches and sweep, and closes the pool.
 func (s *bucketStore) close() error {
+	s.qmu.Lock()
+	s.qclosed = true
+	s.qmu.Unlock()
+	s.drains.Wait()
 	s.mu.Lock()
 	s.closed = true
 	s.mu.Unlock()
@@ -187,52 +218,200 @@ func (s *bucketStore) charge(ctx context.Context, now time.Time, d draw) error {
 	return err
 }
 
-// draw runs drawSQL, again if a sweep deleted a row between rate_draw's
-// insert and its lock, or if Postgres rolled it back for a deadlock with
-// a statement that locks bucket rows out of key order (none of this
-// package's does; an operator's might): rate_draw is one statement, so a
-// draw rolled back deducted nothing. It returns the buckets' tokens
-// before any deduction, by key, and whether it deducted.
+// draw queues a request's draw for the next batch (drawBatch) and waits
+// for its answer: the buckets' tokens before any deduction, by key, and
+// whether it deducted.
+//
+// Draws batch as group commit's writes do. Up to slots batches run at
+// once, one per connection of the bucket pool; a draw that finds one free
+// starts one, and the others queue. Each batch, as it ends, takes every
+// draw queued meanwhile (up to drawBatchItems buckets), as one statement:
+// a hot bucket's row (a namespace's, a busy principal's) is locked once per
+// batch rather than once per write, and no draw waits for a connection of
+// the pool, only for the batch before it (docs/CAPACITY.md, "Several
+// namespaces on one database"). A draw whose request is gone before its
+// batch starts is dropped.
+func (s *bucketStore) draw(ctx context.Context, now time.Time, draws []draw, force bool) (map[string]float64, bool, error) {
+	r := &drawReq{ctx: ctx, now: now, ds: merged(draws), force: force, done: make(chan drawRes, 1)}
+	s.qmu.Lock()
+	if s.qclosed {
+		s.qmu.Unlock()
+		return nil, false, errBucketsClosed
+	}
+	s.queue = append(s.queue, r)
+	start := s.running < s.slots
+	if start {
+		s.running++
+		s.drains.Add(1)
+	}
+	s.qmu.Unlock()
+	if start {
+		go s.drain()
+	}
+	select {
+	case res := <-r.done:
+		return res.tokens, res.ok, res.err
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+}
+
+// drawReq is a draw queued for a batch (draw).
+type drawReq struct {
+	ctx   context.Context
+	now   time.Time
+	ds    []draw // merged
+	force bool
+	done  chan drawRes
+}
+
+// drawRes answers a drawReq.
+type drawRes struct {
+	tokens map[string]float64
+	ok     bool
+	err    error
+}
+
+// drawBatchItems bounds the buckets a batch draws on, so that one batch
+// doesn't hold its rows' locks for long while the next queues; a request
+// drawing on more has a batch of its own.
+const drawBatchItems = 4096
+
+// drain runs batches of the queued draws until none is queued.
+func (s *bucketStore) drain() {
+	defer s.drains.Done()
+	for {
+		s.qmu.Lock()
+		b := s.take()
+		if len(b) == 0 {
+			s.running--
+			s.qmu.Unlock()
+			return
+		}
+		s.qmu.Unlock()
+		s.drawBatch(b)
+	}
+}
+
+// take takes the queued draws for a batch, in queue order: at least one,
+// and then as many as drawBatchItems allows. A draw whose request is gone
+// is answered so, and dropped. s.qmu is held.
+func (s *bucketStore) take() []*drawReq {
+	var b []*drawReq
+	items, i := 0, 0
+	for ; i < len(s.queue); i++ {
+		r := s.queue[i]
+		if err := r.ctx.Err(); err != nil {
+			r.done <- drawRes{err: err}
+			continue
+		}
+		if len(b) > 0 && items+len(r.ds) > drawBatchItems {
+			break
+		}
+		b = append(b, r)
+		items += len(r.ds)
+		s.drawing.Add(1)
+	}
+	n := copy(s.queue, s.queue[i:])
+	clear(s.queue[n:])
+	s.queue = s.queue[:n]
+	return b
+}
+
+// drawBatch draws b, a batch, and answers each draw: a single draw with
+// drawSQL, as before batches, more with drawsSQL. It runs again if a
+// sweep deleted a row between the statement's insert and its lock, or if
+// Postgres rolled it back for a deadlock with a statement that locks
+// bucket rows out of key order (none of this package's does; an
+// operator's might): either is one statement, so a batch rolled back
+// deducted nothing.
 //
 // After a deadlock it pauses first (drawPause): the statement that
 // survived waits for a row the draw held, and a draw run again at once
 // could lock that row again before the survivor, woken, takes it, and
 // close the same cycle, as often as it runs.
-func (s *bucketStore) draw(ctx context.Context, now time.Time, draws []draw, force bool) (map[string]float64, bool, error) {
-	ds := merged(draws)
-	keys := make([][]byte, len(ds))
-	rates := make([]float64, len(ds))
-	bursts := make([]float64, len(ds))
-	costs := make([]float64, len(ds))
-	for i, d := range ds {
-		keys[i], rates[i], bursts[i], costs[i] = []byte(d.key), d.rate.Rate, d.rate.Burst, d.cost
-	}
+//
+// The batch's statement runs until every request in it is gone, or it
+// ends: a request gone meanwhile may have drawn, as one gone during its
+// own statement may have.
+func (s *bucketStore) drawBatch(b []*drawReq) {
+	ctx, stop := batchContext(b)
+	defer stop()
+	var res []drawRes
 	var err error
 	for attempt := 1; attempt <= drawAttempts; attempt++ {
-		var tokens map[string]float64
-		var ok bool
-		tokens, ok, err = s.drawOnce(ctx, now, keys, rates, bursts, costs, force)
-		switch {
-		case deadlocked(err):
+		var complete bool
+		if len(b) == 1 {
+			res, complete, err = s.drawOnce(ctx, b[0])
+		} else {
+			res, complete, err = s.drawsOnce(ctx, b)
+		}
+		if deadlocked(err) {
 			if attempt < drawAttempts {
-				if err := drawPause(ctx, attempt); err != nil {
-					return nil, false, err
+				if perr := drawPause(ctx, attempt); perr != nil {
+					err = perr
+					break
 				}
 				s.retried.Add(1)
 			}
 			continue
-		case err != nil:
-			return nil, false, err
-		case len(tokens) == len(ds):
-			if ok {
-				s.maybeSweep(now)
-			}
-			return tokens, ok, nil
+		}
+		if err != nil || complete {
+			break
 		}
 		// A sweep deletes only full buckets, so not on every attempt.
 		err = errBucketsVanish
 	}
-	return nil, false, err
+	defer s.drawing.Add(-int64(len(b)))
+	if err != nil {
+		for _, r := range b {
+			r.done <- drawRes{err: err}
+		}
+		return
+	}
+	if len(b) > 1 {
+		s.batches.Add(1)
+		s.batched.Add(int64(len(b)))
+	}
+	// The sweep, if one is due, starts before the draws are answered, as
+	// it did before draws batched.
+	var swept time.Time
+	for i, r := range b {
+		if res[i].ok && r.now.After(swept) {
+			swept = r.now
+		}
+	}
+	if !swept.IsZero() {
+		s.maybeSweep(swept)
+	}
+	for i, r := range b {
+		r.done <- res[i]
+	}
+}
+
+// batchContext is the context of b's statement: done once every request
+// of b is.
+func batchContext(b []*drawReq) (context.Context, func()) {
+	if len(b) == 1 {
+		return b[0].ctx, func() {}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var left atomic.Int64
+	left.Store(int64(len(b)))
+	stops := make([]func() bool, len(b))
+	for i, r := range b {
+		stops[i] = context.AfterFunc(r.ctx, func() {
+			if left.Add(-1) == 0 {
+				cancel()
+			}
+		})
+	}
+	return ctx, func() {
+		for _, stop := range stops {
+			stop()
+		}
+		cancel()
+	}
 }
 
 // drawAttempts bounds how often draw runs drawSQL.
@@ -260,9 +439,17 @@ func drawPause(ctx context.Context, attempt int) error {
 	}
 }
 
-// drawOnce runs drawSQL once.
-func (s *bucketStore) drawOnce(ctx context.Context, now time.Time, keys [][]byte, rates, bursts, costs []float64, force bool) (map[string]float64, bool, error) {
-	rows, err := s.db.QueryContext(ctx, drawSQL, keys, rates, bursts, costs, now.UnixMicro(), force)
+// drawOnce runs drawSQL once for r. complete is false if a bucket's row
+// went (rate_draw deducted nothing then).
+func (s *bucketStore) drawOnce(ctx context.Context, r *drawReq) ([]drawRes, bool, error) {
+	keys := make([][]byte, len(r.ds))
+	rates := make([]float64, len(r.ds))
+	bursts := make([]float64, len(r.ds))
+	costs := make([]float64, len(r.ds))
+	for i, d := range r.ds {
+		keys[i], rates[i], bursts[i], costs[i] = []byte(d.key), d.rate.Rate, d.rate.Burst, d.cost
+	}
+	rows, err := s.db.QueryContext(ctx, drawSQL, keys, rates, bursts, costs, r.now.UnixMicro(), r.force)
 	if err != nil {
 		return nil, false, err
 	}
@@ -283,7 +470,69 @@ func (s *bucketStore) drawOnce(ctx context.Context, now time.Time, keys [][]byte
 	if err := rows.Err(); err != nil {
 		return nil, false, err
 	}
-	return tokens, ok, nil
+	return []drawRes{{tokens: tokens, ok: ok}}, len(tokens) == len(r.ds), nil
+}
+
+// drawsSQL draws a batch of requests (drawsOnce): item i of the keys $2,
+// rates $3, bursts $4 and costs $5 is a draw of request $1[i] (1, 2, ...),
+// which draws at $6[$1[i]] (Unix microseconds), deducting whatever its
+// buckets hold if $7[$1[i]] (a charge): see rate_draws (migration
+// 030_rate_draws_batched).
+const drawsSQL = `SELECT r, k, t, admitted FROM rate_draws($1::int[], $2::bytea[], $3::float8[], $4::float8[], $5::float8[], $6::bigint[], $7::boolean[])`
+
+// drawsOnce runs drawsSQL once for b, a batch. complete is false if a
+// bucket's row went (rate_draws deducted nothing then).
+func (s *bucketStore) drawsOnce(ctx context.Context, b []*drawReq) ([]drawRes, bool, error) {
+	n := 0
+	for _, r := range b {
+		n += len(r.ds)
+	}
+	rq := make([]int32, 0, n)
+	keys := make([][]byte, 0, n)
+	rates := make([]float64, 0, n)
+	bursts := make([]float64, 0, n)
+	costs := make([]float64, 0, n)
+	nows := make([]int64, len(b))
+	forced := make([]bool, len(b))
+	res := make([]drawRes, len(b))
+	for i, r := range b {
+		for _, d := range r.ds {
+			rq = append(rq, int32(i+1))
+			keys = append(keys, []byte(d.key))
+			rates = append(rates, d.rate.Rate)
+			bursts = append(bursts, d.rate.Burst)
+			costs = append(costs, d.cost)
+		}
+		nows[i], forced[i] = r.now.UnixMicro(), r.force
+		res[i].tokens = make(map[string]float64, len(r.ds))
+	}
+	rows, err := s.db.QueryContext(ctx, drawsSQL, rq, keys, rates, bursts, costs, nows, forced)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	got := 0
+	for rows.Next() {
+		var q int
+		var k []byte
+		var t float64
+		var ok bool
+		if err := rows.Scan(&q, &k, &t, &ok); err != nil {
+			return nil, false, err
+		}
+		if q < 1 || q > len(b) {
+			return nil, false, fmt.Errorf("rate buckets: rate_draws answered request %d of %d", q, len(b))
+		}
+		res[q-1].tokens[string(k)], res[q-1].ok = t, ok
+		got++
+	}
+	if err := rows.Close(); err != nil {
+		return nil, false, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	return res, got == n, nil
 }
 
 // deadlocked reports whether Postgres rolled a statement back as the
@@ -298,6 +547,8 @@ type bucketError string
 func (e bucketError) Error() string { return string(e) }
 
 const errBucketsVanish = bucketError("rate buckets: rows deleted under every draw")
+
+const errBucketsClosed = bucketError("rate buckets: closed")
 
 // sweepEvery is how often an instance deletes the buckets that have
 // refilled to their burst, which are the same as no row (rate_draw), as
