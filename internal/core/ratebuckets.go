@@ -80,6 +80,9 @@ type bucketStore struct {
 	// batches counts the batches of more than one draw (drawsSQL), and
 	// batched the draws in them (tests).
 	batches, batched atomic.Int64
+	// drawing counts the draws taken for a batch and not yet answered
+	// (tests).
+	drawing atomic.Int64
 
 	// qmu guards the queue of draws (draw): queue holds the draws no
 	// batch has taken yet, running counts the goroutines that run batches
@@ -307,6 +310,7 @@ func (s *bucketStore) take() []*drawReq {
 		}
 		b = append(b, r)
 		items += len(r.ds)
+		s.drawing.Add(1)
 	}
 	n := copy(s.queue, s.queue[i:])
 	clear(s.queue[n:])
@@ -358,6 +362,7 @@ func (s *bucketStore) drawBatch(b []*drawReq) {
 		// A sweep deletes only full buckets, so not on every attempt.
 		err = errBucketsVanish
 	}
+	defer s.drawing.Add(-int64(len(b)))
 	if err != nil {
 		for _, r := range b {
 			r.done <- drawRes{err: err}
@@ -368,15 +373,19 @@ func (s *bucketStore) drawBatch(b []*drawReq) {
 		s.batches.Add(1)
 		s.batched.Add(int64(len(b)))
 	}
+	// The sweep, if one is due, starts before the draws are answered, as
+	// it did before draws batched.
 	var swept time.Time
 	for i, r := range b {
 		if res[i].ok && r.now.After(swept) {
 			swept = r.now
 		}
-		r.done <- res[i]
 	}
 	if !swept.IsZero() {
 		s.maybeSweep(swept)
+	}
+	for i, r := range b {
+		r.done <- res[i]
 	}
 }
 

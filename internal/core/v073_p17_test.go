@@ -622,7 +622,7 @@ func p17DrawBlockedBy(t *testing.T, e *Engine, pid int) {
 	within(t, 10*time.Second, "the draw waits for the lock", func() bool {
 		var n int
 		e.db.QueryRow(`SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()
-			AND wait_event_type = 'Lock' AND query LIKE '%rate_draw(%' AND $1 = ANY (pg_blocking_pids(pid))`, pid).Scan(&n)
+			AND wait_event_type = 'Lock' AND query LIKE '%rate_draw%' AND $1 = ANY (pg_blocking_pids(pid))`, pid).Scan(&n)
 		return n > 0
 	})
 }

@@ -110,8 +110,9 @@ func batchEngine(t *testing.T, fresh bool) (*Engine, *bucketStore, time.Time) {
 // draw's answer is sent on the returned channel.
 func holdBucket(t *testing.T, e *Engine, s *bucketStore, now time.Time, key string) (release func(), blocked <-chan error) {
 	t.Helper()
+	// Not full, so no sweep deletes it.
 	r := Rate{1, 1e9}
-	if _, err := e.db.Exec(`INSERT INTO rate_buckets (key, tokens, last, rate, burst) VALUES ($1, $2, $3, $4, $2) ON CONFLICT (key) DO NOTHING`,
+	if _, err := e.db.Exec(`INSERT INTO rate_buckets (key, tokens, last, rate, burst) VALUES ($1, $2 - 2, $3, $4, $2) ON CONFLICT (key) DO NOTHING`,
 		[]byte(key), r.Burst, now.UnixMicro(), r.Rate); err != nil {
 		t.Fatal(err)
 	}
