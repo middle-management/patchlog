@@ -404,6 +404,11 @@ func Open(opt Options) (*Engine, error) {
 	if opt.LongPollInterval == 0 {
 		opt.LongPollInterval = 20 * time.Second
 	}
+	// Intervals are a positive whole number of milliseconds (§7.7, v0.88):
+	// the phase is taken modulo the interval in milliseconds.
+	if opt.LongPollInterval < time.Millisecond || opt.LongPollInterval%time.Millisecond != 0 {
+		return nil, fmt.Errorf("core: the long-poll interval %v is not a positive whole number of milliseconds (§7.7)", opt.LongPollInterval)
+	}
 	if opt.Now == nil {
 		opt.Now = time.Now
 	}

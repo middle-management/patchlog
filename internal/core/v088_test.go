@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/pgtest"
@@ -60,6 +61,24 @@ func TestV088OneReadBudgetPerRequest(t *testing.T) {
 	if first, _, _ := twice(bctx); first {
 		t.Fatal("a second transaction of one request got a fresh budget")
 	}
+}
+
+// v0.88 §7.7 ("each a positive whole number of milliseconds"): an
+// interval under a millisecond, or with a fraction of one, is refused when
+// the engine opens; a whole one is taken.
+func TestV088LongPollIntervalWholeMilliseconds(t *testing.T) {
+	t.Parallel()
+	for _, d := range []time.Duration{time.Microsecond, 1500 * time.Microsecond, -time.Second} {
+		if e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, LongPollInterval: d}); err == nil {
+			e.Close()
+			t.Errorf("long-poll interval %v: opened", d)
+		}
+	}
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, LongPollInterval: 1500 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.Close()
 }
 
 // v0.88 §7.9 URLs ("Ranges are immutable but for purges and archive
