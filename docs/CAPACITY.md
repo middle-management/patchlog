@@ -760,6 +760,12 @@ time only): the consumers read the revision each namespace entry names
   1.9 ms, and Postgres showed row-lock waits (`Lock:tuple`, `Lock:transactionid`). Drawing
   outside the check's transaction would free the connection; a principal writing across many
   namespaces still serialises on its row.
+- **A writer principal per namespace added 15–19%** on the pool of 64: 5,242 and 5,523 writes a
+  second at eight and sixteen namespaces, against 4,547 and 4,649 with one in the same run, and
+  the row-lock waits went. The pool was full again (430–580 requests waiting for a connection),
+  with about 40 sessions idle in a check's transaction, and the core's instance at 79% CPU, much
+  of it garbage collection. So past a larger pool and the draw moved out of the check, the
+  core's CPU is next on a 4-vCPU instance; more instances share the work (D.8).
 - **Since these runs** (not yet measured again):
   - `pool_max_conns=N` sets the main pool to `N` connections, above 4 per GOMAXPROCS too, and
     the bucket pool to a quarter of `N`.
@@ -769,6 +775,24 @@ time only): the consumers read the revision each namespace entry names
   - Group commits take a connection from a pool of their own (a quarter of the main pool's
     size) when one is free, so a group of about 30 writes no longer queues behind every
     write's check.
+- **With those (93149318), the draws are the limit.** On a pool of 64 and one writer principal,
+  4, 8 and 16 namespaces wrote 3,923, 3,933 and 2,181 a second; with a principal per namespace
+  3,960, 5,214 and 4,550. Up to 1,340 writes waited for one of the bucket pool's 16 connections,
+  with 13–16 draws running, and with one principal they queued on its row (`rate_draw` 1.7 ms,
+  `Lock:tuple` waits). Writes reached the group commit queue so slowly that groups shrank to
+  about 2. `rate_draw` took more of Postgres's time than every other statement together. With
+  `--local-rate-buckets` the same run wrote 7,733 and 8,134 a second at 8 and 16 namespaces (p99
+  171 and 675 ms), so a draw per write is what costs: a draw for many writes at once, as group
+  commit does for their rows, would take each bucket row's lock once. There the pool of 64 was
+  full again, 1,400 requests waiting, most of them for checks' read transactions (five round
+  trips each), and the core's instance at 82% CPU.
+- **Past that, the core's CPU is the limit on 4 vCPUs.** A pool of 128 wrote less than 64 (6,544
+  and 7,451 a second at 8 and 16 namespaces): the core used 3.4 of its 4 vCPUs (pprof), and the
+  extra connections only waited on it (up to 91 sessions idle in a transaction). A write's check
+  took 31–36% of the core's CPU, about a fifth of it in pgx: six round trips (begin, the
+  namespace, resource and head reads, the retry lookup of §7.2, rollback), each a statement
+  through pgx and TLS (TLS writes 8–9% in all). Followers' revision reads took 10–15%, group
+  commits 9%, garbage collection 11%. Fewer round trips in the check would save the most.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
