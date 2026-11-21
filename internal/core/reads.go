@@ -655,7 +655,7 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 		}
 		if q != nil {
 			q.ok, q.anyone, q.until = standing(t, n, cred, a)
-			if byDoc {
+			if byDoc || t.isSealedNS(n) && t.readsPartially(n, a) {
 				// Its answers are judged per entry, never shared.
 				q.ok = false
 			}
@@ -755,8 +755,10 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 		// entries after it: the horizon's sealed snapshot is served as
 		// /rev/{H} (ResourceRev), never as a log entry (§7.1 Paging).
 		out.Last = since
-		if byDoc {
-			// Each entry judged with its own read envelope (§C.2 item 5).
+		if byDoc || sealed && t.readsPartially(n, a) {
+			// Each entry judged with its own read envelope (§C.2 item 5);
+			// a partial reader's answer at sealed is filtered and sealed for
+			// its view whatever its rules refer to (§7.9, v0.89).
 			ms, shown, patches, ok := t.judgeEntries(n, a, name, entries)
 			if !ok {
 				// A range it can read nothing of from genesis is a

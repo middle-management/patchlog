@@ -426,7 +426,7 @@ func (t *tx) seesAnyEntry(n *nsRow, a *actor, name string, entries []LogEntry) b
 // resource's URLs (judgeEntries): hidden entries are left out of a range,
 // rather than refusing it.
 func (t *tx) readsPartially(n *nsRow, a *actor) bool {
-	return a.view == "" && a.verified != nil && t.filteredScope(n) != nil && t.partialReader(a)
+	return a != nil && a.view == "" && a.verified != nil && t.filteredScope(n) != nil && t.partialReader(a)
 }
 
 // judgePruneEvents leaves out of a resource stream's events (resourceEvents)
