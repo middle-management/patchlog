@@ -734,19 +734,23 @@ time only): the consumers read the revision each namespace entry names
 - **Nothing is CPU-bound at 2,900.** RDS was at 25–39% (CloudWatch, 1-minute averages while
   namespaces were busy), the core's instance at most 38%, the consumers' at most 38% and the
   writers' at most 18%.
-- **The core's Postgres pool is not the limit.** It is 4 connections per vCPU, 16 on a
-  `c7g.xlarge` (`internal/core/pgpool.go`). With `pool_max_conns=64` in the database URL, four,
-  eight and sixteen namespaces wrote 3,126, 3,105 and 3,074 a second: 7% more, with the same
-  latencies (p99 258, 637 and 1,419 ms). RDS CPU stayed at 24–38%.
 - **Nor is storage.** RDS wrote 150–206 IOPS of the 3,000 gp3 gives 20 GiB, at 1–3 ms, its disk
   queue under 0.4 (CloudWatch, 1-minute averages).
-- **Nor is the writers' principal's rate bucket.** Every write draws on `p\x00<principal>` in
-  `rate_buckets` (`rate_draw`, `ratebuckets.go`), locking that row until the draw commits, and
-  that bucket is the principal's across every namespace (§6.6). Locally (Postgres 16, 4 vCPU),
-  draws on one row stop at 4,000–4,700 a second however many clients there are. But with a
-  writer principal per namespace, writes stopped at 2,962–3,037 a second, as with one
-  (3,000–3,055). What caps them is not yet known; the next run samples Postgres's wait events
-  and patchlog's group commit sizes and lock waits.
+- **Nor is the writers' principal's rate bucket**, one row of `rate_buckets` (`rate_draw`) that
+  every write of a principal locks, across namespaces (§6.6): with a writer principal per
+  namespace, writes stopped at 2,962–3,037 a second, as with one (3,000–3,055).
+- **The limit is the core's main pool, 16 connections.** It is 4 per GOMAXPROCS
+  (`internal/core/pgpool.go`), and `pool_max_conns` only lowers it, so a run with
+  `pool_max_conns=64` kept 16. Profiled (net/http/pprof) at 16 namespaces, the core had up to 700
+  requests waiting in `database/sql` for a connection, while Postgres had about 11 sessions not
+  idle, most of them idle in a transaction waiting for the core's next statement
+  (`pg_stat_activity`). Each write's check (D.3) takes a connection for five round trips, and the
+  group commit workers wait in the same queue: each spent about 90% of its time waiting for a
+  connection, so groups of about 30 writes (of `--group-commit` 32) committed about 100 times a
+  second in all, about 3,000 writes. Postgres did little: about 2.5 ms of statements per group.
+  A larger pool (a GOMAXPROCS above the vCPUs, since `pool_max_conns` can't raise it), or a
+  connection the group commit workers don't queue for, should raise the limit; a run with
+  GOMAXPROCS 16 will tell.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
