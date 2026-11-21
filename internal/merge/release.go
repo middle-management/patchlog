@@ -164,6 +164,12 @@ type ReleaseStep struct {
 	// IDs are the ids the batch left its resources at, which step 3's
 	// preconditions name.
 	IDs map[string]string `json:"ids,omitempty"`
+	// Carried, in step 3, are the documents a stored plan's step 3 was to
+	// publish that steps 1 and 2 of an earlier, stopped merge have merged
+	// already, still unset, by name, with the head each is published on
+	// (§F.9: "Planning again after a stop takes step 3's documents, those
+	// still unset, from the stored plan").
+	Carried map[string]string `json:"carried,omitempty"`
 }
 
 // Publish is the field step 3 sets (§F.9): Path, a JSON pointer readers'
@@ -326,6 +332,9 @@ type relCtx struct {
 	ownCfgs map[string]string         // branch -> config id our approval left (resume)
 	// onBranches are the branches of the releases this one builds on.
 	onBranches []string
+	// carried are, per key, step 3's documents taken from the stored plan
+	// (carryPublished).
+	carried map[string]map[string]string
 }
 
 // PlanRelease classifies a release and reports its conflicts, without
@@ -377,6 +386,9 @@ func planRelease(ctx context.Context, c *client.Client, opt ReleaseOptions, own 
 		x.listed[rel.Doc.Branches[k].NS] = true
 	}
 	if err := x.branches(ctx); err != nil {
+		return nil, err
+	}
+	if err := x.carryPublished(ctx); err != nil {
 		return nil, err
 	}
 	if err := x.classify(ctx); err != nil {
@@ -694,8 +706,21 @@ func (x *relCtx) classify(ctx context.Context) error {
 			rp.Notes = append(rp.Notes, fmt.Sprintf("%s merges into %s, a branch of the release this one builds on: no step 3 there, as that release's step 3 publishes what it creates", b.NS, b.Target))
 			continue
 		}
-		if created := createdItems(p); len(created) > 0 {
-			publishSteps = append(publishSteps, &ReleaseStep{Step: StepPublish, Key: b.Key, Resources: created})
+		created := createdItems(p)
+		carried := map[string]string{}
+		for name, id := range x.carried[b.Key] {
+			if !slicesContains(created, name) {
+				carried[name] = id
+				created = append(created, name)
+			}
+		}
+		if len(created) > 0 {
+			sort.Strings(created)
+			st := &ReleaseStep{Step: StepPublish, Key: b.Key, Resources: created}
+			if len(carried) > 0 {
+				st.Carried = carried
+			}
+			publishSteps = append(publishSteps, st)
 		}
 	}
 	rp.Steps = append(rp.Steps, contentSteps...)
@@ -1423,12 +1448,74 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 // publishItems are step 3's digest items: for each document step 2
 // created, the published field set, its precondition the id step 2's item
 // leaves it at, { "batch", "item" } in the plan.
+//
+// A document carried from a stored plan (ReleaseStep.Carried), which
+// steps 1 and 2 merged before the merge stopped, has no item in step 2:
+// its precondition is the head it is published on, an id.
 func publishItems(st *ReleaseStep, pub *Publish) []any {
 	out := make([]any, 0, len(st.Resources))
 	for _, name := range st.Resources {
-		out = append(out, digestItem(name, map[string]any{"after": map[string]any{"step": StepContent, "key": st.Key, "item": name}}, []client.Step{pub.step()}))
+		pre := map[string]any{"after": map[string]any{"step": StepContent, "key": st.Key, "item": name}}
+		if id, ok := st.Carried[name]; ok {
+			pre = map[string]any{"ifMatch": id}
+		}
+		out = append(out, digestItem(name, pre, []client.Step{pub.step()}))
 	}
 	return orderItems(st, out)
+}
+
+// carryPublished finds, in the stored plan of the release, the documents
+// its step 3 was to publish that are now live in their target with the
+// published field still unset: what a merge stopped between steps 2 and 3
+// left (§F.9). Planning again takes them into step 3 (classify), on their
+// heads now, whether or not step 2 still creates them; those it creates
+// keep their step-2 precondition.
+func (x *relCtx) carryPublished(ctx context.Context) error {
+	pub := x.rp.Publish
+	if pub == nil {
+		return nil
+	}
+	stored, err := LoadReleasePlan(ctx, x.c, x.opt)
+	if err != nil || stored == nil || !samePublish(stored.Publish, pub) {
+		return err
+	}
+	ptr := pub.ptr()
+	for _, st := range stored.Steps {
+		if st.Step != StepPublish {
+			continue
+		}
+		b := x.rp.Branch(st.Key)
+		if b == nil || b.Target != b.Key {
+			continue
+		}
+		for _, name := range st.Resources {
+			h, err := x.c.Head(ctx, b.Target, name)
+			if err != nil {
+				if client.IsNotFound(err) || client.IsGone(err) {
+					continue
+				}
+				return err
+			}
+			if h.State != client.Live {
+				continue
+			}
+			d, err := x.c.Doc(ctx, b.Target, name, h.ID)
+			if err != nil {
+				return err
+			}
+			if v, ok := pointer.Get(d.Value, ptr); ok && jsonv.Equal(v, jsonv.FromGo(pub.Value)) {
+				continue // published already
+			}
+			if x.carried == nil {
+				x.carried = map[string]map[string]string{}
+			}
+			if x.carried[st.Key] == nil {
+				x.carried[st.Key] = map[string]string{}
+			}
+			x.carried[st.Key][name] = h.ID
+		}
+	}
+	return nil
 }
 
 // digestItems renders a step's items for the plan's digest (§F.9), in the
@@ -1623,7 +1710,7 @@ func (x *relCtx) digest(ctx context.Context) error {
 			}
 		case StepPublish:
 			for _, n := range st.Resources {
-				found := false
+				_, found := st.Carried[n]
 				for _, it := range content[st.Key] {
 					found = found || it.name == n
 				}
@@ -1802,23 +1889,29 @@ func runPublish(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *R
 	for i, it := range want {
 		m, _ := it.(map[string]any)
 		name, _ := m["resource"].(string)
-		pre, _ := m["ifMatch"].(map[string]any)
-		bi, ok1 := pre["batch"].(float64)
-		ii, ok2 := pre["item"].(float64)
-		src := rp.stepOfBatch(int(bi))
-		if !ok1 || !ok2 || src == nil || src.Done == "" {
-			return "", nil, fmt.Errorf("%w: step 3's item %d of %s names no submitted batch", ErrInvalidPlan, i, st.Key)
-		}
-		srcItems, err := rp.batchItems(int(bi))
-		if err != nil {
-			return "", nil, err
-		}
-		if int(ii) >= len(srcItems) || srcItems[int(ii)].(map[string]any)["resource"] != name {
-			return "", nil, fmt.Errorf("%w: step 3's item %s of %s follows another resource", ErrInvalidPlan, name, st.Key)
-		}
-		parent := src.IDs[name]
+		// The id step 2 left it at, or for a document carried from a
+		// stored plan the head it was planned on (publishItems).
+		parent, _ := m["ifMatch"].(string)
+		left := "planning"
 		if parent == "" {
-			return "", nil, fmt.Errorf("%w: step %d recorded no id for %s", ErrInvalidPlan, src.Step, name)
+			pre, _ := m["ifMatch"].(map[string]any)
+			bi, ok1 := pre["batch"].(float64)
+			ii, ok2 := pre["item"].(float64)
+			src := rp.stepOfBatch(int(bi))
+			if !ok1 || !ok2 || src == nil || src.Done == "" {
+				return "", nil, fmt.Errorf("%w: step 3's item %d of %s names no submitted batch", ErrInvalidPlan, i, st.Key)
+			}
+			srcItems, err := rp.batchItems(int(bi))
+			if err != nil {
+				return "", nil, err
+			}
+			if int(ii) >= len(srcItems) || srcItems[int(ii)].(map[string]any)["resource"] != name {
+				return "", nil, fmt.Errorf("%w: step 3's item %s of %s follows another resource", ErrInvalidPlan, name, st.Key)
+			}
+			if parent = src.IDs[name]; parent == "" {
+				return "", nil, fmt.Errorf("%w: step %d recorded no id for %s", ErrInvalidPlan, src.Step, name)
+			}
+			left = fmt.Sprintf("step %d", src.Step)
 		}
 		steps := []client.Step{pub.step()}
 		if !jsonv.Equal(jsonv.FromGo(digestItem(name, nil, steps)["steps"]), m["steps"]) {
@@ -1846,7 +1939,7 @@ func runPublish(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *R
 			}
 		}
 		if h.State != client.Live || h.ID != parent {
-			return "", nil, fmt.Errorf("%w (step 3: %s/%s is %s %s, not %s, which step %d left it at)", ErrPlanChanged, b.Target, name, h.State, h.ID, parent, src.Step)
+			return "", nil, fmt.Errorf("%w (step 3: %s/%s is %s %s, not %s, which %s left it at)", ErrPlanChanged, b.Target, name, h.State, h.ID, parent, left)
 		}
 		req.Items = append(req.Items, client.BatchItem{Resource: name, IfMatch: parent, Steps: np.withNonces(steps)})
 	}

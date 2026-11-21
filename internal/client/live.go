@@ -91,7 +91,16 @@ func (c *Client) nsLongPollResult(ctx context.Context, ns, view, since string, r
 		return res, nil
 	}
 	body := r.value()
-	if isJOSE(r) {
+	switch {
+	case view != "":
+		// A filtered answer: sealed, under the view's K_view, bound to
+		// [since, the newest entry scanned] (§7.9 Sealed namespaces).
+		if body, err = c.filteredBody(ctx, r, ns, func() (any, error) {
+			return c.openFiltered(ctx, ns, view, string(r.body), fixedPL(seal.RangePL(ns, since, res.Since)))
+		}); err != nil {
+			return nil, err
+		}
+	case isJOSE(r):
 		if body, err = c.openRange(ctx, ns, since, res.Since, string(r.body)); err != nil {
 			return nil, fmt.Errorf("client: namespace log %s: %w", ns, err)
 		}
@@ -211,7 +220,27 @@ func (c *Client) FilteredNSEvents(ctx context.Context, ns, view, since string, f
 	if err := checkID("view", view); err != nil {
 		return err
 	}
-	return c.nsEvents(ctx, ns, "/ns/"+ns+"/view/"+view+"/events", since, nil, fn)
+	return c.eventsAt(ctx, "/ns/"+ns+"/view/"+view+"/events", since, nil, func(ev Event) error {
+		if ev.JWE != "" {
+			// Sealed: one JWE per event under the view's K_view, bound to
+			// { ns, view, event: id } (§7.9 Sealed namespaces, §E.2.2).
+			v, err := c.openFiltered(ctx, ns, view, ev.JWE, fixedPL(seal.NamespaceEventPL(ns, ev.ID)))
+			if err != nil {
+				return fmt.Errorf("client: event %s: %w", ev.ID, err)
+			}
+			ev.Data = v
+		} else if held := c.levels.held(ns); held == "sealed" || held == "e2e" {
+			return fmt.Errorf("client: event %s in the clear in a namespace this client holds as %s (§7.9): %w", ev.ID, held, ErrLevelLowered)
+		}
+		e, err := ParseNSEntry(ev.Data)
+		if err != nil {
+			return err
+		}
+		if ev.JWE != "" && e.ID != ev.ID {
+			return fmt.Errorf("client: event %s carries entry %s: %w", ev.ID, e.ID, seal.ErrMismatch)
+		}
+		return fn(e)
+	})
 }
 
 // nsEvents streams the namespace events at path, a 302 being the error
@@ -264,6 +293,13 @@ func (c *Client) ResourceEvents(ctx context.Context, ns, name, since string, fn 
 			}
 			return fn(ev)
 		}
+		if h, err := seal.ParseHeader(ev.JWE); err == nil && h.PL["view"] != nil {
+			// A partial reader's, filtered: under its view's K_view, the
+			// unfiltered form's pl with view, a hidden event's kind
+			// "hidden"; a revision shown with patches is its stored JWE
+			// under its K_log (§7.9 Sealed namespaces, §E.2.2).
+			return c.filteredResourceEvent(ctx, ns, name, ev, fn)
+		}
 		switch ev.Type {
 		case "revision", "tombstone":
 			e, err := c.openEntry(ctx, ns, name, ev.JWE)
@@ -288,6 +324,55 @@ func (c *Client) ResourceEvents(ctx context.Context, ns, name, since string, fn 
 		}
 		return fn(ev)
 	})
+}
+
+// filteredResourceEvent opens ev, a partial reader's sealed event of
+// ns/name (ResourceEvents), and calls fn with its data in the clear.
+func (c *Client) filteredResourceEvent(ctx context.Context, ns, name string, ev Event, fn func(Event) error) error {
+	var pl seal.PL
+	switch ev.Type {
+	case "revision", "tombstone", "hidden":
+		kind := ev.Type
+		if kind == "revision" {
+			kind = seal.KindRev
+		}
+		pl = seal.ResourcePL(ns, name, ev.ID, kind)
+	case "purge", "prune":
+		pl = seal.ResourceEventPL(ns, name, ev.Type)
+	default:
+		return fmt.Errorf("client: sealed event of type %q", ev.Type)
+	}
+	body, err := c.openFiltered(ctx, ns, "", ev.JWE, fixedPL(pl))
+	if err != nil {
+		return fmt.Errorf("client: %s event: %w", ev.Type, err)
+	}
+	if s, ok := body.(string); ok {
+		e, err := c.openEntry(ctx, ns, name, s)
+		if err != nil {
+			return fmt.Errorf("client: event %s: %w", ev.ID, err)
+		}
+		if e.ID != ev.ID {
+			return fmt.Errorf("client: event %s carries entry %s: %w", ev.ID, e.ID, seal.ErrMismatch)
+		}
+		ev.Data = e.Raw
+		return fn(ev)
+	}
+	m, ok := body.(map[string]any)
+	if !ok {
+		return fmt.Errorf("client: %s event: %w", ev.Type, seal.ErrMismatch)
+	}
+	if ev.Type == "purge" || ev.Type == "prune" {
+		if m["kind"] != ev.Type || m["resource"] != name {
+			return fmt.Errorf("client: %s event carries a %v entry of %v: %w", ev.Type, m["kind"], m["resource"], seal.ErrMismatch)
+		}
+		ev.ID, ev.Data = "", withoutIDPrev(m)
+		return fn(ev)
+	}
+	if m["id"] != ev.ID {
+		return fmt.Errorf("client: event %s carries entry %v: %w", ev.ID, m["id"], seal.ErrMismatch)
+	}
+	ev.Data = m
+	return fn(ev)
 }
 
 // openResourceEvent opens a sealed purge or prune event ev of resource name.

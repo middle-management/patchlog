@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/middle-management/patchlog/internal/grantcheck"
@@ -26,18 +27,52 @@ func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]an
 }
 
 // readScope gives the read checks made until the function it returns is
-// called one budget of validationSteps between them, as an exchange and
-// a key request have for all the names they judge (§6.6 Validation work:
-// "each read, exchange and key request a grant is presented for"). Inside
-// another's scope it keeps that budget. Every other read check, a write's
-// own included, is made outside any scope and gets a fresh budget
-// (grantRules, readsNS, readRule).
+// called one budget of validationSteps between them (§6.6 Validation
+// work: "Each read request, exchange and key request a grant is
+// presented for gets one budget, shared by every check it makes"): every
+// read transaction has one (Engine.read, requestScope), and an exchange
+// one per grant (ownReadScope). Inside another's scope it keeps that
+// budget. A read check a write makes is outside any scope and gets a
+// fresh budget (grantRules, readsNS, readRule).
 func (t *tx) readScope() func() {
 	if t.readMeter != nil {
 		return func() {}
 	}
 	t.readMeter = &writeMeter{Meter: *rules.Budget(t.e.opt.MaxValidationSteps), read: true, t: t}
 	return func() { t.readMeter = nil }
+}
+
+// ownReadScope is readScope with a budget of its own, inside another's
+// scope too, until the function it returns restores that one: for each
+// grant of an exchange, and for one referencing or dependents list,
+// which count as one (§6.6 Validation work).
+func (t *tx) ownReadScope() func() {
+	prev := t.readMeter
+	t.readMeter = nil
+	done := t.readScope()
+	return func() { done(); t.readMeter = prev }
+}
+
+// ReadBudget gives ctx one budget of validationSteps for every read check
+// the engine makes for it (§6.6 Validation work: "Each read request …
+// gets one budget, shared by every check it makes"), across the read
+// transactions it runs, as a long-poll does for each fetch. Without it
+// each read transaction has one of its own.
+func (e *Engine) ReadBudget(ctx context.Context) context.Context {
+	return context.WithValue(ctx, readBudgetKey{}, &writeMeter{Meter: *rules.Budget(e.opt.MaxValidationSteps), read: true})
+}
+
+type readBudgetKey struct{}
+
+// requestScope is the read scope of a read transaction (Engine.read): the
+// budget ctx carries (ReadBudget), else one of the transaction's own.
+func (t *tx) requestScope(ctx context.Context) func() {
+	if m, ok := ctx.Value(readBudgetKey{}).(*writeMeter); ok && t.readMeter == nil {
+		m.t = t
+		t.readMeter = m
+		return func() { t.readMeter = nil }
+	}
+	return t.readScope()
 }
 
 // readSpent reports whether the budget the read checks in progress share
@@ -75,6 +110,9 @@ type writeMeter struct {
 	// (authorize): running out there doesn't answer at once, since a check
 	// that fails outright answers before it (§6.6 Validation work).
 	stepOne bool
+	// charged are the actors whose attrs check this budget has counted
+	// (chargeAttrs).
+	charged map[*actor]bool
 }
 
 // newMeter is a meter for one write, at the deployment's limit.
@@ -92,6 +130,27 @@ func (t *tx) metered(readable func() bool) func() {
 	}
 	t.meter = t.newMeter(readable)
 	return func() { t.meter = nil }
+}
+
+// chargeAttrs counts the steps of a's attrs check (§C.4) against m, the
+// budget of a check of a's grant, once per budget (§6.6 Validation work,
+// v0.88: "a key scope's attrs schema" counts). One that ran out spends
+// m: the check then runs out too.
+func (m *writeMeter) chargeAttrs(a *actor) {
+	if m == nil || a.attrsSteps == 0 && !a.attrsOver {
+		return
+	}
+	if m.charged[a] {
+		return
+	}
+	if m.charged == nil {
+		m.charged = map[*actor]bool{}
+	}
+	m.charged[a] = true
+	m.Steps += a.attrsSteps
+	if a.attrsOver || m.Max > 0 && m.Steps >= m.Max {
+		m.Over = true
+	}
 }
 
 // rule is m as the rules package takes it, nil for no meter.
@@ -206,6 +265,7 @@ func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[strin
 // scopeRules evaluates the key-scope and block rules of a's verified
 // grant, as grantRulesMode does.
 func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []string, m *writeMeter) *Error {
+	m.chargeAttrs(a)
 	if m != nil && m.read && m.Over {
 		// The budget its exchange or key request shares is spent.
 		return errReadRanOut()

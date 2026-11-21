@@ -1105,6 +1105,9 @@ func (t *tx) brokenAmong(ch refChange, uses map[string]map[int64]*nsRow) []*nsRo
 // page of them. (A caller who may read few of them still has the search
 // go on to the end.)
 func (t *tx) refsInUse(ch refChange, msg string) *Error {
+	// The list's judgments share one budget of validationSteps; where it
+	// runs out the list ends there, without more (§6.6, v0.88).
+	defer t.ownReadScope()()
 	limit := t.e.opt.Maximums.LogPageSize
 	names := []string{}
 	found, more := false, false
@@ -1119,8 +1122,11 @@ func (t *tx) refsInUse(ch refChange, msg string) *Error {
 	}
 	t.brokenEach(&ch, func(m *nsRow) bool {
 		found = true
+		if t.readSpent() {
+			return false
+		}
 		if !reads(m) {
-			return true
+			return !t.readSpent()
 		}
 		if len(names) == limit {
 			more = true

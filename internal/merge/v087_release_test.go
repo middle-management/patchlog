@@ -306,6 +306,36 @@ func TestV087ReleasePublishStopsOnChange(t *testing.T) {
 	if d := w.doc("matches", "final"); d["published"] != nil || d["venue"] != "Hampden" {
 		t.Fatalf("final %v", d)
 	}
+
+	// v0.88 §F.9 ("Planning again after a stop takes step 3's documents,
+	// those still unset, from the stored plan, since steps 1 and 2 have
+	// merged them"): planned again as the CLI plans a stopped merge,
+	// approved and applied, the merge publishes final on its head now.
+	// Until v0.88 the new plan had no step 3: final classified as merged.
+	o.AfterStep = nil
+	old := must(merge.LoadReleasePlan(ctx, w.anna, o))
+	o.AcceptFrozen = old.FrozenBy()
+	rp := must(merge.PlanRelease(ctx, w.anna, o))
+	merge.AdoptHead(rp, old)
+	var pub *merge.ReleaseStep
+	for _, st := range rp.Steps {
+		if st.Step == merge.StepPublish {
+			pub = st
+		}
+	}
+	if pub == nil || pub.Carried["final"] != must(w.anna.Head(ctx, "matches", "final")).ID {
+		t.Fatalf("step 3 of the new plan: %+v", pub)
+	}
+	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, rp))
+	must(merge.ApproveRelease(ctx, w.anna, o))
+	rp, err = merge.ApplyRelease(ctx, w.anna, o)
+	noErr(t, err)
+	if rp.State != merge.ReleaseDone {
+		t.Fatalf("state %s", rp.State)
+	}
+	if d := w.doc("matches", "final"); d["published"] != true || d["venue"] != "Hampden" {
+		t.Fatalf("final after the new plan %v", d)
+	}
 }
 
 // MRG-22: a release built on another branches that release's branches and

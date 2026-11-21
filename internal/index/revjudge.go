@@ -13,7 +13,8 @@ import (
 // Hits are filtered per revision (§A.4 Private namespaces, §7.9 Visible,
 // §C.2 item 5): a hit is shown only where its head revision as of the
 // checkpoint is visible to the reader, judged with that revision's read
-// envelope, doc being the revision's document, or null in a sealed or
+// envelope, doc being the revision's document (a sealed one opened with
+// the index's keys, v0.89), or null in an
 // end-to-end namespace, where every rule on /doc fails. A filter whose
 // rules don't refer to /doc decides by name. Otherwise the document is
 // fetched from the origin, with the index's own grant, which reads the
@@ -61,7 +62,7 @@ func (ix *Index) revAllow(ns string, f *grantcheck.ReadFilter) allowFunc {
 }
 
 // revDoc is the document of revision id of ns/resource for a read
-// envelope: none (null) without an id, in a sealed or end-to-end
+// envelope: none (null) without an id, in an end-to-end
 // namespace, or where the origin doesn't serve it. stable reports an
 // answer that can be kept: not one that failed for now.
 func (ix *Index) revDoc(ns, resource, id string) (doc any, hasDoc, stable bool) {
@@ -74,7 +75,9 @@ func (ix *Index) revDoc(ns, resource, id string) (doc any, hasDoc, stable bool) 
 	if err != nil {
 		return nil, false, false
 	}
-	if derived.Protected(derived.InfoOf(cfg.Doc).Level) {
+	if derived.InfoOf(cfg.Doc).Level == derived.LevelE2E {
+		// Only end-to-end: a sealed namespace's documents, which the index
+		// opens with its keys, are judged (SERVICES §A.4, v0.89).
 		return nil, false, true
 	}
 	d, err := ix.c.Doc(ctx, ns, resource, id)

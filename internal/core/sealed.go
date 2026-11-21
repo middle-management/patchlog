@@ -306,7 +306,7 @@ func (t *tx) revEpochFixed(n *nsRow, r *revRow) (int, bool) {
 	// Content without an epoch of its own keeps the one its first stored
 	// sealing fixed, whichever form that was (§E.2.2, §E.2.5).
 	var prefix string
-	err := t.QueryRow(`SELECT substr(jwe, 1, 4096) FROM sealed WHERE ns = ? AND rev_seq = ? AND kind IN ('doc', 'entry') ORDER BY created LIMIT 1`, n.id, r.seq).Scan(&prefix)
+	err := t.QueryRow(`SELECT substr(jwe, 1, 4096) FROM sealed WHERE ns = ? AND rev_seq = ? AND kind IN ('doc', 'entry', 'keys') ORDER BY created LIMIT 1`, n.id, r.seq).Scan(&prefix)
 	if err == nil {
 		if e, ok := jweEpoch(prefix); ok {
 			return e, true
@@ -370,16 +370,27 @@ type sealJob struct {
 	// K_n of the stored row's epoch and replaces that row (storedNS).
 	reseal bool
 	// unzip holds the stored bytes of a resource document or log entry
-	// sealed before v0.65 with zip "DEF", which no reader opens: j seals it
-	// again, uncompressed, under the same key, and replaces the row only
-	// while it still holds these bytes (storedRes).
+	// sealed under an earlier draft's key (before v0.89, under K_r; before
+	// v0.65, also with zip "DEF"), which no reader opens: j seals it
+	// again, under its K_rev or K_log of the same epoch, and replaces the
+	// row only while it still holds these bytes (storedRes).
 	unzip string
+	// view is set for what is sealed under a view's K_view (filtered_seal.go),
+	// counted under that key (jobSealKey).
+	view string
 }
 
 // sealKver is the kver of the rows this version stores (migration 016):
-// namespace documents and grants under K_n, the rest under K_r. Rows of
-// kver 0, from before, hold namespace documents and grants under K_e.
-const sealKver = 1
+// namespace documents and grants under K_n (kver 1 and up), resource
+// documents under K_rev and log entries under K_log (kver 2, v0.89), the
+// rest under K_n or K_view. Rows of kver 0 hold namespace documents and
+// grants under K_e, and rows of kver 0 and 1 resource documents and
+// entries under K_r.
+const sealKver = 2
+
+// nsSealKver is the oldest kver whose namespace documents and grants are
+// sealed under K_n, as they still are (storedNS).
+const nsSealKver = 1
 
 // servedLen is the length of what j serves: its stored JWE's, or one
 // sealed under a throwaway key, of the same length, so a sealed resource
@@ -436,25 +447,66 @@ func (t *tx) resJob(n *nsRow, name string, row *revRow, kind string, plain func(
 	if j.unzip == "" {
 		e = t.revEpoch(n, row)
 	}
-	kr, err := seal.ResourceKey(t.epochKey(n.id, e), n.name, name)
-	t.must(err)
-	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), kr, seal.ResourcePL(n.name, name, row.id.String(), plKind), plain()
+	// A revision's document under its K_rev, its or a tombstone's log
+	// entry under its K_log (§E.2.1, v0.89).
+	k := t.revKey(n, e, name, row.id.String())
+	if kind == sealEntry {
+		k = t.logKey(n, e, name, row.id.String())
+	}
+	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), k, seal.ResourcePL(n.name, name, row.id.String(), plKind), plain()
 	j.pad = t.config(n.configSeq).Pad
 	return j
 }
 
+// resourceKey is K_r of resource name in n's epoch e (§E.2.1).
+func (t *tx) resourceKey(n *nsRow, e int, name string) []byte {
+	kr, err := seal.ResourceKey(t.epochKey(n.id, e), n.name, name)
+	t.must(err)
+	return kr
+}
+
+// revKey is K_rev of revision id of name in n's epoch e (§E.2.1).
+func (t *tx) revKey(n *nsRow, e int, name, id string) []byte {
+	k, err := seal.RevKey(t.resourceKey(n, e, name), id)
+	t.must(err)
+	return k
+}
+
+// logKey is K_log of revision or tombstone id of name in n's epoch e
+// (§E.2.1).
+func (t *tx) logKey(n *nsRow, e int, name, id string) []byte {
+	k, err := seal.LogKey(t.resourceKey(n, e, name), id)
+	t.must(err)
+	return k
+}
+
+// blobKey is K_blob of blob bid of name in n's epoch e (§E.2.1).
+func (t *tx) blobKey(n *nsRow, e int, name, bid string) []byte {
+	k, err := seal.BlobKey(t.resourceKey(n, e, name), bid)
+	t.must(err)
+	return k
+}
+
+// viewKey is K_view of view in n's epoch e (§E.2.1).
+func (t *tx) viewKey(n *nsRow, e int, view string) []byte {
+	k, err := seal.FilterViewKey(t.epochKey(n.id, e), n.name, view)
+	t.must(err)
+	return k
+}
+
 // storedRes is stored for a resource document or log entry: true if j's
-// row holds a sealing a reader opens. A row stored before v0.65 with zip
-// "DEF" in its header (stored.md item 5), which no reader opens (§E.2.2:
-// sealed payloads are never compressed), is never served again: it
-// reports the epoch the row's kid fixed, under whose K_r j is sealed
-// again, uncompressed, with the plaintext computed as for a new row, and
-// replaces the row while it still holds those bytes (unzip, finishSeal),
-// the first stored winning. The ETag "{id}.{e}" names the same epoch, and
-// the old bytes are never opened. If that epoch's key is gone, or the kid
-// can't be read or names another namespace, the answer is 500, as
-// storedNS's. Rows stored since v0.81 (kver 1) are never compressed.
-// Content sealed by clients (E3) is never in this table.
+// row holds a sealing a reader opens. A row stored before v0.89 (kver 0
+// or 1) holds it under K_r, and before v0.65 perhaps with zip "DEF"
+// (stored.md item 5), which no reader opens since v0.89 (§E.2.1: a
+// document under its K_rev, an entry under its K_log): it is never served
+// again, but reports the epoch the row's kid fixed, under whose K_rev or
+// K_log j is sealed again, with the plaintext computed as for a new row,
+// and replaces the row while it still holds those bytes (unzip,
+// finishSeal), the first stored winning. The ETag "{id}.{e}" names the
+// same epoch, and the old bytes are never opened. If that epoch's key is
+// gone, or the kid can't be read or names another namespace, the answer
+// is 500, as storedNS's. Content sealed by clients (E3) is never in this
+// table.
 func (t *tx) storedRes(n *nsRow, j *sealJob) (bool, int) {
 	var jwe string
 	var kver int
@@ -467,13 +519,9 @@ func (t *tx) storedRes(n *nsRow, j *sealJob) (bool, int) {
 		j.jwe = jwe
 		return true, 0
 	}
-	if h, err := seal.ParseHeader(jwe); err == nil && h.Zip == "" {
-		j.jwe = jwe
-		return true, 0
-	}
 	kns, e, ok := jweKid(jwe)
 	if !ok || kns != n.name || !t.hasEpochKey(n.id, e) {
-		panic(apiErr(500, "internal", "message", fmt.Sprintf("namespace %s: the %s %s was sealed compressed under an earlier draft, and the key of its epoch is gone; it can't be served (§E.2.2, v0.81)", n.name, j.kind, j.key)))
+		panic(apiErr(500, "internal", "message", fmt.Sprintf("namespace %s: the %s %s was sealed under an earlier draft's key, and the key of its epoch is gone; it can't be served (§E.2.1, v0.89)", n.name, j.kind, j.key)))
 	}
 	j.unzip = jwe
 	return false, e
@@ -520,7 +568,7 @@ func (t *tx) storedNS(n *nsRow, j *sealJob) (bool, int) {
 		return false, 0
 	}
 	t.must(err)
-	if kver >= sealKver {
+	if kver >= nsSealKver {
 		j.jwe = jwe
 		return true, 0
 	}
@@ -626,7 +674,7 @@ func (t *tx) insertSealed(ns int64, j *sealJob, name, rev any) {
 	var err error
 	if j.reseal {
 		_, err = t.Exec(`UPDATE sealed SET jwe = ?, kver = ?, created = ? WHERE ns = ? AND kind = ? AND key = ? AND kver < ?`,
-			j.jwe, sealKver, t.now.UnixMilli(), ns, j.kind, j.key, sealKver)
+			j.jwe, sealKver, t.now.UnixMilli(), ns, j.kind, j.key, nsSealKver)
 	} else {
 		if j.unzip != "" {
 			_, err = t.Exec(`UPDATE sealed SET jwe = ?, kver = ? WHERE ns = ? AND kind = ? AND key = ? AND jwe = ?`,
@@ -790,7 +838,7 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		}
 		// §E.2.3's test is part of the read check, so it comes before a
 		// purged namespace's 410 and not_offered (§8.5).
-		names, perResource, serr := t.keysScope(a, kr)
+		names, perResource, view, serr := t.keysScope(n, a, kr)
 		if serr != nil {
 			return serr
 		}
@@ -808,6 +856,9 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		emit := func(kid, resource string, key []byte) error {
 			if enc != nil {
 				w, err := seal.WrapKey(enc, kid, resource, key)
+				if view != "" {
+					w, err = seal.WrapViewKey(enc, kid, view, key)
+				}
 				if err != nil {
 					return err
 				}
@@ -818,6 +869,9 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			if resource != "" {
 				m["name"] = resource
 			}
+			if view != "" {
+				m["view"] = view
+			}
 			out = append(out, m)
 			return nil
 		}
@@ -825,6 +879,13 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		for _, ep := range epochs {
 			kid := seal.Kid(n.name, ep)
 			ke := t.epochKey(n.id, ep)
+			if view != "" {
+				// A partial reader's only key: its view's K_view (§E.2.3).
+				if err := emit(kid, "", t.viewKey(n, ep, view)); err != nil {
+					return err
+				}
+				continue
+			}
 			if !perResource {
 				if err := emit(kid, "", ke); err != nil {
 					return err
@@ -854,7 +915,7 @@ func (t *tx) drawExchange(a *actor) *Error {
 	if a == nil || a.bucketKey == "" {
 		return nil
 	}
-	return t.admit([]draw{{"e\x00" + a.bucketKey, t.e.opt.Maximums.ExchangeRate, 1, "exchangeRate"}})
+	return t.admit([]draw{{"e\x00" + a.exchangeBucket(), t.e.opt.Maximums.ExchangeRate, 1, "exchangeRate"}})
 }
 
 // selectEpochs keeps the epochs of window that asked names, all of them
@@ -876,23 +937,43 @@ func selectEpochs(window, asked []int) []int {
 	return keep
 }
 
-// keysScope decides what a grant gets from /keys at E2 (§E.2.3): a grant
-// whose rules fix /resource (§2.1, fixedNames) gets K_r for the names
-// asked, by default every name its rules fix, each of which they must fix
-// and the grant may read (403 otherwise), sorted; any other grant gets K_e
-// if it reads the namespace unrestricted (§2.1), and is 403 otherwise, the
-// names asked being ignored. With authentication disabled, every request
+// keysScope decides what a grant gets from /keys at E2 (§E.2.3), never
+// more than one kind: a grant that reads n unrestricted (§2.1) gets K_e;
+// one whose rules fix /resource (§2.1, fixedNames) and whose read rules
+// don't refer to /doc gets K_r for the names asked, by default every name
+// its rules fix, each of which they must fix and the grant may read (403
+// otherwise), sorted; a partial reader (§7.9), a fixed-name grant with
+// /doc rules included, gets only its view's K_view, returned as view,
+// where §7.9 covers n (v0.89); any other grant is 403, the names asked
+// being ignored but for K_r. With authentication disabled, every request
 // gets K_e.
-func (t *tx) keysScope(a *actor, kr KeysRequest) (names []string, perResource bool, err *Error) {
+func (t *tx) keysScope(n *nsRow, a *actor, kr KeysRequest) (names []string, perResource bool, view string, err *Error) {
 	if a == nil || a.verified == nil {
-		return nil, false, nil
+		return nil, false, "", nil
 	}
 	fixed, fixes := fixedNames(a)
-	if !fixes {
-		if !t.readsUnrestricted(a) {
-			return nil, false, forbidden("epoch keys need unrestricted read on the namespace (§2.1, §E.2.3)")
+	docRules := false
+	if j := t.grantJudge(a); j != nil {
+		docRules = j.doc
+	}
+	switch {
+	case !fixes && t.readsUnrestricted(a):
+		return nil, false, "", nil
+	case !fixes || docRules:
+		// A partial reader, a fixed-name grant with /doc rules included,
+		// gets only its view's K_view, where §7.9 applies (§E.2.3,
+		// v0.89); any other grant nothing.
+		if fs := t.filteredScope(n); fs != nil && t.partialReader(a) {
+			fv, verr := t.grantView(fs, t.filteredCurrent(fs), a)
+			if verr != nil {
+				return nil, false, "", verr
+			}
+			return nil, false, fv.view, nil
 		}
-		return nil, false, nil
+		if docRules {
+			return nil, false, "", forbidden("a grant whose read rules refer to /doc gets a view key only where filtered reads apply (§7.9 Where, §E.2.3)")
+		}
+		return nil, false, "", forbidden("epoch keys need unrestricted read on the namespace (§2.1, §E.2.3)")
 	}
 	in := make(map[string]bool, len(fixed))
 	for _, n := range fixed {
@@ -910,15 +991,15 @@ func (t *tx) keysScope(a *actor, kr KeysRequest) (names []string, perResource bo
 		}
 		seen[r] = true
 		if !in[r] {
-			return nil, false, forbidden(fmt.Sprintf("the grant's rules don't fix /resource to %q, so it gets no key of it (§2.1, §E.2.3)", r))
+			return nil, false, "", forbidden(fmt.Sprintf("the grant's rules don't fix /resource to %q, so it gets no key of it (§2.1, §E.2.3)", r))
 		}
 		if t.grantRules(a, "read", nil, t.basicEnvelope("read", r, a), false) != nil {
-			return nil, false, forbidden(fmt.Sprintf("the grant may not read %q, so it gets no key of it (§E.2.3)", r))
+			return nil, false, "", forbidden(fmt.Sprintf("the grant may not read %q, so it gets no key of it (§E.2.3)", r))
 		}
 		names = append(names, r)
 	}
 	sort.Strings(names)
-	return names, true, nil
+	return names, true, "", nil
 }
 
 // readsUnrestricted reports whether a reads the namespace unrestricted

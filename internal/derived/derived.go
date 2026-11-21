@@ -28,18 +28,20 @@
 //	                            key of K_n = NamespaceKey(K_e, ns), served
 //	                            as Content-Type application/jose
 //	one entry (SealItem):       pl { "ns", "name", "view" }, sealed under
-//	                            the view key of K_r = ResourceKey(K_e, ns,
-//	                            name) of the entry's resource, as
-//	                            { …clear, "sealed": "<JWE>" }
+//	                            the view key of K_rev = RevKey(K_r, id) of
+//	                            the revision the entry derives from at E2,
+//	                            of K_r = ResourceKey(K_e, ns, name) at E3,
+//	                            as { …clear, "sealed": "<JWE>" }
 //
-// A view key is HKDF-SHA256(ikm = K_n or K_r, salt = "patchlog-view", info
-// = view) (seal.ViewKey), so views count toward no epoch key's message
-// bound (§E.2.1, §E.2.6); a value of another resource nested in an entry
-// is sealed as an entry of that resource is (SealItem with its name). The
-// view key is derived when a value is sealed, from the Key the caller
-// chose, never ahead of it. Entries use the per-resource key, like the
-// revisions they derive from (§E.2.1), so a reader holding only some
-// per-resource keys opens exactly the entries of those resources. Nothing
+// A view key is HKDF-SHA256(ikm = K_n, K_rev or K_r, salt =
+// "patchlog-view", info = view) (seal.ViewKey), so views count toward no
+// epoch key's message bound (§E.2.1, §E.2.6); a value of another resource
+// nested in an entry is sealed as an entry of that resource is (SealItem
+// with its name and id). The view key is derived when a value is sealed,
+// from the Key the caller chose, never ahead of it. Entries use the key
+// of the revision they derive from (§E.2.1), so a reader holding only
+// some per-resource keys, or only the K_rev its filtered answers carry,
+// opens exactly the entries of those revisions. Nothing
 // is compressed (a view mixes content of many resources and authors); a
 // namespace with encryption.pad pads what is sealed for it to its size
 // bucket (§E.2.2).
@@ -118,12 +120,16 @@ func canonical(v any) ([]byte, error) {
 }
 
 // Key is what seals for one namespace under one epoch: the epoch, its
-// epoch key and whether the namespace pads (Keys.Current, Keys.KeyAt).
+// epoch key, whether the namespace pads, and whether it is end-to-end
+// (Keys.Current, Keys.KeyAt).
 type Key struct {
 	NS    string
 	Epoch int
-	K     []byte // K_e: SealView and SealItem derive K_n or K_r and the view key from it
+	K     []byte // K_e: SealView and SealItem derive K_n, K_r or K_rev and the view key from it
 	Pad   bool
+	// E3: the namespace is end-to-end, where an entry is sealed under its
+	// resource's K_r; at E2 under its revision's K_rev (§E.2.6, v0.89).
+	E3 bool
 }
 
 // seal seals body under key. Its plaintext is body in canonical JSON
@@ -153,20 +159,33 @@ func SealView(k Key, v View, body any) (string, error) {
 	return k.seal(kv, v.PL(), body)
 }
 
-// SealItem seals the sealed values of one entry, derived from k.NS/name,
-// under the view key of that resource's K_r: ViewKey(ResourceKey(K_e, ns,
-// name), view) (§E.2.6). A value of another resource an entry carries is
-// sealed by SealItem with that resource's Key and name.
-func SealItem(k Key, v View, name string, values any) (string, error) {
-	kr, err := seal.ResourceKey(k.K, k.NS, name)
+// SealItem seals the sealed values of one entry, derived from revision id
+// of k.NS/name, under the view key of the revision's K_rev at E2,
+// ViewKey(RevKey(ResourceKey(K_e, ns, name), id), view), so origin and
+// service needn't agree on a reader's view and a partial reader opens it
+// with the K_rev its filtered answers carry; at E3 under that of the
+// resource's K_r (§E.2.6, v0.89). A value of another resource an entry
+// carries is sealed by SealItem with that resource's Key, name and id.
+func SealItem(k Key, v View, name, id string, values any) (string, error) {
+	ik, err := itemKey(k.K, k.NS, name, id, k.E3)
 	if err != nil {
 		return "", err
 	}
-	kv, err := seal.ViewKey(kr, v.Target)
+	kv, err := seal.ViewKey(ik, v.Target)
 	if err != nil {
 		return "", err
 	}
 	return k.seal(kv, v.ItemPL(k.NS, name), values)
+}
+
+// itemKey is the key below K_e an entry derived from revision id of
+// ns/name is sealed under: K_rev at E2, K_r at E3 (SealItem).
+func itemKey(ke []byte, ns, name, id string, e3 bool) ([]byte, error) {
+	kr, err := seal.ResourceKey(ke, ns, name)
+	if err != nil || e3 {
+		return kr, err
+	}
+	return seal.RevKey(kr, id)
 }
 
 // wholeViewKey is the key a whole response of ns is sealed under:
@@ -187,25 +206,37 @@ func OpenView(jwe string, keyOf func(kid string) []byte, v View) ([]byte, error)
 }
 
 // OpenItem decrypts one sealed entry derived from ns/name: keyOf returns
-// K_r of that resource for the kid the JWE names (ItemKey derives it from
-// epoch keys), from which the view key is derived.
+// the entry's K_rev at E2 or its resource's K_r at E3 for the kid the JWE
+// names (ItemKey and ItemKeyE3 derive them from epoch keys; a partial
+// reader's K_rev comes with its filtered answers), from which the view key
+// is derived.
 func OpenItem(jwe string, keyOf func(kid string) []byte, v View, ns, name string) ([]byte, error) {
-	return open(jwe, keyOf, ns, v.ItemPL(ns, name), func(kr []byte) ([]byte, error) { return seal.ViewKey(kr, v.Target) })
+	return open(jwe, keyOf, ns, v.ItemPL(ns, name), func(k []byte) ([]byte, error) { return seal.ViewKey(k, v.Target) })
 }
 
-// ItemKey returns a keyOf for OpenItem that derives K_r of ns/name from
-// the epoch keys epochKeyOf returns.
-func ItemKey(epochKeyOf func(kid string) []byte, ns, name string) func(string) []byte {
+// ItemKey returns a keyOf for OpenItem at E2 that derives K_rev of
+// revision id of ns/name from the epoch keys epochKeyOf returns.
+func ItemKey(epochKeyOf func(kid string) []byte, ns, name, id string) func(string) []byte {
+	return itemKeyOf(epochKeyOf, ns, name, id, false)
+}
+
+// ItemKeyE3 returns a keyOf for OpenItem at E3 that derives K_r of
+// ns/name from the epoch keys epochKeyOf returns.
+func ItemKeyE3(epochKeyOf func(kid string) []byte, ns, name string) func(string) []byte {
+	return itemKeyOf(epochKeyOf, ns, name, "", true)
+}
+
+func itemKeyOf(epochKeyOf func(kid string) []byte, ns, name, id string, e3 bool) func(string) []byte {
 	return func(kid string) []byte {
 		ke := epochKeyOf(kid)
 		if ke == nil {
 			return nil
 		}
-		kr, err := seal.ResourceKey(ke, ns, name)
+		k, err := itemKey(ke, ns, name, id, e3)
 		if err != nil {
 			return nil
 		}
-		return kr
+		return k
 	}
 }
 

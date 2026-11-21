@@ -987,6 +987,7 @@ func (t *tx) purgeApply(p *purgePlan, author int64, forced bool) ids.ID {
 		for _, a := range batch {
 			appended[a.n.id] = true
 			t.tags = append(t.tags, "r:"+a.n.name+"/"+p.name, "heads:"+a.n.name)
+			t.tagFilteredRanges(a.n)
 		}
 		t.flushDocs = true
 	}
@@ -1015,6 +1016,7 @@ func (t *tx) purgeApply(p *purgePlan, author int64, forced bool) ids.ID {
 			// digest (NamespaceHeads): every branch the purge reaches purges
 			// its own.
 			t.tags = append(t.tags, "r:"+n.name+"/"+p.name, "heads:"+n.name)
+			t.tagFilteredRanges(n)
 			t.flushDocs = true
 		}
 		if n.id == p.root.id {
@@ -1209,21 +1211,18 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		if ifMatch != head.String() {
 			return apiErr(412, "stale", "head", head.String())
 		}
-		// The dependents (§8.5 item 4, v0.86): the first logPageSize by
-		// name, in byte order, with "more": true if there are others.
-		// Only that page is read, and one row more.
-		limit := t.e.opt.Maximums.LogPageSize
-		var deps []string
-		for _, b := range t.branchesAfter(n, "", true, limit+1) {
-			deps = append(deps, b.name)
-		}
-		if len(deps) > limit {
-			e := apiErr(409, "in_use", "dependents", anyStrings(deps[:limit]))
-			e.Body["more"] = true
-			return e
-		}
-		if len(deps) > 0 {
-			return apiErr(409, "in_use", "dependents", anyStrings(deps))
+		// The dependents (§8.5 item 4): listed as referencing is, those
+		// the caller may read, a page by name (§6.1, v0.88).
+		deps := t.branchDependents(n)
+		if first, ok := deps(); ok {
+			return t.dependentsRefusal(func() (*nsRow, bool) {
+				if first != nil {
+					b := first
+					first = nil
+					return b, true
+				}
+				return deps()
+			}, "")
 		}
 		gone := func(ns *nsRow, _ string) bool { return ns.id == n.id }
 		forced := false

@@ -39,14 +39,33 @@ func (e *Engine) ResourceRaw(ctx context.Context, ns, name, id string, cred Cred
 		if err != nil {
 			return err
 		}
-		if t.readsByDoc(n, a) && (n.purged || t.nsLevel(n) >= levelSealed) {
+		byDoc := t.readsByDoc(n, a)
+		if byDoc && (n.purged && !t.purgedReadable(a, n, name) || t.nsLevel(n) >= levelE2E) {
 			return notFound() // judged with a null document (§6.4.1)
 		}
 		if n.purged {
 			return t.purgedRead(n)
 		}
 		out.Public = t.cachePublic(n)
-		if t.nsLevel(n) >= levelSealed && t.resolve(n, name, nil).state != Purged {
+		if t.nsLevel(n) >= levelSealed {
+			v := t.resolve(n, name, nil)
+			if v.state == Purged {
+				return nil
+			}
+			if byDoc {
+				// At E2 the origin judges the revision's document it
+				// holds (§6.4.1, v0.89): one hidden is answered as a
+				// revision that doesn't exist.
+				row := v.head
+				if id != "" && v.head != nil {
+					if rid, err := ids.Parse(id); err == nil {
+						row = t.findInAncestry(v.head, rid)
+					}
+				}
+				if !t.mayReadRow(a, n, name, row) {
+					return notFound()
+				}
+			}
 			return rawNotOffered(out.Public)
 		}
 		// A purged resource, of any level, answers as its document URL

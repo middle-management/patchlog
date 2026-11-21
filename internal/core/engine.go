@@ -404,6 +404,11 @@ func Open(opt Options) (*Engine, error) {
 	if opt.LongPollInterval == 0 {
 		opt.LongPollInterval = 20 * time.Second
 	}
+	// Intervals are a positive whole number of milliseconds (§7.7, v0.88):
+	// the phase is taken modulo the interval in milliseconds.
+	if opt.LongPollInterval < time.Millisecond || opt.LongPollInterval%time.Millisecond != 0 {
+		return nil, fmt.Errorf("core: the long-poll interval %v is not a positive whole number of milliseconds (§7.7)", opt.LongPollInterval)
+	}
 	if opt.Now == nil {
 		opt.Now = time.Now
 	}
@@ -589,7 +594,7 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.86"
+const SpecVersion = "0.89"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a
@@ -723,6 +728,10 @@ type tx struct {
 	// while it is set (readScope), nil outside one: every read check then
 	// gets a fresh budget.
 	readMeter *writeMeter
+	// stepOneAttrs is set while a resource write or batch is checked
+	// (checkItems): an attrs check that runs out then is its step-1
+	// run-out (chargeAttrs); anywhere else it refuses the grant.
+	stepOneAttrs bool
 	// judged are the per-revision read answers this transaction gave that
 	// read_judged doesn't hold yet (judge, flushJudged).
 	judged []judgedRow
@@ -819,6 +828,8 @@ func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
 	var judged []judgedRow
 	err = e.read1(ctx, func(t *tx) error {
 		defer func() { judged = t.judged }()
+		// The read checks of a request share one budget (§6.6).
+		defer t.requestScope(ctx)()
 		return f(t)
 	})
 	// Per-revision answers it gave are kept once it has ended (judge).

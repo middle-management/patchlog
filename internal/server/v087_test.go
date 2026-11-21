@@ -245,11 +245,13 @@ func TestV087RouteTable(t *testing.T) {
 		"/ns/{ns}/view/{view}/r/{name}/rev/{id}":     filtered,
 		"/ns/{ns}/view/{view}/r/{name}/rev/{id}/raw": {codes: []int{404}},
 		"/ns/{ns}/view/{view}/r/{name}/blob/{bid}":   filtered,
-		"/ns/{ns}/gestures/{gesture}":                filtered,
-		"/ns/{ns}/principal":                         filtered,
-		"/ns/{ns}/grants/{gid}":                      refused,
-		"/ns/{ns}/branches":                          refused,
-		core.DefaultJWKSPath:                         filtered,
+		// Not offered outside sealed namespaces (§7.8), under a view too.
+		"/ns/{ns}/view/{view}/r/{name}/blob/{bid}/e/{e}": {codes: []int{404}},
+		"/ns/{ns}/gestures/{gesture}":                    filtered,
+		"/ns/{ns}/principal":                             filtered,
+		"/ns/{ns}/grants/{gid}":                          refused,
+		"/ns/{ns}/branches":                              refused,
+		core.DefaultJWKSPath:                             filtered,
 	}
 	for _, route := range v87Routes(t) {
 		wt, ok := table[route]

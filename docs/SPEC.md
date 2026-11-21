@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.87 · 2026-11-19. See Changes at the end, and CHANGELOG.md for the full history.
+Status: draft v0.89 · 2026-11-20. See Changes at the end, and CHANGELOG.md for the full history.
 
 **Scope.** This document is the protocol: what a server stores, checks and answers. The core (§1–§10, §12, §13) specifies, implementation-neutrally, identity, validation, rules, the HTTP API with its filtered reads, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. Its addenda cover:
 
@@ -104,7 +104,7 @@ Large values are **blobs**: immutable bytes attached to a resource, served from 
 
 - **A service or tool** conforms to the sections of the companions, or of Addendum G, that it claims.
 
-- **Byte-exact definitions,** such as ids (§3), blob ids (§3.7), bundle digests (§G.4.1), plan digests (§F.9), padding buckets (§E.2.2) and long-poll phases (§7.7), MUST agree between implementations. A conforming implementation reproduces the test vectors of Addendum I for each part it implements; some are still to come (§I.26).
+- **Byte-exact definitions,** such as ids (§3), blob ids (§3.7), bundle digests (§G.4.1), plan digests (§F.9), padding buckets (§E.2.2) and long-poll phases (§7.7), MUST agree between implementations. A conforming implementation reproduces the test vectors of Addendum I for each part it implements; some are still to come (§I.28).
 
 ---
 
@@ -522,7 +522,7 @@ A revision pruned in `N` counts as one `N` can't resolve.
 
   - a config write that would leave a reference without a copy, such as narrowing `drafts.for`.
 
-The answer lists, as `referencing`, the referencing namespaces in which the caller may read anything, judged as for reading other namespaces (§7.5): the first `logPageSize` in byte order of name, with `"more": true` where it may read others. At E3 the server can't see references (§E.3.2).
+The answer lists, as `referencing`, the referencing namespaces in which the caller may read anything, judged as for reading other namespaces (§7.5): the first `logPageSize` in byte order of name, with `"more": true` where it may read others. `dependents` (§7.4, §8.5) list the dependents alike. At E3 the server can't see references (§E.3.2).
 
 -
 **Forcing.** A refused purge can be forced by `?force=1` on the purge request, under a grant chained to:
@@ -585,7 +585,7 @@ for a `PATCH` with `If-Match` (in a batch, an item whose first step is a patch s
 
     - in a branch, the state is the branch's view (§7.6): a resource read through settles by the base's head as of `at`, and a tombstone there makes the first write a restore, with that tombstone as its foreign parent
 
-A settled verb that isn't a candidate (§C.2 item 2) is `403` here, before the `If-Match` comparison, and counts as failing authorisation in §7.5's failure report and dry run. So does a write to a resource with a head, a `DELETE` or create included, by a grant that may `read` but whose read rules don't allow reading that head (§C.2 item 5), so steps 3–5 never judge a document it can't read.
+A settled verb that isn't a candidate (§C.2 item 2) is `403` here, before the `If-Match` comparison, and counts as failing authorisation in §7.5's failure report and dry run. So does a write to a resource with a head as the writer sees it, a `DELETE`, create, purge or prune included, by a grant that may `read` but whose read rules don't allow reading that head (§C.2 item 5). No later step then judges or names a head it can't read. A grant may `read` here as a partial reader may (§7.9, first two conditions): §C.2 item 2 allows it, no block or key-scope rule refers to `/now` and, if it carries roles, an effective role that lists `read` has no such rule.
 
   -
 author signatures (§C.3.1): `422` (`signature`).
@@ -724,7 +724,7 @@ A member the grant gives no value for is empty: `attrs` is `{}`, and `groups`, `
 
   - `doc` is the document of the revision the read concerns: the head for `GET /r/{ns}/{name}` and the resource's other URLs that name no revision; for a blob, each stored document that references it (§7.8), the read passing where one does, or the head where none does; that revision for `/rev/{id}`; each entry's revision for a log, a stream or the gestures listing; each row's head for `/heads`. For a tombstone, it is the document the tombstone deleted.
 
-  - It is `null` for purge entries, where the read concerns no revision or one whose document is no longer stored (purged, or pruned and not kept, §8.6), and in a sealed or end-to-end namespace, whose content the server doesn't judge. Wherever it is `null`, a rule that refers to `/doc` fails as a whole, as one on `/now` does.
+  - It is `null` for purge entries, where the read concerns no revision or one whose document is no longer stored (purged, or pruned and not kept, §8.6), and in an end-to-end namespace, whose content the server never sees. Wherever it is `null`, a rule that refers to `/doc` fails as a whole, as one on `/now` does, except in the read check for a purged resource's `410` (§8.3, §8.5), which sets such rules aside, `all`s flattened.
 
 -
 The envelope holds no previous state: rules judge the resulting document and the change itself, or for a delete the document it removes.
@@ -924,20 +924,24 @@ At E3 every create and restore gets that bound, and appends stay within `patchSe
 This keeps every string, sealed or not, replaceable by one ordinary append with a `test` of its old value (§11). In a namespace that configuration makes E3, the left side adds `36 B × blobsPerDocument`, for the declared blob list (§E.3.1). Larger values belong in blobs (§7.8).
 
 -
-**Validation work.** Each document a write produces, each step of a batch item counting alone, gets at most `validationSteps` steps for its validation (§6.2 step 5) and its envelope's rule `schema` tests (§6.4.2), those of step 1 and every candidate verb's included (§C.2 item 2). A write that produces none, such as a delete or a blob upload (§7.8), gets one such budget.
+**Validation work.** Each document a write produces, each step of a batch item counting alone, gets at most `validationSteps` steps for its validation (§6.2 step 5) and its envelope's rule `schema` tests (§6.4.2), those of step 1, a key scope's `attrs` schema (§C.4) and every candidate verb's included (§C.2 item 2). A write that produces none, such as a delete or a blob upload (§7.8), gets one such budget.
 
   - A step is one schema or subschema applied to one value, a `$ref` or `$dynamicRef` target counting as one. Only the unit is defined: validators that try subschemas differently count differently, so counts agree across implementations only approximately.
 
-  - Running out of a write's budget is `422` (`limit`), even inside a rule whose own failure is `403`. At step 1 it answers only if no check there fails outright, after the rate limits, drawing only buckets keyed by its principal. In a batch it counts as failing authorisation (§7.5).
+  - Running out of a write's budget is `422` (`limit`), even inside a rule whose own failure is `403`. At step 1 it answers only if no check there fails outright, after the rate limits. It then checks and draws, a token each, only the buckets keyed by its principal that the write would draw on (none for an exempt write): its principal's or allowance's and its per-resource ones, never the namespace's or `blobRate`.
 
-  - Each read, exchange and key request a grant is presented for, each read check a write makes (§6.1, §7.5, §7.6), and each revision judged for a filtered read (§7.9) or item a service filters by a grant (SERVICES §A.4) gets its own budget. Running out there fails that whole check, with its usual refusal, or leaves the item out.
+  - Candidate verbs (§C.2 item 2) and roles (§C.2 item 4) share the budget: a run-out in judging any of them is the whole check's, even where another would pass. An upload stops at the first candidate that passes. An outright failure in another check, or in another step of a batch item, still answers first.
+
+  - In a batch a run-out at step 1 counts as failing authorisation (§7.5), reported as `422` (`limit`). A batch whose step-1 failures are all run-outs draws its items' cost (Cost), less the namespace's tokens; one with an item that fails step 1 outright draws nothing for its items.
+
+  - Each read request, exchange and key request a grant is presented for gets one budget, shared by every check it makes, in every namespace and for every name it covers. So does each read check a write makes (§6.1, §7.5, §7.6), one `referencing` or `dependents` list's judgments counting as one, each check an event stream repeats (§7.3), and each revision judged for a filtered read (§7.9) or item a service filters by a grant (SERVICES §A.4). Running out there fails that whole request or check, with its usual refusal, or leaves the item out. A paged read that runs out after its first entry ends its page there instead (§7.1), and a list (§6.1) ends there, without `more`.
 
   - No deployment leaves `validationSteps` unbounded.
 
 -
 **Rate limits** are token buckets, refilled at the rate and holding at most the burst, checked at the end of step 1 of §6.2.
 
-  - **Buckets are keyed by the root `sub` and the key that signed the root block** (`kid`, §C.1), never by `via`, which any holder can set in a narrowing block. Bucket scopes are in §12.2.
+  - **Buckets are keyed by the root `sub` and the key that signed the root block** (`kid`, §C.1), never by `via`, which any holder can set in a narrowing block. Every bucket but `exchangeRate`'s is also the namespace's own, so a key listed in two namespaces has buckets in each. Bucket scopes are in §12.2.
 
   - **Exceeding one** is `429` with `Retry-After`, `code: "rate"`, `limit` naming a bucket that was hit (a §6.6 key, `allowance` or `allowance.blobRate`), and `retryAfter`, the wait in seconds, as a decimal number, until every bucket it draws on holds a token. `Retry-After` is whole seconds, rounded up.
 
@@ -945,11 +949,11 @@ This keeps every string, sealed or not, replaceable by one ordinary append with 
 
   - **Cost.** A request is admitted while every bucket it draws on holds at least one token. Its cost is then deducted, even below zero, in one atomic step with the check across every instance sharing the store. A write never commits without its deduction, and a request refused after admission keeps it, whether in step 2 of §6.2 (`412`, `410`, `428`, `409 frozen`, a settled verb's `403`) or later, as does an idempotent retry (§7.2).
 
-    - A batch costs one token per resource it touches from each per-resource bucket, and one token per item from the principal and namespace buckets. Its `config` change, if any, costs what a config write does, though one that fails after step 1, whose error then answers the batch (§7.5), is exempt only under a `*` key.
+    - A batch costs one token per resource it touches from each per-resource bucket, and one token per item from the principal and namespace buckets. Its `config` change, if any, costs what a config write does, drawn once the change passes its own step 1, even where an item then fails step 1. One that fails after step 1, whose error then answers the batch (§7.5), is exempt only under a `*` key.
 
     - A blob upload (§7.8) costs one token from the per-resource, principal and namespace buckets, and its size from the principal's `blobRate` bucket.
 
-    - Any other write that isn't exempt costs one token from the principal and namespace buckets of the namespace whose chain records it, the base's for a branch's creation. Of these, a resource write or a prune costs one from its per-resource bucket too. A `PATCH /ns/{ns}` creation's `412` under any but an operator grant costs one from that grant's principal bucket in `{ns}`.
+    - Any other write that isn't exempt costs one token from the principal and namespace buckets of the namespace whose chain records it, the base's for a branch's creation. Of these, a resource write or a prune costs one from its per-resource bucket too. A `PATCH /ns/{ns}` creation's `412` under any but an operator grant, one chained to a `*` key included, costs one from that grant's principal bucket in `{ns}`.
 
   - **Exempt:** config writes under a `*` key, config writes whose `writes` are non-empty and all at `/frozen`, `/successor` or `/merged` and whose resulting document has `frozen: true`, purges, a namespace's creation under an operator grant, its `412` included (§7.4), and entries the server writes itself (§7.4).
 
@@ -1022,7 +1026,7 @@ The `regex` format asserts the same syntax. A pattern RE2 doesn't accept makes a
 
   - In `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Log-Next` and `Last-Event-ID`, an id is unquoted.
 
-- **`GET /`** answers `{ "origin": "https://cms.example", "spec": "0.87", "auth": "grants" }`: the deployment's canonical origin (§C.3), the spec version it implements, as dotted decimal numbers compared component by component, and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4). A client, peer or tool MUST NOT refuse a deployment on the version alone; endpoints show what is offered (`404 not_offered` for an optional one, a plain `404` from an older server).
+- **`GET /`** answers `{ "origin": "https://cms.example", "spec": "0.89", "auth": "grants" }`: the deployment's canonical origin (§C.3), the spec version it implements, as dotted decimal numbers compared component by component, and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4). A client, peer or tool MUST NOT refuse a deployment on the version alone; endpoints show what is offered (`404 not_offered` for an optional one, a plain `404` from an older server).
 
 - **Answers,** a service's too, may carry members this spec doesn't define, which clients ignore.
 
@@ -1083,19 +1087,35 @@ Writes, `GET /ns/{ns}/principal`, `POST /ns/{ns}/keys`, and every request to a n
 
 - It honours `If-None-Match` with `304`. It honours `If-Modified-Since` with `304` when `If-None-Match` is absent and `Last-Modified` is sent. Elsewhere `If-Modified-Since` is ignored (RFC 9110, section 13.1.3).
 
-- **End-to-end namespaces.** The server never folds a resource other than `keyring` (§E.3.2). A client learns each namespace's level, a base's included, from its configuration, the current namespace document (not one read by id), or else `/keys`' `level` (§E.2.3), and keeps the highest it has learnt, since levels never go down (Addendum E). It refuses a claim below the level it holds, or one it doesn't know while it holds any, and learns nothing from either, nor from a level it doesn't know; before it has learnt a level, only its configuration protects it, a configured level it doesn't know counting as `e2e`. It holds for a branch at least the level it holds for any base in the branch's `base` chain (Levels). A reader of a sealed branch needn't read its bases' namespace documents: the branch seals all it serves under its own keys (§E.2.5). A reader that expects end-to-end refuses any other resource's `200` that isn't `application/jose`. For any other resource:
+- **End-to-end namespaces.** The server never folds a resource other than `keyring` (§E.3.2).
 
-  - `200` is served only where a prune stored a sealed snapshot (§8.6): at the horizon, or, where the horizon is a tombstone, at the tombstone's parent, its last live revision (§E.3.1), which the tombstone's `410` names as `last`. In a branch this includes a base's stored snapshot, whatever the branch has written since (§7.6).
+  - A client learns each namespace's level, a base's included, from its configuration, the current namespace document, or else `/keys`' `level` (§E.2.3), and keeps the highest it has learnt, since levels never go down (Addendum E).
 
-  - A stored snapshot is served until a purge or a later prune that moves the horizon, whatever is restored from an archive (§8.6).
+  - It refuses a claim below the level it holds, or one it doesn't know while it holds any, and learns no level from either, nor from a level it doesn't know. A document read by id is no claim: it teaches no level and isn't refused for its level.
 
-  - The body is the snapshot's JWE, as `application/jose`.
+  - Before it has learnt a level, only its configuration protects it, a configured level it doesn't know counting as `e2e` unless the client refuses that configuration when it starts.
 
-  - Any other `id` that would be `200` is `404` with `code: "not_offered"`, after the read check, cached as short.
+  - It holds for a branch at least the level it holds for any base in the branch's `base` chain (Levels). A reader of a sealed branch needn't read its bases' namespace documents: the branch seals all it serves under its own keys (§E.2.5).
 
-    - The body carries the resource's `horizon`, as the namespace sees it, where it has one, and `last`, the tombstone's parent, where that horizon is a tombstone.
+  - While it holds `sealed` or `e2e` for any namespace, it reads a namespace's current document, and those of the bases it names, before it accepts that namespace's first plaintext `200`. It takes `base`, which never changes (invariant 7), from any document of the namespace, one it refuses or reads by id included. A document its grant may not read (`403`, `404`) teaches nothing, one served sealed (§E.2.2) teaches `sealed`, and any other failure fails the read.
 
-    - Readers fold the log up to `id` (below) from the revision that `last`, or else `horizon`, names, or from genesis where neither is given.
+  - This floor holds against honest or misconfigured servers and caches, not hostile ones, which can hide a `base`: against those, only a level configured for the branch itself holds.
+
+  - A reader that holds `sealed` or `e2e` for the namespace refuses a `200` here that isn't `application/jose`, except, at `e2e`, one for `keyring`.
+
+  - In an `e2e` namespace, for any other resource:
+
+    - `200` is served only where a prune stored a sealed snapshot (§8.6): at the horizon, or, where the horizon is a tombstone, at the tombstone's parent, its last live revision (§E.3.1), which the tombstone's `410` names as `last`. In a branch this includes a base's stored snapshot, whatever the branch has written since (§7.6).
+
+    - A stored snapshot is served until a purge or a later prune that moves the horizon, whatever is restored from an archive (§8.6).
+
+    - The body is the snapshot's JWE, as `application/jose`.
+
+    - Any other `id` that would be `200` is `404` with `code: "not_offered"`, after the read check, cached as short.
+
+      - The body carries the resource's `horizon`, as the namespace sees it, where it has one, and `last`, the tombstone's parent, where that horizon is a tombstone.
+
+      - Readers fold the log up to `id` (below) from the revision that `last`, or else `horizon`, names, or from genesis where neither is given.
 
 **`GET /r/{ns}/{name}/rev/{id}/log?since={a}`.**
 
@@ -1448,7 +1468,7 @@ Resource purge is never part of a batch.
 -
 **Failure.** Nothing is written.
 
-  - The status is that of the earliest failing step of §6.2. Where items fail it with different statuses, it is that of the first of them in request order.
+  - The status is that of the earliest failing step of §6.2. Where items fail it with different statuses, it is that of the first of them in request order, an item that ran out of `validationSteps` at step 1 counting after every item that failed step 1 outright (§6.6).
 
   - The body is `{ "code": "batch", "items": [{ "index", "status", "code", … }] }` for the items that failed at that step. If any item fails authorisation (§6.2 steps 1 and 2.2), only those items are reported.
 
@@ -1593,7 +1613,7 @@ GET /r/{ns}/{name}/log?since={id}&live=long-poll&cursor={c}
 
 - **Intervals and cursors.**
 
-  - The server divides time into fixed intervals (default 20 seconds), counted for each log from a fixed epoch plus the log's **phase**: the first 8 bytes of the SHA-256 of its long-poll URL's path (`/ns/{ns}/log`, `/r/{ns}/{name}/log` or `/ns/{ns}/view/{view}/log`, no query), an unsigned big-endian integer, modulo the interval in milliseconds. Interval `n` starts at epoch + phase + `n` × interval. The cursor is the interval number, in decimal. Origin instances SHOULD keep their clocks synchronised to well within an interval.
+  - The server divides time into fixed intervals, each a positive whole number of milliseconds (default 20 seconds), counted for each log from a fixed epoch plus the log's **phase**: the first 8 bytes of the SHA-256 of its long-poll path as built from its names and `view` (`/ns/{ns}/log`, `/r/{ns}/{name}/log` or `/ns/{ns}/view/{view}/log`, no query), as an unsigned big-endian integer, modulo the interval in milliseconds. Interval `n` starts at epoch + phase + `n` × interval. The cursor is the interval number, in decimal. Origin instances SHOULD keep their clocks synchronised to well within an interval.
 
   - On `200`, the response cursor is the current interval number.
 
@@ -1606,6 +1626,8 @@ GET /r/{ns}/{name}/log?since={id}&live=long-poll&cursor={c}
   - A request without a cursor, or with one behind the server's by less, is answered at once: with the entries after `since` if there are any, otherwise `204` with the current cursor in `X-Cursor`.
 
   - One ahead by an hour's worth or less waits as a current one does.
+
+  - A cursor carried by a redirect to another log (§7.9 URLs) is judged by that log's intervals.
 
 - **Caching.**
 
@@ -1762,7 +1784,7 @@ Caching is immutable, with the resource's tags (§9). In sealed namespaces the U
 Optional. A server that implements it gives **partial readers** a namespace's own reads, filtered. One that doesn't answers them as §C.5 says.
 
 -
-**Where.** While authentication is on (§1), in a namespace that is neither a branch (§7.6), public, sealed nor end-to-end. Elsewhere these URLs answer `403`, or `401` without a grant or cookie that verifies, in §7's order.
+**Where.** While authentication is on (§1), in a namespace that is neither a branch (§7.6), public nor end-to-end, sealed ones included (below). Elsewhere these URLs answer `403`, or `401` without a grant or cookie that verifies, in §7's order.
 
 -
 **Partial reader:** a caller for whom all hold:
@@ -1773,7 +1795,7 @@ Optional. A server that implements it gives **partial readers** a namespace's ow
 
   - it lacks unrestricted `read` (§2.1): its read rules refer to `/resource` without fixing it, or to `/doc`, as `{ "op": "test", "path": "/doc/team", "value": "a" }` does.
 
-Unrestricted readers keep the unfiltered URLs; at filtered ones their grant in `Authorization` is `403`, and a `/ns/{ns}` cookie (§2.1) counts as that view's cookie.
+Unrestricted readers keep the unfiltered URLs; at filtered ones their grant in `Authorization` is `403`, and a `/ns/{ns}` cookie (§2.1) reads every revision, its answers `private, no-store`, `no-store` at the edge too (§9), and never shared with that view's readers.
 
 -
 **Visible.** A revision is visible when the reader's blocks, key scope and roles, counted as §C.2 item 5 counts them, allow `read` with that revision's `read` envelope (§6.4.1).
@@ -1792,7 +1814,7 @@ Unrestricted readers keep the unfiltered URLs; at filtered ones their grant in `
 
   - A `batch` shows only its shown `entries`, and its `gestures` and `source.ids` only for items shown as `head` or `tombstone`, each left out if empty. One with nothing shown is dropped, or kept as `config`-only if it has a config entry.
 
-  - A resource's own log, long-poll and event stream show its visible revisions, without `patches` where the parent is hidden, and as `{ "id", "parent", "kind": "hidden" }` (event type `hidden`) each hidden one whose parent is visible; its `purge` and `prune` events as the namespace log shows them.
+  - A resource's own log, long-poll and event stream show its visible revisions, without `patches` where the parent, or the document a tombstone parent deleted, is hidden, and as `{ "id", "parent", "kind": "hidden" }` (event type `hidden`) each hidden one whose parent is visible; its `purge` and `prune` events as the namespace log shows them.
 
   - A filtered log isn't chain-verifiable (§10): batch ids don't hash what is served, and `prev` and `parent` name unseen entries. After a `hidden` entry, or on first seeing a resource mid-history, a reader fetches the next visible revision's document (§7.1) instead of folding.
 
@@ -1809,16 +1831,16 @@ Unrestricted readers keep the unfiltered URLs; at filtered ones their grant in `
 **Events** carry only shown entries, with each read check §7.3 repeats, the cookie check below included.
 
 -
-**Cost (SHOULD).** A server judges each revision's visibility at most once per view and keeps the answer, even once pruning drops the document (§8.6). Waiting followers of a view share it.
+**Cost (SHOULD).** A server judges each revision's visibility at most once per view and keeps the answer, even once pruning drops the document (§8.6). An answer judged without a stored document needn't be kept: the revision is hidden until an archive restores its document (§8.6). Waiting followers of a view share it.
 
 -
 **URLs.** Ranges are at `/ns/{ns}/view/{view}/at/{ns_id}/heads` and `…/log`, `ns_id` an entry of `{ns}`. Long-poll and events are at `/ns/{ns}/view/{view}/log` and `/ns/{ns}/view/{view}/events`.
 
-  - **Content.** A resource's immutable URLs are served under the prefix too: `/ns/{ns}/view/{view}/r/{name}/rev/{id}`, its `/raw` and `/r/{name}/blob/{bid}`, answered as their own forms (§7.1, §7.8) for a visible revision, or a blob a visible revision references, and as a read-rule failure otherwise. They are immutable and tagged as their own forms (§9), so a view's readers share them at the CDN.
+  - **Content.** A resource's immutable URLs are served under the prefix too: `/ns/{ns}/view/{view}/r/{name}/rev/{id}`, its `/raw`, `/r/{name}/blob/{bid}` and its `/e/{e}`, answered as their own forms (§7.1, §7.8), sealed ones as the same bytes, for a visible revision, or a blob a visible revision references (sealed: one of epoch `e`, the `302` naming the latest such `e`), and as a read-rule failure otherwise. They are immutable and tagged as their own forms (§9), so a view's readers share them at the CDN.
 
   - A `view` or `ns_id` not in text form (§3.2) is `400` (`bad_input`), a request-shape error (§6.2).
 
-  - Ranges are immutable but for purges since (§8.3), and tagged as their unfiltered forms (§9).
+  - Ranges are immutable but for purges and archive restores since (§8.3, Cost), and tagged as their unfiltered forms (§9).
 
   - A URL under the prefix without `at` (a `…/log` without `live`, §7.7), and a partial reader's request at an unfiltered URL, answer `302`, `private, no-store`, to the filtered form, a range at the current `at`, a long-poll or stream with its query.
 
@@ -1839,7 +1861,10 @@ Every cookie of a view is `403`, at every URL, once an entry after its exchange 
 **Edge grants.** The origin's exchange (§C.5.2) gives a partial reader the prefix `/ns/{ns}/view/{view}`, with a cookie that never outlasts its grant. For it, §C.5.2's refusals concerning `/resource` and `/doc` rules and qualifying roles don't apply, and its check that rules pass now covers only block and key-scope rules that refer to neither, which Visible judges per revision. A partial reader reads heads at their own URLs with its grant in `Authorization` (§9), and revisions and blobs under its prefix.
 
 -
-**Purged namespaces** answer these URLs as §8.5 answers their unfiltered forms, once the URL's read check passes, its `view` included; a partial reader's unfiltered `/heads` is then `410`, without the `302`.
+**Sealed namespaces (E2).** A partial reader's only key is its view's `K_view` (§E.2.3). Its filtered answers are sealed under that key, and carry the keys of the visible revisions they name and of those revisions' blobs (§E.2.2). It opens those revisions and blobs at their own URLs or under its prefix, comparing their `pl` with the URL without the prefix. Holding `sealed` for the namespace (§7.1), it refuses a filtered `200` that isn't `application/jose`, and event data that isn't one JWE. To a reader with a `/ns/{ns}` cookie they are sealed under `K_n` instead and carry no `keys`: it derives them from `K_e` (§E.2.1).
+
+-
+**Purged namespaces** answer these URLs as §8.5 answers their unfiltered forms, once the URL's read check passes, its `view` included and rules on `/doc` set aside (§6.4.1); a partial reader's unfiltered `/heads` is then `410`, without the `302`.
 
 -
 **Accepted leaks** (§C.6): that hidden writes happen, and when (the namespace head, `X-Namespace-Revision`, long-poll wake-ups, a batch's `author`, `grant` and `created`); hidden ids (`prev`, `parent`, `X-Log-Next`, a `hidden` entry's, a `purge`'s `target`); when a document left a view (`hidden`); the names of purged resources a reader's `/resource` rules allow; who changed the configuration, and when.
@@ -1882,7 +1907,7 @@ Every cookie of a view is `403`, at every URL, once an entry after its exchange 
 
 - **Namespace entry.** A `purge` entry is appended to the namespace log. Consumers MUST drop the resource and purge their derived data and cache tags (§10).
 
-- **Responses.** All `/r/{ns}/{name}/…` URLs then return `410`, before a `not_offered` as in §8.5. They do so once the caller passes the read check for that URL, or, for a write, step 1 of §6.2. Until then a read answers as for a resource the caller can't read (§7 step 4).
+- **Responses.** All `/r/{ns}/{name}/…` URLs then return `410`, before a `not_offered` as in §8.5. They do so once the caller passes the read check for that URL, its rules on `/doc` set aside (§6.4.1 `read`), or, for a write, step 1 of §6.2. Until then a read answers as for a resource the caller can't read (§7 step 4).
 
 - **CDN.** The CDN is purged by tag (§9), `heads:{ns}` included (§7.4), never by id, in each branch a purge reaches too, or by the base's tags where §9 Branches allows.
 
@@ -1892,7 +1917,7 @@ Every cookie of a view is `403`, at every URL, once an entry after its exchange 
 
   - A branch created later, at an `at` before the purge, sees the name as purged where it would read an entry for it through (§7.6). It answers `410` for it, and its `/heads` lists it as `purge`, with its head as of `at` as `target`.
 
-  - In each branch it reaches, the resource is purged and a `purge` entry appended to that branch's log.
+  - In each branch it reaches, frozen or not, the resource is purged and a `purge` entry appended to that branch's log.
 
   - Purges never propagate upwards.
 
@@ -1938,7 +1963,7 @@ Every cookie of a view is `403`, at every URL, once an entry after its exchange 
 
   - the precondition (`412`, then `428`)
 
-  - no **dependents** (§2.1): otherwise `409` with `code: "in_use"` and `dependents`, the first `logPageSize` by name, with `"more": true` if there are others; cleanup proceeds leaves first
+  - no **dependents** (§2.1): otherwise `409` with `code: "in_use"` and `dependents` (§6.1); cleanup proceeds leaves first
 
   - it would remove no last copy of a schema revision (§6.1) referenced from another namespace (its own documents are purged with it): otherwise `409` with `code: "in_use"` and `referencing` (§6.1)
 
@@ -1964,7 +1989,7 @@ Every cookie of a view is `403`, at every URL, once an entry after its exchange 
 | Creating a namespace or a branch under its name (a creation, not a write to it, §7.6), and a branch creator's retry once the branch is purged | `412` |
 | Edge-grant issuance for a grant naming it (§C.5.2) | `410` as §C.5.2 says |
 
-The full read check of the first row is the grant's rules, unrestricted `read` where the URL needs it, any `read` for the gestures listing, §E.2.3's test for `/keys`, and for `/principal` verification alone.
+The full read check of the first row is the grant's rules, those on `/doc` set aside (§6.4.1 `read`), unrestricted `read` where the URL needs it, any `read` for the gestures listing, §E.2.3's test for `/keys`, and for `/principal` verification alone.
 
 **Sealed namespaces.** Where namespace documents and log ranges are sealed (§E.2.2), the purge destroys the epoch keys their `K_n` derive from (§E.2.4), and those reads, events and long-poll included, answer `410` too. `GET /ns/{ns}` still redirects, to a revision that is `410` where it is sealed.
 
@@ -2035,7 +2060,7 @@ Pruning bounds the storage of long histories **without changing any id**.
 -
 **Archive.** Before pruning, the server writes the pruned history as a full-history bundle (§G.4.1), with `"authors": true` and grant lines, to a destination configured by the operator or in `retention`, and MUST NOT write anywhere else. It holds that resource's pruned revisions alone, with the blobs they reference. It has no dependency closure (§G.4.2), an exception to §G.4.3's Modes close downward, and no `external`. Its `docs` names only that resource, and its `requires` the parent of its first revision unless its first revision is genesis. Outside a branch, only two prunes go without one: under a `*` key where no destination is configured (Request), and applying a retention rule that says `"archive": false` (Retention policy).
 
-  - In encrypted namespaces (Addendum E), archives are sealed bundles (§G.5.1.1), one per resource. Each one's only recipient is a key the server holds for that resource, which purge destroys (§E.1). Each line is padded (§E.2.2) where the namespace sets `pad`.
+  - In encrypted namespaces (Addendum E), archives are sealed bundles (§G.5.1.1), one per resource. Each one's only recipient is a key the server holds for that resource, which never leaves the deployment and which purge destroys (§E.1): only the server opens such an archive, to restore from it. Each line is padded (§E.2.2) where the namespace sets `pad`.
 
   - At E3 a key-holding client supplies `H`'s document (the last live one when `H` is a tombstone) as `snapshot`, sealed like a patch set (§E.3.1).
 
@@ -2069,10 +2094,10 @@ Pruning bounds the storage of long histories **without changing any id**.
 **Pruning is not purge.** Cached and consumers' copies stay; purge (§8.3) removes content, archives included.
 
 -
-**Verification.** A client verifying through logs (§G.2) starts from the archive (invariant 4), or from a revision at or after `H` that it has already verified.
+**Verification.** A client verifying through logs (§G.2) starts from the archive (invariant 4), in an encrypted namespace from what the server restores from it, or from a revision at or after `H` that it has already verified.
 
 -
-**Merges, branches and exports.** Classification by ancestry (§F.3) works across a horizon. Fast-forward and replay need the patch sets after the common ancestor, which protected revisions keep for branches; otherwise an item whose needed history was pruned is a conflict. A full-history export (§G.4.3) from before the horizon needs the archive.
+**Merges, branches and exports.** Classification by ancestry (§F.3) works across a horizon. Fast-forward and replay need the patch sets after the common ancestor, which protected revisions keep for branches; otherwise an item whose needed history was pruned is a conflict. A full-history export (§G.4.3) from before the horizon needs the archive, in an encrypted namespace restored first.
 
 ---
 
@@ -2107,7 +2132,7 @@ Pruning bounds the storage of long histories **without changing any id**.
 
   - **Base tags.** A branch's response for a resource it reads through MAY also carry `r:{base}/{name}` for each base in its `base` chain, down to the one it reads from, and its `/heads` pages `heads:{base}` for each base. A branch's reader may not know its base, so the origin, or a service, adds them only where every response reaches clients through caches that strip `Cache-Tag` and `Surrogate-Key`.
 
-  - Once no cache its purges reach holds a branch's response without them, those cached before it began adding them included, a deployment MAY satisfy a propagated purge by the base's tags alone, except `r:{branch}/{name}` of a branch with its own chain for the name.
+  - Once no cache its purges reach holds a branch's response without them, those cached before it began adding them included, a deployment MAY satisfy a propagated purge by the base's tags alone, `heads:{base}` standing for every `/heads` page of the branch, except `r:{branch}/{name}` of a branch with its own chain for the name.
 
 **Sealed namespaces** (Addendum E) are cached by their `read` mode, like any other.
 
@@ -2131,7 +2156,7 @@ Pruning bounds the storage of long histories **without changing any id**.
 The origin still authorises the read itself, from the forwarded cookie or grant (§C.5.3). The headers decide only the lifetimes, never when an event stream ends (§7.3).
 
   -
-**Everything else private is `CDN-Cache-Control: no-store`** (and `Surrogate-Control: no-store`), with or without an edge: reads with a grant in `Authorization`, schema revisions opened by a referrer (§6.1), and reads the edge only relayed.
+**Everything else private is `CDN-Cache-Control: no-store`** (and `Surrogate-Control: no-store`), with or without an edge: reads with a grant in `Authorization`, a `/ns/{ns}` cookie's reads at view URLs (§7.9), schema revisions opened by a referrer (§6.1), and reads the edge only relayed.
 
   -
 **Without one** (no CDN, or a CDN that doesn't verify grants), every private response is therefore `no-store`. The origin is configured with which deployment it is in.
@@ -2228,7 +2253,7 @@ In TOOLS.md.
 | `schema_unavailable` | 422 | A schema revision path that doesn't resolve for the writer: unknown, purged, pruned without a kept document, a tombstone, not a schema, in an end-to-end namespace, or unreadable (§6.1); `path` names it |
 | `rule` | 422 | A namespace rule failed; `rule` and `path` locate it (§6.4.3) |
 | `precondition_required` | 428 | No precondition, or not the one the request takes (§7.2, §7.5, §7.6); any at all on a prune or blob upload (§7.8, §8.6) |
-| `behind` | 503 | A service hasn't caught up with what a query or exchange needs (§A.4, §A.5), or with a `min` (§A.5). Or it can't yet fetch the keys a view needs (§E.2.6). Or an exchange has no `exp` left for its cookie (§A.4). Or the origin would seal past a key's message bound (§E.2.1). `Retry-After` is set |
+| `behind` | 503 | A service hasn't caught up with what a query or exchange needs (§A.4, §A.5), or with a `min` (§A.5). Or it can't yet fetch the keys a view needs (§E.2.6). Or an exchange has no `exp` left for its cookie (§C.5.2). Or the origin would seal past a key's message bound (§E.2.1). `Retry-After` is set |
 | `upstream` | 502 | A service couldn't read a namespace document a grant names (§A.4) |
 | `rate` | 429 | A rate limit of §6.6 was exceeded; `limit`, `retryAfter` and `Retry-After` as §6.6 gives them |
 | `pruned` | 410 | Pruning removed what the request needs (cases below the table) |
@@ -2289,7 +2314,7 @@ The limits of §6.6, with their keys in a namespace document's `limits` and thei
 | largest string in a document, member names included, as canonical JSON (Values, §6.6) | `valueSize` | 64 KiB |
 | longest JSON Pointer to any value in a document, as canonical JSON | `pathSize` | 2 KiB |
 | nesting depth: the arrays and objects on the longest path from the root to a value, the root included (`{"a":[1]}` has 2) | `nestingDepth` | 64 |
-| validation steps per document a write produces and per read check, in `$schema` and rule `schema`s: one schema or subschema applied to one value (§6.2, §6.6), deployment only | `validationSteps` | 5,000,000 |
+| validation steps per document a write produces and per read request or check (§6.6), in `$schema` and rule `schema`s: one schema or subschema applied to one value (§6.2, §6.6), deployment only | `validationSteps` | 5,000,000 |
 | rules in the namespace document: in `rules`, roles and key scopes | `rulesPerNamespace` | 256 |
 | rules per grant chain, in its blocks, deployment only | `rulesPerGrant` | 32 |
 | grant size, deployment only | `grantSize` | 8 KiB |
@@ -2298,7 +2323,7 @@ The limits of §6.6, with their keys in a namespace document's `limits` and thei
 | bytes of patch sets per log page, sealed ones as served (§7.1, §7.3, §7.7), at least one entry per page, deployment only | `logPageBytes` | 16 MiB |
 | log page size, in resource entries, a batch entry counting as its items, for log ranges (§7.1), `/heads`, `/branches` and `GET /ns` pages and gesture listings (§7.4), event-stream catch-up (§7.3) and long-poll answers (§7.7), deployment only | `logPageSize` | 1,000 entries |
 | branch depth (bases of bases), deployment only | `branchDepth` | 8 |
-| live branches per namespace: neither frozen nor purged (§F.6) | `branchesPerNamespace` | 100 |
+| direct branches per namespace that are live: neither frozen nor purged (§F.6) | `branchesPerNamespace` | 100 |
 | writes and blob uploads per resource, per principal | `ratePerResource` | 10/s, burst 20 |
 | writes and blob uploads per principal | `ratePerPrincipal` | 50/s, burst 100 |
 | writes and blob uploads per namespace | `ratePerNamespace` | 500/s, burst 1,000 |
@@ -2796,9 +2821,11 @@ An entry stored without `can` allows no verb. Changing keys and scopes needs a `
 
   - listing the deployment's namespaces (`GET /ns`, §7.4).
 
-Any other request under one, at the origin or a service (§C.6), is `401`, as for a key the namespace doesn't list, with two exceptions:
+Any other request under one, at the origin or another service (§C.6), is `401`, as for a key the namespace doesn't list, and at a file gateway `403` (§H.7), with three exceptions:
 
   - Requests that ignore any grant, such as public reads, `GET /` and `DELETE /edge-grants`, ignore it too (§7, §C.5.4).
+
+  - An index's `GET /_refs` and the URLs it redirects to answer as without it (§A.4).
 
   - `GET /ns/{ns}/principal` describes it (§7.4).
 
@@ -2878,7 +2905,9 @@ Otherwise a reader limited to some documents follows them through a filtering pr
 
   - Each cookie has no `Domain` attribute. It has `Path` set to the prefix, `Secure`, `HttpOnly`, and `SameSite=None` when the deployment names credentialed origins, `Lax` otherwise. It is named per prefix (§C.5.3).
 
-  - Cookies last until the earliest `exp` among the grant's blocks or 15 minutes, whichever is sooner, less any whole seconds a minter MAY take off so that cookies for one prefix that it must tell apart differ in `exp` (§A.4).
+  - Cookies last until the earliest `exp` among the grant's blocks or 15 minutes, whichever is sooner, less any whole seconds a minter MAY take off so that cookies for one prefix that it must tell apart differ in `exp` (§7.9 `view`).
+
+  - Where no `exp` is left, as every future whole second a cookie may get is past its grant or that of a `403` cookie for the same prefix, the answer is `503` (`behind`) with `Retry-After`, setting no cookie. The request has then drawn its `exchangeRate` tokens (Rate).
 
   - A prefix several grants give gets one cookie, lasting as long as the longest.
 
@@ -2911,7 +2940,7 @@ Otherwise a reader limited to some documents follows them through a filtering pr
   - and `410` only when every namespace refused is purged and the grant verifies in each. Only this `410` carries `ns` and `head`, naming the first refused one in the order the grants and their root blocks list them.
 
 -
-**Rate.** Once nothing is refused, the prefix cap's `400` included, the request draws one token from the `exchangeRate` bucket (§6.6) of each distinct principal among its grants, however many grants it carries. The buckets are keyed as write buckets are. The request draws from no write bucket.
+**Rate.** Once nothing is refused, the prefix cap's `400` included, the request draws one token from the `exchangeRate` bucket (§6.6) of each distinct principal among its grants, however many grants it carries. The buckets are keyed by root `sub` and the verifying key's thumbprint (`key`, §7.4), across namespaces, since a `kid` is unique only within one. The request draws from no write bucket.
 
 -
 **Browsers.** Credentialed responses to a page on another origin name that origin from the deployment's list, with `Access-Control-Allow-Credentials: true` and `Vary: Origin`, never `*` and never an echoed `Origin` (§7, browsers).
@@ -3093,7 +3122,7 @@ The levels are cumulative in intent; E3 clients seal in E2's JWE format (§E.3.1
 
   - A branch never serves what it reads through at a weaker level than its base serves it.
 
-  - An epoch key reaches only grants whose window covers that epoch.
+  - An epoch key, or a key derived from it, reaches only grants whose window covers that epoch (§E.2.3).
 
   - A sealed payload's `pl` and `kid` bind where and in which epoch it was sealed. Readers compare them in full with what they fetched, accepting a base's `ns` only in an E3 `sealed` op read through (§E.3.1).
 
@@ -3138,7 +3167,19 @@ The origin keeps plaintext, so validation, rules, `writes`, idempotent retry, co
 K_r = HKDF-SHA256(ikm = K_e, salt = "patchlog-e2", info = ns ‖ 0x0A ‖ name), 32 bytes
 ```
 
-`K_r` decrypts only that resource's revisions of epoch `e`, and yields neither `K_e` nor `K_n`.
+`K_r` opens only that resource's content of epoch `e`, and yields neither `K_e` nor `K_n`.
+
+-
+**Per-revision, per-blob and per-view keys.** At E2 the origin seals a resource's revisions and blobs under keys derived from its `K_r`, and filtered answers (§7.9) under a key per view (§E.2.2):
+
+```
+K_rev  = HKDF-SHA256(ikm = K_r, salt = "patchlog-e2-rev",  info = id), 32 bytes
+K_log  = HKDF-SHA256(ikm = K_r, salt = "patchlog-e2-log",  info = id), 32 bytes
+K_blob = HKDF-SHA256(ikm = K_r, salt = "patchlog-e2-blob", info = bid), 32 bytes
+K_view = HKDF-SHA256(ikm = K_e, salt = "patchlog-e2-view", info = ns ‖ 0x0A ‖ view), 32 bytes
+```
+
+`id` is a revision's or tombstone's id, `bid` a blob's id (§3.7) and `view` a view (§7.9), each in text form (§3.2). Each is one way: a `K_rev`, `K_log` or `K_blob` yields no sibling and no `K_r`, and a `K_view` yields no other key. A holder of `K_e` derives every `K_view`, and of `K_r` its `K_rev`s, `K_log`s and `K_blob`s. E3 has none of them: clients seal under `K_r` (§E.3.1).
 
 -
 **Namespace key.** What is sealed for the namespace rather than for a resource (§E.2.2) is sealed under
@@ -3168,7 +3209,7 @@ Its `info` is no `K_r`'s, as a resource name is never empty (§3.6). `K_e` itsel
 
 ### E.2.2 Sealed representation
 
-Sealed payloads are JWEs (RFC 7516) in compact serialization, each served alone as `Content-Type: application/jose`. A resource log range or resource long-poll answer is a canonical JSON array (§3.1) of its entries' JWEs, served as `application/json`, and an SSE event's `data` is one JWE.
+Sealed payloads are JWEs (RFC 7516) in compact serialization, each served alone as `Content-Type: application/jose`. An unfiltered resource log range or resource long-poll answer is a canonical JSON array (§3.1) of its entries' JWEs, served as `application/json`, and an SSE event's `data` is one JWE.
 
 -
 **Algorithms:** `alg: "dir"` and `enc: "A256GCM"`.
@@ -3176,28 +3217,30 @@ Sealed payloads are JWEs (RFC 7516) in compact serialization, each served alone 
 -
 **Protected header:** `{ "alg": "dir", "enc": "A256GCM", "kid": "{ns}#{e}", "pl": { … } }` as canonical JSON (§3.1), with `pl` as below. Ids in `pl` are in text form, and an empty one is `""`.
 
-  - The `pl` claims are integrity-protected as AAD, so a ciphertext can't be replayed under another resource, revision or epoch. Readers MUST compare `pl`, and the namespace that `kid` names, with what they fetched. At E3 they accept in both a base's `ns` for a `sealed` op a branch reads through, up to the resource's foreign parent (§2, §E.3.1). Where they can't place that parent, the op fails the check (§E.3.2). At E2 a branch seals all it serves under its own keys (§E.2.5).
+  - The `pl` claims are integrity-protected as AAD, so a ciphertext can't be replayed under another resource, revision or epoch. Readers MUST compare `pl`, and the namespace that `kid` names, with what they fetched. At E3 they accept in both a base's `ns` for a `sealed` op a branch reads through, up to the resource's foreign parent (§2, §E.3.1). In a chain of branches, each base's `ns` is accepted only up to the foreign parent of the nearest branch below it with entries of its own for the resource. Where they can't place such a parent, as where a document or `/heads` page that places it is unreadable to them, the ops it bounds fail the check and the read goes on (§E.3.2). At E2 a branch seals all it serves under its own keys (§E.2.5).
 
 -
 **What gets sealed,** each under the key, epoch and `pl` given here:
 
 | Payload | Key | Epoch | `pl` |
 |---|---|---|---|
-| `/rev/{id}` document | `K_r` | the revision's | `{ "ns", "name", "id", "kind": "doc" }` |
-| resource log entry (§7.1), in a range or as a `revision` or `tombstone` event | `K_r` | the revision's | `{ "ns", "name", "id", "kind" }`, `kind` the entry's (`rev` or `tombstone`) |
-| resource `purge` or `prune` event | `K_r` | current when sealed | `{ "ns", "name", "kind" }`, `kind` the event type |
+| `/rev/{id}` document | its `K_rev` (§E.2.1) | the revision's | `{ "ns", "name", "id", "kind": "doc" }` |
+| resource log entry (§7.1), in a range or as a `revision` or `tombstone` event | its revision's `K_log` | the revision's | `{ "ns", "name", "id", "kind" }`, `kind` the entry's (`rev` or `tombstone`) |
+| resource `purge` or `prune` event, unfiltered | `K_r` | current when sealed | `{ "ns", "name", "kind" }`, `kind` the event type |
 | namespace document at `ns_id` | `K_n` | in force at `ns_id` | `{ "ns", "id": ns_id, "kind": "doc" }` |
 | namespace log range or long-poll answer | `K_n` | current when sealed | `{ "ns", "range": [since, last] }`: the bounds of the page actually served (§7.1), `[since, id]` for an empty page |
 | namespace event (§7.3) | `K_n` | current when sealed | `{ "ns", "event": id }`, `id` its entry's |
 | grant (§C.3.1) | `K_n` | in force at the first namespace log entry recording it | `{ "ns", "grant": gid }` |
-| blob, in a binary form (Sealed blobs, below) | `K_r` | each epoch it is served under | as in Sealed blobs |
+| blob, in a binary form (Sealed blobs, below) | its `K_blob` | each epoch it is served under | as in Sealed blobs |
+| filtered answer (§7.9): a log range, long-poll answer, `/heads` page or event | its view's `K_view`, `K_n` for a `/ns/{ns}` cookie (§7.9) | current when sealed | its unfiltered form's, with `view` added: a resource's range or long-poll answer `{ "ns", "view", "name", "range": [since, last] }`, a `/heads` page `{ "ns", "view", "at", "after" }`, `after` `""` on the first page, a `hidden` event's `kind` `hidden` |
+| a view's keys for a revision (Filtered answers, below) | that view's `K_view` | the revision's | `{ "ns", "view", "name", "id", "kind": "keys" }` |
 
-Each plaintext above but a blob's is canonical JSON (§3.1), before any padding (below). A resource log entry's is the whole §7.1 entry. A namespace log range's or long-poll answer's is the JSON array of its §7.4 entries, `[]` for an empty page, and a namespace event's is its one entry.
+Each plaintext above but a blob's is canonical JSON (§3.1), before any padding (below). A resource log entry's is the whole §7.1 entry. A namespace log range's or long-poll answer's is the JSON array of its §7.4 entries, `[]` for an empty page, and a namespace event's is its one entry. Filtered answers and a view's keys are below.
 
 The epoch in force at a namespace entry is the `encryption.epoch` of the namespace document in force there. A revision's epoch is the current one when it is first sealed (Epochs, below), and so is that of a namespace document or grant from before the namespace was sealed, or of a grant only a base records (§C.3.1).
 
 -
-**What stays in the clear:** everything else, such as URLs (so names and ids), status codes, headers, error and `410` bodies, `/heads` and `/branches` pages, live timing and padded sizes. But the exact `created` of each revision, a document's length and its digest aren't sent outside the sealed logs (§7.1, §7.4).
+**What stays in the clear:** everything else, such as URLs (so names and ids), status codes, headers, error and `410` bodies, unfiltered `/heads` and `/branches` pages, live timing and padded sizes. But the exact `created` of each revision, a document's length and its digest aren't sent outside the sealed logs (§7.1, §7.4).
 
 -
 **Stored once, served forever.** Sealed bytes for a revision, a document, a resource log entry or a grant are produced once, stored, and served identically forever, so `304`s and caching work as without sealing. A sealed revision or namespace document has `ETag: "{id}.{e}"`, as a sealed blob does.
@@ -3209,6 +3252,17 @@ The epoch in force at a namespace entry is the `encryption.epoch` of the namespa
   - A range's `ETag`, if any, is weak.
 
   - Resource `purge` and `prune` events and namespace events need not be stored: each may be sealed again, with fresh bytes, whenever it is sent, and every sealing counts (§E.2.1).
+
+  - Filtered answers are never stored (§7.9): each is sealed when it is produced, readers accept any copy, and a range's `ETag`, if any, is weak. A view's keys for a revision are sealed once and stored, so what an ended epoch's `K_view` seals stays bounded (§E.2.1).
+
+-
+**Filtered answers** (§7.9). At E2 a filtered answer's plaintext is `{ "body", "keys" }`:
+
+  - `body` is the answer as §7.9 gives it: the array of its entries, `[]` for an empty page, the `/heads` body, or the event's data (§7.3). A resource log entry it shows with `patches`, to a partial reader only where the keys it carries for that revision hold `log`, is there as its stored JWE (above), so content stays under its revision's epoch;
+
+  - `keys` holds, as JWEs in the order the body first names their revisions, a view's keys for each revision of the namespace it names that is visible (§7.9), tombstones excepted, `[]` if none.
+
+A view's keys for a revision are `{ "key", "log"?, "blobs" }`, each key in base64url: `key` its `K_rev`, `log` its `K_log` only where §7.9 shows its entry with `patches`, and `blobs` an object holding, by id, the `K_blob` of each blob its document references, `{}` if none or the document is no longer stored, all of the revision's epoch. They are sealed under that epoch's `K_view`, so a reader opens those of the epochs its window covers (§E.2.3) and no others. Carrying them fixes the revision's epoch as serving it would (Epochs, below). The reader fetches the blobs at `…/blob/{bid}/e/{e}` for that epoch (§7.9).
 
 -
 **Compression.** Sealed payloads are never compressed and carry no `zip` header: a document mixes several authors' content (CRIME/BREACH).
@@ -3240,7 +3294,7 @@ plaintext = size ‖ bytes ‖ padding
 
   - `size` is the length of `bytes` as an 8-byte big-endian integer. `padding` is zero bytes, present only with `pad`, up to the bucket of `size ‖ bytes`. Readers check that it is all zeros.
 
-  - **At E2** the header is `{ "enc": "A256GCM", "kid": "{ns}#{e}", "pl": { "ns", "name", "blob": bid } }`, and the key is the resource's `K_r` of epoch `e` (§E.2.1).
+  - **At E2** the header is `{ "enc": "A256GCM", "kid": "{ns}#{e}", "pl": { "ns", "name", "blob": bid } }`, and the key is the blob's `K_blob` of epoch `e` (§E.2.1).
 
   - **Epochs.** In a sealed namespace, `…/blob/{bid}` answers `302` (head-pointer caching) to `…/blob/{bid}/e/{e}` for the latest served epoch; a reader holding only older epochs asks for one of those.
 
@@ -3275,11 +3329,15 @@ Authorization: Bearer
 { "epochs": [3, 4], "resources": ["derby"] }      // resources only for per-resource grants
 ```
 
-- **What a grant gets** at E2:
+- **What a grant gets** at E2, never more than one kind:
 
-  - A grant whose rules fix `/resource` (§2.1, `readScope: "resource"`) gets **per-resource keys** `K_r` for the names in `resources`, by default every name it fixes. A name it doesn't fix, or may not read, is `403`.
+  - A grant that reads the namespace unrestricted (§2.1) gets epoch keys `K_e`.
 
-  - Any other grant gets epoch keys `K_e` if it reads the namespace unrestricted (§2.1), and is `403` otherwise, in a public namespace too (§C.2); `resources` is ignored.
+  - A grant whose rules fix `/resource` (§2.1, `readScope: "resource"`) and whose read rules (§7.9 `view`) don't refer to `/doc` gets **per-resource keys** `K_r` for the names in `resources`, by default every name it fixes. A name it doesn't fix, or may not read, is `403`.
+
+  - A partial reader (§7.9) gets, where §7.9 applies, a **view key**: only the `K_view` of its own `view` (§E.2.1), which opens nothing for a copy or schema resolution (§2.1, §6.1).
+
+  - Any other grant is `403`, in a public namespace too (§C.2). `resources` is ignored but for per-resource keys.
 
 - **Which epochs:** those in `epochs`, by default all, within a window; others are left out.
 
@@ -3311,7 +3369,7 @@ Authorization: Bearer
 
   - HPKE runs in base mode (auth mode for `keyring` entries, §E.3.2), with the suite DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and AES-256-GCM, and an empty `aad`.
 
-  - The plaintext is the key's 32 bytes, and the `info` is `"patchlog-key-v1" ‖ 0x0A ‖ kid ‖ 0x0A ‖ name`, with `name` empty for `K_e`.
+  - The plaintext is the key's 32 bytes, and the `info` is `"patchlog-key-v1" ‖ 0x0A ‖ kid ‖ 0x0A ‖ name`, with `name` empty for `K_e` and `view:{view}` for a `K_view`, which no resource name can be (§3.6).
 
   - `wrapped` is HPKE's 32-byte encapsulated key followed by the ciphertext.
 
@@ -3319,9 +3377,9 @@ Authorization: Bearer
 
   - Both `wrapped` and the thumbprint are base64url without padding.
 
-- **Responses** are `{ "epoch", "level", "pad", "keys": [{ "kid", "name"?, "from"?, "wrapped" }] }`, `Cache-Control: no-store`.
+- **Responses** are `{ "epoch", "level", "pad", "keys": [{ "kid", "name"?, "view"?, "from"?, "wrapped" }] }`, `Cache-Control: no-store`.
 
-  - `name` is there for a `K_r`, and `from` for a keyring entry (§E.3.2).
+  - `name` is there for a `K_r`, `view` for a `K_view`, and `from` for a keyring entry (§E.3.2).
 
   - `epoch` is the current epoch.
 
@@ -3333,11 +3391,11 @@ Authorization: Bearer
 
 ### E.2.4 Revocation, honestly
 
-- **Future content.** Revoking read access means rotating the epoch of the namespace and, recursively, of its branches, which the base's `*` keys can do (§7.6); the revoked reader gets no keys for the new epochs, so can't read what is written afterwards.
+- **Future content.** Revoking or narrowing read access means rotating the epoch of the namespace and, recursively, of its branches, which the base's `*` keys can do (§7.6); the revoked reader gets no keys for the new epochs, so can't read what is written afterwards.
 
 - **Past content.** What was sealed under epochs the reader already held stays readable to them, from their copies or the CDN's.
 
-- **Reducing past exposure:** shorter epochs; per-resource keys (§E.2.3), so each reader holds only what they were granted; purge, which removes content and keys (E.1).
+- **Reducing past exposure:** shorter epochs; per-resource and view keys (§E.2.3), so each reader holds only what they were granted; purge, which removes content and keys (E.1).
 
 ### E.2.5 Interaction with the rest of the spec
 
@@ -3480,7 +3538,7 @@ The server checks `pl` and `kid` (`422`, `invalid`).
 
   - authors and their grants (§7.4; at E3 served in the clear to readers, §C.3.1); at E3 also gesture ids (§7.2), which clients that must hide the grouping keep inside their sealed content, and whom the `keyring` wraps each epoch to and from
 
-  - query strings of derived views (§E.2.6)
+  - query strings of derived views (§E.2.6); at E2, under view prefixes (§7.9), which revisions and blobs each view reads
 
   - at E3, which revisions reference which blobs; at E2, which epochs a blob is served under; whether a blob carried over without a nonce matches a guess (§C.7)
 
@@ -3495,6 +3553,8 @@ The server checks `pl` and `kid` (`422`, `invalid`).
 ## E.5 Open questions
 
 - Should E3 let clients reveal a **plaintext `writes` list** beside the sealed patch set, for the server to enforce path policy on and readers to check against the decrypted patches?
+
+- Should `view` digests (§7.9) be fixed byte for byte, so that an index could seal a whole response for a partial reader under a key its `K_view` gives, aggregates included (§E.2.6)?
 
 ---
 
@@ -3524,7 +3584,7 @@ Its hooks in the core are in §3.5, §6.5, §7, §7.5 and §8.6.
 
 - **Names are stable across environments.** Keep them the same everywhere (§11.1), and let the origin say which environment it is.
 
-**Purges follow imports.** A namespace imported from another deployment, as full history or snapshots, records that deployment's origin in its import batches' `source` (§7.5, §G.4.4). Where its operator trusts that origin (any writer can assert a `source`, §7.5), its deployment SHOULD follow that origin's namespace log from the first such `source.at`, and apply each `purge` there of a name it imported, and each `purge-ns` to every such name, as §8.3 does locally: its own chains for the name, its upstream namespace's (§G.4.4), its branches and its cache tags. It writes these entries itself (§7.4); one that §6.1 refuses as `in_use` waits for an operator.
+**Purges follow imports.** A namespace imported from another deployment, as full history or snapshots, records that deployment's origin in its import batches' `source` (§7.5, §G.4.4). Its operator may trust that origin and name the principals that import from it. Any writer can assert a `source` (§7.5), so only import batches by such a principal count, under a grant that may `purge` the names they write (§C.2). Its deployment SHOULD then follow that origin's namespace log from the first such batch's `source.at`, and apply each `purge` there of a name such a batch wrote, and each `purge-ns` to every such name, as §8.3 does locally: its own chains for the name, its upstream namespace's (§G.4.4), its branches and its cache tags. It writes these entries itself (§7.4); one that §6.1 refuses as `in_use` waits for an operator.
 
 ## G.2 External consumers
 
@@ -3819,6 +3879,20 @@ K_r = 37a2b615272e7bdec36b97f35176a206caa2dbbef43d89b81aa5a4ee874a5c25
 K_n = b2d9864bdf7f562d58e3638e08ec2e97e553c74995edbcef110ee9adfed62b4c
 ```
 
+From that `K_r`, with `info` I.2's ids and I.3's blob id, and from `K_e` with `info` `demo` ‖ `0x0A` ‖ I.8's `view`, all in ASCII:
+
+```
+K_rev(g) = cd871b109456a65f5a8fd3ed2d388530f48fbc564aab663b97c8dcbf899a4520
+K_rev(c) = 862174c8254b0e713e89114a8ec5a08f5449425a83161bf9885aff737f7f4e4f
+K_log(g) = 9abce0db7ac06d4b5f78bc5b049031bc1cc0ce3a6678e65ba7cff3ba0241ac90
+K_log(c) = 81167117c493c3099541f3e98fa6273b77d2caf66aa2a8e055127ea3402943b0
+K_log(t) = 438c584a2e28de744187018066861363e84f14a63e3b95d4eb1ea52d59b15f20      (t: the tombstone of c)
+K_blob   = 5dfd0d03c4d8133d358deaa8f76733e86966efdf30a9523bfbab147f2044d74d      (bid 1m5jj344d7tz7cicfmq53ayhmwuubpmyt)
+K_view   = 253c74b74bb46bdccd4b05348fbb1c07be9090c3c0b7d179c922a048b90e1db4      (view 17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm)
+```
+
+A tombstone has no document, so only its `K_log` seals anything.
+
 ## I.8 Views and combined checkpoints (§7.9, §A.4)
 
 The subject strings and the two `ns_id`s of I.2 serve as inputs only.
@@ -3886,12 +3960,13 @@ X25519 keys and their JWK thumbprints:
 | `40 41 … 5f`, admin | `eaYx7t4b-cmPEgMs3q3Q56B5OY_HhriMyEbsia-FpRo` | `YKbZ9qRn_duml9RTz_7p5FNztMst4VCEVI2fzJCu4TE` |
 | `60 61 … 7f`, ephemeral | `Z13VdO13iTELPS52gfN5C0ZsdzsVIf7PNld5WDcepS8` | — |
 
-HPKE seals to the recipient with the ephemeral key, `enc` `675dd574ed7789310b3d2e7681f3790b466c773b1521fecf36577958371ea52f`, and in auth mode under the admin's key; the plaintexts are I.7's `K_e` and `K_r`, `kid` `demo#3`:
+HPKE seals to the recipient with the ephemeral key, `enc` `675dd574ed7789310b3d2e7681f3790b466c773b1521fecf36577958371ea52f`, and in auth mode under the admin's key; the plaintexts are I.7's `K_e`, `K_r` and `K_view`, `kid` `demo#3`:
 
 | Wrapped | `info` | Ciphertext after `enc` |
 |---|---|---|
 | `K_e`, base mode | `"patchlog-key-v1\ndemo#3\n"` | `13386e84aa77fad0af82e2a04ab738043314aabaf00288d5a7b19d2e51a286199487aff2c4b39fdd308fff2138fce511` |
 | `K_r`, base mode | `"patchlog-key-v1\ndemo#3\nderby"` | `44df8b2081f0cd07201259e95859d355b4eb54fb127b63baa5008415035156c0e6edbdc1ce1e3e7f2b8d1a12bef36044` |
+| `K_view`, base mode | `"patchlog-key-v1\ndemo#3\nview:17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm"` | `84e146c9c1e73365e83dec3586b5779b7e3b68b034ba9fc0ff1cf49119d67e2a8df3fc06872979f87646026dd7560841` |
 | `K_e`, auth mode | `"patchlog-key-v1\ndemo#3\n"` | `43cec1d61c3e0101e1b5c9ff5d87ffbf3b88c348d886ee56d4ac596b3d896a5e9d2f5ed1c215a94f4c9ac0b9a63d854c` |
 
 `wrapped` is `enc` followed by the ciphertext, and the auth-mode one opens under no other sender. A `keyring` entry without `kid` or `wrapped`, or with a `from` that isn't a thumbprint (`"admin"`), is `422` (§E.3.2). This sealed-bundle envelope wraps `K_b` `dbe5882e2579683432c1bfc525454add0cd87274d67084caaf0e0d36c8496db7` to the recipient:
@@ -3904,14 +3979,14 @@ An Ed25519 key with seed `a0 a1 … bf` has `pub` `T9CZzNR9eJPf6ewkQU7LDZtUICMqr
 
 ## I.13 Sealed payloads and blobs (§E.2.2, §E.3.1)
 
-With I.7's keys, `kid` `demo#3`, the IV `c0 c1 … cb`, and protected headers and plaintexts in canonical form, the document of `g` (I.2) seals as
+With I.7's keys, `kid` `demo#3`, the IV `c0 c1 … cb`, and protected headers and plaintexts in canonical form, the document of `g` (I.2) seals under `K_rev(g)` as
 
 ```
 header = {"alg":"dir","enc":"A256GCM","kid":"demo#3","pl":{"id":"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll","kind":"doc","name":"derby","ns":"demo"}}
-JWE    = base64url(header) "..wMHCw8TFxsfIycrL.k52qUNJsIIT4U4tl77_Pp374T3Og8nfcnFY4.bUtNtAX8TEcZT6jIGgsZ9w"
+JWE    = base64url(header) "..wMHCw8TFxsfIycrL.Phlvrjb-VTs3mn8RXc8xX40b3qg5WY-9dCNY._Y5aruVU4bSOaU-64iXJBA"
 ```
 
-and padded to 256 bytes has the tag `p2Mr0OgF8n6NV7D4m7OZzw`. Others, unpadded:
+and padded to 256 bytes has the tag `r4lkevRuwdj3KQnE_8nRbA`. Others, unpadded:
 
 | Payload | Key | `pl` | Plaintext | Tag |
 |---|---|---|---|---|
@@ -3921,13 +3996,13 @@ and padded to 256 bytes has the tag `p2Mr0OgF8n6NV7D4m7OZzw`. Others, unpadded:
 
 The E3 write `[{"blobs":["12cpfgvfvu3goo36nr6agtphftlh7zktj"],"op":"sealed","value":<the E3 patch set's JWE>}]` has the genesis id `1ptb7hgvw5g5msprod2l5d2pp5b2mtppz`.
 
-I.3's blob sealed under `K_r` with the header `{"enc":"A256GCM","kid":"demo#3","pl":{"blob":"1m5jj344d7tz7cicfmq53ayhmwuubpmyt","name":"derby","ns":"demo"}}` is these 168 bytes, and 401 padded:
+I.3's blob sealed under its `K_blob` with the header `{"enc":"A256GCM","kid":"demo#3","pl":{"blob":"1m5jj344d7tz7cicfmq53ayhmwuubpmyt","name":"derby","ns":"demo"}}` is these 168 bytes, and 401 padded:
 
 ```
 504c42310000006d7b22656e63223a224132353647434d222c226b6964223a2264656d6f2333222c22706c223a7b22626c6f62223a22
 316d356a6a3334346437747a37636963666d7135336179686d77757562706d7974222c226e616d65223a226465726279222c226e7322
-3a2264656d6f227d7dc0c1c2c3c4c5c6c7c8c9cacbe8bfde39a60045a9aa14af6cecf3d0e426b95176aae20e1d89f02cc16897ac81a6
-77eb3cc8748b
+3a2264656d6f227d7dc0c1c2c3c4c5c6c7c8c9cacb55c032b23b8b9a1cae367c49b2dd276fcedfdd1ec139aa46c026482d5c459f330a
+47045d9ea3e9
 ```
 
 At E3, under the key `e0 e1 … ff` with the header `{"enc":"A256GCM"}`, it is these 76 bytes, with blob id `1chzlyccn2qkoz6mobtbzvzm4s6h7pbi6`:
@@ -3999,7 +4074,7 @@ The last renders as these 96 bytes, each line followed by `0a`:
 
 ## I.17 Sealed bundles (§G.5.1.1)
 
-These values were recomputed from the text alone in v0.85 and await the reference's confirmation (VECTORS-PROPOSED.md).
+These values were recomputed from the text alone in v0.85; the reference reproduces them.
 
 I.12's envelope wraps `K_b` `dbe5882e2579683432c1bfc525454add0cd87274d67084caaf0e0d36c8496db7` to I.12's recipient, the X25519 key `20 21 … 3f` with thumbprint `5_RYhfysTyU1BDBnv9LSpAGNHJ_A1_UesBCKoRG370E`. Under `K_b`, with I.13's IV, it seals the three lines of I.20's accepted bundle (`"authors": false`), with the headers
 
@@ -4061,7 +4136,7 @@ Each of these changes to the unpadded file rejects it whole, by the rule of §G.
 
 ## I.19 Sealed log entries, namespace documents and ranges (§E.2.2)
 
-With I.13's keys, `kid` and IV, these illustrative plaintexts, which no deployment could write as given, seal as below:
+With I.7's keys, I.13's `kid` and IV, these illustrative plaintexts, which no deployment could write as given, seal as below:
 
 ```
 entry_g  = {"author":"user:bob","created":"2026-10-04T12:00:00.000Z","grant":{"id":"15swdvi5nbnlkv76v7y6k77h52atov6ru","kid":"ops-2026","sub":"user:bob"},"id":"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll","kind":"rev","parent":"","patches":[{"op":"add","path":"","value":{"title":"Hello","views":0}}]}
@@ -4076,9 +4151,9 @@ nsentry₂ = {"author":"user:bob","created":"2026-10-04T12:00:00.000Z","grant":{
 
 | Key | `pl` | Plaintext | Tag | Padded |
 |---|---|---|---|---|
-| `K_r` | `{"id":"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll","kind":"rev","name":"derby","ns":"demo"}` | `entry_g` | `c68oZCDNfPm8VZUXOdRmXg` | `O9Z6SEotAUWkOeYCYpo_Dg` |
-| `K_r` | `{"id":"1sywh54kpo3c4ezn2znktvl3avge4zl5d","kind":"rev","name":"derby","ns":"demo"}` | `entry_c` | `pzkHTSbEc_4DelqyHdgd3w` | `eBSxsbW5-2SOW6qeTsv9Rg` |
-| `K_r` | `{"id":"1idx6u2b3z42obqmwsgmlzvrfuutks2bq","kind":"tombstone","name":"derby","ns":"demo"}` | `entry_t` | `qM0CXrHt-MBnP2Mge7t9Dg` | `IDqEgk-5WA7hlci08qsYIA` |
+| `K_log(g)` | `{"id":"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll","kind":"rev","name":"derby","ns":"demo"}` | `entry_g` | `yfH2leZO8n6cjMECUyyH0w` | `Cg07e1dKHUMl2OYuEpdkSw` |
+| `K_log(c)` | `{"id":"1sywh54kpo3c4ezn2znktvl3avge4zl5d","kind":"rev","name":"derby","ns":"demo"}` | `entry_c` | `OwyEAM7T4CfqJF3xn8GEUg` | `jS361xdyARKseb0gclHqRQ` |
+| `K_log(t)` | `{"id":"1idx6u2b3z42obqmwsgmlzvrfuutks2bq","kind":"tombstone","name":"derby","ns":"demo"}` | `entry_t` | `EY1dwq_IW1TRlQ5byJICtw` | `syUJgGok3oXkkZH16gYrEw` |
 | `K_n` | `{"id":"1vmctae4vewju6nvxi374rkrkmyzpdrif","kind":"doc","ns":"demo"}` | `nsdoc` | `g9GNuYsEUxQIUflrD4Pgrg` | `y3m-vOgPYKJ_ng0H3nB7WA` |
 | `K_n` | `{"ns":"demo","range":["","1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm"]}` | `[nsentry₁,nsentry₂]` | `3CUwPfA7GtS8GLr7bQFbuQ` | `iwW5mt5KJ1sbvzneqrT6PA` |
 | `K_n` | `{"ns":"demo","range":["1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm","1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm"]}` | `[]` | `gFdn5cMoLtKWpkGcZKvRcg` | `81hR8mEqKtouAa1XtJCNqQ` |
@@ -4087,14 +4162,14 @@ nsentry₂ = {"author":"user:bob","created":"2026-10-04T12:00:00.000Z","grant":{
 
 ```
 eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiaWQiOiIxbDJnaTJoaG0zdnQ3MmxzMm91ZnFwa3Fw
-c2g2dXZtbGwiLCJraW5kIjoicmV2IiwibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.k52_TNJoKtTgS-F18LbSv
-zC1Wzjpp2eMwwcxR9zeeocp7wTUg2d8tmhTnhTJQIzPSDZ3L_56yorXqCMuKVryC2uCMTHSKs2gMEkixDYnnTk1FVrSMeITi6lXwuziocVQm
-YJ0IrVjF7l3gGRRLU8VEmtD6Wquc9UCadJw0FttGapmaGPPxQQfwcvFebUPbTW7WDvhqml64ZXzz4r4rCmR9cV3WSsig-gbzfAyF-opZJPTR
-IvjSmBTKkutRh1tLiHpkwWvjwh_T40DWhE-9oG7-VezKc626mN7tdslpVrd7yawDpeAy2IYh2ph2UXPYFC8WIdEJ6h6LfjaerYclaLAjFQBw
-xCMGYMkzdVN76fUFy4_ID8S5cFLPQ.c68oZCDNfPm8VZUXOdRmXg
+c2g2dXZtbGwiLCJraW5kIjoicmV2IiwibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIn19..wMHCw8TFxsfIycrL.L4p9srPTK8kfVFYYWc6us
+y3emYKt299y0itdBeyuLrpQ-67Z6tcNFDOMUIGkLOXPxz6TAUIOfXfqZUyvG7DmknXFq9ADXKKszznqLj5n9E3g45WXrthe2ZmTPUbT5A_-i
+4RcQspLxNE6whYY3aJr9_ZwAs3bmBgnF8XPSPo6eGEULPma8kllMXUhsD_tn78LAW_TuE05gq0IekdE3wLxlQ1yzozin8PGXGCG312Bw7TC0
+McmXEtFnNm7iTGOYMKAfY7rQDt-ZwPUQJmO-KkNWQYlAjwTFmKpdSe-EIfFxPwTS4hSxTILH5vBFsyrqKmHcKYEMcYW5FvISfkgyYvmKxdBE
+QOIq2JCG1l9RlzKKzBA0sSO531e_g.yfH2leZO8n6cjMECUyyH0w
 ```
 
-and the resource log range from `g` to `c`, the array of `entry_g`'s and `entry_c`'s JWEs, is 1247 bytes, sha-256 `a1cfeddee66cfb678d2a7fc5f9eaf11666dd1353b43295f16554963fcd78a433`.
+and the resource log range from `g` to `c`, the array of `entry_g`'s and `entry_c`'s JWEs, is 1247 bytes, sha-256 `0a85cba9eca3bb3ba7a4845c62c6012725de2414df30803788f3639d4e470459`.
 
 ## I.20 Full-history lines with `via` (§G.4.1)
 
@@ -4345,10 +4420,10 @@ An index on its own origin serves `demo` (epoch 3) at I.8's `view`, an input onl
 pl.view = /demo/view/17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm/at/1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm?q=a%20b&sort=%2Ftitle
 ```
 
-With `info` the `pl.view`'s ASCII bytes, the hit for `derby` is sealed per entry under
+With `info` the `pl.view`'s ASCII bytes, the hit for `derby`, derived from `c`, is sealed per entry under
 
 ```
-HKDF-SHA256(K_r, "patchlog-view", pl.view) = e3fdb292d5cae0f7a6829614b3a3c5a0a5e573246a039d90c89e6b30616219d5
+HKDF-SHA256(K_rev(c), "patchlog-view", pl.view) = f231f91356f7a5eee6952ea1624301f401d1e4463003d2e2d414148c88da845e
 ```
 
 with `kid` `demo#3` and the hit's sealed values as plaintext:
@@ -4359,11 +4434,11 @@ plaintext = {"/title":["Hello"],"score":1.5}
 
 eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsibmFtZSI6ImRlcmJ5IiwibnMiOiJkZW1vIiwidmll
 dyI6Ii9kZW1vL3ZpZXcvMTdpMnJxenN2M28yaTV2bGZoc2tsbzZmdTIyam5xd3RtL2F0LzFwYTJuaDZpdzJ5ZDJkanFmeTJ3cnN6ZDVrZ2xm
-cHh2bT9xPWElMjBiJnNvcnQ9JTJGdGl0bGUifX0..wMHCw8TFxsfIycrL.a-vVzxqEqGtOcJAm8NTR6ugD3e09wWXGas7BqkCExdg.hKn1d7
-GAO_p1H2JmXb6J6g
+cHh2bT9xPWElMjBiJnNvcnQ9JTJGdGl0bGUifX0..wMHCw8TFxsfIycrL.JEoIQh93GokwDDDeQSC2gv82Afnn0Gz5BnVdULrflr0.4uHvip
+x5sQzxapkGKQhWNQ
 ```
 
-Padded, its tag is `2ZZsCDc80ADzJQXXG0J04g`. The hit is served as `{"id":"1sywh54kpo3c4ezn2znktvl3avge4zl5d","resource":"derby","sealed":"<that JWE>","url":"/r/demo/derby/rev/1sywh54kpo3c4ezn2znktvl3avge4zl5d"}`.
+Padded, its tag is `9dxFzhfRfphN2T4yqrc6Kw`. The hit is served as `{"id":"1sywh54kpo3c4ezn2znktvl3avge4zl5d","resource":"derby","sealed":"<that JWE>","url":"/r/demo/derby/rev/1sywh54kpo3c4ezn2znktvl3avge4zl5d"}`.
 
 A JWE whose `pl.view` is the same target with `+` for the space, lowercase hex (`%2ftitle`) or the parameters in another order, or with a scheme and host, doesn't match the URL fetched, and the reader rejects it. No `pl.view` has a `min`: a `200` is never served at a URL with one (§A.5).
 
@@ -4376,6 +4451,8 @@ Each of these changes to I.20's bundle rejects it whole:
 | the grant line's `grant`, and both history lines', is `1d7hzis4zva7kl5aa3hi7cr3lxslua25j`, the id of I.21's `ops-2027` root block | `0ec81821b866aa5c02558212e4bb1b84640841cfba2457d594eab0730fb0bfcf` | a grant line whose `grant` isn't the id of its `root` |
 | the grant line's `stored` is the authority block of I.21's token whose root block string isn't canonical (`sub` first), validly signed | `027a5892e6e75752703a253d24a4b8e6bb4db92a91bb46fad0c95cb6035a2278` | a grant line whose `stored` block's `grant_block` isn't `canonical(root)` |
 | the header with `"x-note":"hi"` | `eff926c75ff1a289375536562a090a02c1fabb11c921abfe43a5b95735548954` | a member §G.4.1 doesn't define |
+| the grant line's `key.kid` is `ops-2027` | `59dd09cd7d6913eaf8bfc58025bb02f5b27468b757ee351b64d90457ded62920` | a grant line whose `key` has a `kid` other than `root.kid` |
+| the grant line's `key.pub` is `Kay64UG8yvCyLhqU000LxzYeUm0L_hLIl5S8kyKWbdc`, the key of seed `20 21 … 3f` (§I.21's `ops-2027`) | `44e7aa12dfb273be81818819f8f53cefb404d031da212971847afd8bdd8b0910` | a grant line whose `key` doesn't verify the `stored` block |
 
 ## I.25 Long-poll phases (§7.7)
 
@@ -4390,28 +4467,96 @@ At the default 20 s interval, a path's phase is the first 8 bytes of its SHA-256
 
 The last path's `view` is I.8's.
 
-## I.26 Still to come
+## I.26 Whole responses sealed at an index `view` (§E.2.6, §7.9)
 
-Candidates for these, computed independently from this text and not yet confirmed by the reference implementation, are in VECTORS-PROPOSED.md: a whole response sealed at an index `view` (§E.2.6, §A.4), and grant lines whose `key` has a `kid` other than `root.kid` or doesn't verify the `stored` block (§G.4.1). Still missing: a sealed Biscuit token accepted (§C.8).
+An index on its own origin serves private `demo` (epoch 3) to a reader whose grant `demo`'s key `ops-2026`, with I.14's `pub`, verifies, and who would be issued a namespace-wide edge grant there. Its `key:` string (§7.9) and `view`, the hash of the one-subject array holding it (a grant with unrestricted `read` has no `scope:` subject), are
+
+```
+key:{text(trunc160(sha256(canonical(["ops-2026","A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"]))))} = key:1gorsoawpfk76fdd6bdqtgqkial3qgvl4
+view   = text(trunc160(sha256(canonical([key:…])))) = 1h3svqdgo2zzbsi4ue4judyzylpexfd6q
+```
+
+so, for the query of §I.23 at `ns_id₂`,
+
+```
+view = /demo/view/1h3svqdgo2zzbsi4ue4judyzylpexfd6q/at/1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm?q=a%20b&sort=%2Ftitle
+HKDF-SHA256(K_n, "patchlog-view", view) = a762431d29f898ca1cdba66ac808b8b64af1ccbab978bdcd4fac1acccb0ae920
+```
+
+The whole response, sealed under that key with `kid` `demo#3`:
+
+```
+header    = {"alg":"dir","enc":"A256GCM","kid":"demo#3","pl":{"ns":"demo","view":"/demo/view/1h3svqdgo2zzbsi4ue4judyzylpexfd6q/at/1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm?q=a%20b&sort=%2Ftitle"}}
+plaintext = {"at":"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm","hits":[{"/title":["Hello"],"id":"1sywh54kpo3c4ezn2znktvl3avge4zl5d","resource":"derby","score":1.5,"url":"/r/demo/derby/rev/1sywh54kpo3c4ezn2znktvl3avge4zl5d"}]}
+
+eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsibnMiOiJkZW1vIiwidmlldyI6Ii9kZW1vL3ZpZXcv
+MWgzc3ZxZGdvMnp6YnNpNHVlNGp1ZHl6eWxwZXhmZDZxL2F0LzFwYTJuaDZpdzJ5ZDJkanFmeTJ3cnN6ZDVrZ2xmcHh2bT9xPWElMjBiJnNv
+cnQ9JTJGdGl0bGUifX0..wMHCw8TFxsfIycrL.ys5PdxEUYtMTUlo_a0x1PNC2piNeOoWo7smYW_yMwImTYzdRGZO9krVWt-ViRzLa6PhbNJ
+R1ebCWMxR_iG34Yj6Z3blPniiIz2PVoE4FulnSqSYpCZMKADxv_2Jh0G7aClOuE-Aia6OVYPO9tSKbJh11NOplqJjCdOMYXav0qPi-_-RynP
+yUmUx13hjaurqx05tRp35vkHbAnufZUgP2uxEY_x-wYtM11eEoDyW3wzdlrVsrjwNblVT2e0TzjUhDZCW7iw1fhFhvg7LU.17d3wcDoXnGWN
+qWPQhKDxw
+```
+
+Padded (§E.2.2), its plaintext is that canonical JSON (204 bytes) followed by ASCII spaces to its bucket, 256 bytes:
+
+```
+eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsibnMiOiJkZW1vIiwidmlldyI6Ii9kZW1vL3ZpZXcv
+MWgzc3ZxZGdvMnp6YnNpNHVlNGp1ZHl6eWxwZXhmZDZxL2F0LzFwYTJuaDZpdzJ5ZDJkanFmeTJ3cnN6ZDVrZ2xmcHh2bT9xPWElMjBiJnNv
+cnQ9JTJGdGl0bGUifX0..wMHCw8TFxsfIycrL.ys5PdxEUYtMTUlo_a0x1PNC2piNeOoWo7smYW_yMwImTYzdRGZO9krVWt-ViRzLa6PhbNJ
+R1ebCWMxR_iG34Yj6Z3blPniiIz2PVoE4FulnSqSYpCZMKADxv_2Jh0G7aClOuE-Aia6OVYPO9tSKbJh11NOplqJjCdOMYXav0qPi-_-RynP
+yUmUx13hjaurqx05tRp35vkHbAnufZUgP2uxEY_x-wYtM11eEoDyW3wzdlrVsrjwNblVT2e0TzjUhDZCW7iw1fhFhvg7LUp4zI4vCW5lNaGx
+73Mwh4tnxEF90csI7DJbTA0D4zi-9mrokDprtP0ktnAXaIEuWJNdLq9g.CFAbY8nEhgY4BCDiILDI5A
+```
+
+## I.27 Filtered answers sealed for a view (§E.2.2, §7.9)
+
+With I.7's keys, I.13's `kid` and IV, and I.19's plaintexts, a partial reader at I.8's `view` to whom `g` is visible gets this view's keys for `g`, which carry `log` as `g` is a genesis, sealed under `K_view`:
+
+```
+pl        = {"id":"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll","kind":"keys","name":"derby","ns":"demo","view":"17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm"}
+plaintext = {"blobs":{},"key":"zYcbEJRWpl9aj9PtLTiFMPSPvFZKq2Y7l8jcv4maRSA","log":"mrzg23rAbUtfeLxbBJAxvBzAzjpmeOZbp8_zugJBrJA"}
+
+eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZGVtbyMzIiwicGwiOnsiaWQiOiIxbDJnaTJoaG0zdnQ3MmxzMm91ZnFwa3Fw
+c2g2dXZtbGwiLCJraW5kIjoia2V5cyIsIm5hbWUiOiJkZXJieSIsIm5zIjoiZGVtbyIsInZpZXciOiIxN2kycnF6c3YzbzJpNXZsZmhza2xv
+NmZ1MjJqbnF3dG0ifX0..wMHCw8TFxsfIycrL.G9qYPG2P5kgFb6NPdjCXL92jG_YeqcWVoZk-a-BsyOX1zRH5cfUJw3g5oScs8M0BiY261H
+TBszsvuPBUnEAUwwJspXCt6yeg0OKs2CYT3eXMzOFBD_SlGoNCMP8jww-S8wCiqBMNTEjqe5MwH1SfShF2AaA.doJf0LKbEdi3nddN40sPsw
+```
+
+Padded, its tag is `SVTajqyH3aFAdBHVAOriRQ`. Had `g`'s document referenced I.3's blob, the plaintext would be `{"blobs":{"1m5jj344d7tz7cicfmq53ayhmwuubpmyt":"Xf0NA8TYEz01jeqo92cz6Glm798wqVI7-6sUfyBE100"},"key":"zYcbEJRWpl9aj9PtLTiFMPSPvFZKq2Y7l8jcv4maRSA","log":"mrzg23rAbUtfeLxbBJAxvBzAzjpmeOZbp8_zugJBrJA"}`, with the tag `SR6Ls0us2dqMfX7ybh-iug`, and `Dyljyuz9iPShvEj0AzHeeg` padded. These keys open I.13's document of `g` and sealed blob, and I.19's `entry_g`.
+
+Filtered answers under that `K_view`, each with the plaintext `{"body":…,"keys":[<that keys JWE>]}`:
+
+| Answer | `pl` | `body` | Tag | Padded |
+|---|---|---|---|---|
+| namespace range from the start | `{"ns":"demo","range":["","1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm"],"view":"17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm"}` | `[nsentry₁,nsentry₂]` | `BC994v4RbPBI-2-qZV1xIA` | `4ibwPewPWhMU_P60BZ-Cmg` |
+| first `/heads` page at `ns_id₂` | `{"after":"","at":"1pa2nh6iw2yd2djqfy2wrszd5kglfpxvm","ns":"demo","view":"17i2rqzsv3o2i5vlfhsklo6fu22jnqwtm"}` | `{"heads":[{"kind":"head","resource":"derby","target":"1l2gi2hhm3vt72ls2oufqpkqpsh6uvmll"}]}` | `PFEu95UTVra3D5QI04B8JQ` | `PFEu95UTVra3D5QI04B8JQ` |
+
+The range's plaintext is 1016 bytes, and its JWE 1604 bytes, sha-256 `debb556bb5f1af30fa8b6b6deefe460b7ca946f9062f6774797b2d1d5114c562`. The `/heads` plaintext is 544 bytes, a bucket size, so padding adds nothing.
+
+Rejected: the range's JWE with the unfiltered range's `pl`, without `view`, in its header; and any of these JWEs opened under `K_n` or `K_r`.
+
+## I.28 Still to come
+
+Still missing: a sealed Biscuit token accepted (§C.8).
 
 ---
 
 ## Changes
 
-The full history is in CHANGELOG.md, and the conformance checklist in CONFORMANCE.md. Since v0.86:
+The full history is in CHANGELOG.md, and the conformance checklist in CONFORMANCE.md. Since v0.88:
 
-- **v0.87:** a simplification. Four features go and one core primitive replaces most of what they did; the three documents shrink from about 75,800 words to about 63,000.
+- **v0.89:** filtered reads and `/doc` read rules work at `sealed`, through derived keys.
 
-  - **Filtered reads move into the core (§7.9),** decided by the grant's own read rules. Read envelopes carry `doc`, the document of the revision read (§6.4.1), so read rules may test content, e.g. `/doc/folder`. Every read is judged per revision; a revision's visibility under given rules never changes, so it is judged once and cached. A partial reader follows `/ns/{ns}/view/{view}/…` (`gs` is now `view`): one namespace, one `ns_id` per answer; revisions and blobs are served under that prefix too, so a view's readers share them at the CDN. A document leaving a view shows as a `hidden` entry; a reader first seeing a resource mid-history gets its document, not patches whose parent it can't read; blobs are judged by the revisions that reference them. A grant that may `read` but can't read a resource's head can't write it (§6.2 step 2.2), so writes can't probe hidden content or pull a document into the writer's view. A namespace whose read rules test `/doc` should guard those fields with write rules (§6.4.4).
+  - **Derived keys (§E.2.1).** Below each resource's `K_r`: `K_rev` for a revision's document, `K_log` for its log entry and `K_blob` for each blob; below each epoch's `K_e`: `K_view` for a view. Each is one-way and yields no sibling. A revision's document is sealed under its `K_rev`, its log entry under its `K_log` and each blob under its `K_blob`.
 
-  - **Catalogs and the tree service are removed** (SERVICES Addendum B), with `requireAt`, `maxLag` and a grant's `at`. Hierarchy and folder-based access are a document field and `/doc` read rules.
+  - **Who gets which (§E.2.3).** Unrestricted readers get `K_e` and fixed-name readers without `/doc` rules `K_r`, as before. A partial reader, a fixed-name grant with `/doc` rules included, gets only its view's `K_view`. Its filtered answers are sealed under `K_view` and carry, for each visible revision, that revision's `K_rev`, its blobs' `K_blob`, and its `K_log` only where its parent is visible, so patches of a hidden parent stay closed.
 
-  - **Remote branches are removed** (the former G.3 and G.5.2), with the `export` verb and `remoteRegistration`. Work across deployments is export and import (§G.4), which keep ids and merge by ancestry. A deployment SHOULD follow the purges of origins it imported from, where its operator trusts them (§G.1).
+  - **Where (§7.9, §6.4.1).** Filtered reads apply in sealed namespaces too; the origin judges `/doc` on the plaintext it holds. End-to-end namespaces stay out: the server never sees their content, and `doc` is `null` there.
 
-  - **Files (TOOLS Addendum H):** a file's folder and name are fields of its document; listings come from the index; a move is a `replace`.
+  - **The index** seals a per-document hit under the revision's `K_rev`, so origin and index needn't agree on a `view`.
 
-  - **Releases (TOOLS §F.9)** are reworked without catalogs: schemas, then content, then a `published` field set last.
+  - **Metadata.** View-prefixed URLs show caches which revisions a view sees (§E.4).
 
-  - **Vectors.** §I.23, §I.25's last row and candidate C.4 are recomputed for `view` paths.
+  - **Vectors.** §I.7, §I.12, §I.13, §I.19 and §I.23 are recomputed under the derived keys; §I.27 gives a view's keys, a filtered range and a filtered `/heads` page; "Still to come" is §I.28.
 
-  - **The reference changes:** filtered reads in the core, `doc` in read envelopes and per-revision judging, `view` URLs and cookies, `hidden` entries, blob and patch rules for hidden revisions; dropping catalogs, the tree service, `requireAt`, remote branches and `export`; following trusted origins' purges after imports.
+  - **The reference changes:** the derived keys and what is sealed under each, view keys at `/keys`, filtered answers sealed for a view, `doc` at E2, and §7.9 at `sealed`.

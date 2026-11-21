@@ -64,7 +64,7 @@ func TestV082SealedPlaintextCanonical(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		item, err := SealItem(k, v, "r", body)
+		item, err := SealItem(k, v, "r", testRev, body)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -72,7 +72,7 @@ func TestV082SealedPlaintextCanonical(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ipt, err := OpenItem(item, ItemKey(keyOf, "n", "r"), v, "n", "r")
+		ipt, err := OpenItem(item, ItemKey(keyOf, "n", "r", testRev), v, "n", "r")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -109,7 +109,7 @@ func TestV082ViewIsTheTargetByteForByte(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	item, err := SealItem(k, v, "r", map[string]any{"title": "T"})
+	item, err := SealItem(k, v, "r", testRev, map[string]any{"title": "T"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestV082ViewIsTheTargetByteForByte(t *testing.T) {
 		if _, err := OpenView(whole, keyOf, o); !errors.Is(err, seal.ErrMismatch) {
 			t.Errorf("a whole response opened as %s: %v, want ErrMismatch", what, err)
 		}
-		if _, err := OpenItem(item, ItemKey(keyOf, "n", "r"), o, "n", "r"); !errors.Is(err, seal.ErrMismatch) {
+		if _, err := OpenItem(item, ItemKey(keyOf, "n", "r", testRev), o, "n", "r"); !errors.Is(err, seal.ErrMismatch) {
 			t.Errorf("an entry opened as %s: %v, want ErrMismatch", what, err)
 		}
 	}

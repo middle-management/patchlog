@@ -291,7 +291,7 @@ func TestV075FilteredScope(t *testing.T) {
 		}
 	})
 	for name, o := range map[string]v75Opts{
-		"sealed": {matches: func(doc map[string]any) { doc["encryption"] = map[string]any{"level": "sealed"} }},
+		"e2e":    {matches: func(doc map[string]any) { doc["encryption"] = map[string]any{"level": "e2e"} }},
 		"public": {matches: func(doc map[string]any) { doc["read"] = "public" }},
 	} {
 		w := newV75World(t, o)
@@ -335,7 +335,8 @@ func TestV075NSAccess(t *testing.T) {
 		}
 	})
 	// The same grant in an uncovered namespace is nsReader's 403.
-	w2 := newV75World(t, v75Opts{matches: func(doc map[string]any) { doc["encryption"] = map[string]any{"level": "sealed"} }})
+	// e2e: sealed namespaces are covered since v0.89 (§7.9 Where).
+	w2 := newV75World(t, v75Opts{matches: func(doc map[string]any) { doc["encryption"] = map[string]any{"level": "e2e"} }})
 	li2 := w2.li()
 	w2.inTx(func(t2 *tx) {
 		n := t2.nsByName("matches")

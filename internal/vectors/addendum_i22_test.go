@@ -306,10 +306,13 @@ func TestI23ViewKey(t *testing.T) {
 	if strings.Contains(view, "min") {
 		t.Errorf("the view carries min: %s", view)
 	}
+	// v0.89: the hit derives from c, and is sealed under the view key of
+	// K_rev(c) (§E.2.6).
 	kr, _ := seal.ResourceKey(seq(0x00), "demo", "derby")
-	vkr, err := seal.ViewKey(kr, view)
-	if err != nil || hex.EncodeToString(vkr) != p.ViewKeyKr {
-		t.Errorf("the view key of K_r is %x %v, want %s", vkr, err, p.ViewKeyKr)
+	krev, _ := seal.RevKey(kr, idC)
+	vkr, err := seal.ViewKey(krev, view)
+	if err != nil || hex.EncodeToString(vkr) != p.ViewKeyKrevC {
+		t.Errorf("the view key of K_rev(c) is %x %v, want %s", vkr, err, p.ViewKeyKrevC)
 	}
 
 	v := derived.View{NS: "demo", Target: view}
@@ -320,7 +323,7 @@ func TestI23ViewKey(t *testing.T) {
 		}
 		return nil
 	}
-	itemKey := derived.ItemKey(keyOf, "demo", "derby")
+	itemKey := derived.ItemKey(keyOf, "demo", "derby", idC)
 	header := func(jwe string) string {
 		b, err := base64.RawURLEncoding.DecodeString(jwe[:strings.IndexByte(jwe, '.')])
 		if err != nil {
@@ -338,7 +341,7 @@ func TestI23ViewKey(t *testing.T) {
 		open func(string, derived.View) ([]byte, error)
 	}{
 		{"the hit", p.Item, vkr, v.ItemPL("demo", "derby"),
-			func(k derived.Key, body any) (string, error) { return derived.SealItem(k, v, "derby", body) },
+			func(k derived.Key, body any) (string, error) { return derived.SealItem(k, v, "derby", idC, body) },
 			func(jwe string, v derived.View) ([]byte, error) {
 				return derived.OpenItem(jwe, itemKey, v, "demo", "derby")
 			}},
@@ -400,7 +403,7 @@ func TestI23ViewKey(t *testing.T) {
 			av := derived.View{NS: "demo", Target: target}
 			// A JWE whose pl.view is the altered form, however it was
 			// keyed, doesn't match the URL fetched.
-			avk, _ := seal.ViewKey(kr, target)
+			avk, _ := seal.ViewKey(krev, target)
 			apl := seal.PL{}
 			for k, x := range c.pl {
 				apl[k] = x

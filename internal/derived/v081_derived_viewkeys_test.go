@@ -49,16 +49,17 @@ func TestV081ViewKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	kvr, err := seal.ViewKey(kr, v.Target)
+	krev, _ := seal.RevKey(kr, testRev)
+	kvr, err := seal.ViewKey(krev, v.Target)
 	if err != nil {
 		t.Fatal(err)
 	}
-	item, err := SealItem(k, v, "r", map[string]any{"title": "T"})
+	item, err := SealItem(k, v, "r", testRev, map[string]any{"title": "T"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if pt, err := seal.OpenExpect(item, kvr, "n#3", v.ItemPL("n", "r")); err != nil || string(pt) != `{"title":"T"}` {
-		t.Fatalf("an entry under ViewKey(K_r, view): %q %v", pt, err)
+		t.Fatalf("an entry under ViewKey(K_rev, view): %q %v", pt, err)
 	}
 	for what, key := range map[string][]byte{"K_e": ke, "K_n": kn, "K_r": kr, "ViewKey(K_n, view)": kvn} {
 		if _, err := seal.OpenExpect(item, key, "n#3", v.ItemPL("n", "r")); !errors.Is(err, seal.ErrDecrypt) {
@@ -77,7 +78,7 @@ func TestV081ViewKeys(t *testing.T) {
 	if _, err := OpenView(whole, keyOf, v); err != nil {
 		t.Fatalf("OpenView: %v", err)
 	}
-	if _, err := OpenItem(item, ItemKey(keyOf, "n", "r"), v, "n", "r"); err != nil {
+	if _, err := OpenItem(item, ItemKey(keyOf, "n", "r", testRev), v, "n", "r"); err != nil {
 		t.Fatalf("OpenItem: %v", err)
 	}
 	// A JWE of another view is a mismatch, judged on pl before any key is
@@ -93,12 +94,13 @@ func TestV081ViewKeys(t *testing.T) {
 func TestV081ViewKeyOtherResource(t *testing.T) {
 	ke := seal.NewKey()
 	v := View{NS: "cat", Target: "/cat/at/1abc/children"}
-	file, err := SealItem(Key{NS: "files", Epoch: 2, K: ke, Pad: true}, v, "notes", map[string]any{"file": "x"})
+	file, err := SealItem(Key{NS: "files", Epoch: 2, K: ke, Pad: true}, v, "notes", testRev, map[string]any{"file": "x"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	kr, _ := seal.ResourceKey(ke, "files", "notes")
-	kv, _ := seal.ViewKey(kr, v.Target)
+	krev, _ := seal.RevKey(kr, testRev)
+	kv, _ := seal.ViewKey(krev, v.Target)
 	h, pt, err := seal.Open(file, kv)
 	if err != nil || h.Expect("files#2", seal.PL{"ns": "files", "name": "notes", "view": v.Target}) != nil || !seal.IsPadded(h, pt) {
 		t.Fatalf("a value of files/notes in a view of cat: %+v %v", h, err)

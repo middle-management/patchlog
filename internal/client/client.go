@@ -448,6 +448,9 @@ func (c *Client) viewContent(r *response, method, path string) (string, bool) {
 // viewContentRe is a resource's immutable URL under a view (§7.9 Content).
 var viewContentRe = regexp.MustCompile(`^/ns/([a-z0-9][a-z0-9_-]{0,63})/view/1[a-z2-7]{32}(/r/.+)$`)
 
+// viewPrefixRe is a view's prefix /ns/{ns}/view/{view} (§7.9 URLs).
+var viewPrefixRe = regexp.MustCompile(`^/ns/[a-z0-9][a-z0-9_-]{0,63}/view/1[a-z2-7]{32}`)
+
 func (c *Client) setAuth(hr *http.Request) {
 	if c.bearer != "" {
 		hr.Header.Set("Authorization", "Bearer "+c.bearer)

@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Filtered namespace reads (§7.9).
@@ -132,6 +134,24 @@ func checkFilteredAt(fa FilteredAt) error {
 	return checkOptID("at", fa.At)
 }
 
+// filteredBody is the body of a filtered 200 r of namespace ns: opened by
+// open where it is sealed (application/jose, §7.9 Sealed namespaces),
+// else its JSON, which a client holding sealed or e2e for ns refuses
+// (ErrLevelLowered): a sealed namespace's filtered answers are JWEs.
+func (c *Client) filteredBody(ctx context.Context, r *response, ns string, open func() (any, error)) (any, error) {
+	if isJOSE(r) {
+		body, err := open()
+		if err != nil {
+			return nil, fmt.Errorf("client: %s: %w", r.path, err)
+		}
+		return body, nil
+	}
+	if held := c.levels.held(ns); held == "sealed" || held == "e2e" {
+		return nil, fmt.Errorf("client: %s: a filtered 200 in the clear in a namespace this client holds as %s (§7.9): %w", r.path, held, ErrLevelLowered)
+	}
+	return r.value(), nil
+}
+
 // endOf is an answer's X-Namespace-Revision, which an answer at an at
 // carries (§7.9 Log ranges): the range's end.
 func endOf(r *response) (string, error) {
@@ -210,7 +230,16 @@ func (c *Client) filteredHeads(ctx context.Context, fa FilteredAt, prefix, after
 			if fa.End, err = endOf(r); err != nil {
 				return nil, "", FilteredAt{}, err
 			}
-			items, next, err := parseHeads(r, prefix)
+			body, err := c.filteredBody(ctx, r, fa.NS, func() (any, error) {
+				// Sealed: one JWE under the view's K_view, bound to
+				// { ns, view, at, after } (§7.9 Sealed namespaces).
+				return c.openFiltered(ctx, fa.NS, fa.View, string(r.body), fixedPL(seal.PL{"ns": fa.NS, "at": fa.At, "after": after}))
+			})
+			if err != nil {
+				return nil, "", FilteredAt{}, err
+			}
+			m, _ := body.(map[string]any)
+			items, next, err := parseHeadsValue(m, r.path, prefix)
 			if err == nil {
 				err = checkFilteredHeads(r, items, next, after)
 			}
@@ -421,18 +450,26 @@ func (c *Client) FilteredLogPage(ctx context.Context, fa FilteredAt, since strin
 		return nil, "", got, err
 	}
 	got = FilteredAt{NS: fa.NS, View: fa.View, At: fa.At}
-	next, err = c.filteredLogPage(ctx, filteredPath(fa, "log"), since, func(r *response, _ string) (string, error) {
-		if isJOSE(r) {
-			// Only namespaces that are neither sealed nor end-to-end
-			// are filtered (§7.9 Where).
-			return "", fmt.Errorf("client: %s: a filtered page is sealed (§7.9)", r.path)
-		}
+	next, err = c.filteredLogPage(ctx, filteredPath(fa, "log"), since, func(r *response, logNext string) (string, error) {
 		end, err := endOf(r)
 		if err != nil {
 			return "", err
 		}
 		got.End = end
-		es, err := parseNSLog(r.value(), r.path)
+		body, err := c.filteredBody(ctx, r, fa.NS, func() (any, error) {
+			// Sealed: one JWE under the view's K_view, bound to the
+			// page's bounds, its last entry scanned, X-Log-Next, or on
+			// the last page the range's end (§7.9 Sealed namespaces).
+			last := logNext
+			if last == "" {
+				last = end
+			}
+			return c.openFiltered(ctx, fa.NS, fa.View, string(r.body), fixedPL(seal.RangePL(fa.NS, since, last)))
+		})
+		if err != nil {
+			return "", err
+		}
+		es, err := parseNSLog(body, r.path)
 		if err != nil {
 			return "", err
 		}

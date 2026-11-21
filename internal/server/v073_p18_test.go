@@ -197,6 +197,9 @@ func kidsOf(t *testing.T, r *resp) string {
 		if n, ok := e["name"].(string); ok {
 			k += " " + n
 		}
+		if _, ok := e["view"].(string); ok {
+			k += " view" // a partial reader's K_view (§E.2.3, v0.89)
+		}
 		out = append(out, k)
 	}
 	return strings.Join(out, ",")
@@ -312,8 +315,8 @@ func TestV073KeysPerResourceNames(t *testing.T) {
 		"readable of those":          {g(enum("a", "b"), notB), []any{"a"}, 200, "s#1 a"},
 		"inside all":                 {g(map[string]any{"all": []any{enum("a", "b")}}), nil, 200, "s#1 a,s#1 b"},
 		"two fixing rules intersect": {g(enum("a", "b"), map[string]any{"op": "test", "path": "/resource", "value": "a"}), nil, 200, "s#1 a"},
-		"refers without fixing":      {g(notB), nil, 403, ""},
-		"an invalid literal":         {g(enum("a", "b/c")), []any{"a"}, 403, ""},
+		"refers without fixing":      {g(notB), nil, 200, "s#1 view"},                    // a partial reader: K_view (v0.89)
+		"an invalid literal":         {g(enum("a", "b/c")), []any{"a"}, 200, "s#1 view"}, // fixes nothing: a partial reader
 		"unrestricted: K_e, ignored": {e.grant(k, "user:r", []string{"s"}, []string{"read"}), []any{"zzz"}, 200, "s#1"},
 	} {
 		body := map[string]any{}

@@ -1224,8 +1224,8 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 		}
 		byDoc := t.readsByDoc(n, a)
 		if n.purged {
-			if byDoc {
-				return notFound() // judged with a null document (§6.4.1)
+			if byDoc && !t.purgedReadable(a, n, name) {
+				return notFound() // judged with /doc rules set aside (§6.4.1, §8.5)
 			}
 			return t.purgedRead(n)
 		}
@@ -1235,7 +1235,7 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 			out.Status = 404
 			return nil
 		}
-		if byDoc && !t.mayReadBlob(a, n, name, bid) {
+		if byDoc && !t.mayReadBlob(a, n, name, bid) && !(t.resolve(n, name, nil).state == Purged && t.purgedReadable(a, n, name)) {
 			// Judged with the documents that reference it (§7.8, §6.4.1).
 			return notFound()
 		}
@@ -1249,7 +1249,25 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 		}
 		if t.isSealedNS(n) {
 			// Sealed namespaces never serve the plaintext: 302 to the blob
-			// sealed under an epoch (§E.2.2, sealedblobs.go).
+			// sealed under an epoch (§E.2.2, sealedblobs.go); for a reader
+			// judged per revision, the latest of a revision it may read
+			// (§7.9 Content, v0.89).
+			if byDoc {
+				if eps, all := t.visibleBlobEpochs(a, n, name, bid); !all {
+					if len(eps) > 0 {
+						out.Status, out.Epoch = 302, latestEpoch(eps)
+						return nil
+					}
+					// None it may read has an epoch yet: the newest it
+					// may read is sealed under the current one, never a
+					// hidden one, whose epoch the 302 would name
+					// (HTTP-76). With none, as a read-rule failure.
+					if job, nsID = t.visibleBlobHead(a, n, name, bid), n.id; job == nil {
+						return notFound()
+					}
+					return nil
+				}
+			}
 			job, nsID = t.sealedBlobHead(n, name, bid, out), n.id
 			return nil
 		}

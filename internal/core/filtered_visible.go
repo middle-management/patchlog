@@ -14,7 +14,8 @@ import (
 // resource's URLs that name none, that revision for /rev/{id}, each
 // entry's for a log, the deleted document for a tombstone, and null where
 // the read concerns no stored document (none, purged, or pruned and not
-// kept), in a sealed or end-to-end namespace, and for purge entries. A
+// kept), in an end-to-end namespace (sealed ones judge the plaintext the
+// origin holds, v0.89), and for purge entries. A
 // rule that refers to /doc fails as a whole against a null doc.
 //
 // A judge is one reader's check: its grant's rules, or those a view's
@@ -120,7 +121,7 @@ func (t *tx) visibleRow(j *judge, n *nsRow, name string, row *revRow) bool {
 	if !j.doc {
 		return j.byName(name)
 	}
-	if row == nil || t.nsLevel(n) >= levelSealed || t.resPurged(row.res) {
+	if row == nil || t.nsLevel(n) >= levelE2E || t.resPurged(row.res) {
 		return j.filter.AllowsDoc(name, nil, false)
 	}
 	k := judgedKey{j.key, name, row.id}
@@ -282,6 +283,52 @@ func (t *tx) mayReadBlob(a *actor, n *nsRow, name string, bid ids.ID) bool {
 		}
 	}
 	return !found && t.visibleRow(j, n, name, v.head)
+}
+
+// visibleBlobEpochs lists, for a whose reads of sealed n are judged per
+// revision (readsByDoc), the epochs n serves blob bid of name under
+// through a revision a may read: those whose epoch is fixed (§E.2.2) and
+// whose document references it. A blob of an epoch only hidden revisions
+// reference is a read-rule failure (§7.9 Content: "a blob a visible
+// revision references (sealed: one of epoch e …)", v0.89). all is true
+// where a's admission decides alone (rowJudge).
+func (t *tx) visibleBlobEpochs(a *actor, n *nsRow, name string, bid ids.ID) (eps map[int]bool, all bool) {
+	j, every := t.rowJudge(n, a)
+	if every || j != nil && !j.doc && (a.view == "" || j.byName(name)) {
+		return nil, true
+	}
+	eps = map[int]bool{}
+	if j == nil {
+		return eps, false
+	}
+	v := t.resolve(n, name, nil)
+	if v.head == nil {
+		return eps, false
+	}
+	for _, seg := range t.ancestry(v.head) {
+		rows, err := t.Query(`SELECT r.seq FROM revisions r JOIN blob_refs b ON b.res = r.res AND b.bid = ?
+			WHERE r.res = ? AND r.kind = ? AND r.seq <= ? AND r.seq >= b.from_seq AND (b.to_seq IS NULL OR r.seq < b.to_seq)
+			ORDER BY r.seq DESC`, bid[:], seg.res, kindRev, seg.max)
+		t.must(err)
+		var seqs []int64
+		for rows.Next() {
+			var s int64
+			t.must(rows.Scan(&s))
+			seqs = append(seqs, s)
+		}
+		t.must(rows.Err())
+		rows.Close()
+		for _, s := range seqs {
+			row := t.rev(s)
+			if !t.visibleRow(j, n, name, row) {
+				continue
+			}
+			if e, fixed := t.revEpochFixed(n, row); fixed {
+				eps[e] = true
+			}
+		}
+	}
+	return eps, false
 }
 
 // ViewPrivate reports whether cred, a view's content URL's (ViewCredentials),

@@ -100,7 +100,7 @@ func TestV081LegacySealingResealed(t *testing.T) {
 		t.Fatalf("resealed %s, want %s", got, doc)
 	}
 	var kver int
-	if err := db.QueryRow(`SELECT kver FROM sealed WHERE kind = 'config' AND key = `+ph(1), h1).Scan(&kver); err != nil || kver != 1 {
+	if err := db.QueryRow(`SELECT kver FROM sealed WHERE kind = 'config' AND key = `+ph(1), h1).Scan(&kver); err != nil || kver != 2 {
 		t.Fatalf("kver %d %v", kver, err)
 	}
 	if again := e.get("/ns/s/rev/" + h1); string(again.Body) != string(r.Body) {

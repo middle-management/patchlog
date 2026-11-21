@@ -34,3 +34,54 @@ func ViewKey(key []byte, view string) ([]byte, error) {
 	}
 	return hkdf.Key(sha256.New, key, []byte(ViewKeySalt), view, KeySize)
 }
+
+// Salts of the keys derived below each resource's K_r and each epoch's
+// K_e (§E.2.1, v0.89).
+const (
+	RevKeySalt      = "patchlog-e2-rev"
+	LogKeySalt      = "patchlog-e2-log"
+	BlobKeySalt     = "patchlog-e2-blob"
+	FilterViewSalt  = "patchlog-e2-view"
+	viewWrapNamePfx = "view:"
+)
+
+// RevKey derives K_rev = HKDF-SHA256(ikm = K_r, salt = "patchlog-e2-rev",
+// info = id), 32 bytes (§E.2.1): the key a revision's document is sealed
+// under at E2. id is the revision's id in text form. It yields no sibling
+// and no K_r.
+func RevKey(resourceKey []byte, id string) ([]byte, error) {
+	return deriveBelow(resourceKey, RevKeySalt, id)
+}
+
+// LogKey derives K_log = HKDF-SHA256(ikm = K_r, salt = "patchlog-e2-log",
+// info = id), 32 bytes (§E.2.1): the key a revision's or tombstone's
+// resource log entry is sealed under at E2, in a range or as an event.
+func LogKey(resourceKey []byte, id string) ([]byte, error) {
+	return deriveBelow(resourceKey, LogKeySalt, id)
+}
+
+// BlobKey derives K_blob = HKDF-SHA256(ikm = K_r, salt =
+// "patchlog-e2-blob", info = bid), 32 bytes (§E.2.1): the key a blob is
+// sealed under at E2 (§E.2.2 Sealed blobs). bid is the blob's id in text
+// form.
+func BlobKey(resourceKey []byte, bid string) ([]byte, error) {
+	return deriveBelow(resourceKey, BlobKeySalt, bid)
+}
+
+// FilterViewKey derives K_view = HKDF-SHA256(ikm = K_e, salt =
+// "patchlog-e2-view", info = ns ‖ 0x0A ‖ view), 32 bytes (§E.2.1): the
+// only key of a partial reader at E2 (§E.2.3), under which its filtered
+// answers and a view's keys for each revision are sealed (§E.2.2, §7.9).
+// view is the §7.9 view id in text form. It yields no other key. It is not
+// ViewKey, the "patchlog-view" key services seal derived views under
+// (§E.2.6).
+func FilterViewKey(epochKey []byte, ns, view string) ([]byte, error) {
+	return deriveBelow(epochKey, FilterViewSalt, ns+"\n"+view)
+}
+
+func deriveBelow(ikm []byte, salt, info string) ([]byte, error) {
+	if len(ikm) != KeySize {
+		return nil, ErrKeySize
+	}
+	return hkdf.Key(sha256.New, ikm, []byte(salt), info, KeySize)
+}

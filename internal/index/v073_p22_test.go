@@ -580,7 +580,7 @@ func TestV073PublicSealedPerEntry(t *testing.T) {
 		if hit["resource"] != "a" || hit["score"] != nil || jwe == "" {
 			t.Fatalf("hit %v", hit)
 		}
-		v := decodeJSON(t, must(derived.OpenItem(jwe, derived.ItemKey(epochKeys(t, w, "ps"), "ps", "a"), derived.View{NS: "ps", Target: f.path}, "ps", "a")))
+		v := decodeJSON(t, must(derived.OpenItem(jwe, derived.ItemKey(epochKeys(t, w, "ps"), "ps", "a", hit["id"].(string)), derived.View{NS: "ps", Target: f.path}, "ps", "a")))
 		if v["score"] == nil || fmt.Sprint(v["/tag"]) != "[t]" {
 			t.Errorf("opens to %v", v)
 		}

@@ -95,15 +95,44 @@ func nsKey(t *testing.T, ke []byte, ns string) []byte {
 	return k
 }
 
-// open decrypts a JWE, requiring kid and pl.
+// open decrypts a JWE, requiring kid and pl. key is K_n for namespace
+// content and K_r for a resource's, from which a revision's document's
+// K_rev and a log entry's K_log are derived (§E.2.1, v0.89).
 func open(t *testing.T, jwe string, key []byte, kid string, pl seal.PL) []byte {
 	t.Helper()
+	key = belowKr(t, key, pl)
 	pt, err := seal.OpenExpect(jwe, key, kid, pl)
 	if err != nil {
 		h, _ := seal.ParseHeader(jwe)
 		t.Fatalf("open (want %s %v): %v; header %s", kid, pl, err, h.Raw)
 	}
 	return pt
+}
+
+// belowKr is the key below K_r kr that content bound to pl is sealed
+// under at E2 (§E.2.1): K_rev of a document, K_log of a log entry, K_blob
+// of a blob; kr itself for anything else.
+func belowKr(t *testing.T, kr []byte, pl seal.PL) []byte {
+	t.Helper()
+	id, _ := pl["id"].(string)
+	var k []byte
+	var err error
+	switch kind, _ := pl["kind"].(string); {
+	case pl["name"] == nil:
+		return kr
+	case pl["blob"] != nil:
+		k, err = seal.BlobKey(kr, pl["blob"].(string))
+	case id != "" && kind == seal.KindDoc:
+		k, err = seal.RevKey(kr, id)
+	case id != "" && (kind == seal.KindRev || kind == seal.KindTombstone):
+		k, err = seal.LogKey(kr, id)
+	default:
+		return kr
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return k
 }
 
 func isJOSE(r *resp) bool { return r.H.Get("Content-Type") == seal.ContentType }

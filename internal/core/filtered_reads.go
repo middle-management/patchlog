@@ -172,6 +172,13 @@ func (e *Engine) FilteredCurrent(ctx context.Context, ns, view, suffix string, c
 // admission (§8.5). info is set wherever the checkpoint is known, errors
 // included, for the answer's tags.
 func (e *Engine) FilteredHeads(ctx context.Context, ns, view, at, after, prefix string, cred Credentials) (page *HeadsPage, info *FilteredInfo, err error) {
+	var fsl *fsealing
+	defer func() {
+		// In a sealed namespace, one JWE under the view's K_view (§E.2.2).
+		if err == nil && fsl != nil {
+			page.JWE, err = e.sealFiltered(ctx, fsl)
+		}
+	}()
 	err = e.read(ctx, func(t *tx) error {
 		n, fv, cp, err := t.filteredHeadsView(ns, view, at, cred)
 		if err != nil {
@@ -198,6 +205,7 @@ func (e *Engine) FilteredHeads(ctx context.Context, ns, view, at, after, prefix 
 		if len(rows) == limit {
 			page.Next = rows[len(rows)-1].name
 		}
+		fsl = t.filteredHeadsSealing(n, fv, after, page, rows)
 		return nil
 	})
 	return page, info, err

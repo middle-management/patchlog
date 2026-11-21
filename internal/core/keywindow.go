@@ -12,7 +12,8 @@ package core
 // give the request's own grant or one in Source-Authorization:
 //
 //   - which keys (keysOpenResource): K_r of the resource, for a grant whose
-//     rules fix /resource to it and that may read it, or K_e, for one that
+//     rules fix /resource to it, don't refer to /doc and that may read it
+//     (v0.89: a partial reader's K_view opens nothing here), or K_e, for one that
 //     reads the namespace unrestricted; any other gets none;
 //   - which epochs (grantEpochsOf): the grant's §E.2.3 window, from the
 //     epoch in force at its latest nbf (the current one without nbf) up to
@@ -76,6 +77,11 @@ func (t *tx) keysOpen(n *nsRow, name string, epochs map[int]bool, creds []Creden
 // it and a may read it, or K_e, if they don't fix it and a reads the
 // namespace unrestricted (§2.1, §E.2.3).
 func (t *tx) keysOpenResource(a *actor, name string) bool {
+	if j := t.grantJudge(a); j != nil && j.doc {
+		// Read rules on /doc: a view key at most, which opens nothing
+		// for a copy or schema resolution (§E.2.3, v0.89).
+		return false
+	}
 	fixed, fixes := fixedNames(a)
 	if !fixes {
 		return t.readsUnrestricted(a)

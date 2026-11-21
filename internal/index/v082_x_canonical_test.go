@@ -147,7 +147,7 @@ func TestV082XIndexSealsCanonicalJSON(t *testing.T) {
 		if ih.Kid != ns+"#1" || ih.PL["view"] != pf.path || ih.PL["name"] != "a" || ih.PL["ns"] != ns || len(ih.PL) != 3 {
 			t.Errorf("%s per entry: header %+v, served at %s", ns, ih, pf.path)
 		}
-		ipt := must(derived.OpenItem(jwe, derived.ItemKey(keys, ns, "a"), derived.View{NS: ns, Target: pf.path}, ns, "a"))
+		ipt := must(derived.OpenItem(jwe, derived.ItemKey(keys, ns, "a", hit["id"].(string)), derived.View{NS: ns, Target: pf.path}, ns, "a"))
 		vals := canonical(ns+", a's sealed values", ipt, padded)
 		// The members it replaces: none of them is also served clear.
 		for m := range vals {

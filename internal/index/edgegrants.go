@@ -215,7 +215,10 @@ func decodePending(s string) map[string]string {
 // in the id text form of §3.2, K being the whole entry of the key that
 // verified the grant, as the judged namespace document gives it (for a
 // branch, the effective key's source entry, §C.4), and R mapping each
-// read role recorded to its whole definition there. "" for no key.
+// read role recorded, and every other role that lists read there, to its
+// whole definition there (readRoleDefs): a change to any role that lists
+// read ends the cookie, as at the origin (§7.9 view, SERVICES §A.4;
+// Filtered reads scenario 61). "" for no key.
 func entryDigest(key map[string]any, roles map[string]any) string {
 	if key == nil {
 		return ""
@@ -325,16 +328,37 @@ func (ix *Index) entryOfIn(ctx context.Context, cfg *grantcheck.Config, kid stri
 	if err != nil || !ok || key.Raw == nil {
 		return "", key, false, err
 	}
-	defs, _ := cfg.Doc["roles"].(map[string]any)
+	rs, ok := readRoleDefs(cfg.Doc, roles)
+	if !ok {
+		return "", key, false, nil
+	}
+	return entryDigest(key.Raw, rs), key, true, nil
+}
+
+// readRoleDefs maps, in a namespace document doc, each role of roles, a
+// grant's read roles, and every other role that lists read, to its whole
+// definition (entryDigest). ok is false where one of roles is gone.
+func readRoleDefs(doc map[string]any, roles []string) (map[string]any, bool) {
+	defs, _ := doc["roles"].(map[string]any)
 	rs := make(map[string]any, len(roles))
 	for _, r := range roles {
 		def, ok := defs[r]
 		if !ok {
-			return "", key, false, nil
+			return nil, false
 		}
 		rs[r] = def
 	}
-	return entryDigest(key.Raw, rs), key, true, nil
+	for r, def := range defs {
+		m, _ := def.(map[string]any)
+		can, _ := m["can"].([]any)
+		for _, v := range can {
+			if v == "read" {
+				rs[r] = def
+				break
+			}
+		}
+	}
+	return rs, true
 }
 
 // entryHolds reports whether k, a key a cookie came from, is still, in
@@ -998,6 +1022,9 @@ func (ix *Index) keysHold(ctx context.Context, ns, m string, exp int64, also fun
 	if err != nil {
 		return err
 	}
+	if err := ix.basesJudged(ctx, cfg); err != nil {
+		return err
+	}
 	for _, k := range recorded {
 		key, ok, err := ix.entryHolds(ctx, cfg, k)
 		if err != nil {
@@ -1006,6 +1033,29 @@ func (ix *Index) keysHold(ctx context.Context, ns, m string, exp int64, also fun
 		if !ok || also != nil && !also(cfg, key, k) {
 			return errRulesChanged
 		}
+	}
+	return nil
+}
+
+// basesJudged is errRulesChanged where a cookie of cfg's namespace can't
+// be judged by every namespace-document entry of its bases after its
+// exchange (SERVICES §A.4 Cookies, v0.88: "in a branch by its bases'
+// entries after their checkpoints then too … A cookie it can't judge so
+// … is 403"): a base in its chain the index doesn't follow brings no
+// batch to judge (cookieEnds), so a change there and back would go
+// unseen. A base whose document can't be read now is that error.
+func (ix *Index) basesJudged(ctx context.Context, cfg *grantcheck.Config) error {
+	seen := map[string]bool{cfg.NS: true}
+	for cur := cfg; cur.Base != ""; {
+		if seen[cur.Base] || len(seen) > maxChain || !ix.known(cur.Base) {
+			return errRulesChanged
+		}
+		seen[cur.Base] = true
+		next, err := ix.checker.Config(ctx, cur.Base)
+		if err != nil {
+			return err
+		}
+		cur = next
 	}
 	return nil
 }
@@ -1139,14 +1189,9 @@ func ownHolds(cfg *grantcheck.Config, k viewKeyRow) bool {
 		return false
 	}
 	key := cfg.Keys[i]
-	defs, _ := cfg.Doc["roles"].(map[string]any)
-	rs := make(map[string]any, len(roles))
-	for _, r := range roles {
-		def, has := defs[r]
-		if !has {
-			return false
-		}
-		rs[r] = def
+	rs, ok := readRoleDefs(cfg.Doc, roles)
+	if !ok {
+		return false
 	}
 	return k.pub != "" && keyPub(key) == k.pub && key.Lists("read") && entryDigest(key.Raw, rs) == k.entry
 }
@@ -1817,6 +1862,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 	ex := &exchanged{subjects: map[string][]string{}, filters: map[string]*markerRec{}}
 	var (
 		markers []string
+		views   = map[string]string{}
 		refsExp time.Time
 		upErr   error
 		denied  *grant.AuthError
@@ -1907,6 +1953,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		}
 		if _, ok := reached[ns]; ok && ix.keys.Skipped(ns) == "" {
 			markers = append(markers, a.marker)
+			views[ns] = a.vid
 			if refsExp.IsZero() || exp.Before(refsExp) {
 				refsExp = exp
 			}
@@ -1916,7 +1963,7 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		return nil, nil, upErr
 	}
 	if len(markers) > 0 {
-		vid := grantcheck.ViewID(markers)
+		vid := refsViewID(views)
 		slices.Sort(markers)
 		ex.issues = append(ex.issues, svcIssue{Prefix: refsPrefix(vid), Exp: refsExp})
 		ex.subjects[refsPrefix(vid)] = markers

@@ -252,7 +252,7 @@ func UnwrapKeyAuth(priv *ecdh.PrivateKey, sender *ecdh.PublicKey, w WrappedKey) 
 	if sender == nil || sender.Curve() != ecdh.X25519() || priv.Curve() != ecdh.X25519() {
 		return nil, fmt.Errorf("seal: an X25519 key is needed")
 	}
-	k, err := hpkeOpen(hpkeAEADAES256GCM, priv, sender, wrapInfo(w.Kid, w.Resource), nil, w.Wrapped)
+	k, err := hpkeOpen(hpkeAEADAES256GCM, priv, sender, wrapInfo(w.Kid, w.infoName()), nil, w.Wrapped)
 	if err != nil || len(k) != KeySize {
 		return nil, ErrDecrypt
 	}

@@ -124,7 +124,8 @@ func TestV049KeysUnrestricted(t *testing.T) {
 
 // v0.49 §7.4, §C.7: a namespace can't start requiring nonces while a
 // dependent, a branch at any depth that isn't purged, doesn't: 409 in_use
-// with the dependents, leaves first, the order to set them in.
+// with the dependents, set leaves first, and listed since v0.88 as
+// referencing is, in byte order of name (§6.1).
 func TestV049NonceDependents(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -146,7 +147,7 @@ func TestV049NonceDependents(t *testing.T) {
 			t.Fatalf("%s: dependents %v, want %v", ns, got, want)
 		}
 	}
-	dependents("m", "b2", "b1", "c1")
+	dependents("m", "b1", "b2", "c1")
 	dependents("b1", "b2")
 	expect(t, e.patchNS("b2", require, ""), 201)
 	expect(t, e.patchNS("b1", require, ""), 201)
