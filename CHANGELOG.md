@@ -77,6 +77,17 @@ core, decided by the grant's own read rules. About 86,000 lines are removed and 
   `pool_max_conns` set high as a ceiling is now the pool's size: `pool_max_conns=100` on 4 vCPUs
   went from 16 + 4 connections to 100 + 25 + 25. Keep every instance's sum under the server's
   `max_connections`.
+- **Postgres: a write's check and a revision read take one round trip.** A single write's
+  check outside the lock (D.3) read its namespace, the resource, its head and the idempotent
+  retry's revision (§7.2) in four statements inside a read transaction: six round trips with
+  its begin and rollback. It now reads them in one statement, and a revision read
+  (`/r/{ns}/{name}/rev/{id}`) likewise reads its namespace, resource, head and revision in one.
+  Either runs without a transaction while it needs that one statement, which sees one snapshot
+  as a transaction would, and holds no connection, idle in a transaction, while it works; one
+  that needs more (a branch's bases, a document or schema not cached, a retry) is begun again
+  in a read transaction, and its namespace's next reads start in one for a while. The re-check
+  under the lock is unchanged. On a local Postgres a check uses about a third less of the core's
+  CPU, a revision read about 40% less.
 - **A purge doesn't read the branches it has no work in.** A purge in a base looked every
   branch below it up by key, to learn whether it held the purged document or might read it
   through: about 0.005 ms a branch, 54 ms on Postgres with 10,000 branches that didn't see

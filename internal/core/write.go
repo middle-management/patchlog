@@ -502,10 +502,19 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// A config change locks the namespace exclusively; resource writes
 	// alone lock it shared (pglock.go).
 	t.reqCreds = req.anyCreds()
+	st := make([]*itemState, len(items))
+	for i, it := range items {
+		st[i] = &itemState{Item: it, index: i}
+	}
 	var n *nsRow
-	if cc != nil || t.exclusive {
+	switch {
+	case cc != nil || t.exclusive:
 		n = t.nsForWrite(req.NS)
-	} else {
+	case len(items) == 1:
+		// With the item's resource, its head and the retry lookup's
+		// revision, in one statement (lookupResource).
+		n = t.nsForItem(req.NS, st[0])
+	default:
 		n = t.nsForResources(req.NS)
 	}
 	if n == nil {
@@ -551,10 +560,6 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	maxItems, maxSize := t.batchLimits(cur, a)
 
 	// The optional config change runs steps 1–6 first (§7.5).
-	st := make([]*itemState, len(items))
-	for i, it := range items {
-		st[i] = &itemState{Item: it, index: i}
-	}
 	all := append([]*itemState(nil), st...) // a dry run drops failed items from st
 	dryFails := map[int]*Error{}
 	fail := func(fs []itemErr) error {
@@ -1340,8 +1345,8 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 			return nil
 		}
 		last := want[len(want)-1]
-		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, last[:]))
-		if err != nil || row.author != author || !t.sameRoot(row.grantID, a) {
+		row := t.revByID(own.id, last)
+		if row == nil || row.author != author || !t.sameRoot(row.grantID, a) {
 			return nil
 		}
 		if s.cands != nil && !contains(s.cands, t.entryVerb(row)) {
@@ -1397,11 +1402,11 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		if err != nil {
 			return nil
 		}
-		var rseq int64
-		if t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND id = ?`, own.id, target[:]).Scan(&rseq) != nil {
+		row := t.revByID(own.id, target)
+		if row == nil {
 			return nil
 		}
-		rows, err := t.Query(`SELECT ns_seq FROM head_history WHERE res = ? AND target_seq = ?`, own.id, rseq)
+		rows, err := t.Query(`SELECT ns_seq FROM head_history WHERE res = ? AND target_seq = ?`, own.id, row.seq)
 		t.must(err)
 		for rows.Next() {
 			var s int64
@@ -1479,8 +1484,8 @@ func (t *tx) candidateVerbsMatch(n *nsRow, st []*itemState) bool {
 		if !ok || own == nil {
 			return false
 		}
-		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, want[0][:]))
-		if err != nil || !contains(s.cands, t.entryVerb(row)) {
+		row := t.revByID(own.id, want[0])
+		if row == nil || !contains(s.cands, t.entryVerb(row)) {
 			return false
 		}
 	}

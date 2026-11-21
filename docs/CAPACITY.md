@@ -769,6 +769,18 @@ time only): the consumers read the revision each namespace entry names
   - Group commits take a connection from a pool of their own (a quarter of the main pool's
     size) when one is free, so a group of about 30 writes no longer queues behind every
     write's check.
+  - A write's check is one round trip, not six: its namespace, resource, head and the retry
+    lookup of §7.2 are one statement (the lookup returns no row almost always), and a check
+    that needs only that statement runs without a transaction (no begin, no rollback), so its
+    connection is held for the statement alone, not idle in a transaction while the core works
+    on the check. A check that needs more (a branch's bases, a document or schema not cached,
+    an idempotent retry) runs again in a read transaction. The same holds for followers'
+    revision reads (`resourceRev`): one round trip instead of five, or seven below the head.
+    `purgedItems` and the rest of step 2 repeated no statements (the transaction kept the
+    rows) but resolved each item again; they now share one view. On a local Postgres 16, a
+    check took about 175 µs of the core's CPU instead of 270, a revision read about 150 instead
+    of 240 (`BenchmarkCheckAppend`, `BenchmarkRevUncached`, `cpu-ns/op` at `-cpu 1`); over TLS
+    to RDS the saved round trips cost more.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.

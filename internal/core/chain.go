@@ -212,6 +212,9 @@ func (t *tx) keptRow(id int64) (*nsRow, bool) {
 // uncounted runs a query of the PATCHLOG_TEST_VALIDATE_BOTH oracle, which
 // tests that count statements don't see (onStatement).
 func (t *tx) uncounted(q string, args ...any) *sql.Row {
+	if t.solo {
+		panic(errNeedsTx)
+	}
 	if t.e.pg {
 		q = rebind(q)
 	}
