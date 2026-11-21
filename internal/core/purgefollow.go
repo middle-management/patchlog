@@ -108,9 +108,9 @@ func (k followKey) String() string {
 // recordImport records an import batch's source (§G.4.4), as the batch
 // commits: a source with a bundle and another deployment's origin starts a
 // follow of n from source.at, if none exists, and adds the names the batch
-// wrote whose purge a's grant allows (§C.2 step 1), with a's principal as
-// their importer. A batch whose grant may purge none of them records
-// nothing (§G.1, v0.88). Whether the origin is trusted, and the principal
+// wrote whose purge a's grant allows as a purge judges it (mayPurgeAll),
+// with a's principal as their importer. A batch whose grant may purge none
+// of them records nothing (§G.1, v0.88). Whether the origin is trusted, and the principal
 // its importer, is decided only when following.
 func (t *tx) recordImport(n *nsRow, a *actor, src any, st []*itemState) {
 	m, ok := src.(map[string]any)
@@ -128,7 +128,7 @@ func (t *tx) recordImport(n *nsRow, a *actor, src any, st []*itemState) {
 	if _, err := ids.Parse(at); err != nil {
 		return
 	}
-	st = t.mayPurgeAll(a, st)
+	st = t.mayPurgeAll(n, a, st)
 	if len(st) == 0 {
 		return
 	}
@@ -159,20 +159,38 @@ func (t *tx) recordImport(n *nsRow, a *actor, src any, st []*itemState) {
 	}
 }
 
-// mayPurgeAll is the items of st whose resource a's grant may purge, as
-// step 1 of a purge judges it (authorize, §C.2), each check with a budget
-// of its own; one that runs out may not.
-func (t *tx) mayPurgeAll(a *actor, st []*itemState) []*itemState {
+// mayPurgeAll is the items of st whose resource a's grant may purge, as a
+// purge of it judges the grant (§6.2, §C.2, nspurge.go): step 1
+// (authorize), step 2.2 (its read rules allow reading the head) and step
+// 6 (its rules, then n's, with the purge's envelope: doc null, no writes
+// or patches). Each check has a budget of its own; one that runs out may
+// not. It changes nothing.
+func (t *tx) mayPurgeAll(n *nsRow, a *actor, st []*itemState) []*itemState {
 	prev := t.meter
-	t.meter = nil
 	defer func() { t.meter = prev }()
+	cfg := t.config(n.configSeq)
 	var out []*itemState
 	for _, s := range st {
-		if t.authorize(a, "purge", s.Resource) == nil {
+		t.meter = nil
+		if t.mayPurge(n, cfg, a, s.Resource) {
 			out = append(out, s)
 		}
 	}
 	return out
+}
+
+// mayPurge is one name's check of mayPurgeAll, under a meter of its own.
+func (t *tx) mayPurge(n *nsRow, cfg *Config, a *actor, name string) bool {
+	defer t.metered(func() bool { return t.canRead(n, cfg, a, name) })()
+	if t.authorize(a, "purge", name) != nil {
+		return false
+	}
+	if t.readsWrittenHead(n, cfg, a, name) != nil {
+		return false
+	}
+	env := t.basicEnvelope("purge", name, a)
+	env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
+	return t.purgeRules(cfg, a, env, false) == nil
 }
 
 // importerArgs is the condition on purge_follow_names that keeps the

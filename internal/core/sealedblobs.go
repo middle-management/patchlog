@@ -140,12 +140,25 @@ func (t *tx) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJ
 		return nil
 	}
 	if v.head != nil {
-		if job := t.newestBlobRev(n, name, v.head, bid); job != nil {
+		if job := t.newestBlobRev(n, name, v.head, bid, nil); job != nil {
 			return job
 		}
 	}
 	out.Status, out.NoStore = 404, true
 	return nil
+}
+
+// visibleBlobHead is sealedBlobHead for a reader a judged per revision
+// none of whose readable revisions referencing bid has an epoch yet
+// (visibleBlobEpochs): the sealing of the newest of those it may read,
+// which fixes its epoch, or nil if it may read none (§7.9 Content).
+func (t *tx) visibleBlobHead(a *actor, n *nsRow, name string, bid ids.ID) *sealJob {
+	j, _ := t.rowJudge(n, a)
+	v := t.resolve(n, name, nil)
+	if j == nil || v.head == nil {
+		return nil
+	}
+	return t.newestBlobRev(n, name, v.head, bid, func(r *revRow) bool { return t.visibleRow(j, n, name, r) })
 }
 
 // blobKeyEpochs lists the epochs a request for blob bid of resource name
@@ -162,7 +175,7 @@ func (t *tx) blobKeyEpochs(n *nsRow, name string, bid ids.ID) map[int]bool {
 	eps := t.blobEpochs(n, v.head, bid)
 	if len(eps) == 0 && v.head != nil && t.blobRevServed(v.head, bid) {
 		if t.write {
-			if e, ok := t.storeSeal(n.id, t.newestBlobRev(n, name, v.head, bid)); ok {
+			if e, ok := t.storeSeal(n.id, t.newestBlobRev(n, name, v.head, bid, nil)); ok {
 				eps[e] = true
 				return eps
 			}
@@ -187,8 +200,9 @@ func (t *tx) blobRevServed(head *revRow, bid ids.ID) bool {
 }
 
 // newestBlobRev prepares the sealing of the newest still served revision
-// of the history ending at head whose document references bid, or nil.
-func (t *tx) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID) *sealJob {
+// of the history ending at head whose document references bid, of those
+// keep allows if it isn't nil, or nil.
+func (t *tx) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID, keep func(*revRow) bool) *sealJob {
 	where := ` WHERE b.res = ? AND b.bid = ? AND r.seq <= ? AND r.kind = 0 AND ` + servedRev
 	for _, seg := range t.ancestry(head) {
 		rows, err := t.Query(`SELECT r.seq`+refRevs+where+` ORDER BY r.seq DESC`, seg.res, bid[:], seg.max)
@@ -202,6 +216,9 @@ func (t *tx) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID) *sea
 		rows.Close()
 		for _, s := range seqs {
 			row := t.rev(s)
+			if keep != nil && !keep(row) {
+				continue
+			}
 			b, err := t.docBytesAt(row)
 			if err != nil {
 				continue

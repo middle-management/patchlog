@@ -1253,8 +1253,18 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 			// judged per revision, the latest of a revision it may read
 			// (§7.9 Content, v0.89).
 			if byDoc {
-				if eps, all := t.visibleBlobEpochs(a, n, name, bid); !all && len(eps) > 0 {
-					out.Status, out.Epoch = 302, latestEpoch(eps)
+				if eps, all := t.visibleBlobEpochs(a, n, name, bid); !all {
+					if len(eps) > 0 {
+						out.Status, out.Epoch = 302, latestEpoch(eps)
+						return nil
+					}
+					// None it may read has an epoch yet: the newest it
+					// may read is sealed under the current one, never a
+					// hidden one, whose epoch the 302 would name
+					// (HTTP-76). With none, as a read-rule failure.
+					if job, nsID = t.visibleBlobHead(a, n, name, bid), n.id; job == nil {
+						return notFound()
+					}
 					return nil
 				}
 			}
