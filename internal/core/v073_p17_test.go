@@ -551,8 +551,13 @@ func TestV073P17SweepNeverWaitsOnDraw(t *testing.T) {
 	done := make(chan res, 1)
 	go func() {
 		// drawOnce, which runs rate_draw once: a deadlock is its error.
-		tokens, _, err := s.drawOnce(context.Background(), now, [][]byte{[]byte("a"), []byte("b"), []byte("c")},
-			[]float64{1, 1, 1}, []float64{10, 10, 10}, []float64{1, 1, 1}, false)
+		r := Rate{1, 10}
+		got, _, err := s.drawOnce(context.Background(), &drawReq{ctx: context.Background(), now: now,
+			ds: merged([]draw{{"a", r, 1, "x"}, {"b", r, 1, "x"}, {"c", r, 1, "x"}})})
+		var tokens map[string]float64
+		if err == nil {
+			tokens = got[0].tokens
+		}
 		done <- res{tokens, err}
 	}()
 	// The draw has seen a and b, and is adding c.

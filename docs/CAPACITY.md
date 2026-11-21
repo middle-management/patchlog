@@ -769,6 +769,14 @@ time only): the consumers read the revision each namespace entry names
   - Group commits take a connection from a pool of their own (a quarter of the main pool's
     size) when one is free, so a group of about 30 writes no longer queues behind every
     write's check.
+  - Concurrent rate-limit draws batch, as group commit's writes do (`bucketStore.draw`,
+    `rate_draws`). Up to one draw statement runs on each of the bucket pool's connections, and
+    the draws queued meanwhile go in the next one, which locks each bucket's row once for all
+    of them and judges them in turn. A principal writing to every namespace locked its row
+    once per write before; now once per batch, and no draw waits for a connection of the
+    bucket pool. To measure it again: doors' `ec2-sources.sh` with `MODE=namespaces
+    DB_CLASS=db.m7g.2xlarge FETCHES=8 STORE_POOL_CONNS=64 PRINCIPALS="one namespace"
+    PROFILE=1`, without `--local-rate-buckets`.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.

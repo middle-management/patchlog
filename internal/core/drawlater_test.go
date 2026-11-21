@@ -56,7 +56,6 @@ func TestPGDrawHoldsNoMainConn(t *testing.T) {
 	}
 
 	const n = 3 * size
-	before := e.rate.store.db.Stats().WaitCount
 	errs := make([]error, n)
 	done := make(chan struct{})
 	go func() {
@@ -73,12 +72,12 @@ func TestPGDrawHoldsNoMainConn(t *testing.T) {
 	})
 	// Two draws wait, one on each of the bucket pool's connections, the
 	// first for the held row and the other for the first, and the others
-	// wait for those connections.
+	// queue for the next batch (ratebuckets.go, draw).
 	within(t, 10*time.Second, "every write's check ends and its draw waits", func() bool {
 		var w, held int
 		mon.QueryRow(`SELECT COUNT(*), COUNT(*) FILTER (WHERE $1 = ANY (pg_blocking_pids(pid))) FROM pg_stat_activity
 			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%rate_draw(%'`, pid).Scan(&w, &held)
-		return w == 2 && held > 0 && e.rate.store.db.Stats().WaitCount-before >= n-2
+		return w == 2 && held > 0 && e.rate.store.queued() == n-2
 	})
 	// The main pool's connections are free, but for the leader lock's and
 	// one the tailer may hold.
