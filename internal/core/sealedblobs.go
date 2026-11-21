@@ -259,9 +259,9 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 		if aerr != nil {
 			return aerr
 		}
-		if t.readsByDoc(n, a) && (n.purged || !t.mayReadRow(a, n, name, nil)) {
-			// Sealed content is judged with a null document (§6.4.1),
-			// as is a purged namespace's.
+		if t.readsByDoc(n, a) && !t.sealedBlobReadable(a, n, name) {
+			// Sealed content is judged with a null document (§6.4.1); a
+			// purged one with its rules on /doc set aside (§8.3, §8.5).
 			return notFound()
 		}
 		if n.purged {

@@ -90,10 +90,12 @@ func TestV088PurgedResourceGoneToDocReader(t *testing.T) {
 	}}
 	nope := w.grant(w.k, "user:nope", []string{"matches"}, []string{"read"}, map[string]any{"rules": []any{only}})
 	adminP := w.grant(w.k, "user:root", []string{"matches"}, []string{"read", "create", "append", "purge"})
-	h := w.v87Doc("matches", "secret", map[string]any{"team": "a"})
+	bid := w.upload("matches", "secret", "text/plain", []byte("s"), w.admin)
+	h := w.v87Doc("matches", "secret", map[string]any{"team": "a", "file": map[string]any{"": bid, "type": "text/plain", "size": 1.0}})
 	expect(t, w.get("/r/matches/secret", li), 302)
 	expect(t, w.purge("matches", "secret", h, adminP), 204)
-	for _, p := range []string{"/r/matches/secret", "/r/matches/secret/rev/" + h, "/r/matches/secret/log", "/r/matches/secret/raw"} {
+	for _, p := range []string{"/r/matches/secret", "/r/matches/secret/rev/" + h, "/r/matches/secret/log", "/r/matches/secret/raw",
+		"/r/matches/secret/blob/" + bid, "/r/matches/secret/blob/" + bid + "/e/1", "/r/matches/secret/log?live=long-poll", "/r/matches/secret/events"} {
 		r := w.v87Get(p, li)
 		if r.Code == 302 && p != "/r/matches/secret" {
 			// A partial reader's immutable URL is served under its view

@@ -53,3 +53,13 @@ func (t *tx) headReadable(a *actor, n *nsRow, name string) bool {
 	}
 	return t.mayReadRow(a, n, name, v.head)
 }
+
+// sealedBlobReadable is the read check of a sealed blob's epoch URL for a
+// reader judged per revision: a purged namespace's or resource's with its
+// rules on /doc set aside (purgedReadable), any other with a null document.
+func (t *tx) sealedBlobReadable(a *actor, n *nsRow, name string) bool {
+	if n.purged || t.resolve(n, name, nil).state == Purged {
+		return t.purgedReadable(a, n, name)
+	}
+	return t.mayReadRow(a, n, name, nil)
+}
