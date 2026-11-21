@@ -793,7 +793,20 @@ time only): the consumers read the revision each namespace entry names
   namespace, resource and head reads, the retry lookup of §7.2, rollback), each a statement
   through pgx and TLS (TLS writes 8–9% in all). Followers' revision reads took 10–15%, group
   commits 9%, garbage collection 11%. Fewer round trips in the check would save the most.
-- **Since these runs** (not yet measured again):
+- **On an 8-vCPU core (`c7g.2xlarge`), pool 64, buckets in memory**, 8 and 16 namespaces wrote
+  7,777 and 10,462 a second at 3.5–4.5 vCPUs busy, the pool full again (1,000–1,250 requests
+  waiting). A pool of 128 wrote less (7,757 at 16): Postgres slowed with more sessions (group
+  commit's insert 2.5 ms against 1.6, the log lock 0.49 ms against 0.12) while RDS was at 67%
+  CPU, so about 64 connections is the most that helps a `db.m7g.2xlarge`.
+- **With batched draws and one-statement checks (cce94746, below), buckets in Postgres again**,
+  8-vCPU core, pool 64: one writer principal wrote 7,819 and 11,621 a second at 8 and 16
+  namespaces (p99 179 and 255 ms), more than with buckets in memory before; a principal per
+  namespace 7,978 and 9,874 (a batch then locks a row per namespace). No request waited for a
+  connection: writes waited in their namespaces' group commit queues, the core at 58% CPU, RDS
+  at 76% with write latency up to 7.9 ms and a disk queue of 3.3. `rate_draw` and `rate_draws`
+  took most of Postgres's statement time, and about two in five draws still ran alone. Next
+  are Postgres's CPU and its volume (20 GiB of gp3: 125 MiB/s, of which up to 74 MB/s here).
+- **Since these runs** (cce94746, measured above):
   - A write's check is one round trip, not six: its namespace, resource, head and the retry
     lookup of §7.2 are one statement (the lookup returns no row almost always), and a check
     that needs only that statement runs without a transaction (no begin, no rollback), so its
