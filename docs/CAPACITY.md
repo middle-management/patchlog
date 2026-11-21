@@ -759,6 +759,12 @@ time only): the consumers read the revision each namespace entry names
   1.9 ms, and Postgres showed row-lock waits (`Lock:tuple`, `Lock:transactionid`). Drawing
   outside the check's transaction would free the connection; a principal writing across many
   namespaces still serialises on its row.
+- **A writer principal per namespace added 15–19%** on the pool of 64: 5,242 and 5,523 writes a
+  second at eight and sixteen namespaces, against 4,547 and 4,649 with one in the same run, and
+  the row-lock waits went. The pool was full again (430–580 requests waiting for a connection),
+  with about 40 sessions idle in a check's transaction, and the core's instance at 79% CPU, much
+  of it garbage collection. So past a larger pool and the draw moved out of the check, the
+  core's CPU is next on a 4-vCPU instance; more instances share the work (D.8).
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
