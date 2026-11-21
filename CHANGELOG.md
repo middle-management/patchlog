@@ -45,13 +45,14 @@ core, decided by the grant's own read rules. About 86,000 lines are removed and 
   stored before the first batch and a stopped merge resumes from it. The plan digest is
   `{release, batches}`.
 - **Migrations:**
-  - **Core, Postgres:** `026`–`029`.
+  - **Core, Postgres:** `026`–`030`.
   - **Core, SQLite:** `025`–`028`.
 
   Between them, they:
   - drop the remote-branch tables and the old checkpoint store of filtered reads;
   - add `read_judged` and the per-view records;
-  - add the purge follows.
+  - add the purge follows;
+  - add `rate_draws`, the batched rate-limit draw (Postgres).
 
   **Index, SQLite:** `014`–`017`. The catalog's and tree service's own databases are no longer
   used.
@@ -69,6 +70,16 @@ core, decided by the grant's own read rules. About 86,000 lines are removed and 
   refused draw answers its 429 as before. Once an instance has seen a bucket empty, checks stop
   at their draw until it can have refilled, so writes over their limit don't run their whole
   check first.
+- **Postgres: concurrent rate-limit draws batch**, as group commit's writes do. With every
+  connection of the bucket pool drawing, the draws queued meanwhile go in one statement, the
+  new function `rate_draws`: it locks each bucket's row once for the batch, in key order, and
+  judges the requests in queue order as `rate_draw` would one after another, so a request is
+  admitted only if every one of its buckets holds a token at its turn, refusals answer `429`
+  with the same wait and limit, and charges always deduct. A hot bucket (one principal writing
+  to many namespaces) took a row lock and a round trip per write; on RDS that held 16
+  namespaces to about 2,200 writes a second, against 8,100 with `--local-rate-buckets`
+  (docs/CAPACITY.md, "Several namespaces on one database"). No setting changes, and a single
+  draw still runs `rate_draw`.
 - **Postgres: group commits get connections of their own**, a pool a quarter of the main pool's
   size (at least 2), so a group no longer queues behind every write's check; with all of them
   busy a group takes a connection of the main pool as before.

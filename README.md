@@ -783,7 +783,10 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   burst; an admitted write's deduction is never lost, and a request refused after admission
   keeps it. Each instance deletes full buckets once a minute. It costs a round trip per write
   (about +1.2 ms for one writer, and about 25% of the peak throughput of 32 writers on one
-  namespace, a hot bucket's row lock, measured with `cmd/capacity`). A deployment of one instance
+  namespace, a hot bucket's row lock, measured with `cmd/capacity`). Concurrent draws batch:
+  once every connection of the bucket pool is drawing, the draws queued meanwhile go in one
+  statement (the function `rate_draws`), which locks each bucket's row once and judges the
+  requests in turn, so a hot bucket costs a lock per batch, not per write. A deployment of one instance
   may keep its buckets in memory, as SQLite does, with `serve --local-rate-buckets`
   (`Options.LocalRateBuckets`); before v0.73 every instance enforced the limits on what it
   served.
