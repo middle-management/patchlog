@@ -57,10 +57,7 @@ func (t *tx) checkNonceDependents(n *nsRow, cur, cfg *Config) *Error {
 	if !cfg.NonceRequired || cur.NonceRequired {
 		return nil
 	}
-	if deps := t.nonceDependents(n); len(deps) > 0 {
-		return apiErr(409, "in_use", "dependents", anyStrings(deps), "message", "require nonces in these branches first, leaves first (§7.4, §C.7)")
-	}
-	return nil
+	return t.dependentsInUse(t.nonceDependents(n), "require nonces in these branches first, leaves first (§7.4, §C.7)")
 }
 
 // nonceDependents lists the dependents of n that don't require nonces,

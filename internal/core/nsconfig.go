@@ -510,22 +510,21 @@ func (t *tx) configInUse(n *nsRow, cur, cfg *Config) *Error {
 				deps = append(deps, d)
 			}
 		}
-		if len(deps) > 0 {
-			return apiErr(409, "in_use", "dependents", anyStrings(deps), "message", "a namespace with public dependents cannot become sealed")
+		if err := t.dependentsInUse(deps, "a namespace with public dependents cannot become sealed"); err != nil {
+			return err
 		}
 	}
 	if cfg.level > cur.level {
-		if deps := t.lowerDependents(n, cfg.level); len(deps) > 0 {
-			return apiErr(409, "in_use", "dependents", anyStrings(deps), "message", "raise the encryption level of these branches first")
+		if err := t.dependentsInUse(t.lowerDependents(n, cfg.level), "raise the encryption level of these branches first, leaves first"); err != nil {
+			return err
 		}
 	}
 	if err := t.checkNonceDependents(n, cur, cfg); err != nil {
 		return err
 	}
 	if cur.Read == "public" && cfg.Read != "public" {
-		deps := t.publicDependents(n)
-		if len(deps) > 0 {
-			return apiErr(409, "in_use", "dependents", anyStrings(deps))
+		if err := t.dependentsInUse(t.publicDependents(n), ""); err != nil {
+			return err
 		}
 	}
 	if n.isBranch() && !sameStrings(cur.DraftsFor, cfg.DraftsFor) {

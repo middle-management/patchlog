@@ -27,6 +27,35 @@ func TestV088BatchConfigChangeDrawsDespiteItem(t *testing.T) {
 	expectCode(t, r, 429, "rate")
 }
 
+// v0.88 §8.5 item 4, §6.1 ("dependents (§7.4, §8.5) list the dependents
+// alike"): a namespace purge refused for dependents lists only those the
+// caller may read, by name; one it may read none of is still 409, with
+// []. Until v0.88 every direct branch was named, readable or not.
+func TestV088PurgeNSDependentsFiltered(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil)
+	e := f.tenv
+	for _, b := range []string{"sec-b", "sec-c"} {
+		expect(t, e.branch("sec", map[string]any{"name": b}, f.adminG), 201)
+	}
+	expect(t, e.patchNS("sec", ops(op("add", "/frozen", true)), f.adminG), 201)
+	purgeNS := func(bearer string) *resp {
+		return e.do(req{method: "POST", path: "/ns/sec/purge", ifMatch: e.nsHead("sec", f.adminG), bearer: bearer})
+	}
+	// adminG names sec and sec-b, not sec-c.
+	r := purgeNS(f.adminG)
+	expectCode(t, r, 409, "in_use")
+	if deps, _ := r.Obj()["dependents"].([]any); len(deps) != 1 || deps[0] != "sec-b" || r.Obj()["more"] != nil {
+		t.Fatalf("dependents for a grant naming sec-b alone: %s, want [sec-b] without more", r.Body)
+	}
+	only := e.grant(f.admin, "user:root", []string{"sec"}, allVerbs)
+	r = purgeNS(only)
+	expectCode(t, r, 409, "in_use")
+	if deps, ok := r.Obj()["dependents"].([]any); !ok || len(deps) != 0 {
+		t.Fatalf("dependents for a grant naming neither branch: %s, want []", r.Body)
+	}
+}
+
 // v0.88 §6.6 ("Every bucket but exchangeRate's is also the namespace's
 // own, so a key listed in two namespaces has buckets in each"), §C.5.2
 // Rate ("keyed by root sub and the verifying key's thumbprint, across
