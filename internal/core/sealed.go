@@ -854,7 +854,7 @@ func (t *tx) drawExchange(a *actor) *Error {
 	if a == nil || a.bucketKey == "" {
 		return nil
 	}
-	return t.admit([]draw{{"e\x00" + a.bucketKey, t.e.opt.Maximums.ExchangeRate, 1, "exchangeRate"}})
+	return t.admit([]draw{{"e\x00" + a.exchangeBucket(), t.e.opt.Maximums.ExchangeRate, 1, "exchangeRate"}})
 }
 
 // selectEpochs keeps the epochs of window that asked names, all of them

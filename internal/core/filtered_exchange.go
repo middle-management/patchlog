@@ -56,7 +56,7 @@ func (t *tx) filteredEdgeGrant(n *nsRow, fs *fscope, a *actor, exp time.Time) (*
 	rec := viewRecordOf(fv, until.Unix())
 	rec.conf = t.fconfigSeqAt(fv.cp.seq)
 	rec.entry = t.viewEntryDigest(n, t.config(rec.conf), rec.kid)
-	return &edgeIssue{view: fv.view, rec: rec, bucket: a.bucketKey}, nil
+	return &edgeIssue{view: fv.view, rec: rec, bucket: a.exchangeBucket()}, nil
 }
 
 // passesNow reports whether a's block and key-scope rules that refer

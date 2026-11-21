@@ -49,9 +49,15 @@ type actor struct {
 	principal grant.Principal
 	verified  *grant.Verified // nil with auth disabled
 	star      bool
+	// bucketKey keys the principal's write buckets: root sub and kid,
+	// each bucket also the namespace's own (§6.6, principalDraw).
 	bucketKey string
-	keyRate   *grant.Rate
-	grant     *grant.Grant
+	// exchangeKey keys its exchangeRate bucket: root sub and the
+	// verifying key's thumbprint, across namespaces, since a kid is unique
+	// only within one (§C.5.2 Rate, v0.88); "" for bucketKey.
+	exchangeKey string
+	keyRate     *grant.Rate
+	grant       *grant.Grant
 	// noAuth: a request made while authentication is disabled (§1). The
 	// namespace entries written for it record "grant": null (§7.4).
 	noAuth bool
@@ -65,6 +71,14 @@ type actor struct {
 }
 
 func (a *actor) id() string { return a.principal.ID }
+
+// exchangeBucket keys a's exchangeRate bucket (exchangeKey).
+func (a *actor) exchangeBucket() string {
+	if a.exchangeKey != "" {
+		return a.exchangeKey
+	}
+	return a.bucketKey
+}
 
 func (a *actor) envelope() any {
 	if a.verified == nil {
@@ -237,6 +251,7 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 	}
 	a := &actor{principal: v.Principal, verified: v, star: v.StarKey, grant: g, keyRate: v.Key.Rate}
 	a.bucketKey = v.Principal.ID + "\x00" + v.Key.Kid
+	a.exchangeKey = v.Principal.ID + "\x00" + keyThumbprint(v.Key.Pub)
 	return a, nil
 }
 
@@ -924,7 +939,7 @@ func (t *tx) principalDraw(n *nsRow, cfg *Config, a *actor, cost float64) draw {
 	if a.keyRate != nil && a.keyRate.Rate < pr.Rate {
 		pr = Rate{a.keyRate.Rate, math.Min(a.keyRate.Burst, pr.Burst)}
 	}
-	return draw{"p\x00" + a.bucketKey, pr, cost, "ratePerPrincipal"}
+	return draw{"p\x00" + n.name + "\x00" + a.bucketKey, pr, cost, "ratePerPrincipal"}
 }
 
 // blobDraw is the draw of an upload's bytes from the principal's blobRate
@@ -933,7 +948,7 @@ func (t *tx) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
 	if al := t.allowanceOf(cfg, a); al != nil && al.BlobRate.Rate > 0 {
 		return draw{"ab\x00" + n.name + "\x00" + al.Sub + "\x00" + al.Kid, al.BlobRate, float64(size), "allowance.blobRate"}
 	}
-	return draw{"b\x00" + a.bucketKey, cfg.Limits.BlobRate, float64(size), "blobRate"}
+	return draw{"b\x00" + n.name + "\x00" + a.bucketKey, cfg.Limits.BlobRate, float64(size), "blobRate"}
 }
 
 // admit draws tokens, or answers 429 (§6.6): Retry-After in whole seconds,

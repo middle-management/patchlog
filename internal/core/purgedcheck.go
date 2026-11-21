@@ -26,8 +26,13 @@ func (t *tx) purgedReadable(a *actor, n *nsRow, name string) bool {
 // views whose cached ranges a purge or an archive restore may change:
 // ranges are immutable but for those (§7.9, v0.88), since a revision the
 // purge removes, or whose document a restore brings back, is judged anew.
-// A namespace no view was recorded for has no filtered range cached.
+// A namespace no view was recorded for has no filtered range cached, nor
+// has a branch, which filtered reads don't cover (§7.9 Where): a purge's
+// statements don't grow with the branches it reaches.
 func (t *tx) tagFilteredRanges(n *nsRow) {
+	if n.isBranch() {
+		return
+	}
 	var any bool
 	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM filtered_views WHERE ns = ?)`, n.name).Scan(&any))
 	if any {

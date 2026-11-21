@@ -344,7 +344,7 @@ func refusalRank(err *Error) int {
 // rules fix /resource to, else (names nil) one namespace-wide, or, for a
 // partial reader of a covered namespace, one for its view, with
 // rec its filtered_views row (§7.9); and the key of its principal's
-// buckets (actor.bucketKey).
+// exchangeRate bucket (actor.exchangeBucket).
 type edgeIssue struct {
 	names  []string
 	view   string
@@ -438,7 +438,7 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 		pe.Body["ns"] = ns
 		return nil, pe
 	}
-	return &edgeIssue{names: names, bucket: a.bucketKey}, nil
+	return &edgeIssue{names: names, bucket: a.exchangeBucket()}, nil
 }
 
 // qualifies reports whether an effective role listing read, with rules
