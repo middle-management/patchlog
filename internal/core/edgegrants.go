@@ -275,8 +275,8 @@ func (c *edgeCollect) add(eg EdgeGrant) bool {
 func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) (string, *Error) {
 	// The exchange of g has one budget of validationSteps for the rules
 	// it evaluates, whatever namespaces and names they are for (§6.6
-	// Validation work).
-	defer t.readScope()()
+	// Validation work), its own whatever the request's other grants take.
+	defer t.ownReadScope()()
 	exp := grantExp(g)
 	var bucket string
 	var refused *Error

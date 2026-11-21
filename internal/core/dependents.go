@@ -37,7 +37,7 @@ func (t *tx) dependentsInUse(names []string, msg string) *Error {
 // dependentsRefusal is dependentsInUse over next, which yields the
 // dependents in byte order of name, at least one.
 func (t *tx) dependentsRefusal(next func() (*nsRow, bool), msg string) *Error {
-	defer t.readScope()()
+	defer t.ownReadScope()()
 	limit := t.e.opt.Maximums.LogPageSize
 	listed := []string{}
 	more := false

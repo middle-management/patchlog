@@ -819,6 +819,8 @@ func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
 	var judged []judgedRow
 	err = e.read1(ctx, func(t *tx) error {
 		defer func() { judged = t.judged }()
+		// The read checks of a request share one budget (§6.6).
+		defer t.requestScope(ctx)()
 		return f(t)
 	})
 	// Per-revision answers it gave are kept once it has ended (judge).

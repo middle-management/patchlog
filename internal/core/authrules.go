@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/middle-management/patchlog/internal/grantcheck"
@@ -26,18 +27,52 @@ func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]an
 }
 
 // readScope gives the read checks made until the function it returns is
-// called one budget of validationSteps between them, as an exchange and
-// a key request have for all the names they judge (§6.6 Validation work:
-// "each read, exchange and key request a grant is presented for"). Inside
-// another's scope it keeps that budget. Every other read check, a write's
-// own included, is made outside any scope and gets a fresh budget
-// (grantRules, readsNS, readRule).
+// called one budget of validationSteps between them (§6.6 Validation
+// work: "Each read request, exchange and key request a grant is
+// presented for gets one budget, shared by every check it makes"): every
+// read transaction has one (Engine.read, requestScope), and an exchange
+// one per grant (ownReadScope). Inside another's scope it keeps that
+// budget. A read check a write makes is outside any scope and gets a
+// fresh budget (grantRules, readsNS, readRule).
 func (t *tx) readScope() func() {
 	if t.readMeter != nil {
 		return func() {}
 	}
 	t.readMeter = &writeMeter{Meter: *rules.Budget(t.e.opt.MaxValidationSteps), read: true, t: t}
 	return func() { t.readMeter = nil }
+}
+
+// ownReadScope is readScope with a budget of its own, inside another's
+// scope too, until the function it returns restores that one: for each
+// grant of an exchange, and for one referencing or dependents list,
+// which count as one (§6.6 Validation work).
+func (t *tx) ownReadScope() func() {
+	prev := t.readMeter
+	t.readMeter = nil
+	done := t.readScope()
+	return func() { done(); t.readMeter = prev }
+}
+
+// ReadBudget gives ctx one budget of validationSteps for every read check
+// the engine makes for it (§6.6 Validation work: "Each read request …
+// gets one budget, shared by every check it makes"), across the read
+// transactions it runs, as a long-poll does for each fetch. Without it
+// each read transaction has one of its own.
+func (e *Engine) ReadBudget(ctx context.Context) context.Context {
+	return context.WithValue(ctx, readBudgetKey{}, &writeMeter{Meter: *rules.Budget(e.opt.MaxValidationSteps), read: true})
+}
+
+type readBudgetKey struct{}
+
+// requestScope is the read scope of a read transaction (Engine.read): the
+// budget ctx carries (ReadBudget), else one of the transaction's own.
+func (t *tx) requestScope(ctx context.Context) func() {
+	if m, ok := ctx.Value(readBudgetKey{}).(*writeMeter); ok && t.readMeter == nil {
+		m.t = t
+		t.readMeter = m
+		return func() { t.readMeter = nil }
+	}
+	return t.readScope()
 }
 
 // readSpent reports whether the budget the read checks in progress share
