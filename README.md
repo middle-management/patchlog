@@ -788,13 +788,18 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   (`Options.LocalRateBuckets`); before v0.73 every instance enforced the limits on what it
   served.
 - **Connections.** An instance opens up to 4 × `GOMAXPROCS` connections for its transactions,
-  plus up to `GOMAXPROCS` (at least 2) for its rate-limit draws unless `--local-rate-buckets`,
-  and keeps them open, idle, for later requests; one of them holds the background loops' leader
-  lock. Keep the sum over every instance under the server's `max_connections` (100 by default),
-  or bound each instance with two parameters of the URL, as pgxpool names them:
-  `pool_max_conns=N` caps the first pool at `N` connections (at least 2) and the draws' at a
-  quarter of `N` (at least 2), and `pool_max_conn_idle_time=5m` closes a connection idle for
-  longer.
+  plus a quarter of that (at least 2) for its rate-limit draws unless `--local-rate-buckets`,
+  and as many again for its group commits, and keeps them open, idle, for later requests; one
+  of them holds the background loops' leader lock. Two parameters of the URL, as pgxpool names
+  them, change that: `pool_max_conns=N` sets the first pool to `N` connections (at least 2),
+  above 4 × `GOMAXPROCS` too, and the other two to a quarter of `N` (at least 2), and
+  `pool_max_conn_idle_time=5m` closes a connection idle for longer. A connection mostly waits
+  on a round trip to the server, so a database a millisecond or more away wants more than the
+  CPUs give: on RDS a 4-vCPU core's default 16 held it to about 3,000 writes a second across
+  namespaces while Postgres sat mostly idle, and 64 took it to about 4,600
+  ([docs/CAPACITY.md](docs/CAPACITY.md#several-namespaces-on-one-database)). Keep the sum over
+  every instance under the server's `max_connections` (100 by default). Before this release
+  `pool_max_conns` could only lower the first pool.
 - **Per instance:** the in-memory caches above.
 - **Edge-grant keys.** Without `--edge-grant-key`, each instance signs edge-grant cookies with a
   random key of its own, so a cookie one instance mints is refused by the others: behind a load

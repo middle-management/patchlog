@@ -325,11 +325,13 @@ type Engine struct {
 	// purgeHoldersMax, if not 0, replaces the constant of that name for a
 	// test: negative, every purge searches level by level (purgeLevels).
 	purgeHoldersMax int
-	// Group commit (groupcommit.go): the queues, and for tests, noSolo
+	// Group commit (groupcommit.go): the queues, the connections only
+	// groups' transactions take (on Postgres), and for tests, noSolo
 	// queues even a write that finds its namespace idle, groupStart is
 	// called in a group's transaction once it holds its locks, and
 	// groupMember before each of its writes' entries is appended.
 	groups      groups
+	commits     *commitPool
 	noSolo      bool
 	groupStart  func(t *tx, size int)
 	groupMember func(t *tx, i int)
@@ -517,6 +519,14 @@ func Open(opt Options) (*Engine, error) {
 			return nil, err
 		}
 	}
+	if e.grouping() {
+		// The group commits' own connections (groupcommit.go).
+		if e.commits, err = openCommitPool(opt.Path); err != nil {
+			e.rate.close()
+			db.Close()
+			return nil, err
+		}
+	}
 	if pg {
 		if e.opt.TailInterval <= 0 {
 			e.opt.TailInterval = 100 * time.Millisecond
@@ -524,6 +534,7 @@ func Open(opt Options) (*Engine, error) {
 		s, err := e.tailStart(context.Background())
 		if err != nil {
 			e.rate.close()
+			e.commits.close()
 			db.Close()
 			return nil, fmt.Errorf("starting the tailer: %w", err)
 		}
@@ -580,6 +591,7 @@ func (e *Engine) Close() error {
 	err := e.db.Close()
 	e.comp.close()
 	e.rate.close()
+	e.commits.close()
 	return err
 }
 
@@ -730,6 +742,10 @@ type tx struct {
 	// so a transaction run again (Postgres, pglock.go) doesn't draw them
 	// twice.
 	rateDrawn *bool
+	// drawLater, when set (a write's check outside the lock on the store's
+	// buckets, checkOutside), records the rate-limit draws instead of
+	// making them (admit).
+	drawLater *drawLater
 	// memo and dirty: rows read in this transaction, and whether it has
 	// written (memo.go).
 	memo  memo
@@ -909,9 +925,22 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 // updateOnce runs f in one write transaction, first taking the advisory
 // locks of want (Postgres), and the log locks of logs at its first append.
 func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[int32]lockMode, logs map[int32]bool) (rotate []string, err error) {
-	sqlTx, err := e.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
+	var sqlTx *sql.Tx
+	if c := e.commits; c != nil && committingGroup(ctx) && c.take() {
+		// A group commit's transaction, on a connection no check queues
+		// for (commitPool); on the main pool if none opens (the server's
+		// max_connections reached, say).
+		if tx, err := c.db.BeginTx(ctx, nil); err == nil {
+			sqlTx = tx
+			defer c.give()
+		} else {
+			c.give()
+		}
+	}
+	if sqlTx == nil {
+		if sqlTx, err = e.db.BeginTx(ctx, nil); err != nil {
+			return nil, err
+		}
 	}
 	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}, wake: map[string]map[string]bool{}}
 	committing := false

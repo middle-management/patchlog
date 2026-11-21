@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"slices"
 	"sync"
@@ -67,6 +68,62 @@ import (
 // trips; writes beyond those queue. So a few writers see no difference,
 // groups form only once writers contend, and GroupCommit 1 turns group
 // commit off.
+
+// commitPool is a pool of connections that only group commits'
+// transactions take (updateOnce), a quarter of the main pool's size, at
+// least 2 (pgPool.sideSize). On the main pool a worker queued for a
+// connection behind every write's check (D.3), each of which holds one
+// for its round trips: with 16 connections and 16 busy namespaces each
+// worker spent about 90% of its time waiting, so its group of 30 writes
+// waited behind as many checks as could be queued (docs/CAPACITY.md,
+// "Several namespaces on one database"). A worker takes a connection of
+// its own pool if one is free, and otherwise queues on the main pool as
+// before, so workers held up on their namespaces' locks (behind a purge,
+// say) don't hold up the others' commits.
+type commitPool struct {
+	db *sql.DB
+	// free holds a token for each connection of db that a worker holds.
+	free chan struct{}
+}
+
+// openCommitPool opens the commit pool on the Postgres database url.
+func openCommitPool(url string) (*commitPool, error) {
+	url, pool, err := parsePGPool(url)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("pgx", url)
+	if err != nil {
+		return nil, err
+	}
+	pool.sizeSide(db)
+	return &commitPool{db: db, free: make(chan struct{}, pool.sideSize())}, nil
+}
+
+// take reports whether one of the pool's connections is free, and if so
+// reserves it until give.
+func (c *commitPool) take() bool {
+	select {
+	case c.free <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *commitPool) give() { <-c.free }
+
+func (c *commitPool) close() {
+	if c != nil {
+		c.db.Close()
+	}
+}
+
+// commitKey marks the context of a group commit's transaction.
+type commitKey struct{}
+
+// committingGroup reports whether ctx is a group commit's (commitGroup).
+func committingGroup(ctx context.Context) bool { return ctx.Value(commitKey{}) != nil }
 
 // Group commit defaults (Options.GroupCommit, GroupCommitWait).
 const (
@@ -303,7 +360,7 @@ func (e *Engine) commitGroup(ns string, group []*groupWrite) {
 	// one of its requests is cancelled (a shutdown timeout), so is it,
 	// even while it waits for a lock (acquire), and it doesn't commit
 	// (cancelDue).
-	ctx, cancel := context.WithCancel(context.WithoutCancel(group[0].ctx))
+	ctx, cancel := context.WithCancel(context.WithValue(context.WithoutCancel(group[0].ctx), commitKey{}, true))
 	defer cancel()
 	var left atomic.Int64
 	left.Store(int64(len(group)))

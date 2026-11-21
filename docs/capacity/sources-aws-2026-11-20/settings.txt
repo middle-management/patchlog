@@ -1,0 +1,3 @@
+doors 507d8e701f, patchlog 0b017f31, mode both, region eu-west-1, 2026-11-20T13:20:44Z to 2026-11-20T13:48:40Z
+namespaces: store c7g.xlarge (RDS db.m7g.large), consumers c7g.xlarge, driver c7g.2xlarge; NAMESPACES 1,2,4,8,16 RATE 10 DURATION 30000 FETCHES 1 8
+fanout: origin c7g.xlarge (SQLite), cdn c7g.xlarge (CDN_PORTS 4), load c7g.4xlarge; FANOUT_SCENARIOS changes ticking FANOUT_SUBSCRIBERS 1000,10000,40000 FANOUT_VIA cdn,direct

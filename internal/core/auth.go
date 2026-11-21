@@ -936,15 +936,29 @@ func (t *tx) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
 	return draw{"b\x00" + a.bucketKey, cfg.Limits.BlobRate, float64(size), "blobRate"}
 }
 
-// admit draws tokens, or answers 429 (§6.6): Retry-After in whole seconds,
-// rounded up, and in the body retryAfter, the wait in seconds as a decimal
-// (rounded up to the millisecond), which a client under a fast allowance
-// waits by instead.
+// admit draws tokens, or answers 429 (§6.6).
+//
+// In a write's check outside the lock (checkOutside, drawLater) on the
+// store's buckets it only records the draws, which checkOutside makes
+// once the check's read transaction has ended, so that no connection of
+// the main pool waits, idle in a transaction, for the bucket pool and
+// the buckets' row locks: the check goes on as if admitted. Unless this
+// instance last found a bucket of draws empty and it hasn't refilled
+// since (bucketStore.knownEmpty): then the check stops here (errDrawFirst),
+// as it would at a 429, and runs again once the draw admits it.
 func (t *tx) admit(draws []draw) *Error {
 	var wait time.Duration
 	var hit string
 	var ok bool
 	if s := t.e.rate.store; s != nil {
+		if l := t.drawLater; l != nil {
+			l.draws = append(l.draws, draws)
+			if s.knownEmpty(t.now, draws) {
+				l.first = true
+				return errDrawFirst
+			}
+			return nil
+		}
 		var err error
 		wait, hit, ok, err = s.admit(t.ctx, t.now, draws)
 		t.must(err)
@@ -952,13 +966,49 @@ func (t *tx) admit(draws []draw) *Error {
 		wait, hit, ok = t.e.rate.admit(t.now, draws)
 	}
 	if !ok {
-		secs := int(math.Ceil(wait.Seconds()))
-		if secs < 1 {
-			secs = 1
+		return rateRefused(wait, hit)
+	}
+	return nil
+}
+
+// rateRefused is the 429 of a refused draw (§6.6): Retry-After in whole
+// seconds, rounded up, and in the body retryAfter, the wait in seconds as
+// a decimal (rounded up to the millisecond), which a client under a fast
+// allowance waits by instead.
+func rateRefused(wait time.Duration, hit string) *Error {
+	secs := int(math.Ceil(wait.Seconds()))
+	if secs < 1 {
+		secs = 1
+	}
+	e := apiErr(429, "rate", "message", "rate limit exceeded", "limit", hit, "retryAfter", math.Ceil(wait.Seconds()*1000)/1000)
+	e.Header = map[string][]string{"Retry-After": {fmt.Sprint(secs)}}
+	return e
+}
+
+// drawLater holds the draws a write's check recorded (admit), in order,
+// for checkOutside to make after its read transaction.
+type drawLater struct {
+	draws [][]draw
+	// first: the check stopped at the last of draws (errDrawFirst).
+	first bool
+}
+
+// errDrawFirst stops a write's check at a draw on a bucket this instance
+// found empty (admit). checkOutside never answers it.
+var errDrawFirst = &Error{Status: 429, Body: map[string]any{"code": "rate"}}
+
+// drawAfter makes the draws a write's check recorded (drawLater), one
+// atomic draw after another as the check would have, and answers the
+// first refusal's 429.
+func (e *Engine) drawAfter(ctx context.Context, now time.Time, l *drawLater) error {
+	for _, draws := range l.draws {
+		wait, hit, ok, err := e.rate.store.admit(ctx, now, draws)
+		if err != nil {
+			return err
 		}
-		e := apiErr(429, "rate", "message", "rate limit exceeded", "limit", hit, "retryAfter", math.Ceil(wait.Seconds()*1000)/1000)
-		e.Header = map[string][]string{"Retry-After": {fmt.Sprint(secs)}}
-		return e
+		if !ok {
+			return rateRefused(wait, hit)
+		}
 	}
 	return nil
 }
