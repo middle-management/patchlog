@@ -281,6 +281,8 @@ func (s *Server) viewLive(w http.ResponseWriter, r *http.Request) {
 // next poll gives as since. X-Cursor is as unfiltered (§7.7). Every fetch
 // is admitted again at the current checkpoint.
 func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, view string, reqCursor int64) {
+	// One read request, one budget of validationSteps (§6.6).
+	r = r.WithContext(s.e.ReadBudget(r.Context()))
 	since := r.URL.Query().Get("since")
 	tags := []string{"ns:" + ns}
 	clock := s.clockOf(filteredLogPath(ns, view))

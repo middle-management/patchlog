@@ -260,10 +260,11 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			return aerr
 		}
 		byDoc := t.readsByDoc(n, a)
-		if byDoc && (n.purged || !t.isSealedNS(n) && !t.mayReadRow(a, n, name, nil)) {
-			// A purged namespace's content is judged with a null document
-			// (§6.4.1); a sealed one's by the revisions of the epoch
-			// asked, below (v0.89).
+		if byDoc && !t.sealedBlobReadable(a, n, name) {
+			// A purged namespace or resource is judged with its rules on
+			// /doc set aside (§8.3, §8.5); a sealed one's content by the
+			// revisions of the epoch asked, below (v0.89); any other with
+			// a null document (§6.4.1).
 			return notFound()
 		}
 		if n.purged {

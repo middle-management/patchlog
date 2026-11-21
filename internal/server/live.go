@@ -74,8 +74,8 @@ func newLiveClock(interval time.Duration, path string) liveClock {
 // or "/ns/{ns}/view/{view}/log", no query), as an unsigned big-endian integer,
 // modulo the interval in milliseconds, in milliseconds: one phase for all
 // the log's followers, spread evenly over the interval across logs. An
-// interval is counted in whole milliseconds, and one under a millisecond
-// has no phase.
+// interval is a positive whole number of milliseconds (§7.7, v0.88; the
+// engine refuses any other); given one under a millisecond, the phase is 0.
 func LongPollPhase(path string, interval time.Duration) time.Duration {
 	ms := uint64(interval / time.Millisecond)
 	if ms == 0 {
@@ -135,6 +135,9 @@ func judgeCursor(now time.Time, clock liveClock, reqCursor int64) (int64, error)
 // (§7.7 Intervals and cursors).
 func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header string, tags []string, reqCursor int64, clock liveClock,
 	wait func() <-chan struct{}, fetch func(ctx context.Context, since string) (*core.Log, error)) {
+	// One read request, one budget of validationSteps for every fetch's
+	// read check (§6.6 Validation work).
+	r = r.WithContext(s.e.ReadBudget(r.Context()))
 	since := r.URL.Query().Get("since")
 	interval := clock.interval
 	current, err := judgeCursor(time.Now(), clock, reqCursor)

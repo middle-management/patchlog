@@ -54,6 +54,11 @@ func (e *Engine) Principal(ctx context.Context, ns string, cred Credentials) (*P
 				}
 			}
 			t.e.bearers.put(cred.Bearer, g)
+			if a != nil && a.attrsOver {
+				// Verification alone decides here: attrs whose check
+				// ran out don't match (§C.4, §6.6).
+				return forbidden("attrs not allowed by the key's scope: their check takes more than validationSteps steps (§6.6)")
+			}
 		}
 		if n.purged {
 			return t.purgedNS(n)

@@ -1261,8 +1261,11 @@ func (x *E2E) foldLog(ctx context.Context, ns, name, id, since string) ([]any, e
 
 // chain maps ns and its bases to their depth: 0 for ns, 1 for its base,
 // and so on (a branch reads its base's ciphertext, whose patch sets and
-// snapshots are bound to the base, §F.8).
-func (x *E2E) chain(ctx context.Context, ns string) (depth map[string]int, err error) {
+// snapshots are bound to the base, §F.8). cut is set where a base's
+// namespace document is one this reader may not read (403, 404): the
+// bases beyond it are unknown, so ops sealed under them fail the check
+// and the read goes on (§E.2.2, v0.88). ns's own document must be read.
+func (x *E2E) chain(ctx context.Context, ns string) (depth map[string]int, cut bool, err error) {
 	depth = map[string]int{}
 	for cur, d := ns, 0; cur != ""; d++ {
 		if _, seen := depth[cur]; seen {
@@ -1270,12 +1273,15 @@ func (x *E2E) chain(ctx context.Context, ns string) (depth map[string]int, err e
 		}
 		depth[cur] = d
 		cfg, err := x.config(ctx, cur)
+		if cur != ns && nsUnreadable(err) {
+			return depth, true, nil
+		}
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		cur = cfg.Base
 	}
-	return depth, nil
+	return depth, false, nil
 }
 
 // chainCheck checks, for the entries of one resource log of ns in order,
@@ -1296,6 +1302,7 @@ type chainCheck struct {
 	ctx   context.Context
 	ns    string
 	depth map[string]int
+	cut   bool // the chain stops at a base whose document can't be read (chain)
 	last  int
 
 	// name is the resource whose log is checked ("" for no fork check);
@@ -1339,12 +1346,16 @@ func (c *chainCheck) ok(kns string) (bool, error) {
 	if kns != c.ns {
 		if c.depth == nil {
 			var err error
-			if c.depth, err = c.x.chain(c.ctx, c.ns); err != nil {
+			if c.depth, c.cut, err = c.x.chain(c.ctx, c.ns); err != nil {
 				return false, err
 			}
 		}
 		var ok bool
 		if d, ok = c.depth[kns]; !ok {
+			// Past a base whose document this reader can't read, the
+			// chain is unknown: the op fails the check, as one past an
+			// unplaced foreign parent does (§E.2.2).
+			c.blind = c.cut
 			return false, nil
 		}
 		if c.name != "" {
@@ -1456,6 +1467,13 @@ func (x *E2E) forksOf(ctx context.Context, ns, name string) (forkList, error) {
 	for cur, seen := ns, map[string]bool{}; !seen[cur]; {
 		seen[cur] = true
 		cfg, err := x.config(ctx, cur)
+		if cur != ns && nsUnreadable(err) {
+			// A document that places the next fork is unreadable to this
+			// reader: nothing behind it is accepted, and the read goes
+			// on (§E.2.2, v0.88).
+			forks.unplaced = true
+			break
+		}
 		if err != nil {
 			return forkList{}, err
 		}

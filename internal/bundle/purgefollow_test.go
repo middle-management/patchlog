@@ -36,15 +36,21 @@ func (p *tagPurger) has(tag string) bool {
 	return slices.Contains(p.tags, tag)
 }
 
+// importer is the principal the test deployments import as (their
+// client's author, authentication being disabled), which a follower names
+// as each trusted origin's importer (§G.1, v0.88).
+const importer = "alice"
+
 // follower is an importing deployment that trusts the origins given, or
-// none, and follows only when asked (Interval -1).
+// none, with importer as their importer, and follows only when asked
+// (Interval -1).
 func follower(t *testing.T, purger core.Purger, trusted ...*deployment) *deployment {
 	return newDeployment(t, cmsOrigin, func(o *core.Options) {
 		o.Purger = purger
 		o.FollowPurges.Interval = -1
 		o.FollowPurges.Origins = map[string]core.PurgeOrigin{}
 		for _, d := range trusted {
-			o.FollowPurges.Origins[d.origin] = core.PurgeOrigin{BaseURL: d.url}
+			o.FollowPurges.Origins[d.origin] = core.PurgeOrigin{BaseURL: d.url, Importers: []string{importer}}
 		}
 	})
 }
@@ -335,7 +341,7 @@ func TestPurgesFollowLoop(t *testing.T) {
 	b := exportBundle(t, src, bundle.ExportOptions{Select: []string{"matches"}})
 	dst := newDeployment(t, cmsOrigin, func(o *core.Options) {
 		o.FollowPurges.Interval = 20 * time.Millisecond
-		o.FollowPurges.Origins = map[string]core.PurgeOrigin{src.origin: {BaseURL: src.url}}
+		o.FollowPurges.Origins = map[string]core.PurgeOrigin{src.origin: {BaseURL: src.url, Importers: []string{importer}}}
 	})
 	importB(t, dst, b, bundle.ImportOptions{})
 	src.purge("matches", "derby")
@@ -347,4 +353,28 @@ func TestPurgesFollowLoop(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	dst.followedEntry("matches", "derby")
+}
+
+// v0.88 §G.1 ("Its operator may trust that origin and name the principals
+// that import from it … only import batches by such a principal count"):
+// a deployment that trusts the origin but names another principal as its
+// importer follows none of the purges of what alice imported.
+func TestPurgesFollowOnlyNamedImporters(t *testing.T) {
+	src := newDeployment(t, stagingOrigin)
+	src.ns("matches", nil)
+	src.create("matches", "derby", map[string]any{"title": "Derby"})
+	b := exportBundle(t, src, bundle.ExportOptions{Select: []string{"matches"}})
+	dst := newDeployment(t, cmsOrigin, func(o *core.Options) {
+		o.FollowPurges.Interval = -1
+		o.FollowPurges.Origins = map[string]core.PurgeOrigin{src.origin: {BaseURL: src.url, Importers: []string{"bob"}}}
+	})
+	importB(t, dst, b, bundle.ImportOptions{})
+	src.purge("matches", "derby")
+	dst.follow()
+	if st := dst.status("matches", "derby"); st != 200 {
+		t.Fatalf("derby, imported by alice where bob is the importer: %d, want 200", st)
+	}
+	if es := dst.purgeEntries("matches", "derby"); len(es) != 0 {
+		t.Fatalf("purge entries %+v", es)
+	}
 }

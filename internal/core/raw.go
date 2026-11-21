@@ -40,7 +40,7 @@ func (e *Engine) ResourceRaw(ctx context.Context, ns, name, id string, cred Cred
 			return err
 		}
 		byDoc := t.readsByDoc(n, a)
-		if byDoc && (n.purged || t.nsLevel(n) >= levelE2E) {
+		if byDoc && (n.purged && !t.purgedReadable(a, n, name) || t.nsLevel(n) >= levelE2E) {
 			return notFound() // judged with a null document (§6.4.1)
 		}
 		if n.purged {

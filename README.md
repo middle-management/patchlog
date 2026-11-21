@@ -3070,20 +3070,24 @@ patchlog import -i all.jsonl --atomic --ns demo-schemas=demo2-schemas,demo=demo2
   line carries no document, and an upstream import appends only a tombstone, so a moved
   resource's `$successor` (§8.1) travels in history bundles, where it is content like any
   other, and not in snapshots.
-- **Purges follow imports** (§G.1, v0.87). An import batch from another deployment (a `source`
+- **Purges follow imports** (§G.1, v0.88). An import batch from another deployment (a `source`
   with a `bundle` and an `origin`) starts, as it commits, a follow of that origin's namespace
-  log from its `source.at`, recording the names the batch wrote. For an origin the operator
-  trusts, `serve --follow-purges-from ORIGIN` (repeatable, as `source.origin` records it, with
-  `--follow-purges-bearer ORIGIN=GRANT` and `--follow-purges-url ORIGIN=URL` to reach it, every
-  `--follow-purges-interval`, default 5m), the leader applies each later `purge` there of a
-  name imported, and each `purge-ns` to every such name, as `system:purge-follow`, without
+  log from its `source.at`, recording the names the batch wrote under a grant that may `purge`
+  them, with the batch's principal as their importer. For an origin the operator trusts,
+  `serve --follow-purges-from ORIGIN` (repeatable, as `source.origin` records it, with
+  `--follow-purges-importer ORIGIN=PRINCIPAL`, the root `sub` of each principal that imports
+  from it, at least one, `--follow-purges-bearer ORIGIN=GRANT` and `--follow-purges-url
+  ORIGIN=URL` to reach it, every `--follow-purges-interval`, default 5m), the leader applies
+  each later `purge` there of a name such an importer imported, and each `purge-ns` to every
+  such name, as `system:purge-follow`, without
   `grant` or `via`: in the namespace and its branches with their cache tags, and in the upstream
   namespace, whose import batches carry the same `source`. A purge refused as `in_use` (§6.1)
   waits for an operator, who removes the references or purges the name with `?force=1`, and
   is retried at each follow without holding up later ones (`Engine.FollowedPurgesWaiting`
   lists them). A name an older bundle brings after the follow passed its purge is read for
-  once more from that bundle's `source.at`. A `source` naming an origin not listed purges
-  nothing. Imports committed before this version started no follow.
+  once more from that bundle's `source.at`. A `source` naming an origin not listed, or written
+  by a principal not named as its importer, purges nothing. Names recorded before v0.88 carry
+  no importer and are no longer followed; imports committed before v0.87 started no follow.
 - **`--atomic`** lands each namespace as one batch, which needs an allowance for large imports
   (§6.6), within the deployment maximums (1,000 items and 16 MiB unless raised with
   `serve --max-items-per-batch` and `--max-batch-size`). **`--pace`** splits batches to fit the
@@ -4071,9 +4075,10 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   check with its usual refusal (`404` for a resource of a private namespace, `403` for the
   namespace's log, an exchange, a key request and branching) or leaves the item out; a test
   cut short never passes, under a `not` either. A key scope's `attrs` schema is held to the
-  same count. The index applies it per read check
-  and per item too; the limit is in no namespace document, so it takes
-  `--max-validation-steps` itself (default 5,000,000) and should be given the origin's.
+  count, that of the check it is verified for (v0.88). A read request has one budget for all
+  its checks (v0.88). The index applies it per read check and per item too; the limit is in
+  no namespace document, so the index reads the origin's from `GET /ns/{ns}/principal`'s
+  `writer.limits` when it opens (v0.88), unless `--max-validation-steps` overrides it.
   Annotation walks are not counted.
 - **A patch to a typed document is validated where it changes it**, when this instance has
   validated the document it applies to against the same schema revision: the changed values,

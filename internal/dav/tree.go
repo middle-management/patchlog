@@ -323,8 +323,9 @@ type ixHit struct {
 // indexFolder lists folder fpath of tree ns through the index (§H.3), with
 // the request's token, every page of it: at most MaxListing documents, a
 // larger folder refused (403), never listed cut short. An index that has
-// no document of the file schema the reader may see yet, which refuses the
-// facet as marked by no schema (400), lists an empty folder.
+// no document of the file schema the reader may see yet refuses the facet
+// as marked by no schema (400): errUnmarked, which lists an empty folder,
+// never one empty for a write (treeList, treeListingForWrite).
 func (st *reqState) indexFolder(ctx context.Context, ns, fpath string) ([]ixHit, error) {
 	q := url.Values{}
 	q.Set("facet[/folder]", fpath)
@@ -346,9 +347,6 @@ func (st *reqState) indexFolder(ctx context.Context, ns, fpath string) ([]ixHit,
 		}
 		final, err := st.indexGet(ctx, u, &page)
 		if err != nil {
-			if errors.Is(err, errUnmarked) {
-				return nil, nil
-			}
 			return nil, err
 		}
 		if at == "" {
@@ -445,6 +443,11 @@ func (st *reqState) indexGet(ctx context.Context, u string, v any) (*url.URL, er
 // folder.
 func (st *reqState) treeList(ctx context.Context, t target, l *listing) error {
 	hits, err := st.indexFolder(ctx, t.ns, t.fpath)
+	if errors.Is(err, errUnmarked) {
+		// An empty folder to list, but not to write by (§H.3).
+		l.unmarked = true
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -530,6 +533,26 @@ func (st *reqState) treeListing(ctx context.Context, ns, fpath, dirPath string) 
 		k = kNSDir
 	}
 	return st.list(ctx, target{kind: k, path: dirPath, ns: ns, tree: true, fpath: fpath, dir: pathDir(dirPath), base: pathBase(dirPath)})
+}
+
+// treeListingForWrite is treeListing for a write that goes by what the
+// folder holds, a folder's delete or move: the index's 400 for the facet
+// lists an empty folder, never one empty for a write (§H.3, v0.88). The
+// folder is listed again with ?min at the namespace head (catchUp), and a
+// 400 then still is the index not showing what is there: 503, as for an
+// index behind, and nothing is written on the strength of it (§H.3).
+func (st *reqState) treeListingForWrite(ctx context.Context, ns, fpath, dirPath string) (*listing, error) {
+	l, err := st.treeListing(ctx, ns, fpath, dirPath)
+	if err != nil || !l.unmarked {
+		return l, err
+	}
+	if err := st.catchUp(ctx, ns); err != nil {
+		return nil, err
+	}
+	if l, err = st.treeListing(ctx, ns, fpath, dirPath); err != nil || !l.unmarked {
+		return l, err
+	}
+	return nil, upBusy(theIndex, fmt.Errorf("folder %s of %s: the index marks no file document there, even at the namespace head, so it can't show the folder empty for a write", fpath, ns))
 }
 
 // resolveTree resolves t, a path in tree t.ns (segs its segments, the
@@ -942,7 +965,7 @@ func (st *reqState) treeMkdir(ctx context.Context, t target) error {
 // folder documents, with If-Match on the head read. Children the user
 // can't see don't stop it, and fall out of the tree.
 func (st *reqState) treeRmdir(ctx context.Context, t target) error {
-	l, err := st.treeListing(ctx, t.ns, t.fpath, t.path)
+	l, err := st.treeListingForWrite(ctx, t.ns, t.fpath, t.path)
 	if err != nil {
 		return err
 	}
@@ -1111,7 +1134,7 @@ func (st *reqState) treeMoveFolder(ctx context.Context, src, dst target) error {
 	// Every visible document under it, folder by folder.
 	var walk func(fpath, dirPath string) error
 	walk = func(fpath, dirPath string) error {
-		l, err := st.treeListing(ctx, src.ns, fpath, dirPath)
+		l, err := st.treeListingForWrite(ctx, src.ns, fpath, dirPath)
 		if err != nil {
 			return err
 		}

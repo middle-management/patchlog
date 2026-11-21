@@ -195,10 +195,13 @@ func (a *releaseVerbCmd) run(sub string) {
 			break
 		}
 		if old != nil {
-			if old.State == merge.ReleaseMerging || old.State == merge.ReleaseDone {
+			if old.State == merge.ReleaseDone {
 				err = fmt.Errorf("the release is %s; a new plan would replace its record (status shows it)", old.State)
 				break
 			}
+			// A merge that stopped for a new approval is planned again:
+			// step 3 takes the documents it was to publish, still unset,
+			// from the stored plan (§F.9).
 			opt.AcceptFrozen = old.FrozenBy()
 		}
 		rp, err = merge.PlanRelease(ctx, c, opt)

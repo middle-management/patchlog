@@ -4,12 +4,15 @@ package core
 //
 // A namespace imported from another deployment records that deployment's
 // origin in its import batches' source (§7.5, §G.4.4 step 7): a batch
-// whose source names a bundle and an origin. Where the operator trusts
-// that origin (FollowPurgesOptions.Origins: any writer can assert a
-// source), the deployment follows the origin's namespace log from the
-// first such source.at and applies each purge there of a name it imported,
-// and each purge-ns to every such name, as §8.3 does locally: its own
-// chains for the name and its branches, with their cache tags. The
+// whose source names a bundle and an origin. Any writer can assert a
+// source (§7.5), so only import batches by a principal the operator names
+// as that origin's importer count, under a grant that may purge the names
+// they write (§G.1, v0.88). Where the operator trusts the origin
+// (FollowPurgesOptions.Origins, with its Importers), the deployment
+// follows the origin's namespace log from the first such batch's
+// source.at and applies each purge there of a name such a batch wrote, and
+// each purge-ns to every such name, as §8.3 does locally: its own chains
+// for the name and its branches, with their cache tags. The
 // upstream namespace's chains (§G.4.4) are reached the same way, as the
 // import's batches into it carry the same source. Nothing here is the
 // importer's doing: the server writes these entries itself, without grant
@@ -24,8 +27,10 @@ package core
 //     the origin is trusted then, so trusting it later follows from there.
 //   - purge_follow_names: the names imported, those the batch itself wrote
 //     (never source.ids' keys alone, which a writer may fill with names of
-//     resources the batch didn't touch, VEC-87), each with the source.at
-//     that brought it first. A name an import brings after the follow
+//     resources the batch didn't touch, VEC-87) under a grant that may
+//     purge them, each with the principal that wrote it, the importer,
+//     and the source.at that brought it first. Only those an importer the
+//     operator names for the origin wrote are followed. A name an import brings after the follow
 //     started is pending: the cursor may have passed a purge of it already
 //     (an older bundle imported late), so the origin's log is read once more
 //     from that source.at for it (FollowPurges). Purges are idempotent: a
@@ -44,6 +49,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -71,8 +77,12 @@ type FollowPurgesOptions struct {
 	Timeout time.Duration
 }
 
-// PurgeOrigin is how a trusted origin is reached.
+// PurgeOrigin is how a trusted origin is reached, and who imports from it.
 type PurgeOrigin struct {
+	// Importers are the principals (root sub, as a namespace entry's
+	// author records it) that import from the origin (§G.1): only names
+	// their import batches wrote are followed. None follows nothing.
+	Importers []string
 	// BaseURL is where the origin answers; empty means the origin itself.
 	BaseURL string
 	// Bearer is a grant read with the origin's namespace logs (§C.5).
@@ -98,8 +108,11 @@ func (k followKey) String() string {
 // recordImport records an import batch's source (§G.4.4), as the batch
 // commits: a source with a bundle and another deployment's origin starts a
 // follow of n from source.at, if none exists, and adds the names the batch
-// wrote. Whether the origin is trusted is decided only when following.
-func (t *tx) recordImport(n *nsRow, src any, st []*itemState) {
+// wrote whose purge a's grant allows (§C.2 step 1), with a's principal as
+// their importer. A batch whose grant may purge none of them records
+// nothing (§G.1, v0.88). Whether the origin is trusted, and the principal
+// its importer, is decided only when following.
+func (t *tx) recordImport(n *nsRow, a *actor, src any, st []*itemState) {
 	m, ok := src.(map[string]any)
 	if !ok {
 		return
@@ -115,6 +128,11 @@ func (t *tx) recordImport(n *nsRow, src any, st []*itemState) {
 	if _, err := ids.Parse(at); err != nil {
 		return
 	}
+	st = t.mayPurgeAll(a, st)
+	if len(st) == 0 {
+		return
+	}
+	importer := a.id()
 	_, err := t.Exec(`INSERT INTO purge_follows (ns, origin, src_ns, upto) VALUES (?,?,?,?) ON CONFLICT DO NOTHING`, n.id, origin, srcNS, at)
 	t.must(err)
 	var cursor string
@@ -127,18 +145,49 @@ func (t *tx) recordImport(n *nsRow, src any, st []*itemState) {
 	// namespace's lock.
 	for i := 0; i < len(st); i += 100 {
 		chunk := st[i:min(i+100, len(st))]
-		q := `INSERT INTO purge_follow_names (ns, origin, src_ns, name, from_at, pending) VALUES `
-		args := make([]any, 0, 6*len(chunk))
+		q := `INSERT INTO purge_follow_names (ns, origin, src_ns, name, importer, from_at, pending) VALUES `
+		args := make([]any, 0, 7*len(chunk))
 		for j, s := range chunk {
 			if j > 0 {
 				q += `,`
 			}
-			q += `(?,?,?,?,?,?)`
-			args = append(args, n.id, origin, srcNS, s.Resource, at, pending)
+			q += `(?,?,?,?,?,?,?)`
+			args = append(args, n.id, origin, srcNS, s.Resource, importer, at, pending)
 		}
 		_, err := t.Exec(q+` ON CONFLICT DO NOTHING`, args...)
 		t.must(err)
 	}
+}
+
+// mayPurgeAll is the items of st whose resource a's grant may purge, as
+// step 1 of a purge judges it (authorize, §C.2), each check with a budget
+// of its own; one that runs out may not.
+func (t *tx) mayPurgeAll(a *actor, st []*itemState) []*itemState {
+	prev := t.meter
+	t.meter = nil
+	defer func() { t.meter = prev }()
+	var out []*itemState
+	for _, s := range st {
+		if t.authorize(a, "purge", s.Resource) == nil {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// importerArgs is the condition on purge_follow_names that keeps the
+// names origin's importers wrote, and its arguments: none at all where it
+// names none.
+func importerArgs(po PurgeOrigin) (string, []any) {
+	if len(po.Importers) == 0 {
+		return ` AND 1 = 0`, nil
+	}
+	q := ` AND importer IN (?` + strings.Repeat(`,?`, len(po.Importers)-1) + `)`
+	args := make([]any, len(po.Importers))
+	for i, p := range po.Importers {
+		args[i] = p
+	}
+	return q, args
 }
 
 // followRow is a follow as stored.
@@ -176,7 +225,9 @@ func (e *Engine) FollowPurges(ctx context.Context) error {
 		t.must(q.Err())
 		q.Close()
 		for _, r := range rows {
-			q, err := t.Query(`SELECT from_at, name FROM purge_follow_names WHERE ns = ? AND origin = ? AND src_ns = ? AND pending = 1`, r.ns, r.origin, r.srcNS)
+			cond, args := importerArgs(trusted[r.origin])
+			q, err := t.Query(`SELECT DISTINCT from_at, name FROM purge_follow_names WHERE ns = ? AND origin = ? AND src_ns = ? AND pending = 1`+cond+` ORDER BY from_at, name`,
+				append([]any{r.ns, r.origin, r.srcNS}, args...)...)
 			t.must(err)
 			for q.Next() {
 				var at, name string
@@ -225,7 +276,7 @@ func (e *Engine) followOne(ctx context.Context, r *followRow, po PurgeOrigin) er
 	unknown := false
 	entries, head, err := originLog(ctx, c, r.srcNS, r.cursor)
 	if err == nil {
-		err = e.applyFollowed(ctx, r.followKey, entries, func(id string) error { return e.moveCursor(ctx, r.followKey, r.cursor, id, &r.cursor) })
+		err = e.applyFollowed(ctx, r.followKey, po, entries, func(id string) error { return e.moveCursor(ctx, r.followKey, r.cursor, id, &r.cursor) })
 	}
 	if err == nil && head != r.cursor {
 		err = e.moveCursor(ctx, r.followKey, r.cursor, head, &r.cursor)
@@ -243,14 +294,16 @@ func (e *Engine) followOne(ctx context.Context, r *followRow, po PurgeOrigin) er
 	for _, at := range ats {
 		entries, head, err := originLog(ctx, c, r.srcNS, at)
 		if err == nil {
-			err = e.applyFollowed(ctx, r.followKey, entries, nil)
+			err = e.applyFollowed(ctx, r.followKey, po, entries, nil)
 		}
 		if err == nil {
 			// Exactly the names read for: one a batch of the same bundle
 			// added meanwhile stays pending.
+			cond, iargs := importerArgs(po)
 			err = e.update(ctx, func(t *tx) error {
 				for _, name := range r.rescans[at] {
-					_, err := t.Exec(`UPDATE purge_follow_names SET pending = 0 WHERE ns = ? AND origin = ? AND src_ns = ? AND name = ? AND from_at = ?`, r.ns, r.origin, r.srcNS, name, at)
+					_, err := t.Exec(`UPDATE purge_follow_names SET pending = 0 WHERE ns = ? AND origin = ? AND src_ns = ? AND name = ? AND from_at = ?`+cond,
+						append([]any{r.ns, r.origin, r.srcNS, name, at}, iargs...)...)
 					t.must(err)
 				}
 				return nil
@@ -323,7 +376,7 @@ func (e *Engine) moveCursor(ctx context.Context, k followKey, old, id string, cu
 // applyFollowed applies the purges among entries, in order: a purge of a
 // name imported, and a purge-ns to every name imported. After each such
 // entry, done (if set) is called with its id.
-func (e *Engine) applyFollowed(ctx context.Context, k followKey, entries []client.NSEntry, done func(id string) error) error {
+func (e *Engine) applyFollowed(ctx context.Context, k followKey, po PurgeOrigin, entries []client.NSEntry, done func(id string) error) error {
 	for _, en := range entries {
 		if en.Kind != "purge" && en.Kind != "purge-ns" {
 			continue
@@ -331,7 +384,7 @@ func (e *Engine) applyFollowed(ctx context.Context, k followKey, entries []clien
 		if err := e.jobStep(ctx); err != nil {
 			return err
 		}
-		names, err := e.importedNames(ctx, k, en)
+		names, err := e.importedNames(ctx, k, po, en)
 		if err != nil {
 			return err
 		}
@@ -350,13 +403,15 @@ func (e *Engine) applyFollowed(ctx context.Context, k followKey, entries []clien
 }
 
 // importedNames are the names an origin's purge entry reaches here: its
-// resource, if imported, or for a purge-ns every name imported.
-func (e *Engine) importedNames(ctx context.Context, k followKey, en client.NSEntry) ([]string, error) {
+// resource, if one of po's importers imported it, or for a purge-ns every
+// name they imported.
+func (e *Engine) importedNames(ctx context.Context, k followKey, po PurgeOrigin, en client.NSEntry) ([]string, error) {
 	var names []string
 	err := e.read(ctx, func(t *tx) error {
 		names = nil
-		q := `SELECT name FROM purge_follow_names WHERE ns = ? AND origin = ? AND src_ns = ?`
-		args := []any{k.ns, k.origin, k.srcNS}
+		cond, iargs := importerArgs(po)
+		q := `SELECT DISTINCT name FROM purge_follow_names WHERE ns = ? AND origin = ? AND src_ns = ?` + cond
+		args := append([]any{k.ns, k.origin, k.srcNS}, iargs...)
 		if en.Kind == "purge" {
 			q += ` AND name = ?`
 			args = append(args, en.Resource)

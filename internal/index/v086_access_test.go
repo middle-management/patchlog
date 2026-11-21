@@ -68,8 +68,11 @@ func TestV086CookiesToldApartByExp(t *testing.T) {
 	if got := v82Status(t, d.x, paths, alC); got != v82Refuse {
 		t.Errorf("al under her cookie once her role changed: %s, want 403", got)
 	}
-	if got := v82Status(t, d.x, paths, boC); got != v82Reads {
-		t.Errorf("bo under his cookie once al's role changed: %s, want 200", got)
+	// A change to any role that lists read ends every cookie of the key's
+	// views (v0.88: the index digests them all, as the origin does;
+	// Filtered reads scenario 61).
+	if got := v82Status(t, d.x, paths, boC); got != v82Refuse {
+		t.Errorf("bo under his cookie once al's role, which lists read, changed: %s, want 403", got)
 	}
 	// No whole second left: a grant with one second to go, whose one
 	// candidate exp another cookie of the prefix holds.
