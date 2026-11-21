@@ -1,6 +1,6 @@
 # Patch Log — Tools
 
-Status: draft v0.87 · 2026-11-19. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.89 · 2026-11-20. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Clients and tools that use the protocol's public API. A server needs nothing from this document.
 
@@ -16,7 +16,7 @@ Status: draft v0.87 · 2026-11-19. A companion to the [Patch Log specification](
 
 ## 11. Client behaviour (non-normative)
 
-- **load:** `GET /r/{ns}/{name}`, following the redirect; the head is `X-Revision`. At E3 it is the redirect's `ETag`, and the `404` (`not_offered`) at the target names the snapshot to fold the log from, or none for genesis (§7.1).
+- **load:** `GET /r/{ns}/{name}`, following the redirect; the head is `X-Revision`. At E3 it is the redirect's `ETag`, and the `404` (`not_offered`) at the target names the snapshot to fold the log from, or none for genesis (§7.1). At E2 a partial reader takes the revision's key from a filtered answer that names it, such as the resource's log (§7.9, §E.2.2).
 - **sync(to):** `GET …/rev/{to}/log?since={head}`, following pages until `to` arrives (§7.1); apply the entries in order.
 - **submit(patches):** `PATCH` with `If-Match: "{head}"`, then apply the returned revision. On `412`, `sync(body.head)` and resend the same patches, re-sealed at E3 (§E.3.1) and re-signed if signed (§C.3.1): this is the rebase. Surface `422` and `403` errors; retry a bounded number of times.
 - **Conflict safety:** prefix a set that must not land on changed data with `test` ops of the values seen. A retry on changed data then fails with `422`. At E3, where the server applies nothing (§6.2), it fails instead when the client applies it to the new head before re-sealing.
@@ -273,7 +273,7 @@ To bring `release-7` up to date with `matches`:
 
 ## F.8 Access, encryption and indexes
 
-- **Editors limited to some documents** can't branch the base themselves (§7.6). A service that may branch it creates the branch for them, recorded with `via` (§C.1), with `read: "grant"`, and issues them grants on it with the rules of their base grants. Filtered reads don't cover branches (§7.9), so such grants list only through a preview index (below, §A.4).
+- **Editors limited to some documents** can't branch the base themselves (§7.6). A service that may branch it creates the branch for them, recorded with `via` (§C.1), with `read: "grant"`, and issues them grants on it with the rules of their base grants. Filtered reads don't cover branches (§7.9), so such grants list only through a preview index (below, §A.4), and in a sealed branch those whose rules refer to `/doc` get no keys (§E.2.3).
 - **Keys and revocation** in a base reach its branches (§C.4); roles and rules don't (§7.6, §F.3).
 - **Encryption (Addendum E),** whose Levels also bind a branch's level to its base's:
   - **E2** as §E.2.5 says, where fast-forward merges keep ids, which are over plaintext.
@@ -336,7 +336,7 @@ A release may span several namespaces, such as content and schemas. Each is bran
 
   1.  **Schemas, by fast-forward only,** in `$ref` order: the resources whose documents have a dialect URL as `$schema` (§6.1), tombstones and restores included. One the base changed since `at` is a conflict: rebase (below), and migrate the documents with `replace /$schema` (§6.3). An end-to-end schema namespace isn't branched: new revisions are written to it first.
   2.  **Content,** in any order.
-  3.  **Publishing,** where readers' rules test a field that marks documents published (e.g. `/doc/published`, §7.9, guarded as §6.4.4 says): one batch per content namespace sets it on the documents the release created, which carried it unset. A change to that field in steps 1 and 2 is a conflict. Edits to documents already published show at step 2.
+  3.  **Publishing,** where readers' rules test a field that marks documents published (e.g. `/doc/published`, §7.9, guarded as §6.4.4 says, with an exemption for a group the merge service's grant carries, since a role would add verbs): one batch per content namespace sets it on the documents the release created or restored, which carried it unset. A change to that field in steps 1 and 2 is a conflict. Edits to documents already published show at step 2. Planning again after a stop takes step 3's documents, those still unset, from the stored plan, since steps 1 and 2 have merged them.
 
 - **The plan.** A person approves the plan's **digest**, `text(trunc160(sha256(canonical(plan))))`, where `plan` is `{ "release": <the release document's revision path>, "batches": [{ "ns", "source"?, "config"?, "items": [{ "resource", "ifMatch" | "ifNoneMatch", "steps" }] }] }`, with no other members.
   - `release` is `/r/{ns}/{name}/rev/{id}`, the id in text form, as `on` writes it.
@@ -383,7 +383,7 @@ A selection is a list of resources, or anything a resolver turns into one, e.g. 
 2.  **Declared references:** fields marked `x-ref` in the documents' schemas (§6.5). A **pinned** reference needs that exact revision, a **live** one the head as of the export's `at`.
 3.  **Application resolvers:** tool plug-ins for relationships no schema expresses, e.g. "a match brings its team pages".
 
-Untyped documents have no level 2, but an opt-in rule may treat any string in them matching `^/r/` as a reference. Dependencies left out with `external` are checked by the importer to exist in the target: by id for pinned references, in the resource's chain and neither purged nor pruned without a kept document (§8.6), and by name for live ones.
+Untyped documents have no level 2, but an opt-in rule may treat any string in them matching `^/r/` as a reference. Dependencies left out with `external` are checked by the importer to exist in the target: by id for pinned references, in the resource's chain and neither purged nor, unless it is a tombstone, pruned without a kept document (§8.6), and by name for live ones.
 
 ### G.4.3 History or snapshot
 
@@ -525,7 +525,7 @@ A **file tree** is a namespace whose documents carry their place as data. A gate
 
 ## H.3 Listings
 
-- **In a tree,** a folder is listed by the index (Addendum A): `GET /{ns}?facet[/folder]={path}&schema=/r/schemas/file&sort=/name`, paged through. A path is resolved one folder at a time, or with `facet[/name]` too. Hits are filtered by the reader's read rules (§A.4, §7.9).
+- **In a tree,** a folder is listed by the index (Addendum A): `GET /{ns}?facet[/folder]={path}&schema=/r/schemas/file&sort=/name`, paged through. A path is resolved one folder at a time, or with `facet[/name]` too. Hits are filtered by the reader's read rules (§A.4, §7.9). The index's `400` for the facet path, as where the reader may see no file document (§A.4), lists an empty folder, never one empty for a write (§H.4 Names before writes).
 - **A folder too large to list whole** (beyond what a tool pages through) is refused (`403`, saying why), never listed cut short.
 - **An index that is behind** answers `503 behind` (§A.5); a tool answers `503` (§H.4 Answers), and deletes nothing on the strength of a listing meanwhile.
 - **Read-your-writes.** A tool sends the `X-Namespace-Revision` of its writes as `?min` on later listings (§A.5).
@@ -538,7 +538,7 @@ A **file tree** is a namespace whose documents carry their place as data. A gate
 
 A save follows §11.3, with these specifics:
 
-- **Names before writes.** The index lags (§A.5), so before any write a tool reads the documents it resolved from a listing and checks that each still has that `folder` and `name`, and lists again with `?min` where one doesn't. A folder is empty only when a listing at or past the tool's last write in the namespace has nothing in it. A name the filtered listing lacks is never revealed or edited: a `PUT` onto a name only a sibling hidden from the user has creates a new file.
+- **Names before writes.** The index lags (§A.5), so before any write a tool reads the documents it resolved from a listing and checks that each still has that `folder` and `name`, and lists again where one doesn't, with `?min` at the namespace head. A folder is empty only when a listing at or past the tool's last write in the namespace has nothing in it. A name the filtered listing lacks is never revealed or edited: a `PUT` onto a name only a sibling hidden from the user has creates a new file.
 
 - **The base.** The entity tag a client sends names the **base**: the revision the client opened. The tag is the one in `If-Match` (its first value, `W/` dropped) or, failing that, in an `If` header (the first tag of the first list that applies to this resource and isn't negated with `Not`; tag-only lists are not lock tokens).
 
@@ -591,12 +591,12 @@ A save follows §11.3, with these specifics:
   | Frozen namespace                                                                                                                                                                                                                                                           | `403`, naming the successor; never `423` (§H.6)                                                                                                                            |
   | Purged                                                                                                                                                                                                                                                                     | `410`                                                                                                                                                                      |
   | Rate limited, or a service behind, for longer than a client waits (§6.6, §A.5)                                                                                                                                                                                             | `503` with `Retry-After`                                                                                                                                                   |
-  | A core or service request the gateway makes for the user's request fails (`408`, `429`, `5xx`, no connection, or no answer in time), a read of another namespace's documents or a write included, whether or not the answer needed it; a failed read never counts as a refusal | `503` with `Retry-After` after a `429`, a `503` or no answer in time, else `502` |
+  | A core or service request the gateway makes for the user's request fails (`408`, `429`, `5xx`, no connection, or no answer in time) at its last attempt, a read of another namespace's documents, a write or a due re-check of the user's grant (§H.7) included, whether or not the answer needed it; a failed read never counts as a refusal | `503` with `Retry-After` after a `429`, a `503` or no answer in time, else `502` |
   | A limit exceeded (the core's `413` or `422` with `code: "limit"`)                                                                                                                                                                                                          | `413`, in one shape: `too large: {limit} {measured} > {max} (§6.6): {message}`, a limit without sizes named alone, and a `413` that names no limit keeping the core's text |
   | A bound of the gateway's own (an upload buffer, a file-size setting, `blobSize` checked before an upload)                                                                                                                                                                  | `413` in the same shape, naming its setting, `measured` a lower bound where reading stopped                                                                                |
   | The gateway's own memory for scratch files or locks full (§H.6)                                                                                                                                                                                                            | `507`; bounds are generous                                                                                                                                                 |
 
-  A gateway's `502` and `503` name only the upstream that failed, the core or a service, and carry nothing of its answer, as §C.6 says of a service's `502`; the `503`'s `Retry-After` is the gateway's own.
+  A gateway's `502` and `503` name only the upstream that failed, the core or a service, and carry nothing of its answer, as §C.6 says of a service's `502`; the `503`'s `Retry-After` is the gateway's own. Requests made in the background, such as refreshes of a shared cache, never count. A read that fails before the request's first write stops the request, so nothing is written. One that fails after a write still fails the request, with the work done, and the writes that follow and don't decide by that read are still sent.
 
 ## H.5 Deleting, renaming, moving and copying
 
@@ -665,7 +665,7 @@ A save follows §11.3, with these specifics:
   - Each kind of per-user state is bounded per user. A new scope when content scopes are full is `503` with `Retry-After`, never a drop of one holding content.
 - **Re-checking.** A gateway creates state for a grant only after the core has accepted it, bounds the users it keeps state for, and re-checks a grant at least every five minutes. It relies on a `writer` block (§7.4) for 30 seconds at most, and reads it again after `409 frozen`, `422 nonce` or a limit refusal. When the core refuses a token, the gateway stops serving it; the user's state stays for their other tokens, each re-checked at its next request.
 - **Limited grants** list a tree through the index (§H.3), and a flat view only through filtered `/heads` (§7.9). They learn what they may write from `GET /ns/{ns}/principal` (§7.4).
-- **Folders as access.** Read rules on `/doc/folder` give a grant a subtree (§7.9), its own folder document included: `{ "any": [{ "op": "test", "path": "/doc/folder", "schema": { "pattern": "^/team-a(/|$)" } }, { "all": [{ "op": "test", "path": "/doc/folder", "value": "/" }, { "op": "test", "path": "/doc/name", "value": "team-a" }] }] }`. Write rules guard `folder` and `name` (§6.4.4), else anyone who may edit a file, even one it can't read, may move it into its own view or another's. In sealed and end-to-end trees `/doc` rules fail (§6.4.1), so such grants read nothing there.
+- **Folders as access.** Read rules on `/doc/folder` give a grant a subtree (§7.9), its own folder document included: `{ "any": [{ "op": "test", "path": "/doc/folder", "schema": { "pattern": "^/team-a(/|$)" } }, { "all": [{ "op": "test", "path": "/doc/folder", "value": "/" }, { "op": "test", "path": "/doc/name", "value": "team-a" }] }] }`. Write rules guard `folder` and `name` (§6.4.4), else anyone who may edit a file, even one it can't read, may move it into its own view or another's. In end-to-end trees `/doc` rules fail (§6.4.1), so such grants read nothing there; in sealed ones they read with a view key (§E.2.3).
 - **Sealed and end-to-end namespaces** need keys (Addendum E). A gateway without them doesn't offer those namespaces, and never shows their files as writable empty files.
 
 ## H.8 WebDAV
