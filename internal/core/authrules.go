@@ -110,6 +110,9 @@ type writeMeter struct {
 	// (authorize): running out there doesn't answer at once, since a check
 	// that fails outright answers before it (§6.6 Validation work).
 	stepOne bool
+	// charged are the actors whose attrs check this budget has counted
+	// (chargeAttrs).
+	charged map[*actor]bool
 }
 
 // newMeter is a meter for one write, at the deployment's limit.
@@ -127,6 +130,27 @@ func (t *tx) metered(readable func() bool) func() {
 	}
 	t.meter = t.newMeter(readable)
 	return func() { t.meter = nil }
+}
+
+// chargeAttrs counts the steps of a's attrs check (§C.4) against m, the
+// budget of a check of a's grant, once per budget (§6.6 Validation work,
+// v0.88: "a key scope's attrs schema" counts). One that ran out spends
+// m: the check then runs out too.
+func (m *writeMeter) chargeAttrs(a *actor) {
+	if m == nil || a.attrsSteps == 0 && !a.attrsOver {
+		return
+	}
+	if m.charged[a] {
+		return
+	}
+	if m.charged == nil {
+		m.charged = map[*actor]bool{}
+	}
+	m.charged[a] = true
+	m.Steps += a.attrsSteps
+	if a.attrsOver || m.Max > 0 && m.Steps >= m.Max {
+		m.Over = true
+	}
 }
 
 // rule is m as the rules package takes it, nil for no meter.
@@ -241,6 +265,7 @@ func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[strin
 // scopeRules evaluates the key-scope and block rules of a's verified
 // grant, as grantRulesMode does.
 func (t *tx) scopeRules(a *actor, env map[string]any, stepOne bool, unknown []string, m *writeMeter) *Error {
+	m.chargeAttrs(a)
 	if m != nil && m.read && m.Over {
 		// The budget its exchange or key request shares is spent.
 		return errReadRanOut()

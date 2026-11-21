@@ -58,7 +58,13 @@ type actor struct {
 	// only within one (§C.5.2 Rate, v0.88); "" for bucketKey.
 	exchangeKey string
 	keyRate     *grant.Rate
-	grant       *grant.Grant
+	// attrsSteps are the validation steps the check of the grant's attrs
+	// against its key's attrs schema took (§C.4), which every check of
+	// the grant counts against its budget (chargeAttrs, §6.6, v0.88);
+	// attrsOver, that the check ran out, and so does every check then.
+	attrsSteps int
+	attrsOver  bool
+	grant      *grant.Grant
 	// noAuth: a request made while authentication is disabled (§1). The
 	// namespace entries written for it record "grant": null (§7.4).
 	noAuth bool
@@ -226,11 +232,24 @@ func nsNotNamed(ns string) *Error {
 // verifyGrant verifies a decoded grant against namespace n's configuration
 // in force, or against keysOverride (operator keys).
 func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, keysOverride []grant.Key) (*actor, *Error) {
+	var attrsSteps int
+	var attrsOver bool
 	env := grant.Env{
 		Now: t.now,
 		NS:  nsName,
 		ValidateAttrs: func(schema any, attrs map[string]any) error {
-			return validateAttrs(schema, attrs, t.e.opt.MaxValidationSteps)
+			m := rules.Budget(t.e.opt.MaxValidationSteps)
+			err := validateAttrs(schema, attrs, m)
+			attrsSteps, attrsOver = m.Steps, m.Over
+			if m.Over {
+				// Ran out: every check of the grant counts that against
+				// its budget (chargeAttrs), so a write's step 1 runs out,
+				// answered after any check that fails outright, and a
+				// read check fails with its usual refusal (§6.6). Where
+				// verification alone decides, it is refused (attrsOver).
+				return nil
+			}
+			return err
 		},
 	}
 	if keysOverride != nil {
@@ -250,7 +269,7 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 	if err != nil {
 		return nil, authErr(err)
 	}
-	a := &actor{principal: v.Principal, verified: v, star: v.StarKey, grant: g, keyRate: v.Key.Rate}
+	a := &actor{principal: v.Principal, verified: v, star: v.StarKey, grant: g, keyRate: v.Key.Rate, attrsSteps: attrsSteps, attrsOver: attrsOver}
 	a.bucketKey = v.Principal.ID + "\x00" + v.Key.Kid
 	a.exchangeKey = v.Principal.ID + "\x00" + keyThumbprint(v.Key.Pub)
 	return a, nil
@@ -309,10 +328,10 @@ func contains(xs []string, s string) bool {
 }
 
 // validateAttrs checks key-scope attrs against a JSON Schema by evaluating a
-// rule with that schema, within a budget of steps validation steps of its
-// own: attrs whose check takes more don't match (§6.6 Validation work
-// names no budget for it; none is left unbounded).
-func validateAttrs(schema any, attrs map[string]any, steps int) error {
+// rule with that schema, on meter m: attrs whose check runs out don't
+// match. The steps it takes count against the budget of every check of
+// the grant (chargeAttrs, §6.6 Validation work).
+func validateAttrs(schema any, attrs map[string]any, m *rules.Meter) error {
 	r, err := rules.Compile(map[string]any{"op": "test", "path": "/attrs", "schema": schema})
 	if err != nil {
 		return fmt.Errorf("invalid attrs schema: %v", err)
@@ -321,7 +340,7 @@ func validateAttrs(schema any, attrs map[string]any, steps int) error {
 	if attrs != nil {
 		a = attrs
 	}
-	if !r.Passes(map[string]any{"attrs": a}, rules.Budget(steps)) {
+	if !r.Passes(map[string]any{"attrs": a}, m) {
 		return fmt.Errorf("attrs do not match the key scope")
 	}
 	return nil

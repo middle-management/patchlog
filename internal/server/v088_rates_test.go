@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/grant"
 )
 
 // v0.88 §6.6 Cost ("Its config change, if any, costs what a config write
@@ -25,6 +26,48 @@ func TestV088BatchConfigChangeDrawsDespiteItem(t *testing.T) {
 	r := e.batchReq("sec", map[string]any{"config": map[string]any{
 		"ifMatch": e.configID("sec", f.adminG), "patches": ops(op("add", "/x-b", 1.0))}}, bob)
 	expectCode(t, r, 429, "rate")
+}
+
+// v0.88 §6.6 Validation work ("those of step 1, a key scope's attrs
+// schema (§C.4) and every candidate verb's included"), LIM-7: the check
+// of a grant's attrs against its key's attrs schema counts against the
+// budget of the check it is verified for. An attrs check and a step-1
+// rule that each fit run out together, 422 validationSteps; an attrs
+// check that runs out alone is a write's run-out at step 1, 422, never the
+// 403 of attrs that don't match, and fails a read as a read's run-out
+// does: 404 at a resource, 403 at /principal. Until v0.88 the attrs check
+// had a budget of its own.
+func TestV088AttrsSchemaCountsAgainstTheCheck(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t, func(o *core.Options) { o.MaxValidationSteps = 3000 })
+	admin, half, over := newKey("admin"), newKey("half"), newKey("over")
+	entry := func(k keyPair, levels int) map[string]any {
+		m := k.entry("read", "create")
+		m["attrs"] = doubling(levels)
+		return m
+	}
+	e.mkNS("at", map[string]any{"read": "grant", "keys": []any{admin.entry("*"), entry(half, 9), entry(over, 30)}})
+	adminG := e.grant(admin, "user:root", []string{"at"}, allVerbs)
+	put := func(name, who string) *resp { return e.write("PATCH", "at", name, "", addRoot(map[string]any{}), who) }
+	g := func(k keyPair) string {
+		return e.grant(k, "user:w", []string{"at"}, []string{"read", "create"}, map[string]any{"attrs": map[string]any{"desk": "x"}})
+	}
+	expect(t, put("a", g(half)), 201)
+	mintHalf, err := grant.Decode(g(half), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slow := narrowed(t, mintHalf, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": doubling(9)}}})
+	expectSteps(t, put("b", slow))
+	expectSteps(t, put("c", g(over)))
+	expect(t, put("d", adminG), 201)
+	// A read fails as a read check that runs out does (scenario 79), and
+	// /principal, which verification alone decides, refuses it.
+	if r := e.get("/r/at/d", g(over)); r.Code != 404 {
+		t.Fatalf("a read under a grant whose attrs check runs out: %d %s, want 404", r.Code, r.Body)
+	}
+	expect(t, e.get("/ns/at/principal", g(half)), 200)
+	expectCode(t, e.get("/ns/at/principal", g(over)), 403, "forbidden")
 }
 
 // v0.88 §8.5 item 4, §6.1 ("dependents (§7.4, §8.5) list the dependents
