@@ -874,6 +874,11 @@ time only): the consumers read the revision each namespace entry names
   revision insert 2.4 ms against 1.3, group commit's 3.0 against 1.8), it waited on hot pages
   (`LWLock:BufferContent`) and its WAL (`LWLock:WALWrite`), at 68% CPU and up to 130 MB/s and
   3,900 IOPS. About 14,000 writes a second is what a `db.m7g.2xlarge` takes of this load.
+- **On a `db.m7g.4xlarge`** (16 vCPU, 64 GiB) the same two instances wrote 15,864 a second at 16
+  namespaces (every namespace its full 1,000) and 25,104 at 32 (p99 132 and 281 ms), 75% more
+  than the 2xlarge, at 62% RDS CPU, 3,700 write IOPS and 176 MB/s. Postgres waited on its WAL
+  (`LWLock:WALWrite`, 2–4 sessions) and the log lock's mean wait was 2 ms; the instances were at
+  56–59% CPU. So the database's size sets this ceiling, and it scales with it.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
