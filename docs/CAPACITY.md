@@ -868,6 +868,12 @@ time only): the consumers read the revision each namespace entry names
   bucket), 40–50 in Postgres, which waited on its WAL (`LWLock:WALWrite`); the core at 60% CPU,
   RDS at 56%. Past here: more instances of the core, a larger database, or Postgres's own WAL
   grouping (`commit_delay`).
+- **Two instances of the core** (`c7g.2xlarge` each, `pool_max_conns=32` each, namespace i
+  through instance i mod 2) wrote 13,588 a second at 16 namespaces and 14,326 at 32 (p99 445
+  ms), the instances at 40% and 43% CPU: Postgres is the limit. Its statements slowed (the
+  revision insert 2.4 ms against 1.3, group commit's 3.0 against 1.8), it waited on hot pages
+  (`LWLock:BufferContent`) and its WAL (`LWLock:WALWrite`), at 68% CPU and up to 130 MB/s and
+  3,900 IOPS. About 14,000 writes a second is what a `db.m7g.2xlarge` takes of this load.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
