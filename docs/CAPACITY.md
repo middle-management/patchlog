@@ -879,6 +879,13 @@ time only): the consumers read the revision each namespace entry names
   than the 2xlarge, at 62% RDS CPU, 3,700 write IOPS and 176 MB/s. Postgres waited on its WAL
   (`LWLock:WALWrite`, 2–4 sessions) and the log lock's mean wait was 2 ms; the instances were at
   56–59% CPU. So the database's size sets this ceiling, and it scales with it.
+- **On Aurora PostgreSQL Serverless v2** (I/O-Optimized) the same two instances wrote 5,308 and
+  6,125 a second at 16 and 32 namespaces scaling from 2 ACU, a third of the 4xlarge's: groups
+  were full (32) but each commit waited for Aurora's storage quorum (`IO:XactSync`), so a
+  group took about 90 ms and the log lock's mean wait was 8–13 ms; CPU stayed at 17–26% and
+  capacity reached only 22 ACU. With a 32 ACU minimum and `--group-commit 128` they wrote
+  15,115 and 20,834 (p99 185 and 329 ms), scaling to the 64 ACU maximum. On Aurora, commit
+  latency rather than capacity bounds a namespace's log, so larger groups pay most.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
