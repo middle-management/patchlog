@@ -858,7 +858,16 @@ time only): the consumers read the revision each namespace entry names
   102 MB/s; it began minutes after the resize, while RDS optimises the volume. Then every
   namespace had one group commit running, at the `--group-commit` cap of 32 (mean 26): about
   850 writes a second per namespace, one full group after another, the core at 61% CPU and RDS
-  at 57%. A larger `--group-commit` is the next lever.
+  at 57%.
+- **`--group-commit 128` didn't raise it** (13,716 a second). Groups grew to 36–38 writes at 16
+  namespaces (up to 128), but held each namespace's log lock longer: its mean wait rose to 4–5
+  ms (p90 up to 50 ms), against under 1. Each namespace wrote 850 a second at 16 where 8 wrote
+  their full 1,000, so what they share sets the limit, and no one stage does (goroutine dumps
+  at the peaks): about 1,000 writes in group commit queues, 300–400 waiting for a main-pool
+  connection for their check, 140–275 in draws (with one principal, a batch at a time on its
+  bucket), 40–50 in Postgres, which waited on its WAL (`LWLock:WALWrite`); the core at 60% CPU,
+  RDS at 56%. Past here: more instances of the core, a larger database, or Postgres's own WAL
+  grouping (`commit_delay`).
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
