@@ -852,6 +852,13 @@ time only): the consumers read the revision each namespace entry names
   63%. The volume is next: write latency up to 23 ms after the busy rows, its queue up to 9.4,
   88 MB/s of the 125 MiB/s gp3 gives 20 GiB, and Postgres waiting on `LWLock:WALWrite`. The log
   lock's mean wait, 0.83 ms, is the next on the core's side.
+- **On 400 GiB of gp3** (12,000 IOPS, 500 MiB/s, against 3,000 and 125 MiB/s on 20 GiB), the
+  same run wrote 13,577 a second at 16 namespaces with one writer principal (p99 187 ms), RDS's
+  write latency at most 2.4 ms against 23 and its disk queue at most 3.3 against 9.4, at
+  102 MB/s; it began minutes after the resize, while RDS optimises the volume. Then every
+  namespace had one group commit running, at the `--group-commit` cap of 32 (mean 26): about
+  850 writes a second per namespace, one full group after another, the core at 61% CPU and RDS
+  at 57%. A larger `--group-commit` is the next lever.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
