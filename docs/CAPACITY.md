@@ -844,6 +844,14 @@ time only): the consumers read the revision each namespace entry names
     second instead of 11,300, 7.5 draws a statement instead of 2.5, with 2% of draws alone
     (32% before). To measure it again, use the same `ec2-sources.sh` run as above
     (`STORE_TYPE=c7g.2xlarge`).
+- **With draws batched by bucket (b13be98a)**, the same run wrote 12,798 a second at 16
+  namespaces with one writer principal and 11,738 with a principal per namespace (p99 259 and
+  349 ms), against 11,621 and 9,874. The draws took 335 s of Postgres's statement time against
+  2,087 (`rate_draw` 520,000 calls, `rate_draws` 206,000), and the row-lock waits went. Writes
+  waited in their namespaces' group commit queues (about 1,500), the core at 60% CPU and RDS at
+  63%. The volume is next: write latency up to 23 ms after the busy rows, its queue up to 9.4,
+  88 MB/s of the 125 MiB/s gp3 gives 20 GiB, and Postgres waiting on `LWLock:WALWrite`. The log
+  lock's mean wait, 0.83 ms, is the next on the core's side.
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
