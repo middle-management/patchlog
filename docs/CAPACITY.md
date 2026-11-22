@@ -827,6 +827,23 @@ time only): the consumers read the revision each namespace entry names
     bucket pool. To measure it again: doors' `ec2-sources.sh` with `MODE=namespaces
     DB_CLASS=db.m7g.2xlarge FETCHES=8 STORE_POOL_CONNS=64 PRINCIPALS="one namespace"
     PROFILE=1`, without `--local-rate-buckets`.
+  - Draws on the same bucket share a batch. Measured with batched draws (16 namespaces, a
+    `c7g.2xlarge` core with `pool_max_conns=64`), the core wrote 11,621 a second with one writer
+    principal and 9,874 with one per namespace. Still, `rate_draw` ran 1.12M times beside
+    222k `rate_draws` (5.25M draws), so about two in five draws ran alone. The draws took more
+    Postgres time than every other statement together, and one principal's batches waited on
+    its row (`Lock:tuple`, `Lock:transactionid`). A draw that found a connection free started a
+    batch of its own, only to wait for the row the batch before it held. Now at most one batch
+    runs on any bucket: a draw on a bucket a batch draws on queues for the next batch on it,
+    and draws on buckets no batch holds start a batch at once. At most 4 batches run at once
+    (`drawBatches`), not one per connection of the bucket pool. A lone draw on an idle
+    instance still starts at once, and requests on one bucket are still judged in queue order.
+    On a local Postgres 16 (`BenchmarkDrawContended`, 64 goroutines, a bucket pool of 16),
+    the one-principal case drew 17,900 a second instead of 6,400, 32 draws a statement instead
+    of 2.3, with almost no draw alone (28% before). A principal per namespace drew 25,000 a
+    second instead of 11,300, 7.5 draws a statement instead of 2.5, with 2% of draws alone
+    (32% before). To measure it again, use the same `ec2-sources.sh` run as above
+    (`STORE_TYPE=c7g.2xlarge`).
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.

@@ -53,8 +53,8 @@ import (
 // (rateLimiter), as does an instance on Postgres with LocalRateBuckets.
 //
 // Concurrent draws batch (draw, drawBatch), as group commit's writes do:
-// with every connection of the bucket pool drawing, the draws queued
-// meanwhile go in one statement, rate_draws (migration
+// while a batch draws on a bucket, the draws on it queued meanwhile go in
+// the next batch, one statement, rate_draws (migration
 // 030_rate_draws_batched), which locks the rows of all their buckets
 // once, in key order, and judges the requests in queue order, each as
 // rate_draw would have after the ones before it. One draw per write, each
@@ -85,15 +85,19 @@ type bucketStore struct {
 	drawing atomic.Int64
 
 	// qmu guards the queue of draws (draw): queue holds the draws no
-	// batch has taken yet, running counts the goroutines that run batches
-	// (drain), at most slots, the bucket pool's size, and qclosed that
-	// the store is closed; drains waits for them.
-	qmu     sync.Mutex
-	queue   []*drawReq
-	running int
-	slots   int
-	qclosed bool
-	drains  sync.WaitGroup
+	// batch has taken yet, and queuedOn counts them by bucket key;
+	// drawingOn counts by key the batches running that draw on it;
+	// running counts the goroutines that run batches (drain), at most
+	// slots, the bucket pool's size, and qclosed that the store is
+	// closed; drains waits for them.
+	qmu       sync.Mutex
+	queue     []*drawReq
+	queuedOn  map[string]int
+	drawingOn map[string]int
+	running   int
+	slots     int
+	qclosed   bool
+	drains    sync.WaitGroup
 	// empty holds, by key, the buckets this instance's last draw on found
 	// empty, until when (Unix microseconds) they stay so if no other
 	// instance's draws refill them: knownEmpty.
@@ -113,11 +117,12 @@ func openBucketStore(url string) (*bucketStore, error) {
 	cfg.RuntimeParams["synchronous_commit"] = "off"
 	db := stdlib.OpenDB(*cfg)
 	pool.sizeSide(db)
-	return &bucketStore{db: db, slots: pool.sideSize()}, nil
+	return &bucketStore{db: db, slots: min(pool.sideSize(), drawBatches)}, nil
 }
 
 // The bucket pool is a quarter of the main pool's size, at least two
-// (pgPool.sideSize), and runs as many batches at once (draw): a draw is
+// (pgPool.sideSize), and runs as many batches at once, up to drawBatches,
+// on disjoint buckets (draw): a draw is
 // one short statement, a fraction of the round trips of the write that
 // waits for it, and batches on one bucket queue on its row lock whatever
 // the pool's size: more connections would only hold more of the server's
@@ -223,12 +228,17 @@ func (s *bucketStore) charge(ctx context.Context, now time.Time, d draw) error {
 // whether it deducted.
 //
 // Draws batch as group commit's writes do. Up to slots batches run at
-// once, one per connection of the bucket pool; a draw that finds one free
-// starts one, and the others queue. Each batch, as it ends, takes every
-// draw queued meanwhile (up to drawBatchItems buckets), as one statement:
-// a hot bucket's row (a namespace's, a busy principal's) is locked once per
-// batch rather than once per write, and no draw waits for a connection of
-// the pool, only for the batch before it (docs/CAPACITY.md, "Several
+// once (drawBatches), each on a connection of the bucket pool, but at most
+// drawKeyBatches of them on any one bucket: a draw on a bucket a batch
+// draws on queues for the next batch on it, rather than starting a batch
+// of its own that would only wait for the first's row lock, and a draw
+// on buckets no batch draws on starts one at once if a connection is
+// free (a lone draw on an idle instance waits for nothing). Each batch,
+// as it ends, takes every draw queued meanwhile that it can (up to
+// drawBatchItems buckets), as one statement: a hot bucket's row (a
+// namespace's, a busy principal's) is locked once per batch rather than
+// once per write, and no draw waits for a connection of the pool, only
+// for the batch before it on its buckets (docs/CAPACITY.md, "Several
 // namespaces on one database"). A draw whose request is gone before its
 // batch starts is dropped.
 func (s *bucketStore) draw(ctx context.Context, now time.Time, draws []draw, force bool) (map[string]float64, bool, error) {
@@ -238,8 +248,11 @@ func (s *bucketStore) draw(ctx context.Context, now time.Time, draws []draw, for
 		s.qmu.Unlock()
 		return nil, false, errBucketsClosed
 	}
-	s.queue = append(s.queue, r)
-	start := s.running < s.slots
+	// Every draw queued waits for a batch on its buckets (or a connection,
+	// which a drain that ends takes the next batch on), so r can start a
+	// batch at once only if no draw queued draws on its buckets.
+	start := s.running < s.slots && s.free(r)
+	s.enqueue(r)
 	if start {
 		s.running++
 		s.drains.Add(1)
@@ -277,45 +290,146 @@ type drawRes struct {
 // drawing on more has a batch of its own.
 const drawBatchItems = 4096
 
-// drain runs batches of the queued draws until none is queued.
+// drawKeyBatches bounds the batches running at once that draw on one
+// bucket (draw). Batches on one bucket serialise on its row's lock
+// whatever their number: each one more is a statement more, and a lock
+// handed over more, for the same draws. One lets the draws that queue
+// while a batch runs all go in the next; the EC2 bench drew two in five
+// draws alone with a batch per connection (docs/CAPACITY.md, "Several
+// namespaces on one database").
+const drawKeyBatches = 1
+
+// drawBatches bounds the batches running at once (slots), on any
+// buckets. Every batch is a statement, and a batch more at once is a
+// batch less of the draws queued meanwhile: with a batch per connection,
+// draws by a principal per namespace, sharing no bucket, ran some 2 to a
+// statement where 4 batches at once ran 7 or 8 and drew twice as fast
+// (BenchmarkDrawContended); 2 at once ran 15, no faster, and serialise
+// disjoint draws behind each other more.
+const drawBatches = 4
+
+// enqueue queues r for a batch. s.qmu is held.
+func (s *bucketStore) enqueue(r *drawReq) {
+	if s.queuedOn == nil {
+		s.queuedOn, s.drawingOn = map[string]int{}, map[string]int{}
+	}
+	s.queue = append(s.queue, r)
+	for _, d := range r.ds {
+		s.queuedOn[d.key]++
+	}
+}
+
+// free reports whether r, not queued, could start a batch now: no draw
+// queued, and fewer than drawKeyBatches batches running, draw on any of
+// its buckets. s.qmu is held.
+func (s *bucketStore) free(r *drawReq) bool {
+	for _, d := range r.ds {
+		if s.queuedOn[d.key] > 0 || s.drawingOn[d.key] >= drawKeyBatches {
+			return false
+		}
+	}
+	return true
+}
+
+// count adds n to m[k], deleting it at 0.
+func count(m map[string]int, k string, n int) {
+	if m[k] += n; m[k] == 0 {
+		delete(m, k)
+	}
+}
+
+// drain runs batches of the queued draws until none it can take is
+// queued.
 func (s *bucketStore) drain() {
 	defer s.drains.Done()
 	for {
 		s.qmu.Lock()
-		b := s.take()
+		b, more := s.take()
 		if len(b) == 0 {
 			s.running--
 			s.qmu.Unlock()
 			return
 		}
+		// Draws left at drawBatchItems that no batch draws on go in a
+		// batch of their own, if a connection is free; if not, the next
+		// drain to end a batch takes them.
+		start := more && s.running < s.slots
+		if start {
+			s.running++
+			s.drains.Add(1)
+		}
 		s.qmu.Unlock()
+		if start {
+			go s.drain()
+		}
 		s.drawBatch(b)
+		s.qmu.Lock()
+		s.drawn(b)
+		s.qmu.Unlock()
 	}
 }
 
-// take takes the queued draws for a batch, in queue order: at least one,
-// and then as many as drawBatchItems allows. A draw whose request is gone
-// is answered so, and dropped. s.qmu is held.
-func (s *bucketStore) take() []*drawReq {
-	var b []*drawReq
-	items, i := 0, 0
-	for ; i < len(s.queue); i++ {
-		r := s.queue[i]
+// drawn records that b, a batch take took, has ended. s.qmu is held.
+func (s *bucketStore) drawn(b []*drawReq) {
+	for _, r := range b {
+		for _, d := range r.ds {
+			count(s.drawingOn, d.key, -1)
+		}
+	}
+}
+
+// take takes the queued draws for a batch, in queue order: every draw
+// none of whose buckets more than drawKeyBatches-1 running batches, or a
+// draw queued before it and not taken, draw on, up to drawBatchItems
+// buckets, but at least one draw. Draws on one bucket are therefore
+// taken in queue order, and judged so (rate_draws). more reports that a
+// draw was left at drawBatchItems that could have been taken. A draw
+// whose request is gone is answered so, and dropped. s.qmu is held.
+func (s *bucketStore) take() (b []*drawReq, more bool) {
+	var left map[string]bool // the buckets of draws left queued
+	items, n := 0, 0
+	for _, r := range s.queue {
 		if err := r.ctx.Err(); err != nil {
 			r.done <- drawRes{err: err}
+			for _, d := range r.ds {
+				count(s.queuedOn, d.key, -1)
+			}
 			continue
 		}
-		if len(b) > 0 && items+len(r.ds) > drawBatchItems {
-			break
+		ok := !more
+		for _, d := range r.ds {
+			if !ok {
+				break
+			}
+			ok = !left[d.key] && s.drawingOn[d.key] < drawKeyBatches
+		}
+		if ok && len(b) > 0 && items+len(r.ds) > drawBatchItems {
+			ok, more = false, true
+		}
+		if !ok {
+			if left == nil {
+				left = map[string]bool{}
+			}
+			for _, d := range r.ds {
+				left[d.key] = true
+			}
+			s.queue[n] = r
+			n++
+			continue
 		}
 		b = append(b, r)
 		items += len(r.ds)
-		s.drawing.Add(1)
 	}
-	n := copy(s.queue, s.queue[i:])
 	clear(s.queue[n:])
 	s.queue = s.queue[:n]
-	return b
+	for _, r := range b {
+		for _, d := range r.ds {
+			count(s.queuedOn, d.key, -1)
+			count(s.drawingOn, d.key, 1)
+		}
+	}
+	s.drawing.Add(int64(len(b)))
+	return b, more
 }
 
 // drawBatch draws b, a batch, and answers each draw: a single draw with
