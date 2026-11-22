@@ -886,6 +886,10 @@ time only): the consumers read the revision each namespace entry names
   capacity reached only 22 ACU. With a 32 ACU minimum and `--group-commit 128` they wrote
   15,115 and 20,834 (p99 185 and 329 ms), scaling to the 64 ACU maximum. On Aurora, commit
   latency rather than capacity bounds a namespace's log, so larger groups pay most.
+  A second such run (15,399 and 20,307 a second) had pg_stat_statements loaded: Aurora's write
+  statements took 2–3 times the 4xlarge's (group commit's insert 7.0 ms against 2.5, the
+  revision insert 3.6 against 1.3, the log lock's wait 3.7 against 2.0), its reads the same
+  (a check 0.05 ms).
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
