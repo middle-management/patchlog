@@ -760,7 +760,13 @@ time only): the consumers read the revision each namespace entry names
   1.9 ms, and Postgres showed row-lock waits (`Lock:tuple`, `Lock:transactionid`). Drawing
   outside the check's transaction would free the connection; a principal writing across many
   namespaces still serialises on its row.
-- **Since these runs** (not yet measured again):
+- **A writer principal per namespace added 15–19%** on the pool of 64: 5,242 and 5,523 writes a
+  second at eight and sixteen namespaces, against 4,547 and 4,649 with one in the same run, and
+  the row-lock waits went. The pool was full again (430–580 requests waiting for a connection),
+  with about 40 sessions idle in a check's transaction, and the core's instance at 79% CPU, much
+  of it garbage collection. So past a larger pool and the draw moved out of the check, the
+  core's CPU is next on a 4-vCPU instance; more instances share the work (D.8).
+- **Changed after those runs** (93149318, measured below):
   - `pool_max_conns=N` sets the main pool to `N` connections, above 4 per GOMAXPROCS too, and
     the bucket pool to a quarter of `N`.
   - A write's draw is made after its check's read transaction, so it holds no main-pool
@@ -769,6 +775,38 @@ time only): the consumers read the revision each namespace entry names
   - Group commits take a connection from a pool of their own (a quarter of the main pool's
     size) when one is free, so a group of about 30 writes no longer queues behind every
     write's check.
+- **With those (93149318), the draws are the limit.** On a pool of 64 and one writer principal,
+  4, 8 and 16 namespaces wrote 3,923, 3,933 and 2,181 a second; with a principal per namespace
+  3,960, 5,214 and 4,550. Up to 1,340 writes waited for one of the bucket pool's 16 connections,
+  with 13–16 draws running, and with one principal they queued on its row (`rate_draw` 1.7 ms,
+  `Lock:tuple` waits). Writes reached the group commit queue so slowly that groups shrank to
+  about 2. `rate_draw` took more of Postgres's time than every other statement together. With
+  `--local-rate-buckets` the same run wrote 7,733 and 8,134 a second at 8 and 16 namespaces (p99
+  171 and 675 ms), so a draw per write is what costs: a draw for many writes at once, as group
+  commit does for their rows, would take each bucket row's lock once. There the pool of 64 was
+  full again, 1,400 requests waiting, most of them for checks' read transactions (five round
+  trips each), and the core's instance at 82% CPU.
+- **Past that, the core's CPU is the limit on 4 vCPUs.** A pool of 128 wrote less than 64 (6,544
+  and 7,451 a second at 8 and 16 namespaces): the core used 3.4 of its 4 vCPUs (pprof), and the
+  extra connections only waited on it (up to 91 sessions idle in a transaction). A write's check
+  took 31–36% of the core's CPU, about a fifth of it in pgx: six round trips (begin, the
+  namespace, resource and head reads, the retry lookup of §7.2, rollback), each a statement
+  through pgx and TLS (TLS writes 8–9% in all). Followers' revision reads took 10–15%, group
+  commits 9%, garbage collection 11%. Fewer round trips in the check would save the most.
+- **On an 8-vCPU core (`c7g.2xlarge`), pool 64, buckets in memory**, 8 and 16 namespaces wrote
+  7,777 and 10,462 a second at 3.5–4.5 vCPUs busy, the pool full again (1,000–1,250 requests
+  waiting). A pool of 128 wrote less (7,757 at 16): Postgres slowed with more sessions (group
+  commit's insert 2.5 ms against 1.6, the log lock 0.49 ms against 0.12) while RDS was at 67%
+  CPU, so about 64 connections is the most that helps a `db.m7g.2xlarge`.
+- **With batched draws and one-statement checks (cce94746, below), buckets in Postgres again**,
+  8-vCPU core, pool 64: one writer principal wrote 7,819 and 11,621 a second at 8 and 16
+  namespaces (p99 179 and 255 ms), more than with buckets in memory before; a principal per
+  namespace 7,978 and 9,874 (a batch then locks a row per namespace). No request waited for a
+  connection: writes waited in their namespaces' group commit queues, the core at 58% CPU, RDS
+  at 76% with write latency up to 7.9 ms and a disk queue of 3.3. `rate_draw` and `rate_draws`
+  took most of Postgres's statement time, and about two in five draws still ran alone. Next
+  are Postgres's CPU and its volume (20 GiB of gp3: 125 MiB/s, of which up to 74 MB/s here).
+- **Since these runs** (cce94746, measured above):
   - A write's check is one round trip, not six: its namespace, resource, head and the retry
     lookup of §7.2 are one statement (the lookup returns no row almost always), and a check
     that needs only that statement runs without a transaction (no begin, no rollback), so its
@@ -806,6 +844,60 @@ time only): the consumers read the revision each namespace entry names
     second instead of 11,300, 7.5 draws a statement instead of 2.5, with 2% of draws alone
     (32% before). To measure it again, use the same `ec2-sources.sh` run as above
     (`STORE_TYPE=c7g.2xlarge`).
+- **With draws batched by bucket (b13be98a)**, the same run wrote 12,798 a second at 16
+  namespaces with one writer principal and 11,738 with a principal per namespace (p99 259 and
+  349 ms), against 11,621 and 9,874. The draws took 335 s of Postgres's statement time against
+  2,087 (`rate_draw` 520,000 calls, `rate_draws` 206,000), and the row-lock waits went. Writes
+  waited in their namespaces' group commit queues (about 1,500), the core at 60% CPU and RDS at
+  63%. The volume is next: write latency up to 23 ms after the busy rows, its queue up to 9.4,
+  88 MB/s of the 125 MiB/s gp3 gives 20 GiB, and Postgres waiting on `LWLock:WALWrite`. The log
+  lock's mean wait, 0.83 ms, is the next on the core's side.
+- **On 400 GiB of gp3** (12,000 IOPS, 500 MiB/s, against 3,000 and 125 MiB/s on 20 GiB), the
+  same run wrote 13,577 a second at 16 namespaces with one writer principal (p99 187 ms), RDS's
+  write latency at most 2.4 ms against 23 and its disk queue at most 3.3 against 9.4, at
+  102 MB/s; it began minutes after the resize, while RDS optimises the volume. Then every
+  namespace had one group commit running, at the `--group-commit` cap of 32 (mean 26): about
+  850 writes a second per namespace, one full group after another, the core at 61% CPU and RDS
+  at 57%.
+- **`--group-commit 128` didn't raise it** (13,716 a second). Groups grew to 36–38 writes at 16
+  namespaces (up to 128), but held each namespace's log lock longer: its mean wait rose to 4–5
+  ms (p90 up to 50 ms), against under 1. Each namespace wrote 850 a second at 16 where 8 wrote
+  their full 1,000, so what they share sets the limit, and no one stage does (goroutine dumps
+  at the peaks): about 1,000 writes in group commit queues, 300–400 waiting for a main-pool
+  connection for their check, 140–275 in draws (with one principal, a batch at a time on its
+  bucket), 40–50 in Postgres, which waited on its WAL (`LWLock:WALWrite`); the core at 60% CPU,
+  RDS at 56%. Past here: more instances of the core, a larger database, or Postgres's own WAL
+  grouping (`commit_delay`).
+- **Two instances of the core** (`c7g.2xlarge` each, `pool_max_conns=32` each, namespace i
+  through instance i mod 2) wrote 13,588 a second at 16 namespaces and 14,326 at 32 (p99 445
+  ms), the instances at 40% and 43% CPU: Postgres is the limit. Its statements slowed (the
+  revision insert 2.4 ms against 1.3, group commit's 3.0 against 1.8), it waited on hot pages
+  (`LWLock:BufferContent`) and its WAL (`LWLock:WALWrite`), at 68% CPU and up to 130 MB/s and
+  3,900 IOPS. About 14,000 writes a second is what a `db.m7g.2xlarge` takes of this load.
+- **On a `db.m7g.4xlarge`** (16 vCPU, 64 GiB) the same two instances wrote 15,864 a second at 16
+  namespaces (every namespace its full 1,000) and 25,104 at 32 (p99 132 and 281 ms), 75% more
+  than the 2xlarge, at 62% RDS CPU, 3,700 write IOPS and 176 MB/s. Postgres waited on its WAL
+  (`LWLock:WALWrite`, 2–4 sessions) and the log lock's mean wait was 2 ms; the instances were at
+  56–59% CPU. So the database's size sets this ceiling, and it scales with it.
+  With `--group-commit 128` and `pool_max_conns=48` on each of two instances it wrote 15,944 and
+  28,070 a second (p99 68 and 202 ms), at 59–62% CPU on the instances and 64% on RDS. Three
+  instances of 64 connections wrote less (24,243 at 32 namespaces), the log lock's mean wait
+  5.8 ms against 2.2: past about 100 connections, Postgres's contention costs more than another
+  instance adds.
+  One instance of 64 connections wrote 15,778 and 19,610 a second (p99 124 and 396 ms) at 85%
+  CPU: instances add throughput, 43% from one to two at 32 namespaces, until their connections
+  together pass what the database takes.
+- **On Aurora PostgreSQL Serverless v2** (I/O-Optimized) the same two instances wrote 5,308 and
+  6,125 a second at 16 and 32 namespaces scaling from 2 ACU, a third of the 4xlarge's: groups
+  were full (32) but each commit waited for Aurora's storage quorum (`IO:XactSync`), so a
+  group took about 90 ms and the log lock's mean wait was 8–13 ms; CPU stayed at 17–26% and
+  capacity reached only 22 ACU. With a 32 ACU minimum and `--group-commit 128` they wrote
+  15,115 and 20,834 (p99 185 and 329 ms), scaling to the 64 ACU maximum. On Aurora, commit
+  latency rather than capacity bounds a namespace's log, so larger groups pay most.
+  A second such run (15,399 and 20,307 a second) had pg_stat_statements loaded: Aurora's write
+  statements took 2–3 times the 4xlarge's (group commit's insert 7.0 ms against 2.5, the
+  revision insert 3.6 against 1.3, the log lock's wait 3.7 against 2.0), its reads the same
+  (a check 0.05 ms).
 - **Followers that read each change's own revision applied everything at one and two
   namespaces** (999 and 1,993 a second). From four namespaces on they applied about 900–1,000 a
   second in all.
