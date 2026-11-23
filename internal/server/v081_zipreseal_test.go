@@ -135,7 +135,7 @@ func TestV081ZipSealingResealed(t *testing.T) {
 		if pt := open(t, got, k, "s#1", pl); !bytes.Equal(pt, plain) {
 			t.Fatalf("%s: resealed %s, want %s", what, pt, plain)
 		}
-		if stored, kver := row(what); stored != got || kver != 1 {
+		if stored, kver := row(what); stored != got || kver != 2 {
 			t.Fatalf("%s: the row holds %.40s… kver %d, not what was served", what, stored, kver)
 		}
 	}

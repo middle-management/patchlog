@@ -1905,10 +1905,12 @@ function nsDocPL(ns, id) {
   return { ns, id, kind: 'doc' };
 }
 
-/* openSealed decrypts a JWE of namespace ns after checking its kid and pl against what was asked for: under the
- * resource's K_r, or for resource "" the namespace's K_n, or where pl names a view (SERVICES.md §E.2.6), under that
- * key's view key for the view asked for. */
-async function openSealed(ns, jwe, resource, wantPL) {
+/* openSealed decrypts a JWE of namespace ns after checking its kid and pl against what was asked for: a revision's
+ * document under its K_rev and a log entry under its K_log, both derived from the resource's K_r (§E.2.1, v0.89), other
+ * resource content under K_r, for resource "" the namespace's K_n, or where pl names a view (SERVICES.md §E.2.6),
+ * under that key's view key for the view asked for: for an entry derived from revision revID, at E2, the view key of
+ * that revision's K_rev, at E3 of K_r. */
+async function openSealed(ns, jwe, resource, wantPL, revID) {
   const { header } = Z.parseJWE(jwe);
   const k = Z.parseKid(header.kid);
   if (!Z.isNamespaceName(k.ns)) throw new Error(`kid ${JSON.stringify(header.kid)} names no namespace (§3.6)`);
@@ -1921,9 +1923,25 @@ async function openSealed(ns, jwe, resource, wantPL) {
   if (checks.some((c) => !c.ok)) throw Object.assign(new Error(checks.filter((c) => !c.ok).map((c) => c.what).join('; ')), { checks, header });
   const view = want && typeof want.view === 'string' ? want.view : null;
   let key = await contentKey(header.kid, resource);
-  if (view !== null) key = await Z.viewKey(key, view);
-  const o = await Z.openJWE(jwe, key);
-  const kname = resource ? 'K_r(' + k.ns + ', ' + resource + ')' : 'K_n(' + k.ns + ')';
+  let kname = resource ? 'K_r(' + k.ns + ', ' + resource + ')' : 'K_n(' + k.ns + ')';
+  const wid = want && typeof want.id === 'string' ? want.id : '';
+  if (resource && wid && view === null && want.kind === 'doc') {
+    key = await Z.revKey(key, wid); kname = 'K_rev(' + wid + ')';
+  } else if (resource && wid && view === null && (want.kind === 'rev' || want.kind === 'tombstone')) {
+    key = await Z.logKey(key, wid); kname = 'K_log(' + wid + ')';
+  }
+  let o;
+  if (view !== null && resource && revID) {
+    // An entry derived from revision revID: at E2 under the view key of its K_rev, at E3 of K_r (§E.2.6, v0.89).
+    try {
+      o = await Z.openJWE(jwe, await Z.viewKey(await Z.revKey(key, revID), view));
+      kname = 'K_rev(' + revID + ')';
+    } catch (_) { o = undefined; }
+  }
+  if (!o) {
+    if (view !== null) key = await Z.viewKey(key, view);
+    o = await Z.openJWE(jwe, key);
+  }
   checks.push({ ok: true, what: `decrypted with ${view !== null ? 'the view key of ' + kname : kname} of ${header.kid}` + (/ +$/.test(o.text) ? ', padded' : '') });
   let value = o.text;
   try { value = JSON.parse(o.text); } catch (_) { /* not JSON */ }
@@ -2468,13 +2486,14 @@ function findBlobRefs(doc) {
 const httpFail = (r) => new Error(r.neterr ? 'network error: ' + r.neterr : `HTTP ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}${r.json && r.json.message ? ': ' + r.json.message : ''}`);
 
 /* openE2Blob opens a blob a sealed namespace delivered sealed (§E.2.2): kid names this namespace, pl is
- * { ns, name, blob }, and the key is the resource's K_r of that epoch. A missing key is tagged noKey. */
+ * { ns, name, blob }, and the key is the blob's K_blob, below the resource's K_r of that epoch (v0.89). A missing key
+ * is tagged noKey. */
 async function openE2Blob(ns, name, bid, bytes) {
   const { header } = Z.parseBlob(bytes);
   const k = Z.parseKid(header.kid);
   if (k.ns !== ns) throw new Error(`the blob is sealed under ${header.kid}, not a key of ${ns}`);
   let key;
-  try { key = await contentKey(header.kid, name); } catch (err) { throw Object.assign(err, { noKey: true, epoch: k.epoch }); }
+  try { key = await Z.blobKey(await contentKey(header.kid, name), bid); } catch (err) { throw Object.assign(err, { noKey: true, epoch: k.epoch }); }
   const o = await Z.openBlob(bytes, key);
   const diff = Z.plDiff(o.header.pl, { ns, name, blob: bid });
   if (o.header.kid !== header.kid || diff.length) throw new Error('the sealed blob is bound to another ' + (diff.join(', ') || 'kid'));
@@ -3039,7 +3058,7 @@ async function openSealedEntries(v, view, from, filed, ctx) {
           throw new Error(`a sealed value of ${ens}/${rname}, in the namespace its entry's url names, ${itemNS}, which isn't known to be a branch of its item's namespace ${item[1]} (§B.5 Previews, §E.2.6)`);
         }
       }
-      const d = await openSealed(ens, v.sealed, rname, { ns: ens, name: rname, view });
+      const d = await openSealed(ens, v.sealed, rname, { ns: ens, name: rname, view }, !other && typeof v.id === 'string' ? v.id : '');
       // (Not by assignment of "__proto__", which would replace the entry's prototype.)
       if (d.value && typeof d.value === 'object') for (const k of Object.keys(d.value)) if (k !== '__proto__') v[k] = d.value[k];
       v._opened = hdr.kid;

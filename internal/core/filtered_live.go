@@ -76,6 +76,17 @@ func sharedView(e *Engine, fv *fview) *fview {
 // on. From a purged namespace's purge-ns entry it is 410 purged (§8.5).
 // The page is shared by the waiters of the same view, since and at.
 func (e *Engine) FilteredLiveLog(ctx context.Context, ns, view, since string, limit int, cred Credentials) (*Log, *FilteredInfo, error) {
+	return e.filteredLiveLog(ctx, ns, view, since, limit, cred, false)
+}
+
+// FilteredEventLog is FilteredLiveLog for /ns/{ns}/view/{view}/events: in
+// a sealed namespace each entry is its own JWE, an event's data, where a
+// long-poll answer is one (§7.9 Sealed namespaces, §E.2.2).
+func (e *Engine) FilteredEventLog(ctx context.Context, ns, view, since string, limit int, cred Credentials) (*Log, *FilteredInfo, error) {
+	return e.filteredLiveLog(ctx, ns, view, since, limit, cred, true)
+}
+
+func (e *Engine) filteredLiveLog(ctx context.Context, ns, view, since string, limit int, cred Credentials, events bool) (*Log, *FilteredInfo, error) {
 	var fv *fview
 	var info *FilteredInfo
 	var until time.Time
@@ -88,7 +99,9 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, view, since string, li
 		if aerr != nil {
 			return aerr
 		}
-		if t.fromPurgeEntry(n, since) {
+		if t.fromPurgeEntry(n, since) || t.sealedPurged(n) {
+			// A sealed namespace's keys go with its purge: 410, as its
+			// unfiltered live reads answer (§8.5).
 			return t.purgedRead(n)
 		}
 		fv, info, until = v, filteredInfo(v), t.admittedUntil(n, cred, v.a)
@@ -108,8 +121,15 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, view, since string, li
 				return notFound()
 			}
 			lg = t.filteredRange(n, fv, since, fv.cp.seq, limit)
+			if len(lg.Entries) > 0 {
+				// A page with none is answered 204, nothing sealed.
+				t.filteredRangeSealing(n, fv, since, fv.cp.at, lg, events)
+			}
 			return nil
 		})
+		if err == nil {
+			err = e.sealFilteredLog(ctx, lg)
+		}
 		if err != nil {
 			return nil, nil, err
 		}
@@ -118,6 +138,9 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, view, since string, li
 	}
 	fv = sharedView(e, fv)
 	key := filteredLiveKey(e, ns, fv.view, since, limit, fv.cp.at)
+	if events {
+		key += "\x00events"
+	}
 	filteredLiveDone.Lock()
 	lg, ok := filteredLiveDone.lru.Get(key)
 	filteredLiveDone.Unlock()
@@ -137,8 +160,16 @@ func (e *Engine) FilteredLiveLog(ctx context.Context, ns, view, since string, li
 					return notFound()
 				}
 				lg = t.filteredRange(n, fv, since, fv.cp.seq, limit)
+				if len(lg.Entries) > 0 {
+					t.filteredRangeSealing(n, fv, since, fv.cp.at, lg, events)
+				}
 				return nil
 			})
+			if err == nil {
+				// Sealed once for the waiters that share it (§E.2.2:
+				// readers accept any copy).
+				err = e.sealFilteredLog(sctx, lg)
+			}
 			if err == nil && len(lg.Entries) <= maxLiveDoneEntries {
 				filteredLiveDone.Lock()
 				if filteredLiveDone.lru.MaxEntries == 0 {

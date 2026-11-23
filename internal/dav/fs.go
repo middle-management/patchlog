@@ -466,6 +466,10 @@ type listing struct {
 	docs   map[string]headDoc  // file name -> document
 	res    map[string]headDoc  // a flat namespace's: resource name -> document
 	tree   map[string]*treeEnt // a tree folder's: name -> file or folder
+	// unmarked: the index refused a tree folder's facet as marked by no
+	// schema (400, errUnmarked), so it lists empty, but is never taken as
+	// empty for a write (treeListingForWrite, §H.3).
+	unmarked bool
 }
 
 // list reads directory t: its files and folders as the core has them now

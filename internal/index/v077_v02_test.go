@@ -157,9 +157,10 @@ func TestV077ScopeMarkerKey(t *testing.T) {
 // end a view cookie (§7.9 view)"; scenarios 66 and 121): li's cookie for
 // its scope marker in docs, through k1 with the role reader, is 403 at
 // /docs/view/{view} and at /_refs once docs (a) removes k1, (b) changes k1's
-// pub, (c) narrows reader's rules, or (d) drops read from reader; a
-// change to an unrelated role leaves it read. Before v0.77 it read on
-// under the old rules until it expired.
+// pub, (c) narrows reader's rules, (d) drops read from reader, or, since
+// v0.88, (e) adds another role that lists read (Filtered reads scenario
+// 61: any role that lists read). Before v0.77 it read on under the old
+// rules until it expired.
 func TestV077ScopeCookieEnds(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
@@ -180,8 +181,11 @@ func TestV077ScopeCookieEnds(t *testing.T) {
 		{"reader without read", func(d *v77docs) map[string]any {
 			return map[string]any{"op": "replace", "path": "/roles/reader/can", "value": []any{"create"}}
 		}, false},
-		{"another role added", func(d *v77docs) map[string]any {
+		{"another role listing read added", func(d *v77docs) map[string]any {
 			return map[string]any{"op": "add", "path": "/roles/other", "value": map[string]any{"can": []any{"read"}}}
+		}, false},
+		{"another role not listing read added", func(d *v77docs) map[string]any {
+			return map[string]any{"op": "add", "path": "/roles/other", "value": map[string]any{"can": []any{"create"}}}
 		}, true},
 	} {
 		t.Run(c.name, func(t *testing.T) {

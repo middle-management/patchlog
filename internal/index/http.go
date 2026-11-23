@@ -1255,7 +1255,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 				hits = append(hits, m)
 				continue
 			}
-			jwe, err := derived.SealItem(key, view, h.Resource, values)
+			jwe, err := derived.SealItem(key, view, h.Resource, h.ID, values)
 			if err != nil {
 				return derived.Stored{}, "", fmt.Errorf("sealing a hit: %w", err)
 			}

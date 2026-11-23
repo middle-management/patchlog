@@ -59,9 +59,9 @@ func readsView(ns string, k clienttest.Key) string {
 }
 
 // readsRefsView is the /_refs view of a reader of ns whole through k
-// alone, over its marker there.
+// alone: over {ns}:{v}, v its view there (SERVICES §A.4, v0.88).
 func readsRefsView(ns string, k clienttest.Key) string {
-	return grantcheck.ViewID([]string{"reads:" + ns + ":" + grantcheck.KeySubject(k.Kid, k.Pub)})
+	return grantcheck.ViewID([]string{ns + ":" + readsView(ns, k)})
 }
 
 // v82Grant is k's grant for sub with the role reader, expiring exp from
@@ -105,8 +105,9 @@ const (
 // reads:docs. Once docs changes any member of k1 (its groups scope, its
 // sub scope, its maxTtl, its pub), removes it, or changes the role she
 // read through, her cookie is 403 at /docs/view/{view}, at the at URL it was
-// answered at, and at /_refs, until she exchanges again; a change to
-// another key or role leaves it read. Before v0.82 a reads:{ns} cookie
+// answered at, and at /_refs, until she exchanges again, as does since
+// v0.88 a change to any role that lists read; a change to another key or
+// to a role that doesn't list read leaves it read. Before v0.82 a reads:{ns} cookie
 // was never checked and read the namespace whole until it expired.
 func TestV082ReadsCookieEndsOnKeyChange(t *testing.T) {
 	t.Parallel()
@@ -126,7 +127,10 @@ func TestV082ReadsCookieEndsOnKeyChange(t *testing.T) {
 		{"k1 removed", map[string]any{"op": "remove", "path": "/keys/1"}, 401},
 		{"reader gains a verb", map[string]any{"op": "replace", "path": "/roles/reader/can", "value": []any{"read", "append"}}, 200},
 		{"k2's sub scope", map[string]any{"op": "add", "path": "/keys/2/sub", "value": "user:.*"}, 0},
-		{"another role added", map[string]any{"op": "add", "path": "/roles/other", "value": map[string]any{"can": []any{"read"}}}, 0},
+		// v0.88: any role that lists read ends it (scenario 61); one that
+		// doesn't, doesn't.
+		{"another role listing read added", map[string]any{"op": "add", "path": "/roles/other", "value": map[string]any{"can": []any{"read"}}}, 200},
+		{"another role not listing read added", map[string]any{"op": "add", "path": "/roles/other", "value": map[string]any{"can": []any{"create"}}}, 0},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()

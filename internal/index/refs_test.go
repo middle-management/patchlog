@@ -312,7 +312,7 @@ func TestReferenceSealed(t *testing.T) {
 	if len(hits) != 1 || hits[0].(map[string]any)["resource"] != "a" {
 		t.Fatalf("hits %v", hits)
 	}
-	pt := must(derived.OpenItem(hits[0].(map[string]any)["sealed"].(string), derived.ItemKey(epochKeys(t, w, "sec"), "sec", "a"), derived.View{NS: "sec", Target: f.path}, "sec", "a"))
+	pt := must(derived.OpenItem(hits[0].(map[string]any)["sealed"].(string), derived.ItemKey(epochKeys(t, w, "sec"), "sec", "a", hits[0].(map[string]any)["id"].(string)), derived.View{NS: "sec", Target: f.path}, "sec", "a"))
 	if v := decodeJSON(t, pt); fmt.Sprint(v["refs"]) != "[map[path:/related/0 ref:/r/other/thing]]" {
 		t.Errorf("refs in %s", pt)
 	}

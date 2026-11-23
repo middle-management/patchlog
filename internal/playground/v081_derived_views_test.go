@@ -41,16 +41,17 @@ FUNCTIONS
 `
 
 // The playground opens the views derived seals (KEYS-5): a whole response
-// under the view key of K_n, an entry under the view key of its own K_r,
-// with view exactly the redirect's path and query (§E.2.6). The bare K_e,
-// K_n and K_r open none of them, nor does the view key of another view.
+// under the view key of K_n, an entry under the view key of the K_rev of
+// the revision it derives from, its id (v0.89), with view exactly the
+// redirect's path and query (§E.2.6). The bare K_e, K_n and K_r open none
+// of them, nor does the view key of another view or of K_r.
 func TestV081PlaygroundOpensDerivedViews(t *testing.T) {
 	t.Parallel()
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed")
 	}
-	const ns = "cat"
+	const ns, xRev = "cat", "1sywh54kpo3c4ezn2znktvl3avge4zl5d"
 	view := "/cat/at/1abcdefghijklmnopqrstuvwxyz234567/children/a%2Fb?depth=2&q=%C3%A9"
 	ke := seal.NewKey()
 	k := derived.Key{NS: ns, Epoch: 1, K: ke}
@@ -92,12 +93,12 @@ func TestV081PlaygroundOpensDerivedViews(t *testing.T) {
 	}
 	title := func(name string) []byte { b, _ := derived.Marshal(map[string]any{"title": "T " + name}); return b }
 	entries := map[string]any{"children": []any{
-		map[string]any{"name": "x", "sealed": must(derived.SealItem(k, v, "x", map[string]any{"title": "T x"}))},
+		map[string]any{"name": "x", "id": xRev, "sealed": must(derived.SealItem(k, v, "x", xRev, map[string]any{"title": "T x"}))},
 		map[string]any{"name": "y", "sealed": must(seal.SealUncompressed(kr["y"], kid, v.ItemPL(ns, "y"), title("y")))},
 		map[string]any{"name": "z", "sealed": must(seal.SealUncompressed(ke, kid, v.ItemPL(ns, "z"), title("z")))},
 		map[string]any{"name": "w", "sealed": must(seal.SealUncompressed(viewKey(kn, view), kid, v.ItemPL(ns, "w"), title("w")))},
 		// An index hit names its resource "resource".
-		map[string]any{"resource": "x", "sealed": must(derived.SealItem(k, v, "x", map[string]any{"title": "T x"}))},
+		map[string]any{"resource": "x", "id": xRev, "sealed": must(derived.SealItem(k, v, "x", xRev, map[string]any{"title": "T x"}))},
 	}}
 	// contentKey gives K_n for the namespace ("") and K_r for a resource,
 	// as app.js's does.

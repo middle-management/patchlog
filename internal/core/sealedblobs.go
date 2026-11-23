@@ -81,7 +81,7 @@ func (t *tx) blobEpochs(n *nsRow, head *revRow, bid ids.ID) map[int]bool {
 			rows.Close()
 		}
 		// Content without an epoch of its own: that of its stored sealing.
-		q := `SELECT substr(s.jwe, 1, 4096)` + refRevs + ` JOIN sealed s ON s.ns = ? AND s.rev_seq = r.seq AND s.kind IN ('doc', 'entry')` + where
+		q := `SELECT substr(s.jwe, 1, 4096)` + refRevs + ` JOIN sealed s ON s.ns = ? AND s.rev_seq = r.seq AND s.kind IN ('doc', 'entry', 'keys')` + where
 		args := []any{n.id, seg.res, bid[:], seg.max}
 		if own {
 			q += ` AND NOT EXISTS (SELECT 1 FROM rev_epochs e WHERE e.seq = r.seq)`
@@ -140,12 +140,25 @@ func (t *tx) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJ
 		return nil
 	}
 	if v.head != nil {
-		if job := t.newestBlobRev(n, name, v.head, bid); job != nil {
+		if job := t.newestBlobRev(n, name, v.head, bid, nil); job != nil {
 			return job
 		}
 	}
 	out.Status, out.NoStore = 404, true
 	return nil
+}
+
+// visibleBlobHead is sealedBlobHead for a reader a judged per revision
+// none of whose readable revisions referencing bid has an epoch yet
+// (visibleBlobEpochs): the sealing of the newest of those it may read,
+// which fixes its epoch, or nil if it may read none (§7.9 Content).
+func (t *tx) visibleBlobHead(a *actor, n *nsRow, name string, bid ids.ID) *sealJob {
+	j, _ := t.rowJudge(n, a)
+	v := t.resolve(n, name, nil)
+	if j == nil || v.head == nil {
+		return nil
+	}
+	return t.newestBlobRev(n, name, v.head, bid, func(r *revRow) bool { return t.visibleRow(j, n, name, r) })
 }
 
 // blobKeyEpochs lists the epochs a request for blob bid of resource name
@@ -162,7 +175,7 @@ func (t *tx) blobKeyEpochs(n *nsRow, name string, bid ids.ID) map[int]bool {
 	eps := t.blobEpochs(n, v.head, bid)
 	if len(eps) == 0 && v.head != nil && t.blobRevServed(v.head, bid) {
 		if t.write {
-			if e, ok := t.storeSeal(n.id, t.newestBlobRev(n, name, v.head, bid)); ok {
+			if e, ok := t.storeSeal(n.id, t.newestBlobRev(n, name, v.head, bid, nil)); ok {
 				eps[e] = true
 				return eps
 			}
@@ -187,8 +200,9 @@ func (t *tx) blobRevServed(head *revRow, bid ids.ID) bool {
 }
 
 // newestBlobRev prepares the sealing of the newest still served revision
-// of the history ending at head whose document references bid, or nil.
-func (t *tx) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID) *sealJob {
+// of the history ending at head whose document references bid, of those
+// keep allows if it isn't nil, or nil.
+func (t *tx) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID, keep func(*revRow) bool) *sealJob {
 	where := ` WHERE b.res = ? AND b.bid = ? AND r.seq <= ? AND r.kind = 0 AND ` + servedRev
 	for _, seg := range t.ancestry(head) {
 		rows, err := t.Query(`SELECT r.seq`+refRevs+where+` ORDER BY r.seq DESC`, seg.res, bid[:], seg.max)
@@ -202,6 +216,9 @@ func (t *tx) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID) *sea
 		rows.Close()
 		for _, s := range seqs {
 			row := t.rev(s)
+			if keep != nil && !keep(row) {
+				continue
+			}
 			b, err := t.docBytesAt(row)
 			if err != nil {
 				continue
@@ -259,9 +276,12 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 		if aerr != nil {
 			return aerr
 		}
-		if t.readsByDoc(n, a) && (n.purged || !t.mayReadRow(a, n, name, nil)) {
-			// Sealed content is judged with a null document (§6.4.1),
-			// as is a purged namespace's.
+		byDoc := t.readsByDoc(n, a)
+		if byDoc && !t.sealedBlobReadable(a, n, name) {
+			// A purged namespace or resource is judged with its rules on
+			// /doc set aside (§8.3, §8.5); a sealed one's content by the
+			// revisions of the epoch asked, below (v0.89); any other with
+			// a null document (§6.4.1).
 			return notFound()
 		}
 		if n.purged {
@@ -284,6 +304,13 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 		if perr != nil || eerr != nil || ep < 1 || strconv.Itoa(ep) != epochText {
 			out.Status = 404
 			return nil
+		}
+		if byDoc {
+			// Readable where a visible revision of epoch ep references
+			// it; otherwise a read-rule failure (§7.9 Content, §7.8).
+			if eps, all := t.visibleBlobEpochs(a, n, name, bid); !all && !eps[ep] {
+				return notFound()
+			}
 		}
 		ans := t.servableBlob(n, name, bid)
 		out.Status = ans.status
@@ -327,8 +354,8 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			out.setContent(memContent(data))
 			return nil
 		}
-		k, err := seal.ResourceKey(t.epochKey(n.id, ep), n.name, name)
-		t.must(err)
+		// Under the blob's K_blob of that epoch (§E.2.1, v0.89).
+		k := t.blobKey(n, ep, name, bid.String())
 		job = &sealedBlobJob{ns: n.id, name: name, bid: bid, epoch: ep, key: k, kid: seal.Kid(n.name, ep),
 			pl: seal.BlobPL(n.name, name, bid.String()), plain: t.readBytes(ans.row.owner, ans.row.hash), pad: t.config(n.configSeq).Pad}
 		return nil

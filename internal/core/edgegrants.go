@@ -275,8 +275,8 @@ func (c *edgeCollect) add(eg EdgeGrant) bool {
 func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) (string, *Error) {
 	// The exchange of g has one budget of validationSteps for the rules
 	// it evaluates, whatever namespaces and names they are for (§6.6
-	// Validation work).
-	defer t.readScope()()
+	// Validation work), its own whatever the request's other grants take.
+	defer t.ownReadScope()()
 	exp := grantExp(g)
 	var bucket string
 	var refused *Error
@@ -344,7 +344,7 @@ func refusalRank(err *Error) int {
 // rules fix /resource to, else (names nil) one namespace-wide, or, for a
 // partial reader of a covered namespace, one for its view, with
 // rec its filtered_views row (§7.9); and the key of its principal's
-// buckets (actor.bucketKey).
+// exchangeRate bucket (actor.exchangeBucket).
 type edgeIssue struct {
 	names  []string
 	view   string
@@ -438,7 +438,7 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 		pe.Body["ns"] = ns
 		return nil, pe
 	}
-	return &edgeIssue{names: names, bucket: a.bucketKey}, nil
+	return &edgeIssue{names: names, bucket: a.exchangeBucket()}, nil
 }
 
 // qualifies reports whether an effective role listing read, with rules

@@ -318,7 +318,9 @@ func sealedGrantsHandler(t *testing.T, grants map[string]*grant.Grant, grantFor 
 						}
 						ns, _ := h.PL["ns"].(string)
 						name, _ := h.PL["name"].(string)
-						kr, _ := seal.ResourceKey(epochKey(ns), ns, name)
+						kr0, _ := seal.ResourceKey(epochKey(ns), ns, name)
+						id, _ := h.PL["id"].(string)
+						kr, _ := seal.LogKey(kr0, id) // an entry is under its K_log (§E.2.1, v0.89)
 						_, pt, err := seal.Open(jwe, kr)
 						if err != nil {
 							t.Fatal(err)

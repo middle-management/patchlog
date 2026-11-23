@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -49,9 +50,21 @@ type actor struct {
 	principal grant.Principal
 	verified  *grant.Verified // nil with auth disabled
 	star      bool
+	// bucketKey keys the principal's write buckets: root sub and kid,
+	// each bucket also the namespace's own (§6.6, principalDraw).
 	bucketKey string
-	keyRate   *grant.Rate
-	grant     *grant.Grant
+	// exchangeKey keys its exchangeRate bucket: root sub and the
+	// verifying key's thumbprint, across namespaces, since a kid is unique
+	// only within one (§C.5.2 Rate, v0.88); "" for bucketKey.
+	exchangeKey string
+	keyRate     *grant.Rate
+	// attrsSteps are the validation steps the check of the grant's attrs
+	// against its key's attrs schema took (§C.4), which every check of
+	// the grant counts against its budget (chargeAttrs, §6.6, v0.88);
+	// attrsOver, that the check ran out, and so does every check then.
+	attrsSteps int
+	attrsOver  bool
+	grant      *grant.Grant
 	// noAuth: a request made while authentication is disabled (§1). The
 	// namespace entries written for it record "grant": null (§7.4).
 	noAuth bool
@@ -65,6 +78,14 @@ type actor struct {
 }
 
 func (a *actor) id() string { return a.principal.ID }
+
+// exchangeBucket keys a's exchangeRate bucket (exchangeKey).
+func (a *actor) exchangeBucket() string {
+	if a.exchangeKey != "" {
+		return a.exchangeKey
+	}
+	return a.bucketKey
+}
 
 func (a *actor) envelope() any {
 	if a.verified == nil {
@@ -211,11 +232,23 @@ func nsNotNamed(ns string) *Error {
 // verifyGrant verifies a decoded grant against namespace n's configuration
 // in force, or against keysOverride (operator keys).
 func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, keysOverride []grant.Key) (*actor, *Error) {
+	var attrsSteps int
+	var attrsOver bool
 	env := grant.Env{
 		Now: t.now,
 		NS:  nsName,
 		ValidateAttrs: func(schema any, attrs map[string]any) error {
-			return validateAttrs(schema, attrs, t.e.opt.MaxValidationSteps)
+			m := rules.Budget(t.e.opt.MaxValidationSteps)
+			err := validateAttrs(schema, attrs, m)
+			attrsSteps, attrsOver = m.Steps, m.Over
+			if m.Over && t.stepOneAttrs {
+				// Ran out in a write's check: its step 1 counts that
+				// against its budget (chargeAttrs) and runs out, answered
+				// after any check that fails outright (§6.6). Anywhere
+				// else the grant is refused, fail closed.
+				return nil
+			}
+			return err
 		},
 	}
 	if keysOverride != nil {
@@ -235,8 +268,9 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 	if err != nil {
 		return nil, authErr(err)
 	}
-	a := &actor{principal: v.Principal, verified: v, star: v.StarKey, grant: g, keyRate: v.Key.Rate}
+	a := &actor{principal: v.Principal, verified: v, star: v.StarKey, grant: g, keyRate: v.Key.Rate, attrsSteps: attrsSteps, attrsOver: attrsOver}
 	a.bucketKey = v.Principal.ID + "\x00" + v.Key.Kid
+	a.exchangeKey = v.Principal.ID + "\x00" + keyThumbprint(v.Key.Pub)
 	return a, nil
 }
 
@@ -293,10 +327,10 @@ func contains(xs []string, s string) bool {
 }
 
 // validateAttrs checks key-scope attrs against a JSON Schema by evaluating a
-// rule with that schema, within a budget of steps validation steps of its
-// own: attrs whose check takes more don't match (§6.6 Validation work
-// names no budget for it; none is left unbounded).
-func validateAttrs(schema any, attrs map[string]any, steps int) error {
+// rule with that schema, on meter m: attrs whose check runs out don't
+// match. The steps it takes count against the budget of every check of
+// the grant (chargeAttrs, §6.6 Validation work).
+func validateAttrs(schema any, attrs map[string]any, m *rules.Meter) error {
 	r, err := rules.Compile(map[string]any{"op": "test", "path": "/attrs", "schema": schema})
 	if err != nil {
 		return fmt.Errorf("invalid attrs schema: %v", err)
@@ -305,7 +339,7 @@ func validateAttrs(schema any, attrs map[string]any, steps int) error {
 	if attrs != nil {
 		a = attrs
 	}
-	if !r.Passes(map[string]any{"attrs": a}, rules.Budget(steps)) {
+	if !r.Passes(map[string]any{"attrs": a}, m) {
 		return fmt.Errorf("attrs do not match the key scope")
 	}
 	return nil
@@ -448,6 +482,22 @@ func (t *tx) ownDraws(n *nsRow, cfg *Config, a *actor, resources []string, items
 		if d.name != "ratePerNamespace" {
 			out = append(out, d)
 		}
+	}
+	return out
+}
+
+// joinDraws is the draws of a and b as one admission, the costs of draws
+// on one bucket added up, so that a request drawing for two reasons is
+// refused or admitted at once (admit).
+func joinDraws(a, b []draw) []draw {
+	out := append([]draw(nil), a...)
+	for _, d := range b {
+		i := slices.IndexFunc(out, func(o draw) bool { return o.key == d.key })
+		if i < 0 {
+			out = append(out, d)
+			continue
+		}
+		out[i].cost += d.cost
 	}
 	return out
 }
@@ -924,7 +974,7 @@ func (t *tx) principalDraw(n *nsRow, cfg *Config, a *actor, cost float64) draw {
 	if a.keyRate != nil && a.keyRate.Rate < pr.Rate {
 		pr = Rate{a.keyRate.Rate, math.Min(a.keyRate.Burst, pr.Burst)}
 	}
-	return draw{"p\x00" + a.bucketKey, pr, cost, "ratePerPrincipal"}
+	return draw{"p\x00" + n.name + "\x00" + a.bucketKey, pr, cost, "ratePerPrincipal"}
 }
 
 // blobDraw is the draw of an upload's bytes from the principal's blobRate
@@ -933,7 +983,7 @@ func (t *tx) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
 	if al := t.allowanceOf(cfg, a); al != nil && al.BlobRate.Rate > 0 {
 		return draw{"ab\x00" + n.name + "\x00" + al.Sub + "\x00" + al.Kid, al.BlobRate, float64(size), "allowance.blobRate"}
 	}
-	return draw{"b\x00" + a.bucketKey, cfg.Limits.BlobRate, float64(size), "blobRate"}
+	return draw{"b\x00" + n.name + "\x00" + a.bucketKey, cfg.Limits.BlobRate, float64(size), "blobRate"}
 }
 
 // admit draws tokens, or answers 429 (§6.6).

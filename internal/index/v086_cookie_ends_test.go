@@ -388,3 +388,42 @@ func TestV086CookieOfAStaleHeadIsJudged(t *testing.T) {
 		t.Errorf("li under her cookie once the change was undone: %d, want 403 until she exchanges again", got)
 	}
 }
+
+// v0.88 SERVICES §A.4 Cookies ("it judges a cookie by every
+// namespace-document entry after the checkpoint it judged the exchange
+// at, in a branch by its bases' entries after their checkpoints then too
+// … and a cookie it can't judge so … is 403"), SVC-59: an index that
+// follows the branch docs-b and not its base docs can't judge li's
+// docs-b cookie by docs' entries, so the cookie is 403; the same index
+// following docs too reads it. Until v0.88 such a cookie was judged by
+// the documents at the heads alone, and read on after a change to docs
+// and its undo.
+func TestV088BranchCookieUnjudgedWithoutBase(t *testing.T) {
+	t.Parallel()
+	d, nss := newV86Branch(t)
+	// The index's grant reads both; it follows docs-b alone.
+	db := d.x.dbPath
+	d.x.stop()
+	ev := must(edge.New([]byte("s3cret"), "", ""))
+	d.x = startSvcWith(t, d.s.Client(t, client.WithBearer(d.admin.Grant(t, d.s.Now(), "svc:indexer", nss, []string{"read"}))),
+		svcOpts{db: db, ns: []string{"docs-b"}, untyped: true, now: d.s.Now},
+		func(o *indexOpts) {
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate, ev
+		})
+	d.x.caughtUp("docs-b")
+	status := func(p string, c []*http.Cookie) int {
+		t.Helper()
+		r, _ := p37Follow(t, d.x, p+"?q=word", c, "")
+		return r.status
+	}
+	tok := v86GrantFor(d, "docs-b")
+	pb, cb := v86Exchange(d, tok)
+	if got := status(pb, cb); got != 403 {
+		t.Fatalf("a docs-b cookie, docs not followed: %d, want 403", got)
+	}
+	v86Restart(d, nss, false)
+	pb, cb = v86Exchange(d, tok)
+	if got := status(pb, cb); got != 200 {
+		t.Fatalf("a docs-b cookie, docs followed: %d, want 200", got)
+	}
+}

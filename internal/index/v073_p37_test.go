@@ -395,7 +395,7 @@ func TestV073P37SealedEpochs(t *testing.T) {
 	for _, h := range decodeJSON(t, f.body)["hits"].([]any) {
 		h := h.(map[string]any)
 		name := h["resource"].(string)
-		if _, err := derived.OpenItem(h["sealed"].(string), derived.ItemKey(keyOf, "sec", name), derived.View{NS: "sec", Target: f.path}, "sec", name); err != nil {
+		if _, err := derived.OpenItem(h["sealed"].(string), derived.ItemKey(keyOf, "sec", name, h["id"].(string)), derived.View{NS: "sec", Target: f.path}, "sec", name); err != nil {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
@@ -459,7 +459,7 @@ func TestV073P37E2EEpochs(t *testing.T) {
 		h := h.(map[string]any)
 		name := h["resource"].(string)
 		keyOf := func(kid string) []byte { return must(ad.Key(ctx, kid)) }
-		if _, err := derived.OpenItem(h["sealed"].(string), derived.ItemKey(keyOf, "e", name), derived.View{NS: "e", Target: f.path}, "e", name); err != nil {
+		if _, err := derived.OpenItem(h["sealed"].(string), derived.ItemKeyE3(keyOf, "e", name), derived.View{NS: "e", Target: f.path}, "e", name); err != nil {
 			t.Errorf("%s: %v", name, err)
 		}
 	}

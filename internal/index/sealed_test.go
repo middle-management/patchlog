@@ -287,7 +287,8 @@ func TestSealedPerResource(t *testing.T) {
 	if h := must(seal.ParseHeader(jwe)); fmt.Sprint(h.PL) != fmt.Sprint(map[string]any{"name": "a", "ns": "sec", "view": f.path}) {
 		t.Fatalf("hit pl %v", h.PL)
 	}
-	// The reader's own K_a opens it; K_b doesn't.
+	// The reader's own K_a opens it, through the K_rev of the hit's
+	// revision it derives (§E.2.6, v0.89); K_b doesn't.
 	pr := s.Client(t, client.WithBearer(fixed))
 	fk := must(pr.FetchKeys(ctx, "sec", nil, []string{"a"}))
 	if len(fk) != 1 || fk[0].Resource != "a" {
@@ -295,7 +296,7 @@ func TestSealedPerResource(t *testing.T) {
 	}
 	ka := func(kid string) []byte {
 		if kid == fk[0].Kid {
-			return fk[0].Key
+			return must(seal.RevKey(fk[0].Key, hit["id"].(string)))
 		}
 		return nil
 	}
@@ -303,7 +304,7 @@ func TestSealedPerResource(t *testing.T) {
 	if v["score"] == nil || v["schema"] == nil {
 		t.Fatalf("values %v", v)
 	}
-	kb := derived.ItemKey(epochKeys(t, w, "sec"), "sec", "b")
+	kb := derived.ItemKey(epochKeys(t, w, "sec"), "sec", "b", hit["id"].(string))
 	if _, err := derived.OpenItem(jwe, kb, derived.View{NS: "sec", Target: f.path}, "sec", "b"); err == nil {
 		t.Fatal("opened with K_b")
 	}
@@ -390,7 +391,7 @@ func TestE2ENamespace(t *testing.T) {
 	for _, h := range b["hits"].([]any) {
 		h := h.(map[string]any)
 		name := h["resource"].(string)
-		v := decodeJSON(t, must(derived.OpenItem(h["sealed"].(string), derived.ItemKey(epochKey, "e", name), derived.View{NS: "e", Target: f.path}, "e", name)))
+		v := decodeJSON(t, must(derived.OpenItem(h["sealed"].(string), derived.ItemKeyE3(epochKey, "e", name), derived.View{NS: "e", Target: f.path}, "e", name)))
 		if v["score"] == nil {
 			t.Errorf("%s opens to %v", name, v)
 		}
@@ -429,7 +430,7 @@ func TestSealedPadded(t *testing.T) {
 		hit := hit.(map[string]any)
 		name, jwe := hit["resource"].(string), hit["sealed"].(string)
 		h := must(seal.ParseHeader(jwe))
-		pt := must(derived.OpenItem(jwe, derived.ItemKey(epochKeys(t, c, "p"), "p", name), derived.View{NS: "p", Target: f.path}, "p", name))
+		pt := must(derived.OpenItem(jwe, derived.ItemKey(epochKeys(t, c, "p"), "p", name, hit["id"].(string)), derived.View{NS: "p", Target: f.path}, "p", name))
 		if !seal.IsPadded(h, pt) || len(pt) <= 700 {
 			t.Fatalf("%s not padded: zip %q, %d bytes", name, h.Zip, len(pt))
 		}

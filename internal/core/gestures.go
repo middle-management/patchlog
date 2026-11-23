@@ -136,7 +136,11 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 		// Rows the reader may not read are skipped, so a page is filled
 		// from as many batches as it takes.
 		var rs []row
-		for len(rs) <= limit {
+		// The request's checks share one budget of validationSteps: a
+		// page that runs out after its first row ends there, a next on
+		// it; one that runs out before fails the read (§6.6, v0.88).
+		spent := false
+		for len(rs) <= limit && !spent {
 			rows, qerr := t.Query(`SELECT r.seq, r.res, s.name, r.id, r.kind, r.gesture, r.undoes, r.author FROM revisions r JOIN resources s ON s.res = r.res
 				WHERE s.ns = ? AND s.state <> ? AND (r.gesture = ? OR r.undoes = ?) AND r.seq > ? ORDER BY r.seq LIMIT ?`,
 				n.id, statePurged, gesture, gesture, after, limit+1)
@@ -152,19 +156,30 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 			// query at a time.
 			rows.Close()
 			for _, r := range batch {
-				if visible == nil || visible(r.name, r.seq) {
+				ok := visible == nil || visible(r.name, r.seq)
+				if t.readSpent() {
+					spent = true
+					break
+				}
+				if ok {
 					rs = append(rs, r)
 				}
 			}
-			if len(batch) <= limit {
+			if spent || len(batch) <= limit {
 				break
 			}
 			after = batch[len(batch)-1].seq
 		}
+		if spent && len(rs) == 0 {
+			return errReadRanOut()
+		}
 		out = &GesturePage{Entries: []map[string]any{}}
-		if len(rs) > limit {
+		more := len(rs) > limit
+		if more {
 			rs = rs[:limit]
-			last := rs[limit-1]
+		}
+		if more || spent {
+			last := rs[len(rs)-1]
 			out.Next = last.name + "/" + ids.FromBytes(last.id).String()
 		}
 		for _, r := range rs {

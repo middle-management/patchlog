@@ -21,7 +21,7 @@ import (
 // A followed namespace is covered, as the origin decides it, from its
 // namespace document alone (§7.9 Where), whether or not the origin
 // implements filtered reads, and only while the core's authentication is
-// on (authOff): neither a branch, public, sealed nor e2e.
+// on (authOff): neither a branch, public nor e2e (sealed ones since v0.89).
 //
 // A partial reader of a covered namespace (one whose grant allows read
 // there without a namespace-wide edge grant, §C.5.2) reads it filtered by
@@ -132,10 +132,10 @@ func (ix *Index) docAt(ctx context.Context, ns, id string) (map[string]any, erro
 }
 
 // fsOpen reports whether a namespace with document doc can be covered:
-// not public, not sealed or e2e (§7.9 Where).
+// not public, not e2e (§7.9 Where; sealed ones since v0.89).
 func fsOpen(doc map[string]any) bool {
 	read, _ := doc["read"].(string)
-	return read != "public" && !derived.Protected(derived.InfoOf(doc).Level)
+	return read != "public" && derived.InfoOf(doc).Level != derived.LevelE2E
 }
 
 // coverage is ns's checkpoint at z, the index's checkpoint of it (§7.9
@@ -163,7 +163,7 @@ func (ix *Index) coverage(ctx context.Context, ns, z string) (*fcp, error) {
 }
 
 // coverable reports whether a namespace with document doc is covered
-// while authentication is on: neither a branch (§7.6), public, sealed nor
+// while authentication is on: neither a branch (§7.6), public nor
 // end-to-end (§7.9 Where).
 func coverable(doc map[string]any) bool {
 	_, branch := doc["base"]

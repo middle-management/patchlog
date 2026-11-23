@@ -69,7 +69,7 @@ type indexCmd struct {
 	Branches           bool          `arg:"--branches" help:"also follow branches, building a preview index per branch (§F.8)"`
 	Rebuild            bool          `arg:"--rebuild" help:"drop the index and replay from the beginning (§A.6)"`
 	UntypedListing     bool          `arg:"--untyped-listing" default:"true" help:"list untyped documents in plain listings (never in text/facet/sort queries); --untyped-listing=false to leave them out"`
-	MaxValidationSteps int           `arg:"--max-validation-steps" default:"5000000" placeholder:"N" help:"validationSteps (§6.6, §12.2) as the origin's deployment sets it (serve --max-validation-steps), which no namespace document carries: the steps each read check and each item filtered by a grant may take in its rules' schema tests; one that needs more fails, or the item is left out; at least 1"`
+	MaxValidationSteps int           `arg:"--max-validation-steps" placeholder:"N" help:"validationSteps (§6.6, §12.2): the steps each read check and each item filtered by a grant may take in its rules' schema tests; one that needs more fails, or the item is left out. By default the origin's, which GET /ns/{ns}/principal gives the index's grant in writer.limits (SERVICES §A.4); set, at least 1, it overrides that"`
 	MinWait            time.Duration `arg:"--min-wait" default:"2s" placeholder:"DURATION" help:"how long ?min= waits for the index to catch up (§A.5)"`
 	SSE                bool          `arg:"--sse" help:"follow by server-sent events instead of long-poll"`
 	FetchConcurrency   int           `arg:"--fetch-concurrency" default:"8" placeholder:"N" help:"how many documents the index fetches at once while applying the log, across all namespaces"`
@@ -116,9 +116,11 @@ func (a *indexCmd) run(string) {
 
 	ctx, sigs := shutdownSignals("patchlog index")
 
-	steps, err := validationSteps(a.MaxValidationSteps)
-	if err != nil {
-		log.Fatal(err)
+	steps := 0 // the origin's (index.Options.ValidationSteps)
+	if a.MaxValidationSteps != 0 {
+		if steps, err = validationSteps(a.MaxValidationSteps); err != nil {
+			log.Fatal(err)
+		}
 	}
 	opt := index.Options{ValidationSteps: steps, Client: c, DB: a.DB, Namespaces: nss, Branches: a.Branches, Rebuild: a.Rebuild,
 		UntypedListing: a.UntypedListing, MinWait: a.MinWait, Recipient: recipient, FetchConcurrency: a.FetchConcurrency}

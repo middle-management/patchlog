@@ -7,6 +7,10 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
+// testRev is the revision the tests' entries derive from: at E2 an entry
+// is sealed under that revision's K_rev (§E.2.6, v0.89).
+const testRev = "1sywh54kpo3c4ezn2znktvl3avge4zl5d"
+
 func TestSealOpen(t *testing.T) {
 	ke := seal.NewKey()
 	k := Key{NS: "n", Epoch: 3, K: ke, Pad: true}
@@ -35,17 +39,17 @@ func TestSealOpen(t *testing.T) {
 	if _, err := OpenView(jwe, func(string) []byte { return nil }, v); !errors.Is(err, ErrNoKey) {
 		t.Fatalf("no key: %v", err)
 	}
-	item, err := SealItem(k, v, "r", map[string]any{"score": 1})
+	item, err := SealItem(k, v, "r", testRev, map[string]any{"score": 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := OpenItem(item, ItemKey(keyOf, "n", "r"), v, "n", "r"); err != nil {
+	if _, err := OpenItem(item, ItemKey(keyOf, "n", "r", testRev), v, "n", "r"); err != nil {
 		t.Fatalf("item: %v", err)
 	}
 	if _, err := OpenItem(item, keyOf, v, "n", "r"); !errors.Is(err, seal.ErrDecrypt) {
 		t.Fatalf("item under K_e: %v", err)
 	}
-	if _, err := OpenItem(item, ItemKey(keyOf, "n", "s"), v, "n", "s"); err == nil {
+	if _, err := OpenItem(item, ItemKey(keyOf, "n", "s", testRev), v, "n", "s"); err == nil {
 		t.Fatal("item as another resource")
 	}
 }

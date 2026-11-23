@@ -47,12 +47,13 @@ func TestV086BaseNSRejectedInEveryDeliveryForm(t *testing.T) {
 		kid := mk.kidNS + "#1"
 		kr := must(seal.ResourceKey(keys[mk.kidNS], mk.kidNS, "d"))
 		kn := must(seal.NamespaceKey(keys[mk.kidNS], mk.kidNS))
-		entry := must(seal.Seal(kr, kid, seal.ResourcePL(mk.plNS, "d", id, seal.KindRev), []byte(`{"id":"`+id+`","kind":"rev","parent":"","patches":[]}`)))
+		// v0.89: an entry under its K_log, a blob under its K_blob (§E.2.1).
+		entry := must(seal.Seal(must(seal.LogKey(kr, id)), kid, seal.ResourcePL(mk.plNS, "d", id, seal.KindRev), []byte(`{"id":"`+id+`","kind":"rev","parent":"","patches":[]}`)))
 		prune := must(seal.Seal(kr, kid, seal.ResourceEventPL(mk.plNS, "d", "prune"), []byte(`{"kind":"prune","resource":"d","horizon":"`+id+`"}`)))
 		nsEntry := `{"id":"` + nsID + `","prev":"","kind":"head","resource":"d","target":"` + id + `","author":"x","created":"2026-01-01T00:00:00.000Z"}`
 		nsEvent := must(seal.Seal(kn, kid, seal.NamespaceEventPL(mk.plNS, nsID), []byte(nsEntry)))
 		rng := must(seal.Seal(kn, kid, seal.RangePL(mk.plNS, "", nsID), []byte("["+nsEntry+"]")))
-		sealedBlob := must(seal.SealBlob(kr, kid, seal.BlobPL(mk.plNS, "d", bid), blob, false))
+		sealedBlob := must(seal.SealBlob(must(seal.BlobKey(kr, bid)), kid, seal.BlobPL(mk.plNS, "d", bid), blob, false))
 		var mu sync.Mutex
 		var asked []string
 		sse := func(w http.ResponseWriter, events ...[3]string) {

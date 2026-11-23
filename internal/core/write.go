@@ -344,6 +344,17 @@ type itemErr struct {
 	err   *Error
 }
 
+// anyOutright reports whether an item of fs failed step 1 outright, not
+// by running out of validationSteps (§6.6 Validation work).
+func anyOutright(fs []itemErr) bool {
+	for _, f := range fs {
+		if !f.err.ranOut {
+			return true
+		}
+	}
+	return false
+}
+
 // batchError builds the §7.5 failure body.
 func batchError(fails []itemErr) *Error {
 	// An item whose step 1 ran out of validationSteps answers only if no
@@ -499,6 +510,12 @@ type writePlan struct {
 // returns a plan to insert, or a final result (an idempotent retry, a dry
 // run), or an error.
 func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun, rateDrawn bool) (*writePlan, *WriteResult, error) {
+	// Each read check a write makes has a budget of its own (§6.6), also
+	// where its steps run in a read transaction (checkOutside, dry runs),
+	// which would otherwise share the request's.
+	prevRead, prevWrite := t.readMeter, t.stepOneAttrs
+	t.readMeter, t.stepOneAttrs = nil, true
+	defer func() { t.readMeter, t.stepOneAttrs = prevRead, prevWrite }()
 	// A config change locks the namespace exclusively; resource writes
 	// alone lock it shared (pglock.go).
 	t.reqCreds = req.anyCreds()
@@ -676,23 +693,39 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			// failed (F-G4). A submit is then answered with the change's
 			// error, which a dry run reports, judging the items against
 			// the current configuration.
-			if len(authorizeItems(a)) == 0 {
-				cost := len(items)
-				if !a.star {
-					cost++
+			cfgCost := 0
+			if !a.star {
+				cfgCost = 1
+			}
+			names := make([]string, len(items))
+			for i, it := range items {
+				names[i] = it.Resource
+			}
+			if ifs := authorizeItems(a); len(ifs) > 0 {
+				// The change passed its own step 1, so its token is drawn
+				// even where an item fails step 1 (§6.6 Cost, v0.88): with
+				// the items' own draws if their failures are all
+				// run-outs, alone otherwise.
+				var draws []draw
+				if !anyOutright(ifs) {
+					draws = t.ownDraws(n, cur, a, names, len(items))
 				}
-				if cost > 0 {
-					names := make([]string, len(items))
-					for i, it := range items {
-						names[i] = it.Resource
-					}
-					if err := t.rateLimit(n, cur, a, names, cost); err != nil {
+				if cfgCost > 0 {
+					draws = joinDraws(draws, t.writeDraws(n, cur, a, nil, cfgCost))
+				}
+				if len(draws) > 0 && !drawn {
+					if err := t.admitOnce(draws); err != nil {
 						return nil, nil, err
 					}
 					drawn = true
-					if t.rateDrawn != nil {
-						*t.rateDrawn = true
+				}
+			} else {
+				cost := len(items) + cfgCost
+				if cost > 0 && !drawn {
+					if err := t.admitOnce(t.writeDraws(n, cur, a, names, cost)); err != nil {
+						return nil, nil, err
 					}
+					drawn = true
 				}
 				// A retried batch finds its config precondition stale:
 				// look for the batch it would have produced first (§7.5,
@@ -748,23 +781,23 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		// authorisation (§7.5), and are listed with those that fail
 		// outright. Only if none does do the rate limits come first,
 		// drawing what the batch costs from the caller's own buckets and
-		// nothing from the namespace's (§6.6 Validation work). A batch
-		// whose config change failed after its step 1 draws nothing once
-		// an item fails step 1, however it fails.
-		outright := false
-		for _, f := range fs {
-			outright = outright || !f.err.ranOut
-		}
-		if !outright && !cfgFailed && !drawn {
-			cost := len(items)
-			if cplan != nil && !cplan.exempt {
-				cost++
-			}
+		// nothing from the namespace's (§6.6 Validation work). A config
+		// change that passed its own step 1 draws what a config write
+		// does all the same, even where an item fails step 1 outright
+		// (§6.6 Cost, v0.88); one that failed after its step 1 drew above.
+		var draws []draw
+		if !anyOutright(fs) {
 			names := make([]string, len(items))
 			for i, it := range items {
 				names[i] = it.Resource
 			}
-			if err := t.admitOnce(t.ownDraws(n, cfg, a, names, cost)); err != nil {
+			draws = t.ownDraws(n, cfg, a, names, len(items))
+		}
+		if cplan != nil && !cplan.exempt {
+			draws = joinDraws(draws, t.writeDraws(n, cfg, a, nil, 1))
+		}
+		if len(draws) > 0 && !cfgFailed && !drawn {
+			if err := t.admitOnce(draws); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -1113,7 +1146,7 @@ func (t *tx) planEntry(p *writePlan, author int64, entries []any, inserted []his
 			entry["source"] = p.src
 			// An import from another deployment starts a follow of its
 			// purges (§G.1).
-			t.recordImport(p.n, p.src, p.st)
+			t.recordImport(p.n, p.a, p.src, p.st)
 		}
 		return nsAppend{entry: entry, meta: batchGestures(p.st), author: author, hist: inserted}
 	}

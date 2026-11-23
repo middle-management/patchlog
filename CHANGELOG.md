@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+Spec v0.89: filtered reads and `/doc` read rules work in sealed namespaces, through derived
+keys; v0.88's answers to the reference's notes on v0.87.
+
+- **Derived keys (§E.2.1).** Below each resource's `K_r`, a revision's document is sealed
+  under its own `K_rev`, its log entry under `K_log` and each blob under `K_blob`; below each
+  epoch's `K_e`, a view has its `K_view`. Rows sealed before are sealed again on their next
+  read; earlier blob sealings are discarded once at start.
+- **Filtered reads at `sealed` (§7.9, §E.2.3).** The origin judges `/doc` rules on the
+  plaintext it holds; only end-to-end namespaces are left out. A partial reader gets only its
+  view's `K_view` at `/keys`. Each filtered range, long-poll answer, `/heads` page and event is
+  one JWE under `K_view` that carries, for each visible revision, its `K_rev`, its blobs'
+  `K_blob`, and its `K_log` only where the parent is visible, so patches of a hidden parent stay
+  closed. The index seals a per-document hit under the revision's `K_rev` and judges `/doc`
+  rules on the documents it opens. The client opens all of these.
+- **A purged resource is `410`** to a reader whose rules fail only for want of `doc`, at every
+  resource URL; it was `404`. Purges and restores purge `ns:{ns}`, the tag of cached filtered
+  ranges.
+- **Purges after imports follow only the operator's named importers** (§G.1):
+  `serve --follow-purges-importer ORIGIN=PRINCIPAL`, at least one per `--follow-purges-from`
+  origin, and only names whose import batch's grant may `purge` them. A writer can no longer
+  forge an import that a trusted origin's purge then applies.
+- **One validation budget per request** (§6.6): every check of a read request or long-poll
+  shares it; each grant of an exchange, each read check a write makes and each list of a
+  refused purge has its own. A gestures page ends early where the budget runs out. A key
+  scope's `attrs` schema counts against it, and running out refuses the grant outside writes.
+  A batch's `config` change draws once it passes its own step 1.
+- **Rate buckets:** `exchangeRate` is keyed by the root `sub` and the verifying key's
+  thumbprint, across namespaces; every other bucket is the namespace's own.
+- **A namespace purge's `dependents`** is filtered to what the caller may read and paged by
+  name, as `referencing` is.
+- **Long-poll intervals** must be a whole number of milliseconds; others are refused at start.
+- **Client levels:** only a `403` or `404` of a namespace document teaches nothing; an
+  unreadable base flags the operations behind it and the read goes on.
+- **Index:** cookies end when any role that lists `read` changes, and are `403` in a branch
+  whose bases it doesn't follow; the `/_refs` view is the hash of `{ns}:{v}` markers;
+  `validationSteps` comes from the origin's `/principal` (`--max-validation-steps` overrides).
+- **Releases:** a merge stopped between content and publishing can be planned again; step 3
+  carries the documents the stored plan was to publish.
+- **WebDAV:** an index `400` for an unindexed folder is no empty folder before a delete or
+  move: the gateway lists again at the namespace head and answers `503` if still `400`.
+- **Migration** `030_purge_follows_by_importer` on Postgres, `029_…` on SQLite: recorded
+  imported names gain their importer; names recorded before follow nothing until imported
+  again.
+
 Spec v0.87: catalogs, the tree service and remote branches go; filtered reads move into the
 core, decided by the grant's own read rules. About 86,000 lines are removed and 13,000 added.
 

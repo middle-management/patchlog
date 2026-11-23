@@ -50,13 +50,149 @@ type Keys struct {
 	epoch     map[string][]byte // kid -> K_e
 	nsKeys    map[string][]byte // kid -> K_n, derived from K_e
 	res       map[string][]byte // kid "\n" resource -> K_r
-	noFetch   bool
+	// sub holds the keys below K_r (§E.2.1, v0.89): kid "\n" resource
+	// "\n" kind "\n" id -> K_rev ("rev"), K_log ("log") or K_blob
+	// ("blob"), derived from K_r or carried by a filtered answer.
+	sub map[string][]byte
+	// view holds K_view: kid "\n" view -> K_view, from /keys, or derived
+	// from K_e.
+	view    map[string][]byte
+	noView  map[string]bool // kid "\n" view: /keys gave none
+	noFetch bool
 }
 
 // NewKeys returns an empty key cache. recipient, if not nil, unwraps keys
 // the server wraps to the grant's enc (§E.2.3).
 func NewKeys(recipient *ecdh.PrivateKey) *Keys {
-	return &Keys{recipient: recipient, epoch: map[string][]byte{}, nsKeys: map[string][]byte{}, res: map[string][]byte{}}
+	return &Keys{recipient: recipient, epoch: map[string][]byte{}, nsKeys: map[string][]byte{}, res: map[string][]byte{},
+		sub: map[string][]byte{}, view: map[string][]byte{}, noView: map[string]bool{}}
+}
+
+// Kinds of the keys below K_r (subKey).
+const (
+	subRev  = "rev"
+	subLog  = "log"
+	subBlob = "blob"
+)
+
+// AddView caches a view key K_view of view (§E.2.1), as /keys gives a
+// partial reader (§E.2.3).
+func (k *Keys) AddView(kid, view string, key []byte) {
+	k.mu.Lock()
+	k.view[kid+"\n"+view] = append([]byte(nil), key...)
+	k.mu.Unlock()
+}
+
+// addSub caches a key below K_r of resource, kind subRev, subLog or
+// subBlob, for id (a revision's or a blob's).
+func (k *Keys) addSub(kid, resource, kind, id string, key []byte) {
+	k.mu.Lock()
+	k.sub[kid+"\n"+resource+"\n"+kind+"\n"+id] = append([]byte(nil), key...)
+	k.mu.Unlock()
+}
+
+// cachedSub returns a cached key below K_r, or one derived from a K_r or
+// K_e cached, nil if neither is.
+func (k *Keys) cachedSub(kid, resource, kind, id string) []byte {
+	k.mu.Lock()
+	b := k.sub[kid+"\n"+resource+"\n"+kind+"\n"+id]
+	k.mu.Unlock()
+	if b != nil {
+		return b
+	}
+	kr := k.cached(kid, resource)
+	if kr == nil {
+		return nil
+	}
+	return deriveSub(kr, kind, id)
+}
+
+// deriveSub derives K_rev, K_log or K_blob of id from K_r (§E.2.1).
+func deriveSub(kr []byte, kind, id string) []byte {
+	var b []byte
+	var err error
+	switch kind {
+	case subRev:
+		b, err = seal.RevKey(kr, id)
+	case subLog:
+		b, err = seal.LogKey(kr, id)
+	case subBlob:
+		b, err = seal.BlobKey(kr, id)
+	default:
+		return nil
+	}
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// cachedView returns K_view of view for kid: cached, or derived from a
+// cached K_e, which derives every K_view (§E.2.1); nil otherwise.
+func (k *Keys) cachedView(kid, view string) []byte {
+	k.mu.Lock()
+	b, ke := k.view[kid+"\n"+view], k.epoch[kid]
+	k.mu.Unlock()
+	if b != nil || ke == nil {
+		return b
+	}
+	ns, _, err := seal.ParseKid(kid)
+	if err != nil {
+		return nil
+	}
+	b, err = seal.FilterViewKey(ke, ns, view)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// subKey returns the key below K_r of resource that content sealed under
+// kid opens with (kind subRev, subLog or subBlob, for id): carried by a
+// filtered answer, or derived from K_r, fetched as key fetches it.
+func (k *Keys) subKey(ctx context.Context, c *Client, kid, resource, kind, id, via string) ([]byte, error) {
+	if b := k.cachedSub(kid, resource, kind, id); b != nil {
+		return b, nil
+	}
+	kr, err := k.key(ctx, c, kid, resource, via)
+	if err != nil {
+		return nil, err
+	}
+	if b := deriveSub(kr, kind, id); b != nil {
+		return b, nil
+	}
+	return nil, ErrNoKeys
+}
+
+// viewKey returns K_view of view for kid, fetching keys from via's /keys
+// if needed (§E.2.3).
+func (k *Keys) viewKey(ctx context.Context, c *Client, kid, view, via string) ([]byte, error) {
+	if b := k.cachedView(kid, view); b != nil {
+		return b, nil
+	}
+	k.mu.Lock()
+	lacking := k.noView[kid+"\n"+view]
+	k.mu.Unlock()
+	if k.noFetch || lacking {
+		return nil, ErrNoKeys
+	}
+	_, epoch, err := seal.ParseKid(kid)
+	if err != nil {
+		return nil, err
+	}
+	if err := k.fetch(ctx, c, via, epoch, ""); err != nil {
+		return nil, err
+	}
+	if b := k.cachedView(kid, view); b != nil {
+		return b, nil
+	}
+	// Outside the grant's window (§E.2.3): remembered, so that keys of
+	// older epochs in later answers don't ask /keys again, each drawing
+	// a token of exchangeRate (§6.6).
+	k.mu.Lock()
+	k.noView[kid+"\n"+view] = true
+	k.mu.Unlock()
+	return nil, ErrNoKeys
 }
 
 // StaticKeys returns a key cache that never fetches: only keys added with
@@ -184,9 +320,12 @@ func (k *Keys) fetch(ctx context.Context, c *Client, ns string, epoch int, resou
 				return fmt.Errorf("client: unwrapping %s: %w", e.Kid, err)
 			}
 		}
-		if e.Resource == "" {
+		switch {
+		case e.View != "":
+			k.AddView(e.Kid, e.View, key)
+		case e.Resource == "":
 			k.Add(e.Kid, key)
-		} else {
+		default:
 			k.AddResource(e.Kid, e.Resource, key)
 		}
 	}
@@ -201,6 +340,9 @@ func WithKeys(k *Keys) Option { return func(c *Client) { c.keys = k } }
 type KeyEntry struct {
 	Kid      string
 	Resource string // the answer's name: set for a per-resource key K_r
+	// View is the answer's view: set for a partial reader's view key
+	// K_view (§E.2.3, v0.89).
+	View string
 	// From is set for a keyring entry an e2e namespace relays (§E.3.2):
 	// the thumbprint of the admin key that wrapped it in HPKE auth mode.
 	From    string
@@ -272,7 +414,7 @@ func (c *Client) FetchKeysAnswer(ctx context.Context, ns string, epochs []int, r
 	for _, x := range arr {
 		m, _ := x.(map[string]any)
 		// A K_r's resource is "name"; servers before v0.63 said "resource".
-		e := KeyEntry{Kid: str(m, "kid"), Resource: str(m, "name")}
+		e := KeyEntry{Kid: str(m, "kid"), Resource: str(m, "name"), View: str(m, "view")}
 		if e.Resource == "" {
 			e.Resource = str(m, "resource")
 		}
@@ -282,7 +424,7 @@ func (c *Client) FetchKeysAnswer(ctx context.Context, ns string, epochs []int, r
 			}
 		} else if e.Wrapped, err = seal.ParseWrappedKey(m); err != nil {
 			return nil, fmt.Errorf("client: %s: %w", e.Kid, err)
-		} else if e.Wrapped.Kid != e.Kid || e.Wrapped.Resource != e.Resource {
+		} else if e.Wrapped.Kid != e.Kid || e.Wrapped.Resource != e.Resource || e.Wrapped.View != e.View {
 			return nil, fmt.Errorf("client: %s: wrapped key mismatch", e.Kid)
 		}
 		e.From = e.Wrapped.From
@@ -347,11 +489,134 @@ func (c *Client) open(ctx context.Context, ns, resource, jwe string, want func(h
 	if kns != ns {
 		return nil, fmt.Errorf("client: sealed content of %s is sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
 	}
-	key, err := c.keys.key(ctx, c, h.Kid, resource, ns)
+	// pl is compared with what was fetched before any key is derived from
+	// it: a JWE bound to another revision is a mismatch, not a failed
+	// decryption under that revision's key.
+	if err := h.Expect(h.Kid, pl); err != nil {
+		return nil, err
+	}
+	// A revision's document opens under its K_rev, a log entry under its
+	// K_log (§E.2.1, v0.89); other resource content, purge and prune
+	// events, under K_r; namespace content under K_n.
+	var key []byte
+	id, _ := pl["id"].(string)
+	switch kind, _ := pl["kind"].(string); {
+	case resource != "" && kind == seal.KindDoc && id != "":
+		key, err = c.keys.subKey(ctx, c, h.Kid, resource, subRev, id, ns)
+	case resource != "" && (kind == seal.KindRev || kind == seal.KindTombstone) && id != "":
+		key, err = c.keys.subKey(ctx, c, h.Kid, resource, subLog, id, ns)
+	default:
+		key, err = c.keys.key(ctx, c, h.Kid, resource, ns)
+	}
 	if err != nil {
 		return nil, err
 	}
 	return seal.OpenExpect(jwe, key, h.Kid, pl)
+}
+
+// openFiltered decrypts a filtered answer of view in sealed namespace ns
+// (§7.9 Sealed namespaces, §E.2.2): one JWE under the view's K_view, or,
+// to a reader holding K_e (a /ns/{ns} cookie's), K_n, bound to pl, the
+// unfiltered form's pl with view added, which want returns given the
+// (unauthenticated) header; its plaintext { body, keys }. Each view's keys
+// JWE it carries is opened under the K_view of its own epoch, where the
+// reader has one (others are skipped: a reader opens those of the epochs
+// its window covers), bound to { ns, view, name, id, kind: "keys" }, and
+// the K_rev, K_log and K_blob it holds are cached for the revision it
+// names. It returns the body.
+func (c *Client) openFiltered(ctx context.Context, ns, view, jwe string, want func(h *seal.Header) (seal.PL, error)) (any, error) {
+	if c.keys == nil {
+		return nil, ErrNoKeys
+	}
+	h, err := seal.ParseHeader(jwe)
+	if err != nil {
+		return nil, fmt.Errorf("client: filtered answer: %w", err)
+	}
+	kns, _, err := seal.ParseKid(h.Kid)
+	if err != nil {
+		return nil, fmt.Errorf("client: filtered answer: %w", err)
+	}
+	if kns != ns {
+		return nil, fmt.Errorf("client: filtered answer of %s sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
+	}
+	pl, err := want(h)
+	if err != nil {
+		return nil, err
+	}
+	if view == "" {
+		view, _ = h.PL["view"].(string)
+	}
+	pl = seal.WithView(pl, view)
+	if err := h.Expect(h.Kid, pl); err != nil {
+		return nil, fmt.Errorf("client: filtered answer: %w", err)
+	}
+	vk, err := c.keys.viewKey(ctx, c, h.Kid, view, ns)
+	if err != nil {
+		return nil, err
+	}
+	pt, err := seal.OpenExpect(jwe, vk, h.Kid, pl)
+	if errors.Is(err, seal.ErrDecrypt) {
+		// A /ns/{ns} cookie's answers are under K_n (§7.9).
+		if kn := c.keys.cached(h.Kid, ""); kn != nil && c.keys.cachedView(h.Kid, view) != nil {
+			pt, err = seal.OpenExpect(jwe, kn, h.Kid, pl)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	body, keys, err := seal.ParseFiltered(pt)
+	if err != nil {
+		return nil, err
+	}
+	for _, kj := range keys {
+		if err := c.takeViewKeys(ctx, ns, view, kj); err != nil {
+			return nil, err
+		}
+	}
+	return body, nil
+}
+
+// takeViewKeys opens a view's keys for a revision and caches them; a JWE of
+// an epoch the reader has no K_view of is skipped (§E.2.2).
+func (c *Client) takeViewKeys(ctx context.Context, ns, view, jwe string) error {
+	h, err := seal.ParseHeader(jwe)
+	if err != nil {
+		return fmt.Errorf("client: view keys: %w", err)
+	}
+	kns, _, err := seal.ParseKid(h.Kid)
+	if err != nil || kns != ns {
+		return fmt.Errorf("client: view keys of %s sealed under %s: %w", ns, h.Kid, seal.ErrMismatch)
+	}
+	name, _ := h.PL["name"].(string)
+	id, _ := h.PL["id"].(string)
+	if name == "" || id == "" {
+		return fmt.Errorf("client: view keys: %w", seal.ErrMismatch)
+	}
+	pl := seal.ViewKeysPL(ns, view, name, id)
+	if err := h.Expect(h.Kid, pl); err != nil {
+		return fmt.Errorf("client: view keys: %w", err)
+	}
+	vk, err := c.keys.viewKey(ctx, c, h.Kid, view, ns)
+	if err != nil {
+		// Outside the reader's window: no key, nothing taken.
+		return nil
+	}
+	pt, err := seal.OpenExpect(jwe, vk, h.Kid, pl)
+	if err != nil {
+		return fmt.Errorf("client: view keys of %s/%s: %w", name, id, err)
+	}
+	ks, err := seal.ParseViewKeys(pt)
+	if err != nil {
+		return err
+	}
+	c.keys.addSub(h.Kid, name, subRev, id, ks.Key)
+	if ks.Log != nil {
+		c.keys.addSub(h.Kid, name, subLog, id, ks.Log)
+	}
+	for bid, b := range ks.Blobs {
+		c.keys.addSub(h.Kid, name, subBlob, bid, b)
+	}
+	return nil
 }
 
 func fixedPL(pl seal.PL) func(*seal.Header) (seal.PL, error) {
@@ -398,6 +663,9 @@ func (c *Client) openEntry(ctx context.Context, ns, name, jwe string) (LogEntry,
 // namespace an array of per-entry JWEs, which must chain from since and end
 // at last (when not "").
 func (c *Client) openLog(ctx context.Context, ns, name, since, last string, r *response) ([]LogEntry, error) {
+	if isJOSE(r) {
+		return c.openFilteredLog(ctx, ns, name, since, last, string(r.body))
+	}
 	arr, ok := r.value().([]any)
 	if !ok {
 		return nil, fmt.Errorf("client: %s: log is not an array", r.path)
@@ -427,6 +695,49 @@ func (c *Client) openLog(ctx context.Context, ns, name, since, last string, r *r
 	}
 	if last != "" && prev != last {
 		return nil, fmt.Errorf("client: sealed log of %s/%s ends at %s, not %s: %w", ns, name, prev, last, seal.ErrMismatch)
+	}
+	return out, nil
+}
+
+// openFilteredLog decrypts a partial reader's resource log range or
+// long-poll answer of ns/name in a sealed namespace (§7.9 Sealed
+// namespaces, §E.2.2): one JWE under its view's K_view, pl { ns, view,
+// name, range: [since, end] }, end last where the caller knows it, the
+// view its own (the key it holds is its view's alone). Its body holds the
+// entries §7.9 shows: one shown with patches as its stored JWE under its
+// K_log, which the answer's keys carry, any other in the clear, a hidden
+// one as { id, parent, kind: "hidden" }. A filtered log isn't
+// chain-verifiable (§10).
+func (c *Client) openFilteredLog(ctx context.Context, ns, name, since, last, jwe string) ([]LogEntry, error) {
+	body, err := c.openFiltered(ctx, ns, "", jwe, func(h *seal.Header) (seal.PL, error) {
+		end := last
+		if rg, ok := h.PL["range"].([]any); ok && len(rg) == 2 && end == "" {
+			end, _ = rg[1].(string)
+		}
+		return seal.PL{"ns": ns, "name": name, "range": []any{since, end}}, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("client: log of %s/%s: %w", ns, name, err)
+	}
+	arr, ok := body.([]any)
+	if !ok {
+		return nil, fmt.Errorf("client: log of %s/%s: the filtered body is not an array", ns, name)
+	}
+	out := make([]LogEntry, 0, len(arr))
+	for _, x := range arr {
+		if s, ok := x.(string); ok {
+			e, err := c.openEntry(ctx, ns, name, s)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, e)
+			continue
+		}
+		e, err := parseLogEntry(x)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
 	}
 	return out, nil
 }

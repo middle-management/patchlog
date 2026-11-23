@@ -266,12 +266,12 @@ func (c *Client) probeKey(ns string) string {
 // local base those documents name, to the end of the chain as known,
 // where the client holds sealed or e2e for some namespace and hasn't read
 // them yet (unread), learning their levels and bases. A document that
-// names a lower level than held is ErrLevelLowered. One the server
-// refuses this caller (401, 403, 404, 410) teaches nothing and isn't
-// asked for again with the same credentials; a failure of the moment
-// (transport, 429, 5xx) is returned, naming the document that wasn't
-// read, and asked for again next time: without it the level of what was
-// served can't be confirmed. Concurrent callers share one read.
+// names a lower level than held is ErrLevelLowered. One the caller's
+// grant may not read (403, 404) teaches nothing and isn't asked for again
+// with the same credentials; any other failure (a 401, a 410, transport,
+// 429, 5xx) is returned, naming the document that wasn't read, and asked
+// for again next time: without it the level of what was served can't be
+// confirmed (§7.1, v0.88). Concurrent callers share one read.
 func (c *Client) learnChain(ctx context.Context, ns string) error {
 	seen := map[string]bool{ns: true}
 	for todo := []string{ns}; len(todo) > 0; {
@@ -288,8 +288,9 @@ func (c *Client) learnChain(ctx context.Context, ns string) error {
 				}
 			}
 			_, _, _, err := c.currentLevel(ctx, cur)
-			var ae *APIError
-			if errors.As(err, &ae) && !Retryable(err) && !errors.Is(err, ErrLevelLowered) {
+			if nsUnreadable(err) && !errors.Is(err, ErrLevelLowered) {
+				// A document the grant may not read (403, 404) teaches
+				// nothing; any other failure fails the read (§7.1, v0.88).
 				c.levels.markRefused(key)
 				err = nil
 			}
