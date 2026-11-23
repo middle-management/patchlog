@@ -884,6 +884,9 @@ time only): the consumers read the revision each namespace entry names
   instances of 64 connections wrote less (24,243 at 32 namespaces), the log lock's mean wait
   5.8 ms against 2.2: past about 100 connections, Postgres's contention costs more than another
   instance adds.
+  One instance of 64 connections wrote 15,778 and 19,610 a second (p99 124 and 396 ms) at 85%
+  CPU: instances add throughput, 43% from one to two at 32 namespaces, until their connections
+  together pass what the database takes.
 - **On Aurora PostgreSQL Serverless v2** (I/O-Optimized) the same two instances wrote 5,308 and
   6,125 a second at 16 and 32 namespaces scaling from 2 ACU, a third of the 4xlarge's: groups
   were full (32) but each commit waited for Aurora's storage quorum (`IO:XactSync`), so a
