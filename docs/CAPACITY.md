@@ -879,6 +879,11 @@ time only): the consumers read the revision each namespace entry names
   than the 2xlarge, at 62% RDS CPU, 3,700 write IOPS and 176 MB/s. Postgres waited on its WAL
   (`LWLock:WALWrite`, 2–4 sessions) and the log lock's mean wait was 2 ms; the instances were at
   56–59% CPU. So the database's size sets this ceiling, and it scales with it.
+  With `--group-commit 128` and `pool_max_conns=48` on each of two instances it wrote 15,944 and
+  28,070 a second (p99 68 and 202 ms), at 59–62% CPU on the instances and 64% on RDS. Three
+  instances of 64 connections wrote less (24,243 at 32 namespaces), the log lock's mean wait
+  5.8 ms against 2.2: past about 100 connections, Postgres's contention costs more than another
+  instance adds.
 - **On Aurora PostgreSQL Serverless v2** (I/O-Optimized) the same two instances wrote 5,308 and
   6,125 a second at 16 and 32 namespaces scaling from 2 ACU, a third of the 4xlarge's: groups
   were full (32) but each commit waited for Aurora's storage quorum (`IO:XactSync`), so a
