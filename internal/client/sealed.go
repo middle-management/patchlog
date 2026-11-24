@@ -164,6 +164,14 @@ func (k *Keys) subKey(ctx context.Context, c *Client, kid, resource, kind, id, v
 	return nil, ErrNoKeys
 }
 
+// gaveView reports whether /keys gave K_view of view for kid (AddView), as
+// against one derived from a K_e.
+func (k *Keys) gaveView(kid, view string) bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.view[kid+"\n"+view] != nil
+}
+
 // viewKey returns K_view of view for kid, fetching keys from via's /keys
 // if needed (§E.2.3).
 func (k *Keys) viewKey(ctx context.Context, c *Client, kid, view, via string) ([]byte, error) {
@@ -543,7 +551,8 @@ func (c *Client) openFiltered(ctx context.Context, ns, view, jwe string, want fu
 	if err != nil {
 		return nil, err
 	}
-	if view == "" {
+	urlView := view != ""
+	if !urlView {
 		view, _ = h.PL["view"].(string)
 	}
 	pl = seal.WithView(pl, view)
@@ -553,6 +562,13 @@ func (c *Client) openFiltered(ctx context.Context, ns, view, jwe string, want fu
 	vk, err := c.keys.viewKey(ctx, c, h.Kid, view, ns)
 	if err != nil {
 		return nil, err
+	}
+	if !urlView && !c.keys.gaveView(h.Kid, view) {
+		// Where the URL names no view, as at a resource's URLs, pl.view
+		// is compared with the view of the key /keys gave the grant the
+		// request carried: another view's answer is refused, even one
+		// that opens (§E.2.2 Protected header, v0.90).
+		return nil, fmt.Errorf("client: filtered answer of view %s, not the one /keys gave the grant: %w", view, seal.ErrMismatch)
 	}
 	pt, err := seal.OpenExpect(jwe, vk, h.Kid, pl)
 	if errors.Is(err, seal.ErrDecrypt) {
