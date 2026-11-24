@@ -15,14 +15,14 @@ import (
 // one JWE under the K_view of the current epoch, with the unfiltered
 // form's pl and view added, whose plaintext is { body, keys }: body the
 // answer as §7.9 gives it, keys a view's keys JWE for each visible
-// revision the body names, tombstones excepted, in the order it first
-// names them. A view's keys for a revision, { key, log?, blobs }, hold its
-// K_rev, its K_log only where §7.9 shows its entry with patches (its
-// parent, or the document a tombstone parent deleted, is visible), and the
-// K_blob of each blob its document references; they are sealed once under
-// the K_view of the revision's epoch and stored (kind "keys", keyed by
-// view, name and id), which fixes that epoch as serving the revision would
-// (revEpochFixed). A resource log entry the body shows with patches is its
+// revision the body names, tombstones and revisions of purged resources
+// excepted (v0.90), in the order it first names them. A view's keys for
+// a revision, { key, log?, blobs }, hold its K_rev, its K_log only where
+// §7.9 shows its entry with patches (its parent, or the document a
+// tombstone parent deleted, is visible), and the K_blob of each blob its
+// document references; they are sealed once under the K_view of the
+// revision's epoch and stored (kind "keys", keyed by view, name and id),
+// which fixes that epoch as serving the revision would (revEpochFixed). A resource log entry the body shows with patches is its
 // stored JWE under its K_log, so content stays under its revision's epoch;
 // any other entry is plain inside the answer. To an unrestricted reader's
 // /ns/{ns} cookie at a view's URL the answers are sealed under K_n instead
@@ -72,11 +72,22 @@ func (t *tx) filteredSealing(n *nsRow, fv *fview, pl seal.PL, revs []namedRev, i
 	}
 	fs.k, fs.view = t.viewKey(n, e, fv.view), fv.view
 	seen := map[ids.ID]bool{}
+	purged := map[int64]bool{}
 	for _, r := range revs {
 		if r.row == nil || r.row.kind == kindTombstone || seen[r.row.id] {
 			continue
 		}
 		seen[r.row.id] = true
+		// None for a purged resource's revisions, whose view keys the
+		// purge removed (§E.2.2 Filtered answers, §8.3 Effect, v0.90).
+		p, ok := purged[r.row.res]
+		if !ok {
+			p = t.resPurged(r.row.res)
+			purged[r.row.res] = p
+		}
+		if p {
+			continue
+		}
 		fs.keys = append(fs.keys, t.viewKeysJob(n, fv.view, r.name, r.row, t.parentShown(fv, r.name, r.row)))
 	}
 	return fs
