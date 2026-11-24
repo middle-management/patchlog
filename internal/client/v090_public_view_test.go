@@ -58,7 +58,10 @@ func v090PublicView(t *testing.T, sealed bool) {
 
 	sc := must(admin.Create(ctx, "pub", "sch", wrap(client.GenesisPatches(map[string]any{"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object"})))).ID
 	ref := "/r/pub/sch/rev/" + sc
-	a1 := must(admin.Create(ctx, "pub", "a1", wrap(client.GenesisPatches(map[string]any{"$schema": ref, "team": "a", "mark": "A1"})))).ID
+	data := []byte("the blob of a1")
+	bid := must(admin.UploadBlob(ctx, "pub", "a1", "text/plain", "", data))
+	bref := map[string]any{"$blob": bid, "type": "text/plain", "size": float64(len(data))}
+	a1 := must(admin.Create(ctx, "pub", "a1", wrap(client.GenesisPatches(map[string]any{"$schema": ref, "team": "a", "mark": "A1", "file": bref})))).ID
 	b1 := must(admin.Create(ctx, "pub", "b1", wrap(client.GenesisPatches(map[string]any{"$schema": ref, "team": "b", "mark": "HIDDEN-B1"})))).ID
 	x1 := must(admin.Create(ctx, "pub", "x", wrap(client.GenesisPatches(map[string]any{"team": "b", "mark": "HIDDEN-X1"})))).ID
 	x2 := must(admin.Append(ctx, "pub", "x", x1, wrap(ops(op("replace", "/team", "a"), op("replace", "/mark", "X2"))))).ID
@@ -147,6 +150,22 @@ func v090PublicView(t *testing.T, sealed bool) {
 			if _, err := reader.Doc(ctx, "pub", name, id); err == nil {
 				t.Fatalf("hidden %s@%s opened", name, id)
 			}
+		}
+	}
+
+	if sealed {
+		// The view key opens nothing for a copy (§E.2.3, TERM-6): a blob
+		// copy out of the public sealed namespace with the partial
+		// reader's grant as the source grant is refused, as before v0.90
+		// when it got no key at all; an unrestricted source grant copies.
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "p"))).CreateNamespace(ctx, "p",
+			map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+		pw := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"p"}, []string{"read", "create"})))
+		if err := pw.CopyBlob(ctx, "p", "c", bid, "pub", "a1", readerGrant); err == nil {
+			t.Fatal("a blob copied out of a public sealed namespace with a partial reader's grant")
+		}
+		if err := pw.CopyBlob(ctx, "p", "c", bid, "pub", "a1", adminGrant); err != nil {
+			t.Fatalf("a blob copied with an unrestricted grant: %v", err)
 		}
 	}
 

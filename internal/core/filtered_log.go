@@ -40,8 +40,10 @@ func (t *tx) scanNSLogRow(rows *sql.Rows) nsLogRow {
 // decorateNSEntry is r's entry as a log answer serves it (§7.4): its body
 // with id, prev (the id of the entry before it, given; "" on the chain's
 // first, which always carries it, §7.4 v0.81), author, created, via, grant
-// and the gesture members, none of them hashed but id and prev.
-func (t *tx) decorateNSEntry(r *nsLogRow, prev string) map[string]any {
+// and the gesture members, none of them hashed but id and prev, and a head
+// entry's schema, never served while n is at E3 (§7.4), a namespace raised
+// there since included.
+func (t *tx) decorateNSEntry(n *nsRow, r *nsLogRow, prev string) map[string]any {
 	m := r.m
 	m["id"] = ids.FromBytes(r.id).String()
 	if r.prev == nil {
@@ -71,7 +73,11 @@ func (t *tx) decorateNSEntry(r *nsLogRow, prev string) map[string]any {
 		// gesture and undoes of a single write, gestures of a batch, and
 		// a head entry's schema: not part of the hashed entry either
 		// (§7.4). In a sealed namespace they are sealed with it (§E.4).
+		e3 := t.nsLevel(n) >= levelE2E
 		for k, v := range jsonv.MustParse([]byte(r.meta.String)).(map[string]any) {
+			if e3 && (k == "schema" || k == "schemas") {
+				continue
+			}
 			if k == "schemas" {
 				// A batch's, by resource: each on its head entry, those
 				// a filtered answer keeps included; never on a hidden
@@ -169,7 +175,7 @@ func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit
 					// place (§7.9 Log entries).
 					m = map[string]any{"id": id, "prev": prev, "kind": "hidden", "resource": r.m["resource"]}
 				} else {
-					m = t.decorateNSEntry(r, prev)
+					m = t.decorateNSEntry(n, r, prev)
 					if g, ok := m["gestures"].(map[string]any); ok && f.names != nil {
 						// A batch's, from its row's metadata (§7.4).
 						narrowNames(m, "gestures", g, f.names)

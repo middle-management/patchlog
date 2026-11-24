@@ -348,13 +348,14 @@ func (w *oracleWorld) filterLog(es []map[string]any) []map[string]any {
 }
 
 // served reads the reader's filtered log from genesis to at, page by
-// page, and checks that pages chain.
+// page, and checks that pages chain and that each ends with the reader's
+// grant, in a public namespace too (credUntil).
 func (w *oracleWorld) served(view, at string) []map[string]any {
 	var out []map[string]any
 	since := ""
 	for {
 		lg, info, err := w.e.FilteredLog(context.Background(), "orc", view, at, since, 3, w.reader)
-		if err != nil || lg.Status != 200 || info.At != at {
+		if err != nil || lg.Status != 200 || info.At != at || lg.Until.IsZero() {
 			w.t.Fatalf("FilteredLog since %q: %+v %+v %v", since, lg, info, err)
 		}
 		out = append(out, lg.Entries...)

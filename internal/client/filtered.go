@@ -489,10 +489,14 @@ func (c *Client) FilteredLogPage(ctx context.Context, fa FilteredAt, since strin
 // v0.90). In a sealed namespace POST /ns/{ns}/keys names it with the view
 // key it gives a partial reader (§E.2.3); elsewhere, where /keys is 404
 // not_offered, POST /edge-grants names it in the prefix
-// /ns/{ns}/view/{view} it issues (§C.5.2), drawing an exchangeRate token.
-// It returns "" for a grant that reads ns unrestricted (K_e, or a
-// /ns/{ns} prefix), which reads the unfiltered URLs, and the refusal of
-// any other grant.
+// /ns/{ns}/view/{view} it issues (§C.5.2). Either draws a token from the
+// principal's exchangeRate bucket (§6.6), so a caller reading often keeps
+// the view rather than asking each time; and the exchange is all or
+// nothing across the namespaces the grant names. It returns "" for a grant
+// that isn't a partial reader there, one that reads ns unrestricted (K_e,
+// a /ns/{ns} prefix) or fixes the names it reads (K_r, /r/{ns}/{name}
+// prefixes), which reads at the unfiltered URLs, and the refusal of any
+// other grant.
 func (c *Client) ViewOf(ctx context.Context, ns string) (string, error) {
 	if err := checkNS(ns); err != nil {
 		return "", err

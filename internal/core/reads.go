@@ -1092,7 +1092,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 					prev = t.nsLogID(*r.prev).String()
 				}
 			}
-			m := t.decorateNSEntry(r, prev)
+			m := t.decorateNSEntry(n, r, prev)
 			pageIDs[r.seq] = m["id"].(string)
 			out.Entries = append(out.Entries, m)
 			out.Last = m["id"].(string)

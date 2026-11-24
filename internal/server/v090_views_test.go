@@ -96,6 +96,13 @@ func TestV090PublicViewRouteTable(t *testing.T) {
 		t.Fatalf("the cookie's read the edge verified: %v", r.H)
 	}
 
+	// The view's long-poll: filtered and private too (§7.9 Long-poll).
+	r = w.get(base+"/log?live=long-poll", reader)
+	if r.Code != 200 || !strings.Contains(string(r.Body), `"doc"`) || strings.Contains(string(r.Body), "HIDDEN") || strings.Contains(string(r.Body), `"hid"`) {
+		t.Fatalf("the view's long-poll: %d %s", r.Code, r.Body)
+	}
+	private("the view's long-poll", r)
+
 	// Every read route.
 	sub := func(p string) string {
 		return strings.NewReplacer("{ns}", "matches", "{name}", "doc", "{id}", visible, "{bid}", bid, "{e}", "1", "{view}", view,
