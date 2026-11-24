@@ -3842,9 +3842,10 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   with the new head, the idempotent retry, or a check against the new configuration), and the
   others are unaffected. Writes of different namespaces still take the one writer in turn.
   WAL checkpoints no longer run inside a write's `COMMIT` (`wal_autocheckpoint(0)`): the engine
-  runs a `PASSIVE` one every 100 ms, a `TRUNCATE` one under the mutex once the WAL holds 16,384
-  frames (overlapping readers can keep a `PASSIVE` checkpoint from letting it start over) or once
-  it is idle, and one at close. `synchronous(NORMAL)` is unchanged. Locally (4 vCPUs) one
+  runs a `PASSIVE` one every 100 ms; a `RESTART` one under the mutex once the WAL holds 16,384
+  frames, since under steady writes and overlapping readers a `PASSIVE` checkpoint never lets it
+  start over (waiting at most 250 ms for readers, and backing off while one stays); and a
+  `TRUNCATE` one once it is idle, and at close. `synchronous(NORMAL)` is unchanged. Locally (4 vCPUs) one
   namespace's 32 writers went from about 2,000 to about 4,000 writes a second, and disk writes
   from about 65 to 15 KiB a write (`go test ./internal/core -run '^$' -bench NamespaceWriters`).
 - **Additions to the D.2 layout**: `namespaces.head_seq/config_seq/base_config_seq`,

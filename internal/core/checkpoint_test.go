@@ -136,7 +136,7 @@ func TestCheckpointInBackground(t *testing.T) {
 
 // Readers that always overlap keep a PASSIVE checkpoint from letting the
 // WAL start over, so without more it grows with every write; past
-// walLimitFrames a TRUNCATE checkpoint waits the readers out and bounds it.
+// walLimitFrames a RESTART checkpoint waits the readers out and bounds it.
 func TestCheckpointWALBounded(t *testing.T) {
 	const limit = 200
 	const writes = 1500
@@ -206,10 +206,10 @@ func TestCheckpointWALBounded(t *testing.T) {
 	on, e := run(5 * time.Millisecond)
 	t.Logf("WAL at most %d frames without checkpoints, %d with (limit %d), %d truncated, %d busy", off/frame, on/frame, limit, e.wal.truncated.Load(), e.wal.busy.Load())
 	if e.wal.truncated.Load() == 0 {
-		t.Fatal("no TRUNCATE checkpoint ran")
+		t.Fatal("no RESTART checkpoint ran")
 	}
 	// The limit plus what the writer adds while a PASSIVE checkpoint
-	// copies frames and a TRUNCATE waits for readers: on a loaded host
+	// copies frames and a RESTART waits for readers: on a loaded host
 	// (the whole suite in parallel) a few times the limit, but a fraction
 	// of the WAL without checkpoints, which grows with every write.
 	if on*3 > off {
@@ -217,6 +217,46 @@ func TestCheckpointWALBounded(t *testing.T) {
 	}
 	// Once the writes and readers stop, the idle WAL is truncated.
 	within(t, 5*time.Second, "the idle WAL truncated", func() bool { return walSize(e.opt.Path) == 0 })
+}
+
+// A reader that stays in the WAL makes the RESTART checkpoint give up
+// after walCheckpointBusy, and the next tries back off, so the writer isn't
+// stalled that long every interval; once the reader is gone the WAL is
+// truncated.
+func TestCheckpointLongReaderBacksOff(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "p.db")
+	e := fileEngine(t, path, func(o *Options) {
+		o.CheckpointInterval = 10 * time.Millisecond
+		o.walLimitFrames = 50
+	})
+	mkNS(t, e, "n", map[string]any{"read": "public"})
+	h, err := put(e, "n", "r", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The reader's snapshot pins every frame written after it.
+	tx, err := e.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := tx.QueryRow(`SELECT count(*) FROM ns_log`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	for i := 1; time.Since(start) < 3*time.Second; i++ {
+		if h, err = put(e, "n", "r", h, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	busy := e.wal.busy.Load()
+	tx.Rollback()
+	// Without the backoff a try every interval plus its wait: about 11
+	// in 3 s; with it at 0, 1 and 3 s, so 2 or 3, and 4 on a slow host.
+	if busy == 0 || busy > 4 {
+		t.Fatalf("%d RESTART checkpoints gave up in 3 s, want 1 to 4", busy)
+	}
+	within(t, 40*time.Second, "the WAL truncated once the reader is gone", func() bool { return walSize(path) == 0 })
 }
 
 // Writes are kept across a close and an open: Close checkpoints the WAL

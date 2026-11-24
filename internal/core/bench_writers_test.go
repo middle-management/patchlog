@@ -24,7 +24,8 @@ import (
 //
 // It reports writes/s, the latency percentiles, the process's CPU and
 // disk writes (/proc/self/io, Linux) per write, on SQLite the time under
-// the writer's mutex and in COMMIT per write, and with group commit the
+// the writer's mutex, in COMMIT and in checkpoints holding it per write,
+// and with group commit the
 // writes per group.
 func BenchmarkNamespaceWriters(b *testing.B) {
 	for _, c := range []struct{ ns, writers int }{
@@ -90,6 +91,7 @@ func benchNamespaceWriters(b *testing.B, nss, perNS int) {
 	groups, grouped := e.groups.committed.Load(), e.groups.appended.Load()
 	cpu0, disk0 := processCPU(), diskWrites()
 	txns0, held0, commit0 := e.lockTimes.txns.Load(), e.lockTimes.held.Load(), e.lockTimes.commit.Load()
+	ckpt0 := e.wal.held.Load()
 	b.ResetTimer()
 	start := time.Now()
 	for _, w := range ws {
@@ -127,6 +129,8 @@ func benchNamespaceWriters(b *testing.B, nss, perNS int) {
 	if txns := e.lockTimes.txns.Load() - txns0; txns > 0 {
 		b.ReportMetric(float64(e.lockTimes.held.Load()-held0)/1e3/float64(b.N), "held-us/write")
 		b.ReportMetric(float64(e.lockTimes.commit.Load()-commit0)/1e3/float64(b.N), "commit-us/write")
+		// And the checkpoints that hold it to let the WAL start over.
+		b.ReportMetric(float64(e.wal.held.Load()-ckpt0)/1e3/float64(b.N), "ckpt-us/write")
 	}
 	if n := e.groups.committed.Load() - groups; n > 0 {
 		g := e.groups.appended.Load() - grouped
