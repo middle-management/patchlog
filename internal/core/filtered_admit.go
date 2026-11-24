@@ -79,7 +79,8 @@ func viewRecordOf(fv *fview, exp int64) *viewRecord {
 // with checkpoint cp (§7.9 URLs, design H), and returns the view it
 // reads with:
 //
-//   - a grant in Authorization: an unrestricted reader's is 403 there,
+//   - a grant in Authorization, in a public namespace too (viewAccess):
+//     an unrestricted reader's is 403 there,
 //     where its unfiltered URLs serve it; a partial reader's reads at its
 //     own view as of cp, and any other view is 403;
 //   - a cookie for /ns/{ns}/view/{view}: its view must be urlView (403), and is
@@ -103,7 +104,8 @@ func viewRecordOf(fv *fview, exp int64) *viewRecord {
 //   - no credentials, or an expired cookie, are 401.
 func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlView string, cp *fcp, cred Credentials) (*fview, *Error) {
 	if cred.Bearer != "" {
-		a, kind, _, err := t.nsAccess(n, cred)
+		// Taken in a public namespace too, as a filter (§7 step 1, v0.90).
+		a, kind, err := t.viewAccess(n, cred)
 		switch {
 		case err != nil:
 			return nil, err

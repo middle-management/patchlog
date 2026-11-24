@@ -291,8 +291,7 @@ func TestV075FilteredScope(t *testing.T) {
 		}
 	})
 	for name, o := range map[string]v75Opts{
-		"e2e":    {matches: func(doc map[string]any) { doc["encryption"] = map[string]any{"level": "e2e"} }},
-		"public": {matches: func(doc map[string]any) { doc["read"] = "public" }},
+		"e2e": {matches: func(doc map[string]any) { doc["encryption"] = map[string]any{"level": "e2e"} }},
 	} {
 		w := newV75World(t, o)
 		w.inTx(func(t2 *tx) {
@@ -301,6 +300,13 @@ func TestV075FilteredScope(t *testing.T) {
 			}
 		})
 	}
+	// A public namespace is covered since v0.90 (§7.9 Where).
+	wp := newV75World(t, v75Opts{matches: func(doc map[string]any) { doc["read"] = "public" }})
+	wp.inTx(func(t2 *tx) {
+		if fs := t2.filteredScope(t2.nsByName("matches")); fs == nil {
+			t.Error("public: matches not covered")
+		}
+	})
 	// The checkpoint is {ns}'s ns_id at its head.
 	head := w.head("matches")
 	w.inTx(func(t2 *tx) {

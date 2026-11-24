@@ -27,6 +27,12 @@ import (
 // engine. Every revision is read before any prune, so the engine's kept
 // answers stand for pruned documents (§7.9 Cost), and the engine is
 // reopened partway, so they are read back from read_judged.
+//
+// Since v0.90 it runs in a public namespace too, where the grant filters
+// only under its view prefix (§7.9 Where, §7 step 1) and a resource's own
+// URLs ignore it; and some documents carry $schema, which every head
+// entry of the unfiltered log carries as schema (§7.4) and the filter
+// keeps on the entries it shows.
 
 var oracleNames = []string{"alpha", "beta", "kilo", "mike", "nina", "zed"}
 
@@ -42,6 +48,8 @@ var oracleRule = map[string]any{"all": []any{
 type oracleWorld struct {
 	*v75World
 	t      *testing.T
+	public bool
+	schema string // the schema revision some documents carry as $schema
 	rng    *rand.Rand
 	admin  Credentials
 	reader Credentials
@@ -53,16 +61,28 @@ type oracleWorld struct {
 	n      int
 }
 
-func newOracleWorld(t *testing.T, seed int64) *oracleWorld {
-	w := &oracleWorld{v75World: newV75World(t, v75Opts{file: true}), t: t, rng: rand.New(rand.NewSource(seed)),
+func newOracleWorld(t *testing.T, seed int64, public bool) *oracleWorld {
+	w := &oracleWorld{v75World: newV75World(t, v75Opts{file: true}), t: t, rng: rand.New(rand.NewSource(seed)), public: public,
 		docs: map[string]map[string]any{}, heads: map[string]string{}, tomb: map[string]bool{}, purged: map[string]bool{}, hor: map[string]string{}}
-	w.mkNS("orc", map[string]any{"read": "grant", "keys": []any{w.kEntry(),
+	read := "grant"
+	if public {
+		read = "public"
+	}
+	w.mkNS("orc", map[string]any{"read": read, "keys": []any{w.kEntry(),
 		map[string]any{"kid": "rd", "alg": "ed25519", "pub": w.catPub, "can": []any{"read"}}}})
 	w.admin = w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:root", "ns": []any{"orc"},
 		"can": []any{"read", "create", "append", "delete", "restore", "purge", "prune", "config"}, "exp": w.now().Add(24 * 365 * time.Hour).UTC().Format(time.RFC3339)})
 	w.v75World.admin = w.admin
 	w.reader = w.cred(w.catPriv, map[string]any{"kid": "rd", "sub": "user:r", "ns": []any{"orc"}, "can": []any{"read"},
 		"rules": []any{oracleRule}, "exp": w.now().Add(24 * 365 * time.Hour).UTC().Format(time.RFC3339)})
+	// A schema some documents name; its name never passes the reader's
+	// rule, so the oracle never shows it.
+	res, err := w.e.WriteResource(context.Background(), Request{NS: "orc", Cred: w.admin}, Item{Resource: "sch", IfNoneMatch: true,
+		Steps: []Step{{Patches: patchTo(map[string]any{"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object"})}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.schema = "/r/orc/sch/rev/" + res.Items[0].IDs[0]
 	return w
 }
 
@@ -70,7 +90,53 @@ func (w *oracleWorld) team() string { return []string{"a", "b"}[w.rng.Intn(2)] }
 
 func (w *oracleWorld) doc() map[string]any {
 	w.n++
-	return map[string]any{"team": w.team(), "n": float64(w.n)}
+	d := map[string]any{"team": w.team(), "n": float64(w.n)}
+	if w.rng.Intn(2) == 0 {
+		d["$schema"] = w.schema
+	}
+	return d
+}
+
+// checkSchemas is §7.4's schema over the unfiltered log es: a head entry,
+// a batch's included, carries its revision's $schema, as the oracle wrote
+// it, and no other entry carries one (v0.90).
+func (w *oracleWorld) checkSchemas(what string, es []map[string]any) {
+	one := func(e map[string]any) {
+		name, _ := e["resource"].(string)
+		target, _ := e["target"].(string)
+		sc, has := e["schema"]
+		if name == "sch" {
+			// A schema's own $schema is its dialect.
+			if sc != "https://json-schema.org/draft/2020-12/schema" {
+				w.t.Fatalf("after %s, the schema's own head carries schema %v", what, sc)
+			}
+			return
+		}
+		var want any
+		if e["kind"] == "head" {
+			if d := w.docs[target]; d != nil {
+				want = d["$schema"]
+			}
+		}
+		if want == nil && has || want != nil && sc != want {
+			w.t.Fatalf("after %s, %s entry of %s at %s: schema %v, want %v", what, e["kind"], name, target, sc, want)
+		}
+	}
+	for _, e := range es {
+		if e["kind"] != "batch" {
+			one(e)
+			continue
+		}
+		if _, has := e["schema"]; has {
+			w.t.Fatalf("after %s, a batch entry carries schema: %v", what, e)
+		}
+		if _, has := e["schemas"]; has {
+			w.t.Fatalf("after %s, a batch entry carries schemas: %v", what, e)
+		}
+		for _, x := range e["entries"].([]any) {
+			one(x.(map[string]any))
+		}
+	}
 }
 
 // patchTo is a patch set taking any document to d.
@@ -307,9 +373,14 @@ func (w *oracleWorld) check(what string) {
 	var view string
 	w.inTx(func(t2 *tx) {
 		n := t2.nsByName("orc")
-		a, kind, fs, err := t2.nsAccess(n, w.reader)
-		if err != nil || kind != accessPartial {
+		fs := t2.filteredScope(n)
+		a, kind, err := t2.viewAccess(n, w.reader)
+		if err != nil || kind != accessPartial || fs == nil {
 			w.t.Fatalf("the reader isn't partial: %v %v", kind, err)
+		}
+		if _, kind, _, err := t2.nsAccess(n, w.reader); err != nil || (kind == accessPartial) == w.public {
+			// In a public namespace an unfiltered URL ignores the grant.
+			w.t.Fatalf("the reader at an unfiltered URL: %v %v", kind, err)
 		}
 		fv, err := t2.grantView(fs, t2.filteredCurrent(fs), a)
 		if err != nil {
@@ -322,6 +393,7 @@ func (w *oracleWorld) check(what string) {
 	if err != nil || all.Status != 200 {
 		w.t.Fatalf("the unfiltered log: %v", err)
 	}
+	w.checkSchemas(what, all.Entries)
 	var want []map[string]any
 	for _, e := range w.filterLog(all.Entries) {
 		if e != nil {
@@ -388,6 +460,7 @@ func (w *oracleWorld) check(what string) {
 		if err != nil || full.Status != 200 {
 			w.t.Fatalf("%s's log: %+v %v", name, full, err)
 		}
+		fullLog := canonAll(full.Entries)
 		var wantLog []map[string]any
 		for _, e := range full.Entries {
 			id, parent := e["id"].(string), e["parent"].(string)
@@ -403,6 +476,14 @@ func (w *oracleWorld) check(what string) {
 			}
 		}
 		lg, err := w.e.ResourceLog(ctx, "orc", name, "", w.hor[name], 0, w.reader)
+		if w.public {
+			// A public namespace's resource URLs ignore the grant (§7
+			// step 1): the reader reads the unfiltered log.
+			if err != nil || lg.Status != 200 || canonAll(lg.Entries) != fullLog {
+				w.t.Fatalf("after %s, %s's log to the reader in a public namespace: %+v %v", what, name, lg, err)
+			}
+			continue
+		}
 		if !oracleRe.MatchString(name) {
 			// Its name never passes: a read-rule failure, 404 (§7).
 			if v75Status(err) != 404 {
@@ -433,10 +514,13 @@ func TestV087FilteredOracle(t *testing.T) {
 	if testing.Short() {
 		seeds = 4
 	}
-	for seed := int64(1); seed <= int64(seeds); seed++ {
-		t.Run(fmt.Sprint(seed), func(t *testing.T) {
+	for i := 1; i <= 2*seeds; i++ {
+		// Odd runs in a private namespace, even ones in a public one
+		// (v0.90).
+		seed, public := int64((i+1)/2), i%2 == 0
+		t.Run(fmt.Sprintf("%d-public=%v", seed, public), func(t *testing.T) {
 			t.Parallel()
-			w := newOracleWorld(t, seed)
+			w := newOracleWorld(t, seed, public)
 			for i := 0; i < 40; i++ {
 				what := w.step()
 				w.check(fmt.Sprintf("step %d (%s)", i, what))

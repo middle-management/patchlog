@@ -289,7 +289,10 @@ func TestV076OriginGSBoundToPub(t *testing.T) {
 
 // §7.9 Purged namespaces, §B.11.5: an uncovered namespace's filtered
 // URLs are 401 for a request with neither a grant that verifies there nor
-// a cookie, a public namespace's included, and 403 otherwise.
+// a cookie, and 403 otherwise. Since v0.90 a public namespace is covered,
+// its view prefix taking the grant as a private one does (§7 step 1): a
+// grant for another namespace is 403 there, and a /ns/{ns} cookie reads
+// at the view's URLs (-1: a redirect to the current at).
 func TestV076OriginUncoveredFiltered401(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -310,10 +313,10 @@ func TestV076OriginUncoveredFiltered401(t *testing.T) {
 		want int
 	}{
 		"public, no credentials":                  {"pub", Credentials{}, 401},
-		"public, a grant for another namespace":   {"pub", k("matches", "read"), 401},
+		"public, a grant for another namespace":   {"pub", k("matches", "read"), 403},
 		"public, a grant that doesn't verify":     {"pub", badSig, 401},
 		"public, a grant that verifies there":     {"pub", k("pub", "read"), 403},
-		"public, a verified cookie":               {"pub", Credentials{Edge: &EdgeGrant{NS: "pub", Prefix: "/ns/pub", Exp: exp}}, 403},
+		"public, a verified cookie":               {"pub", Credentials{Edge: &EdgeGrant{NS: "pub", Prefix: "/ns/pub", Exp: exp}}, -1},
 		"private, no credentials":                 {"priv", Credentials{}, 401},
 		"private, a grant that reads there":       {"priv", k("priv", "read"), 403},
 		"private, a grant for another namespace":  {"priv", k("matches", "read"), 403},

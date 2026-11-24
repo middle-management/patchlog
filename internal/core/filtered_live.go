@@ -104,7 +104,7 @@ func (e *Engine) filteredLiveLog(ctx context.Context, ns, view, since string, li
 			// unfiltered live reads answer (§8.5).
 			return t.purgedRead(n)
 		}
-		fv, info, until = v, filteredInfo(v), t.admittedUntil(n, cred, v.a)
+		fv, info, until = v, filteredInfo(v), t.credUntil(cred, v.a)
 		return nil
 	})
 	if err != nil {

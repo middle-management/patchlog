@@ -201,15 +201,20 @@ func (e *Engine) flushJudged(ctx context.Context, rows []judgedRow) {
 // rowJudge is the judge a's reads of n's revisions are checked by (§C.2
 // item 5), and all true where every revision its admission allows is
 // readable: no actor, as with authentication disabled, in a public
-// namespace, an edge cookie for /r/ (issued only without rules on /doc,
+// namespace but at a view's URL, an edge cookie for /r/ (issued only without rules on /doc,
 // §C.5.2), or an unrestricted reader's cookie at a view's URL. A nil
 // judge without all reads nothing.
 func (t *tx) rowJudge(n *nsRow, a *actor) (j *judge, all bool) {
-	if a == nil || t.e.opt.AuthDisabled || t.config(n.configSeq).Read == "public" {
+	if a == nil || t.e.opt.AuthDisabled {
 		return nil, true
 	}
 	if a.view != "" {
+		// Admitted at a view's URL, which judges by the view in a
+		// public namespace too (§7.9 Where, v0.90).
 		return a.judge, a.judge == nil
+	}
+	if t.config(n.configSeq).Read == "public" {
+		return nil, true
 	}
 	if a.verified == nil {
 		return nil, true

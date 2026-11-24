@@ -944,7 +944,7 @@ func selectEpochs(window, asked []int) []int {
 // its rules fix, each of which they must fix and the grant may read (403
 // otherwise), sorted; a partial reader (§7.9), a fixed-name grant with
 // /doc rules included, gets only its view's K_view, returned as view,
-// where §7.9 covers n (v0.89); any other grant is 403, the names asked
+// where §7.9 covers n (v0.89), a public one included (v0.90); any other grant is 403, the names asked
 // being ignored but for K_r. With authentication disabled, every request
 // gets K_e.
 func (t *tx) keysScope(n *nsRow, a *actor, kr KeysRequest) (names []string, perResource bool, view string, err *Error) {
