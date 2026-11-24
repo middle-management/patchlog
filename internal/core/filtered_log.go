@@ -377,7 +377,11 @@ func (e *Engine) FilteredLog(ctx context.Context, ns, view, at, since string, li
 // too, as patches show it: ok is false otherwise, a read-rule failure.
 // shown[i] is the row of out[i] where it is shown as itself, nil for a
 // hidden stand-in, and patches[i] whether it is shown with its patches.
-func (t *tx) judgeEntries(n *nsRow, a *actor, name string, entries []LogEntry) (out []map[string]any, shown []*revRow, patches []bool, ok bool) {
+//
+// judged is how many of entries were judged whole before the request's
+// one budget ran out (§6.6 Validation work), len(entries) where it
+// didn't: the answer covers those alone, and the page ends there.
+func (t *tx) judgeEntries(n *nsRow, a *actor, name string, entries []LogEntry) (out []map[string]any, shown []*revRow, patches []bool, ok bool, judged int) {
 	partial := t.readsPartially(n, a)
 	parentOf := func(r *revRow) (*revRow, bool) {
 		if !r.parentSeq.Valid {
@@ -385,13 +389,17 @@ func (t *tx) judgeEntries(n *nsRow, a *actor, name string, entries []LogEntry) (
 		}
 		return t.rev(r.parentSeq.Int64), true
 	}
-	for _, e := range entries {
+	for i, e := range entries {
 		vis := t.mayReadRow(a, n, name, e.row)
 		p, hasParent := parentOf(e.row)
 		pvis := hasParent && t.mayReadRow(a, n, name, p)
+		if t.readSpent() {
+			// Ran out judging this entry: the answer ends before it.
+			return out, shown, patches, true, i
+		}
 		if !partial {
 			if !vis || hasParent && !pvis {
-				return nil, nil, nil, false
+				return nil, nil, nil, false, i
 			}
 			out = append(out, e.value())
 			shown, patches = append(shown, e.row), append(patches, true)
@@ -410,7 +418,7 @@ func (t *tx) judgeEntries(n *nsRow, a *actor, name string, entries []LogEntry) (
 			shown, patches = append(shown, nil), append(patches, false)
 		}
 	}
-	return out, shown, patches, true
+	return out, shown, patches, true, len(entries)
 }
 
 // seesKeptRange judges, for a whose reads of n are judged per revision,
