@@ -247,7 +247,7 @@ func TestV084NamespacesAuthOrder(t *testing.T) {
 		"more verbs":      e.opGrant(map[string]any{"can": []any{"config", "purge", "purge-ns"}}).Encode(),
 		"* beside a name": e.opGrant(map[string]any{"ns": []any{"main", "*"}}).Encode(),
 		"narrowed, config kept": narrowed(t, e.opGrant(map[string]any{"can": []any{"config", "purge"}}),
-			map[string]any{"via": "svc:admin", "can": []any{"config"}, "ns": []any{"*"}, "exp": e.clock.Now().Add(time.Minute).Format(time.RFC3339)}),
+			map[string]any{"via": "svc:admin", "can": []any{"config"}, "exp": e.clock.Now().Add(time.Minute).Format(time.RFC3339)}),
 		"empty rules":                     e.opGrant(map[string]any{"rules": []any{}}).Encode(),
 		"a narrowing block without can":   narrowed(t, e.opGrant(nil), map[string]any{"via": "svc:admin"}),
 		"a via and exp narrowing block":   narrowed(t, e.opGrant(nil), map[string]any{"via": "svc:admin", "exp": e.clock.Now().Add(time.Minute).Format(time.RFC3339)}),
@@ -256,6 +256,16 @@ func TestV084NamespacesAuthOrder(t *testing.T) {
 		if r := e.get("/ns", g); r.Code != 200 {
 			t.Errorf("%s: %d %s, want 200", name, r.Code, r.Body)
 		}
+	}
+
+	// 401: "*" in a narrowing block's ns, an operator grant's included,
+	// before the ns check (§C.1, v0.90; CONFORMANCE Access 103).
+	star, err := e.opGrant(map[string]any{"can": []any{"config", "purge"}}).NarrowUnvalidated(map[string]any{"can": []any{"config"}, "ns": []any{"*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := e.get("/ns", star.Encode()); r.Code != 401 {
+		t.Errorf("a narrowing block naming *: %d %s, want 401", r.Code, r.Body)
 	}
 
 	// HEAD answers as GET, without a body.
