@@ -1469,7 +1469,9 @@ func publishItems(st *ReleaseStep, pub *Publish) []any {
 // published field still unset: what a merge stopped between steps 2 and 3
 // left (§F.9). Planning again takes them into step 3 (classify), on their
 // heads now, whether or not step 2 still creates them; those it creates
-// keep their step-2 precondition.
+// keep their step-2 precondition. Those no longer live (deleted, purged)
+// are reported in the plan's notes (v0.90: "and reports those no longer
+// live").
 func (x *relCtx) carryPublished(ctx context.Context) error {
 	pub := x.rp.Publish
 	if pub == nil {
@@ -1490,13 +1492,13 @@ func (x *relCtx) carryPublished(ctx context.Context) error {
 		}
 		for _, name := range st.Resources {
 			h, err := x.c.Head(ctx, b.Target, name)
-			if err != nil {
-				if client.IsNotFound(err) || client.IsGone(err) {
-					continue
-				}
+			if err != nil && !client.IsNotFound(err) && !client.IsGone(err) {
 				return err
 			}
-			if h.State != client.Live {
+			if err != nil || h.State != client.Live {
+				// Reported, not dropped silently: the approved plan named
+				// it (§F.9, v0.90: "reports those no longer live").
+				x.rp.Notes = append(x.rp.Notes, fmt.Sprintf("%s in %s, which the stored plan's step 3 was to publish, is no longer live there: it is left out of step 3", name, b.Target))
 				continue
 			}
 			d, err := x.c.Doc(ctx, b.Target, name, h.ID)
