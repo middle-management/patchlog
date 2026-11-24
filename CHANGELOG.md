@@ -22,8 +22,12 @@ log head entries; the answers to the reference's notes on v0.89 and a conformanc
 - **`ns:{ns}` is purged** by a purge or restore once a view of the namespace has been served,
   recorded at admission, bearer reads included.
 - **Filtered answers carry no keys** for purged resources' revisions.
-- **A long-poll** whose read check runs out of the wait's budget after its first fetch answers
-  `204` naming `since`, where it answered `403` or `404`.
+- **One validation budget for a request's per-revision judgments** at a resource's own URLs
+  (§6.6, Limits 94 and 101): a log range that runs out after its first entry ends its page there,
+  `X-Log-Next` naming the last entry judged whole, and `404` inside the first; a long-poll answers
+  `200` with the entries judged before it ran out, or `204` naming `since` with none, where it
+  answered `403` or `404`. Under a view's prefix each revision keeps a budget of its own, and one
+  that runs out counts as hidden. A judgment that ran out is never cached.
 - **`"*"` in a narrowing block's `ns` is `401`**, operator grants included.
 - **Index:**
   - a branch whose bases it doesn't follow is unfollowed: `404` to queries, left out of
