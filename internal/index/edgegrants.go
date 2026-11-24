@@ -389,19 +389,26 @@ func (ix *Index) entryHolds(ctx context.Context, cfg *grantcheck.Config, k viewK
 // once, as a key or role its marker draws on has changed since the
 // checkpoint the marker is judged at, answers 503 (behind)"): the
 // checkpoint's document gives the key or a role otherwise than the
-// head's, the index not having applied a change yet, or the checker's
-// document moved during the exchange (head is the one read before v was
-// verified), so that what verified v can't be told from what a read is
-// judged by. Before v0.85 either minted a cookie that never held.
-func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, v *grant.Verified, k viewKey) (out viewKey, behind bool) {
+// head's, the index not having applied a change yet. moved reports that
+// the checker's document moved during the exchange (head is the one read
+// before v was verified), so that what verified v can't be told from
+// what a read is judged by: the exchange tries the namespace again, and
+// answers 503 only after exchangeTries (SERVICES §A.4, v0.90: "Other
+// moves of the namespace document while an exchange is judged are
+// retried"). Before v0.85 either minted a cookie that never held; before
+// v0.90 a move was 503 at once.
+func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, v *grant.Verified, k viewKey) (out viewKey, behind, moved bool) {
 	out = k
 	out.entry = ""
+	if testExchangeEntry != nil {
+		testExchangeEntry(ns)
+	}
 	cfg, err := ix.checker.Config(ctx, ns)
 	if err != nil {
-		return out, false
+		return out, false, false
 	}
 	if cfg.Head != head {
-		return out, true
+		return out, false, true
 	}
 	// The chain's documents, read once: the entry and the positions
 	// recorded with it are those of the same documents.
@@ -412,22 +419,22 @@ func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, 
 	}
 	entry, key, ok, err := ix.entryOfIn(ctx, cfg, k.kid, k.roles, over)
 	if err != nil || !ok || !bytes.Equal(jsonv.Canonical(key.Raw), jsonv.Canonical(v.Key.Raw)) {
-		return out, false
+		return out, false, false
 	}
 	if a.cov != nil {
 		doc, err := ix.docAt(ctx, ns, a.cov.cp.at)
 		if err != nil {
-			return out, false
+			return out, false, false
 		}
 		at, err := grantcheck.ParseConfig(ns, "", doc)
 		if err != nil {
-			return out, false
+			return out, false, false
 		}
 		switch e, _, ok, err := ix.entryOfIn(ctx, at, k.kid, k.roles, over); {
 		case err != nil:
-			return out, false
+			return out, false, false
 		case !ok || e != entry:
-			return out, true
+			return out, true, false
 		}
 	}
 	out.entry = entry
@@ -440,8 +447,16 @@ func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, 
 			out.conf[c.NS] = confPos(c)
 		}
 	}
-	return out, false
+	return out, false, false
 }
+
+// testExchangeEntry, if set, is called as exchangeEntry begins (tests move
+// the namespace document there).
+var testExchangeEntry func(ns string)
+
+// exchangeTries is how many times an exchange judges a namespace whose
+// document moves while it is judged before answering 503 (exchangeEntry).
+const exchangeTries = 3
 
 // errExchangeBehind is an exchange whose cookie would be 403 at once
 // (exchangeEntry): 503 behind, ranked as any failure to read upstream
@@ -1906,6 +1921,8 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		}
 	}
 	for _, ns := range namedInOrder(g, ix.refsNamespaces()) {
+		tries := 1
+	again:
 		if _, lacks := ix.keys.Skip(ns); lacks || ix.basesUnfollowed(ctx, ns) {
 			// One the service doesn't follow (§A.4): a sealed one whose
 			// keys it lacks, or a branch whose bases' logs it doesn't all
@@ -1963,11 +1980,18 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		// Every marker, reads:{ns}:{k} included, records the key that
 		// verified the grant here and its entry (§A.4 view).
 		rec := markerRecOf(a, v)
-		var behind bool
+		var behind, moved bool
 		// With the entry, the documents it was drawn from that the index
 		// has yet to reach, for it to tell those of its backlog from the
 		// ones after (cookieEnds).
-		if rec.key, behind = ix.exchangeEntry(ctx, ns, cfg.Head, a, v, rec.key); behind {
+		rec.key, behind, moved = ix.exchangeEntry(ctx, ns, cfg.Head, a, v, rec.key)
+		if moved && tries < exchangeTries {
+			// The document moved while the grant was judged: judged again
+			// from the document it moved to.
+			tries++
+			goto again
+		}
+		if behind || moved {
 			fail(errExchangeBehind)
 			continue
 		}
