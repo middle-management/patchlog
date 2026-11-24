@@ -1,7 +1,7 @@
 -- Migration: filtered served
--- Created: 2026-11-24T20:12:21Z
+-- Created: 2026-11-24T20:29:21Z
 -- Checksum: 698f1e0e7395ae7ed6deb6bd4261aeaddf44dbb8318d4675ff600dd434285b5c
--- Chain: d895c77dfff1511fcf45fbb16b0b00ff5fd42c4f8bd829000a700106f14b5604
+-- Chain: d9dc7dec85dbd26a05262be323c7472484e2402105ba1bcb696e86e9f8be5aad
 --
 -- IMPORTANT: Do not modify this file after commit. The checksum above
 -- tracks the integrity of this migration. Any changes will be detected
