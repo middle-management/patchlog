@@ -35,7 +35,7 @@ PATCHLOG_TEST_SPANNER='postgres://x@127.0.0.1:5432/x?sslmode=disable' make test-
 
 | Postgres (D.8) | Spanner | Where |
 | --- | --- | --- |
-| Schema, `migrations/postgres` through mmmigrate, transactional DDL under an advisory lock | `migrations/spanner`, one baseline equal to Postgres after 031, applied by `dbmigrate.MigrateSpanner`: DDL batched (`START BATCH DDL`) outside transactions, every statement `IF NOT EXISTS` so a half-applied migration runs again, recorded in `mmmigrate_applied`; no lock (instances starting together both run it, harmlessly) | `internal/dbmigrate/spanner.go` |
+| Schema, `migrations/postgres` through mmmigrate, transactional DDL under an advisory lock | `migrations/spanner`, one baseline equal to Postgres after 031, through mmmigrate's Spanner dialect (`driver/spanner`, which `dbmigrate.Migrate` picks when the database has `spanner_sys`): DDL batched outside transactions, DML committed with the migration's progress, recorded in `mmmigrate_applied` once all of it ran; a half-applied migration resumes where it stopped (`mmmigrate_progress`); instances starting together take turns on a lease row (`mmmigrate_lock`). A database the first-phase runner migrated is adopted (below) | `internal/dbmigrate`, mmmigrate's `docs/drivers/spanner.md` |
 | `smallint` flags and codes | `bigint` (no `int2`); still compared with 0 and 1 | baseline |
 | `UNIQUE` constraints | unique indexes; on nullable columns `WHERE col IS NOT NULL`, since Spanner's unique indexes count NULLs equal | baseline |
 | Partial unique indexes `one_first`, `one_ns_first`, `one_config_genesis` | a stored generated column holding the chain's key on its first row only (`CASE WHEN first = 1 THEN res END`), under a null-filtered unique index: Spanner filters partial indexes on `IS NOT NULL` alone | baseline |
@@ -62,6 +62,18 @@ PATCHLOG_TEST_SPANNER='postgres://x@127.0.0.1:5432/x?sslmode=disable' make test-
 | `octet_length(bytea)` | `length(bytea)` | `octetLength` |
 | Unique violations carry the table (`isConflict`) | 23505 without a table: the index named in the message (`spConflictIndexes`) | `dialect.go` |
 | Planner settings (`set_config`) | none | `nspurge.go` |
+
+### Migrations, and databases migrated before mmmigrate had a Spanner dialect
+
+The first phase migrated with a runner of its own, `dbmigrate.MigrateSpanner`, which created
+`mmmigrate_applied` and `mmmigrate_current` itself, with `applied_at` a bigint of Unix
+milliseconds, and took no lock. mmmigrate's dialect names its tables the same but types
+`applied_at` `timestamptz`, which Spanner can't change a column to. So `dbmigrate.Migrate` adopts
+such a database before migrating (`adoptLegacySpanner`): under mmmigrate's own lease it copies
+the records into `patchlog_legacy_migrations` and drops the two tables; mmmigrate creates its own;
+the records are copied in, with their times, and the stash dropped. The migrations they record are
+found applied and don't run again. A run that dies part-way leaves the old tables or the stash, and
+the next carries on. Nothing to do by hand.
 
 ### Why the locks are enough
 
@@ -104,7 +116,9 @@ timestamp instead (`operatorkeys.go`, `archive.go`).
 
 ## What the emulator showed
 
-- Migrations apply to an empty database, and again to a migrated one (`TestMigrateSpanner`).
+- Migrations apply to an empty database, and again to a migrated one (`TestMigrateSpanner`), with
+  instances starting together (`TestMigrateSpannerConcurrent`); a database the first-phase runner
+  migrated is adopted (`TestMigrateSpannerAdoptsLegacy`, `…AdoptsStash`).
 - `serve --dev` starts. Over HTTP and with the `patchlog` CLI: namespace create and list,
   resource put, patch, get, log, ls, delete and restore, a batch, a branch and a write in it, a
   blob upload and download, a purge, and `watch`, on one instance and across two sharing the

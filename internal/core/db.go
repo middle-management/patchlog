@@ -34,7 +34,8 @@ var migrations embed.FS
 // until VACUUM reclaims them (and in WAL and backups until those expire).
 //
 // A Spanner database (isSpannerURL) is opened as a Postgres one, through
-// PGAdapter, and migrated with its own migrations (dbmigrate.MigrateSpanner).
+// PGAdapter, and migrated with its own migrations (migrations/spanner, which
+// dbmigrate.Migrate picks for it).
 // before doesn't run on it: no version before Spanner's could have left
 // what it checks for.
 func openDB(path string, fsys fs.FS, before func(db *sql.DB, pg bool) error) (db *sql.DB, pg bool, err error) {
@@ -112,11 +113,7 @@ func openPG(raw string, fsys fs.FS, before func(db *sql.DB, pg bool) error) (*sq
 			return nil, err
 		}
 	}
-	migrate := dbmigrate.Migrate
-	if isSpannerURL(raw) {
-		migrate = dbmigrate.MigrateSpanner
-	}
-	if err := migrate(context.Background(), db, fsys, "patchlog"); err != nil {
+	if err := dbmigrate.Migrate(context.Background(), db, fsys, "patchlog"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}

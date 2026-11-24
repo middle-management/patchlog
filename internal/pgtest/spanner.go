@@ -17,7 +17,7 @@ import (
 // Spanner's databases (SpannerEnv), through PGAdapter: the emulator's
 // PGAdapter creates a database on the first connection to it, so a new
 // one is just a new name. Applying the schema to one takes about a second
-// (dbmigrate.MigrateSpanner), so, as on Postgres, a test's database goes
+// (dbmigrate.Migrate), so, as on Postgres, a test's database goes
 // back to a pool when it ends, emptied: every table's rows deleted but
 // mmmigrate's, so the next engine finds its migrations applied and only
 // seeds it again. Spanner has no TRUNCATE, nor a way to turn foreign keys

@@ -147,7 +147,7 @@ func TestMigratePostgresSchemas(t *testing.T) {
 // rate_draws_batched again, with an error saying to move the record; once
 // it is moved (README, Schema migrations), it gets purge_follows_by_importer.
 func TestMigrateRenumbered(t *testing.T) {
-	if !pgtest.Enabled() {
+	if !pgtest.Enabled() || pgtest.Spanner() {
 		t.Skip("Postgres only (" + pgtest.Env + ")")
 	}
 	ctx := context.Background()

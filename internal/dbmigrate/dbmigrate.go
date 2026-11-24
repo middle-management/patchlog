@@ -25,13 +25,21 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/middle-management/mmmigrate"
 	"github.com/middle-management/mmmigrate/driver/postgres"
+	mmspanner "github.com/middle-management/mmmigrate/driver/spanner"
 	mmsqlite "github.com/middle-management/mmmigrate/driver/sqlite"
 	"modernc.org/sqlite"
 )
 
 // Migrate applies the migrations in fsys's directory migrations/<dialect>
 // to db, under namespace, the dialect being db's driver's: sqlite
-// (modernc.org/sqlite) or postgres (pgx). On Postgres the namespace is
+// (modernc.org/sqlite) or postgres (pgx), or spanner for a pgx connection
+// to Spanner's PostgreSQL interface through PGAdapter (the core's
+// spanner+postgres:// URLs, docs/SPANNER.md), told apart by Spanner's
+// spanner_sys schema. On Spanner, mmmigrate's spanner dialect runs the
+// migrations outside transactions, DDL in batches, under a lease row
+// (mmmigrate's docs/drivers/spanner.md), and the seed's statements one by
+// one; a database the earlier runner of this package migrated is adopted
+// first (adoptLegacySpanner). On Postgres the namespace is
 // scoped by the schema the tables go to (current_schema(), from the
 // search_path): mmmigrate records every schema's migrations in its own
 // schema mmmigrate, so deployments in different schemas of one database
@@ -50,6 +58,13 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, namespace string) erro
 		dialect, name = mmsqlite.Dialect{}, "sqlite"
 	case *stdlib.Driver:
 		dialect, name = postgres.Dialect{}, "postgres"
+		onSpanner, err := isSpanner(ctx, db)
+		if err != nil {
+			return fmt.Errorf("migrating %s: %w", namespace, err)
+		}
+		if onSpanner {
+			dialect, name = mmspanner.Dialect{}, "spanner"
+		}
 	default:
 		return fmt.Errorf("migrating %s: no migrations for driver %T", namespace, d)
 	}
@@ -70,6 +85,11 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, namespace string) erro
 		}
 		namespace += "@" + schema.String
 	}
+	if name == "spanner" {
+		if err := adoptLegacySpanner(ctx, db); err != nil {
+			return fmt.Errorf("migrating %s: adopting the earlier runner's records: %w", namespace, err)
+		}
+	}
 	if err := mmmigrate.RunMigrations(ctx, db, dialect, sub, testing.Testing(), mmmigrate.WithNamespace(namespace)); err != nil {
 		return fmt.Errorf("migrating %s: %w", namespace, err)
 	}
@@ -79,6 +99,19 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, namespace string) erro
 	}
 	if err != nil {
 		return fmt.Errorf("seeding %s: %w", namespace, err)
+	}
+	if name == "spanner" {
+		// One statement at a time, each committed on its own: Spanner's
+		// drivers run one statement per call.
+		conn, err := db.Conn(ctx)
+		if err != nil {
+			return fmt.Errorf("seeding %s: %w", namespace, err)
+		}
+		defer conn.Close()
+		if err := (mmspanner.Dialect{}).Exec(ctx, conn, string(seed)); err != nil {
+			return fmt.Errorf("seeding %s: %w", namespace, err)
+		}
+		return nil
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {

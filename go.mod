@@ -8,6 +8,7 @@ require (
 	github.com/klauspost/compress v1.20.2
 	github.com/middle-management/mmmigrate v0.7.1-0.20261124150048-394aa63efd12
 	github.com/middle-management/mmmigrate/driver/postgres v0.0.0-20261124150048-394aa63efd12
+	github.com/middle-management/mmmigrate/driver/spanner v0.0.0-20261124150048-394aa63efd12
 	github.com/middle-management/mmmigrate/driver/sqlite v0.0.0-20261124150048-394aa63efd12
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
 	go.opentelemetry.io/otel v1.47.0

@@ -2,255 +2,184 @@ package dbmigrate
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
-	"sort"
-	"strings"
-	"testing"
+	"testing/fstest"
 	"time"
 
-	"github.com/middle-management/mmmigrate/source"
+	"github.com/middle-management/mmmigrate"
+	mmspanner "github.com/middle-management/mmmigrate/driver/spanner"
 )
 
-// MigrateSpanner is Migrate for a database on Spanner's PostgreSQL
-// interface, reached through PGAdapter with the pgx driver, whose
-// migrations are in migrations/spanner and seed in migrations/seed/
-// spanner.sql (docs/SPANNER.md).
-//
-// mmmigrate's Postgres dialect can't run there: it applies each migration
-// in a transaction, Spanner runs DDL only outside one, and it serialises
-// runs with an advisory lock, which Spanner lacks. So this runner applies
-// a migration's statements one by one, consecutive DDL as one batch (START
-// BATCH DDL … RUN BATCH, a single schema change), and then records it in
-// mmmigrate_applied, as mmmigrate's SQLite dialect names its table. A
-// migration that fails halfway is left half applied and runs again from
-// its start at the next run, so Spanner migrations are written to be
-// repeatable (IF NOT EXISTS). Instances starting together may both run a
-// migration; IF NOT EXISTS makes that harmless, and the record is inserted
-// once (ON CONFLICT). Tests also apply current.sql, recorded by checksum in
-// mmmigrate_current. The seed runs statement by statement, each committed
-// on its own.
-func MigrateSpanner(ctx context.Context, db *sql.DB, fsys fs.FS, namespace string) error {
-	sub, err := fs.Sub(fsys, "migrations/spanner")
-	if err == nil {
-		_, err = fs.Stat(sub, ".")
-	}
-	if err != nil {
-		return fmt.Errorf("migrating %s: no spanner migrations: %w", namespace, err)
-	}
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("migrating %s: %w", namespace, err)
-	}
-	defer conn.Close()
-	// Created only if missing: a schema change takes seconds on Spanner
-	// even when it changes nothing, and the emulator refuses one while a
-	// read-write transaction (another instance's) is open.
-	var have int
-	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.tables
-		WHERE table_schema = 'public' AND table_name IN ('mmmigrate_applied', 'mmmigrate_current')`).Scan(&have); err != nil {
-		return fmt.Errorf("migrating %s: %w", namespace, err)
-	}
-	if have < 2 {
-		if err := runSpannerDDL(ctx, conn, []string{
-			`CREATE TABLE IF NOT EXISTS mmmigrate_applied (namespace text NOT NULL, version bigint NOT NULL, name text NOT NULL, applied_at bigint NOT NULL, PRIMARY KEY (namespace, version))`,
-			`CREATE TABLE IF NOT EXISTS mmmigrate_current (namespace text NOT NULL PRIMARY KEY, checksum text NOT NULL, applied_at bigint NOT NULL)`,
-		}); err != nil {
-			return fmt.Errorf("migrating %s: creating the migrations tables: %w", namespace, err)
-		}
-	}
-	migrations, err := source.LoadMigrations(sub, testing.Testing())
-	if err != nil {
-		return fmt.Errorf("migrating %s: %w", namespace, err)
-	}
-	applied := map[int]bool{}
-	rows, err := conn.QueryContext(ctx, `SELECT version FROM mmmigrate_applied WHERE namespace = $1`, namespace)
-	if err != nil {
-		return fmt.Errorf("migrating %s: %w", namespace, err)
-	}
-	for rows.Next() {
-		var v int
-		if err := rows.Scan(&v); err != nil {
-			rows.Close()
-			return fmt.Errorf("migrating %s: %w", namespace, err)
-		}
-		applied[v] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("migrating %s: %w", namespace, err)
-	}
-	sort.Slice(migrations, func(i, j int) bool { return migrations[i].Version < migrations[j].Version })
-	var current *source.Migration
-	for _, m := range migrations {
-		if m.IsCurrent {
-			current = m
-			continue
-		}
-		if applied[m.Version] {
-			continue
-		}
-		if err := runSpannerScript(ctx, conn, m.SQL); err != nil {
-			return fmt.Errorf("migrating %s: migration %d (%s): %w", namespace, m.Version, m.Name, err)
-		}
-		if _, err := conn.ExecContext(ctx, `INSERT INTO mmmigrate_applied (namespace, version, name, applied_at) VALUES ($1, $2, $3, $4) ON CONFLICT (namespace, version) DO NOTHING`,
-			namespace, int64(m.Version), m.Name, time.Now().UnixMilli()); err != nil {
-			return fmt.Errorf("migrating %s: recording migration %d: %w", namespace, m.Version, err)
-		}
-		slog.Info("applied migration", "namespace", namespace, "version", m.Version, "name", m.Name)
-	}
-	if current != nil && len(splitSQL(current.SQL)) > 0 {
-		sum := fmt.Sprintf("%x", sha256.Sum256([]byte(current.SQL)))
-		var have string
-		err := conn.QueryRowContext(ctx, `SELECT checksum FROM mmmigrate_current WHERE namespace = $1`, namespace).Scan(&have)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("migrating %s: %w", namespace, err)
-		}
-		if have != sum {
-			if err := runSpannerScript(ctx, conn, current.SQL); err != nil {
-				return fmt.Errorf("migrating %s: current.sql: %w", namespace, err)
-			}
-			if _, err := conn.ExecContext(ctx, `INSERT INTO mmmigrate_current (namespace, checksum, applied_at) VALUES ($1, $2, $3)
-				ON CONFLICT (namespace) DO UPDATE SET checksum = excluded.checksum, applied_at = excluded.applied_at`,
-				namespace, sum, time.Now().UnixMilli()); err != nil {
-				return fmt.Errorf("migrating %s: recording current.sql: %w", namespace, err)
-			}
-			slog.Info("applied current.sql", "namespace", namespace, "checksum", sum[:8])
-		}
-	}
-	seed, err := fs.ReadFile(fsys, "migrations/seed/spanner.sql")
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("seeding %s: %w", namespace, err)
-	}
-	for _, q := range splitSQL(string(seed)) {
-		if _, err := conn.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("seeding %s: %w", namespace, err)
-		}
-	}
-	return nil
+// isSpanner reports whether a pgx connection reaches Spanner's PostgreSQL
+// interface (through PGAdapter) rather than Postgres: only Spanner has the
+// schema spanner_sys. PGAdapter answers version() as Postgres would.
+func isSpanner(ctx context.Context, db *sql.DB) (bool, error) {
+	var n int64
+	err := db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.schemata WHERE schema_name = 'spanner_sys'`).Scan(&n)
+	return n > 0, err
 }
 
-// runSpannerScript runs a migration's statements in order: each run of
-// DDL as one batch, any other statement on its own.
-func runSpannerScript(ctx context.Context, conn *sql.Conn, script string) error {
-	var ddl []string
-	for _, q := range splitSQL(script) {
-		if isDDL(q) {
-			ddl = append(ddl, q)
-			continue
-		}
-		if err := runSpannerDDL(ctx, conn, ddl); err != nil {
+// The first-phase Spanner backend migrated with a runner of its own
+// (MigrateSpanner, until mmmigrate had a Spanner dialect). It created
+// mmmigrate_applied and mmmigrate_current, the names mmmigrate's Spanner
+// dialect uses, but with applied_at a bigint of Unix milliseconds where the
+// dialect's is a timestamptz, and recorded none of mmmigrate's own
+// (_mmmigrate) migrations. mmmigrate can't write to those tables, and Spanner
+// can't change a column's type, so a database that runner migrated is adopted:
+// its records are copied to a stash table, its two tables dropped, mmmigrate
+// creates its own, and the records are copied into them. Its migrations are
+// then found applied, not run again.
+//
+// The steps that drop tables run under the lease mmmigrate itself takes
+// before it creates its tables (in the _mmmigrate namespace), so an instance
+// starting meanwhile can't create mmmigrate's tables only for another to drop
+// them. The copy back runs outside the lease, before any migration: it is
+// idempotent, every instance that sees the stash completes it before
+// migrating, and the stash is dropped only once a copy is complete. A run
+// that dies at any step leaves either the old tables or the stash, and the
+// next run carries on from there.
+const legacyStash = "patchlog_legacy_migrations"
+
+func adoptLegacySpanner(ctx context.Context, db *sql.DB) error {
+	legacy, stashed, err := legacySpannerState(ctx, db)
+	if err != nil || !legacy && !stashed {
+		// The usual case: adopted already, or never migrated by the old
+		// runner. That doesn't change back, so no lease is needed to know.
+		return err
+	}
+	d := mmspanner.Dialect{}
+	if legacy {
+		if err := stashLegacySpanner(ctx, db, d); err != nil {
 			return err
 		}
-		ddl = nil
-		if _, err := conn.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("%s: %w", firstLine(q), err)
-		}
 	}
-	return runSpannerDDL(ctx, conn, ddl)
-}
-
-// runSpannerDDL runs DDL statements as one batch, a single schema change
-// on Spanner rather than one per statement (each of which takes seconds).
-func runSpannerDDL(ctx context.Context, conn *sql.Conn, ddl []string) error {
-	if len(ddl) == 0 {
-		return nil
-	}
-	if _, err := conn.ExecContext(ctx, `START BATCH DDL`); err != nil {
+	// mmmigrate's tables, created as RunMigrations would (Status applies
+	// nothing else).
+	if _, err := mmmigrate.Status(ctx, db, d, fstest.MapFS{}); err != nil {
 		return err
 	}
-	for _, q := range ddl {
-		if _, err := conn.ExecContext(ctx, q); err != nil {
-			conn.ExecContext(ctx, `ABORT BATCH`)
-			return fmt.Errorf("%s: %w", firstLine(q), err)
-		}
+	return restoreLegacySpanner(ctx, db, d)
+}
+
+// legacySpannerState reports whether the old runner's tables are there
+// (mmmigrate_applied with a bigint applied_at), and whether a stash of their
+// records is.
+func legacySpannerState(ctx context.Context, db *sql.DB) (legacy, stashed bool, err error) {
+	var n int64
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'mmmigrate_applied' AND column_name = 'applied_at' AND data_type = 'bigint'`).Scan(&n); err != nil {
+		return false, false, err
 	}
-	if _, err := conn.ExecContext(ctx, `RUN BATCH`); err != nil {
+	legacy = n > 0
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name = $1`, legacyStash).Scan(&n); err != nil {
+		return false, false, err
+	}
+	return legacy, n > 0, nil
+}
+
+type legacyRecord struct {
+	kind, namespace, name string
+	version, at           int64
+}
+
+func scanLegacy(rows *sql.Rows, err error) ([]legacyRecord, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var recs []legacyRecord
+	for rows.Next() {
+		var r legacyRecord
+		if err := rows.Scan(&r.kind, &r.namespace, &r.version, &r.name, &r.at); err != nil {
+			return nil, err
+		}
+		recs = append(recs, r)
+	}
+	return recs, rows.Err()
+}
+
+// stashLegacySpanner copies the old runner's records into the stash and
+// drops its tables, under mmmigrate's own lease.
+func stashLegacySpanner(ctx context.Context, db *sql.DB, d mmspanner.Dialect) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
 		return err
 	}
-	return nil
-}
-
-func isDDL(q string) bool {
-	w, _, _ := strings.Cut(strings.TrimSpace(q), " ")
-	switch strings.ToUpper(w) {
-	case "CREATE", "ALTER", "DROP", "ANALYZE":
-		return true
+	defer conn.Close()
+	lctx, release, err := d.AcquireLock(ctx, db, conn, mmmigrate.SelfNamespace)
+	if err != nil {
+		return err
 	}
-	return false
-}
+	defer release()
+	ctx = lctx
 
-func firstLine(q string) string {
-	l, _, _ := strings.Cut(strings.TrimSpace(q), "\n")
-	return l
-}
-
-// splitSQL splits a script into its statements, without comments: at
-// semicolons outside quotes, quoted identifiers, dollar quotes and
-// comments.
-func splitSQL(s string) []string {
-	var out []string
-	var b strings.Builder
-	flush := func() {
-		if q := strings.TrimSpace(b.String()); q != "" {
-			out = append(out, q)
+	// Again under the lease: another instance may have adopted it since.
+	legacy, _, err := legacySpannerState(ctx, db)
+	if err != nil || !legacy {
+		return err
+	}
+	slog.Info("adopting the Spanner migration records of the earlier runner")
+	if err := d.Exec(ctx, conn, `CREATE TABLE IF NOT EXISTS `+legacyStash+` (
+		kind        varchar NOT NULL,
+		namespace   varchar NOT NULL,
+		version     bigint NOT NULL,
+		name        varchar NOT NULL,
+		applied_at  bigint NOT NULL,
+		PRIMARY KEY (kind, namespace, version)
+	)`); err != nil {
+		return err
+	}
+	var recs []legacyRecord
+	for _, q := range []string{
+		`SELECT 'applied', namespace, version, name, applied_at FROM mmmigrate_applied`,
+		`SELECT 'current', namespace, 0, checksum, applied_at FROM mmmigrate_current`,
+	} {
+		rs, err := scanLegacy(conn.QueryContext(ctx, q))
+		if err != nil {
+			return err
 		}
-		b.Reset()
+		recs = append(recs, rs...)
 	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c == '-' && i+1 < len(s) && s[i+1] == '-':
-			for i < len(s) && s[i] != '\n' {
-				i++
-			}
-			b.WriteByte('\n')
-		case c == '/' && i+1 < len(s) && s[i+1] == '*':
-			end := strings.Index(s[i+2:], "*/")
-			if end < 0 {
-				i = len(s)
-			} else {
-				i += end + 3
-			}
-			b.WriteByte(' ')
-		case c == '\'' || c == '"':
-			j := i + 1
-			for j < len(s) && s[j] != c {
-				j++
-			}
-			b.WriteString(s[i:min(j+1, len(s))])
-			i = j
-		case c == '$':
-			j := i + 1
-			for j < len(s) && (s[j] == '_' || s[j] >= 'a' && s[j] <= 'z' || s[j] >= 'A' && s[j] <= 'Z') {
-				j++
-			}
-			if j < len(s) && s[j] == '$' {
-				tag := s[i : j+1]
-				end := strings.Index(s[j+1:], tag)
-				if end < 0 {
-					end = len(s) - j - 1
-				} else {
-					end += len(tag)
-				}
-				b.WriteString(s[i:min(j+1+end, len(s))])
-				i = j + end
-			} else {
-				b.WriteByte(c)
-			}
-		case c == ';':
-			flush()
-		default:
-			b.WriteByte(c)
+	for _, r := range recs {
+		if _, err := conn.ExecContext(ctx, `INSERT INTO `+legacyStash+` (kind, namespace, version, name, applied_at)
+			VALUES ($1, $2, $3, $4, $5) ON CONFLICT (kind, namespace, version) DO NOTHING`,
+			r.kind, r.namespace, r.version, r.name, r.at); err != nil {
+			return err
 		}
 	}
-	flush()
-	return out
+	return d.Exec(ctx, conn, `DROP TABLE IF EXISTS mmmigrate_applied; DROP TABLE IF EXISTS mmmigrate_current`)
+}
+
+// restoreLegacySpanner copies the stashed records into mmmigrate's tables,
+// keeping their times, and drops the stash.
+func restoreLegacySpanner(ctx context.Context, db *sql.DB, d mmspanner.Dialect) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	recs, err := scanLegacy(conn.QueryContext(ctx, `SELECT kind, namespace, version, name, applied_at FROM `+legacyStash))
+	if err != nil {
+		return err
+	}
+	for _, r := range recs {
+		at := time.UnixMilli(r.at).UTC()
+		var q string
+		var args []any
+		if r.kind == "current" {
+			q = `INSERT INTO mmmigrate_current (namespace, checksum, applied_at) VALUES ($1, $2, $3) ON CONFLICT (namespace) DO NOTHING`
+			args = []any{r.namespace, r.name, at}
+		} else {
+			q = `INSERT INTO mmmigrate_applied (namespace, version, name, applied_at) VALUES ($1, $2, $3, $4) ON CONFLICT (namespace, version) DO NOTHING`
+			args = []any{r.namespace, r.version, r.name, at}
+		}
+		if _, err := conn.ExecContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("restoring %s %s/%d: %w", r.kind, r.namespace, r.version, err)
+		}
+	}
+	slog.Info("adopted the earlier runner's Spanner migration records", "records", len(recs))
+	return d.Exec(ctx, conn, `DROP TABLE IF EXISTS `+legacyStash)
 }
