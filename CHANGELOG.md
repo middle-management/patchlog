@@ -37,7 +37,8 @@ log head entries; the answers to the reference's notes on v0.89 and a conformanc
 - **Client:** a filtered answer's `pl.view` must be the view `/keys` gave.
 - **Releases:** replanning reports the documents step 3 no longer carries.
 - **Migrations:**
-  - `030_filtered_served` on SQLite, `032_…` on Postgres: which namespaces have served a view.
+  - `030_filtered_served` on SQLite, `032_…` on Postgres: which namespaces have served a view;
+    every namespace that exists at upgrade counts as one that has.
   - Postgres `030_purge_follows_by_importer` is now `031`, after `030_rate_draws_batched`. Both
     had been numbered 030, which broke Postgres on `main`. Neither migration's SQL changed.
 
