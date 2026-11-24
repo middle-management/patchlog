@@ -94,6 +94,9 @@ func TestV0261FilteredPurgedHeadsDifferential(t *testing.T) {
 // a database at migration 014 is seeded directly, and 015 runs on it as
 // an upgrade from v0.26.0 would run it (the table goes in 016).
 func TestV0261Migration015Delete(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("replays the Postgres migrations")
+	}
 	t.Parallel()
 	l := newV081Legacy(t)
 	o := l.opts()

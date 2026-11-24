@@ -143,7 +143,14 @@ func (e *Engine) firstEntryTime(ctx context.Context) (time.Time, error) {
 	}
 	var ms sql.NullInt64
 	err := e.read(ctx, func(t *tx) error {
-		return t.QueryRow(`SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms)
+		q := `SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`
+		if t.e.spanner {
+			// Seqs come from blocks per instance, so the least isn't
+			// always the first (spanner.go): the earliest commit is. Read
+			// once per process, by the commit timestamp's index.
+			q = `SELECT MIN(created) FROM (SELECT created FROM ns_log ORDER BY committed LIMIT 1) f`
+		}
+		return t.QueryRow(q).Scan(&ms)
 	})
 	if err != nil {
 		return time.Time{}, err

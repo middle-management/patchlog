@@ -38,6 +38,9 @@ func v82encRows(t *testing.T, l *v081Legacy, q string) int {
 // With PurgeRaisedE2E the raised namespace is purged, never served, and
 // only then are the snapshots behind a moved horizon deleted.
 func TestV082GateBeforeSnapshotCleanup(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("a database an earlier version left: Spanner's schema starts at its baseline")
+	}
 	t.Parallel()
 	ctx := context.Background()
 	l := newV081Legacy(t)

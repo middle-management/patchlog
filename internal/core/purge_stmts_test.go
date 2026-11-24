@@ -124,6 +124,9 @@ func countPurge(t *testing.T, kind string, branches int) purgeCounts {
 // spent, per branch of each kind, 8, 17 and 25 statements in SQLite and
 // 11, 19 and 27 on Postgres, log locks included.
 func TestPurgeStatements(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("statement counts of Postgres's holder search; Spanner searches level by level")
+	}
 	t.Parallel()
 	few, many := 3, 23
 	limit := map[string]int{branchUnseeing: 0, branchThrough: 4, branchOwn: 3}

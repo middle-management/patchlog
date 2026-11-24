@@ -176,6 +176,9 @@ func (l *v081Legacy) tables(t *testing.T) (raises, pending bool) {
 // its local branch are purged, their epoch keys destroyed, and they answer
 // 410 purged; migration 016 dropped the marker tables.
 func TestV081OpenRefusesRaisedE2E(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("a database an earlier version left: Spanner's schema starts at its baseline")
+	}
 	t.Parallel()
 	ctx := context.Background()
 	l := newV081Legacy(t)
@@ -238,6 +241,9 @@ func TestV081OpenRefusesRaisedE2E(t *testing.T) {
 // stored while sealed in the clear; one with the flag purges m and its
 // branch and the record with them, and then the flag is needed no more.
 func TestV081PurgeRaisedFailsClosedAcrossFailedStart(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("a database an earlier version left: Spanner's schema starts at its baseline")
+	}
 	t.Parallel()
 	ctx := context.Background()
 	l := newV081Legacy(t)
@@ -345,6 +351,9 @@ func (l *v081Legacy) pendingTable(t *testing.T) bool {
 // E2E-11: migrating a database whose only raised namespace was purged
 // under v0.26.1 needs no flag, and leaves neither marker table.
 func TestV081MigrationDropsMarkersOfPurged(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("a database an earlier version left: Spanner's schema starts at its baseline")
+	}
 	t.Parallel()
 	l := newV081Legacy(t)
 	e := l.open15(t)
@@ -374,6 +383,9 @@ func TestV081MigrationDropsMarkersOfPurged(t *testing.T) {
 // sealed blob under its epoch, and a revision whose epoch is fixed with
 // no stored sealing reserves two.
 func TestV081SealCountsSeeded(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("a database an earlier version left: Spanner's schema starts at its baseline")
+	}
 	t.Parallel()
 	l := newV081Legacy(t)
 	e := l.open15(t)
@@ -449,6 +461,9 @@ func TestV081SealCountsSeeded(t *testing.T) {
 // checkLegacyE2E finds once the marker tables are gone, and recording it
 // again changes nothing.
 func TestV081LegacyPendingRoundTrip(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("a database an earlier version left: Spanner's schema starts at its baseline")
+	}
 	t.Parallel()
 	path, pg := pgtest.FreshDB(t), pgtest.Enabled()
 	driver, dsn := "pgx", pgtest.DSN(path)

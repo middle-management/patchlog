@@ -37,8 +37,19 @@ func TestIsConflict(t *testing.T) {
 	id := func(b byte) []byte { x := make([]byte, 20); x[0] = b; return x }
 	mustExec(`INSERT INTO authors (author, name) VALUES (1, 'a')`)
 	mustExec(`INSERT INTO namespaces (ns, name) VALUES (1, 'n')`)
-	mustExec(`INSERT INTO ns_log (ns, id, prev_seq, kind, body, config_seq, author, created) VALUES (1, ?, NULL, 3, '{}', 1, 1, 0)`, id(1))
-	err = exec(`INSERT INTO ns_log (ns, id, prev_seq, kind, body, config_seq, author, created) VALUES (1, ?, NULL, 3, '{}', 1, 1, 0)`, id(2))
+	// Spanner's ns_log takes its seq and commit timestamp from the writer.
+	logIns := `INSERT INTO ns_log (ns, id, prev_seq, kind, body, config_seq, author, created) VALUES (1, ?, NULL, 3, '{}', 1, 1, 0)`
+	if e.spanner {
+		logIns = `INSERT INTO ns_log (seq, ns, id, prev_seq, kind, body, config_seq, author, created, committed) VALUES (?, 1, ?, NULL, 3, '{}', 1, 1, 0, spanner.pending_commit_timestamp())`
+	}
+	logArgs := func(n int64, b byte) []any {
+		if e.spanner {
+			return []any{n, id(b)}
+		}
+		return []any{id(b)}
+	}
+	mustExec(logIns, logArgs(1, 1)...)
+	err = exec(logIns, logArgs(2, 2)...)
 	if err == nil || !isConflict(panicErr(err)) {
 		t.Fatalf("namespace chain fork: %v", err)
 	}

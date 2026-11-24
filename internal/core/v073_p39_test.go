@@ -109,6 +109,9 @@ func TestV073P39HoldCheckedAfterItsTest(t *testing.T) {
 // the fixed 200 ms TestV073P17DrawRetriesDeadlock slept), so the deadlock
 // that test provokes is the one it means: the draw waits first.
 func TestV073P39DrawBlockedByWaitsForTheDraw(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("Postgres only: pg_backend_pid")
+	}
 	if !pgtest.Enabled() {
 		t.Skip("Postgres only")
 	}

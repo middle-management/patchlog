@@ -384,7 +384,11 @@ func (t *tx) operatorKeysAt(created time.Time) []ArchiveCandidateKey {
 			// In force from the deployment's first namespace entry, as
 			// Engine.OperatorKeyHistory publishes it.
 			var ms sql.NullInt64
-			t.must(t.QueryRow(`SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms))
+			q := `SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`
+			if t.e.spanner { // the earliest commit (operatorkeys.go)
+				q = `SELECT MIN(created) FROM (SELECT created FROM ns_log ORDER BY committed LIMIT 1) f`
+			}
+			t.must(t.QueryRow(q).Scan(&ms))
 			first = t.e.started
 			if ms.Valid {
 				first = time.UnixMilli(ms.Int64).UTC()

@@ -145,6 +145,9 @@ func TestPurgeSearch(t *testing.T) {
 // one index seek each, however many rows each has, and the holders' chains
 // of bases by key.
 func TestPGPurgeSearchPlans(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("Postgres's plans")
+	}
 	if !pgtest.Enabled() {
 		t.Skip("PATCHLOG_TEST_PG is not set")
 	}

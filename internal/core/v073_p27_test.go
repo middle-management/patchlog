@@ -208,6 +208,9 @@ func (s *schemaEnv) nsHeadID(ns string) string {
 // NULL, read as Legacy; rows written afterwards are V073. Either way the
 // revision compiles under this version (§6.1, v0.74).
 func TestV073RulesMarkerMigration(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("a database an earlier version left: Spanner's schema starts at its baseline")
+	}
 	t.Parallel()
 	path := pgtest.FreshDB(t)
 	if path == ":memory:" {
