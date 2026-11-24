@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Postgres: the core's migrations load again.** `purge_follows_by_importer` and
+  `rate_draws_batched` were both numbered 030, so no Postgres database could migrate;
+  `rate_draws_batched` is now 031. A database that recorded it as 30 has the record moved to 31
+  on its next start, and then gets `purge_follows_by_importer` (README, Schema migrations).
+  `TestMigrations` now checks every dialect's directory for duplicate versions, and CI runs on
+  the merge queue.
+
 Spec v0.89: filtered reads and `/doc` read rules work in sealed namespaces, through derived
 keys; v0.88's answers to the reference's notes on v0.87.
 

@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A merge queue tests each pull request merged onto the queue ahead of
+  # it: two branches that are each fine alone (two migrations numbered
+  # alike, TestMigrations) fail there, before they reach main.
+  merge_group:
 
 permissions:
   contents: read

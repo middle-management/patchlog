@@ -4413,6 +4413,35 @@ safe to run again (`INSERT … ON CONFLICT DO NOTHING`). Changes an upgrade make
 earlier version stored (data migrations, such as the core's 008–010) are numbered migrations
 like the schema's, in SQL, so they run exactly once, in order with them.
 
+Two migrations of one directory must never share a version: mmmigrate refuses to load the
+directory (`duplicate migration version N`), so nothing that opens that database starts. It
+happens when two branches each commit the next number and both merge, which git allows since
+the files' names differ. `TestMigrations` loads every dialect's directory as mmmigrate does and
+checks the chain, and CI runs it on pull requests and on the merge queue (`merge_group`), so with
+a merge queue or "require branches to be up to date" the second branch fails before it merges.
+
+#### Upgrade note: the core's Postgres 030 and 031
+
+Two of the core's Postgres migrations were both committed as 030 and merged:
+`purge_follows_by_importer` (spec v0.88, PR #37, merged 2026-11-23) and `rate_draws_batched`
+(PR #39, merged 2026-11-21). Main from PR #37's merge until the fix couldn't migrate a Postgres
+database at all. `rate_draws_batched` is now 031. A deployment that applied one of them as 30
+needs no manual step:
+
+- **`purge_follows_by_importer` recorded as 30** (a spec v0.88/v0.89 branch build): the next start
+  applies 031.
+- **`rate_draws_batched` recorded as 30** (main between 2026-11-21 and 11-23): mmmigrate matches
+  by version alone, so it would take that record for `purge_follows_by_importer`, skip it, and
+  run `rate_draws_batched` again as 031. Before migrating, `dbmigrate.Migrate` moves the record
+  to 31 (`UPDATE mmmigrate.applied SET version = 31 … WHERE version = 30 AND name =
+  'rate_draws_batched'`, for the `patchlog@<schema>` namespace, only if nothing is recorded as 31),
+  and logs `re-recorded a renumbered migration`; then 030 runs. Both migrations are independent
+  of each other, so their order doesn't matter.
+
+To check which a database has: `SELECT version, name FROM mmmigrate.applied WHERE namespace LIKE
+'patchlog@%' AND version >= 30`. SQLite databases are unaffected: there the importer migration
+is 029 and there is no `rate_draws`.
+
 To change a schema, write the change in the `current.sql` of each dialect's directory (plain SQL, safe to run twice, since tests apply it after every edit), test it
 (`go test ./...`, and `make test-pg` for the core), and commit it with
 `make migration DESC="what it changes"`, which commits every `current.sql` holding SQL and needs
