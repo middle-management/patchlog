@@ -481,3 +481,98 @@ func (c *Client) FilteredLogPage(ctx context.Context, fa FilteredAt, since strin
 	}
 	return entries, next, got, nil
 }
+
+// ViewOf finds the view of the client's grant in namespace ns (§7.9
+// view) without a redirect: a public namespace's unfiltered URLs ignore
+// the grant and never redirect a partial reader to its view, whose
+// prefix alone takes the grant there, as a filter (§7 step 1, §7.9 Where,
+// v0.90). In a sealed namespace POST /ns/{ns}/keys names it with the view
+// key it gives a partial reader (§E.2.3); elsewhere, where /keys is 404
+// not_offered, POST /edge-grants names it in the prefix
+// /ns/{ns}/view/{view} it issues (§C.5.2), drawing an exchangeRate token.
+// It returns "" for a grant that reads ns unrestricted (K_e, or a
+// /ns/{ns} prefix), which reads the unfiltered URLs, and the refusal of
+// any other grant.
+func (c *Client) ViewOf(ctx context.Context, ns string) (string, error) {
+	if err := checkNS(ns); err != nil {
+		return "", err
+	}
+	ka, err := c.FetchKeysAnswer(ctx, ns, nil, nil)
+	switch {
+	case err == nil && ka.Level == "sealed":
+		// A partial reader's only key is its view's (§E.2.3).
+		for _, k := range ka.Keys {
+			if k.View != "" {
+				return k.View, checkID("view", k.View)
+			}
+		}
+		return "", nil
+	case err != nil && !IsNotOffered(err):
+		return "", err
+	}
+	// Not sealed, or end-to-end, which §7.9 doesn't cover: the exchange.
+	r, err := c.do(ctx, "POST", "/edge-grants", nil, nil)
+	if err != nil {
+		return "", err
+	}
+	if r.status != 200 {
+		return "", r.apiError()
+	}
+	prefixes, _ := r.obj()["prefixes"].([]any)
+	for _, p := range prefixes {
+		s, _ := p.(string)
+		if v, ok := strings.CutPrefix(s, "/ns/"+ns+"/view/"); ok {
+			return v, checkID("view", v)
+		}
+	}
+	return "", nil
+}
+
+// ViewLog is FilteredLog where a partial reader's unfiltered URLs may not
+// redirect it, as in a public namespace (§7 step 1, v0.90): it finds the
+// grant's view with ViewOf and reads the filtered range there from the
+// current at (FilteredLogAt). A grant that reads ns unrestricted reads
+// the unfiltered range, as FilteredLog gives it.
+func (c *Client) ViewLog(ctx context.Context, ns, since string) ([]NSEntry, FilteredAt, error) {
+	view, err := c.ViewOf(ctx, ns)
+	if err != nil {
+		return nil, FilteredAt{}, err
+	}
+	if view == "" {
+		return c.FilteredLog(ctx, ns, since)
+	}
+	return c.FilteredLogAt(ctx, FilteredAt{NS: ns, View: view}, since)
+}
+
+// ViewHeads lists, as FilteredHeads does, every row whose name starts with
+// prefix, at the view ViewOf finds, from the current at (§7.9 /heads,
+// v0.90). A grant that reads ns unrestricted lists the unfiltered /heads
+// at the namespace head.
+func (c *Client) ViewHeads(ctx context.Context, ns, prefix string) ([]HeadItem, FilteredAt, error) {
+	view, err := c.ViewOf(ctx, ns)
+	if err != nil {
+		return nil, FilteredAt{}, err
+	}
+	if view == "" {
+		h, err := c.NSHead(ctx, ns)
+		if err != nil {
+			return nil, FilteredAt{}, err
+		}
+		return c.FilteredHeads(ctx, ns, h.ID, prefix)
+	}
+	items, next, fa, err := c.FilteredHeadsAt(ctx, FilteredAt{NS: ns, View: view}, prefix, "")
+	if err != nil {
+		return nil, FilteredAt{}, err
+	}
+	for next != "" {
+		page, n, got, err := c.FilteredHeadsAt(ctx, fa, prefix, next)
+		if err != nil {
+			return nil, FilteredAt{}, err
+		}
+		if got.At != fa.At {
+			return nil, FilteredAt{}, fmt.Errorf("client: /ns/%s/view/%s/heads moved to another at between pages (§7.9)", ns, view)
+		}
+		items, next = append(items, page...), n
+	}
+	return items, fa, nil
+}
