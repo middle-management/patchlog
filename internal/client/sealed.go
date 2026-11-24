@@ -56,16 +56,30 @@ type Keys struct {
 	sub map[string][]byte
 	// view holds K_view: kid "\n" view -> K_view, from /keys, or derived
 	// from K_e.
-	view    map[string][]byte
-	noView  map[string]bool // kid "\n" view: /keys gave none
+	view   map[string][]byte
+	noView map[string]bool // kid "\n" view: /keys gave none
+	// The views /keys gave each grant, by the bearer that asked (§E.2.2
+	// Protected header): bound[bearer "\n" kid "\n" view], gave[bearer
+	// "\n" kid] when it gave that grant any key of kid, and asked[bearer
+	// "\n" kid] once that grant's /keys answer for kid's epoch is known.
+	// A cache shared by clients with other grants (Client.With) holds
+	// keys for all of them; the view a filtered answer is compared with
+	// is still its own request's grant's. AddView binds for every grant.
+	bound   map[string]bool
+	gave    map[string]bool
+	asked   map[string]bool
 	noFetch bool
 }
+
+// anyGrant stands for every grant in bound and gave (AddView).
+const anyGrant = "\x00"
 
 // NewKeys returns an empty key cache. recipient, if not nil, unwraps keys
 // the server wraps to the grant's enc (§E.2.3).
 func NewKeys(recipient *ecdh.PrivateKey) *Keys {
 	return &Keys{recipient: recipient, epoch: map[string][]byte{}, nsKeys: map[string][]byte{}, res: map[string][]byte{},
-		sub: map[string][]byte{}, view: map[string][]byte{}, noView: map[string]bool{}}
+		sub: map[string][]byte{}, view: map[string][]byte{}, noView: map[string]bool{},
+		bound: map[string]bool{}, gave: map[string]bool{}, asked: map[string]bool{}}
 }
 
 // Kinds of the keys below K_r (subKey).
@@ -76,8 +90,20 @@ const (
 )
 
 // AddView caches a view key K_view of view (§E.2.1), as /keys gives a
-// partial reader (§E.2.3).
+// partial reader (§E.2.3), as the view of every grant the cache's clients
+// carry: a filtered answer at a URL naming no view is accepted for view
+// alone (boundView).
 func (k *Keys) AddView(kid, view string, key []byte) {
+	k.addView(kid, view, key)
+	k.mu.Lock()
+	k.bound[anyGrant+"\n"+kid+"\n"+view] = true
+	k.gave[anyGrant+"\n"+kid] = true
+	k.mu.Unlock()
+}
+
+// addView caches K_view of view, bound to no grant: fetch binds it to the
+// one that asked.
+func (k *Keys) addView(kid, view string, key []byte) {
 	k.mu.Lock()
 	k.view[kid+"\n"+view] = append([]byte(nil), key...)
 	k.mu.Unlock()
@@ -164,12 +190,39 @@ func (k *Keys) subKey(ctx context.Context, c *Client, kid, resource, kind, id, v
 	return nil, ErrNoKeys
 }
 
-// gaveView reports whether /keys gave K_view of view for kid (AddView), as
-// against one derived from a K_e.
-func (k *Keys) gaveView(kid, view string) bool {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return k.view[kid+"\n"+view] != nil
+// boundView checks view, a filtered answer's pl.view at a URL naming
+// none, against the view /keys gave the grant c carries for kid (§E.2.2
+// Protected header), asking ns's /keys once per grant and epoch where it
+// hasn't yet, whatever keys are cached: a cache shared with clients of
+// other grants may hold another's K_view, or a K_e deriving every one.
+// Another view than the one given is a mismatch; none given for kid is
+// ErrNoKeys, as a key outside the grant's window is.
+func (k *Keys) boundView(ctx context.Context, c *Client, kid, view, ns string) error {
+	g := c.bearer + "\n" + kid
+	check := func() (ok, gave, asked bool) {
+		k.mu.Lock()
+		defer k.mu.Unlock()
+		ok = k.bound[g+"\n"+view] || k.bound[anyGrant+"\n"+kid+"\n"+view]
+		return ok, k.gave[g] || k.gave[anyGrant+"\n"+kid], k.asked[g]
+	}
+	ok, gave, asked := check()
+	if !ok && !asked && !k.noFetch {
+		_, epoch, err := seal.ParseKid(kid)
+		if err != nil {
+			return err
+		}
+		if err := k.fetch(ctx, c, ns, epoch, ""); err != nil {
+			return err
+		}
+		ok, gave, _ = check()
+	}
+	switch {
+	case ok:
+		return nil
+	case !gave:
+		return ErrNoKeys
+	}
+	return fmt.Errorf("client: filtered answer of view %s, not the one /keys gave the grant: %w", view, seal.ErrMismatch)
 }
 
 // viewKey returns K_view of view for kid, fetching keys from via's /keys
@@ -311,6 +364,18 @@ func (k *Keys) fetch(ctx context.Context, c *Client, ns string, epoch int, resou
 	if err != nil {
 		return fmt.Errorf("%w: %s epoch %d: %w", ErrKeyFetch, ns, epoch, err)
 	}
+	// What /keys gave the grant c carries (boundView).
+	k.mu.Lock()
+	k.asked[c.bearer+"\n"+seal.Kid(ns, epoch)] = true
+	for _, e := range got {
+		if e.From == "" {
+			k.gave[c.bearer+"\n"+e.Kid] = true
+		}
+		if e.View != "" && e.From == "" {
+			k.bound[c.bearer+"\n"+e.Kid+"\n"+e.View] = true
+		}
+	}
+	k.mu.Unlock()
 	for _, e := range got {
 		if e.From != "" {
 			// A keyring entry an e2e namespace relays (§E.3.2): E2E opens
@@ -330,7 +395,7 @@ func (k *Keys) fetch(ctx context.Context, c *Client, ns string, epoch int, resou
 		}
 		switch {
 		case e.View != "":
-			k.AddView(e.Kid, e.View, key)
+			k.addView(e.Kid, e.View, key)
 		case e.Resource == "":
 			k.Add(e.Kid, key)
 		default:
@@ -559,16 +624,19 @@ func (c *Client) openFiltered(ctx context.Context, ns, view, jwe string, want fu
 	if err := h.Expect(h.Kid, pl); err != nil {
 		return nil, fmt.Errorf("client: filtered answer: %w", err)
 	}
+	if !urlView {
+		// Where the URL names no view, as at a resource's URLs, pl.view
+		// is compared with the view of the key /keys gave the grant the
+		// request carried, before any key is taken: another view's
+		// answer is refused, even one that opens (§E.2.2 Protected
+		// header, v0.90).
+		if err := c.keys.boundView(ctx, c, h.Kid, view, ns); err != nil {
+			return nil, err
+		}
+	}
 	vk, err := c.keys.viewKey(ctx, c, h.Kid, view, ns)
 	if err != nil {
 		return nil, err
-	}
-	if !urlView && !c.keys.gaveView(h.Kid, view) {
-		// Where the URL names no view, as at a resource's URLs, pl.view
-		// is compared with the view of the key /keys gave the grant the
-		// request carried: another view's answer is refused, even one
-		// that opens (§E.2.2 Protected header, v0.90).
-		return nil, fmt.Errorf("client: filtered answer of view %s, not the one /keys gave the grant: %w", view, seal.ErrMismatch)
 	}
 	pt, err := seal.OpenExpect(jwe, vk, h.Kid, pl)
 	if errors.Is(err, seal.ErrDecrypt) {
