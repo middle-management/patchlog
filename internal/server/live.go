@@ -164,16 +164,17 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 		w.WriteHeader(204)
 	}
 	public := false
-	for fetches := 0; ; fetches++ {
+	for {
 		woken := wait()
 		if testLongPollFetch != nil {
 			testLongPollFetch()
 		}
 		lg, err := fetch(r.Context(), since)
-		if err != nil && fetches > 0 && s.e.ReadBudgetSpent(r.Context()) {
-			// The wait's one budget ran out after its first read passed:
-			// 204, never the refusal a read check that runs out gives
-			// (§6.6 Validation work, §7.7, v0.90).
+		if err != nil && s.e.ReadBudgetSpent(r.Context()) {
+			// The wait's one budget ran out, at a read check or judging
+			// an entry, before anything was shown: 204 naming since, the
+			// last entry judged whole, never the refusal a range's read
+			// gives (§6.6 Validation work, §7.7, v0.90).
 			noChange(public)
 			return
 		}

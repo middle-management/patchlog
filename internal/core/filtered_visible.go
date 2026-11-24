@@ -7,6 +7,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/rules"
 )
 
 // Reads are judged per revision (§C.2 item 5): a read envelope's doc is
@@ -116,13 +117,46 @@ type judgedKey struct {
 
 // visibleRow reports whether j may read row, a revision or tombstone of
 // resource name in n (nil for none: the read concerns no document), with
-// that revision's read envelope (§6.4.1, §C.2 item 5).
+// that revision's read envelope (§6.4.1, §C.2 item 5), judged with a
+// budget of its own, as each revision judged for a filtered read is
+// (§6.6 Validation work, §7.9): one that runs out counts as hidden.
 func (t *tx) visibleRow(j *judge, n *nsRow, name string, row *revRow) bool {
+	return t.visibleRowOn(j, n, name, row, nil)
+}
+
+// judgeRow is visibleRow for a's request: under a view's prefix each
+// revision with a budget of its own (§7.9), anywhere else drawing on the
+// one budget of the request, or of the read check a write makes (§6.6
+// Validation work: "Each read request ... gets one budget, shared by
+// every check it makes"; readScope). Whether it ran out, rather than
+// refused, the caller tells by readSpent. Until v0.90's reading each
+// revision had a budget of its own everywhere.
+func (t *tx) judgeRow(a *actor, j *judge, n *nsRow, name string, row *revRow) bool {
+	if a == nil || a.view != "" || !j.doc {
+		return t.visibleRow(j, n, name, row)
+	}
+	defer t.readScope()()
+	return t.visibleRowOn(j, n, name, row, &t.readMeter.Meter)
+}
+
+// visibleRowOn is visibleRow drawing on m, nil for a fresh budget. An
+// answer that ran out is kept neither in memory nor in read_judged: it
+// says nothing of the revision (§6.6).
+func (t *tx) visibleRowOn(j *judge, n *nsRow, name string, row *revRow, m *rules.Meter) bool {
 	if !j.doc {
 		return j.byName(name)
 	}
+	allows := func(doc any, hasDoc bool) (v, over bool) {
+		mm := m
+		if mm == nil {
+			mm = rules.Budget(j.filter.Steps)
+		}
+		v = j.filter.AllowsDocOn(name, doc, hasDoc, mm)
+		return v, mm.Over
+	}
 	if row == nil || t.nsLevel(n) >= levelE2E || t.resPurged(row.res) {
-		return j.filter.AllowsDoc(name, nil, false)
+		v, _ := allows(nil, false)
+		return v
 	}
 	k := judgedKey{j.key, name, row.id}
 	if v, ok := t.e.judgedGet(k); ok {
@@ -141,9 +175,13 @@ func (t *tx) visibleRow(j *judge, n *nsRow, name string, row *revRow) bool {
 	if derr != nil {
 		// Pruned and not kept, never judged: null (§6.4.1). Not kept, as
 		// an archive may bring the document back.
-		return j.filter.AllowsDoc(name, nil, false)
+		v, _ := allows(nil, false)
+		return v
 	}
-	v := j.filter.AllowsDoc(name, jsonv.MustParse(b), true)
+	v, over := allows(jsonv.MustParse(b), true)
+	if over {
+		return false
+	}
 	t.e.judgedPut(k, v)
 	t.judged = append(t.judged, judgedRow{k, v})
 	return v
@@ -236,7 +274,7 @@ func (t *tx) mayReadRow(a *actor, n *nsRow, name string, row *revRow) bool {
 	case !j.doc && a.view == "":
 		return true
 	}
-	return t.visibleRow(j, n, name, row)
+	return t.judgeRow(a, j, n, name, row)
 }
 
 // readsByDoc reports whether a's reads of n are judged per revision
@@ -264,7 +302,7 @@ func (t *tx) mayReadBlob(a *actor, n *nsRow, name string, bid ids.ID) bool {
 	}
 	v := t.resolve(n, name, nil)
 	if v.head == nil {
-		return t.visibleRow(j, n, name, nil)
+		return t.judgeRow(a, j, n, name, nil)
 	}
 	found := false
 	for _, seg := range t.ancestry(v.head) {
@@ -282,12 +320,12 @@ func (t *tx) mayReadBlob(a *actor, n *nsRow, name string, bid ids.ID) bool {
 		rows.Close()
 		for _, s := range seqs {
 			found = true
-			if t.visibleRow(j, n, name, t.rev(s)) {
+			if t.judgeRow(a, j, n, name, t.rev(s)) {
 				return true
 			}
 		}
 	}
-	return !found && t.visibleRow(j, n, name, v.head)
+	return !found && t.judgeRow(a, j, n, name, v.head)
 }
 
 // visibleBlobEpochs lists, for a whose reads of sealed n are judged per
@@ -325,7 +363,7 @@ func (t *tx) visibleBlobEpochs(a *actor, n *nsRow, name string, bid ids.ID) (eps
 		rows.Close()
 		for _, s := range seqs {
 			row := t.rev(s)
-			if !t.visibleRow(j, n, name, row) {
+			if !t.judgeRow(a, j, n, name, row) {
 				continue
 			}
 			if e, fixed := t.revEpochFixed(n, row); fixed {

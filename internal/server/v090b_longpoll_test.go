@@ -29,13 +29,14 @@ func TestV090BLongPollRunOutIs204(t *testing.T) {
 		}
 		return narrowed(t, g, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/principal", "schema": doubling(levels)}}})
 	}
-	// The costliest rule whose one fetch's read check passes: answered at
-	// once (no cursor), the empty log of a name with no entries is 204.
-	// Each level doubles the steps, so two such checks run out.
+	// The costliest rule whose one read check passes, at a head read
+	// (302, else 404). Each level doubles the steps, so two such checks
+	// run out.
 	path := "/r/sec/quiet/log?live=long-poll"
+	e.create("sec", "probe", map[string]any{"v": 1.0}, f.adminG)
 	levels := 0
 	for l := 4; l < 14; l++ {
-		if e.get(path, slow(l)).Code != 204 {
+		if e.get("/r/sec/probe", slow(l)).Code != 302 {
 			break
 		}
 		levels = l

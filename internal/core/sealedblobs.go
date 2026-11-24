@@ -158,7 +158,7 @@ func (t *tx) visibleBlobHead(a *actor, n *nsRow, name string, bid ids.ID) *sealJ
 	if j == nil || v.head == nil {
 		return nil
 	}
-	return t.newestBlobRev(n, name, v.head, bid, func(r *revRow) bool { return t.visibleRow(j, n, name, r) })
+	return t.newestBlobRev(n, name, v.head, bid, func(r *revRow) bool { return t.judgeRow(a, j, n, name, r) })
 }
 
 // blobKeyEpochs lists the epochs a request for blob bid of resource name

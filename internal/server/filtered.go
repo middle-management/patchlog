@@ -314,11 +314,11 @@ func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, vi
 		w.WriteHeader(204)
 	}
 	private := false
-	for fetches := 0; ; fetches++ {
+	for {
 		wait := s.e.Wait(ns)
 		lg, info, err := s.e.FilteredLiveLog(r.Context(), ns, view, since, lim, cred)
-		if err != nil && fetches > 0 && s.e.ReadBudgetSpent(r.Context()) {
-			// The wait's one budget ran out after its first admission:
+		if err != nil && s.e.ReadBudgetSpent(r.Context()) {
+			// The wait's one budget ran out at an admission:
 			// 204 naming the last entry judged whole (§6.6, §7.9
 			// Long-poll, v0.90).
 			noChange(private)

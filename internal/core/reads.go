@@ -773,7 +773,18 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 			// Each entry judged with its own read envelope (§C.2 item 5);
 			// a partial reader's answer at sealed is filtered and sealed for
 			// its view whatever its rules refer to (§7.9, v0.89).
-			ms, shown, patches, ok := t.judgeEntries(n, a, name, entries)
+			ms, shown, patches, ok, judged := t.judgeEntries(n, a, name, entries)
+			if judged < len(entries) && ok {
+				// The request's one budget ran out judging entry judged
+				// (§6.6 Validation work): a page ends before it, its next
+				// since the last entry judged whole; inside the first it
+				// fails as its read check would, and a long-poll answers
+				// 204 (Engine.ReadBudgetSpent).
+				if judged == 0 {
+					return notFound()
+				}
+				entries, out.More = entries[:judged], true
+			}
 			if !ok {
 				// A range it can read nothing of from genesis is a
 				// resource it can read no revision of: answered as a name

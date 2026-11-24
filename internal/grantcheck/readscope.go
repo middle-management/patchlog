@@ -293,15 +293,22 @@ func (f *ReadFilter) Allows(resource string) bool { return f.AllowsDoc(resource,
 // rule of some role does (§C.1.1). hasDoc false is a null doc, against
 // which every rule that refers to /doc fails as a whole.
 func (f *ReadFilter) AllowsDoc(resource string, doc any, hasDoc bool) bool {
+	return f.AllowsDocOn(resource, doc, hasDoc, rules.Budget(f.Steps))
+}
+
+// AllowsDocOn is AllowsDoc with its schema tests drawing on m, a budget
+// it may share with other checks (§6.6 Validation work: a read request's
+// one budget): once m runs out, it fails, as a rule that refuses does,
+// and m.Over tells the caller it ran out.
+func (f *ReadFilter) AllowsDocOn(resource string, doc any, hasDoc bool, m *rules.Meter) bool {
 	f.compile()
-	if f.err != nil {
+	if f.err != nil || m.Over {
 		return false
 	}
 	env := map[string]any{"action": "read", "resource": resource, "principal": f.Principal}
 	if hasDoc {
 		env["doc"] = doc
 	}
-	m := rules.Budget(f.Steps)
 	pass := func(rs []*rules.Rule) bool {
 		for _, r := range rs {
 			if !hasDoc && RefersToDoc(r) {
