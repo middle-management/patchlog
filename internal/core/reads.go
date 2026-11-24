@@ -326,7 +326,9 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 // content is "" (a read for another URL's answer, as ResourceRaw's of
 // /raw, which stays at its own URL).
 func (e *Engine) resourceRev(ctx context.Context, ns, name, id string, cred Credentials, content string) (*Rev, error) {
-	if c := e.rc.rev(ns, name, id); c != nil {
+	if c := e.rc.rev(ns, name, id); c != nil && cred.viewed == nil {
+		// A public revision, but under a view prefix, which judges each
+		// revision by the view in a public namespace too (§7.9, v0.90).
 		return c.answer(true), nil
 	}
 	g := e.rc.load(ns)
@@ -1090,7 +1092,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 					prev = t.nsLogID(*r.prev).String()
 				}
 			}
-			m := t.decorateNSEntry(r, prev)
+			m := t.decorateNSEntry(n, r, prev)
 			pageIDs[r.seq] = m["id"].(string)
 			out.Entries = append(out.Entries, m)
 			out.Last = m["id"].(string)

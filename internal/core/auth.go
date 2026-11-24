@@ -632,6 +632,33 @@ func (t *tx) nsAccess(n *nsRow, cred Credentials) (*actor, accessKind, *fscope, 
 	return a, kind, fs, nil
 }
 
+// viewAccess is nsAccess for the grant in Authorization at a URL under
+// a view prefix of covered n (§7.9 URLs), which takes the grant in a
+// public namespace too (§7 step 1, v0.90): there as anywhere, a request
+// without a grant that verifies is 401, a grant that doesn't name n or
+// that its key's scope refuses 403, and one whose rules refer to /now
+// 403; then a grant that reads n unrestricted by its own rules
+// (grantReadsNS) is accessUnrestricted and a partial reader
+// accessPartial, any other grant refused 403.
+func (t *tx) viewAccess(n *nsRow, cred Credentials) (*actor, accessKind, *Error) {
+	kind := accessNone
+	a, err := t.readerCheckURL(n, cred, func(a *actor) bool {
+		if t.grantReadsNS(a, false) {
+			kind = accessUnrestricted
+			return true
+		}
+		if a == nil || a.verified == nil || !t.partialReader(a) {
+			return false
+		}
+		kind = accessPartial
+		return true
+	}, readView)
+	if err != nil {
+		return nil, accessNone, err
+	}
+	return a, kind, nil
+}
+
 // anyReader is reader for a request that answers any reader of the
 // namespace, filtered to what it may read (the gestures listing, §7.4):
 // a grant with read, through a role without a rule on /now if it carries
@@ -693,10 +720,20 @@ const (
 	readNS       readKind = iota // /ns/{ns} and the URLs under it (readerCheck)
 	readResource                 // a resource URL (reader)
 	readKeys                     // POST /ns/{ns}/keys (keysReader)
+	readView                     // a URL under a view prefix (viewAccess)
 )
 
+// takesGrant reports whether a read of kind in a namespace with document
+// cfg takes the grant it carries: every read but in a public namespace,
+// where only POST /ns/{ns}/keys and the URLs under a view prefix do (§7
+// step 1, v0.90).
+func takesGrant(cfg *Config, kind readKind) bool {
+	return cfg.Read != "public" || kind == readKeys || kind == readView
+}
+
 // readerCheckURL is readerCheck for a kind of read: a public namespace
-// ignores the grant, but at POST /ns/{ns}/keys, and a key-scope failure,
+// ignores the grant, but at POST /ns/{ns}/keys and under a view prefix
+// (takesGrant, v0.90), and a key-scope failure,
 // or a verified grant that may not read, is 404 at a resource URL and 403
 // elsewhere (§7, §C.2). A grant whose blocks or key scope refer to /now
 // is refused every read where its grant counts (§C.2 item 5): here, as
@@ -715,7 +752,7 @@ func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, k
 		switch {
 		case err == nil:
 			t.e.bearers.put(cred.Bearer, g)
-		case cfg.Read == "public" && kind != readKeys:
+		case !takesGrant(cfg, kind):
 			// Public content doesn't need the grant: one that is unusable,
 			// or doesn't name the namespace, is ignored (§7).
 			a = nil
@@ -730,7 +767,7 @@ func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, k
 			return nil, notFound()
 		}
 	}
-	if a != nil && (cfg.Read != "public" || kind == readKeys) && scopeReferToNow(a) {
+	if a != nil && takesGrant(cfg, kind) && scopeReferToNow(a) {
 		if kind == readResource {
 			return nil, notFound()
 		}
@@ -768,6 +805,17 @@ func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, k
 // read envelope has no now (scopeRules, roleRules).
 func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 	if cfg.Read == "public" && !stepOne || t.e.opt.AuthDisabled {
+		return true
+	}
+	return t.grantReadsNS(a, stepOne)
+}
+
+// grantReadsNS is readsNS judged by a's grant alone, whatever n's read
+// mode: under a view prefix, where a public namespace takes the grant as
+// a filter (§7 step 1, §7.9 Where, v0.90), a grant that reads it
+// unrestricted keeps the unfiltered URLs and every other is filtered.
+func (t *tx) grantReadsNS(a *actor, stepOne bool) bool {
+	if t.e.opt.AuthDisabled {
 		return true
 	}
 	if a == nil {

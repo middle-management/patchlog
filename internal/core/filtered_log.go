@@ -40,8 +40,10 @@ func (t *tx) scanNSLogRow(rows *sql.Rows) nsLogRow {
 // decorateNSEntry is r's entry as a log answer serves it (§7.4): its body
 // with id, prev (the id of the entry before it, given; "" on the chain's
 // first, which always carries it, §7.4 v0.81), author, created, via, grant
-// and the gesture members, none of them hashed but id and prev.
-func (t *tx) decorateNSEntry(r *nsLogRow, prev string) map[string]any {
+// and the gesture members, none of them hashed but id and prev, and a head
+// entry's schema, never served while n is at E3 (§7.4), a namespace raised
+// there since included.
+func (t *tx) decorateNSEntry(n *nsRow, r *nsLogRow, prev string) map[string]any {
 	m := r.m
 	m["id"] = ids.FromBytes(r.id).String()
 	if r.prev == nil {
@@ -68,10 +70,29 @@ func (t *tx) decorateNSEntry(r *nsLogRow, prev string) map[string]any {
 		m["grant"] = nil
 	}
 	if r.meta.Valid {
-		// gesture and undoes of a single write, gestures of a batch: not
-		// part of the hashed entry either (§7.4). In a sealed namespace
-		// they are sealed with it (§E.4).
+		// gesture and undoes of a single write, gestures of a batch, and
+		// a head entry's schema: not part of the hashed entry either
+		// (§7.4). In a sealed namespace they are sealed with it (§E.4).
+		e3 := t.nsLevel(n) >= levelE2E
 		for k, v := range jsonv.MustParse([]byte(r.meta.String)).(map[string]any) {
+			if e3 && (k == "schema" || k == "schemas") {
+				continue
+			}
+			if k == "schemas" {
+				// A batch's, by resource: each on its head entry, those
+				// a filtered answer keeps included; never on a hidden
+				// stand-in (§7.9 Log entries).
+				byName, _ := v.(map[string]any)
+				es, _ := m["entries"].([]any)
+				for _, x := range es {
+					if em, ok := x.(map[string]any); ok && em["kind"] == "head" {
+						if sc, ok := byName[fmt.Sprint(em["resource"])]; ok {
+							em["schema"] = sc
+						}
+					}
+				}
+				continue
+			}
 			m[k] = v
 		}
 	}
@@ -101,7 +122,9 @@ const filteredLogChunk = 256
 // What an entry shows is a function of the log alone (filterEntry), never
 // of the pages before it, so a range reads the same in any pages.
 func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit int) *Log {
-	out := &Log{Public: t.cachePublic(n), Purged: n.purged && n.headSeq.Valid && toSeq == n.headSeq.Int64}
+	// Cached as a private namespace's, a public one's too (§7.9 Where,
+	// §9, v0.90).
+	out := &Log{Purged: n.purged && n.headSeq.Valid && toSeq == n.headSeq.Int64}
 	var fromSeq int64
 	if since != "" {
 		id, err := ids.Parse(since)
@@ -152,7 +175,7 @@ func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit
 					// place (§7.9 Log entries).
 					m = map[string]any{"id": id, "prev": prev, "kind": "hidden", "resource": r.m["resource"]}
 				} else {
-					m = t.decorateNSEntry(r, prev)
+					m = t.decorateNSEntry(n, r, prev)
 					if g, ok := m["gestures"].(map[string]any); ok && f.names != nil {
 						// A batch's, from its row's metadata (§7.4).
 						narrowNames(m, "gestures", g, f.names)
@@ -334,7 +357,7 @@ func (e *Engine) FilteredLog(ctx context.Context, ns, view, at, since string, li
 			return t.purgedRead(n)
 		}
 		lg = t.filteredRange(n, fv, since, fv.CP().seq, limit)
-		lg.Until = t.admittedUntil(n, cred, fv.a)
+		lg.Until = t.credUntil(cred, fv.a)
 		// In a sealed namespace, one JWE under the view's K_view (§E.2.2).
 		t.filteredRangeSealing(n, fv, since, fv.CP().at, lg, false)
 		return nil
@@ -424,9 +447,12 @@ func (t *tx) seesAnyEntry(n *nsRow, a *actor, name string, entries []LogEntry) b
 
 // readsPartially reports whether a reads n as a partial reader at a
 // resource's URLs (judgeEntries): hidden entries are left out of a range,
-// rather than refusing it.
+// rather than refusing it. Never in a public namespace.
 func (t *tx) readsPartially(n *nsRow, a *actor) bool {
-	return a != nil && a.view == "" && a.verified != nil && t.filteredScope(n) != nil && t.partialReader(a)
+	// A public namespace's resource URLs ignore the grant (§7 step 1):
+	// only its view prefix filters (v0.90).
+	return a != nil && a.view == "" && a.verified != nil && t.config(n.configSeq).Read != "public" &&
+		t.filteredScope(n) != nil && t.partialReader(a)
 }
 
 // judgePruneEvents leaves out of a resource stream's events (resourceEvents)

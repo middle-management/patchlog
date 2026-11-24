@@ -322,7 +322,9 @@ func (w *v75s) sseFirst(path, bearer string) *resp {
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	hr, _ := http.NewRequestWithContext(ctx, "GET", w.srv.URL+path, nil)
-	hr.Header.Set("Authorization", "Bearer "+bearer)
+	if bearer != "" {
+		hr.Header.Set("Authorization", "Bearer "+bearer)
+	}
 	c := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	r, err := c.Do(hr)
 	if err != nil {

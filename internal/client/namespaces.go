@@ -107,13 +107,19 @@ func (c *Client) NeedsNonce(ctx context.Context, ns string) bool {
 // Sub-entries of a batch are NSEntry values with only Resource/Kind/Target
 // set (and Raw).
 type NSEntry struct {
-	ID        string
-	Prev      string // "" for the first entry
-	Kind      string // head, tombstone, purge, config, batch, branch, purge-ns, prune
-	Resource  string
-	Name      string         // branch: the branch's name
-	At        string         // branch: the base's ns_id it starts at
-	Target    string         // revision, tombstone, config revision or horizon id
+	ID       string
+	Prev     string // "" for the first entry
+	Kind     string // head, tombstone, purge, config, batch, branch, purge-ns, prune
+	Resource string
+	Name     string // branch: the branch's name
+	At       string // branch: the base's ns_id it starts at
+	Target   string // revision, tombstone, config revision or horizon id
+	// Schema, on a head entry, a batch's included, is the $schema of
+	// its revision's document (§7.4, v0.90), "" where it has none, at E3,
+	// and on entries written before servers recorded it. Not hashed, so a
+	// hint: one that verifies what it fetches checks it against the
+	// revision before relying on it (§10). SchemaHeads filters by it.
+	Schema    string
 	Entries   []NSEntry      // batch: config entry first, then resource entries
 	Source    map[string]any // batch: optional provenance
 	HasSource bool
@@ -179,6 +185,9 @@ func ParseNSEntry(v any) (NSEntry, error) {
 		Name: str(m, "name"), At: str(m, "at"), Target: str(m, "target"),
 		Author: str(m, "author"), Created: str(m, "created"), Raw: m,
 	}
+	if e.Kind == "head" {
+		e.Schema = str(m, "schema")
+	}
 	if g, has := m["grant"]; has {
 		if gm, ok := g.(map[string]any); ok {
 			e.Grant = &NSGrant{ID: str(gm, "id"), Sub: str(gm, "sub"), Kid: str(gm, "kid")}
@@ -217,6 +226,32 @@ func ParseNSEntry(v any) (NSEntry, error) {
 		}
 	}
 	return e, nil
+}
+
+// SchemaHeads is the head entries of es, a batch's items included, whose
+// schema is schema (§7.4, v0.90): how a consumer filters the shared log
+// by schema itself, rather than by a narrowed grant's /doc/$schema rule
+// (§7.9). A batch item carries its batch's ID, Author and Created. The
+// schema is a hint, not hashed: a consumer that relies on it checks it
+// against the revision it fetches.
+func SchemaHeads(es []NSEntry, schema string) []NSEntry {
+	var out []NSEntry
+	for _, e := range es {
+		switch e.Kind {
+		case "head":
+			if e.Schema == schema {
+				out = append(out, e)
+			}
+		case "batch":
+			for _, s := range e.Entries {
+				if s.Kind == "head" && s.Schema == schema {
+					s.ID, s.Author, s.Created = e.ID, e.Author, e.Created
+					out = append(out, s)
+				}
+			}
+		}
+	}
+	return out
 }
 
 func parseNSLog(body any, path string) ([]NSEntry, error) {

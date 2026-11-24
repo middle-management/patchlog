@@ -14,9 +14,11 @@ import (
 // or a cookie.
 
 // §7.9 Purged namespaces ("403, or 401 as §B.11.5 says"), §B.11.5: a
-// public namespace is never covered; its filtered URLs are 401 with no
-// credentials or a grant that doesn't verify there, 403 with one that
-// does.
+// public namespace's filtered URLs are 401 with no credentials, and 403
+// for a grant for another namespace (§7 step 2) or one that reads it
+// unrestricted; since v0.90 public namespaces are covered and their view
+// prefixes take the grant (§7 step 1), where before every grant that
+// didn't verify there was 401.
 func TestV076FilteredUncovered401(t *testing.T) {
 	t.Parallel()
 	w := newV75s(t, v75sOpts{})
@@ -32,7 +34,7 @@ func TestV076FilteredUncovered401(t *testing.T) {
 			want   int
 		}{
 			"no credentials":                {"", 401},
-			"a grant for another namespace": {other, 401},
+			"a grant for another namespace": {other, 403},
 			"a grant that verifies in pub":  {inPub, 403},
 		} {
 			r := w.get(path, c.bearer)

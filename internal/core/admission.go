@@ -23,8 +23,18 @@ import (
 // (§7), with authentication disabled (§1), and for a grant whose blocks
 // carry no exp.
 func (t *tx) admittedUntil(n *nsRow, cred Credentials, a *actor) time.Time {
+	if t.cachePublic(n) {
+		return time.Time{}
+	}
+	return t.credUntil(cred, a)
+}
+
+// credUntil is admittedUntil whatever n's read mode: a read under a view
+// prefix, which takes its grant or cookie in a public namespace too (§7
+// step 1, §7.9 Where, v0.90), ends with it there as well.
+func (t *tx) credUntil(cred Credentials, a *actor) time.Time {
 	switch {
-	case t.cachePublic(n) || t.e.opt.AuthDisabled:
+	case t.e.opt.AuthDisabled:
 		return time.Time{}
 	case cred.Edge != nil:
 		return cred.Edge.Exp
