@@ -578,7 +578,8 @@ shared document. The rate is lifted as above.
   98 ms, against seconds on the shared document.
 - **It scales with writers.** On server X 32 writers do almost five times what one does. The
   reason is group commit (D.8): the core writes the resources of several requests in one
-  transaction. On SQLite 32 writers do 1.8 times one writer's.
+  transaction. On SQLite 32 writers do 1.8 times one writer's (measured before SQLite grouped
+  its writes too; see the README's D.3 notes).
 - **It varies between runs on server X.** A second run, with authentication off, did 290, 740
   and 620 creates a second from 1, 8 and 32 writers. Even that is ten times the shared
   document's 64.

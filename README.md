@@ -711,8 +711,8 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   - While no group of a namespace is queued or committing, up to four of its writes take the
     path they take without group commit (checked inside the lock, fewer round trips), so groups
     form only once writers contend. `--group-commit 1` turns it off: every write then commits on
-    its own, exactly as before. SQLite has a single writer and doesn't group. Details in
-    `internal/core/groupcommit.go`.
+    its own, exactly as before. SQLite groups too, under its single writer (see *Heavy work
+    outside the write lock (D.3)*). Details in `internal/core/groupcommit.go`.
 - **One writer per namespace.** Groups are per instance: two instances writing one namespace
   each form their own groups, which then contend for the same log lock. With several instances,
   route each namespace's writes to one of them, e.g. by hashing the namespace name in the load
@@ -1035,9 +1035,11 @@ What is instrumented:
   a trace, so a read served from the read cache has none, and Postgres write retries show in
   one `core.db.update`. Background jobs (the tailer, retention) are not traced.
   Statement-level SQL spans are not recorded.
-- **Postgres**: `patchlog.groupcommit.size` (writes per group commit transaction, D.8) and
-  `patchlog.db.lock.wait` (s, by `patchlog.lock` = `ns` or `log`: time waiting for advisory
-  locks).
+- **Group commit**: `patchlog.groupcommit.size` (writes per group commit transaction, D.8).
+- **Postgres**: `patchlog.db.lock.wait` (s, by `patchlog.lock` = `ns` or `log`: time waiting
+  for advisory locks).
+- **SQLite**: `patchlog.db.write.lock` (s, by `patchlog.phase` = `wait`, `held` or `commit`: a
+  write transaction's time waiting for the single writer, holding it, and in its `COMMIT`).
 - **Consumers** (the index): `patchlog.follow.units` (units applied, by
   `patchlog.follow.snapshot`) and `patchlog.follow.lag` (s: from the newest applied entry's
   `created` to its application, so catching up shows as large values).
@@ -3831,6 +3833,20 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   only after it commits. Dry runs stay read transactions. Config writes, batches with a config
   change, branch creation, purges and prunes are rare and still run
   their whole gate inside one write transaction.
+- **Group commit and checkpoints on SQLite (D.3, D.8).** Once more than four writes of one
+  namespace contend, its checked resource writes and batches queue and commit in groups of up
+  to `--group-commit` (default 32, waiting at most `--group-commit-wait`, 200µs), as on
+  Postgres, in one `BEGIN IMMEDIATE` transaction under the mutex. There each write is re-checked
+  and inserted in turn, after the group's earlier writes, so it is re-checked against exactly the
+  state it commits on; one whose re-check fails is answered alone after the group commits (`412`
+  with the new head, the idempotent retry, or a check against the new configuration), and the
+  others are unaffected. Writes of different namespaces still take the one writer in turn.
+  WAL checkpoints no longer run inside a write's `COMMIT` (`wal_autocheckpoint(0)`): the engine
+  runs a `PASSIVE` one every 100 ms, a `TRUNCATE` one under the mutex once the WAL holds 16,384
+  frames (overlapping readers can keep a `PASSIVE` checkpoint from letting it start over) or once
+  it is idle, and one at close. `synchronous(NORMAL)` is unchanged. Locally (4 vCPUs) one
+  namespace's 32 writers went from about 2,000 to about 4,000 writes a second, and disk writes
+  from about 65 to 15 KiB a write (`go test ./internal/core -run '^$' -bench NamespaceWriters`).
 - **Additions to the D.2 layout**: `namespaces.head_seq/config_seq/base_config_seq`,
   `ns_log.body` (the canonical entry exactly as hashed) and `ns_log.config_seq`,
   `ns_config.doc`, `revisions.signature/schema_ref`, `revisions.rules` (the schema rules a
