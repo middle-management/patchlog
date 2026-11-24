@@ -16,8 +16,9 @@ import (
 // OpenTelemetry in the engine, kept light: a span per database
 // transaction ("core.db.read", "core.db.update": what a request costs
 // beyond the read cache), a span per schema validation
-// ("core.schema.validate"), the sizes of group commits and the time spent
-// waiting for Postgres advisory locks. Nothing is recorded while telemetry
+// ("core.schema.validate"), the sizes of group commits, the time spent
+// waiting for Postgres advisory locks, and SQLite write transactions'
+// time at the single writer (lockTimes). Nothing is recorded while telemetry
 // is off (telemetry.Instruments.Get is nil). Engine-level spans of writes
 // are made by its HTTP caller (internal/server/otel.go).
 
@@ -25,6 +26,7 @@ type coreInst struct {
 	tracer    trace.Tracer
 	groupSize metric.Int64Histogram
 	lockWait  metric.Float64Histogram
+	writeLock metric.Float64Histogram
 	liveReads metric.Int64Counter
 }
 
@@ -32,11 +34,15 @@ var inst = telemetry.NewInstruments("internal/core", func(t trace.Tracer, m metr
 	return &coreInst{
 		tracer: t,
 		groupSize: telemetry.Must(m.Int64Histogram("patchlog.groupcommit.size",
-			metric.WithDescription("Writes committed together in one group commit transaction (Postgres, D.8)"),
+			metric.WithDescription("Writes committed together in one group commit transaction (D.8)"),
 			metric.WithUnit("{write}"),
 			metric.WithExplicitBucketBoundaries(1, 2, 4, 8, 16, 32, 64, 128))),
 		lockWait: telemetry.Must(m.Float64Histogram("patchlog.db.lock.wait",
 			metric.WithDescription("Time spent waiting for a Postgres advisory lock (namespace or log lock)"),
+			metric.WithUnit("s"),
+			metric.WithExplicitBucketBoundaries(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5))),
+		writeLock: telemetry.Must(m.Float64Histogram("patchlog.db.write.lock",
+			metric.WithDescription("SQLite: a write transaction's time waiting for the engine's single writer (wait), holding it (held), and in its COMMIT (commit)"),
 			metric.WithUnit("s"),
 			metric.WithExplicitBucketBoundaries(0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5))),
 		liveReads: telemetry.Must(m.Int64Counter("patchlog.longpoll.resource.reads",
@@ -48,6 +54,7 @@ var inst = telemetry.NewInstruments("internal/core", func(t trace.Tracer, m metr
 var (
 	attrDBSystem = attribute.Key("db.system.name")
 	attrLock     = attribute.Key("patchlog.lock")
+	attrPhase    = attribute.Key("patchlog.phase")
 	attrAnswer   = attribute.Key("patchlog.answer")
 
 	attrSchema      = attribute.Key("patchlog.schema")
@@ -139,6 +146,14 @@ func countNodes(v any) int {
 func observeGroup(n int) {
 	if in := inst.Get(); in != nil {
 		in.groupSize.Record(context.Background(), int64(n))
+	}
+}
+
+// observeWriteLock records a phase of a SQLite write transaction's time
+// at the engine's mutex (lockTimes).
+func observeWriteLock(phase string, d time.Duration) {
+	if in := inst.Get(); in != nil {
+		in.writeLock.Record(context.Background(), d.Seconds(), metric.WithAttributes(attrPhase.String(phase)))
 	}
 }
 

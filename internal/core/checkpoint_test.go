@@ -138,12 +138,14 @@ func TestCheckpointInBackground(t *testing.T) {
 // WAL start over, so without more it grows with every write; past
 // walLimitFrames a TRUNCATE checkpoint waits the readers out and bounds it.
 func TestCheckpointWALBounded(t *testing.T) {
-	defer func(n int64) { walLimitFrames = n }(walLimitFrames)
-	walLimitFrames = 200
+	const limit = 200
 	const writes = 1500
 	run := func(interval time.Duration) (maxWAL int64, e *Engine) {
 		path := filepath.Join(t.TempDir(), "p.db")
-		e = fileEngine(t, path, func(o *Options) { o.CheckpointInterval = interval })
+		e = fileEngine(t, path, func(o *Options) {
+			o.CheckpointInterval = interval
+			o.walLimitFrames = limit
+		})
 		mkNS(t, e, "n", map[string]any{"read": "public"})
 		stop := make(chan struct{})
 		var wg sync.WaitGroup
@@ -202,7 +204,7 @@ func TestCheckpointWALBounded(t *testing.T) {
 	const frame = 4096 + 24
 	off, _ := run(-1)
 	on, e := run(5 * time.Millisecond)
-	t.Logf("WAL at most %d frames without checkpoints, %d with (limit %d), %d truncated, %d busy", off/frame, on/frame, walLimitFrames, e.wal.truncated.Load(), e.wal.busy.Load())
+	t.Logf("WAL at most %d frames without checkpoints, %d with (limit %d), %d truncated, %d busy", off/frame, on/frame, limit, e.wal.truncated.Load(), e.wal.busy.Load())
 	if e.wal.truncated.Load() == 0 {
 		t.Fatal("no TRUNCATE checkpoint ran")
 	}
@@ -275,16 +277,19 @@ func TestCheckpointCrash(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	// "<resource> <revision> <entry>" for every write answered.
+	// "<resource> <revision> <entry> <groups committed>" for every write
+	// answered.
 	type answered struct{ rev, entry string }
 	last := map[string]answered{}
+	groups := "0"
 	var all []answered
 	sc := bufio.NewScanner(out)
 	for sc.Scan() {
 		f := strings.Fields(sc.Text())
-		if len(f) != 3 {
+		if len(f) != 4 {
 			continue
 		}
+		groups = f[3]
 		a := answered{f[1], f[2]}
 		last[f[0]] = a
 		all = append(all, a)
@@ -296,6 +301,9 @@ func TestCheckpointCrash(t *testing.T) {
 	cmd.Wait()
 	if len(all) < 600 {
 		t.Fatalf("the child answered %d writes", len(all))
+	}
+	if groups == "0" {
+		t.Fatal("the child committed no group: the test checks no group commit")
 	}
 	e := fileEngine(t, path, nil)
 	seqs := verifyChain(t, e, "n")
@@ -315,7 +323,7 @@ func TestCheckpointCrash(t *testing.T) {
 			t.Fatalf("%s: head %s, the last answered %s", name, hd.Head, a.rev)
 		}
 	}
-	t.Logf("%d writes answered before the kill, %d entries after reopening", len(all), len(seqs))
+	t.Logf("%d writes answered before the kill (%s groups), %d entries after reopening", len(all), groups, len(seqs))
 }
 
 // headDescends reports whether the head of resource name of namespace n
@@ -367,7 +375,7 @@ func TestCheckpointCrashChild(t *testing.T) {
 				}
 				h = res.Items[0].IDs[0]
 				mu.Lock()
-				fmt.Fprintf(w, "%s %s %s\n", name, h, res.NSID)
+				fmt.Fprintf(w, "%s %s %s %d\n", name, h, res.NSID, e.groups.committed.Load())
 				w.Flush()
 				mu.Unlock()
 			}

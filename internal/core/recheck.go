@@ -203,7 +203,7 @@ func (t *tx) recheckIn(p *writePlan, d *writeDeps, nss map[int64]*nsRow) (*nsRow
 
 // writeOptimistic runs a resource write or a batch without a config change
 // on the D.3 write path: check outside the lock, re-check and insert inside,
-// on Postgres in a group of the namespace's writes (groupcommit.go).
+// in a group of the namespace's writes once they contend (groupcommit.go).
 func (e *Engine) writeOptimistic(ctx context.Context, req Request, items []Item, source any, isBatch bool) (*WriteResult, error) {
 	if e.grouping() {
 		return e.writeGrouped(ctx, req, items, source, isBatch)

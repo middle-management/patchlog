@@ -10,7 +10,20 @@ import (
 	"time"
 )
 
-// Group commit per namespace (Addendum D.8, "Contention"), on Postgres.
+// Group commit per namespace (Addendum D.8, "Contention"), on Postgres
+// and on SQLite.
+//
+// On SQLite every write transaction runs alone, under Engine.mu and BEGIN
+// IMMEDIATE (D.3), and about half of a small write's time there is per
+// transaction (its BEGIN and COMMIT, the WAL frames of the pages it
+// changed), half per write (measured on 4 vCPUs: a batch of k small
+// appends held it 352 µs an item at k = 1, 160 at k = 64). A group shares the
+// former: the queue, the worker and the answers below are the same, and
+// the group's transaction takes no lock but the mutex (lockAll and lockLog
+// are no-ops, and there is no commitPool); it re-checks and appends its
+// writes one after another (appendInTurn). Below, locks, round trips,
+// inserting together and losing a race to insert are Postgres's; the
+// rest holds for both.
 //
 // A namespace's entries are appended one at a time under its log lock,
 // held through commit (pglock.go), so a namespace takes about one write
@@ -171,7 +184,7 @@ type groups struct {
 }
 
 // grouping reports whether resource writes and batches use group commit.
-func (e *Engine) grouping() bool { return e.pg && e.opt.GroupCommit > 1 }
+func (e *Engine) grouping() bool { return e.opt.GroupCommit > 1 }
 
 // get returns ns's state, creating it. Callers hold g.mu.
 func (g *groups) get(ns string) *nsGroup {
@@ -460,6 +473,10 @@ func (e *Engine) commitGroup(ns string, group []*groupWrite) {
 // runs again (errApart), and the re-checks then leave out the writes that
 // lost.
 func (t *tx) appendGroup(group []*groupWrite) {
+	if !t.e.pg {
+		t.appendInTurn(group)
+		return
+	}
 	target := group[0].plan.n.id
 	var names []string
 	for _, w := range group {
@@ -504,6 +521,45 @@ func (t *tx) appendGroup(group []*groupWrite) {
 	}
 	if len(joint) > 0 {
 		t.appendTogether(joint)
+	}
+}
+
+// appendInTurn appends the writes of a group of several on SQLite, in the
+// group's transaction under Engine.mu: one after another in queue order,
+// each re-checked (recheck), then inserted with its entry appended
+// (insertPlan), exactly as its own transaction would on the path without
+// group commit (writeAlone), so each is re-checked against the state it
+// commits on, the group's earlier writes included (D.3, invariant 6).
+//
+// Postgres's reasons to re-check them all first and insert them together
+// (appendGroup) are round trips and deadlocks with other writers, and
+// SQLite has neither: a statement is a call into the library, and the
+// transaction is the database's only writer (BEGIN IMMEDIATE, and
+// Engine.mu in this process). For the same reason no insert can lose a
+// race: a write of a resource an earlier write of the group wrote fails
+// its re-check, like one of another namespace than the group's first
+// (deleted and created again between their checks) or one whose
+// configuration or other dependency changed, and each such write is
+// answered alone once the group has committed, as on Postgres. What the
+// group shares is its BEGIN IMMEDIATE and its COMMIT, whose WAL frames
+// hold a page each however many of the writes changed it.
+func (t *tx) appendInTurn(group []*groupWrite) {
+	target := group[0].plan.n.id
+	for i, w := range group {
+		if h := t.e.groupMember; h != nil {
+			h(t, i)
+		}
+		if w.plan.n.id != target {
+			w.alone = true
+			continue
+		}
+		n, ok := t.recheck(w.plan, w.deps)
+		if !ok {
+			w.alone = true
+			continue
+		}
+		w.plan.n = n
+		w.res = t.insertPlan(w.req, w.plan)
 	}
 }
 

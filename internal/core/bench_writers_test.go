@@ -23,7 +23,8 @@ import (
 //	go test ./internal/core -run '^$' -bench NamespaceWriters -benchtime 3s
 //
 // It reports writes/s, the latency percentiles, the process's CPU and
-// disk writes (/proc/self/io, Linux) per write, and with group commit the
+// disk writes (/proc/self/io, Linux) per write, on SQLite the time under
+// the writer's mutex and in COMMIT per write, and with group commit the
 // writes per group.
 func BenchmarkNamespaceWriters(b *testing.B) {
 	for _, c := range []struct{ ns, writers int }{
@@ -88,6 +89,7 @@ func benchNamespaceWriters(b *testing.B, nss, perNS int) {
 	var wg sync.WaitGroup
 	groups, grouped := e.groups.committed.Load(), e.groups.appended.Load()
 	cpu0, disk0 := processCPU(), diskWrites()
+	txns0, held0, commit0 := e.lockTimes.txns.Load(), e.lockTimes.held.Load(), e.lockTimes.commit.Load()
 	b.ResetTimer()
 	start := time.Now()
 	for _, w := range ws {
@@ -119,6 +121,12 @@ func benchNamespaceWriters(b *testing.B, nss, perNS int) {
 	b.ReportMetric(float64(cpu.Microseconds())/float64(b.N), "cpu-us/write")
 	if disk0 >= 0 {
 		b.ReportMetric(float64(disk)/1024/float64(b.N), "disk-KiB/write")
+	}
+	// SQLite: the writer's time under Engine.mu per write, and of that
+	// the COMMIT's (lockTimes).
+	if txns := e.lockTimes.txns.Load() - txns0; txns > 0 {
+		b.ReportMetric(float64(e.lockTimes.held.Load()-held0)/1e3/float64(b.N), "held-us/write")
+		b.ReportMetric(float64(e.lockTimes.commit.Load()-commit0)/1e3/float64(b.N), "commit-us/write")
 	}
 	if n := e.groups.committed.Load() - groups; n > 0 {
 		g := e.groups.appended.Load() - grouped

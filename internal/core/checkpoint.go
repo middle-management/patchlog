@@ -12,8 +12,10 @@ import (
 //
 // SQLite's default runs a PASSIVE checkpoint inside the COMMIT that takes
 // the WAL past 1,000 frames: in the write transaction, so under Engine.mu,
-// where it was about half of the commit (docs/SQLITE-NAMESPACES.md, "The
-// problem, measured"). Every connection instead sets wal_autocheckpoint(0)
+// where it was about half of the commit (measured on 4 vCPUs: 239 µs with
+// it and 132 without for one small write, 1,443 and 481 µs for 16 in one
+// transaction; on EC2's gp3 a goroutine dump found the holder of Engine.mu
+// in its fsync). Every connection instead sets wal_autocheckpoint(0)
 // (openSQLite), and checkpointLoop runs them alongside the writer:
 //
 //   - Every CheckpointInterval, a PASSIVE checkpoint. It takes no lock a
@@ -58,9 +60,9 @@ const (
 )
 
 // walLimitFrames is how many frames the WAL may hold before a TRUNCATE
-// checkpoint is forced: 64 MiB at the default 4 KiB pages. A variable for
-// tests.
-var walLimitFrames int64 = 16384
+// checkpoint is forced: 64 MiB at the default 4 KiB pages
+// (Options.walLimitFrames replaces it in tests).
+const walLimitFrames = 16384
 
 // walStats counts checkpoints (tests, benchmarks).
 type walStats struct {
@@ -92,7 +94,7 @@ func (e *Engine) checkpointLoop(interval time.Duration) {
 			continue
 		}
 		switch {
-		case frames >= walLimitFrames:
+		case frames >= e.opt.walLimitFrames:
 			e.mu.Lock()
 			frames, _, err = e.checkpointTruncate(walCheckpointBusy)
 			e.mu.Unlock()
@@ -169,4 +171,26 @@ func (e *Engine) closeWAL() {
 	if _, _, err := e.checkpointTruncate(walCheckpointBusy); err != nil {
 		log.Printf("WAL checkpoint at close: %v", err)
 	}
+}
+
+// lockTimes adds up, over a SQLite file's write transactions, the time
+// each waited for Engine.mu, held it, and spent in its COMMIT (with the
+// checkpoints out of it, the WAL frames' writes): the wall-clock split of
+// the writer's time (tests, benchmarks), also recorded as
+// patchlog.db.write.lock.
+type lockTimes struct {
+	txns, wait, held, commit atomic.Int64 // nanoseconds
+}
+
+func (l *lockTimes) note(wait, held time.Duration) {
+	l.txns.Add(1)
+	l.wait.Add(int64(wait))
+	l.held.Add(int64(held))
+	observeWriteLock("wait", wait)
+	observeWriteLock("held", held)
+}
+
+func (l *lockTimes) noteCommit(d time.Duration) {
+	l.commit.Add(int64(d))
+	observeWriteLock("commit", d)
 }

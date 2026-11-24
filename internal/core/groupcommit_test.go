@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"net/url"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,18 +19,50 @@ import (
 	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
-// Group commit per namespace (D.8, groupcommit.go). These tests run only
-// with PATCHLOG_TEST_PG set.
+// Group commit per namespace (D.8, groupcommit.go). Tests named TestPG…
+// run only with PATCHLOG_TEST_PG set; those named TestGroupCommit… run on a
+// SQLite file, and on Postgres too with it set (groupDBs).
 
-// groupEngine opens an engine whose writes always queue (no write on its
-// own) and whose groups wait long for writes still in their check phase,
-// so writes held at BeforeWriteLock until all have arrived form one group.
+// groupDBs runs test on each database group commit runs on: a SQLite file,
+// and Postgres (skipped without PATCHLOG_TEST_PG). db gives the test's
+// database.
+func groupDBs(t *testing.T, test func(t *testing.T, db func(testing.TB) string)) {
+	t.Run("sqlite", func(t *testing.T) { test(t, sqliteFile) })
+	t.Run("pg", func(t *testing.T) { test(t, pgtest.NewDB) })
+}
+
+// sqliteFile is the path of a new SQLite file for a test.
+func sqliteFile(t testing.TB) string { return filepath.Join(t.TempDir(), "p.db") }
+
+// groupEngine is groupEngineOn a Postgres database.
 func groupEngine(t *testing.T) *Engine {
 	t.Helper()
-	e := openInstance(t, pgtest.NewDB(t), t.TempDir())
+	return groupEngineOn(t, pgtest.NewDB(t))
+}
+
+// groupEngineOn opens an engine on db whose writes always queue (no write
+// on its own) and whose groups wait long for writes still in their check
+// phase, so writes held at BeforeWriteLock until all have arrived form one
+// group.
+func groupEngineOn(t *testing.T, db string) *Engine {
+	t.Helper()
+	e := openInstance(t, db, t.TempDir())
+	tickClock(e)
 	e.noSolo = true
 	e.opt.GroupCommitWait = 5 * time.Second
 	return e
+}
+
+// tickClock makes e's clock, on SQLite, advance a millisecond at every
+// reading, so a transaction's entries share a created time no other
+// transaction's has: checkChain's transaction of an entry.
+func tickClock(e *Engine) {
+	if e.pg {
+		return
+	}
+	var ms atomic.Int64
+	ms.Store(time.Now().UnixMilli())
+	e.opt.Now = func() time.Time { return time.UnixMilli(ms.Add(1)) }
 }
 
 // holdChecked makes the first n writes past their check phase wait for each
@@ -124,10 +157,16 @@ func write(e *Engine, ns, name, ifMatch string, n int) (*WriteResult, error) {
 
 // checkChain verifies ns's whole chain in storage: every entry follows the
 // one before it by seq, and its id is the hash of the previous id and its
-// body (§3.5). It returns the transaction id of each entry, by entry id.
+// body (§3.5). It returns the transaction of each entry, by entry id: on
+// Postgres its id, on SQLite its created time, which only the entries of
+// one transaction share on an engine with tickClock.
 func checkChain(t *testing.T, e *Engine, ns string) map[string]string {
 	t.Helper()
-	rows, err := e.db.QueryContext(context.Background(), `SELECT seq, id, prev_seq, body, xid::text FROM ns_log
+	xid := "xid::text"
+	if !e.pg {
+		xid = "CAST(created AS TEXT)"
+	}
+	rows, err := e.db.QueryContext(context.Background(), `SELECT seq, id, prev_seq, body, `+xid+` FROM ns_log
 		WHERE ns = (SELECT ns FROM namespaces WHERE name = $1) ORDER BY seq`, ns)
 	if err != nil {
 		t.Fatal(err)
@@ -169,234 +208,242 @@ func checkChain(t *testing.T, e *Engine, ns string) map[string]string {
 
 // Concurrent writes to one namespace are appended in one transaction, with
 // a correct chain, each answered with its own entry.
-func TestPGGroupCommit(t *testing.T) {
-	e := groupEngine(t)
-	mkNS(t, e, "n", map[string]any{"read": "public"})
-	heads := map[string]string{}
-	for i := 0; i < 3; i++ {
-		h, err := put(e, "n", fmt.Sprint("r", i), "", i)
+func TestGroupCommit(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		e := groupEngineOn(t, db(t))
+		mkNS(t, e, "n", map[string]any{"read": "public"})
+		heads := map[string]string{}
+		for i := 0; i < 3; i++ {
+			h, err := put(e, "n", fmt.Sprint("r", i), "", i)
+			if err != nil {
+				t.Fatal(err)
+			}
+			heads[fmt.Sprint("r", i)] = h
+		}
+		const n = 6
+		sizes := groupSizes(e)
+		before := e.groups.committed.Load()
+		holdChecked(t, e, n, nil)
+		res, errs := concurrently(n, func(i int) (*WriteResult, error) {
+			// Appends to r0–r2, creates of c3 and c4, and a batch creating
+			// c5 and d5.
+			if i < 3 {
+				return write(e, "n", fmt.Sprint("r", i), heads[fmt.Sprint("r", i)], 10+i)
+			}
+			if i == n-1 {
+				r := who
+				r.NS = "n"
+				mk := func(name string) Item {
+					return Item{Resource: name, IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"name": name}}}}}}
+				}
+				return e.Batch(context.Background(), r, []Item{mk(fmt.Sprint("c", i)), mk(fmt.Sprint("d", i))}, nil, nil, false)
+			}
+			return write(e, "n", fmt.Sprint("c", i), "", i)
+		})
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("write %d: %v", i, err)
+			}
+		}
+		if got := sizes(); len(got) != 1 || got[0] != n {
+			t.Fatalf("group sizes %v, want one of %d", got, n)
+		}
+		if got := e.groups.committed.Load() - before; got != 1 {
+			t.Fatalf("%d groups committed, want 1", got)
+		}
+		xids := checkChain(t, e, "n")
+		xid := ""
+		seen := map[string]bool{}
+		for i, r := range res {
+			if r.Status != 201 || r.Replayed || (r.Entry == nil) != (i == n-1) {
+				t.Fatalf("write %d: %+v", i, r)
+			}
+			if seen[r.NSID] {
+				t.Fatalf("write %d answered with entry %s twice", i, r.NSID)
+			}
+			seen[r.NSID] = true
+			x, ok := xids[r.NSID]
+			if !ok {
+				t.Fatalf("write %d's entry %s isn't in the chain", i, r.NSID)
+			}
+			if xid != "" && x != xid {
+				t.Fatalf("write %d committed in transaction %s, the others in %s", i, x, xid)
+			}
+			xid = x
+			for _, it := range r.Items {
+				hd, err := e.ResourceHead(context.Background(), "n", it.Resource, who.Cred)
+				if err != nil || hd.Head != it.IDs[0] {
+					t.Fatalf("%s: head %+v %v, want %s", it.Resource, hd, err, it.IDs[0])
+				}
+			}
+		}
+		log, err := e.NamespaceLog(context.Background(), "n", "", "", 0, who.Cred)
 		if err != nil {
 			t.Fatal(err)
 		}
-		heads[fmt.Sprint("r", i)] = h
-	}
-	const n = 6
-	sizes := groupSizes(e)
-	before := e.groups.committed.Load()
-	holdChecked(t, e, n, nil)
-	res, errs := concurrently(n, func(i int) (*WriteResult, error) {
-		// Appends to r0–r2, creates of c3 and c4, and a batch creating
-		// c5 and d5.
-		if i < 3 {
-			return write(e, "n", fmt.Sprint("r", i), heads[fmt.Sprint("r", i)], 10+i)
+		if want := 1 + 3 + n; len(log.Entries) != want {
+			t.Fatalf("%d entries, want %d", len(log.Entries), want)
 		}
-		if i == n-1 {
-			r := who
-			r.NS = "n"
-			mk := func(name string) Item {
-				return Item{Resource: name, IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"name": name}}}}}}
+		// Authentication is disabled: entries appended together record
+		// "grant": null like the others (§1, §7.4).
+		for i, m := range log.Entries {
+			if g, has := m["grant"]; !has || g != nil {
+				t.Fatalf("entry %d: %v", i, m)
 			}
-			return e.Batch(context.Background(), r, []Item{mk(fmt.Sprint("c", i)), mk(fmt.Sprint("d", i))}, nil, nil, false)
 		}
-		return write(e, "n", fmt.Sprint("c", i), "", i)
 	})
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-	}
-	if got := sizes(); len(got) != 1 || got[0] != n {
-		t.Fatalf("group sizes %v, want one of %d", got, n)
-	}
-	if got := e.groups.committed.Load() - before; got != 1 {
-		t.Fatalf("%d groups committed, want 1", got)
-	}
-	xids := checkChain(t, e, "n")
-	xid := ""
-	seen := map[string]bool{}
-	for i, r := range res {
-		if r.Status != 201 || r.Replayed || (r.Entry == nil) != (i == n-1) {
-			t.Fatalf("write %d: %+v", i, r)
-		}
-		if seen[r.NSID] {
-			t.Fatalf("write %d answered with entry %s twice", i, r.NSID)
-		}
-		seen[r.NSID] = true
-		x, ok := xids[r.NSID]
-		if !ok {
-			t.Fatalf("write %d's entry %s isn't in the chain", i, r.NSID)
-		}
-		if xid != "" && x != xid {
-			t.Fatalf("write %d committed in transaction %s, the others in %s", i, x, xid)
-		}
-		xid = x
-		for _, it := range r.Items {
-			hd, err := e.ResourceHead(context.Background(), "n", it.Resource, who.Cred)
-			if err != nil || hd.Head != it.IDs[0] {
-				t.Fatalf("%s: head %+v %v, want %s", it.Resource, hd, err, it.IDs[0])
-			}
-		}
-	}
-	log, err := e.NamespaceLog(context.Background(), "n", "", "", 0, who.Cred)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := 1 + 3 + n; len(log.Entries) != want {
-		t.Fatalf("%d entries, want %d", len(log.Entries), want)
-	}
-	// Authentication is disabled: entries appended together record
-	// "grant": null like the others (§1, §7.4).
-	for i, m := range log.Entries {
-		if g, has := m["grant"]; !has || g != nil {
-			t.Fatalf("entry %d: %v", i, m)
-		}
-	}
 }
 
 // A write of a group whose resource an earlier write of the same group
 // writes is left out and answered alone, here 412 with the new head; the
 // rest of the group commits.
-func TestPGGroupCommitMovedHead(t *testing.T) {
-	e := groupEngine(t)
-	mkNS(t, e, "n", map[string]any{"read": "public"})
-	h, err := put(e, "n", "s", "", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sizes := groupSizes(e)
-	alone := e.groups.alone.Load()
-	holdChecked(t, e, 4, nil)
-	res, errs := concurrently(4, func(i int) (*WriteResult, error) {
-		if i < 2 {
-			return write(e, "n", "s", h, 100+i) // the same head, different content
+func TestGroupCommitMovedHead(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		e := groupEngineOn(t, db(t))
+		mkNS(t, e, "n", map[string]any{"read": "public"})
+		h, err := put(e, "n", "s", "", 0)
+		if err != nil {
+			t.Fatal(err)
 		}
-		return write(e, "n", fmt.Sprint("c", i), "", i)
+		sizes := groupSizes(e)
+		alone := e.groups.alone.Load()
+		holdChecked(t, e, 4, nil)
+		res, errs := concurrently(4, func(i int) (*WriteResult, error) {
+			if i < 2 {
+				return write(e, "n", "s", h, 100+i) // the same head, different content
+			}
+			return write(e, "n", fmt.Sprint("c", i), "", i)
+		})
+		if got := sizes(); len(got) != 1 || got[0] != 4 {
+			t.Fatalf("group sizes %v, want one of 4", got)
+		}
+		win := 0
+		if errs[0] != nil {
+			win = 1
+		}
+		if errs[win] != nil || status(errs[1-win]) != 412 {
+			t.Fatalf("the writes of s: %v, %v", errs[0], errs[1])
+		}
+		var ae *Error
+		errors.As(errs[1-win], &ae)
+		if ae.Body["head"] != res[win].Items[0].IDs[0] {
+			t.Fatalf("412 names %v, the winner is %s", ae.Body["head"], res[win].Items[0].IDs[0])
+		}
+		if errs[2] != nil || errs[3] != nil {
+			t.Fatalf("the other writes: %v, %v", errs[2], errs[3])
+		}
+		if got := e.groups.alone.Load() - alone; got != 1 {
+			t.Fatalf("%d writes answered alone, want 1", got)
+		}
+		xids := checkChain(t, e, "n")
+		if x := xids[res[win].NSID]; x == "" || x != xids[res[2].NSID] || x != xids[res[3].NSID] {
+			t.Fatalf("the group's writes committed apart: %v", xids)
+		}
+		log, err := e.NamespaceLog(context.Background(), "n", "", "", 0, who.Cred)
+		if err != nil || len(log.Entries) != 1+1+3 {
+			t.Fatalf("log: %v %v", log, err)
+		}
 	})
-	if got := sizes(); len(got) != 1 || got[0] != 4 {
-		t.Fatalf("group sizes %v, want one of 4", got)
-	}
-	win := 0
-	if errs[0] != nil {
-		win = 1
-	}
-	if errs[win] != nil || status(errs[1-win]) != 412 {
-		t.Fatalf("the writes of s: %v, %v", errs[0], errs[1])
-	}
-	var ae *Error
-	errors.As(errs[1-win], &ae)
-	if ae.Body["head"] != res[win].Items[0].IDs[0] {
-		t.Fatalf("412 names %v, the winner is %s", ae.Body["head"], res[win].Items[0].IDs[0])
-	}
-	if errs[2] != nil || errs[3] != nil {
-		t.Fatalf("the other writes: %v, %v", errs[2], errs[3])
-	}
-	if got := e.groups.alone.Load() - alone; got != 1 {
-		t.Fatalf("%d writes answered alone, want 1", got)
-	}
-	xids := checkChain(t, e, "n")
-	if x := xids[res[win].NSID]; x == "" || x != xids[res[2].NSID] || x != xids[res[3].NSID] {
-		t.Fatalf("the group's writes committed apart: %v", xids)
-	}
-	log, err := e.NamespaceLog(context.Background(), "n", "", "", 0, who.Cred)
-	if err != nil || len(log.Entries) != 1+1+3 {
-		t.Fatalf("log: %v %v", log, err)
-	}
 }
 
 // The same write twice in one group: the second finds the first, which
 // committed with the group, and is answered as its idempotent retry
 // (§7.2).
-func TestPGGroupCommitIdempotentRetry(t *testing.T) {
-	e := groupEngine(t)
-	mkNS(t, e, "n", map[string]any{"read": "public"})
-	h, err := put(e, "n", "s", "", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sizes := groupSizes(e)
-	holdChecked(t, e, 3, nil)
-	res, errs := concurrently(3, func(i int) (*WriteResult, error) {
-		if i < 2 {
-			return write(e, "n", "s", h, 7) // the same write
-		}
-		return write(e, "n", "c", "", 1)
-	})
-	for i, err := range errs {
+func TestGroupCommitIdempotentRetry(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		e := groupEngineOn(t, db(t))
+		mkNS(t, e, "n", map[string]any{"read": "public"})
+		h, err := put(e, "n", "s", "", 0)
 		if err != nil {
-			t.Fatalf("write %d: %v", i, err)
+			t.Fatal(err)
 		}
-	}
-	if got := sizes(); len(got) != 1 || got[0] != 3 {
-		t.Fatalf("group sizes %v, want one of 3", got)
-	}
-	first, retry := res[0], res[1]
-	if first.Replayed {
-		first, retry = retry, first
-	}
-	if first.Replayed || first.Status != 201 || !retry.Replayed || retry.Status != 200 {
-		t.Fatalf("want one write and its retry: %+v, %+v", res[0], res[1])
-	}
-	if retry.Items[0].IDs[0] != first.Items[0].IDs[0] || retry.NSID != first.NSID {
-		t.Fatalf("the retry answers %v %s, the write %v %s", retry.Items[0].IDs, retry.NSID, first.Items[0].IDs, first.NSID)
-	}
-	xids := checkChain(t, e, "n")
-	if xids[first.NSID] != xids[res[2].NSID] {
-		t.Fatalf("the group's writes committed apart: %v", xids)
-	}
-	log, err := e.NamespaceLog(context.Background(), "n", "", "", 0, who.Cred)
-	if err != nil || len(log.Entries) != 1+1+2 {
-		t.Fatalf("log: %v %v", log, err)
-	}
+		sizes := groupSizes(e)
+		holdChecked(t, e, 3, nil)
+		res, errs := concurrently(3, func(i int) (*WriteResult, error) {
+			if i < 2 {
+				return write(e, "n", "s", h, 7) // the same write
+			}
+			return write(e, "n", "c", "", 1)
+		})
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("write %d: %v", i, err)
+			}
+		}
+		if got := sizes(); len(got) != 1 || got[0] != 3 {
+			t.Fatalf("group sizes %v, want one of 3", got)
+		}
+		first, retry := res[0], res[1]
+		if first.Replayed {
+			first, retry = retry, first
+		}
+		if first.Replayed || first.Status != 201 || !retry.Replayed || retry.Status != 200 {
+			t.Fatalf("want one write and its retry: %+v, %+v", res[0], res[1])
+		}
+		if retry.Items[0].IDs[0] != first.Items[0].IDs[0] || retry.NSID != first.NSID {
+			t.Fatalf("the retry answers %v %s, the write %v %s", retry.Items[0].IDs, retry.NSID, first.Items[0].IDs, first.NSID)
+		}
+		xids := checkChain(t, e, "n")
+		if xids[first.NSID] != xids[res[2].NSID] {
+			t.Fatalf("the group's writes committed apart: %v", xids)
+		}
+		log, err := e.NamespaceLog(context.Background(), "n", "", "", 0, who.Cred)
+		if err != nil || len(log.Entries) != 1+1+2 {
+			t.Fatalf("log: %v %v", log, err)
+		}
+	})
 }
 
 // A config change that commits between a group's checks and its
 // transaction: every write's re-check fails, and each is checked again
 // against the new configuration (D.3), which here allows it, and there
 // refuses it.
-func TestPGGroupCommitConfigRace(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		change map[string]any
-		status int // 0: the writes succeed
-	}{
-		{"allowed", map[string]any{"op": "add", "path": "/limits", "value": map[string]any{"documentSize": float64(1 << 20)}}, 0},
-		{"refused", map[string]any{"op": "add", "path": "/frozen", "value": true}, 409},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			e := groupEngine(t)
-			cfg := mkNS(t, e, "n", map[string]any{"read": "public"})
-			sizes := groupSizes(e)
-			alone := e.groups.alone.Load()
-			holdChecked(t, e, 3, func() {
-				r := who
-				r.NS = "n"
-				if _, err := e.WriteConfig(context.Background(), r, ConfigChange{IfMatch: cfg, Patches: []any{tc.change}}); err != nil {
-					t.Error(err)
+func TestGroupCommitConfigRace(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		for _, tc := range []struct {
+			name   string
+			change map[string]any
+			status int // 0: the writes succeed
+		}{
+			{"allowed", map[string]any{"op": "add", "path": "/limits", "value": map[string]any{"documentSize": float64(1 << 20)}}, 0},
+			{"refused", map[string]any{"op": "add", "path": "/frozen", "value": true}, 409},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				e := groupEngineOn(t, db(t))
+				cfg := mkNS(t, e, "n", map[string]any{"read": "public"})
+				sizes := groupSizes(e)
+				alone := e.groups.alone.Load()
+				holdChecked(t, e, 3, func() {
+					r := who
+					r.NS = "n"
+					if _, err := e.WriteConfig(context.Background(), r, ConfigChange{IfMatch: cfg, Patches: []any{tc.change}}); err != nil {
+						t.Error(err)
+					}
+				})
+				_, errs := concurrently(3, func(i int) (*WriteResult, error) { return write(e, "n", fmt.Sprint("c", i), "", i) })
+				for i, err := range errs {
+					if status(err) != tc.status && !(tc.status == 0 && err == nil) {
+						t.Fatalf("write %d: %v, want status %d", i, err, tc.status)
+					}
+				}
+				if got := sizes(); len(got) != 1 || got[0] != 3 {
+					t.Fatalf("group sizes %v, want one of 3", got)
+				}
+				if got := e.groups.alone.Load() - alone; got != 3 {
+					t.Fatalf("%d writes answered alone, want 3", got)
+				}
+				checkChain(t, e, "n")
+				log, err := e.NamespaceLog(context.Background(), "n", "", "", 0, who.Cred)
+				want := 2 + 3
+				if tc.status != 0 {
+					want = 2
+				}
+				if err != nil || len(log.Entries) != want {
+					t.Fatalf("log: %d entries (%v), want %d", len(log.Entries), err, want)
 				}
 			})
-			_, errs := concurrently(3, func(i int) (*WriteResult, error) { return write(e, "n", fmt.Sprint("c", i), "", i) })
-			for i, err := range errs {
-				if status(err) != tc.status && !(tc.status == 0 && err == nil) {
-					t.Fatalf("write %d: %v, want status %d", i, err, tc.status)
-				}
-			}
-			if got := sizes(); len(got) != 1 || got[0] != 3 {
-				t.Fatalf("group sizes %v, want one of 3", got)
-			}
-			if got := e.groups.alone.Load() - alone; got != 3 {
-				t.Fatalf("%d writes answered alone, want 3", got)
-			}
-			checkChain(t, e, "n")
-			log, err := e.NamespaceLog(context.Background(), "n", "", "", 0, who.Cred)
-			want := 2 + 3
-			if tc.status != 0 {
-				want = 2
-			}
-			if err != nil || len(log.Entries) != want {
-				t.Fatalf("log: %d entries (%v), want %d", len(log.Entries), err, want)
-			}
-		})
-	}
+		}
+	})
 }
 
 // An error that aborts the group's transaction (a deadlock or a
@@ -1015,300 +1062,313 @@ func queueInOrder(t *testing.T, e *Engine, writes []func() (*WriteResult, error)
 // writes are left out and answered alone; the others commit together, their
 // entries in queue order. Here B1 writes y, B2 y and z, B3 z: B1 and B3
 // commit, and B2 is answered 412.
-func TestPGGroupCommitSharedResources(t *testing.T) {
-	e := groupEngine(t)
-	mkNS(t, e, "n", map[string]any{"read": "public"})
-	hy, err := put(e, "n", "y", "", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hz, err := put(e, "n", "z", "", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sizes := groupSizes(e)
-	alone := e.groups.alone.Load()
-	res, errs := queueInOrder(t, e, []func() (*WriteResult, error){
-		func() (*WriteResult, error) { return write(e, "n", "y", hy, 1) },
-		func() (*WriteResult, error) {
-			r := who
-			r.NS = "n"
-			step := []Step{{Patches: []any{map[string]any{"op": "replace", "path": "/n", "value": 2.0}}}}
-			return e.Batch(context.Background(), r, []Item{{Resource: "y", IfMatch: hy, Steps: step}, {Resource: "z", IfMatch: hz, Steps: step}}, nil, nil, false)
-		},
-		func() (*WriteResult, error) { return write(e, "n", "z", hz, 3) },
-	})
-	if errs[0] != nil || errs[2] != nil || errs[3] != nil {
-		t.Fatalf("writes: %v", errs)
-	}
-	if status(errs[1]) != 412 {
-		t.Fatalf("B2: %v, want 412", errs[1])
-	}
-	if got := sizes(); len(got) != 1 || got[0] != 4 {
-		t.Fatalf("group attempts %v, want one of 4", got)
-	}
-	if got := e.groups.alone.Load() - alone; got != 1 {
-		t.Fatalf("%d writes answered alone, want 1", got)
-	}
-	xids := checkChain(t, e, "n")
-	if xids[res[0].NSID] != xids[res[2].NSID] {
-		t.Fatalf("B1 and B3 committed apart")
-	}
-	var s1, s3 int64
-	for _, q := range []struct {
-		id  string
-		seq *int64
-	}{{res[0].NSID, &s1}, {res[2].NSID, &s3}} {
-		id, _ := ids.Parse(q.id)
-		if err := e.db.QueryRow(`SELECT seq FROM ns_log WHERE id = $1`, id[:]).Scan(q.seq); err != nil {
+func TestGroupCommitSharedResources(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		e := groupEngineOn(t, db(t))
+		mkNS(t, e, "n", map[string]any{"read": "public"})
+		hy, err := put(e, "n", "y", "", 0)
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	if s1 >= s3 {
-		t.Fatalf("B1's entry at %d, B3's at %d: not in queue order", s1, s3)
-	}
+		hz, err := put(e, "n", "z", "", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sizes := groupSizes(e)
+		alone := e.groups.alone.Load()
+		res, errs := queueInOrder(t, e, []func() (*WriteResult, error){
+			func() (*WriteResult, error) { return write(e, "n", "y", hy, 1) },
+			func() (*WriteResult, error) {
+				r := who
+				r.NS = "n"
+				step := []Step{{Patches: []any{map[string]any{"op": "replace", "path": "/n", "value": 2.0}}}}
+				return e.Batch(context.Background(), r, []Item{{Resource: "y", IfMatch: hy, Steps: step}, {Resource: "z", IfMatch: hz, Steps: step}}, nil, nil, false)
+			},
+			func() (*WriteResult, error) { return write(e, "n", "z", hz, 3) },
+		})
+		if errs[0] != nil || errs[2] != nil || errs[3] != nil {
+			t.Fatalf("writes: %v", errs)
+		}
+		if status(errs[1]) != 412 {
+			t.Fatalf("B2: %v, want 412", errs[1])
+		}
+		if got := sizes(); len(got) != 1 || got[0] != 4 {
+			t.Fatalf("group attempts %v, want one of 4", got)
+		}
+		if got := e.groups.alone.Load() - alone; got != 1 {
+			t.Fatalf("%d writes answered alone, want 1", got)
+		}
+		xids := checkChain(t, e, "n")
+		if xids[res[0].NSID] != xids[res[2].NSID] {
+			t.Fatalf("B1 and B3 committed apart")
+		}
+		var s1, s3 int64
+		for _, q := range []struct {
+			id  string
+			seq *int64
+		}{{res[0].NSID, &s1}, {res[2].NSID, &s3}} {
+			id, _ := ids.Parse(q.id)
+			if err := e.db.QueryRow(`SELECT seq FROM ns_log WHERE id = $1`, id[:]).Scan(q.seq); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if s1 >= s3 {
+			t.Fatalf("B1's entry at %d, B3's at %d: not in queue order", s1, s3)
+		}
+	})
 }
 
 // Two writes of one principal (root sub) under grants signed by different
 // namespace keys, appended together: each entry records its own grant
 // (§7.4), whose root kid merge tools and the janitor match against
 // merge.authors (§F.3).
-func TestPGGroupCommitKidPerWrite(t *testing.T) {
-	opPub, opPriv := grant.GenerateKey()
-	ops, err := grant.ParseKeys(jsonv.FromGo([]any{map[string]any{"kid": "operator", "alg": "ed25519", "pub": opPub, "can": []any{"*"}}}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	lim := DefaultLimits()
-	fast := Rate{1e9, 1e9}
-	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e, err := Open(Options{Path: pgtest.NewDB(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1,
-		Limits: lim, TailInterval: tailEvery, Purger: discardPurger{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { e.Close() })
-	e.noSolo = true
-	e.opt.GroupCommitWait = 5 * time.Second
-	exp := time.Now().Add(time.Hour).Format(time.RFC3339)
-	mint := func(priv ed25519.PrivateKey, root map[string]any) string {
-		g, err := grant.Mint(root, priv)
+func TestGroupCommitKidPerWrite(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		opPub, opPriv := grant.GenerateKey()
+		ops, err := grant.ParseKeys(jsonv.FromGo([]any{map[string]any{"kid": "operator", "alg": "ed25519", "pub": opPub, "can": []any{"*"}}}))
 		if err != nil {
 			t.Fatal(err)
 		}
-		return g.Encode()
-	}
-	pub1, priv1 := grant.GenerateKey()
-	pub2, priv2 := grant.GenerateKey()
-	opG := mint(opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"n"}, "can": []any{"config"}, "exp": exp})
-	can := []any{"read", "create", "append"}
-	doc := map[string]any{"read": "public", "keys": []any{
-		map[string]any{"kid": "k1", "alg": "ed25519", "pub": pub1, "can": can},
-		map[string]any{"kid": "k2", "alg": "ed25519", "pub": pub2, "can": can},
-	}}
-	if _, err := e.WriteConfig(context.Background(), Request{NS: "n", Cred: Credentials{Bearer: opG}}, ConfigChange{IfNoneMatch: true, Patches: []any{map[string]any{"op": "add", "path": "", "value": doc}}}); err != nil {
-		t.Fatal(err)
-	}
-	grants := []string{
-		mint(priv1, map[string]any{"kid": "k1", "sub": "svc:merge", "ns": []any{"n"}, "can": can, "exp": exp}),
-		mint(priv2, map[string]any{"kid": "k2", "sub": "svc:merge", "ns": []any{"n"}, "can": can, "exp": exp}),
-	}
-	sizes := groupSizes(e)
-	holdChecked(t, e, 2, nil)
-	res, errs := concurrently(2, func(i int) (*WriteResult, error) {
-		it := Item{Resource: fmt.Sprint("c", i), IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"n": float64(i)}}}}}}
-		return e.WriteResource(context.Background(), Request{NS: "n", Cred: Credentials{Bearer: grants[i]}}, it)
+		lim := DefaultLimits()
+		fast := Rate{1e9, 1e9}
+		lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
+		e, err := Open(Options{Path: db(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1,
+			Limits: lim, TailInterval: tailEvery, Purger: discardPurger{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { e.Close() })
+		tickClock(e)
+		e.noSolo = true
+		e.opt.GroupCommitWait = 5 * time.Second
+		exp := time.Now().Add(time.Hour).Format(time.RFC3339)
+		mint := func(priv ed25519.PrivateKey, root map[string]any) string {
+			g, err := grant.Mint(root, priv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return g.Encode()
+		}
+		pub1, priv1 := grant.GenerateKey()
+		pub2, priv2 := grant.GenerateKey()
+		opG := mint(opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"n"}, "can": []any{"config"}, "exp": exp})
+		can := []any{"read", "create", "append"}
+		doc := map[string]any{"read": "public", "keys": []any{
+			map[string]any{"kid": "k1", "alg": "ed25519", "pub": pub1, "can": can},
+			map[string]any{"kid": "k2", "alg": "ed25519", "pub": pub2, "can": can},
+		}}
+		if _, err := e.WriteConfig(context.Background(), Request{NS: "n", Cred: Credentials{Bearer: opG}}, ConfigChange{IfNoneMatch: true, Patches: []any{map[string]any{"op": "add", "path": "", "value": doc}}}); err != nil {
+			t.Fatal(err)
+		}
+		grants := []string{
+			mint(priv1, map[string]any{"kid": "k1", "sub": "svc:merge", "ns": []any{"n"}, "can": can, "exp": exp}),
+			mint(priv2, map[string]any{"kid": "k2", "sub": "svc:merge", "ns": []any{"n"}, "can": can, "exp": exp}),
+		}
+		sizes := groupSizes(e)
+		holdChecked(t, e, 2, nil)
+		res, errs := concurrently(2, func(i int) (*WriteResult, error) {
+			it := Item{Resource: fmt.Sprint("c", i), IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"n": float64(i)}}}}}}
+			return e.WriteResource(context.Background(), Request{NS: "n", Cred: Credentials{Bearer: grants[i]}}, it)
+		})
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("write %d: %v", i, err)
+			}
+		}
+		if got := sizes(); len(got) != 1 || got[0] != 2 {
+			t.Fatalf("group attempts %v, want one of 2", got)
+		}
+		xids := checkChain(t, e, "n")
+		if xids[res[0].NSID] != xids[res[1].NSID] {
+			t.Fatalf("the writes committed apart")
+		}
+		for i, r := range res {
+			var kid string
+			id, _ := ids.Parse(r.NSID)
+			if err := e.db.QueryRow(`SELECT g.root_kid FROM ns_log l JOIN grants g ON g.id = l.grant_id WHERE l.id = $1`, id[:]).Scan(&kid); err != nil {
+				t.Fatal(err)
+			}
+			if want := []string{"k1", "k2"}[i]; kid != want {
+				t.Errorf("write %d under a grant of %s recorded kid %s", i, want, kid)
+			}
+		}
 	})
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-	}
-	if got := sizes(); len(got) != 1 || got[0] != 2 {
-		t.Fatalf("group attempts %v, want one of 2", got)
-	}
-	xids := checkChain(t, e, "n")
-	if xids[res[0].NSID] != xids[res[1].NSID] {
-		t.Fatalf("the writes committed apart")
-	}
-	for i, r := range res {
-		var kid string
-		id, _ := ids.Parse(r.NSID)
-		if err := e.db.QueryRow(`SELECT g.root_kid FROM ns_log l JOIN grants g ON g.id = l.grant_id WHERE l.id = $1`, id[:]).Scan(&kid); err != nil {
-			t.Fatal(err)
-		}
-		if want := []string{"k1", "k2"}[i]; kid != want {
-			t.Errorf("write %d under a grant of %s recorded kid %s", i, want, kid)
-		}
-	}
 }
 
 // Writes that attach blobs (§7.8) are inserted with the group's others.
-func TestPGGroupCommitBlobWrites(t *testing.T) {
-	e := groupEngine(t)
-	mkNS(t, e, "n", map[string]any{"read": "public"})
-	data := [][]byte{[]byte("hello blob"), []byte("hello blob 2")}
-	bids := []string{uploadBlob(t, e, "n", "b0", data[0]), uploadBlob(t, e, "n", "b1", data[1])}
-	sizes := groupSizes(e)
-	alone := e.groups.alone.Load()
-	holdChecked(t, e, 4, nil)
-	res, errs := concurrently(4, func(i int) (*WriteResult, error) {
-		if i < 2 {
-			r := who
-			r.NS = "n"
-			doc := map[string]any{"b": map[string]any{"$blob": bids[i], "type": "text/plain", "size": float64(len(data[i]))}}
-			it := Item{Resource: fmt.Sprint("b", i), IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": doc}}}}}
-			return e.WriteResource(context.Background(), r, it)
+func TestGroupCommitBlobWrites(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		e := groupEngineOn(t, db(t))
+		mkNS(t, e, "n", map[string]any{"read": "public"})
+		data := [][]byte{[]byte("hello blob"), []byte("hello blob 2")}
+		bids := []string{uploadBlob(t, e, "n", "b0", data[0]), uploadBlob(t, e, "n", "b1", data[1])}
+		sizes := groupSizes(e)
+		alone := e.groups.alone.Load()
+		holdChecked(t, e, 4, nil)
+		res, errs := concurrently(4, func(i int) (*WriteResult, error) {
+			if i < 2 {
+				r := who
+				r.NS = "n"
+				doc := map[string]any{"b": map[string]any{"$blob": bids[i], "type": "text/plain", "size": float64(len(data[i]))}}
+				it := Item{Resource: fmt.Sprint("b", i), IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": doc}}}}}
+				return e.WriteResource(context.Background(), r, it)
+			}
+			return write(e, "n", fmt.Sprint("c", i), "", i)
+		})
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("write %d: %v", i, err)
+			}
 		}
-		return write(e, "n", fmt.Sprint("c", i), "", i)
+		if got := sizes(); len(got) != 1 || got[0] != 4 {
+			t.Fatalf("group attempts %v, want one of 4", got)
+		}
+		if got := e.groups.alone.Load() - alone; got != 0 {
+			t.Fatalf("%d writes answered alone, want none", got)
+		}
+		xids := checkChain(t, e, "n")
+		for i, r := range res {
+			if xids[r.NSID] != xids[res[0].NSID] {
+				t.Fatalf("write %d committed apart", i)
+			}
+		}
+		var refs, pending int
+		if err := e.db.QueryRow(`SELECT (SELECT COUNT(*) FROM blob_refs WHERE to_seq IS NULL), (SELECT COUNT(*) FROM blob_pending)`).Scan(&refs, &pending); err != nil {
+			t.Fatal(err)
+		}
+		if refs != 2 || pending != 0 {
+			t.Fatalf("%d blob_refs and %d pending blobs, want 2 and 0", refs, pending)
+		}
 	})
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-	}
-	if got := sizes(); len(got) != 1 || got[0] != 4 {
-		t.Fatalf("group attempts %v, want one of 4", got)
-	}
-	if got := e.groups.alone.Load() - alone; got != 0 {
-		t.Fatalf("%d writes answered alone, want none", got)
-	}
-	xids := checkChain(t, e, "n")
-	for i, r := range res {
-		if xids[r.NSID] != xids[res[0].NSID] {
-			t.Fatalf("write %d committed apart", i)
-		}
-	}
-	var refs, pending int
-	if err := e.db.QueryRow(`SELECT (SELECT COUNT(*) FROM blob_refs WHERE to_seq IS NULL), (SELECT COUNT(*) FROM blob_pending)`).Scan(&refs, &pending); err != nil {
-		t.Fatal(err)
-	}
-	if refs != 2 || pending != 0 {
-		t.Fatalf("%d blob_refs and %d pending blobs, want 2 and 0", refs, pending)
-	}
 }
 
 // A config change of a branch's base between a group's checks and its
 // transaction: the branch writes' re-checks read the base, so each is
 // answered alone, checked again against the new configuration (D.3).
-func TestPGGroupCommitBaseConfigRace(t *testing.T) {
-	e := groupEngine(t)
-	cfg := mkNS(t, e, "n", map[string]any{"read": "public"})
-	r := who
-	r.NS = "n"
-	if _, err := e.CreateBranch(context.Background(), r, BranchRequest{Name: "b", IfNoneMatch: true}); err != nil {
-		t.Fatal(err)
-	}
-	sizes := groupSizes(e)
-	alone := e.groups.alone.Load()
-	holdChecked(t, e, 3, func() {
-		change := map[string]any{"op": "add", "path": "/limits", "value": map[string]any{"documentSize": float64(1 << 20)}}
-		if _, err := e.WriteConfig(context.Background(), r, ConfigChange{IfMatch: cfg, Patches: []any{change}}); err != nil {
-			t.Error(err)
+func TestGroupCommitBaseConfigRace(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		e := groupEngineOn(t, db(t))
+		cfg := mkNS(t, e, "n", map[string]any{"read": "public"})
+		r := who
+		r.NS = "n"
+		if _, err := e.CreateBranch(context.Background(), r, BranchRequest{Name: "b", IfNoneMatch: true}); err != nil {
+			t.Fatal(err)
 		}
+		sizes := groupSizes(e)
+		alone := e.groups.alone.Load()
+		holdChecked(t, e, 3, func() {
+			change := map[string]any{"op": "add", "path": "/limits", "value": map[string]any{"documentSize": float64(1 << 20)}}
+			if _, err := e.WriteConfig(context.Background(), r, ConfigChange{IfMatch: cfg, Patches: []any{change}}); err != nil {
+				t.Error(err)
+			}
+		})
+		_, errs := concurrently(3, func(i int) (*WriteResult, error) { return write(e, "b", fmt.Sprint("c", i), "", i) })
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("write %d: %v", i, err)
+			}
+		}
+		if got := sizes(); len(got) != 1 || got[0] != 3 {
+			t.Fatalf("group attempts %v, want one of 3", got)
+		}
+		if got := e.groups.alone.Load() - alone; got != 3 {
+			t.Fatalf("%d writes answered alone, want 3", got)
+		}
+		checkChain(t, e, "b")
 	})
-	_, errs := concurrently(3, func(i int) (*WriteResult, error) { return write(e, "b", fmt.Sprint("c", i), "", i) })
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-	}
-	if got := sizes(); len(got) != 1 || got[0] != 3 {
-		t.Fatalf("group attempts %v, want one of 3", got)
-	}
-	if got := e.groups.alone.Load() - alone; got != 3 {
-		t.Fatalf("%d writes answered alone, want 3", got)
-	}
-	checkChain(t, e, "b")
 }
 
 // A write of a group answered alone doesn't draw its rate-limit tokens
 // again: here each resource allows one write, and a config change between
 // the checks and the group sends every write down its own path.
-func TestPGGroupCommitAloneDrawsTokensOnce(t *testing.T) {
-	lim := DefaultLimits()
-	fast := Rate{1e9, 1e9}
-	lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast
-	lim.RatePerResource = Rate{1e-9, 1}
-	e, err := Open(Options{Path: pgtest.NewDB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1,
-		Limits: lim, TailInterval: tailEvery, Purger: discardPurger{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { e.Close() })
-	e.noSolo = true
-	e.opt.GroupCommitWait = 5 * time.Second
-	cfg := mkNS(t, e, "n", map[string]any{"read": "public"})
-	alone := e.groups.alone.Load()
-	holdChecked(t, e, 3, func() {
-		r := who
-		r.NS = "n"
-		change := map[string]any{"op": "add", "path": "/limits", "value": map[string]any{"documentSize": float64(1 << 20)}}
-		if _, err := e.WriteConfig(context.Background(), r, ConfigChange{IfMatch: cfg, Patches: []any{change}}); err != nil {
-			t.Error(err)
+func TestGroupCommitAloneDrawsTokensOnce(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		lim := DefaultLimits()
+		fast := Rate{1e9, 1e9}
+		lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast
+		lim.RatePerResource = Rate{1e-9, 1}
+		e, err := Open(Options{Path: db(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1,
+			Limits: lim, TailInterval: tailEvery, Purger: discardPurger{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { e.Close() })
+		e.noSolo = true
+		e.opt.GroupCommitWait = 5 * time.Second
+		cfg := mkNS(t, e, "n", map[string]any{"read": "public"})
+		alone := e.groups.alone.Load()
+		holdChecked(t, e, 3, func() {
+			r := who
+			r.NS = "n"
+			change := map[string]any{"op": "add", "path": "/limits", "value": map[string]any{"documentSize": float64(1 << 20)}}
+			if _, err := e.WriteConfig(context.Background(), r, ConfigChange{IfMatch: cfg, Patches: []any{change}}); err != nil {
+				t.Error(err)
+			}
+		})
+		_, errs := concurrently(3, func(i int) (*WriteResult, error) { return write(e, "n", fmt.Sprint("c", i), "", i) })
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("write %d: %v", i, err)
+			}
+		}
+		if got := e.groups.alone.Load() - alone; got != 3 {
+			t.Fatalf("%d writes answered alone, want 3", got)
+		}
+		// The bucket is empty now.
+		if _, err := write(e, "n", "c0", "", 9); status(err) != 429 {
+			t.Fatalf("a second write of c0: %v, want 429", err)
 		}
 	})
-	_, errs := concurrently(3, func(i int) (*WriteResult, error) { return write(e, "n", fmt.Sprint("c", i), "", i) })
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("write %d: %v", i, err)
-		}
-	}
-	if got := e.groups.alone.Load() - alone; got != 3 {
-		t.Fatalf("%d writes answered alone, want 3", got)
-	}
-	// The bucket is empty now.
-	if _, err := write(e, "n", "c0", "", 9); status(err) != 429 {
-		t.Fatalf("a second write of c0: %v, want 429", err)
-	}
 }
 
 // A write cancelled while queued is never written, and its namespace's
 // state is dropped once idle.
-func TestPGGroupCommitCancelQueued(t *testing.T) {
-	e := groupEngine(t)
-	mkNS(t, e, "n", map[string]any{"read": "public"})
-	release := make(chan struct{})
-	var mu sync.Mutex
-	calls := 0
-	e.opt.BeforeWriteLock = func() {
-		mu.Lock()
-		calls++
-		c := calls
-		mu.Unlock()
-		if c == 1 {
-			<-release
+func TestGroupCommitCancelQueued(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		e := groupEngineOn(t, db(t))
+		mkNS(t, e, "n", map[string]any{"read": "public"})
+		release := make(chan struct{})
+		var mu sync.Mutex
+		calls := 0
+		e.opt.BeforeWriteLock = func() {
+			mu.Lock()
+			calls++
+			c := calls
+			mu.Unlock()
+			if c == 1 {
+				<-release
+			}
 		}
-	}
-	holder := make(chan error, 1)
-	go func() {
-		_, err := put(e, "n", "b", "", 2)
-		holder <- err
-	}()
-	within(t, 5*time.Second, "the holder checks", func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		return calls == 1
+		holder := make(chan error, 1)
+		go func() {
+			_, err := put(e, "n", "b", "", 2)
+			holder <- err
+		}()
+		within(t, 5*time.Second, "the holder checks", func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return calls == 1
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		queuedErr := make(chan error, 1)
+		go func() {
+			_, err := writeCtx(ctx, e, "n", "a", 1)
+			queuedErr <- err
+		}()
+		within(t, 5*time.Second, "the write queues", func() bool { return queued(e, "n") == 1 })
+		cancel()
+		if err := <-queuedErr; !errors.Is(err, context.Canceled) {
+			t.Fatalf("the cancelled write: %v", err)
+		}
+		close(release)
+		if err := <-holder; err != nil {
+			t.Fatal(err)
+		}
+		if xids := checkChain(t, e, "n"); len(xids) != 2 {
+			t.Fatalf("%d entries, want 2", len(xids))
+		}
+		within(t, 5*time.Second, "the namespace's state is dropped", func() bool { return idle(e) })
 	})
-	ctx, cancel := context.WithCancel(context.Background())
-	queuedErr := make(chan error, 1)
-	go func() {
-		_, err := writeCtx(ctx, e, "n", "a", 1)
-		queuedErr <- err
-	}()
-	within(t, 5*time.Second, "the write queues", func() bool { return queued(e, "n") == 1 })
-	cancel()
-	if err := <-queuedErr; !errors.Is(err, context.Canceled) {
-		t.Fatalf("the cancelled write: %v", err)
-	}
-	close(release)
-	if err := <-holder; err != nil {
-		t.Fatal(err)
-	}
-	if xids := checkChain(t, e, "n"); len(xids) != 2 {
-		t.Fatalf("%d entries, want 2", len(xids))
-	}
-	within(t, 5*time.Second, "the namespace's state is dropped", func() bool { return idle(e) })
 }
 
 // A group's transaction waiting for a lock (here its namespace's, held
@@ -1419,42 +1479,44 @@ func TestPGGroupCommitCancelOneOfGroup(t *testing.T) {
 // context haven't run yet (lagCtx holds them back): every request returns
 // its cancellation and nothing is written. A graceful shutdown's timeout
 // cancels a group's requests so (lifecycle).
-func TestPGGroupCommitCancelledBeforeCommit(t *testing.T) {
-	e := groupEngine(t)
-	mkNS(t, e, "n", map[string]any{"read": "public"})
-	const n = 2
-	ctxs := make([]*lagCtx, n)
-	for i := range n {
-		ctxs[i] = newLagCtx()
-		defer ctxs[i].release()
-	}
-	lags := ctxs[0].lags(t)
-	sizes := groupSizes(e)
-	var once sync.Once
-	e.opt.BeforeCommit = func(context.Context) {
-		once.Do(func() {
-			for _, c := range ctxs {
-				c.cancel()
-			}
-		})
-	}
-	holdChecked(t, e, n, nil)
-	res, errs := concurrently(n, func(i int) (*WriteResult, error) {
-		return writeCtx(ctxs[i], e, "n", fmt.Sprint("c", i), i)
-	})
-	lags()
-	if got := sizes(); len(got) != 1 || got[0] != n {
-		t.Fatalf("group attempts %v, want one of %d", got, n)
-	}
-	for i, err := range errs {
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("write %d: %+v, %v", i, res[i], err)
+func TestGroupCommitCancelledBeforeCommit(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		e := groupEngineOn(t, db(t))
+		mkNS(t, e, "n", map[string]any{"read": "public"})
+		const n = 2
+		ctxs := make([]*lagCtx, n)
+		for i := range n {
+			ctxs[i] = newLagCtx()
+			defer ctxs[i].release()
 		}
-	}
-	if xids := checkChain(t, e, "n"); len(xids) != 1 {
-		t.Fatalf("%d entries, want 1 (nothing written)", len(xids))
-	}
-	within(t, 5*time.Second, "the namespace's state is dropped", func() bool { return idle(e) })
+		lags := ctxs[0].lags(t)
+		sizes := groupSizes(e)
+		var once sync.Once
+		e.opt.BeforeCommit = func(context.Context) {
+			once.Do(func() {
+				for _, c := range ctxs {
+					c.cancel()
+				}
+			})
+		}
+		holdChecked(t, e, n, nil)
+		res, errs := concurrently(n, func(i int) (*WriteResult, error) {
+			return writeCtx(ctxs[i], e, "n", fmt.Sprint("c", i), i)
+		})
+		lags()
+		if got := sizes(); len(got) != 1 || got[0] != n {
+			t.Fatalf("group attempts %v, want one of %d", got, n)
+		}
+		for i, err := range errs {
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("write %d: %+v, %v", i, res[i], err)
+			}
+		}
+		if xids := checkChain(t, e, "n"); len(xids) != 1 {
+			t.Fatalf("%d entries, want 1 (nothing written)", len(xids))
+		}
+		within(t, 5*time.Second, "the namespace's state is dropped", func() bool { return idle(e) })
+	})
 }
 
 // A group whose COMMIT fails (a deferred trigger raising once): every write
@@ -1493,58 +1555,62 @@ func TestPGGroupCommitFailedCommit(t *testing.T) {
 
 // A panic (not an error) inside the group's transaction doesn't stop the
 // worker: every write is answered alone, and the state is dropped after.
-func TestPGGroupCommitPanicInGroup(t *testing.T) {
-	e := groupEngine(t)
-	mkNS(t, e, "n", map[string]any{"read": "public"})
-	var once sync.Once
-	e.groupStart = func(t *tx, size int) {
-		once.Do(func() { panic("injected") })
-	}
-	alone := e.groups.alone.Load()
-	const n = 3
-	holdChecked(t, e, n, nil)
-	_, errs := concurrently(n, func(i int) (*WriteResult, error) { return write(e, "n", fmt.Sprint("c", i), "", i) })
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("write %d: %v", i, err)
+func TestGroupCommitPanicInGroup(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		e := groupEngineOn(t, db(t))
+		mkNS(t, e, "n", map[string]any{"read": "public"})
+		var once sync.Once
+		e.groupStart = func(t *tx, size int) {
+			once.Do(func() { panic("injected") })
 		}
-	}
-	if got := e.groups.alone.Load() - alone; got != n {
-		t.Fatalf("%d writes answered alone, want %d", got, n)
-	}
-	if xids := checkChain(t, e, "n"); len(xids) != 1+n {
-		t.Fatalf("%d entries, want %d", len(xids), 1+n)
-	}
-	within(t, 5*time.Second, "the namespace's state is dropped", func() bool { return idle(e) })
+		alone := e.groups.alone.Load()
+		const n = 3
+		holdChecked(t, e, n, nil)
+		_, errs := concurrently(n, func(i int) (*WriteResult, error) { return write(e, "n", fmt.Sprint("c", i), "", i) })
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("write %d: %v", i, err)
+			}
+		}
+		if got := e.groups.alone.Load() - alone; got != n {
+			t.Fatalf("%d writes answered alone, want %d", got, n)
+		}
+		if xids := checkChain(t, e, "n"); len(xids) != 1+n {
+			t.Fatalf("%d entries, want %d", len(xids), 1+n)
+		}
+		within(t, 5*time.Second, "the namespace's state is dropped", func() bool { return idle(e) })
+	})
 }
 
 // A BeforeWriteLock hook that panics, on a write in its check phase or on
 // one on its own, leaves no namespace counted busy.
-func TestPGGroupCommitHookPanic(t *testing.T) {
-	for _, solo := range []bool{false, true} {
-		t.Run(fmt.Sprint("solo=", solo), func(t *testing.T) {
-			e := groupEngine(t)
-			e.noSolo = !solo
-			e.opt.LockedCheckBytes = -1 // a write on its own checks outside the lock, and calls the hook
-			mkNS(t, e, "n", map[string]any{"read": "public"})
-			e.opt.BeforeWriteLock = func() { panic("injected") }
-			func() {
-				defer func() {
-					if recover() == nil {
-						t.Fatal("the hook didn't panic")
-					}
+func TestGroupCommitHookPanic(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		for _, solo := range []bool{false, true} {
+			t.Run(fmt.Sprint("solo=", solo), func(t *testing.T) {
+				e := groupEngineOn(t, db(t))
+				e.noSolo = !solo
+				e.opt.LockedCheckBytes = -1 // a write on its own checks outside the lock, and calls the hook
+				mkNS(t, e, "n", map[string]any{"read": "public"})
+				e.opt.BeforeWriteLock = func() { panic("injected") }
+				func() {
+					defer func() {
+						if recover() == nil {
+							t.Fatal("the hook didn't panic")
+						}
+					}()
+					write(e, "n", "c", "", 1)
 				}()
-				write(e, "n", "c", "", 1)
-			}()
-			if !idle(e) {
-				t.Fatal("the namespace is still counted busy")
-			}
-			e.opt.BeforeWriteLock = nil
-			if _, err := write(e, "n", "c", "", 1); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
+				if !idle(e) {
+					t.Fatal("the namespace is still counted busy")
+				}
+				e.opt.BeforeWriteLock = nil
+				if _, err := write(e, "n", "c", "", 1); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	})
 }
 
 // Writes taken from a namespace's queue, or removed from it, leave its
@@ -1568,6 +1634,215 @@ func TestGroupQueueReleasesWrites(t *testing.T) {
 	for i, w := range s.queue[len(s.queue):cap(s.queue)] {
 		if w != nil {
 			t.Fatalf("the queue's array still holds a write past its end, at %d", len(s.queue)+i)
+		}
+	}
+}
+
+// A group's writes are appended in queue order: their entries' seqs grow
+// along the chain in the order the writes queued, in one transaction.
+func TestGroupCommitChainOrder(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		e := groupEngineOn(t, db(t))
+		mkNS(t, e, "n", map[string]any{"read": "public"})
+		heads := map[string]string{}
+		for _, name := range []string{"a", "b"} {
+			h, err := put(e, "n", name, "", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			heads[name] = h
+		}
+		sizes := groupSizes(e)
+		alone := e.groups.alone.Load()
+		writes := []func() (*WriteResult, error){
+			func() (*WriteResult, error) { return write(e, "n", "b", heads["b"], 1) },
+			func() (*WriteResult, error) { return write(e, "n", "z", "", 2) },
+			func() (*WriteResult, error) {
+				r := who
+				r.NS = "n"
+				mk := func(name string) Item {
+					return Item{Resource: name, IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"name": name}}}}}}
+				}
+				return e.Batch(context.Background(), r, []Item{mk("m"), mk("c")}, nil, nil, false)
+			},
+			func() (*WriteResult, error) { return write(e, "n", "a", heads["a"], 4) },
+			func() (*WriteResult, error) { return write(e, "n", "y", "", 5) },
+		}
+		res, errs := queueInOrder(t, e, writes)
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("write %d: %v", i, err)
+			}
+		}
+		if got := sizes(); len(got) != 1 || got[0] != len(writes)+1 {
+			t.Fatalf("group attempts %v, want one of %d", got, len(writes)+1)
+		}
+		if got := e.groups.alone.Load() - alone; got != 0 {
+			t.Fatalf("%d writes answered alone, want none", got)
+		}
+		xids := checkChain(t, e, "n")
+		seqs := verifyChain(t, e, "n")
+		for i := 1; i < len(res); i++ {
+			if xids[res[i].NSID] != xids[res[0].NSID] {
+				t.Fatalf("write %d committed apart", i)
+			}
+			if seqs[res[i].NSID] <= seqs[res[i-1].NSID] {
+				t.Fatalf("write %d's entry at %d, write %d's at %d: not in queue order", i, seqs[res[i].NSID], i-1, seqs[res[i-1].NSID])
+			}
+		}
+		// The log serves them so, each entry naming its write's resources.
+		log, err := e.NamespaceLog(context.Background(), "n", "", "", 0, who.Cred)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := log.Entries[len(log.Entries)-len(res):]
+		for i, m := range got {
+			if m["id"] != res[i].NSID {
+				t.Fatalf("entry %d of the group is %v, want write %d's %s", i, m["id"], i, res[i].NSID)
+			}
+		}
+	})
+}
+
+// One write of a group whose resource moved after its check fails its
+// re-check and is answered alone, 412 with the new head; the group's
+// other writes commit together, unaffected.
+func TestGroupCommitOneFailsAlone(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		e := groupEngineOn(t, db(t))
+		mkNS(t, e, "n", map[string]any{"read": "public"})
+		heads := make([]string, 4)
+		for i := range heads {
+			h, err := put(e, "n", fmt.Sprint("r", i), "", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			heads[i] = h
+		}
+		// The setup's last worker gone, so the write below finds the
+		// namespace idle and goes on its own.
+		within(t, 5*time.Second, "the namespace idle", func() bool { return idle(e) })
+		sizes := groupSizes(e)
+		alone := e.groups.alone.Load()
+		var moved string
+		holdChecked(t, e, 4, func() {
+			// Every write checked, none queued yet: r1 moves on its own,
+			// past the hook, which holds its lock while this runs.
+			hook := e.opt.BeforeWriteLock
+			e.opt.BeforeWriteLock = nil
+			e.groups.mu.Lock()
+			e.noSolo = false
+			e.groups.mu.Unlock()
+			h, err := put(e, "n", "r1", heads[1], 99)
+			if err != nil {
+				t.Error(err)
+			}
+			moved = h
+			e.groups.mu.Lock()
+			e.noSolo = true
+			e.groups.mu.Unlock()
+			e.opt.BeforeWriteLock = hook
+		})
+		res, errs := concurrently(4, func(i int) (*WriteResult, error) {
+			return write(e, "n", fmt.Sprint("r", i), heads[i], 10+i)
+		})
+		if got := sizes(); len(got) != 1 || got[0] != 4 {
+			t.Fatalf("group attempts %v, want one of 4", got)
+		}
+		if status(errs[1]) != 412 {
+			t.Fatalf("the write of r1: %v, want 412", errs[1])
+		}
+		var ae *Error
+		errors.As(errs[1], &ae)
+		if ae.Body["head"] != moved {
+			t.Fatalf("412 names %v, r1's head is %s", ae.Body["head"], moved)
+		}
+		if got := e.groups.alone.Load() - alone; got != 1 {
+			t.Fatalf("%d writes answered alone, want 1", got)
+		}
+		xids := checkChain(t, e, "n")
+		for _, i := range []int{0, 2, 3} {
+			if errs[i] != nil {
+				t.Fatalf("write %d: %v", i, errs[i])
+			}
+			if xids[res[i].NSID] != xids[res[0].NSID] {
+				t.Fatalf("write %d committed apart", i)
+			}
+			hd, err := e.ResourceHead(context.Background(), "n", fmt.Sprint("r", i), who.Cred)
+			if err != nil || hd.Head != res[i].Items[0].IDs[0] {
+				t.Fatalf("r%d: head %+v %v, want %s", i, hd, err, res[i].Items[0].IDs[0])
+			}
+		}
+		// The rejected write left nothing: 1 config, 4 creates, r1's move, 3.
+		if len(xids) != 1+4+1+3 {
+			t.Fatalf("%d entries, want 9", len(xids))
+		}
+	})
+}
+
+// Two creates of one name in a group: the first in queue order commits,
+// the second fails its re-check against it and is answered alone, 412
+// with the head the first created.
+func TestGroupCommitCreateConflict(t *testing.T) {
+	groupDBs(t, func(t *testing.T, db func(testing.TB) string) {
+		e := groupEngineOn(t, db(t))
+		mkNS(t, e, "n", map[string]any{"read": "public"})
+		alone := e.groups.alone.Load()
+		res, errs := queueInOrder(t, e, []func() (*WriteResult, error){
+			func() (*WriteResult, error) { return write(e, "n", "x", "", 1) },
+			func() (*WriteResult, error) { return write(e, "n", "x", "", 2) },
+			func() (*WriteResult, error) { return write(e, "n", "y", "", 3) },
+		})
+		if errs[0] != nil || errs[2] != nil || errs[3] != nil {
+			t.Fatalf("writes: %v", errs)
+		}
+		if status(errs[1]) != 412 {
+			t.Fatalf("the second create: %v, want 412", errs[1])
+		}
+		var ae *Error
+		errors.As(errs[1], &ae)
+		if ae.Body["head"] != res[0].Items[0].IDs[0] {
+			t.Fatalf("412 names %v, the first create made %s", ae.Body["head"], res[0].Items[0].IDs[0])
+		}
+		if got := e.groups.alone.Load() - alone; got != 1 {
+			t.Fatalf("%d writes answered alone, want 1", got)
+		}
+		xids := checkChain(t, e, "n")
+		if xids[res[0].NSID] != xids[res[2].NSID] || xids[res[0].NSID] != xids[res[3].NSID] {
+			t.Fatal("the group's other writes committed apart")
+		}
+	})
+}
+
+// On SQLite each write of a group is re-checked once the group's earlier
+// writes are in its transaction, rows and entries (appendInTurn): the
+// state it commits on (D.3, invariant 6).
+func TestSQLiteGroupCommitInTurn(t *testing.T) {
+	e := groupEngineOn(t, sqliteFile(t))
+	mkNS(t, e, "n", map[string]any{"read": "public"})
+	const n = 5
+	var mu sync.Mutex
+	var before []int // the namespace's entries in the transaction, at each re-check
+	e.groupMember = func(tx *tx, i int) {
+		var c int
+		tx.must(tx.QueryRow(`SELECT COUNT(*) FROM ns_log`).Scan(&c))
+		mu.Lock()
+		before = append(before, c)
+		mu.Unlock()
+	}
+	holdChecked(t, e, n, nil)
+	_, errs := concurrently(n, func(i int) (*WriteResult, error) { return write(e, "n", fmt.Sprint("c", i), "", i) })
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	if len(before) != n {
+		t.Fatalf("%d writes re-checked in the group, want %d", len(before), n)
+	}
+	for i, c := range before {
+		if c != 1+i {
+			t.Fatalf("write %d of the group re-checked with %d entries in the transaction, want %d", i, c, 1+i)
 		}
 	}
 }

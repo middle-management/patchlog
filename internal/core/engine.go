@@ -128,10 +128,11 @@ type Options struct {
 	// transaction of its own (D.3), saving that transaction's and the
 	// re-check's round trips. Zero means every write; negative, none.
 	LockedCheckBytes int
-	// GroupCommit: on Postgres, at most how many checked resource writes
-	// and batches of one namespace one transaction appends and commits at
-	// once (group commit, D.8; groupcommit.go). Zero means 32; 1 or less
-	// turns group commit off, so every write commits on its own.
+	// GroupCommit: at most how many checked resource writes and batches
+	// of one namespace one transaction appends and commits at once (group
+	// commit, D.8; on SQLite under its single writer, D.3; groupcommit.go).
+	// Zero means 32; 1 or less turns group commit off, so every write
+	// commits on its own.
 	GroupCommit int
 	// FullValidation validates the whole document on every write. By
 	// default a patch to a document this engine has validated against the
@@ -241,6 +242,9 @@ type Options struct {
 	// migrations, if not nil, replaces the embedded migrations (tests of
 	// a database an earlier version left).
 	migrations fs.FS
+	// walLimitFrames, if not 0, replaces the constant of that name
+	// (checkpoint.go, tests).
+	walLimitFrames int64
 }
 
 // Purger purges CDN cache tags.
@@ -337,11 +341,15 @@ type Engine struct {
 	// groups' transactions take (on Postgres), and for tests, noSolo
 	// queues even a write that finds its namespace idle, groupStart is
 	// called in a group's transaction once it holds its locks, and
-	// groupMember before each of its writes' entries is appended.
+	// groupMember before each of its writes' entries is appended (on
+	// SQLite, before each is re-checked).
 	groups  groups
 	commits *commitPool
-	// wal counts the WAL checkpoints of a SQLite file (checkpoint.go).
+	// wal counts the WAL checkpoints of a SQLite file (checkpoint.go), and
+	// lockTimes the time its write transactions waited for and held
+	// Engine.mu.
 	wal         walStats
+	lockTimes   lockTimes
 	noSolo      bool
 	groupStart  func(t *tx, size int)
 	groupMember func(t *tx, i int)
@@ -447,6 +455,9 @@ func Open(opt Options) (*Engine, error) {
 	if opt.CheckpointInterval == 0 {
 		opt.CheckpointInterval = defaultCheckpointInterval
 	}
+	if opt.walLimitFrames == 0 {
+		opt.walLimitFrames = walLimitFrames
+	}
 	if err := checkStoreCompression(&opt); err != nil {
 		return nil, err
 	}
@@ -542,7 +553,7 @@ func Open(opt Options) (*Engine, error) {
 			return nil, err
 		}
 	}
-	if e.grouping() {
+	if pg && e.grouping() {
 		// The group commits' own connections (groupcommit.go).
 		if e.commits, err = openCommitPool(opt.Path); err != nil {
 			e.rate.close()
@@ -948,8 +959,14 @@ func (e *Engine) update(ctx context.Context, f func(t *tx) error) (err error) {
 func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []string, err error) {
 	if !e.pg {
 		e.stmts.prepare(e.db)
+		start := time.Now()
 		e.mu.Lock()
-		defer e.mu.Unlock()
+		locked := time.Now()
+		defer func() {
+			held := time.Since(locked)
+			e.mu.Unlock()
+			e.lockTimes.note(locked.Sub(start), held)
+		}()
 		return e.updateOnce(ctx, f, nil, nil)
 	}
 	// Postgres: advisory locks instead of the mutex (pglock.go). A
@@ -1042,7 +1059,11 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 	}
 	e.rc.begin(inv)
 	committing = true
+	began := time.Now()
 	err = sqlTx.Commit()
+	if !e.pg {
+		e.lockTimes.noteCommit(time.Since(began))
+	}
 	if err != nil {
 		// Whether it committed may be unknown (a lost connection): the
 		// files it stored are left to the sweep.
