@@ -306,9 +306,17 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			return nil
 		}
 		if byDoc {
-			// Readable where a visible revision of epoch ep references
-			// it; otherwise a read-rule failure (§7.9 Content, §7.8).
+			// Served under ep where a revision the request may read of
+			// epoch ep references it (§E.2.2 Epochs, v0.90). Under a
+			// view's prefix any other is a read-rule failure (§7.9
+			// Content, §7.8); at the blob's own URL it is an epoch not
+			// served, 404 with no-store, so no reader learns the epoch
+			// of a revision hidden from it.
 			if eps, all := t.visibleBlobEpochs(a, n, name, bid); !all && !eps[ep] {
+				if a.view == "" {
+					out.Status, out.NoStore = 404, true
+					return nil
+				}
 				return notFound()
 			}
 		}

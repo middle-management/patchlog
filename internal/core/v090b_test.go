@@ -105,3 +105,44 @@ func TestV090BFilteredAnswersNoKeysOfPurged(t *testing.T) {
 		t.Errorf("%d view keys of purged derby stored", stored)
 	}
 }
+
+// v0.90 §E.2.2 Epochs ("Served epochs are those of the revisions here
+// whose documents are still stored, that reference the blob and that the
+// request may read"; CONFORMANCE ENC-29, Filtered reads 92): li is sent
+// to the epoch of v1, which she may read, never to that of hidden v3; v3's
+// epoch at the unprefixed URL is 404 with no-store for her grant, as any
+// epoch not served, where it was a read-rule failure before v0.90. An
+// unrestricted reader is sent to v3's.
+func TestV090BBlobEpochsOfReadableRevisions(t *testing.T) {
+	w := newV75World(t, v75Opts{})
+	ctx := context.Background()
+	w.patchConfig("matches", map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}})
+	data := []byte("shared blob")
+	bid, nonce := advUpload(t, w, "derby", data)
+	v89Put(w, "derby", map[string]any{"team": "a", "title": "v1", "b": advRef(bid, nonce, data)})
+	w.patchConfig("matches", map[string]any{"op": "replace", "path": "/encryption", "value": map[string]any{"level": "sealed", "epoch": 2.0}})
+	v89Put(w, "derby", map[string]any{"team": "b", "secret": "S", "b": advRef(bid, nonce, data)})
+	if b, err := w.e.OpenBlob(ctx, "matches", "derby", bid, w.admin); err != nil || b.Status != 302 || b.Epoch != 2 {
+		t.Fatalf("admin: %+v %v, want 302 to epoch 2", b, err)
+	}
+	li := advDocReader(w)
+	// Her grant at the blob's own URL is sent to its form under her view
+	// (contentRedirect), which sends her to v1's epoch.
+	_, view := v89Key(t, w, li)
+	vc, err := w.e.ViewCredentials(ctx, "matches", view, li)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, err := w.e.OpenBlob(ctx, "matches", "derby", bid, vc); err != nil || b.Status != 302 || b.Epoch != 1 {
+		t.Fatalf("li: %+v %v, want 302 to epoch 1", b, err)
+	}
+	b, err := w.e.OpenSealedBlob(ctx, "matches", "derby", bid, "2", li)
+	if err != nil || b == nil || b.Status != 404 || !b.NoStore {
+		t.Fatalf("li at hidden v3's epoch 2: %+v %v, want 404 with no-store", b, err)
+	}
+	if b, err := w.e.OpenSealedBlob(ctx, "matches", "derby", bid, "1", li); err != nil || b.Status != 200 {
+		t.Fatalf("li at v1's epoch 1: %+v %v", b, err)
+	} else {
+		b.Close()
+	}
+}
