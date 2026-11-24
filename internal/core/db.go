@@ -53,7 +53,9 @@ func openSQLite(path string, fsys fs.FS, before func(db *sql.DB, pg bool) error)
 			return nil, err
 		}
 	}
-	dsn := sqlitedsn.DSN(path, "_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)&_txlock=immediate")
+	// wal_autocheckpoint(0): no checkpoint inside a write's COMMIT; the
+	// engine runs them alongside its writer (checkpoint.go).
+	dsn := sqlitedsn.DSN(path, "_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)&_pragma=wal_autocheckpoint(0)&_txlock=immediate")
 	if path == ":memory:" {
 		dsn = sqlitedsn.DSN(path, "_pragma=foreign_keys(ON)&_pragma=secure_delete(ON)&_txlock=immediate")
 	}

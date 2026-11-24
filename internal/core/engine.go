@@ -150,6 +150,11 @@ type Options struct {
 	// fails. Zero, or less, means DefaultMaxValidationSteps: no
 	// deployment leaves it unbounded.
 	MaxValidationSteps int
+	// CheckpointInterval is how often a SQLite file's WAL is checkpointed,
+	// off the writer's path (checkpoint.go). Zero means 100 ms; negative
+	// runs none while the engine is open, so only Close checkpoints and the
+	// WAL grows with every write (tests).
+	CheckpointInterval time.Duration
 	// GroupCommitWait is at most how long a group waits for writes of its
 	// namespace still in their check phase (zero means 200µs; negative,
 	// no wait). Writes that find no group of their namespace never wait.
@@ -333,8 +338,10 @@ type Engine struct {
 	// queues even a write that finds its namespace idle, groupStart is
 	// called in a group's transaction once it holds its locks, and
 	// groupMember before each of its writes' entries is appended.
-	groups      groups
-	commits     *commitPool
+	groups  groups
+	commits *commitPool
+	// wal counts the WAL checkpoints of a SQLite file (checkpoint.go).
+	wal         walStats
 	noSolo      bool
 	groupStart  func(t *tx, size int)
 	groupMember func(t *tx, i int)
@@ -436,6 +443,9 @@ func Open(opt Options) (*Engine, error) {
 	}
 	if opt.GroupCommitWait == 0 {
 		opt.GroupCommitWait = defaultGroupCommitWait
+	}
+	if opt.CheckpointInterval == 0 {
+		opt.CheckpointInterval = defaultCheckpointInterval
 	}
 	if err := checkStoreCompression(&opt); err != nil {
 		return nil, err
@@ -556,6 +566,10 @@ func Open(opt Options) (*Engine, error) {
 		e.bg.Add(1)
 		go e.tailLoop(s)
 	}
+	if e.checkpointing() {
+		e.bg.Add(1)
+		go e.checkpointLoop(e.opt.CheckpointInterval)
+	}
 	if opt.RetentionInterval > 0 {
 		e.bg.Add(1)
 		go e.retentionLoop(opt.RetentionInterval)
@@ -597,10 +611,17 @@ func Open(opt Options) (*Engine, error) {
 
 // Close stops the background loops and closes the database.
 func (e *Engine) Close() error {
-	e.closeOnce.Do(func() { close(e.stop) })
+	first := false
+	e.closeOnce.Do(func() {
+		close(e.stop)
+		first = true
+	})
 	e.bg.Wait()
 	e.resign()
 	e.stmts.close()
+	if first {
+		e.closeWAL()
+	}
 	err := e.db.Close()
 	e.comp.close()
 	e.rate.close()
