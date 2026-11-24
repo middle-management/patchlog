@@ -273,12 +273,43 @@ func (t *tx) deletePrunedSealed(res, hseq int64, keep map[int64]*revRow) {
 		seqs = append(seqs, s)
 	}
 	rows.Close()
+	var own int64
+	t.must(t.QueryRow(`SELECT ns FROM resources WHERE res = ?`, res).Scan(&own))
 	for _, s := range seqs {
+		t.keepFixedEpoch(own, s)
 		if _, kept := keep[s]; kept {
 			t.deleteSealed(`rev_seq = ? AND kind = ?`, s, sealEntry)
 		} else {
 			t.deleteSealed(`rev_seq = ?`, s)
 		}
+	}
+}
+
+// keepFixedEpoch records, for revision seq of namespace ns about to lose
+// its stored sealings to a prune, the epoch its first sealing in ns fixed
+// where it has none of its own (written before ns was sealed): the epoch
+// stays the revision's once the sealing is gone, so that a reader who may
+// read it is answered its pruned epoch's 410 (§E.2.2 Epochs,
+// visibleBlobEpochs, revEpochFixed). A branch's sealing of a base's
+// revision fixes nothing for the base.
+func (t *tx) keepFixedEpoch(ns, seq int64) {
+	var e int
+	err := t.QueryRow(`SELECT epoch FROM rev_epochs WHERE seq = ?`, seq).Scan(&e)
+	if err == nil {
+		return
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.must(err)
+	}
+	var prefix string
+	err = t.QueryRow(`SELECT substr(jwe, 1, 4096) FROM sealed WHERE ns = ? AND rev_seq = ? AND kind IN ('doc', 'entry', 'keys') ORDER BY created LIMIT 1`, ns, seq).Scan(&prefix)
+	if errors.Is(err, sql.ErrNoRows) {
+		return
+	}
+	t.must(err)
+	if e, ok := jweEpoch(prefix); ok {
+		_, err := t.Exec(`INSERT INTO rev_epochs (seq, epoch) VALUES (?, ?) ON CONFLICT (seq) DO NOTHING`, seq, e)
+		t.must(err)
 	}
 }
 
