@@ -44,7 +44,7 @@ func TestLiveBranchesFrozenColumn(t *testing.T) {
 		t.Helper()
 		var out []string
 		if err := e.read(ctx, func(t *tx) error {
-			rows, err := t.Query(`SELECT name FROM namespaces WHERE frozen <> 0 ORDER BY ns`)
+			rows, err := t.Query(`SELECT name FROM namespaces WHERE frozen <> 0 ORDER BY name`)
 			t.must(err)
 			defer rows.Close()
 			for rows.Next() {
