@@ -35,7 +35,7 @@ func TestMigrateSpanner(t *testing.T) {
 	defer db.Close()
 	ctx := context.Background()
 	for i := 0; i < 2; i++ {
-		if err := MigrateSpanner(ctx, db, os.DirFS("../core"), "patchlog"); err != nil {
+		if err := Migrate(ctx, db, os.DirFS("../core"), "patchlog"); err != nil {
 			t.Fatalf("run %d: %v", i+1, err)
 		}
 	}

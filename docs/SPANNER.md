@@ -47,7 +47,7 @@ PATCHLOG_TEST_SPANNER=spanner://projects/emulator-project/instances/test-instanc
 
 | Postgres (D.8) | Spanner | Where |
 | --- | --- | --- |
-| Schema, `migrations/postgres` through mmmigrate, transactional DDL under an advisory lock | `migrations/spanner`, one baseline equal to Postgres after 031 and 002 for the hotspots, applied by `dbmigrate.MigrateSpanner`: DDL batched (`START BATCH DDL`) outside transactions, every statement `IF NOT EXISTS` so a half-applied migration runs again, recorded in `mmmigrate_applied`; no lock (instances starting together both run it, harmlessly) | `internal/dbmigrate/spanner.go` |
+| Schema, `migrations/postgres` through mmmigrate, transactional DDL under an advisory lock | `migrations/spanner`, one baseline equal to Postgres after 031 and 002 for the hotspots, through mmmigrate's Spanner dialect (`driver/spanner`, unreleased: patchlog pins main's commit): DDL batched outside transactions, a migration's progress kept so a run that died part-way resumes, runs serialised by a lease row (`mmmigrate_lock`), recorded in `mmmigrate_applied` | `internal/dbmigrate` |
 | `smallint` flags and codes | `bigint` (no `int2`); still compared with 0 and 1 | baseline |
 | `UNIQUE` constraints | unique indexes; on nullable columns `WHERE col IS NOT NULL`, since Spanner's unique indexes count NULLs equal | baseline |
 | Partial unique indexes `one_first`, `one_ns_first`, `one_config_genesis` | a stored generated column holding the chain's key on its first row only (`CASE WHEN first = 1 THEN res END`), under a null-filtered unique index: Spanner filters partial indexes on `IS NOT NULL` alone | baseline |
@@ -146,8 +146,8 @@ would change most of it.
 
 ## What the emulator showed
 
-- Migrations apply to an empty database, and again to a migrated one (`TestMigrateSpanner`), in
-  half a second (PGAdapter: several).
+- Migrations apply to an empty database, and again to a migrated one (`TestMigrateSpanner`),
+  through mmmigrate's Spanner dialect in about 6 s (each migration a schema change of its own).
 - `serve --dev` starts. Over HTTP and with the `patchlog` CLI: namespace create and list,
   resource put, patch, get, log, ls, delete and restore, a batch, a branch and a write in it, a
   blob upload and download, a purge, and `watch`, on one instance and across two sharing the
@@ -178,7 +178,7 @@ would change most of it.
 - Real Spanner's limits the emulator may not enforce: statement parameters (`spValues` splits at
   900), mutations per commit (a batch of 1,000 items with history is far below 80,000).
 - Instances sharing a database at scale: the leader lease is timed by each instance's clock;
-  two instances migrating at once.
+  mmmigrate's migration lease under instances starting together.
 - `internal/server` ran in part only (every sixth test); no other package uses the database.
 
 ## What is left
@@ -188,8 +188,8 @@ would change most of it.
   fullness); fine for a test, a hot table at scale.
 - **Round trips** left in a write: the namespace's head `UPDATE` (a mutation would hide the new
   head from the transaction's own later reads), and a chain of bases read a statement per level.
-- **Migration concurrency**: a lease, as for the leader, if instances must not both migrate.
-- **mmmigrate**: a Spanner driver there would replace `dbmigrate.MigrateSpanner`.
+- **mmmigrate**: its Spanner dialect is on main, not released; move to the release once it is
+  out.
 
 ## The capacity bench on real Spanner
 

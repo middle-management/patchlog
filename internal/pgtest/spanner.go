@@ -24,7 +24,7 @@ import (
 // Spanner's databases (SpannerEnv): on the emulator the driver creates a
 // database on the first connection to it, of the PostgreSQL dialect, so a
 // new one is just a new name; on Spanner, the instance must allow it.
-// Applying the schema to one takes seconds (dbmigrate.MigrateSpanner), so,
+// Applying the schema to one takes seconds (mmmigrate's Spanner dialect), so,
 // as on Postgres, a test's database goes back to a pool when it ends,
 // emptied: every table's rows deleted but mmmigrate's, so the next engine
 // finds its migrations applied and only seeds it again. Spanner has no

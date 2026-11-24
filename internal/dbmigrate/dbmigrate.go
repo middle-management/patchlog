@@ -1,7 +1,8 @@
 // Package dbmigrate applies a package's schema migrations with mmmigrate
 // (README, Schema migrations). Each package that owns tables keeps them as
 // numbered migrations in its own migrations directory, one subdirectory
-// per dialect it supports (migrations/sqlite, migrations/postgres),
+// per dialect it supports (migrations/sqlite, migrations/postgres,
+// migrations/spanner),
 // embedded in the binary, and applies them under a namespace of its own,
 // so several packages' tables share a database (the index's holds its
 // own, the edge store's and the repurge queue's) with independent
@@ -22,16 +23,23 @@ import (
 	"io/fs"
 	"testing"
 
+	spannerdriver "github.com/googleapis/go-sql-spanner"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/middle-management/mmmigrate"
 	"github.com/middle-management/mmmigrate/driver/postgres"
+	mmspanner "github.com/middle-management/mmmigrate/driver/spanner"
 	mmsqlite "github.com/middle-management/mmmigrate/driver/sqlite"
 	"modernc.org/sqlite"
+
+	"github.com/middle-management/patchlog/internal/spannerurl"
 )
 
 // Migrate applies the migrations in fsys's directory migrations/<dialect>
 // to db, under namespace, the dialect being db's driver's: sqlite
-// (modernc.org/sqlite) or postgres (pgx). On Postgres the namespace is
+// (modernc.org/sqlite), postgres (pgx) or spanner (go-sql-spanner, a
+// database of Spanner's PostgreSQL dialect: mmmigrate runs its DDL outside
+// transactions, batched, resumes a migration a run left half applied, and
+// serialises runs with a lease row, as Spanner has no locks to take). On Postgres the namespace is
 // scoped by the schema the tables go to (current_schema(), from the
 // search_path): mmmigrate records every schema's migrations in its own
 // schema mmmigrate, so deployments in different schemas of one database
@@ -50,6 +58,9 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, namespace string) erro
 		dialect, name = mmsqlite.Dialect{}, "sqlite"
 	case *stdlib.Driver:
 		dialect, name = postgres.Dialect{}, "postgres"
+	case *spannerdriver.Driver:
+		// Spanner's PostgreSQL dialect, through go-sql-spanner (spannerurl).
+		dialect, name = mmspanner.Dialect{Driver: spannerurl.DriverName}, "spanner"
 	default:
 		return fmt.Errorf("migrating %s: no migrations for driver %T", namespace, d)
 	}
@@ -79,6 +90,16 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, namespace string) erro
 	}
 	if err != nil {
 		return fmt.Errorf("seeding %s: %w", namespace, err)
+	}
+	if name == "spanner" {
+		// One statement at a time, each committed on its own: Spanner
+		// takes one per Exec.
+		for _, q := range splitSQL(string(seed)) {
+			if _, err := db.ExecContext(ctx, q); err != nil {
+				return fmt.Errorf("seeding %s: %w", namespace, err)
+			}
+		}
+		return nil
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
