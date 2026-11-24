@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+Spec v0.90: filtered reads in public namespaces, and the revision's `schema` on namespace
+log head entries; the answers to the reference's notes on v0.89 and a conformance audit.
+
+- **Filtering a public namespace (§7.9).** A grant with read rules is a filter there, taken
+  only under `/ns/{ns}/view/{view}/…`: no credentials is `401`, another namespace or view
+  `403`. Every other read of a public namespace still ignores the grant. View answers are
+  cached as a private namespace's, and view streams and ranges end with the grant or cookie.
+  The exchange gives a public namespace's partial reader its view cookie. In a public sealed
+  namespace such a grant gets its view's `K_view` at `/keys` and opens the revisions its rules
+  allow. The client reads a public namespace through a narrowed grant (`ViewOf`, `ViewLog`,
+  `ViewHeads`).
+- **`schema` on head entries.** A namespace log `head` entry carries its revision's `$schema`,
+  unhashed (entry ids and chains are unchanged); absent for tombstones, documents without
+  `$schema` and at E3. Entries written before carry none. The client filters a log by schema
+  (`SchemaHeads`).
+- **Blob epochs.** A blob's own `/e/{e}` URL is `404` to a reader for an epoch only hidden
+  revisions have.
+- **`ns:{ns}` is purged** by a purge or restore once a view of the namespace has been served,
+  recorded at admission, bearer reads included.
+- **Filtered answers carry no keys** for purged resources' revisions.
+- **A long-poll** whose read check runs out of the wait's budget after its first fetch answers
+  `204` naming `since`, where it answered `403` or `404`.
+- **`"*"` in a narrowing block's `ns` is `401`**, operator grants included.
+- **Index:**
+  - a branch whose bases it doesn't follow is unfollowed: `404` to queries, left out of
+    `/_refs`, and no cookie at the exchange;
+  - an exchange whose namespace document moves is retried up to three times before `503`;
+  - only a `403` cookie's second is skipped for `exp`, so a live cookie's second is shared.
+- **Client:** a filtered answer's `pl.view` must be the view `/keys` gave.
+- **Releases:** replanning reports the documents step 3 no longer carries.
+- **Migrations:**
+  - `030_filtered_served` on SQLite, `032_…` on Postgres: which namespaces have served a view.
+  - Postgres `030_purge_follows_by_importer` is now `031`, after `030_rate_draws_batched`. Both
+    had been numbered 030, which broke Postgres on `main`. Neither migration's SQL changed.
+
 Spec v0.89: filtered reads and `/doc` read rules work in sealed namespaces, through derived
 keys; v0.88's answers to the reference's notes on v0.87.
 
