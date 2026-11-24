@@ -28,8 +28,8 @@ PATCHLOG_TEST_SPANNER='postgres://x@127.0.0.1:5432/x?sslmode=disable' make test-
   `spanner+postgres://` is a Postgres URL (pgx gets `postgres://`), with `e.spanner` set beside
   `e.pg`. The pool parameters (`pool_max_conns`, `pool_max_conn_idle_time`) work as on Postgres.
 - **Blobs** need `--blob-dir`: a Spanner cell holds at most 10 MiB, less than `maxBlobSize`.
-- **Rate buckets** are each instance's (`--local-rate-buckets` is forced, and logged): the shared
-  buckets are drawn by a Postgres function, `rate_draws`, and Spanner has none.
+- **Rate buckets** are shared, as on Postgres, but drawn by statements from Go
+  (`drawsSpanner`), since Spanner has no functions for `rate_draws`.
 
 ## How each Postgres mechanism maps
 
@@ -45,14 +45,14 @@ PATCHLOG_TEST_SPANNER='postgres://x@127.0.0.1:5432/x?sslmode=disable' make test-
 | `pg_advisory_xact_lock_shared(ns)`: a resource write's namespace, every namespace a decision read | nothing taken: reading the namespace's row in the read-write transaction holds a shared lock on it until commit | `tx.locking` |
 | `pg_advisory_xact_lock(ns)`: config writes, purges, prunes, branches | the namespace's row read `FOR UPDATE` (`spLockRow`, `nsForWrite`) | `pglock.go` |
 | The log lock `pg_advisory_xact_lock(logClass, ns)`, taken last, held through commit | the head read `SELECT head_seq, head_id … FOR UPDATE` just before the append (`logHeadOf`); entries of one chain are appended one transaction at a time, in chain order | `engine.go` |
-| Try-locks below held keys and `errRelock` restarts | none: nothing is tried, so no restart; deadlocks are Spanner's to break (wound-wait aborts the younger), and an aborted transaction runs again (`retryable`, SQLSTATE 40001) | `pglock.go` |
+| Try-locks below held keys and `errRelock` restarts | none: nothing is tried, so no restart; deadlocks are Spanner's to break (wound-wait aborts the younger), and an aborted transaction runs again (`retryable`, SQLSTATE 40001) after a random pause doubling per attempt (`spannerBackoff`). A transaction refused with 25P02 runs again too: a few reads take an error for "no such row", which on Spanner may have been an abort | `pglock.go`, `engine.go` |
 | `READ COMMITTED` writes, every namespace read after its lock | `SERIALIZABLE`, Spanner's only isolation for writes: a read sees the latest commit and keeps it locked, so namespace rows a write read stay as read (`snapshotRows`) | `chain.go` |
 | `REPEATABLE READ READ ONLY` reads | read-only transactions: one strong snapshot | `engine.go` |
 | Tailer: `xid >= from AND xid < pg_snapshot_xmin(pg_current_snapshot())` | `ns_log.committed`, the transaction's `spanner.pending_commit_timestamp()`; a poll reads `committed > from` in a read-only transaction and moves `from` to that transaction's read timestamp | `tailer.go` |
 | `SyncTail`: `pg_snapshot_xmax` | the read timestamp of a strong read made now | `tailer.go` |
 | `cache_gen` | the same row, read in the poll's snapshot | |
 | Leader: session lock `pg_try_advisory_lock(leaderClass, 0)` on a kept connection | a lease row, `leader_lease`, taken when expired, renewed at each tick and each job step; 60 s | `leaderSpanner` |
-| Shared rate buckets, `rate_draws` | per instance | `engine.go` Open |
+| Shared rate buckets, `rate_draws` (a plpgsql function) | the same algorithm in Go, in one read-write transaction per batch: missing buckets inserted, all read `FOR UPDATE`, requests judged in queue order, changed rows upserted in one statement; an aborted batch runs again. The sweep of full buckets has no `SKIP LOCKED`: it deletes in a transaction of its own, and a draw it meets aborts one of them | `drawsSpanner`, `ratebuckets.go` |
 | Group commit | unchanged: one transaction appends a group's entries, and the log heads it appended stay known under the row's lock | `groupcommit.go` |
 | Bulk statements: `unnest` of one array per column | each column's array subscripted by an `unnest` of ordinals, `($1::bigint[])[u.i] … FROM unnest($k::bigint[]) AS u(i)` (no `unnest` of several arrays); `UPDATE … FROM` (`moveHeads`) runs once per row | `bulk.go` |
 | Data-modifying CTEs (`appendNS`'s one statement) | three statements: the entries (multi-row `VALUES`, the commit timestamp only allowed there), the namespace's head, head_history | `appendSpanner` |
@@ -110,7 +110,7 @@ See the commit history and the phase report for the test counts. In short:
 - `serve --dev` starts; namespace create, resource create and patch, document, resource log,
   namespace log and namespace list reads work over HTTP;
 - most of `internal/core`'s tests pass; the ones that fail are listed in the report by cause.
-  Tests of Postgres mechanisms (advisory locks, the shared rate buckets, injected Postgres
+  Tests of Postgres mechanisms (advisory locks, `rate_draws` and its row locks, injected Postgres
   errors, statement counts of recursive queries) skip on Spanner.
 
 ## Untested
@@ -136,8 +136,8 @@ See the commit history and the phase report for the test counts. In short:
   Spanner's classic hotspots. Likely shapes: shard `ns_log_committed` (a hash of `ns` first, the
   tailer reading every shard), and key the chain tables by their chain (`(res, seq)`,
   `(ns, seq)`) with seq dense per chain, which also retires `id_blocks`.
-- **Shared rate buckets**: a draw as statements (read the bucket rows `FOR UPDATE`, refill and
-  deduct in Go, write them back), batched as `ratebuckets.go` batches.
+- **The rate-bucket sweep** scans `rate_buckets` whole (no `SKIP LOCKED`, and no index on
+  fullness); fine for a test, a hot table at scale.
 - **Purge holder search** (`purgeHolders`) without recursive queries: the purge now reads every
   branch below the purged namespace, level by level, which is fine for few branches only.
 - **Round trips**: `moveHeads` runs once per row and an append is three statements; PGAdapter's

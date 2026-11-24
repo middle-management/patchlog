@@ -21,8 +21,8 @@ import (
 // back to a pool when it ends, emptied: every table's rows deleted but
 // mmmigrate's, so the next engine finds its migrations applied and only
 // seeds it again. Spanner has no TRUNCATE, nor a way to turn foreign keys
-// off: the deletes run in one transaction, whose foreign keys are checked
-// as it commits. The pool's databases outlive the process, and the next
+// off: the deletes run in one transaction, each table after those that
+// reference it. The pool's databases outlive the process, and the next
 // reuses them (claimSpannerDB).
 
 // spannerPrefix and spannerFreshPrefix name the pool's databases and
@@ -146,36 +146,58 @@ func emptySpanner(dsn string) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	// One transaction, which Spanner checks foreign keys at the end of;
-	// if it fails, rounds of their own, each deleting what nothing still
-	// references.
-	if tx, err := db.BeginTx(ctx, nil); err == nil {
-		ok := true
-		for _, n := range left {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM `+n+` WHERE true`); err != nil {
-				ok = false
-				break
-			}
-		}
-		if ok && tx.Commit() == nil {
-			return nil
-		}
-		tx.Rollback()
+	// Children first, by the foreign keys, in one transaction.
+	refs := map[string][]string{} // table -> the tables referencing it
+	rows, err = db.QueryContext(ctx, `SELECT tc.table_name, ccu.table_name FROM information_schema.table_constraints tc
+		JOIN information_schema.constraint_table_usage ccu ON ccu.constraint_name = tc.constraint_name
+		WHERE tc.constraint_type = 'FOREIGN KEY'`)
+	if err != nil {
+		return err
 	}
-	for len(left) > 0 {
-		var next []string
-		var last error
-		for _, n := range left {
-			if _, err := db.ExecContext(ctx, `DELETE FROM `+n+` WHERE true`); err != nil {
-				next, last = append(next, n), err
-			}
+	for rows.Next() {
+		var child, parent string
+		if err := rows.Scan(&child, &parent); err != nil {
+			rows.Close()
+			return err
 		}
-		if len(next) == len(left) {
-			return fmt.Errorf("tables %v: %w", next, last)
+		if child != parent {
+			refs[parent] = append(refs[parent], child)
 		}
-		left = next
 	}
-	return nil
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	var order []string
+	done := map[string]bool{}
+	var visit func(n string)
+	visit = func(n string) {
+		if done[n] {
+			return
+		}
+		done[n] = true
+		for _, c := range refs[n] {
+			visit(c)
+		}
+		order = append(order, n)
+	}
+	for _, n := range left {
+		visit(n)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, n := range order {
+		if strings.HasPrefix(n, "mmmigrate_") {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+n+` WHERE true`); err != nil {
+			return fmt.Errorf("%s: %w", n, err)
+		}
+	}
+	return tx.Commit()
 }
 
 // pgxURL is a URL as pgx takes it: a Spanner URL's scheme is postgres://.

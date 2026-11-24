@@ -49,8 +49,8 @@ import (
 //     where they are written; multi-row VALUES (spValues) and arrays
 //     subscripted by an unnest of ordinals (bulk.go) stand in for unnest;
 //   - constraint violations name the index, not the table (isConflict);
-//   - the rate buckets stay in each instance's memory (Options.
-//     LocalRateBuckets): shared buckets need rate_draws, a function.
+//   - the shared rate buckets are drawn by statements in Go
+//     (drawsSpanner), not by rate_draws, a function.
 
 // idBlockSize is how many ids an instance takes from id_blocks at once per
 // table: one short transaction on the counter's row each time.
@@ -430,4 +430,158 @@ func nullPtr(s *string) any {
 		return nil
 	}
 	return *s
+}
+
+// --- rate buckets ---------------------------------------------------------------
+
+// aborted reports an error after which Spanner expects the transaction to
+// run again (40001: aborted, a deadlock broken or a lock lost).
+func aborted(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "40001"
+}
+
+// failedTx reports a statement refused because an earlier one failed the
+// transaction (25P02). Some reads take an error for an answer (no such
+// row: authorID, for one); on Spanner that error may have been an abort,
+// so a write transaction refused so runs again (update1).
+func failedTx(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "25P02"
+}
+
+// drawsSpanner is drawsOnce on Spanner: rate_draws (migration
+// 031_rate_draws_batched), which Spanner can't hold as a function, as
+// statements of one read-write transaction. It adds the buckets never
+// drawn on, full as of the first request that draws on each; reads every
+// bucket of the batch FOR UPDATE; then judges the requests in queue order
+// as rate_draws does, each after the ones before it; and writes each
+// changed row once, in one statement. A deadlock between batches aborts
+// one, which runs again (drawBatch). Every row is read after it is
+// inserted, in the transaction, so the batch is always complete.
+func (s *bucketStore) drawsSpanner(ctx context.Context, b []*drawReq) ([]drawRes, bool, error) {
+	type bucket struct {
+		tokens        float64
+		last          int64
+		rate, burst   float64
+		changed, read bool
+	}
+	buckets := map[string]*bucket{}
+	var keys [][]byte
+	var ins [][]any
+	for _, r := range b {
+		for _, d := range r.ds {
+			if _, ok := buckets[d.key]; ok {
+				continue
+			}
+			buckets[d.key] = &bucket{}
+			keys = append(keys, []byte(d.key))
+			ins = append(ins, []any{[]byte(d.key), d.rate.Burst, r.now.UnixMicro(), d.rate.Rate, d.rate.Burst})
+		}
+	}
+	res := make([]drawRes, len(b))
+	err := func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		for len(ins) > 0 {
+			chunk := ins[:min(len(ins), spMaxArgs/5)]
+			ins = ins[len(chunk):]
+			var q strings.Builder
+			var args []any
+			q.WriteString(`INSERT INTO rate_buckets (key, tokens, last, rate, burst) VALUES `)
+			for i, row := range chunk {
+				if i > 0 {
+					q.WriteString(`, `)
+				}
+				fmt.Fprintf(&q, `($%d, $%d, $%d, $%d, $%d)`, len(args)+1, len(args)+2, len(args)+3, len(args)+4, len(args)+5)
+				args = append(args, row...)
+			}
+			q.WriteString(` ON CONFLICT (key) DO NOTHING`)
+			if _, err := tx.ExecContext(ctx, q.String(), args...); err != nil {
+				return err
+			}
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT key, tokens, last, rate, burst FROM rate_buckets WHERE key = ANY($1::bytea[]) FOR UPDATE`, keys)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var k []byte
+			var x bucket
+			if err := rows.Scan(&k, &x.tokens, &x.last, &x.rate, &x.burst); err != nil {
+				rows.Close()
+				return err
+			}
+			if p := buckets[string(k)]; p != nil {
+				*p = x
+				p.read = true
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for k, p := range buckets {
+			if !p.read {
+				return fmt.Errorf("rate buckets: bucket %q not read", k)
+			}
+		}
+		for i, r := range b {
+			now := r.now.UnixMicro()
+			cur := make([]float64, len(r.ds))
+			ok := true
+			for j, d := range r.ds {
+				p := buckets[d.key]
+				c := p.tokens
+				if now > p.last {
+					c = min(d.rate.Burst, c+float64(now-p.last)*d.rate.Rate/1e6)
+				}
+				cur[j] = c
+				if c < 1 {
+					ok = false
+				}
+			}
+			ok = ok || r.force
+			res[i] = drawRes{tokens: make(map[string]float64, len(r.ds)), ok: ok}
+			for j, d := range r.ds {
+				res[i].tokens[d.key] = cur[j]
+				if ok {
+					p := buckets[d.key]
+					p.tokens, p.last, p.rate, p.burst, p.changed = cur[j]-d.cost, max(p.last, now), d.rate.Rate, d.rate.Burst, true
+				}
+			}
+		}
+		var up [][]any
+		for _, k := range keys {
+			if p := buckets[string(k)]; p.changed {
+				up = append(up, []any{k, p.tokens, p.last, p.rate, p.burst})
+			}
+		}
+		for len(up) > 0 {
+			chunk := up[:min(len(up), spMaxArgs/5)]
+			up = up[len(chunk):]
+			var q strings.Builder
+			var args []any
+			q.WriteString(`INSERT INTO rate_buckets (key, tokens, last, rate, burst) VALUES `)
+			for i, row := range chunk {
+				if i > 0 {
+					q.WriteString(`, `)
+				}
+				fmt.Fprintf(&q, `($%d, $%d, $%d, $%d, $%d)`, len(args)+1, len(args)+2, len(args)+3, len(args)+4, len(args)+5)
+				args = append(args, row...)
+			}
+			q.WriteString(` ON CONFLICT (key) DO UPDATE SET tokens = excluded.tokens, last = excluded.last, rate = excluded.rate, burst = excluded.burst`)
+			if _, err := tx.ExecContext(ctx, q.String(), args...); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	}()
+	if err != nil {
+		return nil, false, err
+	}
+	return res, true, nil
 }

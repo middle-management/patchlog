@@ -9,7 +9,7 @@ import (
 // schema kept, any session a test left open ended; one whose schema a test
 // changed is dropped instead.
 func TestPool(t *testing.T) {
-	if !Enabled() {
+	if !Enabled() || Spanner() {
 		t.Skip("Postgres only (" + Env + ")")
 	}
 	var first string
@@ -53,4 +53,34 @@ func exec(t *testing.T, db *sql.DB, stmts ...string) {
 			t.Fatalf("%s: %v", s, err)
 		}
 	}
+}
+
+// On Spanner a database goes back to the pool emptied, its migrations'
+// records kept, and the next test gets it.
+func TestSpannerPool(t *testing.T) {
+	if !Spanner() {
+		t.Skip("Spanner only (" + SpannerEnv + ")")
+	}
+	var first string
+	t.Run("write", func(t *testing.T) {
+		first = NewDB(t)
+		db := Open(t, first)
+		defer db.Close()
+		exec(t, db, `CREATE TABLE IF NOT EXISTS mmmigrate_applied (namespace text NOT NULL, version bigint NOT NULL, name text NOT NULL, applied_at bigint NOT NULL, PRIMARY KEY (namespace, version))`,
+			`CREATE TABLE IF NOT EXISTS a (id bigint PRIMARY KEY, v text NOT NULL)`,
+			`CREATE TABLE IF NOT EXISTS b (id bigint PRIMARY KEY, a bigint NOT NULL REFERENCES a (id))`,
+			`INSERT INTO mmmigrate_applied VALUES ('t', 1, 'x', 0) ON CONFLICT (namespace, version) DO NOTHING`,
+			`INSERT INTO a VALUES (1, 'x'), (2, 'y')`, `INSERT INTO b VALUES (1, 2)`)
+	})
+	t.Run("reuse", func(t *testing.T) {
+		if got := NewDB(t); got != first {
+			t.Fatalf("got %s, want the pool's %s", got, first)
+		}
+		db := Open(t, first)
+		defer db.Close()
+		var rows, kept int
+		if err := db.QueryRow(`SELECT (SELECT count(*) FROM a) + (SELECT count(*) FROM b), (SELECT count(*) FROM mmmigrate_applied)`).Scan(&rows, &kept); err != nil || rows != 0 || kept == 0 {
+			t.Fatalf("rows left %d, migration records %d, %v", rows, kept, err)
+		}
+	})
 }

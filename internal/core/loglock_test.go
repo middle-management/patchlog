@@ -5,6 +5,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
 // D.8 (v0.34): namespace entries are ordered by a separate advisory log
@@ -16,6 +18,9 @@ import (
 // front, taking its log locks again at its first append. Meanwhile the
 // holder of the namespace lock can take that log lock, so nobody deadlocks.
 func TestPGLogLockNeverWaitsForStateLock(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("advisory locks: Postgres only")
+	}
 	a, b := twoInstances(t)
 	ctx := context.Background()
 	holding, release := make(chan struct{}), make(chan struct{})
@@ -64,6 +69,9 @@ func TestPGLogLockNeverWaitsForStateLock(t *testing.T) {
 // held is only tried, and on a restart all of them are taken in order at
 // the first append.
 func TestPGLogLocksAscending(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("advisory locks: Postgres only")
+	}
 	a, b := twoInstances(t)
 	ctx := context.Background()
 	holding, release := make(chan struct{}), make(chan struct{})

@@ -533,8 +533,8 @@ func p17FullBuckets(t *testing.T, e *Engine, now time.Time, r Rate, keys ...stri
 // held b and waited for a, which the draw had locked while it waited for
 // b: Postgres rolled one back (ratebuckets.go).
 func TestV073P17SweepNeverWaitsOnDraw(t *testing.T) {
-	if !pgtest.Enabled() {
-		t.Skip("Postgres only")
+	if !pgtest.Enabled() || pgtest.Spanner() {
+		t.Skip("Postgres only: plpgsql, deadlock_timeout")
 	}
 	var clock atomic.Int64
 	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
@@ -582,8 +582,8 @@ func TestV073P17SweepNeverWaitsOnDraw(t *testing.T) {
 // error (§6.6 Dry runs). Its buckets: n\x00n < p\x00w < r\x00n\x00a\x00w
 // (new); the sweep's order: p\x00w, m, n\x00n.
 func TestV073P17SweepDuringDryRun(t *testing.T) {
-	if !pgtest.Enabled() {
-		t.Skip("Postgres only")
+	if !pgtest.Enabled() || pgtest.Spanner() {
+		t.Skip("Postgres only: plpgsql, deadlock_timeout")
 	}
 	var clock atomic.Int64
 	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
@@ -639,8 +639,8 @@ func p17DrawBlockedBy(t *testing.T, e *Engine, pid int) {
 // the same timeout, the other statement, waiting a few milliseconds less,
 // was rolled back about once in 25 runs).
 func TestV073P17DrawRetriesDeadlock(t *testing.T) {
-	if !pgtest.Enabled() {
-		t.Skip("Postgres only")
+	if !pgtest.Enabled() || pgtest.Spanner() {
+		t.Skip("Postgres only: plpgsql, deadlock_timeout")
 	}
 	var clock atomic.Int64
 	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())

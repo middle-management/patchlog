@@ -47,11 +47,21 @@ func MigrateSpanner(ctx context.Context, db *sql.DB, fsys fs.FS, namespace strin
 		return fmt.Errorf("migrating %s: %w", namespace, err)
 	}
 	defer conn.Close()
-	if err := runSpannerDDL(ctx, conn, []string{
-		`CREATE TABLE IF NOT EXISTS mmmigrate_applied (namespace text NOT NULL, version bigint NOT NULL, name text NOT NULL, applied_at bigint NOT NULL, PRIMARY KEY (namespace, version))`,
-		`CREATE TABLE IF NOT EXISTS mmmigrate_current (namespace text NOT NULL PRIMARY KEY, checksum text NOT NULL, applied_at bigint NOT NULL)`,
-	}); err != nil {
-		return fmt.Errorf("migrating %s: creating the migrations tables: %w", namespace, err)
+	// Created only if missing: a schema change takes seconds on Spanner
+	// even when it changes nothing, and the emulator refuses one while a
+	// read-write transaction (another instance's) is open.
+	var have int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.tables
+		WHERE table_schema = 'public' AND table_name IN ('mmmigrate_applied', 'mmmigrate_current')`).Scan(&have); err != nil {
+		return fmt.Errorf("migrating %s: %w", namespace, err)
+	}
+	if have < 2 {
+		if err := runSpannerDDL(ctx, conn, []string{
+			`CREATE TABLE IF NOT EXISTS mmmigrate_applied (namespace text NOT NULL, version bigint NOT NULL, name text NOT NULL, applied_at bigint NOT NULL, PRIMARY KEY (namespace, version))`,
+			`CREATE TABLE IF NOT EXISTS mmmigrate_current (namespace text NOT NULL PRIMARY KEY, checksum text NOT NULL, applied_at bigint NOT NULL)`,
+		}); err != nil {
+			return fmt.Errorf("migrating %s: creating the migrations tables: %w", namespace, err)
+		}
 	}
 	migrations, err := source.LoadMigrations(sub, testing.Testing())
 	if err != nil {

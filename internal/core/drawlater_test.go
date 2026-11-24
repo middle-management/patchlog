@@ -24,7 +24,7 @@ import (
 // connections the main pool would have none left for anything else.
 func TestPGDrawHoldsNoMainConn(t *testing.T) {
 	if !pgtest.Enabled() || pgtest.Spanner() {
-		t.Skip("Postgres only: Spanner's rate buckets are each instance's")
+		t.Skip("Postgres only: pg_backend_pid")
 	}
 	const size = 4 // the main pool; the bucket pool is 2
 	url := strings.Replace(pgtest.NewDB(t), "pool_max_conns=8", fmt.Sprintf("pool_max_conns=%d", size), 1)
@@ -115,8 +115,8 @@ func TestPGDrawHoldsNoMainConn(t *testing.T) {
 // (errDrawFirst); if the bucket has a token after all, the write is
 // checked again and admitted, drawing once.
 func TestPGDrawAfterCheck(t *testing.T) {
-	if !pgtest.Enabled() || pgtest.Spanner() {
-		t.Skip("Postgres only: Spanner's rate buckets are each instance's")
+	if !pgtest.Enabled() {
+		t.Skip("Postgres only")
 	}
 	for _, grouped := range []bool{false, true} {
 		t.Run(fmt.Sprintf("grouped=%v", grouped), func(t *testing.T) {

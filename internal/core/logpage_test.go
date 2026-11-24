@@ -17,6 +17,9 @@ import (
 // from its id back to since for every page made reading a long range in
 // pages quadratic.
 func TestLogPageReadsItsRows(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("damages rows through a schema change inside a transaction, which Spanner refuses")
+	}
 	t.Parallel()
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
@@ -173,8 +176,12 @@ func TestNSLogQueriesUseIndexes(t *testing.T) {
 	}
 	defer e.Close()
 	if e.pg {
+		q := `SELECT count(*) FROM pg_indexes WHERE tablename = 'ns_log' AND indexname IN ('ns_log_ns_seq', 'ns_log_ns_config')`
+		if e.spanner {
+			q = `SELECT count(*) FROM information_schema.indexes WHERE table_name = 'ns_log' AND index_name IN ('ns_log_ns_seq', 'ns_log_ns_config')`
+		}
 		var n int
-		if err := e.db.QueryRow(`SELECT count(*) FROM pg_indexes WHERE tablename = 'ns_log' AND indexname IN ('ns_log_ns_seq', 'ns_log_ns_config')`).Scan(&n); err != nil {
+		if err := e.db.QueryRow(q).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		if n != 2 {

@@ -139,8 +139,8 @@ func TestDrawClosedStore(t *testing.T) {
 // a time, and the time now on its clock.
 func batchEngine(t *testing.T, fresh bool) (*Engine, *bucketStore, time.Time) {
 	t.Helper()
-	if !pgtest.Enabled() {
-		t.Skip("Postgres only")
+	if !pgtest.Enabled() || pgtest.Spanner() {
+		t.Skip("Postgres only: rate_draws, and its row locks held by pg_backend_pid")
 	}
 	var clock atomic.Int64
 	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
@@ -459,7 +459,7 @@ func TestPGDrawBatchRowGone(t *testing.T) {
 // End to end: many writes as one principal, more than the bucket pool's
 // connections, draw in batches, and each draws once.
 func TestPGDrawBatchWrites(t *testing.T) {
-	if !pgtest.Enabled() {
+	if !pgtest.Enabled() || pgtest.Spanner() {
 		t.Skip("Postgres only")
 	}
 	e := groupEngine(t)

@@ -622,6 +622,9 @@ func TestPGConfigOtherInstance(t *testing.T) {
 // with its locks in order, so two writers wanting each other's keys don't
 // deadlock.
 func TestPGLockOrder(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("advisory locks: Postgres only")
+	}
 	a, b := twoInstances(t)
 	ctx := context.Background()
 	holding, release := make(chan struct{}), make(chan struct{})
@@ -679,6 +682,9 @@ func TestPGLeader(t *testing.T) {
 // D.8: a leader checks that it still holds the lock before each step of a
 // job, and stops once it lost it. Calls outside a leader's job proceed.
 func TestPGLeaderJobStep(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("the leader's session lock: Postgres only (Spanner's is a lease)")
+	}
 	a, b := twoInstances(t)
 	ctx := context.Background()
 	if !a.leader(ctx) {

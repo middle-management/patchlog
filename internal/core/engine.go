@@ -478,12 +478,6 @@ func Open(opt Options) (*Engine, error) {
 		opt.RetentionInterval = time.Hour
 	}
 	spanner := isSpannerURL(opt.Path)
-	if spanner && !opt.LocalRateBuckets {
-		// The shared buckets are drawn by a function (rate_draws), which
-		// Spanner lacks (spanner.go).
-		log.Printf("spanner: the rate-limit buckets (§6.6) are kept in each instance's memory, not shared")
-		opt.LocalRateBuckets = true
-	}
 	e := &Engine{
 		db:         db,
 		pg:         pg,
@@ -969,7 +963,7 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 			}
 		}
 		rotate, err = e.updateOnce(ctx, f, want, logs)
-		if err == nil || attempt == maxWriteAttempts || !retryable(err) || ctx.Err() != nil {
+		if err == nil || attempt == maxWriteAttempts || !(retryable(err) || e.spanner && failedTx(err)) || ctx.Err() != nil {
 			return rotate, err
 		}
 		var rl *errRelock

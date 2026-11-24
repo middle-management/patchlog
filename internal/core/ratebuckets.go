@@ -64,7 +64,10 @@ import (
 // bucketStore draws on the buckets of rate_buckets (Postgres).
 type bucketStore struct {
 	db *sql.DB
-	mu sync.Mutex
+	// spanner: the draws run as statements of a transaction, in Go
+	// (drawsSpanner), since Spanner has no functions.
+	spanner bool
+	mu      sync.Mutex
 	// swept is when this instance last swept full buckets; sweeping marks
 	// a sweep running, closed that the store is closed.
 	swept    time.Time
@@ -105,8 +108,8 @@ type bucketStore struct {
 }
 
 // openBucketStore opens the bucket pool on the Postgres database url.
-func openBucketStore(url string) (*bucketStore, error) {
-	url, pool, err := parsePGPool(url)
+func openBucketStore(url0 string) (*bucketStore, error) {
+	url, pool, err := parsePGPool(url0)
 	if err != nil {
 		return nil, err
 	}
@@ -114,10 +117,13 @@ func openBucketStore(url string) (*bucketStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.RuntimeParams["synchronous_commit"] = "off"
+	spanner := isSpannerURL(url0)
+	if !spanner { // PGAdapter takes no such setting
+		cfg.RuntimeParams["synchronous_commit"] = "off"
+	}
 	db := stdlib.OpenDB(*cfg)
 	pool.sizeSide(db)
-	return &bucketStore{db: db, slots: min(pool.sideSize(), drawBatches)}, nil
+	return &bucketStore{db: db, slots: min(pool.sideSize(), drawBatches), spanner: spanner}, nil
 }
 
 // The bucket pool is a quarter of the main pool's size, at least two
@@ -455,12 +461,15 @@ func (s *bucketStore) drawBatch(b []*drawReq) {
 	var err error
 	for attempt := 1; attempt <= drawAttempts; attempt++ {
 		var complete bool
-		if len(b) == 1 {
+		switch {
+		case s.spanner:
+			res, complete, err = s.drawsSpanner(ctx, b)
+		case len(b) == 1:
 			res, complete, err = s.drawOnce(ctx, b[0])
-		} else {
+		default:
 			res, complete, err = s.drawsOnce(ctx, b)
 		}
-		if deadlocked(err) {
+		if deadlocked(err) || s.spanner && aborted(err) {
 			if attempt < drawAttempts {
 				if perr := drawPause(ctx, attempt); perr != nil {
 					err = perr
@@ -696,8 +705,15 @@ func (s *bucketStore) maybeSweep(now time.Time) {
 		// changed meanwhile is judged again as it now is (READ
 		// COMMITTED), so a bucket drawn on isn't deleted; one a draw
 		// holds is drawn on, and the next sweep judges it.
-		if _, err := s.db.Exec(`DELETE FROM rate_buckets WHERE key IN (
-			SELECT key FROM rate_buckets WHERE tokens + ($1::bigint - last) * rate / 1e6 >= burst FOR UPDATE SKIP LOCKED)`, now.UnixMicro()); err != nil {
+		q := `DELETE FROM rate_buckets WHERE key IN (
+			SELECT key FROM rate_buckets WHERE tokens + ($1::bigint - last) * rate / 1e6 >= burst FOR UPDATE SKIP LOCKED)`
+		if s.spanner {
+			// No SKIP LOCKED: a draw holding a row aborts the sweep, or
+			// the sweep the draw, which runs again; full rows are judged
+			// as of the sweep's own read, under its locks.
+			q = `DELETE FROM rate_buckets WHERE tokens + ($1::bigint - last) * rate / 1e6 >= burst`
+		}
+		if _, err := s.db.Exec(q, now.UnixMicro()); err != nil {
 			log.Printf("rate buckets: sweep: %v", err)
 		}
 		s.mu.Lock()

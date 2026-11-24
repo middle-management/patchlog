@@ -96,7 +96,7 @@ func TestMigrateDialect(t *testing.T) {
 // search_path) each get their migrations, though mmmigrate keeps every
 // schema's records in its own schema mmmigrate.
 func TestMigratePostgresSchemas(t *testing.T) {
-	if !pgtest.Enabled() {
+	if !pgtest.Enabled() || pgtest.Spanner() {
 		t.Skip("Postgres only (" + pgtest.Env + ")")
 	}
 	ctx := context.Background()

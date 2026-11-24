@@ -62,6 +62,9 @@ func TestLiveBranchesFrozenColumn(t *testing.T) {
 		t.Fatalf("frozen column set for %q, want f1 f2", got)
 	}
 	// The rows as they were written before: the migration sets them.
+	if pgtest.Spanner() {
+		return // Spanner's baseline has the column from the start
+	}
 	dialect := "sqlite"
 	if pgtest.Enabled() {
 		dialect = "postgres"
