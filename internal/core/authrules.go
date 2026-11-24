@@ -64,6 +64,15 @@ func (e *Engine) ReadBudget(ctx context.Context) context.Context {
 
 type readBudgetKey struct{}
 
+// ReadBudgetSpent reports whether the budget ctx carries (ReadBudget) has
+// run out: a long-poll that has shown nothing then answers 204 rather
+// than the refusal its last read check gave (§6.6 Validation work, §7.7,
+// v0.90: "a long-poll that shows none answers 204").
+func (e *Engine) ReadBudgetSpent(ctx context.Context) bool {
+	m, ok := ctx.Value(readBudgetKey{}).(*writeMeter)
+	return ok && m.Over
+}
+
 // requestScope is the read scope of a read transaction (Engine.read): the
 // budget ctx carries (ReadBudget), else one of the transaction's own.
 func (t *tx) requestScope(ctx context.Context) func() {

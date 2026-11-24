@@ -147,12 +147,36 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 	}
 	atOnce := reqCursor < current
 	deadline := clock.end(current)
-	for {
+	// noChange is the 204 of a wait that shows nothing: header names
+	// since, the last entry judged whole, which the next poll gives back.
+	noChange := func(public bool) {
+		cur := clock.cursor(time.Now())
+		if reqCursor+1 > cur {
+			cur = reqCursor + 1
+		}
+		s.setLive(w, r, public, "public, max-age=0, s-maxage=2", tags)
+		if since != "" {
+			// Without since the header is absent, so the client's next
+			// since stays empty (§7.7 Answer).
+			w.Header().Set(header, since)
+		}
+		w.Header().Set("X-Cursor", strconv.FormatInt(cur, 10))
+		w.WriteHeader(204)
+	}
+	public := false
+	for fetches := 0; ; fetches++ {
 		woken := wait()
 		if testLongPollFetch != nil {
 			testLongPollFetch()
 		}
 		lg, err := fetch(r.Context(), since)
+		if err != nil && fetches > 0 && s.e.ReadBudgetSpent(r.Context()) {
+			// The wait's one budget ran out after its first read passed:
+			// 204, never the refusal a read check that runs out gives
+			// (§6.6 Validation work, §7.7, v0.90).
+			noChange(public)
+			return
+		}
 		if err != nil {
 			// A partial reader, by its grant: the filtered long-poll
 			// (§7.9 URLs).
@@ -169,6 +193,7 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 			s.writeLog(w, r, lg, ns, tags)
 			return
 		}
+		public = lg.Public
 		if len(lg.Entries) > 0 {
 			// A page, as a range's (fetch asks for the log page size,
 			// §7.1): header names its last entry, the next since. It
@@ -192,18 +217,7 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 				return
 			}
 		}
-		cur := clock.cursor(time.Now())
-		if reqCursor+1 > cur {
-			cur = reqCursor + 1
-		}
-		s.setLive(w, r, lg.Public, "public, max-age=0, s-maxage=2", tags)
-		if since != "" {
-			// Without since the header is absent, so the client's next
-			// since stays empty (§7.7 Answer).
-			w.Header().Set(header, since)
-		}
-		w.Header().Set("X-Cursor", strconv.FormatInt(cur, 10))
-		w.WriteHeader(204)
+		noChange(lg.Public)
 		return
 	}
 }

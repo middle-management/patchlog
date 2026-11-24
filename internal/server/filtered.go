@@ -296,9 +296,34 @@ func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, vi
 	deadline := clock.end(current)
 	lim := s.e.Limits().LogPageSize
 	cred := creds(r)
-	for {
+	noChange := func(private bool) {
+		cur := clock.cursor(time.Now())
+		if reqCursor+1 > cur {
+			cur = reqCursor + 1
+		}
+		s.setLive(w, r, false, "public, max-age=0, s-maxage=2", tags)
+		if private {
+			// An unrestricted reader's /ns/{ns} cookie: no cache's, its
+			// 204 as much as its entries (§7.9 Partial reader).
+			privateNoStore(w)
+		}
+		if since != "" {
+			w.Header().Set("X-Namespace-Revision", since)
+		}
+		w.Header().Set("X-Cursor", strconv.FormatInt(cur, 10))
+		w.WriteHeader(204)
+	}
+	private := false
+	for fetches := 0; ; fetches++ {
 		wait := s.e.Wait(ns)
 		lg, info, err := s.e.FilteredLiveLog(r.Context(), ns, view, since, lim, cred)
+		if err != nil && fetches > 0 && s.e.ReadBudgetSpent(r.Context()) {
+			// The wait's one budget ran out after its first admission:
+			// 204 naming the last entry judged whole (§6.6, §7.9
+			// Long-poll, v0.90).
+			noChange(private)
+			return
+		}
 		if err != nil {
 			if s.writeErrShort(w, r, err, tags...) {
 				return
@@ -310,6 +335,7 @@ func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, vi
 			s.writeLog(w, r, lg, ns, tags)
 			return
 		}
+		private = info.Private
 		if len(lg.Entries) > 0 {
 			s.setLive(w, r, false, fmt.Sprintf("public, max-age=0, s-maxage=%d", int(interval.Seconds())), tags)
 			if info.Private {
@@ -339,21 +365,7 @@ func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, vi
 				return
 			}
 		}
-		cur := clock.cursor(time.Now())
-		if reqCursor+1 > cur {
-			cur = reqCursor + 1
-		}
-		s.setLive(w, r, false, "public, max-age=0, s-maxage=2", tags)
-		if info.Private {
-			// An unrestricted reader's /ns/{ns} cookie: no cache's, its
-			// 204 as much as its entries (§7.9 Partial reader).
-			privateNoStore(w)
-		}
-		if since != "" {
-			w.Header().Set("X-Namespace-Revision", since)
-		}
-		w.Header().Set("X-Cursor", strconv.FormatInt(cur, 10))
-		w.WriteHeader(204)
+		noChange(info.Private)
 		return
 	}
 }
