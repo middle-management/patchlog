@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"testing"
+	"time"
 )
 
 // v0.90 §8.3 CDN ("ns:{ns} once a view of the namespace has been served",
@@ -169,5 +170,40 @@ func TestV090BPartialReaderPurgedHeads(t *testing.T) {
 	writer := w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"matches"}, "can": []any{"create"}})
 	if _, err := w.e.NamespaceHeads(ctx, "matches", head, "", writer); v75Status(err) != 403 {
 		t.Fatalf("a grant without read at the purged namespace's /heads: %v, want 403", err)
+	}
+}
+
+// v0.90 §E.2.2 Epochs ("An epoch whose referencing revisions were all
+// pruned answers 410 ... where the server recorded it when pruning and
+// the request may read one of them ..., and 404 otherwise"; CONFORMANCE
+// Filtered reads 94): the only revision referencing the blob in epoch 2
+// is hidden v2, since pruned and recorded: li's /e/2 is 404, an
+// unrestricted reader's 410.
+func TestV090BPrunedHiddenEpochIs404(t *testing.T) {
+	w := newV75World(t, v75Opts{})
+	ctx := context.Background()
+	w.patchConfig("matches", map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}})
+	data := []byte("shared blob")
+	bid, nonce := advUpload(t, w, "derby", data)
+	v89Put(w, "derby", map[string]any{"team": "a", "title": "v1", "b": advRef(bid, nonce, data)})
+	w.patchConfig("matches", map[string]any{"op": "replace", "path": "/encryption", "value": map[string]any{"level": "sealed", "epoch": 2.0}})
+	v89Put(w, "derby", map[string]any{"team": "b", "secret": "S", "b": advRef(bid, nonce, data)})
+	w.patchConfig("matches", map[string]any{"op": "replace", "path": "/encryption", "value": map[string]any{"level": "sealed", "epoch": 3.0}})
+	v89Put(w, "derby", map[string]any{"team": "a", "title": "v3", "b": advRef(bid, nonce, data)})
+	v3 := v89Put(w, "derby", map[string]any{"team": "a", "title": "v4", "b": advRef(bid, nonce, data)})
+	if b, err := w.e.OpenBlob(ctx, "matches", "derby", bid, w.admin); err != nil || b.Status != 302 || b.Epoch != 3 {
+		t.Fatalf("admin: %+v %v, want 302 to epoch 3", b, err)
+	}
+	w.clock.Add(int64(10 * time.Minute / time.Millisecond))
+	pruner := w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:root", "ns": []any{"matches"}, "can": []any{"read", "prune"}})
+	if _, err := w.e.Prune(ctx, Request{NS: "matches", Cred: pruner}, "derby", PruneRequest{Horizon: v3}); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := w.e.OpenSealedBlob(ctx, "matches", "derby", bid, "2", w.admin); err != nil || b.Status != 410 {
+		t.Fatalf("admin at pruned epoch 2: %+v %v, want 410", b, err)
+	}
+	b, err := w.e.OpenSealedBlob(ctx, "matches", "derby", bid, "2", advDocReader(w))
+	if err != nil || b == nil || b.Status != 404 {
+		t.Fatalf("li at pruned hidden epoch 2: %+v %v, want 404", b, err)
 	}
 }
