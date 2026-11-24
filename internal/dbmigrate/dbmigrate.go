@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log/slog"
 	"testing"
 
 	"github.com/jackc/pgx/v5/stdlib"
@@ -61,7 +60,6 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, namespace string) erro
 	if err != nil {
 		return fmt.Errorf("migrating %s: no %s migrations: %w", namespace, name, err)
 	}
-	base := namespace
 	if name == "postgres" {
 		var schema sql.NullString
 		if err := db.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
@@ -71,9 +69,6 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, namespace string) erro
 			return fmt.Errorf("migrating %s: no schema in the search_path exists", namespace)
 		}
 		namespace += "@" + schema.String
-	}
-	if err := rerecord(ctx, db, name, base, namespace); err != nil {
-		return fmt.Errorf("migrating %s: %w", namespace, err)
 	}
 	if err := mmmigrate.RunMigrations(ctx, db, dialect, sub, testing.Testing(), mmmigrate.WithNamespace(namespace)); err != nil {
 		return fmt.Errorf("migrating %s: %w", namespace, err)
@@ -95,64 +90,6 @@ func Migrate(ctx context.Context, db *sql.DB, fsys fs.FS, namespace string) erro
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("seeding %s: %w", namespace, err)
-	}
-	return nil
-}
-
-// renumbering is a migration that was committed under a version another
-// migration of its directory had also taken, and later moved to a version of
-// its own. A database that applied it under the old version has it recorded
-// there, where mmmigrate, which goes by version alone, would take it for the
-// migration now numbered so: it would skip that one and run this one again
-// under its new number. rerecord moves the record first.
-type renumbering struct {
-	dialect   string
-	namespace string // before the "@schema" Postgres adds
-	name      string // the migration's name, as mmmigrate records it
-	from, to  int
-}
-
-var renumberings = []renumbering{
-	// The core's Postgres migrations 030_purge_follows_by_importer (from
-	// spec v0.88, PR #37) and 030_rate_draws_batched (PR #39) were both
-	// committed as 030 and merged, #39 first: main ran with rate_draws_batched
-	// as 030 from 2026-11-21 to 11-23, and the spec branches with
-	// purge_follows_by_importer as 030. rate_draws_batched is now 031. A
-	// database recording purge_follows_by_importer as 30 needs nothing: 031
-	// runs next.
-	{dialect: "postgres", namespace: "patchlog", name: "rate_draws_batched", from: 30, to: 31},
-}
-
-// rerecord moves the applied record of each renumbered migration from its
-// old version to its new one, where the database has it under the old one
-// and nothing under the new. It is one conditional UPDATE, so instances
-// starting together move it once, and every instance moves it (or finds it
-// moved) before mmmigrate reads the records.
-func rerecord(ctx context.Context, db *sql.DB, dialect, base, namespace string) error {
-	for _, r := range renumberings {
-		if r.dialect != dialect || r.namespace != base {
-			continue
-		}
-		if dialect != "postgres" {
-			return fmt.Errorf("renumbering %s: no rerecord for dialect %s", r.name, dialect)
-		}
-		var exists bool
-		if err := db.QueryRowContext(ctx, `SELECT to_regclass('mmmigrate.applied') IS NOT NULL`).Scan(&exists); err != nil {
-			return err
-		}
-		if !exists {
-			continue // a new database
-		}
-		res, err := db.ExecContext(ctx, `UPDATE mmmigrate.applied SET version = $3
-			WHERE namespace = $1 AND version = $2 AND name = $4
-			AND NOT EXISTS (SELECT 1 FROM mmmigrate.applied WHERE namespace = $1 AND version = $3)`,
-			namespace, r.from, r.to, r.name)
-		if err != nil {
-			return fmt.Errorf("re-recording migration %s as %d: %w", r.name, r.to, err)
-		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			slog.Info("re-recorded a renumbered migration", "namespace", namespace, "name", r.name, "from", r.from, "to", r.to)
-		}
 	}
 	return nil
 }
