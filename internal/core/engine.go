@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -40,6 +41,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
+	"github.com/middle-management/patchlog/internal/rules"
 	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/sig"
 )
@@ -861,37 +863,61 @@ type docPut struct {
 	doc []byte
 }
 
-// read runs f in a read transaction.
+// read runs f in a read transaction. One that serves the first view of a
+// namespace this engine has seen served (viewServed) runs again once
+// markServed has committed, so that the answer is read from a snapshot
+// taken after the mark (markServed).
 func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
-	var judged []judgedRow
-	var served string
 	budget, _ := ctx.Value(readBudgetKey{}).(*writeMeter)
-	err = e.read1(ctx, func(t *tx) error {
-		defer func() { judged, served = t.judged, t.viewServed }()
-		// The read checks of a request share one budget (§6.6).
-		defer t.requestScope(ctx)()
-		over := budget != nil && budget.Over
-		return ranOutRefusal(f(t), budget != nil && !over && budget.Over)
-	})
-	// Per-revision answers it gave are kept once it has ended (judge).
-	e.flushJudged(ctx, judged)
-	if err == nil && served != "" {
-		err = e.markServed(ctx, served)
+	var spent rules.Meter
+	var charged map[*actor]bool
+	if budget != nil {
+		spent, charged = budget.Meter, maps.Clone(budget.charged)
 	}
-	return err
+	for {
+		var judged []judgedRow
+		var served string
+		err = e.read1(ctx, func(t *tx) error {
+			defer func() { judged, served = t.judged, t.viewServed }()
+			// The read checks of a request share one budget (§6.6).
+			defer t.requestScope(ctx)()
+			over := budget != nil && budget.Over
+			return ranOutRefusal(f(t), budget != nil && !over && budget.Over)
+		})
+		// Per-revision answers it gave are kept once it has ended (judge).
+		e.flushJudged(ctx, judged)
+		if err != nil || served == "" {
+			return err
+		}
+		if _, ok := e.served.Load(served); ok {
+			return nil
+		}
+		if err := e.markServed(ctx, served); err != nil {
+			return err
+		}
+		// Read again, the request's budget as it was before: the answer
+		// just read is from a snapshot taken before the mark.
+		if budget != nil {
+			budget.Meter, budget.charged = spent, maps.Clone(charged)
+		}
+	}
 }
 
 // markServed records that a view of namespace ns has been served, before
-// the answer leaves, so that a later purge in ns clears ns:{ns}, the tag
+// the answer is read, so that a later purge in ns clears ns:{ns}, the tag
 // of its filtered ranges, at the CDN (§8.3 CDN, v0.90: "and ns:{ns} once
-// a view of the namespace has been served"; tagFilteredRanges). Each
-// engine writes it once per namespace; a failure fails the read, whose
-// answer a purge might then not clear.
+// a view of the namespace has been served"; tagFilteredRanges). It holds
+// the namespace's lock shared (Postgres) or the writer (SQLite): a purge
+// that chose its tags before the mark has committed when it is written,
+// and the answer, read after it (read), sees the purge; one that chooses
+// them after sees the mark. Each engine writes it once per namespace; a
+// failure fails the read, whose answer a purge might then not clear.
 func (e *Engine) markServed(ctx context.Context, ns string) error {
 	if _, ok := e.served.Load(ns); ok {
 		return nil
 	}
 	err := e.update(context.WithoutCancel(ctx), func(t *tx) error {
+		t.nsByName(ns) // its lock, shared (pglock.go)
 		_, err := t.Exec(`INSERT INTO filtered_served (ns) VALUES (?) ON CONFLICT (ns) DO NOTHING`, ns)
 		return err
 	})
