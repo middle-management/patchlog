@@ -139,6 +139,9 @@ func TestV073P17KeyScopeFailureIs403(t *testing.T) {
 	ks.add("subs", map[string]any{"can": []any{"read", "create"}, "sub": "user:a.*"})
 	ks.add("groups", map[string]any{"can": []any{"read", "create"}, "groups": map[string]any{"allow": []any{"staff"}}})
 	ks.add("ttl", map[string]any{"can": []any{"read", "create"}, "maxTtl": "PT1M"})
+	ks.add("cans", map[string]any{"can": []any{"read"}})
+	ks.add("rolesk", map[string]any{"can": []any{"read", "create"}, "roles": map[string]any{"allow": []any{"staff"}}})
+	ks.add("attrsk", map[string]any{"can": []any{"read", "create"}, "attrs": map[string]any{"type": "object", "properties": map[string]any{"tier": map[string]any{"const": "gold"}}}})
 	for _, ns := range []string{"p", "q"} {
 		doc := map[string]any{"read": "grant", "keys": ks.entries}
 		if ns == "q" {
@@ -166,6 +169,11 @@ func TestV073P17KeyScopeFailureIs403(t *testing.T) {
 		"sub":       ks.mint(t, map[string]any{"kid": "subs", "sub": "user:x", "ns": []any{"p", "q"}, "can": []any{"read"}}),
 		"groups":    ks.mint(t, map[string]any{"kid": "groups", "sub": "user:g", "groups": []any{"guests"}, "ns": []any{"p", "q"}, "can": []any{"read"}}),
 		"maxTtl":    ks.mint(t, map[string]any{"kid": "ttl", "sub": "user:t", "ns": []any{"p", "q"}, "can": []any{"read"}}),
+		// v0.90: a failure of any part of the key's scope answers as
+		// readScope's does (§C.2 item 1, CONFORMANCE Access 23, 104).
+		"can":   ks.mint(t, map[string]any{"kid": "cans", "sub": "user:c", "ns": []any{"p", "q"}, "can": []any{"read", "append"}}),
+		"roles": ks.mint(t, map[string]any{"kid": "rolesk", "sub": "user:o", "ns": []any{"p", "q"}, "can": []any{"read"}, "roles": []any{"admin"}}),
+		"attrs": ks.mint(t, map[string]any{"kid": "attrsk", "sub": "user:a", "ns": []any{"p", "q"}, "can": []any{"read"}, "attrs": map[string]any{"tier": "silver"}}),
 	}
 	for name, cred := range refused {
 		ns := map[string]func() error{
