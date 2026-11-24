@@ -672,6 +672,9 @@ type Error struct {
 	// which draw on the caller's own buckets alone (§6.2 step 1, §6.6
 	// Validation work; stepOneRanOut).
 	ranOut bool
+	// readRanOut marks the refusal of a read transaction during which the
+	// request's one budget ran out (ranOutRefusal, ReadBudgetRanOut).
+	readRanOut bool
 }
 
 func (e *Error) Error() string {
@@ -862,11 +865,13 @@ type docPut struct {
 func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
 	var judged []judgedRow
 	var served string
+	budget, _ := ctx.Value(readBudgetKey{}).(*writeMeter)
 	err = e.read1(ctx, func(t *tx) error {
 		defer func() { judged, served = t.judged, t.viewServed }()
 		// The read checks of a request share one budget (§6.6).
 		defer t.requestScope(ctx)()
-		return f(t)
+		over := budget != nil && budget.Over
+		return ranOutRefusal(f(t), budget != nil && !over && budget.Over)
 	})
 	// Per-revision answers it gave are kept once it has ended (judge).
 	e.flushJudged(ctx, judged)

@@ -170,11 +170,13 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 			testLongPollFetch()
 		}
 		lg, err := fetch(r.Context(), since)
-		if err != nil && s.e.ReadBudgetSpent(r.Context()) {
+		if core.ReadBudgetRanOut(err) {
 			// The wait's one budget ran out, at a read check or judging
 			// an entry, before anything was shown: 204 naming since, the
 			// last entry judged whole, never the refusal a range's read
-			// gives (§6.6 Validation work, §7.7, v0.90).
+			// gives (§6.6 Validation work, §7.7, v0.90). Only that
+			// refusal: a revoked or expired grant's, a purge's or any
+			// other error answers as it is, whatever the budget.
 			noChange(public)
 			return
 		}
@@ -195,6 +197,14 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 			return
 		}
 		public = lg.Public
+		if len(lg.Entries) == 0 && s.e.ReadBudgetSpent(r.Context()) {
+			// Ran out in a fetch that shows nothing yet passed: the wait
+			// has run out (§6.6: running out fails the whole request),
+			// so 204 now, never a wait on whose next fetch's refusal,
+			// another's, the spent budget would hide.
+			noChange(public)
+			return
+		}
 		if len(lg.Entries) > 0 {
 			// A page, as a range's (fetch asks for the log page size,
 			// §7.1): header names its last entry, the next since. It

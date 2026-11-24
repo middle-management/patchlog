@@ -749,6 +749,12 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 				// a range with a revision it can't read (§C.2 item 5).
 				if byDoc {
 					switch seen, all := t.seesKeptRange(n, a, name, to); {
+					case t.readSpent():
+						// The request's one budget ran out judging the
+						// kept range: the read check's refusal (§6.6
+						// Validation work), never a horizon or a name
+						// that doesn't exist.
+						return notFound()
 					case !seen:
 						return absent()
 					case !all && !t.readsPartially(n, a):
@@ -779,7 +785,7 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 				// (§6.6 Validation work): a page ends before it, its next
 				// since the last entry judged whole; inside the first it
 				// fails as its read check would, and a long-poll answers
-				// 204 (Engine.ReadBudgetSpent).
+				// 204 (ReadBudgetRanOut).
 				if judged == 0 {
 					return notFound()
 				}
@@ -789,7 +795,9 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 				// A range it can read nothing of from genesis is a
 				// resource it can read no revision of: answered as a name
 				// that doesn't exist (§C.2 item 5).
-				if since == "" && !t.seesAnyEntry(n, a, name, entries) {
+				// One that runs out finding out fails as its read check
+				// would (§6.6 Validation work), never as an empty log.
+				if since == "" && !t.seesAnyEntry(n, a, name, entries) && !t.readSpent() {
 					return absent()
 				}
 				return notFound()

@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/middle-management/patchlog/internal/grantcheck"
@@ -71,6 +72,32 @@ type readBudgetKey struct{}
 func (e *Engine) ReadBudgetSpent(ctx context.Context) bool {
 	m, ok := ctx.Value(readBudgetKey{}).(*writeMeter)
 	return ok && m.Over
+}
+
+// ranOutRefusal marks err, the refusal of a read transaction during which
+// the request's one budget ran out (ranOut), as that run-out's own
+// (ReadBudgetRanOut): a 403 or 404, the usual refusal of a read check
+// that runs out (§6.6 Validation work). Any other error, a revoked,
+// expired or unknown credential's 401, a purge's 410, a 429, is never
+// the run-out's, nor is a refusal of a transaction that began with the
+// budget already spent. err is copied, never changed: it may be shared.
+func ranOutRefusal(err error, ranOut bool) error {
+	ae, ok := err.(*Error)
+	if !ranOut || !ok || ae == nil || ae.Status != 403 && ae.Status != 404 {
+		return err
+	}
+	c := *ae
+	c.readRanOut = true
+	return &c
+}
+
+// ReadBudgetRanOut reports whether err is the refusal a read check gave
+// where the request's one budget (ReadBudget) ran out in it, rather than
+// any other refusal or error: a long-poll answers that one alone 204
+// (§6.6 Validation work, §7.7, §7.9 Long-poll, v0.90).
+func ReadBudgetRanOut(err error) bool {
+	var ae *Error
+	return errors.As(err, &ae) && ae.readRanOut
 }
 
 // requestScope is the read scope of a read transaction (Engine.read): the
