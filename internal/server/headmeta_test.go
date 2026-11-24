@@ -368,7 +368,7 @@ func headMetaDB(t *testing.T) string {
 func storedMeta(t *testing.T, path string) int {
 	t.Helper()
 	driver, dsn := "sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)")
-	if strings.HasPrefix(path, "postgres") {
+	if pgtest.IsURL(path) {
 		driver, dsn = "pgx", pgtest.DSN(path)
 	}
 	db, err := sql.Open(driver, dsn)

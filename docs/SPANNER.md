@@ -4,7 +4,7 @@ The core can store in a Google Cloud Spanner database of the PostgreSQL dialect,
 through [PGAdapter](https://github.com/GoogleCloudPlatform/pgadapter), which speaks the
 Postgres wire protocol. This is the first phase: `patchlog serve` runs on it, migrations apply,
 writes and reads work, and part of the Postgres test suite passes, all against the **Spanner
-emulator**, which checks semantics only: it runs one read-write transaction at a time and says
+emulator**, which checks semantics only: its locking is not Spanner's, and it says
 nothing about performance. Nothing here has run on a real Spanner instance yet.
 
 It is the Postgres backend of Addendum D.8 with the differences below; read this beside D.8
@@ -97,36 +97,51 @@ instance. A chain's head was handed out before the transaction that appends afte
 (under the row's lock), so a block taken after that read is above it. An id is taken from the
 block in hand only if it is above the head; otherwise, or if the block is short, the transaction
 rolls back and takes a new block first. Blocks are never taken inside a write transaction:
-there the counter's row would stay locked to commit, serialising every writer, and the emulator,
-which runs one read-write transaction at a time, would wait forever. Ids are not dense, and the
-first entry of the deployment is no longer the one with the least `seq` (`operatorkeys.go` reads
-`MIN(seq)`; harmless while one instance writes first).
+there the counter's row would stay locked to commit, serialising every writer (and on the
+emulator a block taken beside an open write transaction waited for it forever). Ids are not
+dense, and the least `seq` needn't be the deployment's first entry, which is read by commit
+timestamp instead (`operatorkeys.go`, `archive.go`).
 
 ## What the emulator showed
 
-See the commit history and the phase report for the test counts. In short:
-
-- migrations apply to an empty database, and again to a migrated one (`TestMigrateSpanner`);
-- `serve --dev` starts; namespace create, resource create and patch, document, resource log,
-  namespace log and namespace list reads work over HTTP;
-- most of `internal/core`'s tests pass; the ones that fail are listed in the report by cause.
-  Tests of Postgres mechanisms (advisory locks, `rate_draws` and its row locks, injected Postgres
-  errors, statement counts of recursive queries) skip on Spanner.
+- Migrations apply to an empty database, and again to a migrated one (`TestMigrateSpanner`).
+- `serve --dev` starts. Over HTTP and with the `patchlog` CLI: namespace create and list,
+  resource put, patch, get, log, ls, delete and restore, a batch, a branch and a write in it, a
+  blob upload and download, a purge, and `watch`, on one instance and across two sharing the
+  database (a write on one wakes a long-poll and a watch on the other: the tailer).
+- `internal/core` (293 top-level tests, each run on its own, 45–400 s timeout): 233 pass,
+  52 skip, 4 fail, 4 time out. Of the skips, 10 skip on Postgres too (store compression, lz4,
+  the oracle); the rest test Postgres mechanisms Spanner replaces (advisory locks and their
+  order, `rate_draws` and its row locks, the leader's session lock, plpgsql and trigger
+  injections, `pg_locks`, plans and statement counts of recursive queries, databases an
+  earlier version left). The failures and time-outs are all concurrent: writers that the
+  emulator stalls (`TestPGGroupCommitStress`, `…NoDeadlockWithSingleWrite`, `TestPGNoLostUpdates`,
+  `TestV073P17SharedBucketsAcrossInstances`, `TestV087FilteredOracle`), and two that expect one
+  transaction to wait for another's lock (`TestPGParallelNamespaces`'s config write,
+  `TestPGPurgeSkipsBranchPurgedMeanwhile`), where the emulator lets the second go on and aborts
+  the first, which runs again. The fourth failure, `TestPGDrawAfterCheck`, fails on Postgres
+  too.
+- `internal/server`, every sixth of its 594 tests (99): 97 pass; `TestResourceLongPollIsolated`
+  fails on its timing (a long-poll reaches its boundary on the slow emulator) and
+  `TestV034ConcurrentUploadsPending` (concurrent) times out.
+- `internal/dbmigrate` and `internal/pgtest` pass.
 
 ## Untested
 
-- **Anything concurrent.** The emulator runs one read-write transaction at a time; tests with
-  concurrent writers stall on it (`TestPGGroupCommitStress` and the like time out). Lock waits,
-  wound-wait aborts, `FOR UPDATE` ordering, and PGAdapter's own retry of aborted transactions
-  (which replays the statements and gives up with 40001 if results differ) are untested.
+- **Anything concurrent, on real Spanner.** The emulator does run read-write transactions at
+  once, and aborts one of two that conflict (a shared lock upgraded by both, for instance), but
+  with a dozen writers of one namespace it stalls them all for minutes: its lock manager is not
+  Spanner's. Lock waits, wound-wait aborts, `FOR UPDATE` ordering, and PGAdapter's own retry of
+  aborted transactions (which replays the statements and gives up with 40001 if results
+  differ) are untested.
 - Real Spanner's limits the emulator may not enforce: statement parameters (`spValues` splits at
-  900), mutations per commit (a batch of 1,000 items with history is far below 80,000), reading
-  a table in the transaction that wrote a pending commit timestamp into it (the emulator allows
-  it; group commit and purges read `ns_log` after appending).
-- Instances sharing a database: the leader lease (timed by each instance's clock), the tailer
-  across instances, two instances migrating at once.
-- Encryption at rest, sealed and e2e namespaces, filtered reads, retention and pruning were not
-  exercised by hand; their tests' results are in the report.
+  900), mutations per commit (a batch of 1,000 items with history is far below 80,000), and
+  reading a table in the transaction that wrote a pending commit timestamp into it (the emulator
+  allows it; group commit and purges read `ns_log` after appending). If Spanner refuses that,
+  the commit timestamp moves to a table of its own that no write transaction reads.
+- Instances sharing a database at scale: the leader lease is timed by each instance's clock;
+  two instances migrating at once.
+- `internal/server` ran in part only; no other package uses the database.
 
 ## What is left
 
@@ -143,7 +158,7 @@ See the commit history and the phase report for the test counts. In short:
 - **Round trips**: `moveHeads` runs once per row and an append is three statements; PGAdapter's
   `START BATCH DML` could send them together.
 - **Migration concurrency**: a lease, as for the leader, if instances must not both migrate.
-- The failing tests listed in the report.
+- The concurrency above, on a real instance.
 
 ## A capacity bench on real Spanner would need
 

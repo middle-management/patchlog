@@ -3,7 +3,6 @@ package server
 import (
 	"database/sql"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/pgtest"
@@ -142,7 +141,7 @@ func TestPurgeReachSealedCopies(t *testing.T) {
 	stored := func(name string) map[string]int {
 		t.Helper()
 		driver, dsn := "sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)")
-		if strings.HasPrefix(path, "postgres") {
+		if pgtest.IsURL(path) {
 			driver, dsn = "pgx", pgtest.DSN(path)
 		}
 		db, err := sql.Open(driver, dsn)

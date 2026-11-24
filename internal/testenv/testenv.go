@@ -67,7 +67,7 @@ const (
 // panics.
 func StoreCompression(o *core.Options) {
 	v := os.Getenv(StoreCompressionEnv)
-	if v == "" || o.StoreCompression != "" || strings.HasPrefix(o.Path, "postgres") {
+	if v == "" || o.StoreCompression != "" || strings.HasPrefix(o.Path, "postgres") || strings.HasPrefix(o.Path, "spanner+postgres:") {
 		return
 	}
 	o.StoreCompression = v

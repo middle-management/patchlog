@@ -66,8 +66,8 @@ const idBlockSize = 1024
 //
 // Blocks are taken between transactions, never inside one: inside, the
 // counter's row would stay locked until it commits, serialising every
-// writer of the deployment, and the emulator, which runs one read-write
-// transaction at a time, would wait forever for the one open. So a write
+// writer of the deployment (and on the emulator, a block taken beside an
+// open write transaction waited for it forever). So a write
 // transaction takes ids from the blocks in hand only (take), and one that
 // needs more, or one above a head a later block appended, rolls back
 // (errIDBlock), takes a new block (refill) and runs again (update1).

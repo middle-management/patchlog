@@ -32,7 +32,7 @@ func (a *archiveRestoreCmd) run(string) {
 	if a.Resource != "" && a.NS == "" {
 		log.Fatal("--resource needs --ns")
 	}
-	if _, err := os.Stat(a.DB); err != nil && !strings.HasPrefix(a.DB, "postgres") {
+	if _, err := os.Stat(a.DB); err != nil && !strings.HasPrefix(a.DB, "postgres") && !strings.HasPrefix(a.DB, "spanner+postgres:") {
 		log.Fatalf("--db: %v", err)
 	}
 	opt := core.Options{Path: a.DB, BlobDir: a.BlobDir, RetentionInterval: -1}

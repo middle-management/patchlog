@@ -145,7 +145,7 @@ func newEnvWith(t *testing.T, sopts []Option, opts ...envOpt) *tenv {
 	switch {
 	case o.BlobDir == tableBlobs:
 		o.BlobDir = ""
-	case o.BlobDir == "" && (o.Path == ":memory:" || strings.HasPrefix(o.Path, "postgres")):
+	case o.BlobDir == "" && (o.Path == ":memory:" || pgtest.IsURL(o.Path)):
 		// Blob bytes in files, as a SQLite file has them by default.
 		o.BlobDir = t.TempDir()
 	}

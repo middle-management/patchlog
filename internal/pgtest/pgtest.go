@@ -22,6 +22,7 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -44,6 +45,12 @@ func Enabled() bool { return os.Getenv(Env) != "" || Spanner() }
 
 // Spanner reports whether tests run against Spanner (SpannerEnv).
 func Spanner() bool { return os.Getenv(SpannerEnv) != "" }
+
+// IsURL reports whether a database path from DB is a URL (Postgres or
+// Spanner), which Open and DSN take, rather than a SQLite file.
+func IsURL(path string) bool {
+	return strings.HasPrefix(path, "postgres") || strings.HasPrefix(path, "spanner+postgres://")
+}
 
 // DB returns the database path for a test's engine: ":memory:", or with
 // PATCHLOG_TEST_PG set, the URL of an empty Postgres database (NewDB).

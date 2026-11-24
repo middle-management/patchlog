@@ -493,7 +493,7 @@ func v073SQL(t *testing.T, path string) (db *sql.DB, q func(string) string) {
 	t.Helper()
 	driver, dsn := "sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)")
 	q = func(s string) string { return s }
-	if strings.HasPrefix(path, "postgres") {
+	if pgtest.IsURL(path) {
 		driver, dsn = "pgx", pgtest.DSN(path)
 		q = func(s string) string {
 			var b strings.Builder
@@ -525,7 +525,7 @@ func v073Unapplied(t *testing.T, path, name string) {
 	t.Helper()
 	db, q := v073SQL(t, path)
 	table := "mmmigrate_applied"
-	if strings.HasPrefix(path, "postgres") {
+	if strings.HasPrefix(path, "postgres") { // Spanner's is mmmigrate_applied too
 		table = "mmmigrate.applied"
 	}
 	r, err := db.Exec(q(`DELETE FROM `+table+` WHERE (namespace = 'patchlog' OR namespace LIKE 'patchlog@%') AND name = ?`), name)
