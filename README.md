@@ -3845,9 +3845,13 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   runs a `PASSIVE` one every 100 ms; a `RESTART` one under the mutex once the WAL holds 16,384
   frames, since under steady writes and overlapping readers a `PASSIVE` checkpoint never lets it
   start over (waiting at most 250 ms for readers, and backing off while one stays); and a
-  `TRUNCATE` one once it is idle, and at close. `synchronous(NORMAL)` is unchanged. Locally (4 vCPUs) one
-  namespace's 32 writers went from about 2,000 to about 4,000 writes a second, and disk writes
-  from about 65 to 15 KiB a write (`go test ./internal/core -run '^$' -bench NamespaceWriters`).
+  `TRUNCATE` one once it is idle, and at close. `synchronous(NORMAL)` is unchanged. On a shared
+  4-vCPU host (`go test ./internal/core -run '^$' -bench NamespaceWriters`, medians of three),
+  one namespace's 32 writers went from 1,640 to 2,620 writes a second with the checkpoints moved
+  and to 3,410 grouped (p99 41 to 24 ms, 72 to 20 KiB written to disk and 517 to 385 µs of CPU
+  a write); 16 namespaces of 8 writers from 1,640 to 3,000. One writer gained from the
+  checkpoints alone (1,820 to 2,520), and namespaces with too few writers to group (16 of 2)
+  only from them.
 - **Additions to the D.2 layout**: `namespaces.head_seq/config_seq/base_config_seq`,
   `ns_log.body` (the canonical entry exactly as hashed) and `ns_log.config_seq`,
   `ns_config.doc`, `revisions.signature/schema_ref`, `revisions.rules` (the schema rules a
