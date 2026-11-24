@@ -42,7 +42,7 @@ keys; v0.88's answers to the reference's notes on v0.87.
   carries the documents the stored plan was to publish.
 - **WebDAV:** an index `400` for an unindexed folder is no empty folder before a delete or
   move: the gateway lists again at the namespace head and answers `503` if still `400`.
-- **Migration** `030_purge_follows_by_importer` on Postgres, `029_…` on SQLite: recorded
+- **Migration** `031_purge_follows_by_importer` on Postgres, `029_…` on SQLite: recorded
   imported names gain their importer; names recorded before follow nothing until imported
   again.
 
