@@ -140,10 +140,12 @@ func TestMigratePostgresSchemas(t *testing.T) {
 }
 
 // A Postgres database migrated while two of the core's migrations were both
-// numbered 030 upgrades: one that applied rate_draws_batched as 30 (main
-// between PR #39 and PR #37) has it re-recorded as 31 and gets
-// purge_follows_by_importer, and one that applied purge_follows_by_importer
-// as 30 (the spec branches) gets rate_draws_batched as 31.
+// numbered 030 upgrades. One that applied purge_follows_by_importer as 30 (the
+// spec branches) gets rate_draws_batched as 31. One that applied
+// rate_draws_batched as 30 (main between PR #39 and PR #37) is refused by
+// mmmigrate, which would otherwise skip purge_follows_by_importer and run
+// rate_draws_batched again, with an error saying to move the record; once
+// it is moved (README, Schema migrations), it gets purge_follows_by_importer.
 func TestMigrateRenumbered(t *testing.T) {
 	if !pgtest.Enabled() {
 		t.Skip("Postgres only (" + pgtest.Env + ")")
@@ -191,6 +193,18 @@ func TestMigrateRenumbered(t *testing.T) {
 			defer db.Close()
 			if err := Migrate(ctx, db, before(tc.applied), "patchlog"); err != nil {
 				t.Fatal(err)
+			}
+			if tc.applied == "rate_draws_batched" {
+				err := Migrate(ctx, db, core, "patchlog")
+				if err == nil || !strings.Contains(err.Error(), `version 30 is recorded as applied as "rate_draws_batched"`) ||
+					!strings.Contains(err.Error(), `"rate_draws_batched" is now version 31`) {
+					t.Fatalf("expected mmmigrate to refuse the record, got %v", err)
+				}
+				// The README's manual step.
+				if _, err := db.Exec(`UPDATE mmmigrate.applied SET version = 31
+					WHERE namespace LIKE 'patchlog@%' AND version = 30 AND name = 'rate_draws_batched'`); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := Migrate(ctx, db, core, "patchlog"); err != nil {
 				t.Fatal(err)

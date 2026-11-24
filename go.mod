@@ -6,9 +6,9 @@ require (
 	github.com/alexflint/go-arg v1.6.1
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/klauspost/compress v1.20.2
-	github.com/middle-management/mmmigrate v0.7.0
-	github.com/middle-management/mmmigrate/driver/postgres v0.0.0-20261021205057-866b4a3074f6
-	github.com/middle-management/mmmigrate/driver/sqlite v0.0.0-20261021205057-866b4a3074f6
+	github.com/middle-management/mmmigrate v0.7.1-0.20261124150048-394aa63efd12
+	github.com/middle-management/mmmigrate/driver/postgres v0.0.0-20261124150048-394aa63efd12
+	github.com/middle-management/mmmigrate/driver/sqlite v0.0.0-20261124150048-394aa63efd12
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.47.0
