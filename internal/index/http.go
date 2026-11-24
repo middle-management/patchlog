@@ -165,9 +165,10 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not_found", "not found")
 		return
 	}
-	// A namespace the service doesn't follow, or a sealed or e2e one whose
-	// keys it lacks, is 404 alike, before the read check (§A.4, §E.2.6).
-	if _, lacks := ix.keys.Skip(ns); !client.ValidNSName(ns) || !ix.known(ns) || lacks {
+	// A namespace the service doesn't follow, a branch whose bases' logs
+	// it doesn't all follow, or a sealed or e2e one whose keys it lacks,
+	// is 404 alike, before the read check (§A.4, §E.2.6, v0.90).
+	if _, lacks := ix.keys.Skip(ns); !client.ValidNSName(ns) || !ix.known(ns) || lacks || ix.basesUnfollowed(r.Context(), ns) {
 		writeErr(w, http.StatusNotFound, "not_found", "namespace not indexed")
 		return
 	}

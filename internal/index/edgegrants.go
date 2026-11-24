@@ -1512,7 +1512,7 @@ func (ix *Index) refsCookieReader(ctx context.Context, r *http.Request, reached 
 	}
 	rd := &refsReader{vid: vid, public: true, allow: map[string]allowFunc{}, covs: map[string]*access{}}
 	for _, ns := range ix.refsNamespaces() {
-		if _, ok := reached[ns]; !ok || ix.keys.Skipped(ns) != "" {
+		if _, ok := reached[ns]; !ok || ix.keys.Skipped(ns) != "" || ix.basesUnfollowed(ctx, ns) {
 			continue
 		}
 		i := slices.IndexFunc(subs, func(m string) bool {
@@ -1680,17 +1680,20 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var (
-		exs    []*exchanged
-		limit  *grantcheck.LimitError
-		denied *grant.AuthError
-		upErr  error
-		purged *purgedNS
+		exs     []*exchanged
+		limit   *grantcheck.LimitError
+		denied  *grant.AuthError
+		upErr   error
+		purged  *purgedNS
+		unavail bool
 	)
 	for _, b := range bearers {
 		ex, pn, err := ix.exchangeGrant(ctx, b, reached, now)
 		var le *grantcheck.LimitError
 		var ae *grant.AuthError
 		switch {
+		case errors.Is(err, errUnavailable):
+			unavail = true
 		case errors.As(err, &le):
 			if limit == nil {
 				limit = le
@@ -1723,6 +1726,12 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		return
 	case upErr != nil:
 		ix.writeUpstreamErr(w, "exchange", upErr, "cannot read a namespace configuration")
+		return
+	case unavail:
+		// 404 as a query of it is, no other refusal being 401 or 403;
+		// never 410, as a namespace refused isn't purged (§C.5.2 All or
+		// nothing, SERVICES §A.4 Unavailable namespaces, v0.90).
+		writeErr(w, http.StatusNotFound, "not_found", "a namespace the grants name is not indexed")
 		return
 	case purged != nil:
 		purged.write(w)
@@ -1884,9 +1893,25 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			upErr = worseUpstream(upErr, err)
 		}
 	}
+	// unavailable notes a namespace the grant names that the service
+	// doesn't follow, or answers as such: 404, at the exchange too, only
+	// where no other refusal is 401 or 403 (SERVICES §A.4 Unavailable
+	// namespaces, v0.90).
+	unavailable := false
+	if len(g.Blocks) > 0 {
+		for _, ns := range g.Blocks[0].NS {
+			if ns != "*" && !ix.known(ns) && g.NamesNS(ns) {
+				unavailable = true
+			}
+		}
+	}
 	for _, ns := range namedInOrder(g, ix.refsNamespaces()) {
-		if _, lacks := ix.keys.Skip(ns); lacks {
-			continue // one the service doesn't follow (§A.4)
+		if _, lacks := ix.keys.Skip(ns); lacks || ix.basesUnfollowed(ctx, ns) {
+			// One the service doesn't follow (§A.4): a sealed one whose
+			// keys it lacks, or a branch whose bases' logs it doesn't all
+			// follow (§C.4 Keys follow the base). No marker, no cookie.
+			unavailable = true
+			continue
 		}
 		_, purged, err := ix.committed(ctx, ns)
 		if err != nil {
@@ -1979,7 +2004,31 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 	if pn := ix.purgedOnly(ctx, token, g); pn != nil {
 		return nil, pn, nil
 	}
+	if unavailable {
+		return nil, nil, errUnavailable
+	}
 	return nil, nil, &grant.AuthError{Status: 403, Msg: "the grant reads no private namespace this service follows"}
+}
+
+// errUnavailable is an exchange whose grant gets no edge grant, no
+// refusal of it is 401 or 403, and a namespace it names is one the
+// service doesn't follow or answers as such: 404, as a query of it is
+// (SERVICES §A.4 Unavailable namespaces, v0.90).
+var errUnavailable = errors.New("namespace not indexed")
+
+// basesUnfollowed reports whether ns is a branch a base of whose chain
+// the service doesn't follow, so that it can't judge a cookie by every
+// entry of its bases (basesJudged): it is answered as unfollowed, 404,
+// its exchange minting no cookie, and /_refs leaves it out (SERVICES §A.4
+// Unavailable namespaces, v0.90; §C.4 Keys follow the base). Until v0.90
+// such an exchange minted a cookie under which every read was 403. A
+// document that can't be read now is left to the read check.
+func (ix *Index) basesUnfollowed(ctx context.Context, ns string) bool {
+	cfg, err := ix.checker.Config(ctx, ns)
+	if err != nil || cfg.Base == "" {
+		return false
+	}
+	return errors.Is(ix.basesJudged(ctx, cfg), errRulesChanged)
 }
 
 // purgedOnly is the purge an exchange, or /_refs, answers 410 for a grant

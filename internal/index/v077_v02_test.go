@@ -252,8 +252,8 @@ func TestV077AuthDisabledUncovers(t *testing.T) {
 // may see none of the namespaces gets 401 or 403, or, where every
 // namespace its grant names is purged and the grant verifies in each,
 // 410 as §C.5.2 gives it"): once pb is purged, a grant naming pb and the
-// public pub, or pb and schemas, which the index doesn't follow, is
-// refused 403 at the exchange, not 410; one naming pb alone is 410 with
+// public pub is refused 403 at the exchange, and pb and schemas, which
+// the index doesn't follow, 404 (v0.90), not 410; one naming pb alone is 410 with
 // ns and head, at the exchange and, where the index follows no public
 // namespace every reader sees, at /_refs. Before v0.77 the first two were
 // 410, and /_refs answered 200 with nothing.
@@ -269,10 +269,13 @@ func TestV077ExchangePurgedOnly(t *testing.T) {
 		w.x.ix.ExpireGrantChecks()
 		return w.x.raw("/pb", onlyPB).status == 410
 	})
-	for _, nss := range [][]string{{"pb", "pub"}, {"pb", "schemas"}} {
-		g := w.issuer.Grant(t, w.s.Now(), "user:amy", nss, []string{"read"})
-		if r := p37Do(t, w.x, "POST", "/edge-grants", g, "", nil, ""); r.status != 403 || len(r.cookies) != 0 {
-			t.Errorf("exchange naming %v: %d %v", nss, r.status, r.body)
+	// v0.90 SERVICES §A.4 Unavailable namespaces: schemas, which the
+	// index doesn't follow, is 404 at the exchange too, no other refusal
+	// being 401 or 403; never 410.
+	for nss, want := range map[[2]string]int{{"pb", "pub"}: 403, {"pb", "schemas"}: 404} {
+		g := w.issuer.Grant(t, w.s.Now(), "user:amy", nss[:], []string{"read"})
+		if r := p37Do(t, w.x, "POST", "/edge-grants", g, "", nil, ""); r.status != want || len(r.cookies) != 0 {
+			t.Errorf("exchange naming %v: %d %v, want %d", nss, r.status, r.body, want)
 		}
 	}
 	if r := p37Do(t, w.x, "POST", "/edge-grants", onlyPB, "", nil, ""); r.status != 410 || r.body["ns"] != "pb" || r.body["head"] != head {

@@ -284,7 +284,7 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 	var over *grantcheck.LimitError
 	errors.As(derr, &over)
 	for _, ns := range ix.refsNamespaces() {
-		if _, ok := reached[ns]; !ok || ix.keys.Skipped(ns) != "" {
+		if _, ok := reached[ns]; !ok || ix.keys.Skipped(ns) != "" || ix.basesUnfollowed(ctx, ns) {
 			continue
 		}
 		a, err := ix.refsAccess(ctx, ns, r, g)

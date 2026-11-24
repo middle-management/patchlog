@@ -389,15 +389,15 @@ func TestV086CookieOfAStaleHeadIsJudged(t *testing.T) {
 	}
 }
 
-// v0.88 SERVICES §A.4 Cookies ("it judges a cookie by every
-// namespace-document entry after the checkpoint it judged the exchange
-// at, in a branch by its bases' entries after their checkpoints then too
-// … and a cookie it can't judge so … is 403"), SVC-59: an index that
-// follows the branch docs-b and not its base docs can't judge li's
-// docs-b cookie by docs' entries, so the cookie is 403; the same index
-// following docs too reads it. Until v0.88 such a cookie was judged by
-// the documents at the heads alone, and read on after a change to docs
-// and its undo.
+// v0.90 SERVICES §A.4 Unavailable namespaces ("a branch whose bases'
+// namespace logs it doesn't all follow (§C.4 Keys follow the base) ...:
+// 404, at its exchange too, which mints no cookie"; Filtered reads
+// scenario 91), SVC-59: an index that follows the branch docs-b and not
+// its base docs can't judge a docs-b cookie by docs' entries, so docs-b is
+// answered as unfollowed: a query is 404, the exchange 404 with no cookie
+// and no exchangeRate token drawn, and /_refs leaves it out. The same
+// index following docs too serves it. From v0.88 to v0.89 the exchange
+// minted a cookie under which every read was 403.
 func TestV088BranchCookieUnjudgedWithoutBase(t *testing.T) {
 	t.Parallel()
 	d, nss := newV86Branch(t)
@@ -408,22 +408,30 @@ func TestV088BranchCookieUnjudgedWithoutBase(t *testing.T) {
 	d.x = startSvcWith(t, d.s.Client(t, client.WithBearer(d.admin.Grant(t, d.s.Now(), "svc:indexer", nss, []string{"read"}))),
 		svcOpts{db: db, ns: []string{"docs-b"}, untyped: true, now: d.s.Now},
 		func(o *indexOpts) {
-			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.DefaultExchangeRate, ev
+			// One exchange a minute: a drawn token would refuse the next.
+			o.EdgeGrants, o.ExchangeRate, o.Edge = edge.NewCookies("index", []byte("0123456789abcdef0123456789abcdef")), index.Rate{Rate: 1.0 / 60, Burst: 1}, ev
 		})
 	d.x.caughtUp("docs-b")
-	status := func(p string, c []*http.Cookie) int {
-		t.Helper()
-		r, _ := p37Follow(t, d.x, p+"?q=word", c, "")
-		return r.status
-	}
 	tok := v86GrantFor(d, "docs-b")
-	pb, cb := v86Exchange(d, tok)
-	if got := status(pb, cb); got != 403 {
-		t.Fatalf("a docs-b cookie, docs not followed: %d, want 403", got)
+	for i := 0; i < 2; i++ {
+		if r := p37Do(t, d.x, "POST", "/edge-grants", tok, "", nil, ""); r.status != 404 || len(r.cookies) != 0 {
+			t.Fatalf("exchange %d for docs-b, docs not followed: %d %v, %d cookies; want 404 and none", i, r.status, r.body, len(r.cookies))
+		}
+	}
+	if r := p37Do(t, d.x, "GET", "/docs-b?q=word", tok, "", nil, ""); r.status != 404 {
+		t.Fatalf("a docs-b query, docs not followed: %d %v, want 404", r.status, r.body)
+	}
+	// /_refs leaves docs-b out: the grant sees no namespace there.
+	r := p37Do(t, d.x, "GET", "/_refs?to=%2Fr%2Fdocs-b%2Fx", tok, "", nil, "")
+	for i := 0; r.status == 302 && i < 5; i++ {
+		r = p37Do(t, d.x, "GET", r.header.Get("Location"), tok, "", nil, "")
+	}
+	if nsm, _ := r.body["namespaces"].(map[string]any); r.status == 200 && nsm["docs-b"] != nil {
+		t.Fatalf("/_refs covers docs-b, docs not followed: %v", r.body)
 	}
 	v86Restart(d, nss, false)
-	pb, cb = v86Exchange(d, tok)
-	if got := status(pb, cb); got != 200 {
-		t.Fatalf("a docs-b cookie, docs followed: %d, want 200", got)
+	pb, cb := v86Exchange(d, tok)
+	if r, _ := p37Follow(t, d.x, pb+"?q=word", cb, ""); r.status != 200 {
+		t.Fatalf("a docs-b cookie, docs followed: %d, want 200", r.status)
 	}
 }
