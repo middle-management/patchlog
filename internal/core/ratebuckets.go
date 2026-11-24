@@ -55,7 +55,7 @@ import (
 // Concurrent draws batch (draw, drawBatch), as group commit's writes do:
 // while a batch draws on a bucket, the draws on it queued meanwhile go in
 // the next batch, one statement, rate_draws (migration
-// 030_rate_draws_batched), which locks the rows of all their buckets
+// 031_rate_draws_batched), which locks the rows of all their buckets
 // once, in key order, and judges the requests in queue order, each as
 // rate_draw would have after the ones before it. One draw per write, each
 // a round trip and a lock of its buckets' rows, was what bounded writes on
@@ -591,7 +591,7 @@ func (s *bucketStore) drawOnce(ctx context.Context, r *drawReq) ([]drawRes, bool
 // rates $3, bursts $4 and costs $5 is a draw of request $1[i] (1, 2, ...),
 // which draws at $6[$1[i]] (Unix microseconds), deducting whatever its
 // buckets hold if $7[$1[i]] (a charge): see rate_draws (migration
-// 030_rate_draws_batched).
+// 031_rate_draws_batched).
 const drawsSQL = `SELECT r, k, t, admitted FROM rate_draws($1::int[], $2::bytea[], $3::float8[], $4::float8[], $5::float8[], $6::bigint[], $7::boolean[])`
 
 // drawsOnce runs drawsSQL once for b, a batch. complete is false if a

@@ -1,7 +1,7 @@
 -- Migration: rate draws batched
 -- Created: 2026-11-21T18:57:55Z
 -- Checksum: 3ca1d2ced6ec3eba64df7f19817904091aa44fc0887c13693d70559ae3491f9c
--- Chain: b93dc98b4fdc3e4de285d4166549bc8b54bbb04057db9b9d37584d16321be809
+-- Chain: 2cfe78668bd73fbad9e92a2b9f1ec5b0888d535657621e872777f6c561239bb9
 --
 -- IMPORTANT: Do not modify this file after commit. The checksum above
 -- tracks the integrity of this migration. Any changes will be detected
