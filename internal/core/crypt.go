@@ -372,7 +372,7 @@ func (t *tx) storeGrantBlocks(id, blocks []byte, root *grantRoot, encrypt bool) 
 		sub, kid = root.sub, root.kid
 	}
 	if !encrypt {
-		_, err := t.Exec(`INSERT INTO grants (id, blocks, root_sub, root_kid) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`, id, t.e.blobArg(blocks), sub, kid)
+		_, err := t.Exec(`INSERT INTO grants (id, blocks, root_sub, root_kid) VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING`, id, t.e.blobArg(blocks), sub, kid)
 		t.must(err)
 		return
 	}

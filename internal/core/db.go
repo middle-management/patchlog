@@ -32,9 +32,18 @@ var migrations embed.FS
 // plaintext in free pages once the WAL is checkpointed. Postgres has no
 // equivalent: deleted and overwritten tuples stay in the table's files
 // until VACUUM reclaims them (and in WAL and backups until those expire).
+//
+// A Spanner database (isSpannerURL) is opened as a Postgres one, through
+// PGAdapter, and migrated with its own migrations (dbmigrate.MigrateSpanner).
+// before doesn't run on it: no version before Spanner's could have left
+// what it checks for.
 func openDB(path string, fsys fs.FS, before func(db *sql.DB, pg bool) error) (db *sql.DB, pg bool, err error) {
 	if fsys == nil {
 		fsys = migrations
+	}
+	if isSpannerURL(path) {
+		db, err := openPG(path, fsys, nil)
+		return db, true, err
 	}
 	if isPostgresURL(path) {
 		db, err := openPG(path, fsys, before)
@@ -87,8 +96,8 @@ func openSQLite(path string, fsys fs.FS, before func(db *sql.DB, pg bool) error)
 }
 
 // openPG opens a Postgres database and creates or migrates its schema.
-func openPG(url string, fsys fs.FS, before func(db *sql.DB, pg bool) error) (*sql.DB, error) {
-	url, pool, err := parsePGPool(url)
+func openPG(raw string, fsys fs.FS, before func(db *sql.DB, pg bool) error) (*sql.DB, error) {
+	url, pool, err := parsePGPool(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +112,11 @@ func openPG(url string, fsys fs.FS, before func(db *sql.DB, pg bool) error) (*sq
 			return nil, err
 		}
 	}
-	if err := dbmigrate.Migrate(context.Background(), db, fsys, "patchlog"); err != nil {
+	migrate := dbmigrate.Migrate
+	if isSpannerURL(raw) {
+		migrate = dbmigrate.MigrateSpanner
+	}
+	if err := migrate(context.Background(), db, fsys, "patchlog"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrating schema: %w", err)
 	}

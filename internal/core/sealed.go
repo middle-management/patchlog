@@ -681,7 +681,7 @@ func (t *tx) insertSealed(ns int64, j *sealJob, name, rev any) {
 				j.jwe, sealKver, ns, j.kind, j.key, j.unzip)
 			t.must(err)
 		}
-		_, err = t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created, kver) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
+		_, err = t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created, kver) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT (ns, kind, key) DO NOTHING`,
 			ns, j.kind, j.key, name, rev, j.jwe, t.now.UnixMilli(), sealKver)
 	}
 	t.must(err)

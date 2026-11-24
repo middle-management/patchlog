@@ -260,8 +260,17 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 	if err != nil {
 		return "", fmt.Errorf("writing archive %s: %w", key, err)
 	}
-	_, err = t.Exec(`INSERT INTO archives (res, from_seq, to_seq, key, url, created) VALUES (?,?,?,?,?,?)`,
-		res, fromSeq, lastSeq, key, u, t.now.UnixMilli())
+	if t.e.spanner {
+		// A seq above the resource's last archive's, which a read takes
+		// as the latest (archiveURL; spanner.go).
+		var last int64
+		t.must(t.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM archives WHERE res = ?`, res).Scan(&last))
+		_, err = t.Exec(`INSERT INTO archives (seq, res, from_seq, to_seq, key, url, created) VALUES (?,?,?,?,?,?,?)`,
+			t.spID("archives", last), res, fromSeq, lastSeq, key, u, t.now.UnixMilli())
+	} else {
+		_, err = t.Exec(`INSERT INTO archives (res, from_seq, to_seq, key, url, created) VALUES (?,?,?,?,?,?)`,
+			res, fromSeq, lastSeq, key, u, t.now.UnixMilli())
+	}
 	t.must(err)
 	return u, nil
 }

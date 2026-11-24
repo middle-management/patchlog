@@ -2,6 +2,7 @@ package core
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -73,7 +74,10 @@ const poisonedHead = -1 << 60
 // snapshotRows reports whether this transaction's namespace rows change
 // only by its own statements: a read transaction, or SQLite's one writer.
 // Otherwise (a write transaction on Postgres) a row is kept under its lock.
-func (t *tx) snapshotRows() bool { return !t.e.pg || !t.write }
+//
+// On Spanner a write transaction's rows change only by its own statements
+// too: what it read stays locked, shared, until it commits (spanner.go).
+func (t *tx) snapshotRows() bool { return !t.e.pg || !t.write || t.e.spanner }
 
 // link returns the id, name and base of a namespace, reading its chain of
 // bases, all of it, in one statement if the transaction doesn't know it.
@@ -98,6 +102,10 @@ func (t *tx) link(id int64) nsLink {
 // readChain reads the chain of bases from id up: the links, and where rows change only by this transaction's own
 // statements (snapshotRows) the rows as well, which costs nothing more.
 func (t *tx) readChain(id int64) {
+	if t.e.spanner {
+		t.readChainSpanner(id)
+		return
+	}
 	cols, colsN := `ns, name, base`, `n.ns, n.name, n.base`
 	if t.snapshotRows() {
 		cols, colsN = nsCols, nsColsN
@@ -136,6 +144,10 @@ func (t *tx) readChain(id int64) {
 // in one statement however many they are: those of the namespaces a purge
 // reaches (nspurge.go).
 func (t *tx) readChains(ids []int64) {
+	if t.e.spanner {
+		t.readChainsSpanner(ids)
+		return
+	}
 	rows, err := t.Query(`WITH RECURSIVE c(ns, name, base) AS (
 			SELECT ns, name, base FROM namespaces WHERE `+t.e.inArray("ns", "bigint")+`
 			UNION
@@ -152,6 +164,53 @@ func (t *tx) readChains(ids []int64) {
 		t.links[l.id] = l
 	}
 	t.must(rows.Err())
+}
+
+// readChainSpanner is readChain on Spanner, which has no recursive
+// queries: a statement per level, branches being at most branchDepth deep
+// (§6.6).
+func (t *tx) readChainSpanner(id int64) {
+	if t.links == nil {
+		t.links = map[int64]nsLink{}
+	}
+	for next := (sql.NullInt64{Int64: id, Valid: true}); next.Valid; {
+		if _, ok := t.links[next.Int64]; ok {
+			return
+		}
+		n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE ns = ?`, next.Int64))
+		if errors.Is(err, sql.ErrNoRows) {
+			return
+		}
+		t.must(err)
+		t.links[n.id] = linkOf(n)
+		t.keep(n)
+		next = n.base
+	}
+}
+
+// readChainsSpanner is readChains on Spanner: a statement per level, for
+// all the chains at once.
+func (t *tx) readChainsSpanner(ids []int64) {
+	if t.links == nil {
+		t.links = map[int64]nsLink{}
+	}
+	for len(ids) > 0 {
+		rows, err := t.Query(`SELECT ns, name, base FROM namespaces WHERE `+t.e.inArray("ns", "bigint"), t.e.arrayArg(ids))
+		t.must(err)
+		ids = nil
+		for rows.Next() {
+			var l nsLink
+			t.must(rows.Scan(&l.id, &l.name, &l.base))
+			t.links[l.id] = l
+			if l.base.Valid {
+				if _, ok := t.links[l.base.Int64]; !ok {
+					ids = append(ids, l.base.Int64)
+				}
+			}
+		}
+		t.must(rows.Err())
+		rows.Close()
+	}
 }
 
 func (t *tx) keep(n *nsRow) {

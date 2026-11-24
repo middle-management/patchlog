@@ -131,7 +131,7 @@ const namesBelow = "~"
 // and one more the namespace documents the configuration cache lacks.
 func (t *tx) pageNamespaces(after, prefix string, limit int) *NamespacesPage {
 	col := "n.name"
-	if t.e.pg {
+	if t.e.pg && !t.e.spanner { // Spanner's order is byte order, and it has no COLLATE
 		col = `n.name COLLATE "C"`
 	}
 	lower, bound, upper := ` > ?`, plainBound(after), namesBelow

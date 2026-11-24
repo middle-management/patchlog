@@ -34,7 +34,13 @@ func (t *tx) queueRepurge() {
 		key = t.lastNS
 	}
 	due := t.now.Add(t.e.opt.RepurgeDelay).UnixMilli()
-	_, err = t.Exec(`INSERT INTO cdn_repurge (ns_seq, tags, due) VALUES (?,?,?) ON CONFLICT DO NOTHING`, key, string(tags), due)
+	q := `INSERT INTO cdn_repurge (ns_seq, tags, due) VALUES (?,?,?) ON CONFLICT DO NOTHING`
+	if t.e.spanner {
+		// Spanner takes no secondary index as a conflict target, nor none:
+		// ns_seq is this transaction's own entry, which no other row has.
+		q = `INSERT INTO cdn_repurge (ns_seq, tags, due) VALUES (?,?,?)`
+	}
+	_, err = t.Exec(q, key, string(tags), due)
 	t.must(err)
 }
 

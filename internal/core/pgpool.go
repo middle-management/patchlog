@@ -49,9 +49,11 @@ const (
 )
 
 // parsePGPool returns the URL without its pool parameters, and their
-// values. A URL without them is returned as it is.
+// values. A URL without them is returned as it is, but for a Spanner
+// URL's scheme, which becomes postgres:// (pgxURL).
 func parsePGPool(raw string) (string, pgPool, error) {
 	var p pgPool
+	raw = pgxURL(raw)
 	if !strings.Contains(raw, "pool_") {
 		return raw, p, nil
 	}

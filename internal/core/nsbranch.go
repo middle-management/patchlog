@@ -110,8 +110,7 @@ func (t *tx) insertNamespace(name string, patches, doc any, frozen bool, author 
 	canon := jsonv.Canonical(patches)
 	id := ids.Revision(nil, canon)
 	nsid := t.mustInsert(`INSERT INTO namespaces (name, frozen) VALUES (?, ?) RETURNING ns`, name, frozen)
-	cseq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?) RETURNING seq`,
-		nsid, id[:], string(canon), string(jsonv.Canonical(doc)), author, t.now.UnixMilli())
+	cseq := t.insertConfigRow(nsid, id[:], nil, string(canon), string(jsonv.Canonical(doc)), author)
 	n := t.nsByID(nsid)
 	_, nsID := t.appendNS(n, map[string]any{"kind": "config", "target": id.String()}, nil, &cseq, cseq, author)
 	return n, id, nsID
@@ -294,8 +293,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	// counts by the column.
 	bid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq, frozen) VALUES (?,?,?,?,?) RETURNING ns`,
 		br.Name, base.id, atSeq, base.configSeq, cfg.Frozen)
-	cseq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?) RETURNING seq`,
-		bid, cfgID[:], string(gcanon), string(jsonv.Canonical(nd)), author, t.now.UnixMilli())
+	cseq := t.insertConfigRow(bid, cfgID[:], nil, string(gcanon), string(jsonv.Canonical(nd)), author)
 	bn := t.nsByIDLocked(bid, lockExclusive)
 	// Both logs, in ascending key order, after every other lock (D.8).
 	t.lockLogs(base.id, bid)

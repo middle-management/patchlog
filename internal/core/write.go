@@ -1900,9 +1900,14 @@ var (
 	insRevEpochs = bulkInsert("rev_epochs", "seq bigint, epoch bigint", "")
 	insSnapshots = bulkInsert("snapshots", "seq bigint, res bigint, doc bytea", "ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc")
 	upsertHeads  = bulkInsert("heads", "res bigint, seq bigint, doc bytea", "ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc")
-	delHeads     = bulkStmt{pg: `DELETE FROM heads WHERE res = ANY($1::bigint[])`, lite: `DELETE FROM heads WHERE res = ?`, types: []string{"bigint"}}
+	delHeads     = bulkStmt{pg: `DELETE FROM heads WHERE res = ANY($1::bigint[])`, sp: `DELETE FROM heads WHERE res = ANY($1::bigint[])`, lite: `DELETE FROM heads WHERE res = ?`, types: []string{"bigint"}}
 	openBlobRefs = bulkStmt{pg: `SELECT res, bid FROM blob_refs WHERE res = ANY($1::bigint[]) AND to_seq IS NULL`,
+		sp:   `SELECT res, bid FROM blob_refs WHERE res = ANY($1::bigint[]) AND to_seq IS NULL`,
 		lite: `SELECT res, bid FROM blob_refs WHERE res = ? AND to_seq IS NULL`, types: []string{"bigint"}}
+	// insRevisionsSpanner is insRevisions with the seqs, which Spanner's
+	// identities wouldn't give in chain order (spanner.go).
+	insRevisionsSpanner = bulkInsert("revisions", "seq bigint, res bigint, id bytea, parent_seq bigint, first smallint, kind smallint, patches bytea, author bigint, "+
+		"via text, grant_id bytea, signature text, schema_ref text, created bigint, gesture text, undoes text, size bigint, digest bytea, rules smallint", "RETURNING seq, res")
 	// moveHeads moves each resource's head from the one its precondition
 	// matched (old, 0 for none), or not at all (insertItems), with its
 	// snapshot counts.
@@ -2083,11 +2088,23 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 		if len(rows) == 0 {
 			break
 		}
-		t.bulkQuery(insRevisions, rows, func(rs *sql.Rows) {
+		ins := insRevisions
+		if t.e.spanner {
+			ins = insRevisionsSpanner
+			for i, it := range stepItems {
+				rows[i] = append([]any{t.spID("revisions", it.last)}, rows[i]...)
+			}
+		}
+		t.bulkQuery(ins, rows, func(rs *sql.Rows) {
 			var seq, res int64
 			t.must(rs.Scan(&seq, &res))
 			byRes[res].last = seq
 		})
+		if t.e.spanner {
+			for i := range rows {
+				rows[i] = rows[i][1:]
+			}
+		}
 		for i, it := range stepItems {
 			step, row, seq := it.steps[k], rows[i], it.last
 			digest, _ := row[15].([]byte)
@@ -2229,7 +2246,7 @@ func headMeta(doc []byte) (int64, []byte) {
 // the bytes of their stored patch sets, a compressed one's decompressed
 // (as step 7 counts them).
 func (t *tx) countSinceSnapshot(res int64) (revs, size int64) {
-	t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(octet_length(patches)), 0) FROM revisions
+	t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(`+t.e.octetLength("patches")+`), 0) FROM revisions
 		WHERE res = ? AND kind = 0 AND seq > (SELECT COALESCE(MAX(seq), 0) FROM snapshots WHERE res = ?)`, res, res).Scan(&revs, &size))
 	return revs, size + t.packedExtra(res)
 }

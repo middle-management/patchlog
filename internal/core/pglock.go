@@ -118,6 +118,28 @@ const (
 // violation.
 const maxWriteAttempts = 8
 
+// spannerLocks reports whether this transaction locks namespace rows
+// instead of taking advisory locks (Spanner).
+func (t *tx) spannerLocks() bool { return t.e.spanner && t.write && t.noLock == 0 }
+
+// spLockRow locks ns's row exclusively until commit, once per
+// transaction (Spanner).
+func (t *tx) spLockRow(ns int64) {
+	if t.spLocked[ns] {
+		return
+	}
+	var id int64
+	t.counted(`SELECT ns FROM namespaces WHERE ns = ? FOR UPDATE`)
+	done := lockTimer("ns")
+	err := t.Tx.QueryRowContext(t.waitCtx(), `SELECT ns FROM namespaces WHERE ns = $1 FOR UPDATE`, ns).Scan(&id)
+	done()
+	t.must(err)
+	if t.spLocked == nil {
+		t.spLocked = map[int64]bool{}
+	}
+	t.spLocked[ns] = true
+}
+
 // lockKey is a namespace's key in lockClass. The two-argument advisory lock
 // functions take int4 keys; ids beyond that range share keys, which only
 // serialises more.
@@ -166,11 +188,19 @@ func (t *tx) relockAll(want map[int32]lockMode, logKey int32) {
 	panic(&errRelock{want: want, logs: logs})
 }
 
-// locking reports whether this transaction takes advisory locks.
-func (t *tx) locking() bool { return t.e.pg && t.write && t.noLock == 0 }
+// locking reports whether this transaction takes advisory locks: not on
+// Spanner, whose serializable transactions lock the rows they read and
+// write instead (spanner.go).
+func (t *tx) locking() bool { return t.e.pg && !t.e.spanner && t.write && t.noLock == 0 }
 
-// lockNS takes ns's advisory lock in at least mode (see above).
+// lockNS takes ns's advisory lock in at least mode (see above). On
+// Spanner the exclusive lock is the namespace's row read FOR UPDATE, and
+// the shared one the row's read itself (spanner.go).
 func (t *tx) lockNS(ns int64, mode lockMode) {
+	if mode == lockExclusive && t.spannerLocks() {
+		t.spLockRow(ns)
+		return
+	}
 	if !t.locking() {
 		return
 	}
@@ -489,12 +519,18 @@ func retryable(err error) bool {
 	if errors.As(err, &rl) {
 		return true
 	}
+	var nb *errIDBlock
+	if errors.As(err, &nb) {
+		return true // Spanner: ids taken, run again (spanner.go)
+	}
 	var pe *pgconn.PgError
 	if !errors.As(err, &pe) {
 		return false
 	}
 	switch pe.Code {
 	case "40P01", "40001":
+		// On Spanner, 40001 is also an aborted transaction (a deadlock
+		// broken, or a lock lost), which Spanner expects to be run again.
 		return true
 	case "23505":
 		return !isConflict(err)
@@ -512,6 +548,9 @@ func retryable(err error) bool {
 func (e *Engine) leader(ctx context.Context) bool {
 	if !e.pg {
 		return true
+	}
+	if e.spanner {
+		return e.leaderSpanner(ctx)
 	}
 	e.leaderMu.Lock()
 	defer e.leaderMu.Unlock()
@@ -539,6 +578,10 @@ func (e *Engine) leader(ctx context.Context) bool {
 
 // resign releases the leader lock (Close).
 func (e *Engine) resign() {
+	if e.spanner {
+		e.resignSpanner()
+		return
+	}
 	e.leaderMu.Lock()
 	defer e.leaderMu.Unlock()
 	if e.leaderConn == nil {
@@ -585,6 +628,9 @@ func (e *Engine) jobStep(ctx context.Context) error {
 // holdsLeader reports whether this instance's leader connection still
 // holds the leader lock.
 func (e *Engine) holdsLeader(ctx context.Context) bool {
+	if e.spanner {
+		return e.holdsLeaderSpanner(ctx)
+	}
 	e.leaderMu.Lock()
 	defer e.leaderMu.Unlock()
 	if e.leaderConn == nil {

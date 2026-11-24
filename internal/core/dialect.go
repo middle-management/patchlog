@@ -40,14 +40,43 @@ import (
 //   - array arguments, which SQLite reads as JSON (inArray);
 //   - constraint violations (isConflict);
 //   - transactions and write serialisation (engine.go).
+//
+// Spanner's PostgreSQL interface, through PGAdapter (docs/SPANNER.md), is
+// a third: the Postgres dialect (e.pg) with e.spanner set, for the
+// statements Spanner refuses or runs otherwise, each branched where it is
+// written (spanner.go has the shared helpers), and a schema of its own
+// (migrations/spanner).
 
-// isPostgresURL reports whether a database path names a Postgres database.
+// spannerScheme prefixes a URL of a Spanner database's PostgreSQL
+// interface (PGAdapter): it speaks the Postgres protocol, so nothing in
+// the connection tells the two apart.
+const spannerScheme = "spanner+postgres://"
+
+// isPostgresURL reports whether a database path names a Postgres database,
+// or a Spanner database through PGAdapter (isSpannerURL).
 func isPostgresURL(path string) bool {
-	return strings.HasPrefix(path, "postgres://") || strings.HasPrefix(path, "postgresql://")
+	return strings.HasPrefix(path, "postgres://") || strings.HasPrefix(path, "postgresql://") || isSpannerURL(path)
 }
 
-// IsPostgres reports whether the engine stores in Postgres.
+// isSpannerURL reports whether a database path names a Spanner database
+// through PGAdapter: spanner+postgres://user@host:port/database.
+func isSpannerURL(path string) bool { return strings.HasPrefix(path, spannerScheme) }
+
+// pgxURL is a database URL as pgx takes it: a Spanner URL's scheme is
+// postgres://.
+func pgxURL(path string) string {
+	if isSpannerURL(path) {
+		return "postgres://" + strings.TrimPrefix(path, spannerScheme)
+	}
+	return path
+}
+
+// IsPostgres reports whether the engine stores in Postgres, or in Spanner
+// through its PostgreSQL interface.
 func (e *Engine) IsPostgres() bool { return e.pg }
+
+// IsSpanner reports whether the engine stores in Spanner (docs/SPANNER.md).
+func (e *Engine) IsSpanner() bool { return e.spanner }
 
 // rebinds caches rewritten query texts: queries are constant strings,
 // except a few built with a variable number of placeholders.
@@ -139,6 +168,15 @@ func (e *Engine) arrayArg(v any) any {
 	return string(b)
 }
 
+// octetLength is the length in bytes of col: Spanner has no octet_length,
+// and its length of a bytea counts bytes.
+func (e *Engine) octetLength(col string) string {
+	if e.spanner {
+		return `length(` + col + `)`
+	}
+	return `octet_length(` + col + `)`
+}
+
 // conflictTables are the tables whose UNIQUE violations mean a concurrent
 // writer won the race of a resource chain or a namespace chain (D.3).
 var conflictTables = []string{"revisions", "resources", "ns_log", "head_history", "heads"}
@@ -160,6 +198,11 @@ func isConflict(err error) bool {
 	}
 	var pe *pgconn.PgError
 	if errors.As(err, &pe) {
+		if pe.Code == "23505" && pe.TableName == "" {
+			// Spanner's, which names the index or the table in its
+			// message alone (spanner.go); Postgres's name the table.
+			return spannerConflict(pe)
+		}
 		if pe.Code != "23505" { // unique_violation
 			return false
 		}

@@ -423,7 +423,13 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 		q := `SELECT v.res, v.at, (SELECT h.target_seq FROM head_history h WHERE h.res = v.res AND h.ns_seq <= v.at ORDER BY h.ns_seq DESC LIMIT 1)
 			FROM unnest(?::bigint[], ?::bigint[]) AS v(res, at)`
 		args := []any{hres, hat}
-		if !t.e.pg {
+		if t.e.spanner {
+			// No unnest of two arrays: each subscripted by an ordinal.
+			q = `SELECT ($1::bigint[])[u.i], ($2::bigint[])[u.i], (SELECT h.target_seq FROM head_history h
+					WHERE h.res = ($1::bigint[])[u.i] AND h.ns_seq <= ($2::bigint[])[u.i] ORDER BY h.ns_seq DESC LIMIT 1)
+				FROM unnest($3::bigint[]) AS u(i)`
+			args = append(args, spOrdinals(len(hres)))
+		} else if !t.e.pg {
 			q = `WITH v(res, at) AS (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))
 				SELECT v.res, v.at, (SELECT h.target_seq FROM head_history h WHERE h.res = v.res AND h.ns_seq <= v.at ORDER BY h.ns_seq DESC LIMIT 1) FROM v`
 			pairs := make([][2]int64, len(hres))
@@ -602,7 +608,10 @@ func (e *Engine) holdersMax() int {
 func (t *tx) purgeHolders(n *nsRow, name string, rootLo int64) ([]purgeCand, bool) {
 	first := map[int64]sql.NullInt64{} // holders, with their rows' first entries
 	most := t.e.holdersMax()
-	if most < 0 {
+	if most < 0 || t.e.spanner {
+		// Spanner has no recursive queries, which the holders' searches
+		// and chains are (purgeHoldersSealed, purgeChains): the purge
+		// searches level by level (purgeLevels).
 		return nil, false
 	}
 	// The bound is on the holders of all three tables together, and each
@@ -849,7 +858,7 @@ func (t *tx) purgeLevels(n *nsRow, name string, rootLo int64) []purgeCand {
 // back for the statements after it, whose plans are not this function's
 // business.
 func (t *tx) planByIndex() (restore func()) {
-	if !t.e.pg {
+	if !t.e.pg || t.e.spanner { // Spanner has no planner settings
 		return func() {}
 	}
 	// The CTE is read before the row that changes the settings is made.

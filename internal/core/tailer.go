@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"log"
 	"strconv"
 	"time"
@@ -39,15 +40,31 @@ import (
 // instance's purge, revocation or configuration change can be served from
 // this instance's memory: freshFor after it commits.
 
+// On Spanner (spanner.go) there are no transaction ids: every ns_log row
+// records its transaction's commit timestamp (committed, Spanner's
+// pending_commit_timestamp()), and a poll reads, in one read-only
+// transaction, the rows committed after from, then sets from to that
+// transaction's read timestamp. Spanner's commits are externally
+// consistent: a read sees every transaction that committed at or before
+// its timestamp and none after, and a transaction that commits later
+// gets a later timestamp, however long it ran. So the window of a poll
+// is exactly the commits after the last one's read and up to its own,
+// and nothing is skipped, as below xmin on Postgres. (Commit timestamps
+// are read in microseconds, Spanner's nanoseconds truncated, so a poll
+// may see the last poll's last commits again: a wake-up is a hint.)
+
 // tailState is the tailer's position.
 type tailState struct {
-	from uint64 // the next xid to read
+	from uint64 // the next xid to read; on Spanner, the commit timestamp read up to (Unix µs)
 	gen  int64  // cache_gen as last read
 }
 
 // tailStart reads the position to tail from: what is committed now has
 // been seen, by construction of the caches (empty) and the hub (no waiter).
 func (e *Engine) tailStart(ctx context.Context) (tailState, error) {
+	if e.spanner {
+		return e.tailStartSpanner(ctx)
+	}
 	var s tailState
 	var xmin string
 	err := e.db.QueryRowContext(ctx, `SELECT pg_snapshot_xmin(pg_current_snapshot())::text, (SELECT gen FROM cache_gen WHERE id = 1)`).Scan(&xmin, &s.gen)
@@ -75,6 +92,9 @@ const (
 
 // tailPoll reads what committed since s and applies it.
 func (e *Engine) tailPoll(ctx context.Context, s *tailState) error {
+	if e.spanner {
+		return e.tailPollSpanner(ctx, s)
+	}
 	tx, err := e.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
 		return err
@@ -108,7 +128,7 @@ func (e *Engine) tailPoll(ctx context.Context, s *tailState) error {
 		if err != nil {
 			return err
 		}
-		wake := map[string]map[string]bool{} // as tx.wake
+		w := tailWake{}
 		for rows.Next() {
 			var name string
 			var meta bool
@@ -117,37 +137,60 @@ func (e *Engine) tailPoll(ctx context.Context, s *tailState) error {
 				rows.Close()
 				return err
 			}
-			inv.meta = inv.meta || meta
-			cur, seen := wake[name]
-			if !seen {
-				inv.nss = append(inv.nss, name)
-			}
-			switch {
-			case !res.Valid:
-				wake[name] = nil
-			case seen && cur == nil:
-			case cur == nil:
-				wake[name] = map[string]bool{res.String: true}
-			default:
-				cur[res.String] = true
-			}
+			w.add(&inv, name, meta, res)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		for ns, names := range wake {
-			if names == nil {
-				continue
-			}
-			if inv.res == nil {
-				inv.res = map[string][]string{}
-			}
-			for name := range names {
-				inv.res[ns] = append(inv.res[ns], name)
-			}
+		w.into(&inv)
+	}
+	e.tailApply(s, inv, max(s.from, to), gen)
+	return nil
+}
+
+// tailWake gathers a poll's live readers to wake, as tx.wake: per
+// namespace, the resources named, or nil for all of them.
+type tailWake map[string]map[string]bool
+
+// add records an entry, or an item of a batch, of namespace name: whether
+// it changes what reads return beyond the log (meta), and the resource it
+// names, if any.
+func (w tailWake) add(inv *invalidation, name string, meta bool, res sql.NullString) {
+	inv.meta = inv.meta || meta
+	cur, seen := w[name]
+	if !seen {
+		inv.nss = append(inv.nss, name)
+	}
+	switch {
+	case !res.Valid:
+		w[name] = nil
+	case seen && cur == nil:
+	case cur == nil:
+		w[name] = map[string]bool{res.String: true}
+	default:
+		cur[res.String] = true
+	}
+}
+
+// into records the resources to wake in inv.
+func (w tailWake) into(inv *invalidation) {
+	for ns, names := range w {
+		if names == nil {
+			continue
+		}
+		if inv.res == nil {
+			inv.res = map[string][]string{}
+		}
+		for name := range names {
+			inv.res[ns] = append(inv.res[ns], name)
 		}
 	}
+}
+
+// tailApply applies a poll's invalidation and moves the tailer to from,
+// with cache_gen as read, gen.
+func (e *Engine) tailApply(s *tailState, inv invalidation, from uint64, gen int64) {
 	if gen != s.gen {
 		inv.meta = true
 	}
@@ -157,8 +200,130 @@ func (e *Engine) tailPoll(ctx context.Context, s *tailState) error {
 	if inv.meta || len(inv.nss) > 0 {
 		e.invalidate(inv, true)
 	}
-	s.from, s.gen = max(s.from, to), gen
+	s.from, s.gen = from, gen
 	e.tailFrom.Store(s.from)
+}
+
+// tailStartSpanner is tailStart on Spanner: from the read timestamp of
+// the read of cache_gen.
+func (e *Engine) tailStartSpanner(ctx context.Context) (tailState, error) {
+	var s tailState
+	c, err := e.db.Conn(ctx)
+	if err != nil {
+		return s, err
+	}
+	defer c.Close()
+	if err := c.QueryRowContext(ctx, `SELECT gen FROM cache_gen WHERE id = 1`).Scan(&s.gen); err != nil {
+		return s, err
+	}
+	ts, err := spReadTimestamp(ctx, c)
+	if err != nil {
+		return s, err
+	}
+	s.from = uint64(ts)
+	e.tailFrom.Store(s.from)
+	return s, nil
+}
+
+// tailPollSpanner is tailPoll on Spanner: the entries committed after
+// s.from, up to the read timestamp of a read-only transaction. Spanner
+// has no LATERAL nor jsonb_array_elements: a batch's body is read whole
+// and its items found here.
+func (e *Engine) tailPollSpanner(ctx context.Context, s *tailState) error {
+	c, err := e.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	tx, err := c.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var gen int64
+	if err := tx.QueryRow(`SELECT gen FROM cache_gen WHERE id = 1`).Scan(&gen); err != nil {
+		return err
+	}
+	rows, err := tx.Query(`SELECT n.name, l.kind IN (`+metaKinds+`),
+			CASE WHEN l.kind IN (`+resourceKinds+`) THEN r.name END,
+			CASE WHEN l.kind = `+batchKind+` THEN l.body END
+		FROM ns_log l JOIN namespaces n ON n.ns = l.ns
+		LEFT JOIN resources r ON r.res = l.res
+		WHERE l.committed > $1`, time.UnixMicro(int64(s.from)).UTC())
+	if err != nil {
+		return err
+	}
+	inv := invalidation{}
+	w := tailWake{}
+	for rows.Next() {
+		var name string
+		var meta bool
+		var res, body sql.NullString
+		if err := rows.Scan(&name, &meta, &res, &body); err != nil {
+			rows.Close()
+			return err
+		}
+		if !body.Valid {
+			w.add(&inv, name, meta, res)
+			continue
+		}
+		var b struct {
+			Entries []struct{ Kind, Resource string }
+		}
+		if err := json.Unmarshal([]byte(body.String), &b); err != nil {
+			rows.Close()
+			return err
+		}
+		if len(b.Entries) == 0 {
+			// As the join with no items: one row, naming no resource.
+			w.add(&inv, name, meta, sql.NullString{})
+		}
+		for _, it := range b.Entries {
+			r := sql.NullString{String: it.Resource, Valid: it.Kind == "head" || it.Kind == "tombstone"}
+			w.add(&inv, name, meta, r)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	to, err := spReadTimestamp(ctx, c)
+	if err != nil {
+		return err
+	}
+	w.into(&inv)
+	e.tailApply(s, inv, max(s.from, uint64(to)), gen)
+	return nil
+}
+
+// syncTailSpanner is SyncTail on Spanner: every transaction committed
+// before the call committed before the read timestamp of a strong read
+// made now, which the tailer must reach.
+func (e *Engine) syncTailSpanner(ctx context.Context) error {
+	c, err := e.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	var gen int64
+	err = c.QueryRowContext(ctx, `SELECT gen FROM cache_gen WHERE id = 1`).Scan(&gen)
+	var want int64
+	if err == nil {
+		want, err = spReadTimestamp(ctx, c)
+	}
+	c.Close()
+	if err != nil {
+		return err
+	}
+	for e.tailFrom.Load() < uint64(want) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(e.opt.TailInterval / 4):
+		}
+	}
 	return nil
 }
 
@@ -170,6 +335,9 @@ func (e *Engine) tailPoll(ctx context.Context, s *tailState) error {
 func (e *Engine) SyncTail(ctx context.Context) error {
 	if !e.pg {
 		return nil
+	}
+	if e.spanner {
+		return e.syncTailSpanner(ctx)
 	}
 	var xmax string
 	if err := e.db.QueryRowContext(ctx, `SELECT pg_snapshot_xmax(pg_current_snapshot())::text`).Scan(&xmax); err != nil {

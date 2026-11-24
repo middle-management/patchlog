@@ -1060,7 +1060,14 @@ func (t *tx) ensureResource(n *nsRow, name string) int64 {
 	if r := t.resource(n.id, name); r != nil {
 		return r.id
 	}
-	_, err := t.Exec(`INSERT INTO resources (ns, name) VALUES (?, ?) ON CONFLICT (ns, name) DO NOTHING`, n.id, name)
+	q := `INSERT INTO resources (ns, name) VALUES (?, ?) ON CONFLICT (ns, name) DO NOTHING`
+	if t.e.spanner {
+		// No secondary index as a conflict target: none was read just
+		// now, and a concurrent insert aborts this transaction, which
+		// runs again, or fails it on the index, a chain's race.
+		q = `INSERT INTO resources (ns, name) VALUES (?, ?)`
+	}
+	_, err := t.Exec(q, n.id, name)
 	t.must(err)
 	r := t.resource(n.id, name)
 	if r == nil {
@@ -1315,7 +1322,7 @@ func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) {
 		t.must(t.QueryRow(`SELECT COUNT(*) FROM blobs WHERE pruned = 0`).Scan(&s.Attached))
 		t.must(t.QueryRow(`SELECT COUNT(*) FROM blobs WHERE pruned = 1`).Scan(&s.Pruned))
 		t.must(t.QueryRow(`SELECT COUNT(*) FROM blob_pending`).Scan(&s.Pending))
-		t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(octet_length(data)), 0) FROM blob_bytes`).Scan(&s.Bytes, &s.Size))
+		t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(`+t.e.octetLength("data")+`), 0) FROM blob_bytes`).Scan(&s.Bytes, &s.Size))
 		t.must(t.QueryRow(`SELECT COUNT(*) FROM blob_bytes WHERE owner <> 0`).Scan(&s.Encrypted))
 		rows, err := t.Query(`SELECT file FROM blob_bytes WHERE file IS NOT NULL`)
 		t.must(err)

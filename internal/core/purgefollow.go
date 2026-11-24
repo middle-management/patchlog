@@ -133,7 +133,7 @@ func (t *tx) recordImport(n *nsRow, a *actor, src any, st []*itemState) {
 		return
 	}
 	importer := a.id()
-	_, err := t.Exec(`INSERT INTO purge_follows (ns, origin, src_ns, upto) VALUES (?,?,?,?) ON CONFLICT DO NOTHING`, n.id, origin, srcNS, at)
+	_, err := t.Exec(`INSERT INTO purge_follows (ns, origin, src_ns, upto) VALUES (?,?,?,?) ON CONFLICT (ns, origin, src_ns) DO NOTHING`, n.id, origin, srcNS, at)
 	t.must(err)
 	var cursor string
 	t.must(t.QueryRow(`SELECT upto FROM purge_follows WHERE ns = ? AND origin = ? AND src_ns = ?`, n.id, origin, srcNS).Scan(&cursor))
@@ -154,7 +154,7 @@ func (t *tx) recordImport(n *nsRow, a *actor, src any, st []*itemState) {
 			q += `(?,?,?,?,?,?,?)`
 			args = append(args, n.id, origin, srcNS, s.Resource, importer, at, pending)
 		}
-		_, err := t.Exec(q+` ON CONFLICT DO NOTHING`, args...)
+		_, err := t.Exec(q+` ON CONFLICT (ns, origin, src_ns, name, importer) DO NOTHING`, args...)
 		t.must(err)
 	}
 }

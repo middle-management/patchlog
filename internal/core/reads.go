@@ -94,7 +94,7 @@ func (t *tx) namesAfter(n *nsRow, after string, k int) []string { return t.names
 // collation, which is byte order, as SQLite's BINARY is.
 func (t *tx) namesIn(n *nsRow, after, prefix string, k int) []string {
 	col := "name"
-	if t.e.pg {
+	if t.e.pg && !t.e.spanner { // Spanner's order is byte order, and it has no COLLATE
 		col = `name COLLATE "C"`
 	}
 	q, args := `SELECT name FROM resources WHERE ns = ? AND `+col+` > ?`, []any{after}

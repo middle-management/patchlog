@@ -615,7 +615,7 @@ func (t *tx) branchesOf(n *nsRow) []*nsRow {
 // Postgres, index namespaces_base_c; SQLite's namespaces_base is BINARY).
 func (t *tx) branchesAfter(n *nsRow, after string, unpurged bool, limit int) []*nsRow {
 	col, cond := "name", ""
-	if t.e.pg {
+	if t.e.pg && !t.e.spanner { // Spanner's order is byte order, and it has no COLLATE
 		col = `name COLLATE "C"`
 	}
 	if unpurged {
@@ -645,10 +645,25 @@ func (t *tx) allBranchesOf(n *nsRow) []*nsRow {
 	return out
 }
 
+// insertConfigRow inserts an ns_config row, after parent (nil for a
+// genesis), and returns its seq: on Spanner one taken above parent's,
+// since its identities don't grow (spanner.go).
+func (t *tx) insertConfigRow(ns int64, id []byte, parent any, patches, doc string, author int64) int64 {
+	if t.e.spanner {
+		above, _ := parent.(int64)
+		seq := t.spID("ns_config", above)
+		_, err := t.Exec(`INSERT INTO ns_config (seq, ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,?,?,?,?,?,?)`,
+			seq, ns, id, parent, patches, doc, author, t.now.UnixMilli())
+		t.must(err)
+		return seq
+	}
+	return t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,?,?,?,?,?) RETURNING seq`,
+		ns, id, parent, patches, doc, author, t.now.UnixMilli())
+}
+
 // insertConfig inserts a planned config revision and returns its seq.
 func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
-	seq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,?,?,?,?,?) RETURNING seq`,
-		n.id, p.id[:], n.configSeq, string(p.canon), string(jsonv.Canonical(p.doc)), author, t.now.UnixMilli())
+	seq := t.insertConfigRow(n.id, p.id[:], n.configSeq, string(p.canon), string(jsonv.Canonical(p.doc)), author)
 	old := t.config(n.configSeq)
 	raised := p.cfg.level > old.level
 	t.metaChanged = true

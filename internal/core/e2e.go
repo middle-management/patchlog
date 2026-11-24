@@ -106,7 +106,7 @@ func (t *tx) e2eConfigWritten(n *nsRow, old, cfg *Config) {
 	if old != nil && old.level == levelE2E && old.Epoch == cfg.Epoch {
 		return
 	}
-	_, err := t.Exec(`INSERT INTO e2e_epochs (ns, epoch, created) VALUES (?,?,?) ON CONFLICT DO NOTHING`, n.id, cfg.Epoch, t.now.UnixMilli())
+	_, err := t.Exec(`INSERT INTO e2e_epochs (ns, epoch, created) VALUES (?,?,?) ON CONFLICT (ns, epoch) DO NOTHING`, n.id, cfg.Epoch, t.now.UnixMilli())
 	t.must(err)
 	if old == nil || old.level == levelE2E {
 		return

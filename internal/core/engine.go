@@ -248,14 +248,20 @@ func (logPurger) PurgeTags(tags []string) { log.Printf("cdn purge %v", tags) }
 // Engine is the patch-log service.
 type Engine struct {
 	// seals are the sealing counts this instance took (sealcount.go).
-	seals     sealCounter
-	db        *sql.DB
-	pg        bool // Postgres (Addendum D.8), not SQLite
-	opt       Options
-	mu        sync.Mutex // serialises write transactions
-	blobs     blobStore
-	validator *schema.Validator
-	validated validatedDocs // revisions this engine found valid (validateStep)
+	seals sealCounter
+	db    *sql.DB
+	pg    bool // Postgres (Addendum D.8), not SQLite
+	// spanner: Spanner's PostgreSQL interface, through PGAdapter, with pg
+	// set too (spanner.go); spIDs hands out its chain-ordered ids and
+	// leaseHolder names this instance in its leader lease.
+	spanner     bool
+	spIDs       *idBlocks
+	leaseHolder string
+	opt         Options
+	mu          sync.Mutex // serialises write transactions
+	blobs       blobStore
+	validator   *schema.Validator
+	validated   validatedDocs // revisions this engine found valid (validateStep)
 	// How many typed documents step 5 validated in full, and by their
 	// changes (ValidationCounts).
 	validatedFull, validatedChange atomic.Int64
@@ -311,7 +317,7 @@ type Engine struct {
 	// background loops (pglock.go).
 	epoch      time.Time
 	lastPoll   atomic.Int64
-	tailFrom   atomic.Uint64 // the tailer's position: every xid below it is read (SyncTail)
+	tailFrom   atomic.Uint64 // the tailer's position: every xid below it is read, on Spanner every commit up to it, in Unix µs (SyncTail)
 	leaderMu   sync.Mutex
 	leaderConn *sql.Conn
 	// afterWriteLock, if set, is called by resource writes and batches
@@ -471,9 +477,17 @@ func Open(opt Options) (*Engine, error) {
 	if opt.RetentionInterval == 0 {
 		opt.RetentionInterval = time.Hour
 	}
+	spanner := isSpannerURL(opt.Path)
+	if spanner && !opt.LocalRateBuckets {
+		// The shared buckets are drawn by a function (rate_draws), which
+		// Spanner lacks (spanner.go).
+		log.Printf("spanner: the rate-limit buckets (§6.6) are kept in each instance's memory, not shared")
+		opt.LocalRateBuckets = true
+	}
 	e := &Engine{
 		db:         db,
 		pg:         pg,
+		spanner:    spanner,
 		opt:        opt,
 		blobs:      blobs,
 		validator:  schema.NewValidator(),
@@ -485,6 +499,13 @@ func Open(opt Options) (*Engine, error) {
 		cfgCache:   map[int64]*Config{},
 		stop:       make(chan struct{}),
 		started:    opt.Now().UTC(),
+	}
+	if spanner {
+		e.leaseHolder = newLeaseHolder()
+		if e.spIDs, err = openIDBlocks(opt.Path); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	e.refsCache.MaxEntries = 65536
 	e.viewHeld.MaxEntries = 65536
@@ -605,6 +626,7 @@ func (e *Engine) Close() error {
 	e.comp.close()
 	e.rate.close()
 	e.commits.close()
+	e.spIDs.close()
 	return err
 }
 
@@ -805,8 +827,11 @@ type tx struct {
 	rotate         []string
 	// Postgres: the advisory locks held (pglock.go), the largest key among
 	// them, and whether reading namespaces locks them (noLock > 0: no).
-	locks  map[int32]lockMode
-	maxKey int32
+	// spLocked are the namespace rows a Spanner write transaction locked
+	// exclusively (spLockRow).
+	spLocked map[int64]bool
+	locks    map[int32]lockMode
+	maxKey   int32
 	// logLocks are the log locks held (logClass, D.8), maxLogKey the
 	// largest, and logPlan the ones a restarted transaction takes in
 	// ascending order at its first append (errRelock).
@@ -937,6 +962,12 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 	var want map[int32]lockMode
 	var logs map[int32]bool
 	for attempt := 1; ; attempt++ {
+		if e.spanner {
+			// Ids are taken between transactions (spanner.go).
+			if err := e.spIDs.topUp(ctx); err != nil {
+				return nil, err
+			}
+		}
 		rotate, err = e.updateOnce(ctx, f, want, logs)
 		if err == nil || attempt == maxWriteAttempts || !retryable(err) || ctx.Err() != nil {
 			return rotate, err
@@ -944,6 +975,12 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 		var rl *errRelock
 		if errors.As(err, &rl) {
 			want, logs = rl.want, rl.logs
+		}
+		var nb *errIDBlock
+		if errors.As(err, &nb) {
+			if err := e.spIDs.refill(ctx, nb.table, nb.above, nb.n); err != nil {
+				return nil, err
+			}
 		}
 	}
 }
@@ -1139,7 +1176,14 @@ func (t *tx) authorID(name string) int64 {
 	// Authors are shared by all namespaces: a concurrent writer on
 	// Postgres may insert the same one first.
 	t.wrote()
-	err = t.QueryRow(`INSERT INTO authors (name) VALUES (?) ON CONFLICT DO NOTHING RETURNING author`, name).Scan(&id)
+	q := `INSERT INTO authors (name) VALUES (?) ON CONFLICT (name) DO NOTHING RETURNING author`
+	if t.e.spanner {
+		// Spanner takes no secondary index as a conflict target. A
+		// concurrent insert of the name then aborts this transaction, or
+		// fails it on the index, and it runs again (retryable).
+		q = `INSERT INTO authors (name) VALUES (?) RETURNING author`
+	}
+	err = t.QueryRow(q, name).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = t.QueryRow(`SELECT author FROM authors WHERE name = ?`, name).Scan(&id)
 	}
@@ -1227,8 +1271,20 @@ func (t *tx) nsForItem(name string, s *itemState) *nsRow {
 }
 
 func (t *tx) nsByNameLocked(name string, mode lockMode) *nsRow {
+	q := `SELECT ` + nsCols + ` FROM namespaces WHERE name = ?`
+	exclusive := mode == lockExclusive && t.spannerLocks()
+	if exclusive {
+		// The exclusive lock on Spanner: the row, read FOR UPDATE (lockNS).
+		q += ` FOR UPDATE`
+	}
 	return t.nsByNameWith(name, mode, func() *nsRow {
-		n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE name = ?`, name))
+		n, err := scanNS(t.QueryRow(q, name))
+		if err == nil && exclusive {
+			if t.spLocked == nil {
+				t.spLocked = map[int64]bool{}
+			}
+			t.spLocked[n.id] = true
+		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -1393,7 +1449,10 @@ func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targ
 	prev, prevSeq := t.logHeadOf(n)
 	id := ids.Hash(prev, body)
 	var seq int64
-	if t.e.pg {
+	if t.e.spanner {
+		seq = t.appendSpanner(n, prevSeq, configSeq, id, []spLogRow{{id: id[:], kind: kind, res: nullInt(res), target: nullInt(targetSeq),
+			body: string(body), author: author, grantID: grantID, noAuth: noAuth, gestures: gestures, via: via, hist: hist}})[0]
+	} else if t.e.pg {
 		// One statement: the entry, the namespace's head and the heads it
 		// moves, so the log lock is held for a single round trip and the
 		// commit.
@@ -1493,7 +1552,13 @@ func (t *tx) logHeadOf(n *nsRow) (*ids.ID, any) {
 			}
 		}
 	} else {
-		t.must(t.QueryRow(`SELECT head_seq, head_id FROM namespaces WHERE ns = ?`, n.id).Scan(&n.headSeq, &headID))
+		q := `SELECT head_seq, head_id FROM namespaces WHERE ns = ?`
+		if t.spannerLocks() {
+			// The log lock on Spanner: the row, read FOR UPDATE just before
+			// the append, as the log lock is taken (spanner.go).
+			q += ` FOR UPDATE`
+		}
+		t.must(t.QueryRow(q, n.id).Scan(&n.headSeq, &headID))
 		t.forget() // read after the log lock
 	}
 	if !n.headSeq.Valid {
@@ -1569,6 +1634,16 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 		prev = &out[i]
 	}
 	t.wrote()
+	if t.e.spanner {
+		rs := make([]spLogRow, k)
+		for i, a := range as {
+			rs[i] = spLogRow{id: idBytes[i], kind: int(kinds[i]), res: nullInt(res[i]), target: nullInt(targets[i]), body: bodies[i],
+				author: authors[i], grantID: nilBytes(grantIDs[i]), noAuth: nullInt(noAuth[i]), gestures: nullPtr(gestures[i]), via: nullPtr(vias[i]), hist: a.hist}
+		}
+		seqs := t.appendSpanner(n, prevSeq, configSeq, out[k-1], rs)
+		t.appendedMany(n, configSeq, as, out, seqs[k-1])
+		return out
+	}
 	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::bytea[], ?::smallint[], ?::text[], ?::text[])
 				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, grant_id, no_auth, gestures, via, ord)),
 			r AS MATERIALIZED (SELECT nextval(pg_get_serial_sequence('ns_log', 'seq')) AS seq FROM generate_series(1, ?::int)),
@@ -1594,7 +1669,14 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	if len(seqs) != k {
 		panic(fmt.Errorf("appended %d namespace entries, want %d", len(seqs), k))
 	}
-	last := seqs[k-1]
+	t.appendedMany(n, configSeq, as, out, seqs[k-1])
+	return out
+}
+
+// appendedMany records what appendNSMany appended, last the seq of its
+// last entry.
+func (t *tx) appendedMany(n *nsRow, configSeq int64, as []nsAppend, out []ids.ID, last int64) {
+	k := len(as)
 	n.headSeq = sql.NullInt64{Int64: last, Valid: true}
 	if t.logHeads != nil {
 		t.logHeads[n.id] = logHead{last, out[k-1]}
@@ -1608,7 +1690,6 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	for _, a := range as {
 		t.wakeFor(n.name, a.entry)
 	}
-	return out
 }
 
 // grantVia is ns_log.via for an entry written under g: the canonical JSON

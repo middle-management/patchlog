@@ -31,8 +31,19 @@ import (
 // Env is the environment variable naming the Postgres server for tests.
 const Env = "PATCHLOG_TEST_PG"
 
-// Enabled reports whether tests run against Postgres.
-func Enabled() bool { return os.Getenv(Env) != "" }
+// SpannerEnv names, instead, a PGAdapter in front of a Spanner instance
+// (docs/SPANNER.md), e.g. the emulator's postgres://x@127.0.0.1:5432/x?
+// sslmode=disable: tests then run on Spanner's PostgreSQL interface,
+// each in a database of its own (spanner.go). It takes precedence over
+// Env.
+const SpannerEnv = "PATCHLOG_TEST_SPANNER"
+
+// Enabled reports whether tests run against Postgres, or Spanner through
+// its PostgreSQL interface (Spanner).
+func Enabled() bool { return os.Getenv(Env) != "" || Spanner() }
+
+// Spanner reports whether tests run against Spanner (SpannerEnv).
+func Spanner() bool { return os.Getenv(SpannerEnv) != "" }
 
 // DB returns the database path for a test's engine: ":memory:", or with
 // PATCHLOG_TEST_PG set, the URL of an empty Postgres database (NewDB).
@@ -53,6 +64,9 @@ func DB(t testing.TB) string {
 // database itself takes Open, or DSN.
 func NewDB(t testing.TB) string {
 	t.Helper()
+	if Spanner() {
+		return spannerDB(t, true)
+	}
 	u := adminURL(t)
 	if err := pool.start(u.String()); err != nil {
 		t.Fatalf("pgtest: %v", err)
@@ -95,6 +109,7 @@ var PoolParams = map[string]string{
 // DSN is a URL from NewDB without the parameters only the engine reads
 // (PoolParams), for a test that opens the database itself.
 func DSN(rawURL string) string {
+	rawURL = pgxURL(rawURL)
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL
@@ -125,6 +140,9 @@ func FreshDB(t testing.TB) string {
 	if !Enabled() {
 		return ":memory:"
 	}
+	if Spanner() {
+		return spannerDB(t, false)
+	}
 	return newDB(t, "")
 }
 
@@ -135,6 +153,9 @@ func FreshDB(t testing.TB) string {
 // lacks ICU.
 func NewDBCollated(t testing.TB, icuLocale string) string {
 	t.Helper()
+	if Spanner() {
+		t.Skip("Spanner orders text by its bytes, with no collation to choose")
+	}
 	return newDB(t, ` LOCALE_PROVIDER icu ICU_LOCALE '`+icuLocale+`' LOCALE 'C.UTF-8'`)
 }
 

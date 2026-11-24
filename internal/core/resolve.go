@@ -165,7 +165,8 @@ func (t *tx) lookupResource(name, res string, want *ids.ID, full bool) *nsRow {
 	} else {
 		dest = append(dest, &xseq)
 	}
-	q := lookupSQL[b2i(full)][b2i(t.e.pg)]
+	// Spanner has no LATERAL: SQLite's forms, which tx rebinds.
+	q := lookupSQL[b2i(full)][b2i(t.e.pg && !t.e.spanner)]
 	var row *sql.Row
 	if full {
 		row = t.QueryRow(q, res, idArg, name)
@@ -357,6 +358,9 @@ func (t *tx) prefetchHeads(n *nsRow, names []string, asOf *int64) {
 				q = `WITH r(res) AS (SELECT value FROM json_each(?))
 				SELECT r.res, (SELECT h.target_seq FROM head_history h
 					WHERE h.res = r.res AND h.ns_seq <= ? ORDER BY h.ns_seq DESC LIMIT 1) FROM r`
+			} else if t.e.spanner { // nor on Spanner
+				q = `SELECT r.res, (SELECT h.target_seq FROM head_history h
+					WHERE h.res = r.res AND h.ns_seq <= $2 ORDER BY h.ns_seq DESC LIMIT 1) FROM unnest($1::bigint[]) AS r(res)`
 			}
 			rows, err := t.Query(q, t.e.arrayArg(resIDs), *asOf)
 			t.must(err)

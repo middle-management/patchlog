@@ -16,29 +16,61 @@ import (
 // value per placeholder of lite, in order; pg names its arrays $1…$k in
 // that order, with types the Postgres element types of the columns.
 
-// bulkStmt is one statement in both forms.
+//
+// Spanner (spanner.go) has no unnest of several arrays: its form of a
+// bulk insert (sp) subscripts each column's array by the elements of one
+// more, of ordinals 1…n (spOrdinals). A statement without one runs as
+// SQLite's, once per row.
+
+// bulkStmt is one statement in both forms, and Spanner's.
 type bulkStmt struct {
-	pg, lite string
-	types    []string
+	pg, lite, sp string
+	types        []string
 }
 
 // bulkInsert builds an INSERT of cols ("name type", the Postgres element
 // type) into table, followed by suffix (ON CONFLICT …, RETURNING …).
 func bulkInsert(table, cols, suffix string) bulkStmt {
-	var names, arrays, marks []string
+	var names, arrays, marks, subs []string
 	var types []string
-	for i, c := range strings.Split(cols, ",") {
+	cs := strings.Split(cols, ",")
+	for i, c := range cs {
 		name, typ, _ := strings.Cut(strings.TrimSpace(c), " ")
 		names, types = append(names, name), append(types, typ)
 		arrays = append(arrays, fmt.Sprintf("$%d::%s[]", i+1, typ))
 		marks = append(marks, "?")
+		spTyp := typ
+		if typ == "smallint" {
+			spTyp = "bigint" // Spanner has no smallint
+		}
+		subs = append(subs, fmt.Sprintf("($%d::%s[])[u.i]", i+1, spTyp))
 	}
 	list := strings.Join(names, ", ")
 	return bulkStmt{
 		pg:    `INSERT INTO ` + table + ` (` + list + `) SELECT * FROM unnest(` + strings.Join(arrays, ", ") + `) ` + suffix,
 		lite:  `INSERT INTO ` + table + ` (` + list + `) VALUES (` + strings.Join(marks, ",") + `) ` + suffix,
+		sp:    `INSERT INTO ` + table + ` (` + list + `) SELECT ` + strings.Join(subs, ", ") + fmt.Sprintf(` FROM unnest($%d::bigint[]) AS u(i) `, len(cs)+1) + suffix,
 		types: types,
 	}
+}
+
+// spOrdinals is the last argument of a Spanner bulk insert of n rows.
+func spOrdinals(n int) []int64 {
+	o := make([]int64, n)
+	for i := range o {
+		o[i] = int64(i + 1)
+	}
+	return o
+}
+
+// spArgs are the arguments of s's Spanner form over rows: its columns'
+// arrays, then the ordinals, unless the form is Postgres's.
+func (s bulkStmt) spArgs(rows [][]any) []any {
+	args := s.arrays(rows)
+	if s.sp != s.pg {
+		args = append(args, spOrdinals(len(rows)))
+	}
+	return args
 }
 
 // bulkExec runs s over rows and returns the number of rows affected.
@@ -47,7 +79,15 @@ func (t *tx) bulkExec(s bulkStmt, rows [][]any) int64 {
 		return 0
 	}
 	t.wrote()
-	if t.e.pg {
+	if t.e.spanner && s.sp != "" {
+		t.counted(s.sp)
+		r, err := t.Tx.Exec(s.sp, s.spArgs(rows)...)
+		t.must(err)
+		n, err := r.RowsAffected()
+		t.must(err)
+		return n
+	}
+	if t.e.pg && !t.e.spanner {
 		t.counted(s.pg)
 		r, err := t.Tx.Exec(s.pg, s.arrays(rows)...)
 		t.must(err)
@@ -81,7 +121,12 @@ func (t *tx) bulkQuery(s bulkStmt, rows [][]any, scan func(*sql.Rows)) {
 		t.must(rs.Err())
 		rs.Close()
 	}
-	if t.e.pg {
+	if t.e.spanner && s.sp != "" {
+		t.counted(s.sp)
+		each(t.Tx.Query(s.sp, s.spArgs(rows)...))
+		return
+	}
+	if t.e.pg && !t.e.spanner {
 		t.counted(s.pg)
 		each(t.Tx.Query(s.pg, s.arrays(rows)...))
 		return

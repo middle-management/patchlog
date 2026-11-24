@@ -238,7 +238,7 @@ func (keygenCmd) run(string) {
 // serveCmd is patchlog serve.
 type serveCmd struct {
 	Addr               string        `arg:"--addr" default:":8080" help:"listen address"`
-	DB                 string        `arg:"--db,env:PATCHLOG_DB" default:"patchlog.db" placeholder:"PATH|URL" help:"SQLite database path, or a Postgres URL (postgres://user:pass@host/db, Addendum D.8)"`
+	DB                 string        `arg:"--db,env:PATCHLOG_DB" default:"patchlog.db" placeholder:"PATH|URL" help:"SQLite database path, or a Postgres URL (postgres://user:pass@host/db, Addendum D.8), or a Spanner database through PGAdapter (spanner+postgres://user@host:port/db, docs/SPANNER.md)"`
 	BlobDir            string        `arg:"--blob-dir,env:PATCHLOG_BLOB_DIR" placeholder:"DIR" help:"directory blob bytes are stored in; default <db>.blobs next to a SQLite file. On Postgres every instance must share it (a shared volume); without one, bytes are stored in the database"`
 	Origin             string        `arg:"--origin" default:"http://localhost:8080" placeholder:"URL" help:"canonical origin (§G.1)"`
 	Dev                bool          `arg:"--dev" help:"disable authentication (development only); X-Author names the author"`
