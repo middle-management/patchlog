@@ -146,14 +146,24 @@ would change most of it.
 
 ## What the emulator showed
 
-(Results of this phase: see the end of this section.)
-
 - Migrations apply to an empty database, and again to a migrated one (`TestMigrateSpanner`), in
   half a second (PGAdapter: several).
 - `serve --dev` starts. Over HTTP and with the `patchlog` CLI: namespace create and list,
   resource put, patch, get, log, ls, delete and restore, a batch, a branch and a write in it, a
   blob upload and download, a purge, and `watch`, on one instance and across two sharing the
   database (a write on one wakes a long-poll and a watch on the other: the tailer).
+- `internal/core` (310 top-level tests, each run on its own, 280 s timeout): 297 pass or skip
+  (at least 46 skip: Postgres mechanisms Spanner replaces, or skipped on Postgres too), 10 fail
+  and 3 time out. Rerun on the final code, six of those pass or skip as they should (the
+  gesture and purge-order listings, two tests' orderings by a bit-reversed key, a Postgres-only
+  `pg_settings` test, and one flake). Left, all concurrent: writers the emulator stalls
+  (`TestPGGroupCommitStress`, `TestPGNoLostUpdates`, `TestV087FilteredOracle` time out), and
+  tests that expect one transaction to wait for another's lock, where the emulator aborts one
+  (`TestPGParallelNamespaces`, `TestPGPurgeSkipsBranchPurgedMeanwhile`,
+  `TestPGGroupCommitNoDeadlockWithSingleWrite`); and `TestPGDrawAfterCheck`, which fails on
+  Postgres too. `TestV073P17SharedBucketsAcrossInstances`, which timed out through PGAdapter,
+  passes.
+- `internal/server`: every sixth test, results to follow (running).
 
 ## Untested
 
