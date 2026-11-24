@@ -1474,6 +1474,9 @@ func TestPGGroupCommitCancelledBeforeCommit(t *testing.T) {
 // A group whose COMMIT fails (a deferred trigger raising once): every write
 // is answered alone and commits once.
 func TestPGGroupCommitFailedCommit(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("fails a commit with a deferred Postgres trigger")
+	}
 	e := groupEngine(t)
 	mkNS(t, e, "n", map[string]any{"read": "public"})
 	for _, q := range []string{

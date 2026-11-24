@@ -168,6 +168,9 @@ func TestV073P39DrawBlockedByWaitsForTheDraw(t *testing.T) {
 // and records when each call starts (setval, which no rollback undoes),
 // on one connection, warmed by the first call.
 func TestV073P39DrawPausesAfterDeadlock(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("renames tables to cause a Postgres deadlock")
+	}
 	if !pgtest.Enabled() {
 		t.Skip("Postgres only")
 	}

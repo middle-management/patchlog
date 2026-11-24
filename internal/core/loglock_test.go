@@ -125,6 +125,9 @@ func TestPGLogLocksAscending(t *testing.T) {
 // key-share locks the namespace row) proceeds while an appender holds the
 // log lock, and entries commit in chain order with growing seqs.
 func TestPGLogLockOrdersEntries(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("reads advisory locks from pg_locks")
+	}
 	a, b := twoInstances(t)
 	ctx := context.Background()
 	mkNS(t, a, "n", map[string]any{"read": "public"})
