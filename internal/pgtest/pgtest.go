@@ -134,6 +134,15 @@ func DSN(rawURL string) string {
 	return u.String()
 }
 
+// Driver is the database/sql driver name for a URL from NewDB, which DSN's
+// string is for.
+func Driver(rawURL string) string {
+	if spannerurl.Is(rawURL) {
+		return spannerurl.DriverName
+	}
+	return "pgx"
+}
+
 // Open opens a database/sql pool on a URL from NewDB (DSN).
 func Open(t testing.TB, rawURL string) *sql.DB {
 	t.Helper()

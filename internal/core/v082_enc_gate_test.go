@@ -16,7 +16,7 @@ func v82encRows(t *testing.T, l *v081Legacy, q string) int {
 	t.Helper()
 	driver, dsn := "sqlite", sqlitedsn.DSN(l.path, "_pragma=busy_timeout(10000)")
 	if pgtest.Enabled() {
-		driver, dsn = "pgx", pgtest.DSN(l.path)
+		driver, dsn = pgtest.Driver(l.path), pgtest.DSN(l.path)
 	}
 	db, err := sql.Open(driver, dsn)
 	if err != nil {

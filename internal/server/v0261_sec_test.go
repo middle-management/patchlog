@@ -24,14 +24,14 @@ func v0261DB(t *testing.T, path string) (*sql.DB, bool) {
 	t.Helper()
 	driver, dsn := "sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)")
 	if pgtest.IsURL(path) {
-		driver, dsn = "pgx", pgtest.DSN(path)
+		driver, dsn = pgtest.Driver(path), pgtest.DSN(path)
 	}
 	db, err := sql.Open(driver, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	return db, driver == "pgx"
+	return db, pgtest.IsURL(path)
 }
 
 func v0261Count(t *testing.T, db *sql.DB, pg bool, q string, args ...any) int {

@@ -151,7 +151,7 @@ func (l *v081Legacy) tables(t *testing.T) (raises, pending bool) {
 	t.Helper()
 	driver, dsn, pg := "sqlite", sqlitedsn.DSN(l.path, "_pragma=busy_timeout(10000)"), false
 	if pgtest.Enabled() {
-		driver, dsn, pg = "pgx", pgtest.DSN(l.path), true
+		driver, dsn, pg = pgtest.Driver(l.path), pgtest.DSN(l.path), true
 	}
 	db, err := sql.Open(driver, dsn)
 	if err != nil {
@@ -334,7 +334,7 @@ func (l *v081Legacy) pendingTable(t *testing.T) bool {
 	t.Helper()
 	driver, dsn, pg := "sqlite", sqlitedsn.DSN(l.path, "_pragma=busy_timeout(10000)"), false
 	if pgtest.Enabled() {
-		driver, dsn, pg = "pgx", pgtest.DSN(l.path), true
+		driver, dsn, pg = pgtest.Driver(l.path), pgtest.DSN(l.path), true
 	}
 	db, err := sql.Open(driver, dsn)
 	if err != nil {
@@ -466,7 +466,7 @@ func TestV081LegacyPendingRoundTrip(t *testing.T) {
 	}
 	t.Parallel()
 	path, pg := pgtest.FreshDB(t), pgtest.Enabled()
-	driver, dsn := "pgx", pgtest.DSN(path)
+	driver, dsn := pgtest.Driver(path), pgtest.DSN(path)
 	if !pg {
 		driver, dsn = "sqlite", sqlitedsn.DSN(filepath.Join(t.TempDir(), "p.db"), "_pragma=busy_timeout(10000)")
 	}

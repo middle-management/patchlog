@@ -369,7 +369,7 @@ func storedMeta(t *testing.T, path string) int {
 	t.Helper()
 	driver, dsn := "sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)")
 	if pgtest.IsURL(path) {
-		driver, dsn = "pgx", pgtest.DSN(path)
+		driver, dsn = pgtest.Driver(path), pgtest.DSN(path)
 	}
 	db, err := sql.Open(driver, dsn)
 	if err != nil {

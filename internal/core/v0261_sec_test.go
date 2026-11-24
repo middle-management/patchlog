@@ -137,7 +137,7 @@ func TestV0261Migration015Delete(t *testing.T) {
 	// (legacy_e2e.go).
 	driver, dsn := "sqlite", sqlitedsn.DSN(l.path, "_pragma=busy_timeout(10000)")
 	if pgtest.Enabled() {
-		driver, dsn = "pgx", pgtest.DSN(l.path)
+		driver, dsn = pgtest.Driver(l.path), pgtest.DSN(l.path)
 	}
 	db, err := sql.Open(driver, dsn)
 	if err != nil {

@@ -163,7 +163,12 @@ would change most of it.
   `TestPGGroupCommitNoDeadlockWithSingleWrite`); and `TestPGDrawAfterCheck`, which fails on
   Postgres too. `TestV073P17SharedBucketsAcrossInstances`, which timed out through PGAdapter,
   passes.
-- `internal/server`: every sixth test, results to follow (running).
+- `internal/server`, every sixth test (100): 95 pass or skip. Three more failed on tests that
+  opened the database with pgx themselves, or wrote an untyped literal Spanner can't type in a
+  `SELECT` list; fixed (`pgtest.Driver`), they pass. Left, as through PGAdapter:
+  `TestResourceLongPollIsolated` fails on its timing (a long-poll reaches its boundary on the
+  slow emulator), and `TestV034ConcurrentUploadsPending` (concurrent) times out.
+- `internal/dbmigrate` and `internal/pgtest` pass.
 
 ## Untested
 
@@ -174,7 +179,7 @@ would change most of it.
   900), mutations per commit (a batch of 1,000 items with history is far below 80,000).
 - Instances sharing a database at scale: the leader lease is timed by each instance's clock;
   two instances migrating at once.
-- `internal/server` ran in part only; no other package uses the database.
+- `internal/server` ran in part only (every sixth test); no other package uses the database.
 
 ## What is left
 

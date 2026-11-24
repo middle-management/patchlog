@@ -29,6 +29,34 @@ func Open(dsn string) (*sql.DB, error) {
 	return sql.OpenDB(nullBytesConnector{c}), nil
 }
 
+// DriverName is Open's driver as database/sql registers it, for code that
+// opens a pool by name (sql.Open(DriverName, dsn)).
+const DriverName = "spanner-patchlog"
+
+func init() { sql.Register(DriverName, nullBytesDriver{}) }
+
+type nullBytesDriver struct{}
+
+func (nullBytesDriver) Open(dsn string) (driver.Conn, error) {
+	c, err := nullBytesDriver{}.OpenConnector(dsn)
+	if err != nil {
+		return nil, err
+	}
+	return c.Connect(context.Background())
+}
+
+func (nullBytesDriver) OpenConnector(dsn string) (driver.Connector, error) {
+	d, err := spDriver(dsn)
+	if err != nil {
+		return nil, err
+	}
+	c, err := d.OpenConnector(dsn)
+	if err != nil {
+		return nil, err
+	}
+	return nullBytesConnector{c}, nil
+}
+
 // spDriver returns go-sql-spanner's registered driver, whose connectors
 // are cached by connection string, so that pools on one database share a
 // client. database/sql gives it out only from a pool opened on a valid

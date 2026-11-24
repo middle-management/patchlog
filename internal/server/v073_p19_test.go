@@ -595,7 +595,8 @@ func TestV073LegacySealedGrantConverted(t *testing.T) {
 	t.Parallel()
 	path, driver := filepath.Join(t.TempDir(), "legacy.db"), "sqlite"
 	if pgtest.Enabled() {
-		path, driver = pgtest.NewDB(t), "pgx"
+		path = pgtest.NewDB(t)
+		driver = pgtest.Driver(path)
 	}
 	s := newSealedAuthEnv(t, withPath(path))
 	k := newKey("issuer")
@@ -630,12 +631,17 @@ func TestV073LegacySealedGrantConverted(t *testing.T) {
 		t.Fatal(err)
 	}
 	ph := func(i int) string {
-		if driver == "pgx" {
+		if driver != "sqlite" {
 			return "$" + strconv.Itoa(i)
 		}
 		return "?"
 	}
-	if _, err := db.Exec(`INSERT INTO sealed (ns, kind, key, jwe, created) SELECT ns, 'grant', `+ph(1)+`, `+ph(2)+`, 0 FROM namespaces WHERE name = 's'`, sgid, legacy); err != nil {
+	// Spanner types no literal in a SELECT list.
+	kind := `'grant'`
+	if driver != "sqlite" {
+		kind = `'grant'::text`
+	}
+	if _, err := db.Exec(`INSERT INTO sealed (ns, kind, key, jwe, created) SELECT ns, `+kind+`, `+ph(1)+`, `+ph(2)+`, 0 FROM namespaces WHERE name = 's'`, sgid, legacy); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()

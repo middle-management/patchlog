@@ -37,7 +37,7 @@ func TestPGDrawHoldsNoMainConn(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The test's own connections, of a pool no write waits for.
-	mon, err := sql.Open("pgx", pgtest.DSN(url))
+	mon, err := sql.Open(pgtest.Driver(url), pgtest.DSN(url))
 	if err != nil {
 		t.Fatal(err)
 	}
