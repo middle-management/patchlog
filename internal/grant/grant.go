@@ -644,6 +644,11 @@ func parseBlock(raw map[string]any, root bool) (Block, error) {
 	if root && !b.HasNS {
 		return b, errors.New("ns is required")
 	}
+	// "*" only widens: a narrowing block, an operator grant's included,
+	// may not name it (§C.1 Narrowing only restricts, v0.90).
+	if !root && contains(b.NS, "*") {
+		return b, errors.New(`a narrowing block must not name "*" in ns`)
+	}
 	if b.Can, b.HasCan, err = strList(raw, "can"); err != nil {
 		return b, err
 	}
