@@ -146,3 +146,28 @@ func TestV090BBlobEpochsOfReadableRevisions(t *testing.T) {
 		b.Close()
 	}
 }
+
+// v0.90 §8.5 ("The full read check of the first row is ... a partial
+// reader passing at /heads (§7.9)"): once matches is purged, li, a partial
+// reader who lacks unrestricted read, passes the read check of its
+// /heads and gets 410, as at her view's URLs; a grant that may not read
+// matches still gets 403.
+func TestV090BPartialReaderPurgedHeads(t *testing.T) {
+	t.Parallel()
+	w := newV75World(t, v75Opts{})
+	w.seed()
+	ctx := context.Background()
+	head := w.head("matches")
+	w.patchConfig("matches", map[string]any{"op": "add", "path": "/frozen", "value": true})
+	op := w.cred(w.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"matches"}, "can": []any{"purge-ns"}})
+	if _, err := w.e.PurgeNamespace(ctx, Request{NS: "matches", Cred: op}, w.head("matches"), true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.e.NamespaceHeads(ctx, "matches", head, "", w.li()); v75Status(err) != 410 {
+		t.Fatalf("li at the purged namespace's /heads: %v, want 410", err)
+	}
+	writer := w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"matches"}, "can": []any{"create"}})
+	if _, err := w.e.NamespaceHeads(ctx, "matches", head, "", writer); v75Status(err) != 403 {
+		t.Fatalf("a grant without read at the purged namespace's /heads: %v, want 403", err)
+	}
+}
