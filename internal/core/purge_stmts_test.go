@@ -198,7 +198,13 @@ func TestPurgeOrder(t *testing.T) {
 	}
 	var got []string
 	if err := e.read(ctx, func(t *tx) error {
-		rows, err := t.Query(`SELECT n.name FROM ns_log l JOIN namespaces n ON n.ns = l.ns WHERE l.kind = ? ORDER BY l.seq`, nsKindCode("purge"))
+		// Across namespaces Spanner's seqs are ordered by their time bits
+		// (spWriteOrder).
+		order := `l.seq`
+		if t.e.spanner {
+			order = fmt.Sprintf(`mod(l.seq, %d), l.seq`, spOrderMod)
+		}
+		rows, err := t.Query(`SELECT n.name FROM ns_log l JOIN namespaces n ON n.ns = l.ns WHERE l.kind = ? ORDER BY `+order, nsKindCode("purge"))
 		t.must(err)
 		defer rows.Close()
 		for rows.Next() {
