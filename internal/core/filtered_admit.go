@@ -121,6 +121,7 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlView string, cp *fcp, cred C
 		if fv.view != urlView {
 			return nil, forbidden("the grant reads " + n.name + " at its own view, /ns/" + n.name + "/view/" + fv.view + " (§7.9, §B.11.5)")
 		}
+		t.viewServed = n.name // markServed
 		return fv, nil
 	}
 	eg := cred.Edge
@@ -141,6 +142,7 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlView string, cp *fcp, cred C
 		a := &actor{principal: grant.Principal{ID: "edge:" + eg.Prefix}, bucketKey: "edge:" + eg.Prefix, view: urlView}
 		fv := t.newFview(fs, cp, urlView, nil, t.newJudge("", &grantcheck.ReadFilter{}), a)
 		fv.unrestricted = true
+		t.viewServed = n.name // markServed
 		return fv, nil
 	}
 	if eg.View != urlView {
@@ -173,6 +175,7 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlView string, cp *fcp, cred C
 		return nil, apiErr(401, "unauthenticated", "message", "unknown view: exchange the grant again (§7.9)")
 	}
 	a := &actor{principal: grant.Principal{ID: "edge:" + eg.Prefix}, bucketKey: "edge:" + eg.Prefix, view: urlView}
+	t.viewServed = n.name // markServed
 	return t.newFview(fs, cp, urlView, rec.subjects, t.newJudge(rec.digest, filter), a), nil
 }
 

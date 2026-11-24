@@ -1,0 +1,24 @@
+-- Migration: filtered served
+-- Created: 2026-11-24T20:12:21Z
+-- Checksum: 698f1e0e7395ae7ed6deb6bd4261aeaddf44dbb8318d4675ff600dd434285b5c
+-- Chain: ac5dd26f75a05b04c5ab97c865eb9049c5d9b05410d876fd67b852a814aa7024
+--
+-- IMPORTANT: Do not modify this file after commit. The checksum above
+-- tracks the integrity of this migration. Any changes will be detected
+-- and may cause deployment issues.
+--
+
+-- current.sql: Development-only migration file
+-- 
+-- This file is automatically applied in development environments.
+-- When ready for production, commit this as a numbered migration file (NNN_name.sql)
+-- and clear this file.
+--
+-- Example usage:
+-- ALTER TABLE users ADD COLUMN new_feature_flag BOOLEAN DEFAULT false;
+-- The namespaces a view of which has been served (§7.9, §8.3 CDN, v0.90):
+-- a purge clears ns:{ns} at the CDN once one has, as filtered ranges are
+-- tagged ns:{ns}. Kept for good, unlike filtered_views, whose rows are
+-- swept a while after their cookies expire and which bearer reads at a
+-- view URL never write.
+CREATE TABLE IF NOT EXISTS filtered_served (ns TEXT PRIMARY KEY);

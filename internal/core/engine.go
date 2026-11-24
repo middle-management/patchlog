@@ -279,8 +279,11 @@ type Engine struct {
 	viewHeld   lru.Cache[[32]byte, bool]
 	// judgedMem keeps recent per-revision read answers (judge), which
 	// read_judged keeps for good.
-	judgedMu    sync.Mutex
-	judgedMem   lru.Cache[judgedKey, bool]
+	judgedMu  sync.Mutex
+	judgedMem lru.Cache[judgedKey, bool]
+	// served are the namespaces filtered_served holds, as this engine
+	// has seen them (markServed).
+	served      sync.Map
 	schemaScans atomic.Int64
 	cfgMu       sync.Mutex
 	cfgCache    map[int64]*Config
@@ -755,6 +758,10 @@ type tx struct {
 	// judged are the per-revision read answers this transaction gave that
 	// read_judged doesn't hold yet (judge, flushJudged).
 	judged []judgedRow
+	// viewServed is the namespace a view of which this transaction
+	// admitted a read at (filteredAdmit), "" for none: recorded once it
+	// has ended (markServed).
+	viewServed string
 	// rateDrawn, when set, records that a write drew its rate-limit tokens,
 	// so a transaction run again (Postgres, pglock.go) doesn't draw them
 	// twice.
@@ -854,14 +861,38 @@ type docPut struct {
 // read runs f in a read transaction.
 func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
 	var judged []judgedRow
+	var served string
 	err = e.read1(ctx, func(t *tx) error {
-		defer func() { judged = t.judged }()
+		defer func() { judged, served = t.judged, t.viewServed }()
 		// The read checks of a request share one budget (§6.6).
 		defer t.requestScope(ctx)()
 		return f(t)
 	})
 	// Per-revision answers it gave are kept once it has ended (judge).
 	e.flushJudged(ctx, judged)
+	if err == nil && served != "" {
+		err = e.markServed(ctx, served)
+	}
+	return err
+}
+
+// markServed records that a view of namespace ns has been served, before
+// the answer leaves, so that a later purge in ns clears ns:{ns}, the tag
+// of its filtered ranges, at the CDN (§8.3 CDN, v0.90: "and ns:{ns} once
+// a view of the namespace has been served"; tagFilteredRanges). Each
+// engine writes it once per namespace; a failure fails the read, whose
+// answer a purge might then not clear.
+func (e *Engine) markServed(ctx context.Context, ns string) error {
+	if _, ok := e.served.Load(ns); ok {
+		return nil
+	}
+	err := e.update(context.WithoutCancel(ctx), func(t *tx) error {
+		_, err := t.Exec(`INSERT INTO filtered_served (ns) VALUES (?) ON CONFLICT (ns) DO NOTHING`, ns)
+		return err
+	})
+	if err == nil {
+		e.served.Store(ns, struct{}{})
+	}
 	return err
 }
 
