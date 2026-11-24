@@ -72,6 +72,9 @@ type config struct {
 	resWaiters                                                         string
 	resWriters                                                         int
 	resSecs                                                            int
+	busyNS                                                             string
+	busyDocs, busySecs                                                 int
+	busyRate                                                           float64
 }
 
 // args are the harness's flags (go-arg), copied into config.
@@ -97,7 +100,7 @@ type args struct {
 	SingleSecs     int           `arg:"--single-seconds" default:"15" help:"seconds each single-document write measurement runs"`
 	SingleRate     float64       `arg:"--single-rate" help:"single-document measurements: writes a second (and burst) the namespace allows per resource, per principal and in all, in place of the defaults (10, 50 and 500 a second); the core needs --max-rate-per-resource, --max-rate-per-principal and --max-rate-per-namespace raised to it"`
 	BackoffMax     time.Duration `arg:"--single-backoff-max" help:"single-document measurements: the longest wait of the client's backoff after lost races (default: the client's, 16ms)"`
-	Only           string        `arg:"--only" help:"run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live, resource-live; branches runs only when named"`
+	Only           string        `arg:"--only" help:"run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live, resource-live; branches and namespaces run only when named"`
 	BranchCount    int           `arg:"--branch-count" default:"100" help:"branches phase: live branches of the base"`
 	BranchFrozen   int           `arg:"--branch-frozen" help:"branches phase: frozen branches of the base besides the live ones"`
 	BranchChildren int           `arg:"--branch-children" help:"branches phase: branches under each live branch"`
@@ -108,6 +111,10 @@ type args struct {
 	ResWaiters     string        `arg:"--resource-waiters" default:"256,1024" help:"resource-live: long-poll followers, each of a resource of its own in one namespace, to measure ('' to skip)"`
 	ResWriters     int           `arg:"--resource-writers" default:"16" help:"resource-live: concurrent writers, each appending to a resource of its own in the followers' namespace"`
 	ResSecs        int           `arg:"--resource-seconds" default:"20" help:"resource-live: seconds the writers write for each follower count"`
+	BusyNS         string        `arg:"--busy-namespaces" default:"1,2,4,8,16,32" help:"namespaces phase: counts of busy namespaces to measure, each step in new ones"`
+	BusyDocs       int           `arg:"--busy-docs" default:"100" help:"namespaces phase: documents per busy namespace, each with a writer of its own"`
+	BusyRate       float64       `arg:"--busy-rate" default:"10" help:"namespaces phase: writes a second asked of each document (closed loop: a write waits for the one before it)"`
+	BusySecs       int           `arg:"--busy-seconds" default:"30" help:"namespaces phase: seconds each step writes for"`
 }
 
 func (args) Description() string {
@@ -142,6 +149,7 @@ func main() {
 		resWaiters:  a.ResWaiters,
 		resWriters:  a.ResWriters,
 		resSecs:     a.ResSecs,
+		busyNS:      a.BusyNS, busyDocs: a.BusyDocs, busyRate: a.BusyRate, busySecs: a.BusySecs,
 		only:        a.Only,
 		branchCount: a.BranchCount, branchFrozen: a.BranchFrozen, branchChildren: a.BranchChildren,
 		branchDocs: a.BranchDocs, branchDepth: a.BranchDepth, purgeListen: a.PurgeListen, purgeRuns: a.PurgeRuns,
@@ -347,6 +355,9 @@ func (r *runner) run() {
 	}
 	if r.c.only != "" && on("branches") {
 		r.branches()
+	}
+	if r.c.only != "" && on("namespaces") {
+		r.busyNamespaces()
 	}
 	for k, pid := range r.pids() {
 		b, err := os.ReadFile("/proc/" + pid + "/status")

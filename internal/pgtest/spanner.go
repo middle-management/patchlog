@@ -2,7 +2,6 @@ package pgtest
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"net/url"
@@ -12,23 +11,31 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+
+	database "cloud.google.com/go/spanner/admin/database/apiv1"
+	"cloud.google.com/go/spanner/admin/database/apiv1/databasepb"
+	_ "github.com/googleapis/go-sql-spanner"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"github.com/middle-management/patchlog/internal/spannerurl"
 )
 
-// Spanner's databases (SpannerEnv), through PGAdapter: the emulator's
-// PGAdapter creates a database on the first connection to it, so a new
-// one is just a new name. Applying the schema to one takes about a second
-// (dbmigrate.MigrateSpanner), so, as on Postgres, a test's database goes
-// back to a pool when it ends, emptied: every table's rows deleted but
-// mmmigrate's, so the next engine finds its migrations applied and only
-// seeds it again. Spanner has no TRUNCATE, nor a way to turn foreign keys
-// off: the deletes run in one transaction, each table after those that
-// reference it. The pool's databases outlive the process, and the next
-// reuses them (claimSpannerDB).
+// Spanner's databases (SpannerEnv): on the emulator the driver creates a
+// database on the first connection to it, of the PostgreSQL dialect, so a
+// new one is just a new name; on Spanner, the instance must allow it.
+// Applying the schema to one takes seconds (dbmigrate.MigrateSpanner), so,
+// as on Postgres, a test's database goes back to a pool when it ends,
+// emptied: every table's rows deleted but mmmigrate's, so the next engine
+// finds its migrations applied and only seeds it again. Spanner has no
+// TRUNCATE, nor a way to turn foreign keys off: the deletes run in one
+// transaction, each table after those that reference it. The pool's
+// databases outlive the process, and the next reuses them
+// (claimSpannerDB); FreshDB's are dropped when their test ends.
 
 // spannerPrefix and spannerFreshPrefix name the pool's databases and
 // FreshDB's: names of 2 to 30 lowercase letters, digits and underscores.
-// FreshDB's are new each time, so a test run on the emulator uses a dozen
-// of the instance's 100 databases: restart it between runs.
+// FreshDB's are new each time, and dropped after.
 const (
 	spannerPrefix      = "plpool_"
 	spannerFreshPrefix = "plfresh_"
@@ -42,10 +49,9 @@ var spannerPool struct {
 
 // claimSpannerDB claims a pool database no other process holds, and
 // empties it of what an earlier process left. The names are numbered, so
-// runs reuse them: an instance holds 100 databases at most, and PGAdapter
-// can't drop one. A process holds each it claimed until it exits, by a
+// runs reuse them: an instance holds 100 databases at most. A process holds each it claimed until it exits, by a
 // lock on a file of the same name.
-func claimSpannerDB(u *url.URL) (string, error) {
+func claimSpannerDB(instance string) (string, error) {
 	spannerPool.mu.Lock()
 	defer spannerPool.mu.Unlock()
 	for i := 0; i < 64; i++ {
@@ -65,9 +71,7 @@ func claimSpannerDB(u *url.URL) (string, error) {
 			spannerPool.held = map[string]bool{}
 		}
 		spannerPool.held[name] = true // and f stays open, locked, until exit
-		v := *u
-		v.Path = "/" + name
-		if err := emptySpanner(v.String()); err != nil {
+		if err := emptySpanner(spannerDBURL(instance, name)); err != nil {
 			return "", fmt.Errorf("emptying %s: %w", name, err)
 		}
 		return name, nil
@@ -75,15 +79,27 @@ func claimSpannerDB(u *url.URL) (string, error) {
 	return "", errors.New("every pool database is held")
 }
 
+// spannerInstance is SpannerEnv's instance, spanner://projects/P/instances/I.
+func spannerInstance(t testing.TB) string {
+	raw := strings.TrimRight(os.Getenv(SpannerEnv), "/")
+	p := strings.Split(strings.TrimPrefix(raw, spannerurl.Scheme), "/")
+	if !spannerurl.Is(raw) || len(p) != 4 || p[0] != "projects" || p[2] != "instances" {
+		t.Fatalf("%s=%q: want %sprojects/P/instances/I", SpannerEnv, raw, spannerurl.Scheme)
+	}
+	return raw
+}
+
+// spannerDBURL is the URL of the instance's database name.
+func spannerDBURL(instance, name string) string {
+	return instance + "/databases/" + name
+}
+
 // spannerDB is NewDB (pooled) or FreshDB on Spanner.
 func spannerDB(t testing.TB, pooled bool) string {
 	t.Helper()
-	raw := os.Getenv(SpannerEnv)
-	u, err := url.Parse(pgxURL(raw))
-	if err != nil {
-		t.Fatalf("%s: %v", SpannerEnv, err)
-	}
+	instance := spannerInstance(t)
 	var name string
+	var err error
 	if pooled {
 		spannerPool.mu.Lock()
 		if n := len(spannerPool.free); n > 0 {
@@ -92,14 +108,12 @@ func spannerDB(t testing.TB, pooled bool) string {
 		}
 		spannerPool.mu.Unlock()
 		if name == "" {
-			if name, err = claimSpannerDB(u); err != nil {
+			if name, err = claimSpannerDB(instance); err != nil {
 				t.Fatalf("pgtest: %v", err)
 			}
 		}
 		t.Cleanup(func() {
-			u := *u
-			u.Path = "/" + name
-			if err := emptySpanner(u.String()); err != nil {
+			if err := emptySpanner(spannerDBURL(instance, name)); err != nil {
 				t.Logf("pgtest: emptying %s: %v", name, err)
 				return
 			}
@@ -109,19 +123,54 @@ func spannerDB(t testing.TB, pooled bool) string {
 		})
 	} else {
 		name = spannerFreshPrefix + randHex()[:12]
+		t.Cleanup(func() {
+			if err := dropSpanner(spannerDBURL(instance, name)); err != nil {
+				t.Logf("pgtest: dropping %s: %v", name, err)
+			}
+		})
 	}
-	u.Path = "/" + name
-	q := u.Query()
+	q := url.Values{}
 	for k, v := range PoolParams {
 		q.Set(k, v)
 	}
-	u.RawQuery = q.Encode()
-	return "spanner+postgres://" + strings.TrimPrefix(u.String(), "postgres://")
+	return spannerDBURL(instance, name) + "?" + q.Encode()
+}
+
+// spannerDSN is the driver's connection string for a URL of spannerDB.
+func spannerDSN(raw string) string {
+	var drop []string
+	for k := range PoolParams {
+		drop = append(drop, k)
+	}
+	dsn, err := spannerurl.DSN(raw, drop...)
+	if err != nil {
+		return raw
+	}
+	return dsn
+}
+
+// dropSpanner drops a database, if it was created.
+func dropSpanner(raw string) error {
+	db, _, err := spannerurl.Parse(raw)
+	if err != nil {
+		return err
+	}
+	ctx := context.Background()
+	c, err := database.NewDatabaseAdminClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	err = c.DropDatabase(ctx, &databasepb.DropDatabaseRequest{Database: db})
+	if status.Code(err) == codes.NotFound {
+		return nil
+	}
+	return err
 }
 
 // emptySpanner deletes every row of the database's tables but mmmigrate's.
-func emptySpanner(dsn string) error {
-	db, err := sql.Open("pgx", dsn)
+func emptySpanner(raw string) error {
+	db, err := spannerurl.Open(spannerDSN(raw))
 	if err != nil {
 		return err
 	}
@@ -198,12 +247,4 @@ func emptySpanner(dsn string) error {
 		}
 	}
 	return tx.Commit()
-}
-
-// pgxURL is a URL as pgx takes it: a Spanner URL's scheme is postgres://.
-func pgxURL(raw string) string {
-	if s, ok := strings.CutPrefix(raw, "spanner+postgres://"); ok {
-		return "postgres://" + s
-	}
-	return raw
 }

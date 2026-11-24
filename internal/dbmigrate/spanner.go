@@ -16,8 +16,8 @@ import (
 	"github.com/middle-management/mmmigrate/source"
 )
 
-// MigrateSpanner is Migrate for a database on Spanner's PostgreSQL
-// interface, reached through PGAdapter with the pgx driver, whose
+// MigrateSpanner is Migrate for a database of Spanner's PostgreSQL
+// dialect, opened with go-sql-spanner's database/sql driver, whose
 // migrations are in migrations/spanner and seed in migrations/seed/
 // spanner.sql (docs/SPANNER.md).
 //

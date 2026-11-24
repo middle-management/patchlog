@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 
@@ -171,8 +172,11 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids
 //     who is looked at. A branch the purge has nothing to do in, made
 //     before the name's first entry and holding nothing, is not read at
 //     all, nor counted, nor is anything below it unless it holds a row.
-//     For a name more than purgeHoldersMax namespaces of the deployment
-//     hold, the search goes down from the purged namespace instead, a
+//     On Spanner, which has no recursive queries, the holders of sealed
+//     copies and sealings are read by a DISTINCT, and their chains a
+//     level per statement. For a name more than purgeHoldersMax
+//     namespaces of the deployment hold, the search goes down from the
+//     purged namespace instead, a
 //     statement per level that asks every branch (purgeLevels): the same
 //     candidates, at a cost that follows the branches, not the name.
 //   - The candidates are locked exclusively, and the bases their names
@@ -556,7 +560,12 @@ const (
 			UNION ALL
 			SELECT (SELECT MIN(x.ns) FROM blob_epochs x WHERE x.name = ? AND x.ns > h.ns) FROM h WHERE h.ns IS NOT NULL)
 		SELECT ns, CAST(NULL AS bigint) FROM h WHERE ns IS NOT NULL LIMIT ?`
-	purgeBranchesFrom = `SELECT c.ns, c.name, c.base FROM unnest(?::bigint[], ?::bigint[]) AS v(base, lo) CROSS JOIN LATERAL
+	// Spanner's: no recursive queries. A DISTINCT over the index on (name,
+	// ns) reads every row of the namespaces it returns, at most one more
+	// than purgeHoldersMax of them.
+	purgeHoldersSealedSpanner = `SELECT ns, CAST(NULL AS bigint) FROM (SELECT DISTINCT ns FROM sealed WHERE name = ?) h LIMIT ?`
+	purgeHoldersEpochsSpanner = `SELECT ns, CAST(NULL AS bigint) FROM (SELECT DISTINCT ns FROM blob_epochs WHERE name = ?) h LIMIT ?`
+	purgeBranchesFrom         = `SELECT c.ns, c.name, c.base FROM unnest(?::bigint[], ?::bigint[]) AS v(base, lo) CROSS JOIN LATERAL
 			(SELECT ns, name, base FROM namespaces WHERE base = v.base AND base_at >= v.lo AND purged = 0 OFFSET 0) c`
 )
 
@@ -608,17 +617,18 @@ func (e *Engine) holdersMax() int {
 func (t *tx) purgeHolders(n *nsRow, name string, rootLo int64) ([]purgeCand, bool) {
 	first := map[int64]sql.NullInt64{} // holders, with their rows' first entries
 	most := t.e.holdersMax()
-	if most < 0 || t.e.spanner {
-		// Spanner has no recursive queries, which the holders' searches
-		// and chains are (purgeHoldersSealed, purgeChains): the purge
-		// searches level by level (purgeLevels).
+	if most < 0 {
 		return nil, false
 	}
 	// The bound is on the holders of all three tables together, and each
 	// statement stops one past it.
-	for i, q := range []string{purgeHoldersByRow, purgeHoldersSealed, purgeHoldersEpochs} {
+	searches := []string{purgeHoldersByRow, purgeHoldersSealed, purgeHoldersEpochs}
+	if t.e.spanner {
+		searches = []string{purgeHoldersByRow, purgeHoldersSealedSpanner, purgeHoldersEpochsSpanner}
+	}
+	for i, q := range searches {
 		args := []any{name, most + 1}
-		if i > 0 {
+		if i > 0 && !t.e.spanner {
 			args = []any{name, name, most + 1}
 		}
 		rows, err := t.Query(q, args...)
@@ -655,18 +665,40 @@ func (t *tx) purgeHolders(n *nsRow, name string, rootLo int64) ([]purgeCand, boo
 	}
 	if len(ids) > 0 {
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		rows, err := t.Query(t.e.purgeChains(), t.e.arrayArg(ids), n.id)
-		t.must(err)
-		for rows.Next() {
-			var l nsLink
-			var x node
-			var at sql.NullInt64
-			t.must(rows.Scan(&l.id, &l.name, &l.base, &at, &x.purged))
-			x.base, x.at = l.base, at.Int64
-			nodes[l.id], names[l.id] = x, l.name
+		read := func(q string, args ...any) (bases []int64) {
+			rows, err := t.Query(q, args...)
+			t.must(err)
+			for rows.Next() {
+				var l nsLink
+				var x node
+				var at sql.NullInt64
+				t.must(rows.Scan(&l.id, &l.name, &l.base, &at, &x.purged))
+				x.base, x.at = l.base, at.Int64
+				nodes[l.id], names[l.id] = x, l.name
+				if l.id != n.id && l.base.Valid {
+					bases = append(bases, l.base.Int64)
+				}
+			}
+			t.must(rows.Err())
+			rows.Close()
+			return bases
 		}
-		t.must(rows.Err())
-		rows.Close()
+		if !t.e.spanner {
+			read(t.e.purgeChains(), t.e.arrayArg(ids), n.id)
+		} else {
+			// No recursive queries: a statement per level of the chains,
+			// each reading the bases not read yet. Chains are as short as
+			// branches are deep.
+			for level := ids; len(level) > 0; {
+				var next []int64
+				for _, b := range read(`SELECT ns, name, base, base_at, purged FROM namespaces WHERE ns = ANY(?::bigint[])`, level) {
+					if _, done := nodes[b]; !done && !slices.Contains(next, b) {
+						next = append(next, b)
+					}
+				}
+				level = next
+			}
+		}
 	}
 	// Which of them lie below n through unpurged namespaces, and their lo.
 	below, los := map[int64]bool{n.id: true}, map[int64]int64{n.id: rootLo}
@@ -741,7 +773,12 @@ func (t *tx) purgeHolders(n *nsRow, name string, rootLo int64) ([]purgeCand, boo
 			bases[i], ats[i] = f[0], f[1]
 		}
 		args := []any{bases, ats}
-		if !t.e.pg {
+		if t.e.spanner {
+			// No LATERAL: the arrays subscripted by ordinals (bulk.go).
+			q = `SELECT c.ns, c.name, c.base FROM unnest($3::bigint[]) AS u(i)
+				JOIN namespaces c ON c.base = ($1::bigint[])[u.i] AND c.base_at >= ($2::bigint[])[u.i] WHERE c.purged = 0`
+			args = append(args, spOrdinals(len(from)))
+		} else if !t.e.pg {
 			// CROSS JOIN keeps v outside: namespaces by its index.
 			q = `WITH v(base, lo) AS (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))
 				SELECT c.ns, c.name, c.base FROM v CROSS JOIN namespaces c ON c.base = v.base AND c.base_at >= v.lo WHERE c.purged = 0`

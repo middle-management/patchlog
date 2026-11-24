@@ -213,10 +213,7 @@ func (e *Engine) tailStartSpanner(ctx context.Context) (tailState, error) {
 		return s, err
 	}
 	defer c.Close()
-	if err := c.QueryRowContext(ctx, `SELECT gen FROM cache_gen WHERE id = 1`).Scan(&s.gen); err != nil {
-		return s, err
-	}
-	ts, err := spReadTimestamp(ctx, c)
+	ts, err := spReadGen(ctx, c, &s.gen)
 	if err != nil {
 		return s, err
 	}
@@ -226,7 +223,8 @@ func (e *Engine) tailStartSpanner(ctx context.Context) (tailState, error) {
 }
 
 // tailPollSpanner is tailPoll on Spanner: the entries committed after
-// s.from, up to the read timestamp of a read-only transaction. Spanner
+// s.from, up to the read timestamp of a read-only transaction, read from
+// each shard of the index by commit timestamp (spShard). Spanner
 // has no LATERAL nor jsonb_array_elements: a batch's body is read whole
 // and its items found here.
 func (e *Engine) tailPollSpanner(ctx context.Context, s *tailState) error {
@@ -249,7 +247,7 @@ func (e *Engine) tailPollSpanner(ctx context.Context, s *tailState) error {
 			CASE WHEN l.kind = `+batchKind+` THEN l.body END
 		FROM ns_log l JOIN namespaces n ON n.ns = l.ns
 		LEFT JOIN resources r ON r.res = l.res
-		WHERE l.committed > $1`, time.UnixMicro(int64(s.from)).UTC())
+		WHERE l.shard IN (`+spShardList+`) AND l.committed > $1`, time.UnixMicro(int64(s.from)).UTC())
 	if err != nil {
 		return err
 	}
@@ -287,16 +285,34 @@ func (e *Engine) tailPollSpanner(ctx context.Context, s *tailState) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
+	to, err := spReadTimestamp(c)
+	if err != nil {
 		return err
 	}
-	to, err := spReadTimestamp(ctx, c)
-	if err != nil {
+	if err := tx.Commit(); err != nil {
 		return err
 	}
 	w.into(&inv)
 	e.tailApply(s, inv, max(s.from, uint64(to)), gen)
 	return nil
+}
+
+// spReadGen reads cache_gen into gen in a read-only transaction on c, and
+// returns its read timestamp (spReadTimestamp).
+func spReadGen(ctx context.Context, c *sql.Conn, gen *int64) (int64, error) {
+	tx, err := c.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if err := tx.QueryRow(`SELECT gen FROM cache_gen WHERE id = 1`).Scan(gen); err != nil {
+		return 0, err
+	}
+	ts, err := spReadTimestamp(c)
+	if err != nil {
+		return 0, err
+	}
+	return ts, tx.Commit()
 }
 
 // syncTailSpanner is SyncTail on Spanner: every transaction committed
@@ -308,11 +324,7 @@ func (e *Engine) syncTailSpanner(ctx context.Context) error {
 		return err
 	}
 	var gen int64
-	err = c.QueryRowContext(ctx, `SELECT gen FROM cache_gen WHERE id = 1`).Scan(&gen)
-	var want int64
-	if err == nil {
-		want, err = spReadTimestamp(ctx, c)
-	}
+	want, err := spReadGen(ctx, c, &gen)
 	c.Close()
 	if err != nil {
 		return err

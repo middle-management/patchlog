@@ -651,7 +651,7 @@ func (t *tx) allBranchesOf(n *nsRow) []*nsRow {
 func (t *tx) insertConfigRow(ns int64, id []byte, parent any, patches, doc string, author int64) int64 {
 	if t.e.spanner {
 		above, _ := parent.(int64)
-		seq := t.spID("ns_config", above)
+		seq := t.spID(ns, above)
 		_, err := t.Exec(`INSERT INTO ns_config (seq, ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,?,?,?,?,?,?)`,
 			seq, ns, id, parent, patches, doc, author, t.now.UnixMilli())
 		t.must(err)

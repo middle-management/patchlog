@@ -49,19 +49,18 @@ const (
 )
 
 // parsePGPool returns the URL without its pool parameters, and their
-// values. A URL without them is returned as it is, but for a Spanner
-// URL's scheme, which becomes postgres:// (pgxURL).
+// values. A URL without them is returned as it is.
 func parsePGPool(raw string) (string, pgPool, error) {
 	var p pgPool
-	raw = pgxURL(raw)
 	if !strings.Contains(raw, "pool_") {
 		return raw, p, nil
 	}
-	u, err := url.Parse(raw)
+	// A Spanner URL's path isn't a URL's (spannerurl), its query is.
+	base, query, _ := strings.Cut(raw, "?")
+	q, err := url.ParseQuery(query)
 	if err != nil {
 		return "", p, err
 	}
-	q := u.Query()
 	if !q.Has(poolMaxConns) && !q.Has(poolMaxIdleTime) {
 		return raw, p, nil
 	}
@@ -83,8 +82,10 @@ func parsePGPool(raw string) (string, pgPool, error) {
 	}
 	q.Del(poolMaxConns)
 	q.Del(poolMaxIdleTime)
-	u.RawQuery = q.Encode()
-	return u.String(), p, nil
+	if len(q) == 0 {
+		return base, p, nil
+	}
+	return base + "?" + q.Encode(), p, nil
 }
 
 // mainSize is the size of the main pool: pool_max_conns, or mainConns.

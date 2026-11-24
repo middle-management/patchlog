@@ -2,14 +2,11 @@ package dbmigrate
 
 import (
 	"context"
-	"crypto/rand"
-	"database/sql"
-	"encoding/hex"
-	"net/url"
 	"os"
 	"reflect"
-	"strings"
 	"testing"
+
+	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
 func TestSplitSQL(t *testing.T) {
@@ -27,26 +24,14 @@ DO $f$ BEGIN; END $f$;
 	}
 }
 
-// The core's Spanner migrations apply to an empty database through
-// PGAdapter (PATCHLOG_TEST_SPANNER, e.g. postgres://x@127.0.0.1:5432/
-// any?sslmode=disable; the database named is replaced by a new one), and
-// a second run finds everything applied.
+// The core's Spanner migrations apply to an empty database
+// (PATCHLOG_TEST_SPANNER, pgtest.SpannerEnv), and a second run finds
+// everything applied.
 func TestMigrateSpanner(t *testing.T) {
-	raw := os.Getenv("PATCHLOG_TEST_SPANNER")
-	if raw == "" {
-		t.Skip("PATCHLOG_TEST_SPANNER is not set")
+	if !pgtest.Spanner() {
+		t.Skip(pgtest.SpannerEnv + " is not set")
 	}
-	u, err := url.Parse(strings.Replace(raw, "spanner+postgres://", "postgres://", 1))
-	if err != nil {
-		t.Fatal(err)
-	}
-	b := make([]byte, 6)
-	rand.Read(b)
-	u.Path = "/plmig_" + hex.EncodeToString(b)
-	db, err := sql.Open("pgx", u.String())
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := pgtest.Open(t, pgtest.FreshDB(t))
 	defer db.Close()
 	ctx := context.Background()
 	for i := 0; i < 2; i++ {

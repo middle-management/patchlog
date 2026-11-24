@@ -20,7 +20,8 @@ import (
 // Spanner (spanner.go) has no unnest of several arrays: its form of a
 // bulk insert (sp) subscripts each column's array by the elements of one
 // more, of ordinals 1…n (spOrdinals). A statement without one runs as
-// SQLite's, once per row.
+// SQLite's, once per row, its rows sent together as one batch of DML in a
+// write transaction (spDMLBatch).
 
 // bulkStmt is one statement in both forms, and Spanner's.
 type bulkStmt struct {
@@ -81,7 +82,7 @@ func (t *tx) bulkExec(s bulkStmt, rows [][]any) int64 {
 	t.wrote()
 	if t.e.spanner && s.sp != "" {
 		t.counted(s.sp)
-		r, err := t.Tx.Exec(s.sp, s.spArgs(rows)...)
+		r, err := t.Tx.Exec(s.sp, pgArgs(s.spArgs(rows), true)...)
 		t.must(err)
 		n, err := r.RowsAffected()
 		t.must(err)
@@ -94,6 +95,10 @@ func (t *tx) bulkExec(s bulkStmt, rows [][]any) int64 {
 		n, err := r.RowsAffected()
 		t.must(err)
 		return n
+	}
+	if t.e.spanner && t.sp != nil && len(rows) > 1 {
+		// One batch of DML, one round trip (spDMLBatch).
+		return t.spDMLBatch(s.lite, rows)
 	}
 	var n int64
 	for _, row := range rows {
@@ -123,7 +128,7 @@ func (t *tx) bulkQuery(s bulkStmt, rows [][]any, scan func(*sql.Rows)) {
 	}
 	if t.e.spanner && s.sp != "" {
 		t.counted(s.sp)
-		each(t.Tx.Query(s.sp, s.spArgs(rows)...))
+		each(t.Tx.Query(s.sp, pgArgs(s.spArgs(rows), true)...))
 		return
 	}
 	if t.e.pg && !t.e.spanner {

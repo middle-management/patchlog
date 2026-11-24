@@ -2092,7 +2092,7 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 		if t.e.spanner {
 			ins = insRevisionsSpanner
 			for i, it := range stepItems {
-				rows[i] = append([]any{t.spID("revisions", it.last)}, rows[i]...)
+				rows[i] = append([]any{t.spID(it.res, it.last)}, rows[i]...)
 			}
 		}
 		t.bulkQuery(ins, rows, func(rs *sql.Rows) {

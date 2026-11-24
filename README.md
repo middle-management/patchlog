@@ -823,10 +823,11 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   demand grows with the packages and tests run at once. Give the server
   `max_connections=300`, or run fewer packages at once (`go test -p 2`); CI starts its
   `postgres:16` service container with `max_connections=300`.
-- **Spanner** (first phase, emulator only): `--db spanner+postgres://…` runs the core on
-  Spanner's PostgreSQL interface through PGAdapter, with the differences, and what is untested,
-  in [docs/SPANNER.md](docs/SPANNER.md); `PATCHLOG_TEST_SPANNER=… make test-spanner` runs the
-  tests there.
+- **Spanner** (emulator only so far): `--db spanner://projects/P/instances/I/databases/D` runs
+  the core on a Spanner database of the PostgreSQL dialect, with Spanner's Go driver, with the
+  differences, and what is untested, in [docs/SPANNER.md](docs/SPANNER.md);
+  `PATCHLOG_TEST_SPANNER=… make test-spanner` runs the tests there, and
+  `deploy/gcp-spanner.sh` measures its write capacity on Google Cloud.
 
 ### Blob storage
 

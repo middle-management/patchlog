@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"runtime"
 
+	_ "github.com/googleapis/go-sql-spanner"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "modernc.org/sqlite"
 
@@ -33,8 +34,8 @@ var migrations embed.FS
 // equivalent: deleted and overwritten tuples stay in the table's files
 // until VACUUM reclaims them (and in WAL and backups until those expire).
 //
-// A Spanner database (isSpannerURL) is opened as a Postgres one, through
-// PGAdapter, and migrated with its own migrations (dbmigrate.MigrateSpanner).
+// A Spanner database (isSpannerURL) is opened as a Postgres one, with
+// Spanner's driver (sqlOpen), and migrated with its own migrations (dbmigrate.MigrateSpanner).
 // before doesn't run on it: no version before Spanner's could have left
 // what it checks for.
 func openDB(path string, fsys fs.FS, before func(db *sql.DB, pg bool) error) (db *sql.DB, pg bool, err error) {
@@ -101,7 +102,7 @@ func openPG(raw string, fsys fs.FS, before func(db *sql.DB, pg bool) error) (*sq
 	if err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("pgx", url)
+	db, err := sqlOpen(url)
 	if err != nil {
 		return nil, err
 	}

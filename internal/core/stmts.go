@@ -110,7 +110,7 @@ func (t *tx) QueryRow(q string, args ...any) *sql.Row {
 		t.changedNS()
 	}
 	if t.e.pg {
-		return t.Tx.QueryRow(rebind(q), pgArgs(args)...)
+		return t.Tx.QueryRow(rebind(q), pgArgs(args, t.e.spanner)...)
 	}
 	if s := t.e.stmts.get(q); s != nil {
 		return t.Tx.StmtContext(context.Background(), s).QueryRow(args...)
@@ -129,7 +129,7 @@ func (t *tx) Query(q string, args ...any) (*sql.Rows, error) {
 		t.changedNS()
 	}
 	if t.e.pg {
-		return t.Tx.Query(rebind(q), pgArgs(args)...)
+		return t.Tx.Query(rebind(q), pgArgs(args, t.e.spanner)...)
 	}
 	if s := t.e.stmts.get(q); s != nil {
 		return t.Tx.StmtContext(context.Background(), s).Query(args...)
@@ -149,7 +149,7 @@ func (t *tx) Exec(q string, args ...any) (sql.Result, error) {
 	}
 	t.wrote()
 	if t.e.pg {
-		return t.Tx.Exec(rebind(q), pgArgs(args)...)
+		return t.Tx.Exec(rebind(q), pgArgs(args, t.e.spanner)...)
 	}
 	if s := t.e.stmts.get(q); s != nil {
 		return t.Tx.StmtContext(context.Background(), s).Exec(args...)

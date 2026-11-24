@@ -146,12 +146,12 @@ func (t *tx) soloStmt(q string, args []any) {
 
 func (t *tx) soloQueryRow(q string, args []any) *sql.Row {
 	t.soloStmt(q, args)
-	return t.e.db.QueryRowContext(t.ctx, rebind(q), pgArgs(args)...)
+	return t.e.db.QueryRowContext(t.ctx, rebind(q), pgArgs(args, t.e.spanner)...)
 }
 
 func (t *tx) soloQuery(q string, args []any) (*sql.Rows, error) {
 	t.soloStmt(q, args)
-	rows, err := t.e.db.QueryContext(t.ctx, rebind(q), pgArgs(args)...)
+	rows, err := t.e.db.QueryContext(t.ctx, rebind(q), pgArgs(args, t.e.spanner)...)
 	t.soloRows = rows
 	return rows, err
 }

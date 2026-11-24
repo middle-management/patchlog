@@ -1,15 +1,22 @@
 package core
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
 	"sync"
 
+	"cloud.google.com/go/spanner"
+	spannerdriver "github.com/googleapis/go-sql-spanner"
 	"github.com/jackc/pgx/v5/pgconn"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
+
+	"github.com/middle-management/patchlog/internal/spannerurl"
 )
 
 // The storage dialect: SQLite (the default, Addendum D.2) or Postgres
@@ -41,34 +48,55 @@ import (
 //   - constraint violations (isConflict);
 //   - transactions and write serialisation (engine.go).
 //
-// Spanner's PostgreSQL interface, through PGAdapter (docs/SPANNER.md), is
-// a third: the Postgres dialect (e.pg) with e.spanner set, for the
-// statements Spanner refuses or runs otherwise, each branched where it is
-// written (spanner.go has the shared helpers), and a schema of its own
-// (migrations/spanner).
-
-// spannerScheme prefixes a URL of a Spanner database's PostgreSQL
-// interface (PGAdapter): it speaks the Postgres protocol, so nothing in
-// the connection tells the two apart.
-const spannerScheme = "spanner+postgres://"
+// Spanner's PostgreSQL dialect (docs/SPANNER.md) is a third: the Postgres
+// dialect (e.pg) with e.spanner set, for the statements Spanner refuses or
+// runs otherwise, each branched where it is written (spanner.go has the
+// shared helpers), and a schema of its own (migrations/spanner). The engine
+// reaches it with the database/sql driver of go-sql-spanner, which sends
+// the statements to Spanner as they are, and with the driver's Spanner
+// connection where it uses mutations and timestamps (spanner.go).
 
 // isPostgresURL reports whether a database path names a Postgres database,
-// or a Spanner database through PGAdapter (isSpannerURL).
+// or a Spanner database (isSpannerURL).
 func isPostgresURL(path string) bool {
 	return strings.HasPrefix(path, "postgres://") || strings.HasPrefix(path, "postgresql://") || isSpannerURL(path)
 }
 
-// isSpannerURL reports whether a database path names a Spanner database
-// through PGAdapter: spanner+postgres://user@host:port/database.
-func isSpannerURL(path string) bool { return strings.HasPrefix(path, spannerScheme) }
+// isSpannerURL reports whether a database path names a Spanner database:
+// spanner://projects/P/instances/I/databases/D (package spannerurl).
+func isSpannerURL(path string) bool { return spannerurl.Is(path) }
 
-// pgxURL is a database URL as pgx takes it: a Spanner URL's scheme is
-// postgres://.
-func pgxURL(path string) string {
-	if isSpannerURL(path) {
-		return "postgres://" + strings.TrimPrefix(path, spannerScheme)
+// sqlOpen opens a database/sql pool on a Postgres or Spanner URL without
+// the engine's pool parameters (parsePGPool).
+func sqlOpen(url string) (*sql.DB, error) {
+	if isSpannerURL(url) {
+		dsn, err := spannerurl.DSN(url)
+		if err != nil {
+			return nil, err
+		}
+		return spannerurl.Open(dsn)
 	}
-	return path
+	return sql.Open("pgx", url)
+}
+
+// sqlState is the SQLSTATE of a database error, Postgres's or Spanner's
+// (the codes go-sql-spanner gives Spanner's errors: 40001 for an aborted
+// transaction, 23505 for a unique violation, 25P02 for a statement after
+// one that failed), or "" for another error.
+func sqlState(err error) string {
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) {
+		return pe.Code
+	}
+	var se *spanner.Error
+	if errors.As(err, &se) {
+		return spannerdriver.ToPGSQLState(err)
+	}
+	// The driver's own, as ErrAbortedDueToConcurrentModification.
+	if s, ok := grpcstatus.FromError(err); ok && s.Code() != codes.OK && s.Code() != codes.Unknown {
+		return spannerdriver.ToPGSQLState(err)
+	}
+	return ""
 }
 
 // IsPostgres reports whether the engine stores in Postgres, or in Spanner
@@ -114,8 +142,11 @@ func rebind(q string) string {
 }
 
 // pgArgs converts arguments Postgres won't take as they are: bools go into
-// smallint columns as 0 or 1.
-func pgArgs(args []any) []any {
+// smallint columns as 0 or 1. On Spanner (sp) each argument is named for
+// its placeholder, p1 for $1 and so on: go-sql-spanner gives unnamed
+// arguments to the placeholders in the order they appear in the statement,
+// whatever their numbers.
+func pgArgs(args []any, sp bool) []any {
 	copied := false
 	for i, a := range args {
 		if v, ok := a.(bool); ok {
@@ -126,6 +157,16 @@ func pgArgs(args []any) []any {
 				args[i] = int64(1)
 			} else {
 				args[i] = int64(0)
+			}
+		}
+	}
+	if sp {
+		if !copied {
+			args = append([]any(nil), args...)
+		}
+		for i, a := range args {
+			if _, ok := a.(sql.NamedArg); !ok {
+				args[i] = sql.Named("p"+strconv.Itoa(i+1), a)
 			}
 		}
 	}
@@ -196,13 +237,13 @@ func isConflict(err error) bool {
 	if errors.Is(err, errChainRace) {
 		return true
 	}
+	if sqlState(err) == "23505" && spannerConflict(err) {
+		// Spanner's, which names the index or the table in its message
+		// alone (spanner.go); Postgres's name the table.
+		return true
+	}
 	var pe *pgconn.PgError
 	if errors.As(err, &pe) {
-		if pe.Code == "23505" && pe.TableName == "" {
-			// Spanner's, which names the index or the table in its
-			// message alone (spanner.go); Postgres's name the table.
-			return spannerConflict(pe)
-		}
 		if pe.Code != "23505" { // unique_violation
 			return false
 		}

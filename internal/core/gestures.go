@@ -20,7 +20,8 @@ import (
 //     gesture or undoing it, in the order they were written (revision
 //     seq). Within one resource that is chain order; across resources it
 //     is the order the rows were inserted, which is the order of a client's
-//     own successive saves, the case a gesture is made of.
+//     own successive saves, the case a gesture is made of. (On Spanner, the
+//     millisecond they were inserted in: spWriteOrder.)
 //   - Only the namespace's own rows: a branch doesn't list what it reads
 //     through from its base (§7.6), whose gestures belong to the base's
 //     history and are listed there. Purged resources are left out, since
@@ -106,7 +107,7 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 				return v && t.mayReadRow(a, n, name, t.rev(seq))
 			}
 		}
-		var after int64
+		var after, afterOrd int64
 		if since != "" {
 			// It names a row this listing would give the caller, or is 404
 			// (§7.4): one written with the gesture or undoing it, of an
@@ -123,6 +124,7 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 			if visible != nil && !visible(afterName, after) {
 				return notFound()
 			}
+			afterOrd = spWriteOrder(after)
 		}
 		limit := e.opt.Maximums.LogPageSize
 		type row struct {
@@ -141,9 +143,18 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 		// it; one that runs out before fails the read (§6.6, v0.88).
 		spent := false
 		for len(rs) <= limit && !spent {
-			rows, qerr := t.Query(`SELECT r.seq, r.res, s.name, r.id, r.kind, r.gesture, r.undoes, r.author FROM revisions r JOIN resources s ON s.res = r.res
+			q, args := `SELECT r.seq, r.res, s.name, r.id, r.kind, r.gesture, r.undoes, r.author FROM revisions r JOIN resources s ON s.res = r.res
 				WHERE s.ns = ? AND s.state <> ? AND (r.gesture = ? OR r.undoes = ?) AND r.seq > ? ORDER BY r.seq LIMIT ?`,
-				n.id, statePurged, gesture, gesture, after, limit+1)
+				[]any{n.id, statePurged, gesture, gesture, after, limit + 1}
+			if e.spanner {
+				// Spanner's seqs grow along a chain, not across chains:
+				// the order written is their low bits (spWriteOrder).
+				q = `SELECT r.seq, r.res, s.name, r.id, r.kind, r.gesture, r.undoes, r.author FROM revisions r JOIN resources s ON s.res = r.res
+					WHERE s.ns = ? AND s.state <> ? AND (r.gesture = ? OR r.undoes = ?)
+					AND (mod(r.seq, ?) > ? OR mod(r.seq, ?) = ? AND r.seq > ?) ORDER BY mod(r.seq, ?), r.seq LIMIT ?`
+				args = []any{n.id, statePurged, gesture, gesture, spOrderMod, afterOrd, spOrderMod, afterOrd, after, spOrderMod, limit + 1}
+			}
+			rows, qerr := t.Query(q, args...)
 			t.must(qerr)
 			var batch []row
 			for rows.Next() {
@@ -169,6 +180,7 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 				break
 			}
 			after = batch[len(batch)-1].seq
+			afterOrd = spWriteOrder(after)
 		}
 		if spent && len(rs) == 0 {
 			return errReadRanOut()

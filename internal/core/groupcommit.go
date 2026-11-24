@@ -92,7 +92,7 @@ func openCommitPool(url string) (*commitPool, error) {
 	if err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("pgx", url)
+	db, err := sqlOpen(url)
 	if err != nil {
 		return nil, err
 	}

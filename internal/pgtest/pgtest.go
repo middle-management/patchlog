@@ -26,17 +26,20 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/middle-management/patchlog/internal/spannerurl"
+
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 // Env is the environment variable naming the Postgres server for tests.
 const Env = "PATCHLOG_TEST_PG"
 
-// SpannerEnv names, instead, a PGAdapter in front of a Spanner instance
-// (docs/SPANNER.md), e.g. the emulator's postgres://x@127.0.0.1:5432/x?
-// sslmode=disable: tests then run on Spanner's PostgreSQL interface,
-// each in a database of its own (spanner.go). It takes precedence over
-// Env.
+// SpannerEnv names, instead, a Spanner instance (docs/SPANNER.md):
+// spanner://projects/P/instances/I, with SPANNER_EMULATOR_HOST set for the
+// emulator's (spanner://projects/emulator-project/instances/test-instance
+// with the emulator at localhost:9010). Tests then run on Spanner's
+// PostgreSQL dialect, each in a database of its own (spanner.go). It takes
+// precedence over Env.
 const SpannerEnv = "PATCHLOG_TEST_SPANNER"
 
 // Enabled reports whether tests run against Postgres, or Spanner through
@@ -49,7 +52,7 @@ func Spanner() bool { return os.Getenv(SpannerEnv) != "" }
 // IsURL reports whether a database path from DB is a URL (Postgres or
 // Spanner), which Open and DSN take, rather than a SQLite file.
 func IsURL(path string) bool {
-	return strings.HasPrefix(path, "postgres") || strings.HasPrefix(path, "spanner+postgres://")
+	return strings.HasPrefix(path, "postgres") || spannerurl.Is(path)
 }
 
 // DB returns the database path for a test's engine: ":memory:", or with
@@ -116,7 +119,9 @@ var PoolParams = map[string]string{
 // DSN is a URL from NewDB without the parameters only the engine reads
 // (PoolParams), for a test that opens the database itself.
 func DSN(rawURL string) string {
-	rawURL = pgxURL(rawURL)
+	if spannerurl.Is(rawURL) {
+		return spannerDSN(rawURL)
+	}
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL
@@ -132,7 +137,11 @@ func DSN(rawURL string) string {
 // Open opens a database/sql pool on a URL from NewDB (DSN).
 func Open(t testing.TB, rawURL string) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("pgx", DSN(rawURL))
+	open := func(dsn string) (*sql.DB, error) { return sql.Open("pgx", dsn) }
+	if spannerurl.Is(rawURL) {
+		open = spannerurl.Open
+	}
+	db, err := open(DSN(rawURL))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -251,11 +251,11 @@ type Engine struct {
 	seals sealCounter
 	db    *sql.DB
 	pg    bool // Postgres (Addendum D.8), not SQLite
-	// spanner: Spanner's PostgreSQL interface, through PGAdapter, with pg
-	// set too (spanner.go); spIDs hands out its chain-ordered ids and
+	// spanner: Spanner's PostgreSQL dialect (go-sql-spanner), with pg
+	// set too (spanner.go); spSeqs hands out its chain-ordered ids and
 	// leaseHolder names this instance in its leader lease.
 	spanner     bool
-	spIDs       *idBlocks
+	spSeqs      *seqGen
 	leaseHolder string
 	opt         Options
 	mu          sync.Mutex // serialises write transactions
@@ -496,10 +496,7 @@ func Open(opt Options) (*Engine, error) {
 	}
 	if spanner {
 		e.leaseHolder = newLeaseHolder()
-		if e.spIDs, err = openIDBlocks(opt.Path); err != nil {
-			db.Close()
-			return nil, err
-		}
+		e.spSeqs = &seqGen{}
 	}
 	e.refsCache.MaxEntries = 65536
 	e.viewHeld.MaxEntries = 65536
@@ -620,7 +617,6 @@ func (e *Engine) Close() error {
 	e.comp.close()
 	e.rate.close()
 	e.commits.close()
-	e.spIDs.close()
 	return err
 }
 
@@ -724,6 +720,9 @@ func limitKeyErr(status int, key, msg string) *Error {
 // tx is one database transaction with the engine's helpers.
 type tx struct {
 	*sql.Tx
+	// sp is, on Spanner, the connection of a write transaction
+	// (beginWrite), for its mutations (spanner.go).
+	sp     *sql.Conn
 	ctx    context.Context
 	e      *Engine
 	now    time.Time
@@ -948,7 +947,10 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 		e.stmts.prepare(e.db)
 		e.mu.Lock()
 		defer e.mu.Unlock()
-		return e.updateOnce(ctx, f, nil, nil)
+		return e.updateOnce(ctx, f, nil, nil, nil)
+	}
+	if e.spanner {
+		return e.update1Spanner(ctx, f)
 	}
 	// Postgres: advisory locks instead of the mutex (pglock.go). A
 	// transaction that rolled back to take its locks in order, or on a
@@ -956,39 +958,28 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 	var want map[int32]lockMode
 	var logs map[int32]bool
 	for attempt := 1; ; attempt++ {
-		if e.spanner {
-			// Ids are taken between transactions (spanner.go).
-			if err := e.spIDs.topUp(ctx); err != nil {
-				return nil, err
-			}
-		}
-		rotate, err = e.updateOnce(ctx, f, want, logs)
-		if err == nil || attempt == maxWriteAttempts || !(retryable(err) || e.spanner && failedTx(err)) || ctx.Err() != nil {
+		rotate, err = e.updateOnce(ctx, f, want, logs, nil)
+		if err == nil || attempt == maxWriteAttempts || !retryable(err) || ctx.Err() != nil {
 			return rotate, err
 		}
 		var rl *errRelock
 		if errors.As(err, &rl) {
 			want, logs = rl.want, rl.logs
 		}
-		var nb *errIDBlock
-		if errors.As(err, &nb) {
-			if err := e.spIDs.refill(ctx, nb.table, nb.above, nb.n); err != nil {
-				return nil, err
-			}
-		} else if e.spanner {
-			// Spanner aborted it (40001), for a lock it lost: it runs again
-			// after a pause, as Spanner asks, longer each time, so that
-			// transactions aborting each other don't retry in step.
-			spannerBackoff(ctx, attempt)
-		}
 	}
 }
 
 // updateOnce runs f in one write transaction, first taking the advisory
 // locks of want (Postgres), and the log locks of logs at its first append.
-func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[int32]lockMode, logs map[int32]bool) (rotate []string, err error) {
+// On Spanner the transaction is sp's, begun by update1Spanner, and one
+// Spanner aborted is left to it, not rolled back (spWrite).
+func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[int32]lockMode, logs map[int32]bool, sp *spWrite) (rotate []string, err error) {
 	var sqlTx *sql.Tx
-	if c := e.commits; c != nil && committingGroup(ctx) && c.take() {
+	var spConn *sql.Conn
+	if sp != nil {
+		sqlTx, spConn = sp.tx, sp.conn
+		sp.kept, sp.duringCommit = false, false
+	} else if c := e.commits; c != nil && committingGroup(ctx) && c.take() {
 		// A group commit's transaction, on a connection no check queues
 		// for (commitPool); on the main pool if none opens (the server's
 		// max_connections reached, say).
@@ -1004,22 +995,31 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 			return nil, err
 		}
 	}
-	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}, wake: map[string]map[string]bool{}}
+	// rollback ends the transaction after err, but for one Spanner
+	// aborted, which update1Spanner runs again as it is.
+	rollback := func(err error) {
+		if sp != nil && spAborted(err) {
+			sp.kept = true
+			return
+		}
+		sqlTx.Rollback()
+	}
+	t := &tx{Tx: sqlTx, sp: spConn, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}, wake: map[string]map[string]bool{}}
 	committing := false
 	defer func() {
 		if p := recover(); p != nil {
-			sqlTx.Rollback()
+			err = panicErr(p)
+			rollback(err)
 			if !committing {
 				e.removeFiles(t.newFiles)
 			}
-			err = panicErr(p)
 		}
 		err = ctxErr(ctx, err)
 	}()
 	t.lockAll(want)
 	t.logPlan = logs
 	if err := f(t); err != nil {
-		sqlTx.Rollback()
+		rollback(err)
 		e.removeFiles(t.newFiles)
 		return nil, err
 	}
@@ -1062,6 +1062,9 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 		// Whether it committed may be unknown (a lost connection): the
 		// files it stored are left to the sweep.
 		e.rc.bump(inv)
+		if sp != nil && spAborted(err) {
+			sp.kept, sp.duringCommit = true, true
+		}
 		return nil, err
 	}
 	e.removeFiles(t.dropFiles)

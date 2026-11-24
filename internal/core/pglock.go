@@ -8,8 +8,6 @@ import (
 	"log"
 	"math"
 	"sort"
-
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Write serialisation on Postgres (Addendum D.8).
@@ -519,15 +517,7 @@ func retryable(err error) bool {
 	if errors.As(err, &rl) {
 		return true
 	}
-	var nb *errIDBlock
-	if errors.As(err, &nb) {
-		return true // Spanner: ids taken, run again (spanner.go)
-	}
-	var pe *pgconn.PgError
-	if !errors.As(err, &pe) {
-		return false
-	}
-	switch pe.Code {
+	switch sqlState(err) {
 	case "40P01", "40001":
 		// On Spanner, 40001 is also an aborted transaction (a deadlock
 		// broken, or a lock lost), which Spanner expects to be run again.

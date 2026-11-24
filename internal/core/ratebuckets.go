@@ -3,7 +3,6 @@ package core
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"math/rand/v2"
@@ -14,7 +13,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -113,15 +111,20 @@ func openBucketStore(url0 string) (*bucketStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := pgx.ParseConfig(url)
-	if err != nil {
-		return nil, err
-	}
+	var db *sql.DB
 	spanner := isSpannerURL(url0)
-	if !spanner { // PGAdapter takes no such setting
+	if spanner {
+		if db, err = sqlOpen(url); err != nil {
+			return nil, err
+		}
+	} else {
+		cfg, err := pgx.ParseConfig(url)
+		if err != nil {
+			return nil, err
+		}
 		cfg.RuntimeParams["synchronous_commit"] = "off"
+		db = stdlib.OpenDB(*cfg)
 	}
-	db := stdlib.OpenDB(*cfg)
 	pool.sizeSide(db)
 	return &bucketStore{db: db, slots: min(pool.sideSize(), drawBatches), spanner: spanner}, nil
 }
@@ -660,10 +663,7 @@ func (s *bucketStore) drawsOnce(ctx context.Context, b []*drawReq) ([]drawRes, b
 
 // deadlocked reports whether Postgres rolled a statement back as the
 // victim of a deadlock.
-func deadlocked(err error) bool {
-	var pe *pgconn.PgError
-	return errors.As(err, &pe) && pe.Code == "40P01"
-}
+func deadlocked(err error) bool { return sqlState(err) == "40P01" }
 
 type bucketError string
 

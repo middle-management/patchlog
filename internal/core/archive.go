@@ -266,7 +266,7 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 		var last int64
 		t.must(t.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM archives WHERE res = ?`, res).Scan(&last))
 		_, err = t.Exec(`INSERT INTO archives (seq, res, from_seq, to_seq, key, url, created) VALUES (?,?,?,?,?,?,?)`,
-			t.spID("archives", last), res, fromSeq, lastSeq, key, u, t.now.UnixMilli())
+			t.spID(res, last), res, fromSeq, lastSeq, key, u, t.now.UnixMilli())
 	} else {
 		_, err = t.Exec(`INSERT INTO archives (res, from_seq, to_seq, key, url, created) VALUES (?,?,?,?,?,?)`,
 			res, fromSeq, lastSeq, key, u, t.now.UnixMilli())

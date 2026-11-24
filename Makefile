@@ -17,8 +17,8 @@ test-pg: ## run the tests on Postgres (PATCHLOG_TEST_PG=postgres://user@host:por
 	@test -n "$$PATCHLOG_TEST_PG" || (echo "set PATCHLOG_TEST_PG to a Postgres URL whose user may create databases"; exit 1)
 	go test $(PG_PACKAGES)
 
-test-spanner: ## run the tests on Spanner through PGAdapter (PATCHLOG_TEST_SPANNER=postgres://x@host:5432/x; docs/SPANNER.md)
-	@test -n "$$PATCHLOG_TEST_SPANNER" || (echo "set PATCHLOG_TEST_SPANNER to a PGAdapter URL, e.g. the emulator's postgres://x@127.0.0.1:5432/x?sslmode=disable"; exit 1)
+test-spanner: ## run the tests on Spanner (PATCHLOG_TEST_SPANNER=spanner://projects/P/instances/I; docs/SPANNER.md)
+	@test -n "$$PATCHLOG_TEST_SPANNER" || (echo "set PATCHLOG_TEST_SPANNER to a Spanner instance, e.g. the emulator's spanner://projects/emulator-project/instances/test-instance with SPANNER_EMULATOR_HOST=localhost:9010"; exit 1)
 	go test -p 1 $(PG_PACKAGES)
 
 vet: ## go vet

@@ -183,7 +183,7 @@ func TestPGPurgeSearchPlans(t *testing.T) {
 	branch("post0", false)
 	branch("post1", false)
 	explain := func(t *tx, q string, args ...any) string {
-		rows, err := t.Tx.Query(`EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) `+rebind(q), pgArgs(args)...)
+		rows, err := t.Tx.Query(`EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) `+rebind(q), pgArgs(args, false)...)
 		t.must(err)
 		defer rows.Close()
 		var out []string
