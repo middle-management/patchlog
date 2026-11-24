@@ -12,16 +12,17 @@ import (
 // Tests for clauses of v0.86 the index already met: scenarios Tree 144
 // and 148, and Access 85.
 
-// TestV086CookiesToldApartByExp (CONFORMANCE Tree 144; SERVICES §A.4 view,
-// SPEC §C.5.2 Answer: a cookie lasts until its grant's exp "less any
-// whole seconds a minter MAY take off so that cookies for one prefix that
-// it must tell apart differ in exp"; §12.1 behind: "an exchange has no
-// exp left for its cookie"). al and bo read docs whole through k1, under
-// different read roles, with grants that expire at the same second: one
-// marker, so one prefix, and cookies that differ in exp. al's role
-// changes: only her cookie is 403. Where no whole second is left before
-// the grant's exp, the exchange is 503 behind with Retry-After, and gives
-// no cookie.
+// TestV086CookiesToldApartByExp (CONFORMANCE Filtered reads 48 and 85,
+// v0.90; was Tree 144; SPEC §C.5.2 Answer: a cookie lasts until its
+// grant's exp "less any whole seconds a minter MAY take off so that no
+// cookie shares its exp with a 403 cookie for the same prefix; live ones
+// may share one, as they become 403 together"; §12.1 behind). al and bo
+// read docs whole through k1, under different read roles, with grants
+// that expire at the same second: one marker, so one prefix, and, both
+// live, one exp. al's role changes: both cookies are 403. An exchange
+// whose only second is a 403 cookie's is 503 behind with Retry-After,
+// and gives no cookie; one whose only second is a live cookie's shares
+// it. Until v0.90 al's and bo's cookies were told apart by exp.
 func TestV086CookiesToldApartByExp(t *testing.T) {
 	t.Parallel()
 	d := newV82Whole(t)
@@ -53,15 +54,20 @@ func TestV086CookiesToldApartByExp(t *testing.T) {
 		return time.Unix(int64(c.MaxAge), 0)
 	}
 	a, b := cookie(alC), cookie(boC)
-	if a.Value == b.Value || expOf(a).Equal(expOf(b)) {
-		t.Fatalf("al's and bo's cookies for one prefix aren't told apart by exp: %v, %v", a, b)
-	}
-	if got, want := expOf(a).Sub(expOf(b)), time.Second; got != want {
-		t.Errorf("the cookies' exps differ by %s, want a whole second taken off the later exchange's", got)
+	if !expOf(a).Equal(expOf(b)) {
+		t.Fatalf("al's and bo's live cookies for one prefix don't share their exp: %v, %v", a, b)
 	}
 	paths := v82Paths(pa)
 	if ga, gb := v82Status(t, d.x, paths, alC), v82Status(t, d.x, paths, boC); ga != v82Reads || gb != v82Reads {
 		t.Fatalf("under their cookies: al %s, bo %s", ga, gb)
+	}
+	// A short grant whose one second a live cookie holds shares it.
+	short := d.s.Now().Truncate(time.Second).Add(time.Second)
+	if _, c := d.exchange(grant("user:al", "extra", short)); len(c) == 0 {
+		t.Fatalf("no cookie for the one second left")
+	}
+	if _, c := d.exchange(grant("user:bo", "reader", short)); len(c) == 0 {
+		t.Fatalf("bo: no cookie for the one second a live cookie holds")
 	}
 	// al's role changes.
 	d.patch(map[string]any{"op": "replace", "path": "/roles/extra", "value": map[string]any{"can": []any{"read", "append"}}})
@@ -70,20 +76,24 @@ func TestV086CookiesToldApartByExp(t *testing.T) {
 	}
 	// A change to any role that lists read ends every cookie of the key's
 	// views (v0.88: the index digests them all, as the origin does;
-	// Filtered reads scenario 61).
+	// Filtered reads scenario 61), and the cookie they share.
 	if got := v82Status(t, d.x, paths, boC); got != v82Refuse {
 		t.Errorf("bo under his cookie once al's role, which lists read, changed: %s, want 403", got)
 	}
-	// No whole second left: a grant with one second to go, whose one
-	// candidate exp another cookie of the prefix holds.
-	short := d.s.Now().Truncate(time.Second).Add(time.Second)
-	if _, c := d.exchange(grant("user:al", "extra", short)); len(c) == 0 {
-		t.Fatalf("no cookie for the one second left")
-	}
+	// No whole second left: the one candidate exp is a 403 cookie's.
 	r := p37Do(t, d.x, "POST", "/edge-grants", grant("user:bo", "reader", short), "", nil, "")
 	if r.status != 503 || r.body["code"] != "behind" || r.header.Get("Retry-After") == "" || len(r.cookies) != 0 || r.header.Get("Set-Cookie") != "" {
 		t.Errorf("an exchange with no second left for its cookie: %d %v, Retry-After %q, %d cookies; want 503 behind, Retry-After and no cookie",
 			r.status, r.body, r.header.Get("Retry-After"), len(r.cookies))
+	}
+	// Exchanged again, bo gets a cookie that reads, a second before the
+	// 403 one.
+	_, boC2 := d.exchange(bo)
+	if b2 := cookie(boC2); !expOf(b2).Before(expOf(b)) {
+		t.Errorf("bo's new cookie expires at %v, not before the 403 one's %v", expOf(b2), expOf(b))
+	}
+	if got := v82Status(t, d.x, paths, boC2); got != v82Reads {
+		t.Errorf("bo under his new cookie: %s", got)
 	}
 }
 

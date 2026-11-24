@@ -704,7 +704,7 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 				if err != nil {
 					return err
 				}
-				if had := by[exp]; len(had) > 0 && !slices.Equal(had, ks) {
+				if had := by[exp]; len(had) > 0 && !slices.Equal(had, ks) && !ix.slotLive(ctx, m, had, ks) {
 					continue next
 				}
 			}
@@ -733,17 +733,25 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 				}
 			}
 			// The keys the cookie of m expiring at exp came from
-			// (viewKeysAt): written once, and the same ever after.
-			if len(taken[m][exp]) > 0 {
-				continue
-			}
+			// (viewKeysAt): a row is written once, and the same ever
+			// after. A live cookie's second this exchange shares gains
+			// the keys it lacks, so that a change to any of them ends
+			// both cookies, and none revives (slotLive).
+			had := taken[m][exp]
 			for _, k := range want[m] {
+				if slices.ContainsFunc(had, func(o viewKeyRow) bool { return o.kid == k.kid && o.roles == k.roles && o.pub == k.pub }) {
+					continue
+				}
 				if _, err := tx.ExecContext(ctx, `INSERT INTO edge_view_keys (marker, exp, kid, roles, pub, entry, pending, chain) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 					m, exp, k.kid, k.roles, k.pub, k.entry, k.pending, k.chain); err != nil {
 					return err
 				}
+				had = append(had, k)
 			}
-			taken[m][exp] = want[m]
+			slices.SortFunc(had, func(a, b viewKeyRow) int {
+				return cmp.Or(strings.Compare(a.kid, b.kid), strings.Compare(a.roles, b.roles), strings.Compare(a.pub, b.pub))
+			})
+			taken[m][exp] = had
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -764,6 +772,51 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 	}
 	ix.fmu.Unlock()
 	return nil
+}
+
+// slotLive reports whether the cookie of marker m whose keys are had, at a
+// second an exchange that vouches for ks would take, is live: no key it
+// came from has ended (an empty entry, cookieEnds) or differs at the head
+// of m's namespace from what its exchange recorded (entryHolds), one
+// this exchange vouches for too judged by the entry it found. Such a
+// second is shared, the cookies becoming 403 together; only a 403
+// cookie's second is skipped (§C.5.2 Answer, §7.9 view, v0.90: "no cookie
+// shares its exp with a 403 cookie for the same prefix; live ones may
+// share one"). Until v0.90 an exchange skipped every second whose keys
+// weren't exactly its own. A document that can't be read now counts as
+// 403.
+func (ix *Index) slotLive(ctx context.Context, m string, had, ks []viewKeyRow) bool {
+	ns, ok := markerNS(m)
+	if !ok {
+		return false
+	}
+	var cfg *grantcheck.Config
+	for _, r := range had {
+		if r.entry == "" {
+			return false
+		}
+		if i := slices.IndexFunc(ks, func(k viewKeyRow) bool { return k.kid == r.kid && k.roles == r.roles && k.pub == r.pub }); i >= 0 {
+			if ks[i].entry != r.entry {
+				return false
+			}
+			continue
+		}
+		roles, ok := decodeStrings(r.roles)
+		if !ok {
+			return false
+		}
+		if cfg == nil {
+			c, err := ix.checker.Config(ctx, ns)
+			if err != nil || ix.basesJudged(ctx, c) != nil {
+				return false
+			}
+			cfg = c
+		}
+		if _, holds, err := ix.entryHolds(ctx, cfg, viewKey{kid: r.kid, roles: roles, pub: r.pub, entry: r.entry}); err != nil || !holds {
+			return false
+		}
+	}
+	return true
 }
 
 // recordFilters records what the markers of one edge grant minted at now
