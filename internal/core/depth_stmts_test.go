@@ -153,6 +153,9 @@ func countDepth(t *testing.T, depth int, path depthPath) depthCounts {
 // path a write takes: checked inside its locks, checked outside and
 // re-checked inside, and in a group commit.
 func TestBranchDepthStatements(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("Spanner has no recursive queries: a chain is read a statement per level")
+	}
 	t.Parallel()
 	paths := []depthPath{{name: "default"}}
 	if pgtest.Enabled() {

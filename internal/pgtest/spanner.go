@@ -3,11 +3,14 @@ package pgtest
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -18,12 +21,14 @@ import (
 // back to a pool when it ends, emptied: every table's rows deleted but
 // mmmigrate's, so the next engine finds its migrations applied and only
 // seeds it again. Spanner has no TRUNCATE, nor a way to turn foreign keys
-// off, so tables are emptied in rounds, each deleting from those no other
-// table's rows still reference. The pool lasts for the process: the
-// emulator keeps its databases in memory, until it restarts.
+// off: the deletes run in one transaction, whose foreign keys are checked
+// as it commits. The pool's databases outlive the process, and the next
+// reuses them (claimSpannerDB).
 
 // spannerPrefix and spannerFreshPrefix name the pool's databases and
 // FreshDB's: names of 2 to 30 lowercase letters, digits and underscores.
+// FreshDB's are new each time, so a test run on the emulator uses a dozen
+// of the instance's 100 databases: restart it between runs.
 const (
 	spannerPrefix      = "plpool_"
 	spannerFreshPrefix = "plfresh_"
@@ -32,6 +37,42 @@ const (
 var spannerPool struct {
 	mu   sync.Mutex
 	free []string
+	held map[string]bool
+}
+
+// claimSpannerDB claims a pool database no other process holds, and
+// empties it of what an earlier process left. The names are numbered, so
+// runs reuse them: an instance holds 100 databases at most, and PGAdapter
+// can't drop one. A process holds each it claimed until it exits, by a
+// lock on a file of the same name.
+func claimSpannerDB(u *url.URL) (string, error) {
+	spannerPool.mu.Lock()
+	defer spannerPool.mu.Unlock()
+	for i := 0; i < 64; i++ {
+		name := fmt.Sprintf("%s%02d", spannerPrefix, i)
+		if spannerPool.held[name] {
+			continue
+		}
+		f, err := os.OpenFile(filepath.Join(os.TempDir(), "patchlog-"+name+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return "", err
+		}
+		if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
+			f.Close()
+			continue
+		}
+		if spannerPool.held == nil {
+			spannerPool.held = map[string]bool{}
+		}
+		spannerPool.held[name] = true // and f stays open, locked, until exit
+		v := *u
+		v.Path = "/" + name
+		if err := emptySpanner(v.String()); err != nil {
+			return "", fmt.Errorf("emptying %s: %w", name, err)
+		}
+		return name, nil
+	}
+	return "", errors.New("every pool database is held")
 }
 
 // spannerDB is NewDB (pooled) or FreshDB on Spanner.
@@ -51,7 +92,9 @@ func spannerDB(t testing.TB, pooled bool) string {
 		}
 		spannerPool.mu.Unlock()
 		if name == "" {
-			name = spannerPrefix + randHex()
+			if name, err = claimSpannerDB(u); err != nil {
+				t.Fatalf("pgtest: %v", err)
+			}
 		}
 		t.Cleanup(func() {
 			u := *u
@@ -103,7 +146,23 @@ func emptySpanner(dsn string) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	for round := 0; len(left) > 0; round++ {
+	// One transaction, which Spanner checks foreign keys at the end of;
+	// if it fails, rounds of their own, each deleting what nothing still
+	// references.
+	if tx, err := db.BeginTx(ctx, nil); err == nil {
+		ok := true
+		for _, n := range left {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM `+n+` WHERE true`); err != nil {
+				ok = false
+				break
+			}
+		}
+		if ok && tx.Commit() == nil {
+			return nil
+		}
+		tx.Rollback()
+	}
+	for len(left) > 0 {
 		var next []string
 		var last error
 		for _, n := range left {
@@ -111,7 +170,7 @@ func emptySpanner(dsn string) error {
 				next, last = append(next, n), err
 			}
 		}
-		if len(next) == len(left) || round > len(left) {
+		if len(next) == len(left) {
 			return fmt.Errorf("tables %v: %w", next, last)
 		}
 		left = next

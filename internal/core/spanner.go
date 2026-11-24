@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	"strconv"
 	"strings"
 	"sync"
@@ -173,6 +174,17 @@ func (b *idBlocks) topUp(ctx context.Context) error {
 // transaction's inserts (idBlocks).
 func (t *tx) spIDs(table string, above int64, n int) []int64 {
 	return t.e.spIDs.take(table, above, n)
+}
+
+// spannerBackoff pauses before the attempt after attempt of a write
+// transaction Spanner aborted: a random time up to 10 ms × 2^attempt, at
+// most a second.
+func spannerBackoff(ctx context.Context, attempt int) {
+	d := min(10*time.Millisecond<<attempt, time.Second)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Duration(mrand.Int64N(int64(d)))):
+	}
 }
 
 // spID is spIDs for one id.

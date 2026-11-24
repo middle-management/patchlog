@@ -1,6 +1,6 @@
 # Common tasks. `make up` starts the whole stack in Docker; `make dev` runs
 # just the core server natively.
-.PHONY: help build test test-pg vet fmt check migration dev up up-pg down logs seed cdn-check cdn-restart clean fixture
+.PHONY: help build test test-pg test-spanner vet fmt check migration dev up up-pg down logs seed cdn-check cdn-restart clean fixture
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-12s %s\n", $$1, $$2}'
@@ -16,6 +16,10 @@ PG_PACKAGES = ./internal/...
 test-pg: ## run the tests on Postgres (PATCHLOG_TEST_PG=postgres://user@host:port/postgres; a fresh database per test)
 	@test -n "$$PATCHLOG_TEST_PG" || (echo "set PATCHLOG_TEST_PG to a Postgres URL whose user may create databases"; exit 1)
 	go test $(PG_PACKAGES)
+
+test-spanner: ## run the tests on Spanner through PGAdapter (PATCHLOG_TEST_SPANNER=postgres://x@host:5432/x; docs/SPANNER.md)
+	@test -n "$$PATCHLOG_TEST_SPANNER" || (echo "set PATCHLOG_TEST_SPANNER to a PGAdapter URL, e.g. the emulator's postgres://x@127.0.0.1:5432/x?sslmode=disable"; exit 1)
+	go test -p 1 $(PG_PACKAGES)
 
 vet: ## go vet
 	go vet ./...

@@ -174,9 +174,6 @@ func (t *tx) readChainSpanner(id int64) {
 		t.links = map[int64]nsLink{}
 	}
 	for next := (sql.NullInt64{Int64: id, Valid: true}); next.Valid; {
-		if _, ok := t.links[next.Int64]; ok {
-			return
-		}
 		n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE ns = ?`, next.Int64))
 		if errors.Is(err, sql.ErrNoRows) {
 			return

@@ -50,7 +50,9 @@ func TestChainRowsDropped(t *testing.T) {
 				return fmt.Errorf("the row of namespace %d isn't kept", id)
 			}
 		}
-		if t.e.pg {
+		// On Spanner a row read stays locked as read until commit, so a
+		// lock's mode changing drops none (snapshotRows).
+		if t.e.pg && !t.e.spanner {
 			t.lockNS(d1.id, lockExclusive)
 			if _, ok := t.kept[d1.id]; ok {
 				return fmt.Errorf("the row of d1 is kept across a change of its lock's mode")
@@ -154,7 +156,7 @@ func TestChainStatementsRecognised(t *testing.T) {
 // whatever order they are asked for in: transactions taking the same keys
 // exclusively, over and over, never deadlock.
 func TestLockAllOrder(t *testing.T) {
-	if !pgtest.Enabled() {
+	if !pgtest.Enabled() || pgtest.Spanner() {
 		t.Skip("advisory locks: Postgres only")
 	}
 	t.Parallel()
@@ -207,7 +209,7 @@ func TestLockAllOrder(t *testing.T) {
 // again with the whole chain's locks taken up front, in order, waiting for
 // the base's holder: it never fails for the depth of its chain.
 func TestChainLockBusy(t *testing.T) {
-	if !pgtest.Enabled() {
+	if !pgtest.Enabled() || pgtest.Spanner() {
 		t.Skip("advisory locks: Postgres only")
 	}
 	t.Parallel()

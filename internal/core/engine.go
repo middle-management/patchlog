@@ -981,6 +981,11 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 			if err := e.spIDs.refill(ctx, nb.table, nb.above, nb.n); err != nil {
 				return nil, err
 			}
+		} else if e.spanner {
+			// Spanner aborted it (40001), for a lock it lost: it runs again
+			// after a pause, as Spanner asks, longer each time, so that
+			// transactions aborting each other don't retry in step.
+			spannerBackoff(ctx, attempt)
 		}
 	}
 }
@@ -1537,10 +1542,11 @@ func entryResources(entry map[string]any) (names []string, ok bool) {
 // n.headSeq, and returns its id and seq (nil for an empty chain).
 func (t *tx) logHeadOf(n *nsRow) (*ids.ID, any) {
 	var headID []byte
-	if h, ok := t.logHeads[n.id]; ok && (t.logLocks[lockKey(n.id)] || t.locks[lockKey(n.id)] == lockExclusive) {
+	if h, ok := t.logHeads[n.id]; ok && (t.logLocks[lockKey(n.id)] || t.locks[lockKey(n.id)] == lockExclusive || t.spLocked[n.id]) {
 		// The head this transaction appended or read last, under the log
 		// lock it still holds (group commit), or under the namespace's
-		// lock held exclusively, which stands for it (lockLog).
+		// lock held exclusively, which stands for it (lockLog), or on
+		// Spanner under the row's lock.
 		n.headSeq, headID = sql.NullInt64{Int64: h.seq, Valid: true}, h.id[:]
 		if validateBoth {
 			// The oracle: the head as the database has it now.
@@ -1553,12 +1559,19 @@ func (t *tx) logHeadOf(n *nsRow) (*ids.ID, any) {
 		}
 	} else {
 		q := `SELECT head_seq, head_id FROM namespaces WHERE ns = ?`
-		if t.spannerLocks() {
+		sp := t.spannerLocks()
+		if sp {
 			// The log lock on Spanner: the row, read FOR UPDATE just before
 			// the append, as the log lock is taken (spanner.go).
 			q += ` FOR UPDATE`
 		}
 		t.must(t.QueryRow(q, n.id).Scan(&n.headSeq, &headID))
+		if sp {
+			if t.spLocked == nil {
+				t.spLocked = map[int64]bool{}
+			}
+			t.spLocked[n.id] = true
+		}
 		t.forget() // read after the log lock
 	}
 	if !n.headSeq.Valid {

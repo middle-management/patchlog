@@ -479,7 +479,11 @@ func bytesAAD(owner int64, hash []byte) []byte { return rowAAD("blob_bytes", own
 // touchBytes locks a bytes row (Postgres: against a concurrent collector)
 // and reports whether it exists.
 func (t *tx) touchBytes(owner int64, hash []byte) bool {
-	r, err := t.Exec(`UPDATE blob_bytes SET owner = owner WHERE owner = ? AND hash = ?`, owner, hash)
+	q := `UPDATE blob_bytes SET owner = owner WHERE owner = ? AND hash = ?`
+	if t.e.spanner {
+		q = `UPDATE blob_bytes SET file = file WHERE owner = ? AND hash = ?` // no key column on Spanner
+	}
+	r, err := t.Exec(q, owner, hash)
 	t.must(err)
 	n, err := r.RowsAffected()
 	t.must(err)
@@ -503,8 +507,14 @@ func (t *tx) putBytes(owner int64, hash, plain []byte) {
 	// On Postgres a concurrent upload may insert the row first: its file
 	// wins, and this one is discarded.
 	var stored sql.NullString
-	t.must(t.QueryRow(`INSERT INTO blob_bytes (owner, hash, data, file) VALUES (?,?,?,?)
-		ON CONFLICT (owner, hash) DO UPDATE SET owner = excluded.owner RETURNING file`, owner, hash, data, file).Scan(&stored))
+	q := `INSERT INTO blob_bytes (owner, hash, data, file) VALUES (?,?,?,?)
+		ON CONFLICT (owner, hash) DO UPDATE SET owner = excluded.owner RETURNING file`
+	if t.e.spanner {
+		// Spanner updates no key column: the row's file, unchanged.
+		q = `INSERT INTO blob_bytes (owner, hash, data, file) VALUES (?,?,?,?)
+		ON CONFLICT (owner, hash) DO UPDATE SET file = blob_bytes.file RETURNING file`
+	}
+	t.must(t.QueryRow(q, owner, hash, data, file).Scan(&stored))
 	if f, ok := file.(string); ok && stored.String != f {
 		t.discardFile(f)
 	}
@@ -911,9 +921,19 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 		// The namespace's lock is only shared (D.8): the uploader's row
 		// orders its concurrent uploads, so their pending total is read
 		// after the other's commit (blob_uploaders).
-		_, err := t.Exec(`INSERT INTO blob_uploaders (ns, uploader) VALUES (?, ?)
-			ON CONFLICT (ns, uploader) DO UPDATE SET uploader = excluded.uploader`, n.id, g.uploader)
+		q := `INSERT INTO blob_uploaders (ns, uploader) VALUES (?, ?)
+			ON CONFLICT (ns, uploader) DO UPDATE SET uploader = excluded.uploader`
+		if t.e.spanner {
+			// Spanner updates no key column, and the row has no other: it
+			// is inserted, then locked.
+			q = `INSERT INTO blob_uploaders (ns, uploader) VALUES (?, ?) ON CONFLICT (ns, uploader) DO NOTHING`
+		}
+		_, err := t.Exec(q, n.id, g.uploader)
 		t.must(err)
+		if t.e.spanner {
+			var u string
+			t.must(t.QueryRow(`SELECT uploader FROM blob_uploaders WHERE ns = ? AND uploader = ? FOR UPDATE`, n.id, g.uploader).Scan(&u))
+		}
 	}
 	t.must(t.QueryRow(`SELECT COALESCE(SUM(CASE WHEN p.size < ? THEN ? ELSE p.size END), 0)
 		FROM blob_pending p JOIN resources r ON r.res = p.res

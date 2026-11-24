@@ -127,7 +127,12 @@ func write(e *Engine, ns, name, ifMatch string, n int) (*WriteResult, error) {
 // body (§3.5). It returns the transaction id of each entry, by entry id.
 func checkChain(t *testing.T, e *Engine, ns string) map[string]string {
 	t.Helper()
-	rows, err := e.db.QueryContext(context.Background(), `SELECT seq, id, prev_seq, body, xid::text FROM ns_log
+	// On Spanner, the commit timestamp stands for the transaction.
+	txCol := "xid"
+	if e.spanner {
+		txCol = "committed"
+	}
+	rows, err := e.db.QueryContext(context.Background(), `SELECT seq, id, prev_seq, body, `+txCol+`::text FROM ns_log
 		WHERE ns = (SELECT ns FROM namespaces WHERE name = $1) ORDER BY seq`, ns)
 	if err != nil {
 		t.Fatal(err)
@@ -404,6 +409,9 @@ func TestPGGroupCommitConfigRace(t *testing.T) {
 // before any entry was appended, or locks needed out of order) retries the
 // whole group, which then commits once, every write with its single entry.
 func TestPGGroupCommitRetriesAbortedGroup(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("injects Postgres errors and advisory locks")
+	}
 	for _, tc := range []struct {
 		name   string
 		inject func(t *tx)
@@ -484,6 +492,9 @@ func TestPGGroupCommitRetriesAbortedGroup(t *testing.T) {
 // the re-checks and the insert) are re-checked and inserted again in a
 // transaction run again, without savepoints; all commit together.
 func TestPGGroupCommitLostRaceRunsAgain(t *testing.T) {
+	if pgtest.Spanner() {
+		t.Skip("injects Postgres errors")
+	}
 	e := groupEngine(t)
 	mkNS(t, e, "n", map[string]any{"read": "public"})
 	const n = 4
@@ -676,6 +687,9 @@ func nsIDOf(t *testing.T, e *Engine, ns string) int64 {
 // exclusively, until the returned func is called.
 func holdLock(t *testing.T, e *Engine, class int, key int32) func() {
 	t.Helper()
+	if e.spanner {
+		t.Skip("advisory locks: Postgres only")
+	}
 	tx, err := e.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
