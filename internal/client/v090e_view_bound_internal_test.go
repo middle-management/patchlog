@@ -47,7 +47,19 @@ func TestV090EFilteredViewBoundPerGrant(t *testing.T) {
 		mu.Lock()
 		asked[bearer]++
 		mu.Unlock()
+		var body struct {
+			Resources []string `json:"resources"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
 		var entry map[string]any
+		switch {
+		case len(body.Resources) > 0:
+			// Asked for resources' keys alone: a partial reader gets
+			// none of them, nor its view's.
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"epoch": 1, "keys": []any{}})
+			return
+		}
 		switch bearer {
 		case "grant-a":
 			entry = map[string]any{"kid": kid, "view": viewA, "key": base64.RawURLEncoding.EncodeToString(kA)}
@@ -91,6 +103,19 @@ func TestV090EFilteredViewBoundPerGrant(t *testing.T) {
 		}
 		if _, err := a.openFilteredLog(ctx, ns, name, since, last, answer(viewB, kB)); !errors.Is(err, seal.ErrMismatch) {
 			t.Fatalf("A given B's view's answer, B's key cached: %v, want a mismatch", err)
+		}
+	})
+
+	t.Run("a resource's keys asked first", func(t *testing.T) {
+		b, err := New(srv.URL, WithKeys(NewKeys(nil)), WithBearer("grant-b"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.keys.key(ctx, b, kid, name, ns); !errors.Is(err, ErrNoKeys) {
+			t.Fatalf("B's K_r of %s: %v, want none", name, err)
+		}
+		if _, err := b.openFilteredLog(ctx, ns, name, since, last, answer(viewB, kB)); err != nil {
+			t.Fatalf("B's answer of its own view, after asking /keys for a resource's: %v", err)
 		}
 	})
 

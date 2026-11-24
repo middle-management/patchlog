@@ -364,9 +364,12 @@ func (k *Keys) fetch(ctx context.Context, c *Client, ns string, epoch int, resou
 	if err != nil {
 		return fmt.Errorf("%w: %s epoch %d: %w", ErrKeyFetch, ns, epoch, err)
 	}
-	// What /keys gave the grant c carries (boundView).
+	// What /keys gave the grant c carries (boundView): all of it for the
+	// epoch where no resource narrowed the ask.
 	k.mu.Lock()
-	k.asked[c.bearer+"\n"+seal.Kid(ns, epoch)] = true
+	if resource == "" {
+		k.asked[c.bearer+"\n"+seal.Kid(ns, epoch)] = true
+	}
 	for _, e := range got {
 		if e.From == "" {
 			k.gave[c.bearer+"\n"+e.Kid] = true
