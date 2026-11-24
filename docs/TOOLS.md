@@ -1,6 +1,6 @@
 # Patch Log — Tools
 
-Status: draft v0.89 · 2026-11-20. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.90 · 2026-11-24. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Clients and tools that use the protocol's public API. A server needs nothing from this document.
 
@@ -336,7 +336,7 @@ A release may span several namespaces, such as content and schemas. Each is bran
 
   1.  **Schemas, by fast-forward only,** in `$ref` order: the resources whose documents have a dialect URL as `$schema` (§6.1), tombstones and restores included. One the base changed since `at` is a conflict: rebase (below), and migrate the documents with `replace /$schema` (§6.3). An end-to-end schema namespace isn't branched: new revisions are written to it first.
   2.  **Content,** in any order.
-  3.  **Publishing,** where readers' rules test a field that marks documents published (e.g. `/doc/published`, §7.9, guarded as §6.4.4 says, with an exemption for a group the merge service's grant carries, since a role would add verbs): one batch per content namespace sets it on the documents the release created or restored, which carried it unset. A change to that field in steps 1 and 2 is a conflict. Edits to documents already published show at step 2. Planning again after a stop takes step 3's documents, those still unset, from the stored plan, since steps 1 and 2 have merged them.
+  3.  **Publishing,** where readers' rules test a field that marks documents published (e.g. `/doc/published`, §7.9, guarded as §6.4.4 says, with an exemption for a group the merge service's grant carries, since a role would add verbs): one batch per content namespace sets it on the documents the release created or restored, which carried it unset. A change to that field in steps 1 and 2 is a conflict. Edits to documents already published show at step 2. Planning again after a stop takes step 3's documents, those still live and unset, from the stored plan, since steps 1 and 2 have merged them, and reports those no longer live.
 
 - **The plan.** A person approves the plan's **digest**, `text(trunc160(sha256(canonical(plan))))`, where `plan` is `{ "release": <the release document's revision path>, "batches": [{ "ns", "source"?, "config"?, "items": [{ "resource", "ifMatch" | "ifNoneMatch", "steps" }] }] }`, with no other members.
   - `release` is `/r/{ns}/{name}/rev/{id}`, the id in text form, as `on` writes it.
@@ -525,7 +525,7 @@ A **file tree** is a namespace whose documents carry their place as data. A gate
 
 ## H.3 Listings
 
-- **In a tree,** a folder is listed by the index (Addendum A): `GET /{ns}?facet[/folder]={path}&schema=/r/schemas/file&sort=/name`, paged through. A path is resolved one folder at a time, or with `facet[/name]` too. Hits are filtered by the reader's read rules (§A.4, §7.9). The index's `400` for the facet path, as where the reader may see no file document (§A.4), lists an empty folder, never one empty for a write (§H.4 Names before writes).
+- **In a tree,** a folder is listed by the index (Addendum A): `GET /{ns}?facet[/folder]={path}&schema=/r/schemas/file&sort=/name`, paged through. A path is resolved one folder at a time, or with `facet[/name]` too. Hits are filtered by the reader's read rules (§A.4, §7.9). The index's `400` for the facet path, as where the reader may see no file document (§A.4), lists an empty folder, never one empty for a write (§H.4 Names before writes): a folder delete or move still answered that `400` after listing again at the namespace head is `503`.
 - **A folder too large to list whole** (beyond what a tool pages through) is refused (`403`, saying why), never listed cut short.
 - **An index that is behind** answers `503 behind` (§A.5); a tool answers `503` (§H.4 Answers), and deletes nothing on the strength of a listing meanwhile.
 - **Read-your-writes.** A tool sends the `X-Namespace-Revision` of its writes as `?min` on later listings (§A.5).
