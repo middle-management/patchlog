@@ -316,6 +316,9 @@ func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, vi
 	private := false
 	for {
 		wait := s.e.Wait(ns)
+		if testLongPollFetch != nil {
+			testLongPollFetch()
+		}
 		lg, info, err := s.e.FilteredLiveLog(r.Context(), ns, view, since, lim, cred)
 		if core.ReadBudgetRanOut(err) {
 			// The wait's one budget ran out at an admission:

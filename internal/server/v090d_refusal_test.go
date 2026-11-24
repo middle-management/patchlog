@@ -101,9 +101,9 @@ func TestV090DLongPollRevokedMidWaitIsRefused(t *testing.T) {
 // v0.90 §7.9 Long-poll, §6.6: a view's long-poll whose cookie dies
 // mid-wait, its role's rules changed, answers the cookie's refusal (403),
 // never the 204 of a run-out. (A cookie's admission evaluates no rule, so
-// it never draws on the wait's budget.)
+// it never draws on the wait's budget.) Not parallel: it counts fetches
+// through testLongPollFetch.
 func TestV090DFilteredLongPollCookieDeathIsRefused(t *testing.T) {
-	t.Parallel()
 	w := newV75s(t, v75sOpts{})
 	w.put("matches", "derby", map[string]any{"title": "derby"})
 	ck, view := w.cookie(w.li())
@@ -112,17 +112,30 @@ func TestV090DFilteredLongPollCookieDeathIsRefused(t *testing.T) {
 	if r := w.do(req{method: "GET", path: base + "/log?live=long-poll", hdr: cookieHdr(ck)}); r.Code != 200 {
 		t.Fatalf("the cookie's first long-poll: %d %s", r.Code, r.Body)
 	}
+	var fetches atomic.Int64
+	testLongPollFetch = func() { fetches.Add(1) }
+	t.Cleanup(func() { testLongPollFetch = nil })
+	since := w.nsHead("matches", w.admin)
 	cur := waitCursor(t, newLiveClock(interval, filteredLogPath("matches", view)), 10*time.Second)
 	done := make(chan *resp, 1)
 	go func() {
-		done <- w.do(req{method: "GET", path: fmt.Sprintf("%s/log?live=long-poll&since=%s&cursor=%d", base, w.nsHead("matches", w.admin), cur), hdr: cookieHdr(ck)})
+		done <- w.do(req{method: "GET", path: fmt.Sprintf("%s/log?live=long-poll&since=%s&cursor=%d", base, since, cur), hdr: cookieHdr(ck)})
 	}()
-	time.Sleep(200 * time.Millisecond)
+	deadline := time.Now().Add(5 * time.Second)
+	for fetches.Load() < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("the long-poll made no first fetch")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	expect(t, w.patchNS("matches", ops(op("replace", "/roles/reader/rules", []any{v75sNames("derby")})), w.admin), 201)
 	select {
 	case r := <-done:
 		if r.Code != 403 {
 			t.Fatalf("a wait whose cookie died: %d %s, want 403", r.Code, r.Body)
+		}
+		if fetches.Load() < 2 {
+			t.Fatalf("%d fetches: the wait wasn't woken", fetches.Load())
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the long-poll didn't answer")

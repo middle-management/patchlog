@@ -108,11 +108,12 @@ func TestV090AdvPublicSealedHiddenMiddle(t *testing.T) {
 		t.Errorf("LEAK: hidden-only blob answered at view prefix: %+v", b)
 	}
 	ans, err := w.e.Keys(ctx, "matches", li, KeysRequest{Resources: []string{"derby"}})
-	if err == nil {
-		for _, k := range ans.Keys {
-			if v, _ := k["view"].(string); v == "" {
-				t.Errorf("LEAK: /keys gave the partial reader a non-view key: %v", k)
-			}
+	if err != nil {
+		t.Fatalf("/keys for the partial reader: %v", err)
+	}
+	for _, k := range ans.Keys {
+		if v, _ := k["view"].(string); v == "" {
+			t.Errorf("LEAK: /keys gave the partial reader a non-view key: %v", k)
 		}
 	}
 }
@@ -146,11 +147,12 @@ func TestV090AdvPublicSchemaFiltered(t *testing.T) {
 		t.Errorf("LEAK: hidden schema in filtered range: %s", b)
 	}
 	lg, _, err = w.e.FilteredLiveLog(ctx, "matches", view, "", 100, li)
-	if err == nil {
-		b = v090AdvJSON(lg.Entries)
-		if strings.Contains(b, h.Head) || strings.Contains(b, `"schemas"`) {
-			t.Errorf("LEAK: hidden schema in filtered live: %s", b)
-		}
+	if err != nil {
+		t.Fatalf("filtered live: %v", err)
+	}
+	b = v090AdvJSON(lg.Entries)
+	if strings.Contains(b, h.Head) || strings.Contains(b, `"schemas"`) {
+		t.Errorf("LEAK: hidden schema in filtered live: %s", b)
 	}
 }
 
@@ -199,15 +201,19 @@ func TestV090AdvSchemaAfterPurge(t *testing.T) {
 					if strings.Contains(b, sh.Head) {
 						t.Errorf("LEAK %s: hidden schema in filtered range: %s", what, b)
 					}
-					if lg, _, err := w.e.FilteredLiveLog(ctx, "matches", view, "", 100, li); err == nil {
-						if b := v090AdvJSON(lg.Entries); strings.Contains(b, sh.Head) {
-							t.Errorf("LEAK %s: hidden schema in filtered live: %s", what, b)
-						}
+					lg, _, err = w.e.FilteredLiveLog(ctx, "matches", view, "", 100, li)
+					if err != nil {
+						t.Fatalf("%s: filtered live: %v", what, err)
 					}
-					if lg, _, err := w.e.FilteredEventLog(ctx, "matches", view, "", 100, li); err == nil {
-						if b := v090AdvJSON(lg.Entries); strings.Contains(b, sh.Head) {
-							t.Errorf("LEAK %s: hidden schema in filtered events: %s", what, b)
-						}
+					if b := v090AdvJSON(lg.Entries); strings.Contains(b, sh.Head) {
+						t.Errorf("LEAK %s: hidden schema in filtered live: %s", what, b)
+					}
+					lg, _, err = w.e.FilteredEventLog(ctx, "matches", view, "", 100, li)
+					if err != nil {
+						t.Fatalf("%s: filtered events: %v", what, err)
+					}
+					if b := v090AdvJSON(lg.Entries); strings.Contains(b, sh.Head) {
+						t.Errorf("LEAK %s: hidden schema in filtered events: %s", what, b)
 					}
 				}
 				read("before")
@@ -245,7 +251,7 @@ func TestV090AdvSealedSchemaPlaintext(t *testing.T) {
 		v89Put(w, "derby", map[string]any{"$schema": ref, "team": "a"})
 		check := func(what string, lg *Log, err error) {
 			if err != nil {
-				return // refused: nothing in the clear
+				t.Fatalf("pub=%v %s: %v", pub, what, err)
 			}
 			b := v090AdvJSON(lg.Entries)
 			if !lg.Sealed && strings.Contains(b, sc) {
@@ -259,6 +265,13 @@ func TestV090AdvSealedSchemaPlaintext(t *testing.T) {
 		lg, _, err = w.e.NamespaceLiveLog(ctx, "matches", "", 100, w.admin, nil)
 		check("live", lg, err)
 		lg, err = w.e.NamespaceLog(ctx, "matches", w.head("matches"), "", 100, Credentials{})
+		if !pub {
+			// A private namespace refuses the anonymous read outright.
+			if ae, ok := err.(*Error); !ok || ae.Status != 401 {
+				t.Fatalf("anon log of a private namespace: %v, want 401", err)
+			}
+			continue
+		}
 		check("anon log", lg, err)
 	}
 }
