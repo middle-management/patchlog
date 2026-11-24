@@ -161,3 +161,31 @@ func TestMigrateSpannerAdoptsStash(t *testing.T) {
 		t.Fatalf("stash left: %d (%v)", n, err)
 	}
 }
+
+// Spanner doesn't apply a DDL batch atomically: a run that died while
+// dropping the earlier runner's tables may leave only one of them. The next
+// run adopts what is left.
+func TestMigrateSpannerAdoptsPartialLegacy(t *testing.T) {
+	db := spannerDB(t)
+	ctx := context.Background()
+	for _, q := range []string{
+		`CREATE TABLE IF NOT EXISTS mmmigrate_current (namespace text NOT NULL PRIMARY KEY, checksum text NOT NULL, applied_at bigint NOT NULL)`,
+		`CREATE TABLE ` + legacyStash + ` (kind varchar NOT NULL, namespace varchar NOT NULL, version bigint NOT NULL, name varchar NOT NULL, applied_at bigint NOT NULL, PRIMARY KEY (kind, namespace, version))`,
+		`CREATE TABLE t (id bigint PRIMARY KEY)`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO `+legacyStash+` (kind, namespace, version, name, applied_at) VALUES ('applied', 'patchlog', 1, 't', $1)`, time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	fsys := fstest.MapFS{"migrations/spanner/001_t.sql": {Data: []byte(`CREATE TABLE t (id bigint PRIMARY KEY);`)}}
+	if err := Migrate(ctx, db, fsys, "patchlog"); err != nil {
+		t.Fatal(err)
+	}
+	var typ string
+	if err := db.QueryRow(`SELECT data_type FROM information_schema.columns WHERE table_name = 'mmmigrate_current' AND column_name = 'applied_at'`).Scan(&typ); err != nil || typ == "bigint" {
+		t.Fatalf("mmmigrate_current.applied_at: %q (%v), want mmmigrate's", typ, err)
+	}
+}

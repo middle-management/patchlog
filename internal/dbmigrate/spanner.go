@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing/fstest"
 	"time"
 
@@ -63,21 +64,42 @@ func adoptLegacySpanner(ctx context.Context, db *sql.DB) error {
 	return restoreLegacySpanner(ctx, db, d)
 }
 
-// legacySpannerState reports whether the old runner's tables are there
-// (mmmigrate_applied with a bigint applied_at), and whether a stash of their
-// records is.
+// legacyTables returns which of the old runner's tables are there: its
+// mmmigrate_applied and mmmigrate_current have a bigint applied_at. Usually
+// both or neither, but Spanner doesn't apply a DDL batch atomically, so a run
+// that died while dropping them may have left one.
+func legacyTables(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, `SELECT table_name FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name IN ('mmmigrate_applied', 'mmmigrate_current')
+		AND column_name = 'applied_at' AND data_type = 'bigint'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tables := map[string]bool{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		tables[n] = true
+	}
+	return tables, rows.Err()
+}
+
+// legacySpannerState reports whether any of the old runner's tables are
+// there, and whether a stash of their records is.
 func legacySpannerState(ctx context.Context, db *sql.DB) (legacy, stashed bool, err error) {
-	var n int64
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.columns
-		WHERE table_schema = 'public' AND table_name = 'mmmigrate_applied' AND column_name = 'applied_at' AND data_type = 'bigint'`).Scan(&n); err != nil {
+	tables, err := legacyTables(ctx, db)
+	if err != nil {
 		return false, false, err
 	}
-	legacy = n > 0
+	var n int64
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM information_schema.tables
 		WHERE table_schema = 'public' AND table_name = $1`, legacyStash).Scan(&n); err != nil {
 		return false, false, err
 	}
-	return legacy, n > 0, nil
+	return len(tables) > 0, n > 0, nil
 }
 
 type legacyRecord struct {
@@ -117,8 +139,8 @@ func stashLegacySpanner(ctx context.Context, db *sql.DB, d mmspanner.Dialect) er
 	ctx = lctx
 
 	// Again under the lease: another instance may have adopted it since.
-	legacy, _, err := legacySpannerState(ctx, db)
-	if err != nil || !legacy {
+	tables, err := legacyTables(ctx, db)
+	if err != nil || len(tables) == 0 {
 		return err
 	}
 	slog.Info("adopting the Spanner migration records of the earlier runner")
@@ -133,10 +155,13 @@ func stashLegacySpanner(ctx context.Context, db *sql.DB, d mmspanner.Dialect) er
 		return err
 	}
 	var recs []legacyRecord
-	for _, q := range []string{
-		`SELECT 'applied', namespace, version, name, applied_at FROM mmmigrate_applied`,
-		`SELECT 'current', namespace, 0, checksum, applied_at FROM mmmigrate_current`,
+	for table, q := range map[string]string{
+		"mmmigrate_applied": `SELECT 'applied', namespace, version, name, applied_at FROM mmmigrate_applied`,
+		"mmmigrate_current": `SELECT 'current', namespace, 0, checksum, applied_at FROM mmmigrate_current`,
 	} {
+		if !tables[table] {
+			continue
+		}
 		rs, err := scanLegacy(conn.QueryContext(ctx, q))
 		if err != nil {
 			return err
@@ -150,7 +175,11 @@ func stashLegacySpanner(ctx context.Context, db *sql.DB, d mmspanner.Dialect) er
 			return err
 		}
 	}
-	return d.Exec(ctx, conn, `DROP TABLE IF EXISTS mmmigrate_applied; DROP TABLE IF EXISTS mmmigrate_current`)
+	var drops []string
+	for table := range tables {
+		drops = append(drops, "DROP TABLE IF EXISTS "+table)
+	}
+	return d.Exec(ctx, conn, strings.Join(drops, ";\n"))
 }
 
 // restoreLegacySpanner copies the stashed records into mmmigrate's tables,

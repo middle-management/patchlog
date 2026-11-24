@@ -66,10 +66,12 @@ func TestSpannerPool(t *testing.T) {
 		first = NewDB(t)
 		db := Open(t, first)
 		defer db.Close()
-		exec(t, db, `CREATE TABLE IF NOT EXISTS mmmigrate_applied (namespace text NOT NULL, version bigint NOT NULL, name text NOT NULL, applied_at bigint NOT NULL, PRIMARY KEY (namespace, version))`,
+		// A table of mmmigrate's (its prefix), not one of its real ones:
+		// the database goes on to other tests, which migrate it.
+		exec(t, db, `CREATE TABLE IF NOT EXISTS mmmigrate_pooltest (k bigint PRIMARY KEY)`,
 			`CREATE TABLE IF NOT EXISTS a (id bigint PRIMARY KEY, v text NOT NULL)`,
 			`CREATE TABLE IF NOT EXISTS b (id bigint PRIMARY KEY, a bigint NOT NULL REFERENCES a (id))`,
-			`INSERT INTO mmmigrate_applied VALUES ('t', 1, 'x', 0) ON CONFLICT (namespace, version) DO NOTHING`,
+			`INSERT INTO mmmigrate_pooltest VALUES (1) ON CONFLICT (k) DO NOTHING`,
 			`INSERT INTO a VALUES (1, 'x'), (2, 'y')`, `INSERT INTO b VALUES (1, 2)`)
 	})
 	t.Run("reuse", func(t *testing.T) {
@@ -79,7 +81,7 @@ func TestSpannerPool(t *testing.T) {
 		db := Open(t, first)
 		defer db.Close()
 		var rows, kept int
-		if err := db.QueryRow(`SELECT (SELECT count(*) FROM a) + (SELECT count(*) FROM b), (SELECT count(*) FROM mmmigrate_applied)`).Scan(&rows, &kept); err != nil || rows != 0 || kept == 0 {
+		if err := db.QueryRow(`SELECT (SELECT count(*) FROM a) + (SELECT count(*) FROM b), (SELECT count(*) FROM mmmigrate_pooltest)`).Scan(&rows, &kept); err != nil || rows != 0 || kept == 0 {
 			t.Fatalf("rows left %d, migration records %d, %v", rows, kept, err)
 		}
 	})
