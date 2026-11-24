@@ -128,8 +128,9 @@ func TestPGDrawAfterCheck(t *testing.T) {
 			e.noSolo = grouped
 			mkNS(t, e, "n", map[string]any{})
 			w := Credentials{Author: "w"}
-			// The principal's bucket: its name, authentication disabled.
-			pkey := []byte("p\x00w")
+			// The principal's bucket in n (each namespace's own since
+			// v0.88): its name, authentication disabled.
+			pkey := []byte("p\x00n\x00w")
 			tokens := func() float64 {
 				t.Helper()
 				var v float64

@@ -16,7 +16,9 @@ import (
 )
 
 // Every package's committed migrations (every directory under a
-// migrations directory but seed) are unchanged since they were
+// migrations directory but seed: every dialect's) load as mmmigrate loads
+// them at startup, so no two share a version (two branches that each
+// committed the next number and were merged), are unchanged since they were
 // committed (their checksums and chain hold), and, in CI, current.sql holds
 // nothing left to commit: a migration tests apply but deployments wouldn't.
 func TestMigrations(t *testing.T) {
@@ -30,6 +32,9 @@ func TestMigrations(t *testing.T) {
 	for _, dir := range dirs {
 		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() || filepath.Base(dir) == "seed" {
 			continue
+		}
+		if _, err := source.LoadMigrations(os.DirFS(dir), false); err != nil {
+			t.Errorf("%s: %v", dir, err)
 		}
 		if err := source.ValidateChain(dir); err != nil {
 			t.Errorf("%s: %v", dir, err)
@@ -131,5 +136,89 @@ func TestMigratePostgresSchemas(t *testing.T) {
 	var n int
 	if err := admin.QueryRow(`SELECT count(*) FROM information_schema.tables WHERE table_name = 't' AND table_schema IN ('a', 'b')`).Scan(&n); err != nil || n != 2 {
 		t.Fatalf("tables t in a and b: %d (%v), want 2", n, err)
+	}
+}
+
+// A Postgres database migrated while two of the core's migrations were both
+// numbered 030 upgrades: one that applied rate_draws_batched as 30 (main
+// between PR #39 and PR #37) has it re-recorded as 31 and gets
+// purge_follows_by_importer, and one that applied purge_follows_by_importer
+// as 30 (the spec branches) gets rate_draws_batched as 31.
+func TestMigrateRenumbered(t *testing.T) {
+	if !pgtest.Enabled() {
+		t.Skip("Postgres only (" + pgtest.Env + ")")
+	}
+	ctx := context.Background()
+	dir := "../core/migrations/postgres"
+	core := os.DirFS("../core")
+	// The core's migrations as they were on each side: 001–029 and one 030.
+	before := func(keep string) fstest.MapFS {
+		fsys := fstest.MapFS{}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			name := e.Name()
+			v, _, err := source.ParseMigrationName(name)
+			if err != nil || v > 31 {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(dir, name))
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case v < 30:
+			case strings.Contains(name, keep):
+				name = "030_" + strings.SplitN(name, "_", 2)[1]
+			default:
+				continue
+			}
+			fsys["migrations/postgres/"+name] = &fstest.MapFile{Data: data}
+		}
+		return fsys
+	}
+	for _, tc := range []struct{ applied, other string }{
+		{"rate_draws_batched", "purge_follows_by_importer"},
+		{"purge_follows_by_importer", "rate_draws_batched"},
+	} {
+		t.Run(tc.applied, func(t *testing.T) {
+			db, err := sql.Open("pgx", pgtest.DSN(pgtest.FreshDB(t)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := Migrate(ctx, db, before(tc.applied), "patchlog"); err != nil {
+				t.Fatal(err)
+			}
+			if err := Migrate(ctx, db, core, "patchlog"); err != nil {
+				t.Fatal(err)
+			}
+			got := map[int]string{}
+			rows, err := db.Query(`SELECT version, name FROM mmmigrate.applied WHERE namespace LIKE 'patchlog@%' AND version >= 30`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for rows.Next() {
+				var v int
+				var n string
+				rows.Scan(&v, &n)
+				got[v] = n
+			}
+			rows.Close()
+			if got[30] != "purge_follows_by_importer" || got[31] != "rate_draws_batched" {
+				t.Fatalf("applied 30, 31: %v", got)
+			}
+			// Both migrations' objects exist: importer is 030's column,
+			// rate_draws 031's function.
+			var n int
+			if err := db.QueryRow(`SELECT count(*) FROM information_schema.columns WHERE table_name = 'purge_follow_names' AND column_name = 'importer'`).Scan(&n); err != nil || n != 1 {
+				t.Errorf("purge_follow_names.importer: %d (%v)", n, err)
+			}
+			if err := db.QueryRow(`SELECT count(*) FROM pg_proc WHERE proname = 'rate_draws'`).Scan(&n); err != nil || n < 1 {
+				t.Errorf("rate_draws: %d (%v)", n, err)
+			}
+		})
 	}
 }
