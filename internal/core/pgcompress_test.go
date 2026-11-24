@@ -9,8 +9,8 @@ import (
 // On Postgres the large columns are compressed with lz4 where the server
 // has it, not pglz, its default (migrations/postgres).
 func TestPGColumnCompression(t *testing.T) {
-	if !pgtest.Enabled() {
-		t.Skip("Postgres only")
+	if !pgtest.Enabled() || pgtest.Spanner() {
+		t.Skip("Postgres only (pg_settings, TOAST compression)")
 	}
 	t.Parallel()
 	path := pgtest.FreshDB(t)
