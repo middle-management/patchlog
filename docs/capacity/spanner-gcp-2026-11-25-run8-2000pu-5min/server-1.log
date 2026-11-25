@@ -1,0 +1,6 @@
+2026/11/25 14:39:49 INFO applied migration namespace=_mmmigrate version=1 name=create_current
+2026/11/25 14:39:55 INFO applied migration namespace=patchlog version=1 name=baseline_schema
+2026/11/25 14:41:07 INFO applied migration namespace=patchlog version=2 name=hotspots_sharded_commit_timestamp_index_no_id_blocks
+2026/11/25 14:41:31 INFO applied migration namespace=patchlog version=3 name=the_namespace_name_index_includes_what_the_check_reads
+2026/11/25 14:41:32 patchlog dev listening on :8080 (origin http://localhost:8080, dev=true)
+2026/11/25 14:41:32 playground: http://localhost:8080/playground/

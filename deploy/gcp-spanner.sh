@@ -6,8 +6,8 @@
 # namespaces phase against them: BUSY counts of busy namespaces, each of
 # BUSY_DOCS documents written BUSY_RATE times a second, closed loop. After the
 # run it saves Spanner's own statistics of the run's minutes (transactions,
-# locks, queries, from SPANNER_SYS) and the instance's CPU, beside the
-# harness's JSON.
+# locks, queries, from SPANNER_SYS), the instance's CPU, and the VMs' own
+# (vmstat), beside the harness's JSON.
 #
 #   ./deploy/gcp-spanner.sh [-y]       a run
 #   ./deploy/gcp-spanner.sh cleanup    the Spanner instance and service account
@@ -187,6 +187,7 @@ db="spanner://projects/$PROJECT/instances/$INSTANCE/databases/$DATABASE?pool_max
 start_core() { # vm
   gcloud compute scp "$build/patchlog" "$1:patchlog" --zone="$ZONE" --quiet >/dev/null
   ssh_vm "$1" "ulimit -n 1048576 2>/dev/null || true
+    nohup vmstat -t 5 > vmstat.log 2>&1 &
     nohup ./patchlog serve --dev --addr :8080 --db '$db' --blob-dir ./blobs --group-commit $GROUP_COMMIT \
       --max-rate-per-namespace 1e9,1e9 --max-rate-per-resource 1e9,1e9 --max-rate-per-principal 1e9,1e9 > server.log 2>&1 &
     pid=\$!
@@ -204,12 +205,14 @@ wait
 # The run.
 gcloud compute scp "$build/capacity" "$NAME-loader:capacity" --zone="$ZONE" --quiet >/dev/null
 t0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-ssh_vm "$NAME-loader" "ulimit -n 1048576 2>/dev/null || true; ./capacity --url $urls --only namespaces \
+ssh_vm "$NAME-loader" "nohup vmstat -t 5 > vmstat.log 2>&1 & ulimit -n 1048576 2>/dev/null || true; ./capacity --url $urls --only namespaces \
   --busy-namespaces $BUSY --busy-docs $BUSY_DOCS --busy-rate $BUSY_RATE --busy-seconds $BUSY_SECS --json result.json" | tee "$OUT/capacity.log"
 t1=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+gcloud compute scp "$NAME-loader:vmstat.log" "$OUT/vmstat-loader.log" --zone="$ZONE" --quiet >/dev/null || true
 gcloud compute scp "$NAME-loader:result.json" "$OUT/result.json" --zone="$ZONE" --quiet >/dev/null
 for i in $(seq 1 "$SERVERS"); do
   gcloud compute scp "$NAME-core-$i:server.log" "$OUT/server-$i.log" --zone="$ZONE" --quiet >/dev/null || true
+  gcloud compute scp "$NAME-core-$i:vmstat.log" "$OUT/vmstat-core-$i.log" --zone="$ZONE" --quiet >/dev/null || true
 done
 
 # Spanner's statistics of the run: the top transactions, locks and queries
@@ -230,6 +233,13 @@ for metric in instance/cpu/utilization_by_priority instance/cpu/utilization; do
     --data-urlencode "filter=metric.type=\"spanner.googleapis.com/$metric\" AND resource.labels.instance_id=\"$INSTANCE\"" \
     --data-urlencode "interval.startTime=$t0" --data-urlencode "interval.endTime=$t1" \
     > "$OUT/$(tr / _ <<<"$metric").json" || echo "gcp-spanner: reading $metric failed" >&2
+done
+# The VMs' CPU (vmstat every 5 s): the busiest 5 s, and the mean of the
+# samples above 10% busy, the run's.
+for f in "$OUT"/vmstat-*.log; do
+  [ -f "$f" ] || continue
+  awk -v name="$(basename "$f" .log)" '$1 ~ /^[0-9]+$/ && NF >= 17 { busy = 100 - $15; if (busy > max) max = busy; if (busy > 10) { sum += busy; n++ } }
+    END { printf "%-16s CPU busy: max %3d%%, mean while loaded %3d%% (%d samples)\n", name, max, n ? sum / n : 0, n }' "$f"
 done
 python3 - "$OUT/result.json" <<'PY'
 import json, sys

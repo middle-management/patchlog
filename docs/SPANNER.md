@@ -344,6 +344,17 @@ at 1 to 32 namespaces. The index saved its row (4 rows scanned a check, from 5),
 cost more CPU, 1.09 ms against 0.65: Spanner plans the subquery in a `CASE` worse than alone.
 The `CASE` is gone again; the index stays.
 
+**The eighth run, five-minute steps at 2,000 processing units** (`4e246487`, still with the
+`CASE`; files `docs/capacity/spanner-gcp-2026-11-25-run8-2000pu-5min/`): 2,986 a second at 16
+namespaces (p99 1.6 s) and 3,141 at 32 (p99 3.5 s), flat over each step's minutes (240–320
+commits a second), Spanner at 40–50% of its CPU, almost no aborts. So it isn't splits that
+hold it, nor Spanner's CPU. A namespace commits 8–16 groups a second, one at a time, each
+transaction 70–120 ms, of about 12 writes, though 100 writers wait on each: writes reach the
+queue slowly, which points at the cores (their CPU, or the Spanner client's), which the bench
+didn't measure. It does now (vmstat on each VM, `vmstat-*.log`). The check's CPU rose with the
+resources' histories within the first steps' minutes, 0.4 to 1.5–1.8 ms (the `CASE`'s subquery,
+likely), and stayed.
+
 ## The capacity bench on real Spanner
 
 `deploy/gcp-spanner.sh` (header: settings, what it makes, `cleanup`) runs the D.8 comparison on
