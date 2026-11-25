@@ -1,0 +1,15 @@
+[package]
+name = "patchlog-grant"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Native CLI to make, attenuate and inspect patchlog grants (Biscuit v3, Addendum C §C.8)"
+
+[[bin]]
+name = "patchlog-grant"
+path = "src/main.rs"
+
+[dependencies]
+patchlog-core = { path = "../core" }
+getrandom = "0.3"

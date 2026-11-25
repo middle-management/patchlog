@@ -1,0 +1,10 @@
+[package]
+name = "patchlog-bench"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "CPU cost of the write and read paths, natively and as wasm (run under Node's WASI, i.e. V8)"
+
+[dependencies]
+patchlog-core = { path = "../core" }
