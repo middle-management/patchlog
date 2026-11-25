@@ -1,0 +1,467 @@
+{
+  "timeSeries": [
+    {
+      "metric": {
+        "labels": {
+          "database": "patchlog",
+          "priority": "high",
+          "is_system": "false"
+        },
+        "type": "spanner.googleapis.com/instance/cpu/utilization_by_priority"
+      },
+      "resource": {
+        "type": "spanner_instance",
+        "labels": {
+          "location": "europe-west1",
+          "instance_config": "regional-europe-west1",
+          "instance_id": "patchlog-bench",
+          "project_id": "patchlog-515810"
+        }
+      },
+      "metricKind": "GAUGE",
+      "valueType": "DOUBLE",
+      "points": [
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:15:00Z",
+            "endTime": "2026-11-25T14:15:00Z"
+          },
+          "value": {
+            "doubleValue": 0.43728778877985575
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:14:00Z",
+            "endTime": "2026-11-25T14:14:00Z"
+          },
+          "value": {
+            "doubleValue": 0.35259293671799335
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:13:00Z",
+            "endTime": "2026-11-25T14:13:00Z"
+          },
+          "value": {
+            "doubleValue": 0.17179196967323487
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:12:00Z",
+            "endTime": "2026-11-25T14:12:00Z"
+          },
+          "value": {
+            "doubleValue": 0.16927065691740628
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:11:00Z",
+            "endTime": "2026-11-25T14:11:00Z"
+          },
+          "value": {
+            "doubleValue": 0.10320176613987608
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:10:00Z",
+            "endTime": "2026-11-25T14:10:00Z"
+          },
+          "value": {
+            "doubleValue": 0.023685941491946264
+          }
+        }
+      ]
+    },
+    {
+      "metric": {
+        "labels": {
+          "database": "patchlog",
+          "is_system": "true",
+          "priority": "high"
+        },
+        "type": "spanner.googleapis.com/instance/cpu/utilization_by_priority"
+      },
+      "resource": {
+        "type": "spanner_instance",
+        "labels": {
+          "instance_id": "patchlog-bench",
+          "location": "europe-west1",
+          "instance_config": "regional-europe-west1",
+          "project_id": "patchlog-515810"
+        }
+      },
+      "metricKind": "GAUGE",
+      "valueType": "DOUBLE",
+      "points": [
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:15:00Z",
+            "endTime": "2026-11-25T14:15:00Z"
+          },
+          "value": {
+            "doubleValue": 0.015224538701298987
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:14:00Z",
+            "endTime": "2026-11-25T14:14:00Z"
+          },
+          "value": {
+            "doubleValue": 0.018665648290543495
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:13:00Z",
+            "endTime": "2026-11-25T14:13:00Z"
+          },
+          "value": {
+            "doubleValue": 0.020057555105878481
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:12:00Z",
+            "endTime": "2026-11-25T14:12:00Z"
+          },
+          "value": {
+            "doubleValue": 0.0097972827908307473
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:11:00Z",
+            "endTime": "2026-11-25T14:11:00Z"
+          },
+          "value": {
+            "doubleValue": 0.0062056646638472728
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:10:00Z",
+            "endTime": "2026-11-25T14:10:00Z"
+          },
+          "value": {
+            "doubleValue": 0.0730350973338327
+          }
+        }
+      ]
+    },
+    {
+      "metric": {
+        "labels": {
+          "database": "patchlog",
+          "is_system": "false",
+          "priority": "low"
+        },
+        "type": "spanner.googleapis.com/instance/cpu/utilization_by_priority"
+      },
+      "resource": {
+        "type": "spanner_instance",
+        "labels": {
+          "instance_config": "regional-europe-west1",
+          "instance_id": "patchlog-bench",
+          "location": "europe-west1",
+          "project_id": "patchlog-515810"
+        }
+      },
+      "metricKind": "GAUGE",
+      "valueType": "DOUBLE",
+      "points": [
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:15:00Z",
+            "endTime": "2026-11-25T14:15:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:14:00Z",
+            "endTime": "2026-11-25T14:14:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:13:00Z",
+            "endTime": "2026-11-25T14:13:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:12:00Z",
+            "endTime": "2026-11-25T14:12:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:11:00Z",
+            "endTime": "2026-11-25T14:11:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:10:00Z",
+            "endTime": "2026-11-25T14:10:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        }
+      ]
+    },
+    {
+      "metric": {
+        "labels": {
+          "priority": "low",
+          "is_system": "true",
+          "database": "patchlog"
+        },
+        "type": "spanner.googleapis.com/instance/cpu/utilization_by_priority"
+      },
+      "resource": {
+        "type": "spanner_instance",
+        "labels": {
+          "location": "europe-west1",
+          "instance_id": "patchlog-bench",
+          "instance_config": "regional-europe-west1",
+          "project_id": "patchlog-515810"
+        }
+      },
+      "metricKind": "GAUGE",
+      "valueType": "DOUBLE",
+      "points": [
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:15:00Z",
+            "endTime": "2026-11-25T14:15:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:14:00Z",
+            "endTime": "2026-11-25T14:14:00Z"
+          },
+          "value": {
+            "doubleValue": 4.2739494850847696e-05
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:13:00Z",
+            "endTime": "2026-11-25T14:13:00Z"
+          },
+          "value": {
+            "doubleValue": 7.9243908252987075e-05
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:12:00Z",
+            "endTime": "2026-11-25T14:12:00Z"
+          },
+          "value": {
+            "doubleValue": 0.00019600708552966397
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:11:00Z",
+            "endTime": "2026-11-25T14:11:00Z"
+          },
+          "value": {
+            "doubleValue": 0.00015037263252572338
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:10:00Z",
+            "endTime": "2026-11-25T14:10:00Z"
+          },
+          "value": {
+            "doubleValue": 0.0030595090988544279
+          }
+        }
+      ]
+    },
+    {
+      "metric": {
+        "labels": {
+          "is_system": "false",
+          "priority": "medium",
+          "database": "patchlog"
+        },
+        "type": "spanner.googleapis.com/instance/cpu/utilization_by_priority"
+      },
+      "resource": {
+        "type": "spanner_instance",
+        "labels": {
+          "location": "europe-west1",
+          "instance_id": "patchlog-bench",
+          "project_id": "patchlog-515810",
+          "instance_config": "regional-europe-west1"
+        }
+      },
+      "metricKind": "GAUGE",
+      "valueType": "DOUBLE",
+      "points": [
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:15:00Z",
+            "endTime": "2026-11-25T14:15:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:14:00Z",
+            "endTime": "2026-11-25T14:14:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:13:00Z",
+            "endTime": "2026-11-25T14:13:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:12:00Z",
+            "endTime": "2026-11-25T14:12:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:11:00Z",
+            "endTime": "2026-11-25T14:11:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:10:00Z",
+            "endTime": "2026-11-25T14:10:00Z"
+          },
+          "value": {
+            "doubleValue": 0
+          }
+        }
+      ]
+    },
+    {
+      "metric": {
+        "labels": {
+          "is_system": "true",
+          "priority": "medium",
+          "database": "patchlog"
+        },
+        "type": "spanner.googleapis.com/instance/cpu/utilization_by_priority"
+      },
+      "resource": {
+        "type": "spanner_instance",
+        "labels": {
+          "project_id": "patchlog-515810",
+          "instance_id": "patchlog-bench",
+          "location": "europe-west1",
+          "instance_config": "regional-europe-west1"
+        }
+      },
+      "metricKind": "GAUGE",
+      "valueType": "DOUBLE",
+      "points": [
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:15:00Z",
+            "endTime": "2026-11-25T14:15:00Z"
+          },
+          "value": {
+            "doubleValue": 0.031064949012672302
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:14:00Z",
+            "endTime": "2026-11-25T14:14:00Z"
+          },
+          "value": {
+            "doubleValue": 0.0434879005890398
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:13:00Z",
+            "endTime": "2026-11-25T14:13:00Z"
+          },
+          "value": {
+            "doubleValue": 0.021989918180134221
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:12:00Z",
+            "endTime": "2026-11-25T14:12:00Z"
+          },
+          "value": {
+            "doubleValue": 0.0023679948219556927
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:11:00Z",
+            "endTime": "2026-11-25T14:11:00Z"
+          },
+          "value": {
+            "doubleValue": 0.0011408342645587966
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T14:10:00Z",
+            "endTime": "2026-11-25T14:10:00Z"
+          },
+          "value": {
+            "doubleValue": 0.0034549238632117021
+          }
+        }
+      ]
+    }
+  ],
+  "unit": "10^2.%"
+}

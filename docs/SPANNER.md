@@ -316,7 +316,28 @@ files `docs/capacity/spanner-gcp-2026-11-25-run5/`):
   costs Spanner more for each. One node (1,000 processing units) takes about 3,200 writes a
   second of this load; beyond it, Spanner's CPU a write, or more processing units.
 
-Next: the same run at 2,000 processing units, to see whether a node more doubles it. And the
+**The sixth run, at 2,000 processing units** (`77b9222b`, the fifth's code; files
+`docs/capacity/spanner-gcp-2026-11-25-run6-2000pu/`):
+
+| Busy namespaces | Written/s | Write p50 / p99 | Spanner CPU (high priority) |
+|---|---|---|---|
+| 1 | 574 | 165 / 361 ms | 10% |
+| 2 | 1,159 | 164 / 311 ms | 17% |
+| 4 | 1,962 | 190 / 409 ms | 17% |
+| 8 | 2,886 | 262 / 527 ms | 35% |
+| 16 | 3,324 | 435 / 983 ms | 44% |
+| 32 | 2,553 | 1,074 / 3,459 ms | |
+
+- **A node more didn't double it**: the same up to 16 namespaces, twice at 32 (2,553 against
+  1,314), Spanner at 35–44% of its CPU while statement latencies still rose (the check 9 to 24
+  ms; blob_refs and rate_buckets 20 to 70 ms).
+- 83% of one node and 44% of two are the same work. The bench's database is new each run, and
+  each step's namespaces new and written for 60 s: Spanner splits a table's key range under
+  load over minutes, so the rows likely stayed on few splits, on one node. (Spanner's CPU
+  metrics are per instance, so this is inferred; Key Visualizer would show it.) Next: steps of
+  five minutes (`BUSY=16,32 BUSY_SECS=300`), so splits follow the load before it is measured.
+
+And the
 check made cheaper: its namespace read from the name's index alone (migration 003, the index
 including the columns the check reads, which change once a group), and the seq of the revision
 asked for taken from the head when the head is the one asked for, as a write's If-Match mostly
