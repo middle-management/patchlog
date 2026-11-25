@@ -26,19 +26,26 @@ import (
 // disk writes (/proc/self/io, Linux) per write, on SQLite the time under
 // the writer's mutex, in COMMIT and in checkpoints holding it per write,
 // and with group commit the
-// writes per group.
+// writes per group. The readers=8 cases add eight goroutines that read
+// each new revision once (ResourceRev), as consumers following the
+// namespaces do; a revision they can't keep up with is skipped.
 func BenchmarkNamespaceWriters(b *testing.B) {
-	for _, c := range []struct{ ns, writers int }{
-		{1, 1}, {1, 4}, {1, 16}, {1, 32},
-		{4, 8}, {16, 8}, {16, 2},
+	for _, c := range []struct{ ns, writers, readers int }{
+		{1, 1, 0}, {1, 4, 0}, {1, 16, 0}, {1, 32, 0},
+		{4, 8, 0}, {16, 8, 0}, {16, 2, 0},
+		{4, 8, 8}, {16, 8, 8},
 	} {
-		b.Run(fmt.Sprintf("ns=%d/writers=%d", c.ns, c.ns*c.writers), func(b *testing.B) {
-			benchNamespaceWriters(b, c.ns, c.writers)
+		name := fmt.Sprintf("ns=%d/writers=%d", c.ns, c.ns*c.writers)
+		if c.readers > 0 {
+			name += fmt.Sprintf("/readers=%d", c.readers)
+		}
+		b.Run(name, func(b *testing.B) {
+			benchNamespaceWriters(b, c.ns, c.writers, c.readers)
 		})
 	}
 }
 
-func benchNamespaceWriters(b *testing.B, nss, perNS int) {
+func benchNamespaceWriters(b *testing.B, nss, perNS, readers int) {
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
@@ -66,6 +73,7 @@ func benchNamespaceWriters(b *testing.B, nss, perNS int) {
 			ws = append(ws, &writer{ns: ns, name: fmt.Sprint("w", w)})
 		}
 	}
+	var fresh chan [3]string // revisions for the readers
 	put := func(w *writer, i int) error {
 		it := Item{Resource: w.name, IfMatch: w.head, IfNoneMatch: w.head == ""}
 		op := "replace"
@@ -78,6 +86,12 @@ func benchNamespaceWriters(b *testing.B, nss, perNS int) {
 			return err
 		}
 		w.head = r.Items[0].IDs[0]
+		if fresh != nil {
+			select {
+			case fresh <- [3]string{w.ns, w.name, w.head}:
+			default:
+			}
+		}
 		return nil
 	}
 	for _, w := range ws {
@@ -92,6 +106,24 @@ func benchNamespaceWriters(b *testing.B, nss, perNS int) {
 	cpu0, disk0 := processCPU(), diskWrites()
 	txns0, held0, commit0 := e.lockTimes.txns.Load(), e.lockTimes.held.Load(), e.lockTimes.commit.Load()
 	ckpt0 := e.wal.held.Load()
+	var reads atomic.Int64
+	var rwg sync.WaitGroup
+	if readers > 0 {
+		fresh = make(chan [3]string, 1024)
+		for range readers {
+			rwg.Add(1)
+			go func() {
+				defer rwg.Done()
+				for r := range fresh {
+					if _, err := e.ResourceRev(context.Background(), r[0], r[1], r[2], cred); err != nil {
+						b.Error(err)
+						return
+					}
+					reads.Add(1)
+				}
+			}()
+		}
+	}
 	b.ResetTimer()
 	start := time.Now()
 	for _, w := range ws {
@@ -115,6 +147,11 @@ func benchNamespaceWriters(b *testing.B, nss, perNS int) {
 	wg.Wait()
 	el := time.Since(start)
 	b.StopTimer()
+	if fresh != nil {
+		close(fresh)
+		rwg.Wait()
+		b.ReportMetric(float64(reads.Load())/float64(b.N), "reads/write")
+	}
 	cpu, disk := processCPU()-cpu0, diskWrites()-disk0
 	sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
 	b.ReportMetric(float64(b.N)/el.Seconds(), "writes/s")
