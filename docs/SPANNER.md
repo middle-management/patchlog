@@ -317,7 +317,7 @@ files `docs/capacity/spanner-gcp-2026-11-25-run5/`):
   second of this load; beyond it, Spanner's CPU a write, or more processing units.
 
 Next: the same run at 2,000 processing units, to see whether a node more doubles it. And the
-check made cheaper: its namespace read from the name's index alone (migration 004, the index
+check made cheaper: its namespace read from the name's index alone (migration 003, the index
 including the columns the check reads, which change once a group), and the seq of the revision
 asked for taken from the head when the head is the one asked for, as a write's If-Match mostly
 is, without a lookup of its own (`lookupCheckSpanner`); not measured yet.
