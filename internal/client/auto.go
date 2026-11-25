@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 )
@@ -26,10 +27,12 @@ import (
 //     the answer: a view it then reads through, discarding the
 //     unfiltered answer, or "" for a grant that reads there unrestricted
 //     or by fixed names, or that the exchange refuses, which keeps the
-//     plain URLs. An answer marked private remembers "" without asking.
-//     A 401 or 403 at a remembered view's URLs forgets it and asks once
-//     more; a different bearer is a different entry. A request without a
-//     grant never asks.
+//     plain URLs. An answer marked private asks nothing. A 401 or 403 at
+//     a remembered view's URLs forgets it and asks once more: a new view,
+//     or "" for a grant that now reads unrestricted; a grant the exchange
+//     then refuses, as one expired or revoked, gets the view's refusal,
+//     then and at every later read of the namespace. A different bearer is a different entry. A request without a grant
+//     never asks.
 //
 // WithUnfilteredOnly turns all of it off, for a caller that needs the
 // verifiable log: the plain reads then answer a partial reader's
@@ -60,39 +63,38 @@ type viewTable struct {
 type viewSlot struct {
 	done chan struct{}
 	view string
-	err  error
+	// refused is the refusal remembered as view "", err a failure
+	// remembered by no one; ended the refusal of a grant that had a view,
+	// which its reads of ns return from then on.
+	refused, err, ended error
 }
 
 func (c *Client) viewKey(ns string) string { return c.bearer + "\n" + ns }
 
-// knownView is the view remembered for ns, and whether one is.
-func (c *Client) knownView(ns string) (string, bool) {
+// knownView is the view remembered for ns, and whether one is, or the
+// refusal its grant's view ended with.
+func (c *Client) knownView(ns string) (view string, known bool, ended error) {
 	c.views.mu.Lock()
 	s := c.views.m[c.viewKey(ns)]
 	c.views.mu.Unlock()
 	if s == nil {
-		return "", false
+		return "", false, nil
 	}
 	select {
 	case <-s.done:
-		return s.view, s.err == nil
+		return s.view, s.err == nil, s.ended
 	default:
-		return "", false
+		return "", false, nil
 	}
 }
 
-// rememberView records view for ns unless an entry exists.
-func (c *Client) rememberView(ns, view string) {
+// endView remembers that the grant's view of ns ended with err.
+func (c *Client) endView(ns string, err error) {
+	s := &viewSlot{done: make(chan struct{}), ended: err}
+	close(s.done)
 	c.views.mu.Lock()
-	defer c.views.mu.Unlock()
-	if c.views.m == nil {
-		c.views.m = map[string]*viewSlot{}
-	}
-	if _, ok := c.views.m[c.viewKey(ns)]; !ok {
-		s := &viewSlot{done: make(chan struct{}), view: view}
-		close(s.done)
-		c.views.m[c.viewKey(ns)] = s
-	}
+	c.views.m[c.viewKey(ns)] = s
+	c.views.mu.Unlock()
 }
 
 // forgetView drops the entry for ns if it still names view.
@@ -115,33 +117,41 @@ func (c *Client) forgetView(ns, view string) {
 // remembers the answer. A transient failure (Transient: no answer, 408,
 // 429, 5xx) is returned and remembered by no one; any other refusal, as
 // of a deployment without /edge-grants or a grant the exchange refuses,
-// is remembered as "": the plain URLs.
-func (c *Client) learnView(ctx context.Context, ns string) (string, error) {
+// is remembered as "", the plain URLs, and returned as refused.
+func (c *Client) learnView(ctx context.Context, ns string) (view string, refused, err error) {
 	k := c.viewKey(ns)
-	c.views.mu.Lock()
-	if c.views.m == nil {
-		c.views.m = map[string]*viewSlot{}
-	}
-	s := c.views.m[k]
-	if s != nil {
+	for {
+		c.views.mu.Lock()
+		if c.views.m == nil {
+			c.views.m = map[string]*viewSlot{}
+		}
+		s := c.views.m[k]
+		if s == nil {
+			break
+		}
 		c.views.mu.Unlock()
 		select {
 		case <-s.done:
-			return s.view, s.err
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", nil, ctx.Err()
 		}
+		if s.err == nil {
+			return s.view, s.refused, nil
+		}
+		if ctx.Err() != nil || !errors.Is(s.err, context.Canceled) && !errors.Is(s.err, context.DeadlineExceeded) {
+			return "", nil, s.err
+		}
+		// The read that asked was cancelled, not this one: ask again.
 	}
-	s = &viewSlot{done: make(chan struct{})}
+	s := &viewSlot{done: make(chan struct{})}
 	c.views.m[k] = s
 	c.views.mu.Unlock()
 
-	view, err := c.ViewOf(ctx, ns)
-	if err != nil && !Transient(err) && ctx.Err() == nil {
-		view, err = "", nil
+	s.view, s.err = c.ViewOf(ctx, ns)
+	if s.err != nil && !Transient(s.err) && ctx.Err() == nil {
+		s.view, s.refused, s.err = "", s.err, nil
 	}
-	s.view, s.err = view, err
-	if err != nil {
+	if s.err != nil {
 		c.views.mu.Lock()
 		if c.views.m[k] == s {
 			delete(c.views.m, k)
@@ -149,7 +159,7 @@ func (c *Client) learnView(ctx context.Context, ns string) (string, error) {
 		c.views.mu.Unlock()
 	}
 	close(s.done)
-	return view, err
+	return s.view, s.refused, s.err
 }
 
 // shared reports whether r's Cache-Control lets a shared cache keep it,
@@ -170,20 +180,29 @@ func autoRead[T any](ctx context.Context, c *Client, ns string, unfilteredOnly b
 		t, fa, _, err := plain(!unfilteredOnly)
 		return t, fa, err
 	}
-	v, known := c.knownView(ns)
+	v, known, ended := c.knownView(ns)
+	if ended != nil {
+		return zero, FilteredAt{}, ended
+	}
 	if known && v != "" {
 		t, fa, err := view(v)
 		if !IsAuth(err) {
 			return t, fa, err
 		}
 		// The view no longer reads for the grant, as when its rules
-		// changed: ask again, once.
+		// changed: ask again, once. A grant the exchange now refuses, as
+		// one expired or revoked, gets the view's refusal, never the
+		// unfiltered answer in its place.
 		c.forgetView(ns, v)
-		if v, err = c.learnView(ctx, ns); err != nil {
-			return zero, FilteredAt{}, err
-		}
-		if v != "" {
-			return view(v)
+		nv, refused, lerr := c.learnView(ctx, ns)
+		switch {
+		case lerr != nil:
+			return zero, FilteredAt{}, lerr
+		case refused != nil:
+			c.endView(ns, err)
+			return t, fa, err
+		case nv != "":
+			return view(nv)
 		}
 	}
 	// A shared answer may also be one the grant can't open, as a public
@@ -191,12 +210,9 @@ func autoRead[T any](ctx context.Context, c *Client, ns string, unfilteredOnly b
 	// view's key (§E.2.3): its view is looked up all the same.
 	t, fa, sh, err := plain(true)
 	if fa.Filtered() || known || !sh {
-		if err == nil && !fa.Filtered() && !known {
-			c.rememberView(ns, "")
-		}
 		return t, fa, err
 	}
-	v, lerr := c.learnView(ctx, ns)
+	v, _, lerr := c.learnView(ctx, ns)
 	if lerr != nil {
 		return zero, FilteredAt{}, lerr
 	}

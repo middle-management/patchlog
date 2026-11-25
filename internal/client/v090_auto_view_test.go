@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
@@ -226,4 +227,24 @@ func v090AutoView(t *testing.T, read string, sealed bool) {
 		t.Fatalf("after the rule changed: %d POST /edge-grants, want 1", e-e0)
 	}
 	round(r2, false, []string{"a1", "b1"})
+
+	// A grant that expires while it reads through its view gets the
+	// view's refusal, never the unfiltered answer in its place, and the
+	// client asks no more.
+	if public {
+		h := must(reader.NSHead(ctx, "n"))
+		s.Clock.Advance(2 * time.Hour)
+		e0, k0 := n.get()
+		for range 3 {
+			if es, fa, err := reader.NSLog(ctx, "n", h.ID, ""); !client.IsAuth(err) {
+				t.Fatalf("an expired grant's NSLog: %v %+v %v", err, fa, resources(es))
+			}
+			if lp, err := reader.LongPoll(ctx, "n", "", ""); !client.IsAuth(err) {
+				t.Fatalf("an expired grant's LongPoll: %v %+v", err, lp)
+			}
+		}
+		if e, k := n.get(); e+k > e0+k0+1 {
+			t.Fatalf("an expired grant asked %d times", e+k-e0-k0)
+		}
+	}
 }

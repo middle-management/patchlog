@@ -9,7 +9,8 @@
   namespace's redirect to the filtered log and `/heads`, and in a public namespace look the
   grant's view up with `ViewOf` once per grant and namespace (never without a grant, and not
   where an answer is marked `private`), remember it, and forget it on a `401`/`403` at its URLs,
-  asking again once. Each now returns a `FilteredAt` (`LongPollResult` embeds it) whose
+  asking again once; a grant the exchange then refuses (expired, revoked) keeps getting the
+  view's refusal, never the unfiltered answer. Each now returns a `FilteredAt` (`LongPollResult` embeds it) whose
   `Filtered()` says the answer isn't chain-verifiable (§10).
 - **`WithUnfilteredOnly`** (and `Client.Unfiltered`) keeps the unfiltered reads: a partial
   reader's redirect is a `*FilteredError`, now from the log and `/heads` calls too, and a public
