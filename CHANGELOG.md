@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.34.0
 
 ### Client: a read-filtering grant is a view
 
