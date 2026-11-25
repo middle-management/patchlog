@@ -295,7 +295,28 @@ keys; files `docs/capacity/spanner-gcp-2026-11-25-run3/`):
   its groups, at most one write on its own path (four before), and the writes answered alone
   after a group.
 
-Since: one write transaction of a namespace at a time per instance; not measured yet.
+**The fifth run** (`a279e22b`: one write transaction of a namespace at a time per instance;
+files `docs/capacity/spanner-gcp-2026-11-25-run5/`):
+
+| Busy namespaces | Written/s | Write p50 / p99 | Spanner CPU (high priority) |
+|---|---|---|---|
+| 1 | 615 | 153 / 315 ms | 19% |
+| 2 | 1,211 | 156 / 338 ms | 30% |
+| 4 | 1,967 | 191 / 343 ms | 46% |
+| 8 | 2,769 | 274 / 546 ms | 64% |
+| 16 | 3,161 | 474 / 1,094 ms | 83% |
+| 32 | 1,314 | 1,746 / 9,737 ms | |
+
+- **No aborts** (0–2 a minute, from about 1,000) and almost no lock waits; tails short up to 16
+  namespaces (p99 1.1 s, from 4.6), and one namespace's best yet (615 a second, a group's
+  transaction 27–29 ms).
+- **At 32 namespaces Spanner's CPU is full**, and the write's check, which is half of it, waits
+  61 ms instead of 7. Each core has 48 connections and a check holds one throughout, so the cores
+  queue behind them (about 800 checks a second a core); groups shrink to about 6 writes, which
+  costs Spanner more for each. One node (1,000 processing units) takes about 3,200 writes a
+  second of this load; beyond it, Spanner's CPU a write, or more processing units.
+
+Next: the same run at 2,000 processing units, to see whether a node more doubles it.
 
 ## The capacity bench on real Spanner
 
