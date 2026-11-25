@@ -273,7 +273,29 @@ keys; files `docs/capacity/spanner-gcp-2026-11-25-run3/`):
 - The tailer's search seeks now (801 rows a poll, from 28,000), but still costs 19 ms of CPU a
   poll, a fifth of the total.
 
-Since: the target namespace's row locked exclusively first; not measured yet.
+**The fourth run** (`03e0b130`: the target namespace's row locked exclusively first; files
+`docs/capacity/spanner-gcp-2026-11-25-run4/`):
+
+| Busy namespaces | Written/s | Write p50 / p99 | Spanner CPU (high priority) |
+|---|---|---|---|
+| 1 | 486 | 167 / 1,384 ms | 10% |
+| 2 | 1,160 | 152 / 353 ms | 23% |
+| 4 | 2,101 | 163 / 403 ms | 47% |
+| 8 | 2,820 | 215 / 2,108 ms | 46% |
+| 16 | 3,604 | 273 / 4,586 ms | 64% |
+| 32 | 2,001 | 1,523 / 5,185 ms | |
+
+- **The best yet up to 16 namespaces** (3,604 a second), but **32 fell back to 2,001**, with about
+  1,070 aborts a minute still and 2,473 s of lock waits on namespaces rows; every statement on a
+  namespace's row waited 50–120 ms there.
+- Locking the row first doesn't end the aborts: Spanner breaks a conflict by age (wound-wait),
+  and an older transaction asking for a row a younger one holds aborts it, whatever the order
+  they asked in. So several transactions of one namespace queued on its row still abort one
+  another. Now an instance runs its write transactions of a namespace one at a time (`spTurn`):
+  its groups, at most one write on its own path (four before), and the writes answered alone
+  after a group.
+
+Since: one write transaction of a namespace at a time per instance; not measured yet.
 
 ## The capacity bench on real Spanner
 

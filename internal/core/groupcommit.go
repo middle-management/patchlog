@@ -159,6 +159,10 @@ type nsGroup struct {
 	solo, checking int
 	queue          []*groupWrite
 	wake           chan struct{} // nudges a waiting worker
+	// On Spanner (spTurn): the namespace's turn to run a write
+	// transaction, one at a time, and the writes answered alone running.
+	turn  chan struct{}
+	alone int
 }
 
 // groups is the engine's group-commit state, per namespace name.
@@ -180,7 +184,7 @@ func (g *groups) get(ns string) *nsGroup {
 	}
 	s := g.ns[ns]
 	if s == nil {
-		s = &nsGroup{wake: make(chan struct{}, 1)}
+		s = &nsGroup{wake: make(chan struct{}, 1), turn: make(chan struct{}, 1)}
 		g.ns[ns] = s
 	}
 	return s
@@ -188,7 +192,7 @@ func (g *groups) get(ns string) *nsGroup {
 
 // tidy forgets an idle namespace's state. Callers hold g.mu.
 func (g *groups) tidy(ns string, s *nsGroup) {
-	if !s.worker && s.solo == 0 && s.checking == 0 && len(s.queue) == 0 {
+	if !s.worker && s.solo == 0 && s.checking == 0 && s.alone == 0 && len(s.queue) == 0 {
 		delete(g.ns, ns)
 	}
 }
@@ -205,7 +209,11 @@ func (e *Engine) writeGrouped(ctx context.Context, req Request, items []Item, so
 	g := &e.groups
 	g.mu.Lock()
 	s := g.get(req.NS)
-	if !s.worker && s.solo < soloWrites && len(s.queue) == 0 && !e.noSolo {
+	solo := soloWrites
+	if e.spanner {
+		solo = 1 // one write transaction of a namespace at a time (spTurn)
+	}
+	if !s.worker && s.solo < solo && len(s.queue) == 0 && !e.noSolo {
 		// No group of the namespace here: the path without group commit.
 		// Writes beyond soloWrites queue, and their worker doesn't wait for
 		// this one longer than GroupCommitWait (a BeforeWriteLock hook may
@@ -221,6 +229,7 @@ func (e *Engine) writeGrouped(ctx context.Context, req Request, items []Item, so
 			g.tidy(req.NS, s)
 			g.mu.Unlock()
 		}()
+		defer e.spTurn(s)()
 		return e.writeAlone(ctx, req, items, source, isBatch, false, 0)
 	}
 	s.checking++
@@ -269,9 +278,37 @@ func (e *Engine) writeGrouped(ctx context.Context, req Request, items []Item, so
 	}
 	if w.alone {
 		g.alone.Add(1)
+		g.mu.Lock()
+		s.alone++
+		g.mu.Unlock()
+		defer func() {
+			g.mu.Lock()
+			s.alone--
+			g.tidy(req.NS, s)
+			g.mu.Unlock()
+		}()
+		defer e.spTurn(s)()
 		return e.writeAlone(ctx, req, items, source, isBatch, true, 1)
 	}
 	return w.res, nil
+}
+
+// spTurn waits for the namespace's turn to run a write transaction on
+// Spanner, and returns the function that gives it back; elsewhere it
+// returns at once. Spanner breaks a lock conflict by age (wound-wait): of
+// two transactions on one namespace's row, an older one asking for it
+// aborts the younger holding it, so several queued on the row aborted
+// one another (about 1,000 a minute at 32 namespaces in the fourth bench
+// run, docs/SPANNER.md), whatever the order they locked it in. The
+// namespace's appends are one at a time anyway, so this instance runs its
+// writes of the namespace one at a time: its groups, a write on its own
+// path (at most one, solo), and the writes answered alone after a group.
+func (e *Engine) spTurn(s *nsGroup) func() {
+	if !e.spanner {
+		return func() {}
+	}
+	s.turn <- struct{}{}
+	return func() { <-s.turn }
 }
 
 // take removes the first n queued writes and returns them. Callers hold
@@ -341,7 +378,9 @@ func (e *Engine) groupWorker(ns string, s *nsGroup) {
 		}
 		group := s.take(n)
 		g.mu.Unlock()
+		end := e.spTurn(s)
 		e.commitGroup(ns, group)
+		end()
 		for _, w := range group {
 			close(w.done)
 		}

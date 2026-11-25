@@ -1,0 +1,80 @@
+{
+  "timeSeries": [
+    {
+      "metric": {
+        "labels": {
+          "database": "patchlog"
+        },
+        "type": "spanner.googleapis.com/instance/cpu/utilization"
+      },
+      "resource": {
+        "type": "spanner_instance",
+        "labels": {
+          "instance_config": "regional-europe-west1",
+          "location": "europe-west1",
+          "project_id": "patchlog-515810",
+          "instance_id": "patchlog-bench"
+        }
+      },
+      "metricKind": "GAUGE",
+      "valueType": "DOUBLE",
+      "points": [
+        {
+          "interval": {
+            "startTime": "2026-11-25T12:56:19.490Z",
+            "endTime": "2026-11-25T12:56:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.68073341283881417
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T12:55:19.490Z",
+            "endTime": "2026-11-25T12:55:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.60925782752980873
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T12:54:19.490Z",
+            "endTime": "2026-11-25T12:54:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.4691936621060015
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T12:53:19.490Z",
+            "endTime": "2026-11-25T12:53:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.23997662923870955
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T12:52:19.490Z",
+            "endTime": "2026-11-25T12:52:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.1197463682935364
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T12:51:19.490Z",
+            "endTime": "2026-11-25T12:51:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.029793072069098141
+          }
+        }
+      ]
+    }
+  ],
+  "unit": "10^2.%"
+}
