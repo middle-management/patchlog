@@ -175,7 +175,13 @@ func (e *Engine) checkpointWait(mode string, wait time.Duration) (frames, done i
 	start := time.Now()
 	defer func() { e.wal.held.Add(int64(time.Since(start))) }()
 	ctx := context.Background()
-	c, err := e.db.Conn(ctx)
+	// The writer's connection, free while its caller holds Engine.mu
+	// (or, at Close, no write runs), rather than one a reader may hold.
+	pool := e.db
+	if e.wdb != nil {
+		pool = e.wdb
+	}
+	c, err := pool.Conn(ctx)
 	if err != nil {
 		return 0, 0, false, err
 	}

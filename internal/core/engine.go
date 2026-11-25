@@ -294,8 +294,14 @@ type Engine struct {
 	cfgMu       sync.Mutex
 	cfgCache    map[int64]*Config
 	stmts       stmtCache
-	rc          readCache
-	bearers     grantCache
+	// wdb is a SQLite file's writer: its one connection, which only
+	// transactions under Engine.mu take, and wstmts its prepared
+	// statements (openSQLiteWriter). Nil on Postgres and :memory:, whose
+	// writes run on db.
+	wdb     *sql.DB
+	wstmts  stmtCache
+	rc      readCache
+	bearers grantCache
 	// liveReads shares long-poll reads of a namespace log among their
 	// waiters (live.go), and liveDone keeps their recent answers;
 	// liveJoins counts the reads asked of them, and liveShared those made.
@@ -507,22 +513,28 @@ func Open(opt Options) (*Engine, error) {
 		stop:       make(chan struct{}),
 		started:    opt.Now().UTC(),
 	}
+	if !pg && opt.Path != ":memory:" {
+		if e.wdb, err = openSQLiteWriter(opt.Path); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	e.refsCache.MaxEntries = 65536
 	e.viewHeld.MaxEntries = 65536
 	e.rc.maxBytes = opt.ReadCacheBytes
 	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
 	if err := e.checkKeyStore(); err != nil {
-		db.Close()
+		e.closeDB()
 		return nil, err
 	}
 	if err := e.openStoreCodec(); err != nil {
 		e.comp.close()
-		db.Close()
+		e.closeDB()
 		return nil, err
 	}
 	if err := e.purgeRaisedE2E(context.Background(), legacy); err != nil {
 		e.comp.close()
-		db.Close()
+		e.closeDB()
 		return nil, fmt.Errorf("purging namespaces raised to e2e (--purge-raised-e2e): %w", err)
 	}
 	// After the gate, the migrations and the gate's purges: E3 snapshots
@@ -532,7 +544,7 @@ func Open(opt Options) (*Engine, error) {
 		n, err := e.cleanStaleSnapshots(context.Background())
 		if err != nil {
 			e.comp.close()
-			db.Close()
+			e.closeDB()
 			return nil, fmt.Errorf("deleting end-to-end snapshots behind a moved horizon (§7.1): %w", err)
 		}
 		if n > 0 {
@@ -542,14 +554,14 @@ func Open(opt Options) (*Engine, error) {
 	// (Not on a schema of an earlier version that tests open.)
 	if err := e.seedSealCountsAt016(context.Background()); err != nil {
 		e.comp.close()
-		db.Close()
+		e.closeDB()
 		return nil, fmt.Errorf("seeding the sealing counts (§E.2.1): %w", err)
 	}
 	e.warnLegacyE2E(context.Background(), legacy)
 	if pg && !opt.LocalRateBuckets {
 		// The buckets of every instance on the database (ratebuckets.go).
 		if e.rate.store, err = openBucketStore(opt.Path); err != nil {
-			db.Close()
+			e.closeDB()
 			return nil, err
 		}
 	}
@@ -557,7 +569,7 @@ func Open(opt Options) (*Engine, error) {
 		// The group commits' own connections (groupcommit.go).
 		if e.commits, err = openCommitPool(opt.Path); err != nil {
 			e.rate.close()
-			db.Close()
+			e.closeDB()
 			return nil, err
 		}
 	}
@@ -569,7 +581,7 @@ func Open(opt Options) (*Engine, error) {
 		if err != nil {
 			e.rate.close()
 			e.commits.close()
-			db.Close()
+			e.closeDB()
 			return nil, fmt.Errorf("starting the tailer: %w", err)
 		}
 		e.epoch = time.Now()
@@ -620,6 +632,14 @@ func Open(opt Options) (*Engine, error) {
 	return e, nil
 }
 
+// closeDB closes the database's pools, as Open fails.
+func (e *Engine) closeDB() {
+	e.db.Close()
+	if e.wdb != nil {
+		e.wdb.Close()
+	}
+}
+
 // Close stops the background loops and closes the database.
 func (e *Engine) Close() error {
 	first := false
@@ -630,10 +650,16 @@ func (e *Engine) Close() error {
 	e.bg.Wait()
 	e.resign()
 	e.stmts.close()
+	e.wstmts.close()
 	if first {
 		e.closeWAL()
 	}
 	err := e.db.Close()
+	if e.wdb != nil {
+		if werr := e.wdb.Close(); err == nil {
+			err = werr
+		}
+	}
 	e.comp.close()
 	e.rate.close()
 	e.commits.close()
@@ -744,6 +770,7 @@ type tx struct {
 	e      *Engine
 	now    time.Time
 	write  bool
+	writer bool            // on Engine.wdb, with its statements (stmts.go)
 	notify map[string]bool // namespaces whose logs changed
 	// wake are, per namespace in notify, the resources its new entries
 	// name (wakeFor), or nil when one of them concerns the whole
@@ -958,10 +985,19 @@ func (e *Engine) update(ctx context.Context, f func(t *tx) error) (err error) {
 
 func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []string, err error) {
 	if !e.pg {
-		e.stmts.prepare(e.db)
+		if e.wdb == nil {
+			e.stmts.prepare(e.db)
+		}
 		start := time.Now()
 		e.mu.Lock()
 		locked := time.Now()
+		if e.wdb != nil {
+			// On the writer's connection, which a checkpoint holds under
+			// Engine.mu (checkpointWait): preparing before the lock, a
+			// write waited for it without queuing on the mutex, and the
+			// checkpoint loop's TryLock kept taking it.
+			e.wstmts.prepare(e.wdb)
+		}
 		defer func() {
 			held := time.Since(locked)
 			e.mu.Unlock()
@@ -1001,12 +1037,21 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 			c.give()
 		}
 	}
+	writer := false
+	if sqlTx == nil && e.wdb != nil {
+		// SQLite: the writer's own connection (openSQLiteWriter); this
+		// goroutine holds Engine.mu.
+		if sqlTx, err = e.wdb.BeginTx(ctx, nil); err != nil {
+			return nil, err
+		}
+		writer = true
+	}
 	if sqlTx == nil {
 		if sqlTx, err = e.db.BeginTx(ctx, nil); err != nil {
 			return nil, err
 		}
 	}
-	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}, wake: map[string]map[string]bool{}}
+	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, writer: writer, notify: map[string]bool{}, wake: map[string]map[string]bool{}}
 	committing := false
 	defer func() {
 		if p := recover(); p != nil {

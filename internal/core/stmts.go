@@ -99,6 +99,15 @@ func (c *stmtCache) close() {
 // transaction keeps of its branches' chains (chain.go): all of them go
 // through here.
 
+// stmts is the statement cache of the database t runs on: a statement
+// prepared on one *sql.DB can't run in another's transaction.
+func (t *tx) stmts() *stmtCache {
+	if t.writer {
+		return &t.e.wstmts
+	}
+	return &t.e.stmts
+}
+
 func (t *tx) QueryRow(q string, args ...any) *sql.Row {
 	if t.solo {
 		return t.soloQueryRow(q, args)
@@ -112,7 +121,7 @@ func (t *tx) QueryRow(q string, args ...any) *sql.Row {
 	if t.e.pg {
 		return t.Tx.QueryRow(rebind(q), pgArgs(args)...)
 	}
-	if s := t.e.stmts.get(q); s != nil {
+	if s := t.stmts().get(q); s != nil {
 		return t.Tx.StmtContext(context.Background(), s).QueryRow(args...)
 	}
 	return t.Tx.QueryRow(q, args...)
@@ -131,7 +140,7 @@ func (t *tx) Query(q string, args ...any) (*sql.Rows, error) {
 	if t.e.pg {
 		return t.Tx.Query(rebind(q), pgArgs(args)...)
 	}
-	if s := t.e.stmts.get(q); s != nil {
+	if s := t.stmts().get(q); s != nil {
 		return t.Tx.StmtContext(context.Background(), s).Query(args...)
 	}
 	return t.Tx.Query(q, args...)
@@ -151,7 +160,7 @@ func (t *tx) Exec(q string, args ...any) (sql.Result, error) {
 	if t.e.pg {
 		return t.Tx.Exec(rebind(q), pgArgs(args)...)
 	}
-	if s := t.e.stmts.get(q); s != nil {
+	if s := t.stmts().get(q); s != nil {
 		return t.Tx.StmtContext(context.Background(), s).Exec(args...)
 	}
 	return t.Tx.Exec(q, args...)

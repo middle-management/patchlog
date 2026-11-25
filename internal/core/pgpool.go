@@ -114,7 +114,8 @@ func (p pgPool) size(db *sql.DB, n int) {
 }
 
 // mainConns is the size of the main pool on Postgres without
-// pool_max_conns, as of a SQLite file's (openSQLite).
+// pool_max_conns: four connections per CPU, since a connection mostly
+// waits on a round trip to the server.
 func mainConns() int { return 4 * runtime.GOMAXPROCS(0) }
 
 // sideConns is the size of a small pool beside a main pool of main

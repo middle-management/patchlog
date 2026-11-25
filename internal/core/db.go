@@ -53,13 +53,7 @@ func openSQLite(path string, fsys fs.FS, before func(db *sql.DB, pg bool) error)
 			return nil, err
 		}
 	}
-	// wal_autocheckpoint(0): no checkpoint inside a write's COMMIT; the
-	// engine runs them alongside its writer (checkpoint.go).
-	dsn := sqlitedsn.DSN(path, "_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)&_pragma=wal_autocheckpoint(0)&_txlock=immediate")
-	if path == ":memory:" {
-		dsn = sqlitedsn.DSN(path, "_pragma=foreign_keys(ON)&_pragma=secure_delete(ON)&_txlock=immediate")
-	}
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +65,7 @@ func openSQLite(path string, fsys fs.FS, before func(db *sql.DB, pg bool) error)
 		// schema and loses its prepared statements, and database/sql keeps
 		// only two idle ones by default, so under concurrent reads most of
 		// the time went to reopening connections.
-		n := 4 * runtime.GOMAXPROCS(0)
+		n := readerConns()
 		db.SetMaxOpenConns(n)
 		db.SetMaxIdleConns(n)
 	}
@@ -133,4 +127,41 @@ func nsKindCode(k string) int {
 		}
 	}
 	panic("unknown ns kind " + k)
+}
+
+// sqliteDSN is the DSN of the SQLite file path (or ":memory:").
+// wal_autocheckpoint(0): no checkpoint inside a write's COMMIT; the engine
+// runs them alongside its writer (checkpoint.go).
+func sqliteDSN(path string) string {
+	if path == ":memory:" {
+		return sqlitedsn.DSN(path, "_pragma=foreign_keys(ON)&_pragma=secure_delete(ON)&_txlock=immediate")
+	}
+	return sqlitedsn.DSN(path, "_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)&_pragma=wal_autocheckpoint(0)&_txlock=immediate")
+}
+
+// readerConns is the size of a SQLite file's main pool, which every
+// transaction but the writer's takes: two connections per CPU. All the
+// connections of a process share one page cache, behind one mutex (the
+// driver's SQLite is built with SQLITE_ENABLE_MEMORY_MANAGEMENT), which
+// each takes for every page it reads; and in WAL mode a read transaction
+// that begins after a commit empties its connection's share of it. So
+// readers beyond the CPUs, which add no throughput to reads served from
+// memory, made the writer wait on that mutex under Engine.mu: with 16
+// connections on 4 CPUs instead of 8, writers alongside readers committed
+// 5–13% less (BenchmarkNamespaceWriters, readers=8).
+func readerConns() int { return 2 * runtime.GOMAXPROCS(0) }
+
+// openSQLiteWriter opens the one connection of a SQLite file's writer
+// (Engine.wdb): every write transaction runs on it, under Engine.mu, and so
+// do the checkpoints taken under Engine.mu (checkpointWait). On the main
+// pool the writer queued for a connection, holding Engine.mu, behind reads
+// that held them all; none of those can take this one.
+func openSQLiteWriter(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", sqliteDSN(path))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	return db, nil
 }

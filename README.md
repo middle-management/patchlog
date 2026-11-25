@@ -3852,6 +3852,20 @@ patchlog grant mint --key "$NSKEY" --block '{"kid":"editors","sub":"ann","ns":["
   a write); 16 namespaces of 8 writers from 1,640 to 3,000. One writer gained from the
   checkpoints alone (1,820 to 2,520), and namespaces with too few writers to group (16 of 2)
   only from them.
+- **SQLite connections.** Write transactions, and the checkpoints taken under the mutex, run on
+  one connection of their own, so the writer never queues behind reads for one while it holds
+  the mutex; everything else shares a pool of 2 × `GOMAXPROCS` connections (4 × before). All of
+  a process's connections share one page cache behind one mutex (the driver's SQLite is built
+  with `SQLITE_ENABLE_MEMORY_MANAGEMENT`), which a connection takes for every page it reads, and
+  in WAL mode a read transaction that begins after a commit empties its connection's share of
+  it. Readers beyond the CPUs added no throughput, and made the writer wait on that mutex under
+  the write lock (on EC2, a `c7g.2xlarge` with 32 connections, about 65 µs of each write's
+  310). With writers beside eight readers that read each new revision once
+  (`-bench 'NamespaceWriters/.*/readers=8'`, medians of six, 4 vCPUs), 4 namespaces of 8
+  writers went from 2,590 to 2,930 writes a second and 16 namespaces of 8 from 2,680 to 2,960
+  (held 361–373 to 326–328 µs a write); without readers 3 to 10% more. One writer alone loses
+  about 5% (2,690 to 2,520): its check no longer runs on the connection that made the last
+  commit, whose cache stayed warm.
 - **Additions to the D.2 layout**: `namespaces.head_seq/config_seq/base_config_seq`,
   `ns_log.body` (the canonical entry exactly as hashed) and `ns_log.config_seq`,
   `ns_config.doc`, `revisions.signature/schema_ref`, `revisions.rules` (the schema rules a

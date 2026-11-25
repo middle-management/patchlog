@@ -127,6 +127,11 @@ core, decided by the grant's own read rules. About 86,000 lines are removed and 
 - **Postgres: group commits get connections of their own**, a pool a quarter of the main pool's
   size (at least 2), so a group no longer queues behind every write's check; with all of them
   busy a group takes a connection of the main pool as before.
+- **SQLite: the writer has a connection of its own, and readers 2 × `GOMAXPROCS`** (4 ×
+  before; README "Heavy work outside the write lock", SQLite connections). All of a process's
+  connections share one page cache behind one mutex, which readers beyond the CPUs made the
+  writer wait on under its lock; writers beside readers commit 10–13% more, one writer alone
+  about 5% less. No setting changes.
 - **Upgrading on Postgres: count connections again.** An instance now opens up to a quarter
   more for its group commits (4 × `GOMAXPROCS` + 2 × `GOMAXPROCS` in all by default). A
   `pool_max_conns` set high as a ceiling is now the pool's size: `pool_max_conns=100` on 4 vCPUs
