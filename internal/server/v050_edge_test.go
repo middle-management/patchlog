@@ -574,6 +574,10 @@ func TestV050EdgeGrantsRateLimits(t *testing.T) {
 	expect(t, exchange(hank), 200)
 	expect(t, exchange(hank), 200)
 	expectRate("hank's third", exchange(hank), "exchangeRate")
+	// v0.90: with the bucket empty, the prefix cap's 400 still answers,
+	// never 429 (§C.5.2 Answer, CONFORMANCE Access 105).
+	expect(t, e.issueGrants(e.grant(f.issuer, "user:hank", []string{"sec"}, []string{"read"},
+		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": edgeNames("n", 101)}}}})), 400)
 
 	// An allowance's bucket is a write bucket: exchanges don't draw on it.
 	al := g("user:al")

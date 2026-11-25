@@ -37,6 +37,7 @@ type v75s struct {
 
 type v75sOpts struct {
 	env     []envOpt
+	srv     []Option // server options beside the edge grants
 	matches func(doc map[string]any)
 }
 
@@ -50,7 +51,7 @@ func newV75s(t *testing.T, o v75sOpts) *v75s {
 		}
 		o.Maximums.ExchangeRate = core.Rate{Rate: 1e9, Burst: 1e9}
 	}
-	e := newEnvWith(t, []Option{WithEdgeGrants(ck)}, append([]envOpt{withAuth(&priv), fast}, o.env...)...)
+	e := newEnvWith(t, append([]Option{WithEdgeGrants(ck)}, o.srv...), append([]envOpt{withAuth(&priv), fast}, o.env...)...)
 	e.opPriv = priv
 	w := &v75s{tenv: e, ck: ck, k: newKey("k"), cat: newKey("reader-01")}
 	cat := map[string]any{"read": "grant", "keys": []any{w.k.entry("*")}}

@@ -147,12 +147,39 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 	}
 	atOnce := reqCursor < current
 	deadline := clock.end(current)
+	// noChange is the 204 of a wait that shows nothing: header names
+	// since, the last entry judged whole, which the next poll gives back.
+	noChange := func(public bool) {
+		cur := clock.cursor(time.Now())
+		if reqCursor+1 > cur {
+			cur = reqCursor + 1
+		}
+		s.setLive(w, r, public, "public, max-age=0, s-maxage=2", tags)
+		if since != "" {
+			// Without since the header is absent, so the client's next
+			// since stays empty (§7.7 Answer).
+			w.Header().Set(header, since)
+		}
+		w.Header().Set("X-Cursor", strconv.FormatInt(cur, 10))
+		w.WriteHeader(204)
+	}
+	public := false
 	for {
 		woken := wait()
 		if testLongPollFetch != nil {
 			testLongPollFetch()
 		}
 		lg, err := fetch(r.Context(), since)
+		if core.ReadBudgetRanOut(err) {
+			// The wait's one budget ran out, at a read check or judging
+			// an entry, before anything was shown: 204 naming since, the
+			// last entry judged whole, never the refusal a range's read
+			// gives (§6.6 Validation work, §7.7, v0.90). Only that
+			// refusal: a revoked or expired grant's, a purge's or any
+			// other error answers as it is, whatever the budget.
+			noChange(public)
+			return
+		}
 		if err != nil {
 			// A partial reader, by its grant: the filtered long-poll
 			// (§7.9 URLs).
@@ -167,6 +194,15 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 		}
 		if lg.Status != 200 {
 			s.writeLog(w, r, lg, ns, tags)
+			return
+		}
+		public = lg.Public
+		if len(lg.Entries) == 0 && s.e.ReadBudgetSpent(r.Context()) {
+			// Ran out in a fetch that shows nothing yet passed: the wait
+			// has run out (§6.6: running out fails the whole request),
+			// so 204 now, never a wait on whose next fetch's refusal,
+			// another's, the spent budget would hide.
+			noChange(public)
 			return
 		}
 		if len(lg.Entries) > 0 {
@@ -192,18 +228,7 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 				return
 			}
 		}
-		cur := clock.cursor(time.Now())
-		if reqCursor+1 > cur {
-			cur = reqCursor + 1
-		}
-		s.setLive(w, r, lg.Public, "public, max-age=0, s-maxage=2", tags)
-		if since != "" {
-			// Without since the header is absent, so the client's next
-			// since stays empty (§7.7 Answer).
-			w.Header().Set(header, since)
-		}
-		w.Header().Set("X-Cursor", strconv.FormatInt(cur, 10))
-		w.WriteHeader(204)
+		noChange(lg.Public)
 		return
 	}
 }

@@ -20,6 +20,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pgtest"
@@ -81,6 +82,9 @@ type Options struct {
 	// Wrap, if set, wraps the server's handler, e.g. to change state
 	// between two requests of a flow.
 	Wrap func(http.Handler) http.Handler
+	// EdgeGrants offers POST /edge-grants (§C.5.2), its cookies signed
+	// with a random key.
+	EdgeGrants bool
 }
 
 // Server is a running test server.
@@ -138,7 +142,11 @@ func New(t testing.TB, opt Options) *Server {
 		t.Fatal(err)
 	}
 	s.Engine = e
-	var h http.Handler = server.New(e)
+	var sopts []server.Option
+	if opt.EdgeGrants {
+		sopts = append(sopts, server.WithEdgeGrants(edge.NewCookies("", nil)))
+	}
+	var h http.Handler = server.New(e, sopts...)
 	if opt.Wrap != nil {
 		h = opt.Wrap(h)
 	}

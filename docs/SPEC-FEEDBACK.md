@@ -1,174 +1,198 @@
 # Reference-implementation notes for the spec writer
 
-`docs/SPEC.md` mirrors the canonical specification, now at **v0.89**, with `docs/SERVICES.md` and
+`docs/SPEC.md` mirrors the canonical specification, now at **v0.90**, with `docs/SERVICES.md` and
 `docs/TOOLS.md`, split from it in v0.80. This file collects what the reference does that the text
-doesn't yet describe. Open notes come in one list, from implementing v0.88 and v0.89; cite them as
-"v0.89 Open n". v0.88 answered the v0.87 list ("v0.87 Open n", 59 notes, and its three reference
-gaps): what it settled is under "Settled in v0.88", and what it left open is rewritten in the new
-list, marked "was v0.87 Open n". v0.87 answered the v0.86 list (Settled in v0.87), v0.86 the v0.85
+doesn't yet describe. Open notes come in one list, from implementing v0.90; cite them as
+"v0.90 Open n". v0.90 answered the v0.89 list ("v0.89 Open n", 17 notes): what it settled is
+under "Settled in v0.90", and what it left open is rewritten in the new list, marked "was v0.89
+Open n". v0.88 answered the v0.87 list (Settled in v0.88, 59 notes and three reference gaps),
+v0.87 the v0.86 list (Settled in v0.87), v0.86 the v0.85
 list (Settled in v0.86) and the four questions of the branch-limit report
 (docs/capacity/branches/report.md), v0.85 the v0.82 list (Settled in v0.85), v0.82 the v0.81 list
 (Settled in v0.82), the v0.77 list was answered in v0.78 to v0.81 (Settled in v0.81), and earlier
 lists before it.
 
-## Open from v0.89
+## Open from v0.90
 
-From implementing v0.88 and v0.89 (branch `spec-v089`). Numbered afresh; cite these as "v0.89 Open
-n". Each entry gives the section, what the reference does now (the conservative reading where it
-had a choice) and the question. Notes from v0.87 that v0.88 leaves open are carried in place, by
-subject, marked "was v0.87 Open n" and cut to what remains, with their references moved to v0.89's
-sections; v0.88 counts those answered, so each says what is left. The order is: cookies and
-exchanges (1–2), filtered answers, keys and sealing at `sealed` (3–8), caches and budgets (9–10),
-services and federation (11–13), documents and bundles (14–15) and tools (16–17). Where the
+From implementing v0.90 (branch `spec-v090`). Numbered afresh; cite these as "v0.90 Open n". Each
+entry gives the section, what the reference does now (the conservative reading where it had a
+choice) and the question. Notes from v0.89 that v0.90 leaves open are carried in place, by
+subject, marked "was v0.89 Open n" and cut to what remains, with their references moved to v0.90's
+sections; v0.90 counts all 17 answered, so each says what is left. The order is: public views and
+their refusals (1–2), keys and sealing at `sealed` (3–4), the namespace log, caches and
+redirects (5–7), budgets (8), services and federation (9–12) and documents (13). Where the
 reference does less than the text says, that is under Reference gaps, after the list. Sections are
 SPEC.md's unless TOOLS.md is named; Addendum A and §E.2.6 are in SERVICES.md. Scenario numbers
 repeat across CONFORMANCE's groups: "Encryption scenario n" is one under "Encryption levels and
 epochs", "Filtered reads scenario n" one under "Filtered reads (§7.9)".
 
-17 are open: 11 from this version's work and 6 carried.
+13 are open: 8 from this version's work and 5 carried.
 
-1. **The `exp` seconds an exchange may take** (§C.5.2 Answer, §7.9 `view`, SERVICES §A.4, Filtered
-   reads scenario 48; was v0.87 Open 16). Settled: the `503` (`behind`) draws the `exchangeRate`
-   token and sets no cookie. Left: §C.5.2 and scenario 48 give it where every future second is "that
-   of a `403` cookie for the same prefix". The reference skips a second held by any cookie it must
-   tell this one apart from, a live one too, and answers `503` when none is left, at the origin's
-   `view` prefixes as at the index. *Propose:* "that of another cookie for the same prefix that it
-   must tell it apart from". *Question:* is a live cookie's second to count?
+1. **How a consumer of a public namespace learns its view** (§7.9 Where, `view`, §7 step 1, §C.5.2,
+   §E.2.3, Filtered reads scenarios 95, 96). "Only URLs under a view prefix take it; every other
+   read ignores it (§7 step 1), so none redirects to a filtered form", and a `view` is a hash of
+   the grant's `subjects`, which a client has no cause to compute. The reference never redirects a
+   grant at a public namespace's unfiltered URLs, so its client asks for its view: `POST
+   /ns/{ns}/keys` in a sealed namespace, and the edge exchange (§C.5.2) otherwise, each drawing
+   `exchangeRate`. *Question:* should §7.9 Where name how a consumer of a public namespace learns
+   its view, and say that learning it costs an exchange or key request?
 
-2. **A document that moves during the exchange** (§A.4 Private namespaces, Filtered reads scenario
-   46; was v0.87 Open 18). v0.88 counts this answered; left: §A.4 gives `503` (`behind`) for an
-   exchange whose cookie would be `403` at once, as a key or role its `view` draws on has changed
-   since the checkpoint it is judged at. The reference answers `503` also when the namespace
-   document moved between its read and the grant's verification without changing either. *Question:*
-   is any move meant?
+2. **Refusals at a public namespace's view URLs** (§7 step 1 to 3, §7.9 Where and Unrestricted
+   readers, Filtered reads scenario 95). §7 now keeps steps 2 and 3 for "reads under a view
+   prefix", so there a grant that doesn't cover the namespace is `403` (§7 step 2), where the
+   reference answered `401`, and the same grant at the unfiltered URLs is `200`, ignored. A
+   `/ns/{ns}` cookie at a view URL reads every revision, unrestricted, its answers `private,
+   no-store` (§7.9), in a public namespace as in a private one. *Question:* is that split, `200`
+   unprefixed and `403` under the prefix for one grant, meant; and does the cookie's reading
+   hold in a public namespace?
 
-3. **`pl.last` of a filtered answer** (§7.9 Log ranges and Long-poll, §E.2.2 table, ENC-27). A
-   namespace range's `pl` has "the bounds of the page actually served (§7.1)", `[since, id]` for an
-   empty page; a filtered answer's is "its unfiltered form's, with `view` added". A filtered page
-   can scan entries it doesn't show, and may show none, and a resource's range has no unfiltered
-   analogue to copy. The reference sets `last` to the last entry the page scanned, which is its
-   `X-Log-Next` ("naming its last entry, shown or not"), or the range's end where it scanned
-   nothing; for a long-poll answer to its `X-Namespace-Revision` ("names the newest entry scanned");
-   for a resource's range to the last entry the page covers, or `since` where it is empty.
-   *Question:* should the text pin `pl.last`, so that a reader and a server agree on it?
+3. **A partial reader at `sealed` whose rules name only `/resource`** (§7.9 Partial reader, §E.2.3,
+   §E.2.2 table; was v0.89 Open 7). A grant whose read rules "refer to `/resource` without fixing
+   it", with none on `/doc`, is a partial reader and gets "only the `K_view` of its own `view`
+   (§E.2.1)", never a `K_r` or the `K_log` of an entry. v0.90 doesn't touch this. The reference
+   serves its resource log, long-poll and events through the filtered path, sealed for its view,
+   as it does a reader with `/doc` rules, though each revision of a name its rules allow is
+   visible. *Question:* is the filtered form the only one such a reader gets at `sealed`, and
+   should §7.9 or §E.2.3 say so?
 
-4. **A partial reader's resource URLs name no view** (§7.9 URLs, §E.2.2 `pl`, ENC-14). A partial
-   reader's filtered answer at a resource's URL (`/r/{ns}/{name}/log`, its long-poll and events) has
-   no `view` in the URL, which §7.9 gives only to the namespace's filtered URLs and a view's
-   immutable ones. Readers "MUST compare `pl`, and the namespace that `kid` names, with what they
-   fetched", and ENC-14 has "A filtered answer's `pl` is compared in full, its `view` included". At
-   those URLs the client takes the view from the JWE's `pl`, so it has no URL to compare it with.
-   *Question:* is that the check meant, or should the text name what the `view` is compared with
-   there?
+4. **Sealings from an earlier draft** (§1 earlier drafts, CONF-6, §E.2.2 Stored once, §E.2.1,
+   Encryption scenario 83; was v0.89 Open 8). Scenario 83 now has such content "refused or
+   discarded", or "served as stored", opening only to a `K_r` or `K_e` holder. The reference
+   discards the blob sealings of an earlier draft when it starts, and re-seals a resource's stored
+   rows on their next read, under the epoch their `kid` names; §E.2.2 has sealed bytes "produced
+   once, stored, and served identically forever". *Question:* does "a deployment may refuse or
+   discard such data" allow converting a row instead, so that the same `ETag` (`"{id}.{e}"`) then
+   names other bytes?
 
-5. **Plain entries inside a `K_view` body** (§E.2.2 Filtered answers, §7.9, ENC-27, Filtered reads
-   scenario 76). Only a log entry shown with `patches` is "there as its stored JWE (above)".
-   Tombstones, revisions shown without `patches` and `hidden` entries are plain JSON inside the
-   `K_view`-sealed `body`, and tombstones carry no keys ("tombstones excepted"). The plaintext is `{
-   "body", "keys" }`, and for a `/ns/{ns}` cookie, sealed under `K_n`, the text says the answers
-   "carry no `keys`": the reference carries `"keys": []`. *Question:* should the text say that those
-   entries are plain; and is `"keys": []` the form of "no `keys`", or is the member absent?
+5. **`schema` on a head entry at E3** (§7.4 Entries, §8.3 Limits of purge, Filtered reads scenario
+   97). `schema` is "absent where it has none and at E3", "recorded when the entry is written".
+   The reference stores it whatever the level and leaves it out when it serves the entry if the
+   namespace's current level is E3, reading "at E3" as the level now, not the level at the write
+   (levels never go down, §7.1), so an entry written at E2 loses its hint once the namespace is
+   E3. A batch entry records a per-resource map of them, and each is placed on its head item when
+   the entry is served. *Question:* is the current level meant; and should §7.4 say that a batch
+   keeps one `schema` per resource, though `schema` is on "a `head` entry, a batch's included"?
 
-6. **A reader with `/doc` rules who isn't a partial reader** (§E.2.3 What a grant gets, §7.9 Where,
-   TOOLS §F.8, Filtered reads scenarios 72, 73). A grant whose read rules refer to `/doc` in a
-   branch, a public namespace or on a server with filtered reads off is no partial reader, so at
-   `/keys` "Any other grant is `403`, in a public namespace too (§C.2)", and a sealed branch gives
-   it no keys (§F.8). Its unfiltered resource log (`/r/{ns}/{name}/log`) still serves the stored
-   per-entry JWEs where every entry is readable by its rules, ciphertext it can't open, as scenario
-   73 accepts of a partial reader's fetch by URL. *Question:* intended; or is such a log to be
-   refused, there?
+6. **What "once a view has been served" is** (§8.3 CDN, §7.9 URLs and Cost, Filtered reads
+   scenario 89; from v0.89 Open 9). A purge clears `ns:{ns}` "once a view of the namespace has been
+   served". The reference records service of a view durably, in a new table, at admission, bearer
+   reads included. An archive restore still clears `ns:{ns}` once a view is recorded, though
+   "archive restores ... needn't clear them" and scenario 89 needs none. *Question:* is admission
+   what "served" means; and is a restore's clearing harmless, or to be dropped?
 
-7. **A partial reader at `sealed` whose rules name only `/resource`** (§7.9 Partial reader, §E.2.3,
-   §E.2.2 table). A grant whose read rules "refer to `/resource` without fixing it", with none on
-   `/doc`, is a partial reader and gets "only the `K_view` of its own `view` (§E.2.1)", never a
-   `K_r` or the `K_log` of an entry. The reference therefore serves its resource log, long-poll and
-   events through the filtered path, sealed for its view, as it does a reader with `/doc` rules,
-   though each revision of a name its rules allow is visible. *Question:* is the filtered form the
-   only one such a reader gets at `sealed`, and should §7.9 or §E.2.3 say so?
+7. **A blob's own URL for a partial reader** (§7.9 Content, §E.2.2 Epochs, Filtered reads scenario
+   92). Scenario 92 has li's grant at the unprefixed `GET /r/matches/x/blob/{B}` answered `302` to
+   `…/blob/{B}/e/3`. The reference redirects a partial reader's grant there to the view prefix
+   first, `/ns/{ns}/view/{view}/r/matches/x/blob/{B}`, whose `302` names the epoch as §7.9 Content
+   has the prefixed form do ("the `302` naming the latest such `e`"). *Question:* is the scenario's direct `302` to `/e/{e}` required, or may
+   the redirect go through the prefix?
 
-8. **Sealings from an earlier draft** (§1 earlier drafts, CONF-6, §E.2.2 Stored once, §E.2.1,
-   Encryption scenario 83). Scenario 83 has content sealed under `K_r` itself "refused or discarded,
-   never served". The reference discards the blob sealings of an earlier draft when it starts, and
-   re-seals a resource's stored rows on their next read, under the epoch their `kid` names. §E.2.2
-   has sealed bytes "produced once, stored, and served identically forever". *Question:* does "a
-   deployment may refuse or discard such data" allow converting a row instead, so that the same
-   `ETag` (`"{id}.{e}"`) then names other bytes?
+8. **Which checks share a long-poll's budget** (§6.6 Validation work, §7.9 Long-poll, Filtered
+   reads scenario 101, §7.1). §6.6 gives a long-poll "one for its whole wait, shared by every check
+   it makes", and also "each revision judged for a filtered read (§7.9)" a budget; scenario 101
+   has each hidden revision at `/ns/{ns}/view/{view}/log` judged with its own. A partial reader's
+   long-poll at a resource's own URL (`/r/{ns}/{name}/log`) is a filtered read there as well, and
+   the reference gives each revision's `/doc` judgment there its own budget, as at the view URL. *Question:* is that the reading of
+   "shared by every check it makes", and should §6.6 or §7.9 Long-poll name the resource URLs?
 
-9. **What a purge or restore clears for a view** (§7.9 URLs and Cost, §8.3, §8.6, §9 tag table).
-   Filtered ranges are "immutable but for purges and archive restores since (§8.3, Cost)" and tagged
-   as their unfiltered forms, and `ns:{ns}` is on "every response of the namespace that §9's table
-   tags, and filtered reads at its `at`". The reference purges `ns:{ns}` on a purge and on an
-   archive restore once any view is recorded for the namespace, and not before; branches it skips,
-   filtered reads not covering them. *Question:* is the namespace's whole tag meant for the purge or
-   restore of one name, or should the text name a finer one?
+9. **The index's unfollowed namespaces at an exchange** (SERVICES §A.4 Unavailable namespaces,
+   Coverage, §C.5.2 All or nothing, Filtered reads scenario 91; from v0.89 Open 13). (1) §A.4
+   has an exchange for an unfollowed namespace answer `404` "only where no other refusal is `401`
+   or `403`". The reference answers `404` for an exchange whose grants name only unfollowed
+   namespaces, or purged and unfollowed ones, where it answered `403`. (2) A branch indexed without its base answers
+   `404` to every query, a public branch's included, not only an exchange. (3) The index doesn't
+   prefer a free second to a live cookie's for `exp`: two live cookies for a prefix usually
+   share one, which "live ones may share" allows. *Question:* for (1), is a purged namespace
+   among the "other refusal"; for (2), is every query, a public one too, meant?
 
-10. **A long-poll's validation budget** (§6.6 Validation work, §7.7, §7.9 Long-poll). "Each read
-    request, exchange and key request a grant is presented for gets one budget, shared by every
-    check it makes"; the reference gives a long-poll one for all its fetches, where an event stream
-    gets one for "each check an event stream repeats (§7.3)". A busy log judged by expensive rules
-    can exhaust it while the wait goes on, and a run-out before the first entry is shown fails the
-    request, `403` mid-wait. *Question:* should a wait renew the budget at each wake?
+10. **An oversized grant at `/_refs`** (§A.4, §C.4 Operator grants, §7 step 1; was v0.89 Open 11).
+    It has an operator grant ignored at `/_refs` (§C.4) and says nothing of an oversized one. At
+    `/_refs` of an index that also follows private namespaces an oversized grant is still `413`,
+    while an anonymous request gets the public hits. *Question:* is the `413` right where the
+    answer would otherwise be the public hits?
 
-11. **An oversized grant at `/_refs`** (§A.4, §C.4 Operator grants, §7 step 1; was v0.87 Open 23).
-    v0.88 counts this answered; left: it has an operator grant ignored at `/_refs` (§C.4) and says
-    nothing of an oversized one. At `/_refs` of an index that also follows private namespaces an
-    oversized grant is still `413`, while an anonymous request gets the public hits. *Question:* is
-    the `413` right where the answer would otherwise be the public hits?
-
-12. **The index's range filters** (§A.4; was v0.87 Open 37). `gt`, `ge`, `lt` and `le` with a `sort`
+11. **The index's range filters** (§A.4; was v0.89 Open 12). `gt`, `ge`, `lt` and `le` with a `sort`
     mark remain the reference's own, against Canonical URLs' "A parameter the service doesn't
     define, or a non-repeatable one given twice, is `400` (§7)". *Propose:* specify or drop them.
 
-13. **Followed purges before the importer was recorded, and an index's unfollowed base** (§G.1
-    Purges follow imports, TOOLS §G.4.4, SERVICES §A.4 Private namespaces, §C.4 Keys follow the
-    base). (1) The reference's `purge_follow_names` gains an importer, as §G.1 says "only import
-    batches by such a principal count"; names recorded before it follow nothing until they are
-    imported again. (2) The index still issues a cookie in a branch whose base it doesn't follow,
-    and a read under it is `403`, as "A cookie it can't judge so" is, since it can't judge the
-    base's entries; where it can't yet judge an exchange the text has `503` (`behind`). *Question:*
-    for each: should the follow state of batches already written be rebuilt from their authors;
-    should the exchange refuse a cookie it can't honour, and with what status?
+12. **Import batches recorded before the importer was** (§G.1 Purges follow imports, FED-28;
+    from v0.89 Open 13). §G.1 now has "only import batches by such a principal count, whenever
+    written", and FED-28 one by a principal named later counting. The reference's
+    `purge_follow_names` gained an importer in a migration; batches recorded before it follow
+    nothing until they are imported again, and their follow state isn't rebuilt from the
+    batches' authors. *Question:* is rebuilding it from the authors expected of a deployment that
+    upgrades, or does "whenever written" leave batches whose importer was never recorded out?
 
-14. **An undefined member an earlier draft stored** (§7.4 Versions, §1; was v0.87 Open 24). v0.88
-    counts this answered; left: "as a config write does" still names no exemption, and §1 says only
-    that a deployment "may refuse or discard such data". The reference lets a config write keep such
-    a member unchanged, so a namespace written before an upgrade can be frozen or rotated.
-    *Question:* may a write keep it, or must it be `422` until removed?
-
-15. **A `sealed` op in a namespace not labelled `e2e`** (§G.5.1 Importing, §8.6, §2.1; was v0.87
-    Open 26). v0.88 counts this answered; left: "A source whose protection isn't known, such as one
-    missing from a bundle's `access` (§G.5.1), counts as `private`", and Importing lists no step-1
-    refusal for a `sealed` op going into a target that isn't `e2e`. The reference refuses such a
-    bundle at step 1, override or not, so an e2e prune archive from before v0.82, which has no
-    `access`, can be restored and never imported. *Question:* should that be a stated step-1
-    refusal?
-
-16. **Replanning a release after a stop** (TOOLS §F.9 Merging, step 3). "Planning again after a stop
-    takes step 3's documents, those still unset, from the stored plan". The reference carries into
-    step 3 only documents that are live with the field unset; those already published, and those no
-    longer live, drop out of the new plan. *Question:* is dropping a document that is no longer live
-    meant, where the approved plan named it; or is it to be reported?
-
-17. **A folder delete or move where the index still says `400`** (TOOLS §H.3, §H.4 Names before
-    writes, §H.5). "The index's `400` for the facet path, as where the reader may see no file
-    document (§A.4), lists an empty folder, never one empty for a write", and a tool lists again
-    "with `?min` at the namespace head" where a name doesn't match. For a DAV folder delete or move
-    whose index still answers `400` after listing again at the head, the reference answers `503`.
-    *Question:* is `503` the status meant, there?
+13. **An undefined member an earlier draft stored** (§7.4 Versions, §1; was v0.89 Open 14).
+    "As a config write does" still names no exemption, and §1 says only that a deployment "may
+    refuse or discard such data". The reference lets a config write keep such a member
+    unchanged, so a namespace written before an upgrade can be frozen or rotated. *Question:* may
+    a write keep it, or must it be `422` until removed?
 
 ## Reference gaps
 
-Where the reference does less than v0.89 says, or computes something the text defines otherwise.
+Where the reference does less than v0.90 says, or computes something the text defines otherwise.
 They are not questions, so the count above leaves them out; each is the implementation's to
 close. Gaps 1 and 2 of the v0.87 list, the cookie death at the index over all read roles and the
 `/_refs` view over `{ns}:{v}`, are implemented and closed (Settled in v0.88).
 
-1. **Trees** (TOOLS §H.2, §H.5, §H.6, §H.7; was v0.87 Reference gap 3; the questions on Addendum H
-   are v0.89 Open 16 and 17). The reference doesn't do what the text says in four places: the
-   delete-then-write restore (§H.6) in trees creates a new document, where it restores in the flat
-   view; a folder moved to another namespace (§H.5) is `403`; the case-variant exceptions of §H.2
-   Siblings are not implemented; and sealed and end-to-end trees aren't offered (§H.7), a sealed
-   tree's `/doc` rules reading with a view key there as v0.89 has it.
+1. **Trees** (TOOLS §H.2, §H.5, §H.6, §H.7; was v0.87 Reference gap 3; the questions on Addendum H,
+   v0.89 Open 16 and 17, are settled in v0.90). The reference doesn't do what the text says in
+   four places: the delete-then-write restore (§H.6) in trees creates a new document, where it
+   restores in the flat view; a folder moved to another namespace (§H.5) is `403`; the
+   case-variant exceptions of §H.2 Siblings are not implemented; and sealed and end-to-end trees
+   aren't offered (§H.7), a sealed tree's `/doc` rules reading with a view key there as v0.90
+   has it.
+
+## Settled in v0.90
+
+v0.90 answers the 17 notes open from v0.89, with eight audit fixes. Its change log counts all 17
+answered and names none, so each was found by reading the v0.90 text and CONFORMANCE against it;
+where a clause or scenario settles it, the bullet quotes it. "n" below means v0.89 Open n. By the
+reference's reading 12 are settled and 5 stay open (7, 8, 11, 12, 14), rewritten above and marked
+"was v0.89 Open n". Carried, as v0.89 → v0.90: 7 → 3, 8 → 4, 11 → 10, 12 → 11, 14 → 13.
+Notes 9 and 13 are settled and leave a part: 9 as v0.90 Open 6, 13 as 9 and 12. Reference gap 1
+stays.
+
+- **1** (the `exp` seconds an exchange may take): §C.5.2: cookies last "less any whole seconds a
+  minter MAY take off so that no cookie shares its `exp` with a `403` cookie for the same prefix
+  (§7.9 `view`); live ones may share one, as they become `403` together". The `503` (`behind`)
+  when none is left is as before.
+- **2** (a document that moves during the exchange): SERVICES §A.4: "Other moves of the namespace
+  document while an exchange is judged are retried, the exchange answering `503` only after a
+  bounded number of tries (§A.5)".
+- **3** (`pl.last` of a filtered answer): §E.2.2 table: "`last` is the last entry the answer
+  covers, shown or not: a page's `X-Log-Next`, else its range's end, or a long-poll answer's
+  `X-Namespace-Revision` or `X-Revision`".
+- **4** (a partial reader's resource URLs name no view): §E.2.2 `pl`: a filtered answer's `view` is
+  compared "with the URL's, or, where the URL names none, with the `view` of the key `/keys` gave
+  the grant the request carried (§E.2.3)".
+- **5** (plain entries inside a `K_view` body): §E.2.2 Filtered answers: an entry shown with
+  `patches` "is there as its stored JWE (above) ... and every other entry as plain JSON"; §7.9:
+  under `K_n` they carry "`keys` `[]`", so the member is present and empty.
+- **6** (a reader with `/doc` rules who isn't a partial reader): Filtered reads scenario 90 is this
+  case: a `/doc`-ruled grant in a sealed branch gets "`200`, the stored entry JWEs, which it can't
+  open" from the resource log, and `403` at `/keys`. Scenario 72 no longer lists a public
+  namespace, where such a grant is now a partial reader.
+- **9** (what a purge or restore clears for a view): §8.3 CDN: purged "`ns:{ns}` once a view of the
+  namespace has been served"; §7.9 URLs: ranges are "immutable but for later purges, which clear
+  them (§8.3), and archive restores, which needn't clear them (Cost)"; scenario 89. What "served"
+  means is v0.90 Open 6.
+- **10** (a long-poll's validation budget): §6.6: "a long-poll one for its whole wait"; §7.9: a wait
+  may end `204` "where its budget runs out", naming "the last one judged whole"; scenario 101:
+  "never a budget renewed at each wake". Which checks share it is v0.90 Open 8.
+- **13** (followed purges before the importer was recorded; an index's unfollowed base): (1) §G.1:
+  "only import batches by such a principal count, whenever written", and FED-28; the reference
+  doesn't rebuild follow state (v0.90 Open 12). (2) SERVICES §A.4 lists "a branch whose bases'
+  namespace logs it doesn't all follow" as unfollowed, `404` "at its exchange too, which mints
+  no cookie", and scenario 91 has no `exchangeRate` token drawn; the reference does this (v0.90
+  Open 9).
+- **15** (a `sealed` op in a namespace not labelled `e2e`): §G.5.1 Importing refuses, "override or
+  not, a bundle with a `sealed` op in a line of a namespace that `access` doesn't give as `e2e`".
+- **16** (replanning a release after a stop): TOOLS §F.9 step 3: "those still live and unset, from
+  the stored plan ... and reports those no longer live".
+- **17** (a folder delete or move where the index still says `400`): TOOLS §H.3: "a folder delete or
+  move still answered that `400` after listing again at the namespace head is `503`".
 
 ## Settled in v0.88
 

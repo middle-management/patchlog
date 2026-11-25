@@ -28,6 +28,10 @@ func (ix *Index) SealedViews() map[string]string {
 // after CheckerTTL would.
 func (ix *Index) ExpireGrantChecks() { ix.checker.Invalidate() }
 
+// SetExchangeEntryHook sets a function exchangeEntry calls as it begins
+// (tests), nil to remove it.
+func SetExchangeEntryHook(f func(ns string)) { testExchangeEntry = f }
+
 // CountRows counts every row the index holds for ns (tests).
 func (ix *Index) CountRows(ns string) int {
 	total := 0

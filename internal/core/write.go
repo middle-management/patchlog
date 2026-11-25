@@ -1148,11 +1148,45 @@ func (t *tx) planEntry(p *writePlan, author int64, entries []any, inserted []his
 			// purges (§G.1).
 			t.recordImport(p.n, p.a, p.src, p.st)
 		}
-		return nsAppend{entry: entry, meta: batchGestures(p.st), author: author, hist: inserted}
+		return nsAppend{entry: entry, meta: t.withSchemas(p.n, batchGestures(p.st), p.st, true), author: author, hist: inserted}
 	}
 	le := t.logEntry(t.rev(inserted[0].target))
 	p.result.Entry = &le
-	return nsAppend{entry: entries[0].(map[string]any), meta: stepGestures(p.st[0].Steps[0]), res: &inserted[0].res, target: &inserted[0].target, author: author, hist: inserted}
+	return nsAppend{entry: entries[0].(map[string]any), meta: t.withSchemas(p.n, stepGestures(p.st[0].Steps[0]), p.st[:1], false), res: &inserted[0].res, target: &inserted[0].target, author: author, hist: inserted}
+}
+
+// withSchemas adds to meta, an entry's unhashed members, the schema of
+// each of its head entries (§7.4, v0.90): the $schema of the revision's
+// document, recorded as the entry is written, kept through pruning and
+// purge, and never hashed (§3.5). A single write's is "schema" itself;
+// a batch's are "schemas", mapping each item's resource to it, which
+// decorateNSEntry moves into the batch's head entries and never serves.
+// None is recorded for a tombstone, a document without $schema, or at
+// E3, where the server doesn't see the document (§E.3).
+func (t *tx) withSchemas(n *nsRow, meta map[string]any, st []*itemState, batch bool) map[string]any {
+	if t.nsLevel(n) >= levelE2E {
+		return meta
+	}
+	schemas := map[string]any{}
+	for _, s := range st {
+		final := s.steps[len(s.steps)-1]
+		if !final.del && !final.sealed && final.typed != "" {
+			schemas[s.Resource] = final.typed
+		}
+	}
+	if len(schemas) == 0 {
+		return meta
+	}
+	out := make(map[string]any, len(meta)+1)
+	for k, v := range meta {
+		out[k] = v
+	}
+	if !batch {
+		out["schema"] = schemas[st[0].Resource]
+	} else {
+		out["schemas"] = schemas
+	}
+	return out
 }
 
 // stepGestures are a step's gesture members, { gesture?, undoes? } (§7.4),

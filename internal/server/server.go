@@ -337,6 +337,12 @@ func (s *Server) cache(w http.ResponseWriter, r *http.Request, class string, pub
 		privateNoStore(w)
 		return
 	}
+	if underView(r) {
+		// Answers under a view prefix are cached as a private
+		// namespace's, a public one's too, so that no cached copy
+		// answers where the origin wouldn't (§7.9 Where, §9, v0.90).
+		public = false
+	}
 	h := w.Header()
 	if public {
 		h.Set("Cache-Control", class)
@@ -355,6 +361,12 @@ func (s *Server) cache(w http.ResponseWriter, r *http.Request, class string, pub
 		h.Set("Cache-Tag", strings.Join(tags, ","))
 		h.Set("Surrogate-Key", strings.Join(tags, " "))
 	}
+}
+
+// underView reports whether r is at a URL under a view prefix,
+// /ns/{ns}/view/{view}/… (§7.9 URLs).
+func underView(r *http.Request) bool {
+	return r.PathValue("view") != "" && strings.HasPrefix(r.URL.Path, "/ns/")
 }
 
 func noStore(w http.ResponseWriter) { w.Header().Set("Cache-Control", "no-store") }

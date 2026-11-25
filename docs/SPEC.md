@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.89 · 2026-11-20. See Changes at the end, and CHANGELOG.md for the full history.
+Status: draft v0.90 · 2026-11-24. See Changes at the end, and CHANGELOG.md for the full history.
 
 **Scope.** This document is the protocol: what a server stores, checks and answers. The core (§1–§10, §12, §13) specifies, implementation-neutrally, identity, validation, rules, the HTTP API with its filtered reads, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. Its addenda cover:
 
@@ -193,7 +193,7 @@ Nothing else is ranked:
   -
 From a sealed source, public or not, a blob copy or a batch's local `source` takes only a blob that opens:
 
-    - under an epoch it is served under there, fixed as a request for the blob would fix one (§E.2.2);
+    - under an epoch it is served under there to the grant that reads the source, fixed as that grant's request for the blob would fix one (§E.2.2);
 
     - with keys §E.2.3 gives there to the request's own grant or one in `Source-Authorization` (§7.5).
 
@@ -934,7 +934,9 @@ This keeps every string, sealed or not, replaceable by one ordinary append with 
 
   - In a batch a run-out at step 1 counts as failing authorisation (§7.5), reported as `422` (`limit`). A batch whose step-1 failures are all run-outs draws its items' cost (Cost), less the namespace's tokens; one with an item that fails step 1 outright draws nothing for its items.
 
-  - Each read request, exchange and key request a grant is presented for gets one budget, shared by every check it makes, in every namespace and for every name it covers. So does each read check a write makes (§6.1, §7.5, §7.6), one `referencing` or `dependents` list's judgments counting as one, each check an event stream repeats (§7.3), and each revision judged for a filtered read (§7.9) or item a service filters by a grant (SERVICES §A.4). Running out there fails that whole request or check, with its usual refusal, or leaves the item out. A paged read that runs out after its first entry ends its page there instead (§7.1), and a list (§6.1) ends there, without `more`.
+  - Each read request, exchange and key request a grant is presented for gets one budget, a long-poll one for its whole wait, shared by every check it makes, in every namespace and for every name it covers. So does each read check a write makes (§6.1, §7.5, §7.6), one `referencing` or `dependents` list's judgments counting as one, each check an event stream repeats (§7.3), and each revision judged for a filtered read (§7.9) or item a service filters by a grant (SERVICES §A.4). Running out there fails that whole request or check, with its usual refusal, or leaves the item out.
+
+  - A paged read that runs out after its first entry ends its page there instead (§7.1), and a long-poll that shows none answers `204` (§7.9 Long-poll). A list (§6.1) ends there, without `more`.
 
   - No deployment leaves `validationSteps` unbounded.
 
@@ -1022,11 +1024,11 @@ The `regex` format asserts the same syntax. A pattern RE2 doesn't accept makes a
 
   - In `ETag`, `If-Match`, `If-None-Match` and `If-Range`, an id is a quoted strong entity tag. A write's precondition is one such tag or `If-None-Match: *`. `If-Match: *`, a weak tag or a list is `400` (`bad_input`).
 
-  - A sealed `ETag` adds `.{e}` (§E.2.2), which a write's precondition leaves out.
+  - At E2, a sealed revision's, namespace document's or blob's `ETag` adds `.{e}`, the epoch it is sealed under (§E.2.2), which a write's precondition leaves out. An E3 snapshot's doesn't (§7.1).
 
   - In `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Log-Next` and `Last-Event-ID`, an id is unquoted.
 
-- **`GET /`** answers `{ "origin": "https://cms.example", "spec": "0.89", "auth": "grants" }`: the deployment's canonical origin (§C.3), the spec version it implements, as dotted decimal numbers compared component by component, and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4). A client, peer or tool MUST NOT refuse a deployment on the version alone; endpoints show what is offered (`404 not_offered` for an optional one, a plain `404` from an older server).
+- **`GET /`** answers `{ "origin": "https://cms.example", "spec": "0.90", "auth": "grants" }`: the deployment's canonical origin (§C.3), the spec version it implements, as dotted decimal numbers compared component by component, and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4). A client, peer or tool MUST NOT refuse a deployment on the version alone; endpoints show what is offered (`404 not_offered` for an optional one, a plain `404` from an older server).
 
 - **Answers,** a service's too, may carry members this spec doesn't define, which clients ignore.
 
@@ -1052,7 +1054,7 @@ The `regex` format asserts the same syntax. A pattern RE2 doesn't accept makes a
 
 **Private namespaces and existence.** Requests are answered in this order, which hides whether a namespace exists (private ones: Addendum C):
 
-- **Reads of a public namespace**, other than `GET /ns/{ns}/principal` (§7.4) and `POST /ns/{ns}/keys` (§E.2.3), ignore any grant and answer exactly as unauthenticated ones, with content or `404`. Only these, and the schema revisions a public referrer opens (§6.1), answer unauthenticated requests with content or `404`.
+- **Reads of a public namespace**, other than `GET /ns/{ns}/principal` (§7.4), `POST /ns/{ns}/keys` (§E.2.3) and reads under a view prefix (§7.9), ignore any grant and answer exactly as unauthenticated ones, with content or `404`. Only these, and the schema revisions a public referrer opens (§6.1), answer unauthenticated requests with content or `404`.
 
 - **The `ns` check.** With a grant, the server reads `ns` from its blocks before looking up any key. If a namespace isn't named in `ns` by every block that carries `ns` (the root block always does; `"*"` names every namespace), it answers `403` without being consulted, whether or not it exists. The exception is a schema revision it opens with `schemaReads` (§6.1).
 
@@ -1060,7 +1062,7 @@ The `regex` format asserts the same syntax. A pattern RE2 doesn't accept makes a
 
 - **Resources.** Without `read`, a resource that exists and one that doesn't both answer `404`. Off resource URLs, a read a verified grant doesn't allow is `403` (§C.2), even under a grant limited to some resources.
 
-Writes, `GET /ns/{ns}/principal`, `POST /ns/{ns}/keys`, and every request to a namespace that isn't public or doesn't exist, keep the `403` and `401` answers of steps 2 and 3. Namespace names are not secret (§E.4).
+Writes, `GET /ns/{ns}/principal`, `POST /ns/{ns}/keys`, reads under a view prefix, and every request to a namespace that isn't public or doesn't exist, keep the `403` and `401` answers of steps 2 and 3. Namespace names are not secret (§E.4).
 
 ### 7.1 Reads
 
@@ -1071,7 +1073,7 @@ Writes, `GET /ns/{ns}/principal`, `POST /ns/{ns}/keys`, and every request to a n
 | same, tombstoned | `410` with `{ "tombstone": id, "last": lastRevisionId, "successor"? }` and `ETag: "{tombstone}"` (§8.1) | head pointer |
 | same, purged | `410` | long |
 | `HEAD /r/{ns}/{name}` | as `GET`, no body | as `GET` |
-| `GET /r/{ns}/{name}/rev/{id}` | `200` with the document at `id` (at E3, only a stored snapshot, below), `ETag: "{id}"`, `X-Revision: {id}`, and the headers and `304` below | immutable |
+| `GET /r/{ns}/{name}/rev/{id}` | `200` with the document at `id` (at E3, only a stored snapshot, below), `ETag: "{id}"` (`"{id}.{e}"` at E2, §7), `X-Revision: {id}`, and the headers and `304` below | immutable |
 | same, `id` is a tombstone, below a horizon too | `410` with `{ "tombstone": id, "last": its parent }` | immutable |
 | same, unknown `id` | `404` | short |
 | same, purged | `410` | long |
@@ -1287,7 +1289,9 @@ It is `Cache-Control: no-store`.
 
 **`GET /ns/{ns}/rev/{ns_id}/log?since={a}`.**
 
-- Each entry is `{ id, prev, kind, resource?, name?, at?, target?, entries?, source?, forced?, author, via?, grant?, gesture?, undoes?, gestures?, created }`. `prev` is the previous entry's id, `""` on the chain's first.
+- Each entry is `{ id, prev, kind, resource?, name?, at?, target?, schema?, entries?, source?, forced?, author, via?, grant?, gesture?, undoes?, gestures?, created }`. `prev` is the previous entry's id, `""` on the chain's first.
+
+- `schema`, on a `head` entry, a batch's included, is the `$schema` of its revision's document (§6.1), absent where it has none and at E3. It is recorded when the entry is written, kept through pruning and purge, and not hashed, in a batch's `entries` either (§3.5), so it is a hint: a consumer that verifies what it fetches (§10, §G.2) checks it against the revision before relying on it. Entries written before the server recorded it lack it.
 
 - `gesture` and `undoes` are those of a single write. `gestures` maps each resource of a batch to a list of `{ "gesture"?, "undoes"? }`, one per step (§7.2). None of them is hashed.
 
@@ -1781,10 +1785,12 @@ Caching is immutable, with the resource's tags (§9). In sealed namespaces the U
 
 ### 7.9 Filtered reads
 
-Optional. A server that implements it gives **partial readers** a namespace's own reads, filtered. One that doesn't answers them as §C.5 says.
+Optional. A server that implements it gives **partial readers** a namespace's own reads, filtered: narrowing a grant's read rules (§C.1), as with a rule on `/doc/$schema` or a `/resource` pattern, is how a consumer filters a namespace's log. One that doesn't answers them as §C.5 says.
 
 -
-**Where.** While authentication is on (§1), in a namespace that is neither a branch (§7.6), public nor end-to-end, sealed ones included (below). Elsewhere these URLs answer `403`, or `401` without a grant or cookie that verifies, in §7's order.
+**Where.** While authentication is on (§1), in a namespace that is neither a branch (§7.6) nor end-to-end, public and sealed ones included (below). Elsewhere these URLs answer `403`, or `401` without a grant or cookie that verifies, in §7's order.
+
+  - In a public namespace a grant filters rather than restricts, but where sealed it decides the keys its holder gets (§E.2.3). Only URLs under a view prefix take it; every other read ignores it (§7 step 1), so none redirects to a filtered form. Answers under the prefix are cached as a private namespace's (§9).
 
 -
 **Partial reader:** a caller for whom all hold:
@@ -1825,7 +1831,7 @@ Unrestricted readers keep the unfiltered URLs; at filtered ones their grant in `
 **`/heads`** lists a row only where its head revision is visible, a tombstone as its deleted document and a purge as its entry is shown, in pages filled to `logPageSize`; `next`, the last row returned, is on every full page and no other.
 
 -
-**Long-poll.** Only shown entries answer `200` or end a wait. A wait may also end `204` at once after a bounded scan of at least one page. `X-Namespace-Revision` names the newest entry scanned, so a follower moves past dropped ones; a `since` or `Last-Event-ID` may name one.
+**Long-poll.** Only shown entries answer `200` or end a wait. A wait may also end `204` at once after a bounded scan of at least one page, or where its budget runs out (§6.6). `X-Namespace-Revision` (resource logs: `X-Revision`) names the newest entry scanned, after a run-out the last one judged whole, or a revision that alone runs out a fresh budget, which counts as hidden, so a follower moves past dropped ones; a `since` or `Last-Event-ID` may name one.
 
 -
 **Events** carry only shown entries, with each read check §7.3 repeats, the cookie check below included.
@@ -1840,7 +1846,7 @@ Unrestricted readers keep the unfiltered URLs; at filtered ones their grant in `
 
   - A `view` or `ns_id` not in text form (§3.2) is `400` (`bad_input`), a request-shape error (§6.2).
 
-  - Ranges are immutable but for purges and archive restores since (§8.3, Cost), and tagged as their unfiltered forms (§9).
+  - Ranges are tagged as their unfiltered forms (§9), and immutable but for later purges, which clear them (§8.3), and archive restores, which needn't clear them (Cost).
 
   - A URL under the prefix without `at` (a `…/log` without `live`, §7.7), and a partial reader's request at an unfiltered URL, answer `302`, `private, no-store`, to the filtered form, a range at the current `at`, a long-poll or stream with its query.
 
@@ -1861,7 +1867,7 @@ Every cookie of a view is `403`, at every URL, once an entry after its exchange 
 **Edge grants.** The origin's exchange (§C.5.2) gives a partial reader the prefix `/ns/{ns}/view/{view}`, with a cookie that never outlasts its grant. For it, §C.5.2's refusals concerning `/resource` and `/doc` rules and qualifying roles don't apply, and its check that rules pass now covers only block and key-scope rules that refer to neither, which Visible judges per revision. A partial reader reads heads at their own URLs with its grant in `Authorization` (§9), and revisions and blobs under its prefix.
 
 -
-**Sealed namespaces (E2).** A partial reader's only key is its view's `K_view` (§E.2.3). Its filtered answers are sealed under that key, and carry the keys of the visible revisions they name and of those revisions' blobs (§E.2.2). It opens those revisions and blobs at their own URLs or under its prefix, comparing their `pl` with the URL without the prefix. Holding `sealed` for the namespace (§7.1), it refuses a filtered `200` that isn't `application/jose`, and event data that isn't one JWE. To a reader with a `/ns/{ns}` cookie they are sealed under `K_n` instead and carry no `keys`: it derives them from `K_e` (§E.2.1).
+**Sealed namespaces (E2).** A partial reader's only key is its view's `K_view` (§E.2.3). Its filtered answers are sealed under that key, and carry the keys of the visible revisions they name and of those revisions' blobs (§E.2.2). It opens those revisions and blobs at their own URLs or under its prefix, comparing their `pl` with the URL without the prefix. Holding `sealed` for the namespace (§7.1), it refuses a filtered `200` that isn't `application/jose`, and event data that isn't one JWE. To a reader with a `/ns/{ns}` cookie they are sealed under `K_n` instead, with `keys` `[]`: it derives them from `K_e` (§E.2.1).
 
 -
 **Purged namespaces** answer these URLs as §8.5 answers their unfiltered forms, once the URL's read check passes, its `view` included and rules on `/doc` set aside (§6.4.1); a partial reader's unfiltered `/heads` is then `410`, without the `302`.
@@ -1903,13 +1909,13 @@ Every cookie of a view is `403`, at every URL, once an entry after its exchange 
 
 ### 8.3 Purge
 
-- **Effect.** The resource's content (patches, snapshots and blobs, §7.8) is removed and the resource marked purged; storage that keeps identical content once removes only this resource's references to it (§7.8, §8.5). Its archived history (§8.6) is deleted too, or made unreadable by destroying its key, and restoring from an archive MUST skip purged resources.
+- **Effect.** The resource's content (patches, snapshots and blobs, §7.8) and the view keys stored for its revisions (§E.2.2) are removed and the resource marked purged; storage that keeps identical content once removes only this resource's references to it (§7.8, §8.5). Its archived history (§8.6) is deleted too, or made unreadable by destroying its key, and restoring from an archive MUST skip purged resources.
 
 - **Namespace entry.** A `purge` entry is appended to the namespace log. Consumers MUST drop the resource and purge their derived data and cache tags (§10).
 
 - **Responses.** All `/r/{ns}/{name}/…` URLs then return `410`, before a `not_offered` as in §8.5. They do so once the caller passes the read check for that URL, its rules on `/doc` set aside (§6.4.1 `read`), or, for a write, step 1 of §6.2. Until then a read answers as for a resource the caller can't read (§7 step 4).
 
-- **CDN.** The CDN is purged by tag (§9), `heads:{ns}` included (§7.4), never by id, in each branch a purge reaches too, or by the base's tags where §9 Branches allows.
+- **CDN.** The CDN is purged by tag (§9), `heads:{ns}` included (§7.4), and `ns:{ns}` once a view of the namespace has been served (§7.9), never by id, in each branch a purge reaches too, or by the base's tags where §9 Branches allows.
 
 - **Branches.** A purge propagates to the **same name in every branch** of the namespace, recursively, successor generations included, whether the branch reads it through or has its own chain for it.
 
@@ -1921,7 +1927,7 @@ Every cookie of a view is `403`, at every URL, once an entry after its exchange 
 
   - Purges never propagate upwards.
 
-- **Limits of purge.** Purge can't recall copies in caches the operator doesn't control (§9), and does **not** remove hashes: ids of low-entropy content, and `/heads` digests already served (§7.4), can be confirmed by guessing, which required nonces prevent (§C.7). Copies of a blob in other resources (`Blob-From`, §7.8) stay until those resources are purged too.
+- **Limits of purge.** Purge can't recall copies in caches the operator doesn't control (§9), keeps the `schema` of `head` entries (§7.4), and does **not** remove hashes: ids of low-entropy content, and `/heads` digests already served (§7.4), can be confirmed by guessing, which required nonces prevent (§C.7). Copies of a blob in other resources (`Blob-From`, §7.8) stay until those resources are purged too.
 
 ### 8.4 Freezing a namespace
 
@@ -1989,9 +1995,9 @@ Every cookie of a view is `403`, at every URL, once an entry after its exchange 
 | Creating a namespace or a branch under its name (a creation, not a write to it, §7.6), and a branch creator's retry once the branch is purged | `412` |
 | Edge-grant issuance for a grant naming it (§C.5.2) | `410` as §C.5.2 says |
 
-The full read check of the first row is the grant's rules, those on `/doc` set aside (§6.4.1 `read`), unrestricted `read` where the URL needs it, any `read` for the gestures listing, §E.2.3's test for `/keys`, and for `/principal` verification alone.
+The full read check of the first row is the grant's rules, those on `/doc` set aside (§6.4.1 `read`), unrestricted `read` where the URL needs it, a partial reader passing at `/heads` (§7.9), any `read` for the gestures listing, §E.2.3's test for `/keys`, and for `/principal` verification alone.
 
-**Sealed namespaces.** Where namespace documents and log ranges are sealed (§E.2.2), the purge destroys the epoch keys their `K_n` derive from (§E.2.4), and those reads, events and long-poll included, answer `410` too. `GET /ns/{ns}` still redirects, to a revision that is `410` where it is sealed.
+**Sealed namespaces.** Where namespace documents and log ranges are sealed (§E.2.2), the purge destroys the namespace's epoch keys (§E.2.1), from which their `K_n` derive, and those reads, events and long-poll included, answer `410` too. `GET /ns/{ns}` still redirects, to a revision that is `410` where it is sealed.
 
 -
 **Shared storage.** Storage that keeps identical entries of several namespaces once removes only this namespace's references.
@@ -2548,7 +2554,7 @@ A **grant** is a signed token presented as `Authorization: Bearer <grant>`. It c
   - `enc`: in the root block only, the principal's X25519 public key that keys are wrapped to (§E.2.3); one of another form is `401`
 
 -
-**Narrowing only restricts.** A narrowing block may reduce `ns`, `can` and `roles`, set a later `nbf` or an earlier `exp`, and add `rules` and a `via`. It carries no other member, and one it leaves out restricts nothing. A root block MUST carry `kid`, `sub`, `ns` and `exp`, and only members listed above for it. A block that breaks this makes the grant invalid (`401`); values that don't narrow, other than `"*"` (`can` above, §C.4), restrict nothing more (§C.2).
+**Narrowing only restricts.** A narrowing block may reduce `ns`, `can` and `roles`, set a later `nbf` or an earlier `exp`, and add `rules` and a `via`. It carries no other member, and one it leaves out restricts nothing. A root block MUST carry `kid`, `sub`, `ns` and `exp`, and only members listed above for it. A block that breaks this makes the grant invalid (`401`); values that don't narrow, other than `"*"`, restrict nothing more (§C.2). In `ns`, `"*"` is `401` in a narrowing block, an operator grant's included, and in a root block no operator key signs (§C.4).
 
 -
 **Format.** Grants are Biscuit v3 tokens (§C.8).
@@ -2634,7 +2640,7 @@ every block's signature
 revocation (§C.4)
 
   -
-the key's scope, including `can`, `sub`, `maxTtl`, `groups`, `roles`, `attrs` and `readScope`, in that order, the first that fails giving the answer. A grant that breaks `readScope` (§2.1 Fixes `/resource`) fails it: `403` on every request that doesn't ignore the grant, writes included (`404` for a read of a resource in a private namespace, §7)
+the key's scope, including `can`, `sub`, `maxTtl`, `groups`, `roles`, `attrs` and `readScope`, in that order. A grant that fails any of them, as one that breaks `readScope` (§2.1 Fixes `/resource`) does, is `403` on every request that doesn't ignore the grant, writes included, but `404` for a read of a resource in a private namespace (§7 step 4)
 
 Failures are `401` when there is no usable grant: missing, malformed, badly signed, revoked, expired, or not yet valid (`nbf`). They are `403` when a valid grant doesn't allow the request.
 
@@ -2810,7 +2816,7 @@ An entry stored without `can` allows no verb. Changing keys and scopes needs a `
 **Keys follow the base.** A branch accepts its base's **current** keys as well as its own. A `kid` the branch shares with its base is the base's, accepted only while the base has it with the same `pub`. If the base later adds a `kid` the branch added itself (§7.6), only the base's entry is accepted until the base removes it again, when the branch's own applies once more. A `kid` copied from the base at creation never falls back. This applies recursively through every base. Keys added only to a branch, with a base `*` key (§7.6), are its own. A branch can't refuse a base key.
 
 -
-**Bootstrapping.** Creating a namespace needs a deployment-level operator key configured outside the system. A grant for a namespace that doesn't exist yet names it in `ns`, or uses `"*"`, which only grants signed by an operator key may do (`401` otherwise). Branches are the exception: they are created with a `branch` grant on their base (§7.6).
+**Bootstrapping.** Creating a namespace needs a deployment-level operator key configured outside the system. A grant for a namespace that doesn't exist yet names it in `ns`, or uses `"*"`, which only a root block signed by an operator key may do (`401` otherwise, §C.1). Branches are the exception: they are created with a `branch` grant on their base (§7.6).
 
 -
 **Operator grants**, with the verb each action needs (§C.2), authorise exactly:
@@ -2905,7 +2911,7 @@ Otherwise a reader limited to some documents follows them through a filtering pr
 
   - Each cookie has no `Domain` attribute. It has `Path` set to the prefix, `Secure`, `HttpOnly`, and `SameSite=None` when the deployment names credentialed origins, `Lax` otherwise. It is named per prefix (§C.5.3).
 
-  - Cookies last until the earliest `exp` among the grant's blocks or 15 minutes, whichever is sooner, less any whole seconds a minter MAY take off so that cookies for one prefix that it must tell apart differ in `exp` (§7.9 `view`).
+  - Cookies last until the earliest `exp` among the grant's blocks or 15 minutes, whichever is sooner, less any whole seconds a minter MAY take off so that no cookie shares its `exp` with a `403` cookie for the same prefix (§7.9 `view`); live ones may share one, as they become `403` together.
 
   - Where no `exp` is left, as every future whole second a cookie may get is past its grant or that of a `403` cookie for the same prefix, the answer is `503` (`behind`) with `Retry-After`, setting no cookie. The request has then drawn its `exchangeRate` tokens (Rate).
 
@@ -2927,9 +2933,9 @@ Otherwise a reader limited to some documents follows them through a filtering pr
 | The grant carries roles and none is a qualifying role (§2.1) | `403` |
 | The rules of the grant's blocks or key scope don't pass now against a `read` envelope (§6.4.1) for its principal, with `/resource` set to each name it fixes, if any | `403` |
 | A namespace a grant names is purged | `410`, `code: "purged"`, if the grant verifies in it (§8.5) |
-| More than 100 distinct prefixes | `400` (`bad_input`), once nothing else is refused |
+| More than 100 distinct prefixes | `400` (`bad_input`), once nothing other than the `429` below is refused |
 | A body larger than 50 grants of `grantSize` can be | `400` (`bad_input`), before it is parsed; a single grant over `grantSize` is `413` once decoded |
-| A principal's `exchangeRate` bucket is empty | `429`, `code: "rate"`, `limit: "exchangeRate"`, once nothing else is refused |
+| A principal's `exchangeRate` bucket is empty | `429`, `code: "rate"`, `limit: "exchangeRate"`, once nothing else is refused, the prefix cap's `400` included (Rate) |
 
 **All or nothing.** The answer covers every grant and namespace sent, never skipping a refused one:
 
@@ -3217,7 +3223,7 @@ Sealed payloads are JWEs (RFC 7516) in compact serialization, each served alone 
 -
 **Protected header:** `{ "alg": "dir", "enc": "A256GCM", "kid": "{ns}#{e}", "pl": { … } }` as canonical JSON (§3.1), with `pl` as below. Ids in `pl` are in text form, and an empty one is `""`.
 
-  - The `pl` claims are integrity-protected as AAD, so a ciphertext can't be replayed under another resource, revision or epoch. Readers MUST compare `pl`, and the namespace that `kid` names, with what they fetched. At E3 they accept in both a base's `ns` for a `sealed` op a branch reads through, up to the resource's foreign parent (§2, §E.3.1). In a chain of branches, each base's `ns` is accepted only up to the foreign parent of the nearest branch below it with entries of its own for the resource. Where they can't place such a parent, as where a document or `/heads` page that places it is unreadable to them, the ops it bounds fail the check and the read goes on (§E.3.2). At E2 a branch seals all it serves under its own keys (§E.2.5).
+  - The `pl` claims are integrity-protected as AAD, so a ciphertext can't be replayed under another resource, revision or epoch. Readers MUST compare `pl`, and the namespace that `kid` names, with what they fetched; a filtered answer's `view` with the URL's, or, where the URL names none, with the `view` of the key `/keys` gave the grant the request carried (§E.2.3). At E3 they accept in both a base's `ns` for a `sealed` op a branch reads through, up to the resource's foreign parent (§2, §E.3.1). In a chain of branches, each base's `ns` is accepted only up to the foreign parent of the nearest branch below it with entries of its own for the resource. Where they can't place such a parent, as where a document or `/heads` page that places it is unreadable to them, the ops it bounds fail the check and the read goes on (§E.3.2). At E2 a branch seals all it serves under its own keys (§E.2.5).
 
 -
 **What gets sealed,** each under the key, epoch and `pl` given here:
@@ -3232,7 +3238,7 @@ Sealed payloads are JWEs (RFC 7516) in compact serialization, each served alone 
 | namespace event (§7.3) | `K_n` | current when sealed | `{ "ns", "event": id }`, `id` its entry's |
 | grant (§C.3.1) | `K_n` | in force at the first namespace log entry recording it | `{ "ns", "grant": gid }` |
 | blob, in a binary form (Sealed blobs, below) | its `K_blob` | each epoch it is served under | as in Sealed blobs |
-| filtered answer (§7.9): a log range, long-poll answer, `/heads` page or event | its view's `K_view`, `K_n` for a `/ns/{ns}` cookie (§7.9) | current when sealed | its unfiltered form's, with `view` added: a resource's range or long-poll answer `{ "ns", "view", "name", "range": [since, last] }`, a `/heads` page `{ "ns", "view", "at", "after" }`, `after` `""` on the first page, a `hidden` event's `kind` `hidden` |
+| filtered answer (§7.9): a log range, long-poll answer, `/heads` page or event | its view's `K_view`, `K_n` for a `/ns/{ns}` cookie (§7.9) | current when sealed | its unfiltered form's, with `view` added: a resource's range or long-poll answer `{ "ns", "view", "name", "range": [since, last] }`, a `/heads` page `{ "ns", "view", "at", "after" }`, `after` `""` on the first page, a `hidden` event's `kind` `hidden`; `last` is the last entry the answer covers, shown or not: a page's `X-Log-Next`, else its range's end, or a long-poll answer's `X-Namespace-Revision` or `X-Revision` (§7.9) |
 | a view's keys for a revision (Filtered answers, below) | that view's `K_view` | the revision's | `{ "ns", "view", "name", "id", "kind": "keys" }` |
 
 Each plaintext above but a blob's is canonical JSON (§3.1), before any padding (below). A resource log entry's is the whole §7.1 entry. A namespace log range's or long-poll answer's is the JSON array of its §7.4 entries, `[]` for an empty page, and a namespace event's is its one entry. Filtered answers and a view's keys are below.
@@ -3243,7 +3249,7 @@ The epoch in force at a namespace entry is the `encryption.epoch` of the namespa
 **What stays in the clear:** everything else, such as URLs (so names and ids), status codes, headers, error and `410` bodies, unfiltered `/heads` and `/branches` pages, live timing and padded sizes. But the exact `created` of each revision, a document's length and its digest aren't sent outside the sealed logs (§7.1, §7.4).
 
 -
-**Stored once, served forever.** Sealed bytes for a revision, a document, a resource log entry or a grant are produced once, stored, and served identically forever, so `304`s and caching work as without sealing. A sealed revision or namespace document has `ETag: "{id}.{e}"`, as a sealed blob does.
+**Stored once, served forever.** Sealed bytes for a revision, a document, a resource log entry or a grant are produced once, stored, and served identically forever, so `304`s and caching work as without sealing. A sealed revision or namespace document has `ETag: "{id}.{e}"`, as a sealed blob does (§7).
 
   - Namespace log ranges (§7.4) are the exception. A deployment MAY keep only some, oldest evicted first, and seal an evicted range again on request, with fresh bytes, under the `K_n` and `pad` setting current then, from the same plaintext.
 
@@ -3258,9 +3264,9 @@ The epoch in force at a namespace entry is the `encryption.epoch` of the namespa
 -
 **Filtered answers** (§7.9). At E2 a filtered answer's plaintext is `{ "body", "keys" }`:
 
-  - `body` is the answer as §7.9 gives it: the array of its entries, `[]` for an empty page, the `/heads` body, or the event's data (§7.3). A resource log entry it shows with `patches`, to a partial reader only where the keys it carries for that revision hold `log`, is there as its stored JWE (above), so content stays under its revision's epoch;
+  - `body` is the answer as §7.9 gives it: the array of its entries, `[]` for an empty page, the `/heads` body, or the event's data (§7.3). A resource log entry it shows with `patches`, to a partial reader only where the keys it carries for that revision hold `log`, is there as its stored JWE (above), so content stays under its revision's epoch, and every other entry as plain JSON;
 
-  - `keys` holds, as JWEs in the order the body first names their revisions, a view's keys for each revision of the namespace it names that is visible (§7.9), tombstones excepted, `[]` if none.
+  - `keys` holds, as JWEs in the order the body first names their revisions, a view's keys for each revision of the namespace it names that is visible (§7.9), tombstones and revisions of purged resources excepted, `[]` if none.
 
 A view's keys for a revision are `{ "key", "log"?, "blobs" }`, each key in base64url: `key` its `K_rev`, `log` its `K_log` only where §7.9 shows its entry with `patches`, and `blobs` an object holding, by id, the `K_blob` of each blob its document references, `{}` if none or the document is no longer stored, all of the revision's epoch. They are sealed under that epoch's `K_view`, so a reader opens those of the epochs its window covers (§E.2.3) and no others. Carrying them fixes the revision's epoch as serving it would (Epochs, below). The reader fetches the blobs at `…/blob/{bid}/e/{e}` for that epoch (§7.9).
 
@@ -3299,7 +3305,7 @@ plaintext = size ‖ bytes ‖ padding
   - **Epochs.** In a sealed namespace, `…/blob/{bid}` answers `302` (head-pointer caching) to `…/blob/{bid}/e/{e}` for the latest served epoch; a reader holding only older epochs asks for one of those.
 
     -
-**Served epochs** are those of the revisions here whose documents are still stored and reference the blob. Other epochs are `404`, with `no-store`. An epoch whose referencing revisions were all pruned answers `410` as in §7.1 where the server recorded it when pruning, and `404` otherwise.
+**Served epochs** are those of the revisions here whose documents are still stored, that reference the blob and that the request may read (§C.2 item 5), so no reader learns the epoch of a revision hidden from it (§7.9). Other epochs are `404`, with `no-store`. An epoch whose referencing revisions were all pruned answers `410` as in §7.1 where the server recorded it when pruning and the request may read one of them, one judged without its document being hidden unless a kept answer shows it (§7.9 Cost), and `404` otherwise.
 
     -
 **A revision's epoch** is fixed by its first stored sealing:
@@ -3308,7 +3314,7 @@ plaintext = size ‖ bytes ‖ padding
 
       - or, for one read through from a base or written before the namespace was sealed, when it is first served or a check first judges by its epoch (§2.1, §6.1).
 
-A request or such a check for a blob none of whose referencing revisions has an epoch yet first fixes the newest of them under the current epoch. A refused request fixes no epoch.
+A request or such a check for a blob none of whose referencing revisions it may read has an epoch yet first fixes the newest of those under the current epoch. A refused request fixes no epoch.
 
     -
 **Stored once.** Each epoch's sealing of a blob, like a revision's, is produced once and stored. When two instances seal at once, the first one stored wins. Only the stored bytes are served, unchanged, with `ETag: "{bid}.{e}"` and the sealed type as `Content-Type` (the blob's own type is in its reference).
@@ -3395,11 +3401,11 @@ Authorization: Bearer
 
 - **Past content.** What was sealed under epochs the reader already held stays readable to them, from their copies or the CDN's.
 
-- **Reducing past exposure:** shorter epochs; per-resource and view keys (§E.2.3), so each reader holds only what they were granted; purge, which removes content and keys (E.1).
+- **Reducing past exposure:** shorter epochs; per-resource and view keys (§E.2.3), so each reader holds only what they were granted; purge, which removes content, its at-rest and view keys (§E.1, §8.3) and, for a namespace, its epoch keys (§8.5), though keys already delivered still open copies.
 
 ### E.2.5 Interaction with the rest of the spec
 
-- **Caching (§9)** follows the `read` mode: a public sealed namespace is cached publicly, keys alone deciding who reads it; with `read: "grant"`, edge grants also hide **metadata** (names, sizes, timing).
+- **Caching (§9)** follows the `read` mode: a public sealed namespace is cached publicly, keys alone deciding who reads it, but for its view prefixes (§7.9); with `read: "grant"`, edge grants also hide **metadata** (names, sizes, timing).
 
 - **Ids (§3).** Ids are still computed over plaintext canonical patches. Sealed namespaces MUST refresh `$nonce` in every patch set (§C.7).
 
@@ -3584,7 +3590,7 @@ Its hooks in the core are in §3.5, §6.5, §7, §7.5 and §8.6.
 
 - **Names are stable across environments.** Keep them the same everywhere (§11.1), and let the origin say which environment it is.
 
-**Purges follow imports.** A namespace imported from another deployment, as full history or snapshots, records that deployment's origin in its import batches' `source` (§7.5, §G.4.4). Its operator may trust that origin and name the principals that import from it. Any writer can assert a `source` (§7.5), so only import batches by such a principal count, under a grant that may `purge` the names they write (§C.2). Its deployment SHOULD then follow that origin's namespace log from the first such batch's `source.at`, and apply each `purge` there of a name such a batch wrote, and each `purge-ns` to every such name, as §8.3 does locally: its own chains for the name, its upstream namespace's (§G.4.4), its branches and its cache tags. It writes these entries itself (§7.4); one that §6.1 refuses as `in_use` waits for an operator.
+**Purges follow imports.** A namespace imported from another deployment, as full history or snapshots, records that deployment's origin in its import batches' `source` (§7.5, §G.4.4). Its operator may trust that origin and name the principals that import from it. Any writer can assert a `source` (§7.5), so only import batches by such a principal count, whenever written, under a grant that may `purge` the names they write (§C.2). Its deployment SHOULD then follow that origin's namespace log from the first such batch's `source.at`, and apply each `purge` there of a name such a batch wrote, and each `purge-ns` to every such name, as §8.3 does locally: its own chains for the name, its upstream namespace's (§G.4.4), its branches and its cache tags. It writes these entries itself (§7.4); one that §6.1 refuses as `in_use` waits for an operator.
 
 ## G.2 External consumers
 
@@ -3685,7 +3691,7 @@ In TOOLS.md.
 
 - **`access`** in the header gives each exporting namespace's protection as a source (§2.1): `"public"`, `"private"`, `"sealed"` or `"e2e"`. Exporters MUST include it, and so does the server in a prune's archive (§8.6).
 
-- **Importing.** At step 1 (§G.4.4), the importer refuses a bundle that would put a namespace's lines into a target, or into that target's upstream namespace, that ranks below that namespace (§2.1), unless an operator explicitly overrides this for that import. It also refuses a target or upstream namespace whose protection it can't read.
+- **Importing.** At step 1 (§G.4.4), the importer refuses a bundle that would put a namespace's lines into a target, or into that target's upstream namespace, that ranks below that namespace (§2.1), unless an operator explicitly overrides this for that import. It also refuses a target or upstream namespace whose protection it can't read and, override or not, a bundle with a `sealed` op in a line of a namespace that `access` doesn't give as `e2e`.
 
   - An importer that holds an `e2e` target's keys MAY import a source that isn't `e2e` into it by sealing each patch set client-side, encrypting each blob as in §E.3.1 and rewriting its references to the new blob ids. A source resource named `keyring` goes in under another name, as the target's is its key ring (§E.3.2). The ids change, so pins to them, incremental documents and later imports are handled as for a renamed import (§G.4.4).
 
@@ -4543,20 +4549,16 @@ Still missing: a sealed Biscuit token accepted (§C.8).
 
 ## Changes
 
-The full history is in CHANGELOG.md, and the conformance checklist in CONFORMANCE.md. Since v0.88:
+The full history is in CHANGELOG.md, and the conformance checklist in CONFORMANCE.md. Since v0.89:
 
-- **v0.89:** filtered reads and `/doc` read rules work at `sealed`, through derived keys.
+- **v0.90:** the reference's 17 notes on v0.88–v0.89 answered, eight inconsistencies a conformance audit found fixed, and two additions.
 
-  - **Derived keys (§E.2.1).** Below each resource's `K_r`: `K_rev` for a revision's document, `K_log` for its log entry and `K_blob` for each blob; below each epoch's `K_e`: `K_view` for a view. Each is one-way and yields no sibling. A revision's document is sealed under its `K_rev`, its log entry under its `K_log` and each blob under its `K_blob`.
+  - **Filtering a namespace.** A consumer filters by narrowing its grant with read rules (`/resource` patterns, `/doc/$schema`, …); the narrowed grant gets a `view` whose pages every consumer with the same rules shares (§7.9). Filtered reads now apply in public namespaces too: there a grant is a filter, taken only under the view prefix, and view answers are cached as a private namespace's. In a public sealed namespace such a grant now gets its view's `K_view`, and so opens the revisions its rules allow, where v0.89 refused it keys. Namespace log `head` entries carry the revision's `schema` (unhashed; absent without `$schema` and at E3), so the shared log can be filtered by schema on the client.
 
-  - **Who gets which (§E.2.3).** Unrestricted readers get `K_e` and fixed-name readers without `/doc` rules `K_r`, as before. A partial reader, a fixed-name grant with `/doc` rules included, gets only its view's `K_view`. Its filtered answers are sealed under `K_view` and carry, for each visible revision, that revision's `K_rev`, its blobs' `K_blob`, and its `K_log` only where its parent is visible, so patches of a hidden parent stay closed.
+  - **Views and keys.** Only a `403` cookie's seconds are skipped for `exp`; a move during an exchange is retried before `503`; a filtered answer under `K_n` has `"keys": []`; filtered answers carry no keys for purged resources' revisions; a purge clears `ns:{ns}` once a view of the namespace has been served.
 
-  - **Where (§7.9, §6.4.1).** Filtered reads apply in sealed namespaces too; the origin judges `/doc` on the plaintext it holds. End-to-end namespaces stay out: the server never sees their content, and `doc` is `null` there.
+  - **Audit fixes.** A blob's served epochs are only those of referencing revisions the request may read, closing a leak of hidden revisions' epochs. `"*"` in a narrowing block's `ns` is `401`. Any key-scope failure on a private resource read answers as `readScope` does. The prefix cap's `400` comes before `exchangeRate`'s `429`. An end-to-end snapshot's `ETag` and §E.2.4's purge cite agree with the rest. A partial reader passes §8.5's `/heads` check.
 
-  - **The index** seals a per-document hit under the revision's `K_rev`, so origin and index needn't agree on a `view`.
+  - **Other notes.** A long-poll keeps one budget for its wait and, run out, answers `204` naming the last entry judged whole. An index treats a branch whose bases it doesn't follow as unfollowed (`404`, no cookie). An import refuses `sealed` ops in a namespace `access` doesn't give as `e2e`. Replanning a release keeps step 3's live, unset documents and reports the rest.
 
-  - **Metadata.** View-prefixed URLs show caches which revisions a view sees (§E.4).
-
-  - **Vectors.** §I.7, §I.12, §I.13, §I.19 and §I.23 are recomputed under the derived keys; §I.27 gives a view's keys, a filtered range and a filtered `/heads` page; "Still to come" is §I.28.
-
-  - **The reference changes:** the derived keys and what is sealed under each, view keys at `/keys`, filtered answers sealed for a view, `doc` at E2, and §7.9 at `sealed`.
+  - **The reference changes:** public views, `schema` on head entries, the blob epoch rule, the `ns:{ns}` purge for views, the long-poll run-out, the index's unfollowed bases, the import check, and replanning.

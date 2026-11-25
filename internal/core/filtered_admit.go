@@ -79,7 +79,8 @@ func viewRecordOf(fv *fview, exp int64) *viewRecord {
 // with checkpoint cp (§7.9 URLs, design H), and returns the view it
 // reads with:
 //
-//   - a grant in Authorization: an unrestricted reader's is 403 there,
+//   - a grant in Authorization, in a public namespace too (viewAccess):
+//     an unrestricted reader's is 403 there,
 //     where its unfiltered URLs serve it; a partial reader's reads at its
 //     own view as of cp, and any other view is 403;
 //   - a cookie for /ns/{ns}/view/{view}: its view must be urlView (403), and is
@@ -103,7 +104,8 @@ func viewRecordOf(fv *fview, exp int64) *viewRecord {
 //   - no credentials, or an expired cookie, are 401.
 func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlView string, cp *fcp, cred Credentials) (*fview, *Error) {
 	if cred.Bearer != "" {
-		a, kind, _, err := t.nsAccess(n, cred)
+		// Taken in a public namespace too, as a filter (§7 step 1, v0.90).
+		a, kind, err := t.viewAccess(n, cred)
 		switch {
 		case err != nil:
 			return nil, err
@@ -119,6 +121,7 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlView string, cp *fcp, cred C
 		if fv.view != urlView {
 			return nil, forbidden("the grant reads " + n.name + " at its own view, /ns/" + n.name + "/view/" + fv.view + " (§7.9, §B.11.5)")
 		}
+		t.viewServed = n.name // markServed
 		return fv, nil
 	}
 	eg := cred.Edge
@@ -139,6 +142,7 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlView string, cp *fcp, cred C
 		a := &actor{principal: grant.Principal{ID: "edge:" + eg.Prefix}, bucketKey: "edge:" + eg.Prefix, view: urlView}
 		fv := t.newFview(fs, cp, urlView, nil, t.newJudge("", &grantcheck.ReadFilter{}), a)
 		fv.unrestricted = true
+		t.viewServed = n.name // markServed
 		return fv, nil
 	}
 	if eg.View != urlView {
@@ -171,6 +175,7 @@ func (t *tx) filteredAdmit(n *nsRow, fs *fscope, urlView string, cp *fcp, cred C
 		return nil, apiErr(401, "unauthenticated", "message", "unknown view: exchange the grant again (§7.9)")
 	}
 	a := &actor{principal: grant.Principal{ID: "edge:" + eg.Prefix}, bucketKey: "edge:" + eg.Prefix, view: urlView}
+	t.viewServed = n.name // markServed
 	return t.newFview(fs, cp, urlView, rec.subjects, t.newJudge(rec.digest, filter), a), nil
 }
 

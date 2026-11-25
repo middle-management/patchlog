@@ -326,7 +326,9 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 // content is "" (a read for another URL's answer, as ResourceRaw's of
 // /raw, which stays at its own URL).
 func (e *Engine) resourceRev(ctx context.Context, ns, name, id string, cred Credentials, content string) (*Rev, error) {
-	if c := e.rc.rev(ns, name, id); c != nil {
+	if c := e.rc.rev(ns, name, id); c != nil && cred.viewed == nil {
+		// A public revision, but under a view prefix, which judges each
+		// revision by the view in a public namespace too (§7.9, v0.90).
 		return c.answer(true), nil
 	}
 	g := e.rc.load(ns)
@@ -747,6 +749,12 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 				// a range with a revision it can't read (§C.2 item 5).
 				if byDoc {
 					switch seen, all := t.seesKeptRange(n, a, name, to); {
+					case t.readSpent():
+						// The request's one budget ran out judging the
+						// kept range: the read check's refusal (§6.6
+						// Validation work), never a horizon or a name
+						// that doesn't exist.
+						return notFound()
 					case !seen:
 						return absent()
 					case !all && !t.readsPartially(n, a):
@@ -771,12 +779,25 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 			// Each entry judged with its own read envelope (§C.2 item 5);
 			// a partial reader's answer at sealed is filtered and sealed for
 			// its view whatever its rules refer to (§7.9, v0.89).
-			ms, shown, patches, ok := t.judgeEntries(n, a, name, entries)
+			ms, shown, patches, ok, judged := t.judgeEntries(n, a, name, entries)
+			if judged < len(entries) && ok {
+				// The request's one budget ran out judging entry judged
+				// (§6.6 Validation work): a page ends before it, its next
+				// since the last entry judged whole; inside the first it
+				// fails as its read check would, and a long-poll answers
+				// 204 (ReadBudgetRanOut).
+				if judged == 0 {
+					return notFound()
+				}
+				entries, out.More = entries[:judged], true
+			}
 			if !ok {
 				// A range it can read nothing of from genesis is a
 				// resource it can read no revision of: answered as a name
 				// that doesn't exist (§C.2 item 5).
-				if since == "" && !t.seesAnyEntry(n, a, name, entries) {
+				// One that runs out finding out fails as its read check
+				// would (§6.6 Validation work), never as an empty log.
+				if since == "" && !t.seesAnyEntry(n, a, name, entries) && !t.readSpent() {
 					return absent()
 				}
 				return notFound()
@@ -1090,7 +1111,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 					prev = t.nsLogID(*r.prev).String()
 				}
 			}
-			m := t.decorateNSEntry(r, prev)
+			m := t.decorateNSEntry(n, r, prev)
 			pageIDs[r.seq] = m["id"].(string)
 			out.Entries = append(out.Entries, m)
 			out.Last = m["id"].(string)

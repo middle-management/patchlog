@@ -201,7 +201,9 @@ func (e *Engine) FilteredHeads(ctx context.Context, ns, view, at, after, prefix 
 			rows = append(rows, headItem{name: name, state: v.state, row: v.head})
 			return len(rows) < limit
 		})
-		page = &HeadsPage{Items: t.headRows(n, rows), Public: t.cachePublic(n)}
+		// Cached as a private namespace's, a public one's too (§7.9
+		// Where, §9, v0.90).
+		page = &HeadsPage{Items: t.headRows(n, rows)}
 		if len(rows) == limit {
 			page.Next = rows[len(rows)-1].name
 		}

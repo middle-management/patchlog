@@ -296,9 +296,39 @@ func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, vi
 	deadline := clock.end(current)
 	lim := s.e.Limits().LogPageSize
 	cred := creds(r)
+	noChange := func(private bool) {
+		cur := clock.cursor(time.Now())
+		if reqCursor+1 > cur {
+			cur = reqCursor + 1
+		}
+		s.setLive(w, r, false, "public, max-age=0, s-maxage=2", tags)
+		if private {
+			// An unrestricted reader's /ns/{ns} cookie: no cache's, its
+			// 204 as much as its entries (§7.9 Partial reader).
+			privateNoStore(w)
+		}
+		if since != "" {
+			w.Header().Set("X-Namespace-Revision", since)
+		}
+		w.Header().Set("X-Cursor", strconv.FormatInt(cur, 10))
+		w.WriteHeader(204)
+	}
+	private := false
 	for {
 		wait := s.e.Wait(ns)
+		if testLongPollFetch != nil {
+			testLongPollFetch()
+		}
 		lg, info, err := s.e.FilteredLiveLog(r.Context(), ns, view, since, lim, cred)
+		if core.ReadBudgetRanOut(err) {
+			// The wait's one budget ran out at an admission:
+			// 204 naming the last entry judged whole (§6.6, §7.9
+			// Long-poll, v0.90). Only that refusal: a cookie that died,
+			// a revoked grant's, a purge's or any other error answers
+			// as it is, whatever the budget.
+			noChange(private)
+			return
+		}
 		if err != nil {
 			if s.writeErrShort(w, r, err, tags...) {
 				return
@@ -308,6 +338,14 @@ func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, vi
 		}
 		if lg.Status != 200 {
 			s.writeLog(w, r, lg, ns, tags)
+			return
+		}
+		private = info.Private
+		if len(lg.Entries) == 0 && s.e.ReadBudgetSpent(r.Context()) {
+			// Admitted, yet the wait's budget is spent: it has run out
+			// (§6.6), 204 now, past the entries scanned.
+			since = lg.Last
+			noChange(private)
 			return
 		}
 		if len(lg.Entries) > 0 {
@@ -339,21 +377,7 @@ func (s *Server) filteredLongPoll(w http.ResponseWriter, r *http.Request, ns, vi
 				return
 			}
 		}
-		cur := clock.cursor(time.Now())
-		if reqCursor+1 > cur {
-			cur = reqCursor + 1
-		}
-		s.setLive(w, r, false, "public, max-age=0, s-maxage=2", tags)
-		if info.Private {
-			// An unrestricted reader's /ns/{ns} cookie: no cache's, its
-			// 204 as much as its entries (§7.9 Partial reader).
-			privateNoStore(w)
-		}
-		if since != "" {
-			w.Header().Set("X-Namespace-Revision", since)
-		}
-		w.Header().Set("X-Cursor", strconv.FormatInt(cur, 10))
-		w.WriteHeader(204)
+		noChange(info.Private)
 		return
 	}
 }

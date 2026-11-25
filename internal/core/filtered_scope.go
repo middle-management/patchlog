@@ -27,13 +27,17 @@ package core
 // (§7.9 Where).
 
 // fscope is a covered namespace (§7.9 Where), as of the read snapshot.
+// In a public one a grant filters rather than restricts: only the URLs
+// under a view prefix take it (viewAccess), every other read ignoring it
+// (§7 step 1), so no unfiltered URL redirects there (v0.90).
 type fscope struct {
 	n *nsRow
 }
 
 // filteredScope is n's coverage by §7.9, nil if it isn't covered: a
-// namespace, not a branch, neither public nor end-to-end, sealed ones
-// included (nsLevel below e2e, v0.89). Nothing is covered with authentication
+// namespace, not a branch nor end-to-end, public and sealed ones included
+// (nsLevel below e2e; sealed since v0.89, public since v0.90, where only
+// URLs under a view prefix take a grant, §7 step 1). Nothing is covered with authentication
 // disabled, where every reader reads unrestricted (§1), or with
 // Options.NoFilteredReads.
 func (t *tx) filteredScope(n *nsRow) *fscope {
@@ -47,9 +51,9 @@ func (t *tx) filteredScope(n *nsRow) *fscope {
 }
 
 // fsOpen reports whether a namespace with document cfg can be covered:
-// not public, not e2e (§7.9 Where; sealed ones since v0.89).
+// not e2e (§7.9 Where; sealed ones since v0.89, public ones since v0.90).
 func (t *tx) fsOpen(n *nsRow, cfg *Config) bool {
-	return cfg.Read != "public" && cfg.level < levelE2E && t.nsLevel(n) < levelE2E
+	return cfg.level < levelE2E && t.nsLevel(n) < levelE2E
 }
 
 // fconfigAt is the namespace document in force after the ns_log entry seq.

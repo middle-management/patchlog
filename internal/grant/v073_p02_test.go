@@ -79,14 +79,12 @@ func TestV073NarrowingCanOutsideKey(t *testing.T) {
 
 // "*" in ns is for operator grants only, and any other grant naming it is
 // invalid (401), whichever block names it, before the key scope's 403
-// (§C.4, v0.63).
+// (§C.4, v0.63). A narrowing block naming it is invalid however signed
+// (v0.90, TestV090StarNSInNarrowingBlock).
 func TestV073StarIsUnauthenticated(t *testing.T) {
 	f := newFixture(t, map[string]any{"can": []any{"read"}})
-	n, err := mustMint(t, f, map[string]any{"can": []string{"read"}}).Narrow(map[string]any{"ns": []string{"*"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = Verify(roundtrip(t, n), f.env())
+	n := mustMint(t, f, map[string]any{"can": []string{"read"}, "ns": []string{"*"}})
+	_, err := Verify(roundtrip(t, n), f.env())
 	wantStatus(t, err, 401)
 	// The key's can would refuse append (403); "*" is refused first.
 	_, err = Verify(roundtrip(t, mustMint(t, f, map[string]any{"ns": []string{"*"}})), f.env())

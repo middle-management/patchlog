@@ -389,19 +389,26 @@ func (ix *Index) entryHolds(ctx context.Context, cfg *grantcheck.Config, k viewK
 // once, as a key or role its marker draws on has changed since the
 // checkpoint the marker is judged at, answers 503 (behind)"): the
 // checkpoint's document gives the key or a role otherwise than the
-// head's, the index not having applied a change yet, or the checker's
-// document moved during the exchange (head is the one read before v was
-// verified), so that what verified v can't be told from what a read is
-// judged by. Before v0.85 either minted a cookie that never held.
-func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, v *grant.Verified, k viewKey) (out viewKey, behind bool) {
+// head's, the index not having applied a change yet. moved reports that
+// the checker's document moved during the exchange (head is the one read
+// before v was verified), so that what verified v can't be told from
+// what a read is judged by: the exchange tries the namespace again, and
+// answers 503 only after exchangeTries (SERVICES §A.4, v0.90: "Other
+// moves of the namespace document while an exchange is judged are
+// retried"). Before v0.85 either minted a cookie that never held; before
+// v0.90 a move was 503 at once.
+func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, v *grant.Verified, k viewKey) (out viewKey, behind, moved bool) {
 	out = k
 	out.entry = ""
+	if testExchangeEntry != nil {
+		testExchangeEntry(ns)
+	}
 	cfg, err := ix.checker.Config(ctx, ns)
 	if err != nil {
-		return out, false
+		return out, false, false
 	}
 	if cfg.Head != head {
-		return out, true
+		return out, false, true
 	}
 	// The chain's documents, read once: the entry and the positions
 	// recorded with it are those of the same documents.
@@ -412,22 +419,22 @@ func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, 
 	}
 	entry, key, ok, err := ix.entryOfIn(ctx, cfg, k.kid, k.roles, over)
 	if err != nil || !ok || !bytes.Equal(jsonv.Canonical(key.Raw), jsonv.Canonical(v.Key.Raw)) {
-		return out, false
+		return out, false, false
 	}
 	if a.cov != nil {
 		doc, err := ix.docAt(ctx, ns, a.cov.cp.at)
 		if err != nil {
-			return out, false
+			return out, false, false
 		}
 		at, err := grantcheck.ParseConfig(ns, "", doc)
 		if err != nil {
-			return out, false
+			return out, false, false
 		}
 		switch e, _, ok, err := ix.entryOfIn(ctx, at, k.kid, k.roles, over); {
 		case err != nil:
-			return out, false
+			return out, false, false
 		case !ok || e != entry:
-			return out, true
+			return out, true, false
 		}
 	}
 	out.entry = entry
@@ -440,8 +447,16 @@ func (ix *Index) exchangeEntry(ctx context.Context, ns, head string, a *access, 
 			out.conf[c.NS] = confPos(c)
 		}
 	}
-	return out, false
+	return out, false, false
 }
+
+// testExchangeEntry, if set, is called as exchangeEntry begins (tests move
+// the namespace document there).
+var testExchangeEntry func(ns string)
+
+// exchangeTries is how many times an exchange judges a namespace whose
+// document moves while it is judged before answering 503 (exchangeEntry).
+const exchangeTries = 3
 
 // errExchangeBehind is an exchange whose cookie would be 403 at once
 // (exchangeEntry): 503 behind, ranked as any failure to read upstream
@@ -689,7 +704,7 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 				if err != nil {
 					return err
 				}
-				if had := by[exp]; len(had) > 0 && !slices.Equal(had, ks) {
+				if had := by[exp]; len(had) > 0 && !slices.Equal(had, ks) && !ix.slotLive(ctx, m, had, ks) {
 					continue next
 				}
 			}
@@ -718,17 +733,25 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 				}
 			}
 			// The keys the cookie of m expiring at exp came from
-			// (viewKeysAt): written once, and the same ever after.
-			if len(taken[m][exp]) > 0 {
-				continue
-			}
+			// (viewKeysAt): a row is written once, and the same ever
+			// after. A live cookie's second this exchange shares gains
+			// the keys it lacks, so that a change to any of them ends
+			// both cookies, and none revives (slotLive).
+			had := taken[m][exp]
 			for _, k := range want[m] {
+				if slices.ContainsFunc(had, func(o viewKeyRow) bool { return o.kid == k.kid && o.roles == k.roles && o.pub == k.pub }) {
+					continue
+				}
 				if _, err := tx.ExecContext(ctx, `INSERT INTO edge_view_keys (marker, exp, kid, roles, pub, entry, pending, chain) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 					m, exp, k.kid, k.roles, k.pub, k.entry, k.pending, k.chain); err != nil {
 					return err
 				}
+				had = append(had, k)
 			}
-			taken[m][exp] = want[m]
+			slices.SortFunc(had, func(a, b viewKeyRow) int {
+				return cmp.Or(strings.Compare(a.kid, b.kid), strings.Compare(a.roles, b.roles), strings.Compare(a.pub, b.pub))
+			})
+			taken[m][exp] = had
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -749,6 +772,51 @@ func (ix *Index) recordCookies(ctx context.Context, recs []*cookieRec, now time.
 	}
 	ix.fmu.Unlock()
 	return nil
+}
+
+// slotLive reports whether the cookie of marker m whose keys are had, at a
+// second an exchange that vouches for ks would take, is live: no key it
+// came from has ended (an empty entry, cookieEnds) or differs at the head
+// of m's namespace from what its exchange recorded (entryHolds), one
+// this exchange vouches for too judged by the entry it found. Such a
+// second is shared, the cookies becoming 403 together; only a 403
+// cookie's second is skipped (§C.5.2 Answer, §7.9 view, v0.90: "no cookie
+// shares its exp with a 403 cookie for the same prefix; live ones may
+// share one"). Until v0.90 an exchange skipped every second whose keys
+// weren't exactly its own. A document that can't be read now counts as
+// 403.
+func (ix *Index) slotLive(ctx context.Context, m string, had, ks []viewKeyRow) bool {
+	ns, ok := markerNS(m)
+	if !ok {
+		return false
+	}
+	var cfg *grantcheck.Config
+	for _, r := range had {
+		if r.entry == "" {
+			return false
+		}
+		if i := slices.IndexFunc(ks, func(k viewKeyRow) bool { return k.kid == r.kid && k.roles == r.roles && k.pub == r.pub }); i >= 0 {
+			if ks[i].entry != r.entry {
+				return false
+			}
+			continue
+		}
+		roles, ok := decodeStrings(r.roles)
+		if !ok {
+			return false
+		}
+		if cfg == nil {
+			c, err := ix.checker.Config(ctx, ns)
+			if err != nil || ix.basesJudged(ctx, c) != nil {
+				return false
+			}
+			cfg = c
+		}
+		if _, holds, err := ix.entryHolds(ctx, cfg, viewKey{kid: r.kid, roles: roles, pub: r.pub, entry: r.entry}); err != nil || !holds {
+			return false
+		}
+	}
+	return true
 }
 
 // recordFilters records what the markers of one edge grant minted at now
@@ -1512,7 +1580,7 @@ func (ix *Index) refsCookieReader(ctx context.Context, r *http.Request, reached 
 	}
 	rd := &refsReader{vid: vid, public: true, allow: map[string]allowFunc{}, covs: map[string]*access{}}
 	for _, ns := range ix.refsNamespaces() {
-		if _, ok := reached[ns]; !ok || ix.keys.Skipped(ns) != "" {
+		if _, ok := reached[ns]; !ok || ix.keys.Skipped(ns) != "" || ix.basesUnfollowed(ctx, ns) {
 			continue
 		}
 		i := slices.IndexFunc(subs, func(m string) bool {
@@ -1680,17 +1748,20 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var (
-		exs    []*exchanged
-		limit  *grantcheck.LimitError
-		denied *grant.AuthError
-		upErr  error
-		purged *purgedNS
+		exs     []*exchanged
+		limit   *grantcheck.LimitError
+		denied  *grant.AuthError
+		upErr   error
+		purged  *purgedNS
+		unavail bool
 	)
 	for _, b := range bearers {
 		ex, pn, err := ix.exchangeGrant(ctx, b, reached, now)
 		var le *grantcheck.LimitError
 		var ae *grant.AuthError
 		switch {
+		case errors.Is(err, errUnavailable):
+			unavail = true
 		case errors.As(err, &le):
 			if limit == nil {
 				limit = le
@@ -1723,6 +1794,12 @@ func (ix *Index) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		return
 	case upErr != nil:
 		ix.writeUpstreamErr(w, "exchange", upErr, "cannot read a namespace configuration")
+		return
+	case unavail:
+		// 404 as a query of it is, no other refusal being 401 or 403;
+		// never 410, as a namespace refused isn't purged (§C.5.2 All or
+		// nothing, SERVICES §A.4 Unavailable namespaces, v0.90).
+		writeErr(w, http.StatusNotFound, "not_found", "a namespace the grants name is not indexed")
 		return
 	case purged != nil:
 		purged.write(w)
@@ -1884,9 +1961,27 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			upErr = worseUpstream(upErr, err)
 		}
 	}
+	// unavailable notes a namespace the grant names that the service
+	// doesn't follow, or answers as such: 404, at the exchange too, only
+	// where no other refusal is 401 or 403 (SERVICES §A.4 Unavailable
+	// namespaces, v0.90).
+	unavailable := false
+	if len(g.Blocks) > 0 {
+		for _, ns := range g.Blocks[0].NS {
+			if ns != "*" && !ix.known(ns) && g.NamesNS(ns) {
+				unavailable = true
+			}
+		}
+	}
 	for _, ns := range namedInOrder(g, ix.refsNamespaces()) {
-		if _, lacks := ix.keys.Skip(ns); lacks {
-			continue // one the service doesn't follow (§A.4)
+		tries := 1
+	again:
+		if _, lacks := ix.keys.Skip(ns); lacks || ix.basesUnfollowed(ctx, ns) {
+			// One the service doesn't follow (§A.4): a sealed one whose
+			// keys it lacks, or a branch whose bases' logs it doesn't all
+			// follow (§C.4 Keys follow the base). No marker, no cookie.
+			unavailable = true
+			continue
 		}
 		_, purged, err := ix.committed(ctx, ns)
 		if err != nil {
@@ -1938,11 +2033,18 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 		// Every marker, reads:{ns}:{k} included, records the key that
 		// verified the grant here and its entry (§A.4 view).
 		rec := markerRecOf(a, v)
-		var behind bool
+		var behind, moved bool
 		// With the entry, the documents it was drawn from that the index
 		// has yet to reach, for it to tell those of its backlog from the
 		// ones after (cookieEnds).
-		if rec.key, behind = ix.exchangeEntry(ctx, ns, cfg.Head, a, v, rec.key); behind {
+		rec.key, behind, moved = ix.exchangeEntry(ctx, ns, cfg.Head, a, v, rec.key)
+		if moved && tries < exchangeTries {
+			// The document moved while the grant was judged: judged again
+			// from the document it moved to.
+			tries++
+			goto again
+		}
+		if behind || moved {
 			fail(errExchangeBehind)
 			continue
 		}
@@ -1979,7 +2081,31 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 	if pn := ix.purgedOnly(ctx, token, g); pn != nil {
 		return nil, pn, nil
 	}
+	if unavailable {
+		return nil, nil, errUnavailable
+	}
 	return nil, nil, &grant.AuthError{Status: 403, Msg: "the grant reads no private namespace this service follows"}
+}
+
+// errUnavailable is an exchange whose grant gets no edge grant, no
+// refusal of it is 401 or 403, and a namespace it names is one the
+// service doesn't follow or answers as such: 404, as a query of it is
+// (SERVICES §A.4 Unavailable namespaces, v0.90).
+var errUnavailable = errors.New("namespace not indexed")
+
+// basesUnfollowed reports whether ns is a branch a base of whose chain
+// the service doesn't follow, so that it can't judge a cookie by every
+// entry of its bases (basesJudged): it is answered as unfollowed, 404,
+// its exchange minting no cookie, and /_refs leaves it out (SERVICES §A.4
+// Unavailable namespaces, v0.90; §C.4 Keys follow the base). Until v0.90
+// such an exchange minted a cookie under which every read was 403. A
+// document that can't be read now is left to the read check.
+func (ix *Index) basesUnfollowed(ctx context.Context, ns string) bool {
+	cfg, err := ix.checker.Config(ctx, ns)
+	if err != nil || cfg.Base == "" {
+		return false
+	}
+	return errors.Is(ix.basesJudged(ctx, cfg), errRulesChanged)
 }
 
 // purgedOnly is the purge an exchange, or /_refs, answers 410 for a grant

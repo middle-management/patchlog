@@ -1,6 +1,6 @@
 # Patch Log — Services
 
-Status: draft v0.89 · 2026-11-20. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.90 · 2026-11-24. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Services that follow namespaces through the protocol's public API and answer queries over them:
 
@@ -68,7 +68,7 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
 - **Bounded redirects.** A service SHOULD answer `200` at an `at` it redirected to for a while (e.g. a minute), computing or keeping the result, unless §A.1 dropped it, so a reader may be redirected again while purges keep coming. A kept result is keyed by its URL, `view` included, so it never outlives the rules it was filtered by.
 
 - **Unavailable namespaces.** A query of a namespace that is:
-  - unfollowed, or a sealed or end-to-end one whose keys the service lacks (§E.2.6: `/keys` answers it a `4xx` other than `408` and `429`, or gives none it can unwrap): `404`, also where the service learns this only during the read check;
+  - unfollowed, a branch whose bases' namespace logs it doesn't all follow (§C.4 Keys follow the base), or a sealed or end-to-end one whose keys the service lacks (§E.2.6: `/keys` answers it a `4xx` other than `408` and `429`, or gives none it can unwrap): `404`, at its exchange too, which mints no cookie and answers `404` only where no other refusal is `401` or `403` (§C.5.2 All or nothing), also where the service learns this only during the read check;
   - purged: `410` (`purged`), once the read check passes against the last namespace document the service read;
   - followed, without a checkpoint yet: once the reader's grant verifies, `503`, `no-store`, with `code: "behind"` and `Retry-After` (§A.5).
 
@@ -135,7 +135,7 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
   - **Hits are filtered per revision.** A hit is shown only where its head revision as of `at` is visible to the reader's `view`, judged as §7.9 judges it, `doc` being `null` in end-to-end namespaces (§6.4.1). A document of `{ns}` the reader "may see" anywhere in §A.4 is one shown so. Each judgement gets the origin's `validationSteps` (§6.6), which `GET /ns/{ns}/principal` gives the service's own grant in `writer.limits` (§7.4). The service SHOULD judge each revision once per `view` (§7.9 Cost).
   - **Cookies.** The service mints cookies for the prefix `/{ns}/view/{view}` with a key of its own, at an exchange of its own that follows §C.5.2's issuance rules as §7.9 changes them for a `view` prefix, and applies `exchangeRate` (§6.6) to it. A cookie is `403` where §7.9's `view` cookie would be; another reader's exchange revives none. The service judges it by every namespace-document entry after the checkpoint it judged the exchange at, in a branch by its bases' entries after their checkpoints then too (§C.4 Keys follow the base). A cookie it can't judge so, such as one minted before it restarted from a snapshot or one past an entry whose document it can't read, is `403`. The service keeps, per `view`, the rules and values it digests, and judges a request under a cookie from those, never from a grant the request doesn't carry. Services needn't compute the same `view` as the origin or each other.
   - A grant in `Authorization` reads only at its own `view` (`403` elsewhere), and a URL without `/view/{view}` is redirected to its `…/view/{view}/at/…` form by it, `private, no-store`. A request that needs `/view/{view}` and carries neither a grant that verifies in a namespace the service follows nor a cookie it verifies is `401`.
-  - An exchange whose cookie would be `403` at once, as a key or role its `view` draws on has changed since the checkpoint it is judged at, answers `503` (`behind`) with `Retry-After`. So does one with no `exp` left (§C.5.2).
+  - An exchange whose cookie would be `403` at once, as a key or role its `view` draws on has changed since the checkpoint it is judged at, answers `503` (`behind`) with `Retry-After`. So does one with no `exp` left (§C.5.2). Other moves of the namespace document while an exchange is judged are retried, the exchange answering `503` only after a bounded number of tries (§A.5).
 
 - **Sealed and end-to-end namespaces:** results are sealed as in §E.2.6.
 
