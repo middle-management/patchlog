@@ -88,6 +88,24 @@ for tool in gcloud go curl python3; do
   command -v $tool >/dev/null || { echo "gcp-spanner: needs $tool" >&2; exit 1; }
 done
 
+# Before anything is made: the account may use the project, and its APIs
+# are on.
+need_apis="spanner.googleapis.com compute.googleapis.com iam.googleapis.com monitoring.googleapis.com"
+if ! enabled=$(gcloud services list --enabled --format='value(config.name)' 2>&1); then
+  echo "gcp-spanner: $(gcloud config get-value account 2>/dev/null) can't use project $PROJECT:" >&2
+  echo "$enabled" | head -3 >&2
+  echo "  It needs a role there, Owner or Editor for this script (it makes a service account and grants it Spanner)," >&2
+  echo "  or at least roles/serviceusage.serviceUsageConsumer, Spanner Admin, Compute Admin and IAM roles." >&2
+  exit 1
+fi
+missing=""
+for api in $need_apis; do grep -qx "$api" <<<"$enabled" || missing="$missing $api"; done
+if [ -n "$missing" ]; then
+  echo "gcp-spanner: APIs not enabled in $PROJECT:$missing" >&2
+  echo "  gcloud services enable$missing --project $PROJECT   (billing must be on)" >&2
+  exit 1
+fi
+
 steps=$(( $(tr ',' '\n' <<<"$BUSY" | grep -c .) ))
 run_min=$(( steps * (BUSY_SECS + 60) / 60 + 1 ))
 life_min=$(( run_min + 45 ))
