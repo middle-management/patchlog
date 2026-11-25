@@ -46,4 +46,8 @@ func TestMigrateSpanner(t *testing.T) {
 	if err := db.QueryRow(`SELECT gen FROM cache_gen WHERE id = 1`).Scan(&n); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	// Migration 003 dropped every foreign key.
+	if err := db.QueryRow(`SELECT count(*) FROM information_schema.table_constraints WHERE constraint_type = 'FOREIGN KEY'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("foreign keys left: %d, %v", n, err)
+	}
 }

@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"cloud.google.com/go/spanner"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -2095,11 +2096,19 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 				rows[i] = append([]any{t.spID(it.res, it.last)}, rows[i]...)
 			}
 		}
-		t.bulkQuery(ins, rows, func(rs *sql.Rows) {
-			var seq, res int64
-			t.must(rs.Scan(&seq, &res))
-			byRes[res].last = seq
-		})
+		if t.e.spanner {
+			// Mutations: the rows are read back through the memo (t.inserted).
+			t.spMutate(ins, spanner.Insert, rows)
+			for _, row := range rows {
+				byRes[row[1].(int64)].last = row[0].(int64)
+			}
+		} else {
+			t.bulkQuery(ins, rows, func(rs *sql.Rows) {
+				var seq, res int64
+				t.must(rs.Scan(&seq, &res))
+				byRes[res].last = seq
+			})
+		}
 		if t.e.spanner {
 			for i := range rows {
 				rows[i] = rows[i][1:]
@@ -2162,8 +2171,13 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			}
 		}
 	}
-	t.bulkExec(insRevEpochs, epochs)
-	t.bulkExec(insSnapshots, snaps)
+	if t.e.spanner {
+		t.spMutate(insRevEpochs, spanner.Insert, epochs)
+		t.spMutate(insSnapshots, spanner.InsertOrUpdate, snaps)
+	} else {
+		t.bulkExec(insRevEpochs, epochs)
+		t.bulkExec(insSnapshots, snaps)
+	}
 	if len(reserve) > 0 {
 		t.reserveWrite(n, cfg.Epoch, reserve, 0)
 	}
@@ -2217,8 +2231,13 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 	if moved != int64(len(moves)) {
 		panic(errChainRace)
 	}
-	t.bulkExec(upsertHeads, heads)
-	t.bulkExec(delHeads, dropHeads)
+	if t.e.spanner {
+		t.spMutate(upsertHeads, spanner.InsertOrUpdate, heads)
+		t.spDeleteHeads(dropHeads)
+	} else {
+		t.bulkExec(upsertHeads, heads)
+		t.bulkExec(delHeads, dropHeads)
+	}
 
 	out := make([]histRow, len(items))
 	for i, it := range items {

@@ -27,6 +27,10 @@ import (
 type bulkStmt struct {
 	pg, lite, sp string
 	types        []string
+	// table and cols are a bulkInsert's, for its rows as mutations on
+	// Spanner (spMutate).
+	table string
+	cols  []string
 }
 
 // bulkInsert builds an INSERT of cols ("name type", the Postgres element
@@ -52,6 +56,8 @@ func bulkInsert(table, cols, suffix string) bulkStmt {
 		lite:  `INSERT INTO ` + table + ` (` + list + `) VALUES (` + strings.Join(marks, ",") + `) ` + suffix,
 		sp:    `INSERT INTO ` + table + ` (` + list + `) SELECT ` + strings.Join(subs, ", ") + fmt.Sprintf(` FROM unnest($%d::bigint[]) AS u(i) `, len(cs)+1) + suffix,
 		types: types,
+		table: table,
+		cols:  names,
 	}
 }
 
@@ -139,6 +145,38 @@ func (t *tx) bulkQuery(s bulkStmt, rows [][]any, scan func(*sql.Rows)) {
 	for _, row := range rows {
 		each(t.Query(s.lite, row...))
 	}
+}
+
+// mutationValue is a column's value of a row of s as a Spanner mutation
+// takes it, converted as arrays converts it: NULL as nil.
+func (s bulkStmt) mutationValue(c int, v any) any {
+	switch typ := s.types[c]; typ {
+	case "bigint", "smallint":
+		switch x := v.(type) {
+		case int64, nil:
+			return x
+		case int:
+			return int64(x)
+		case bool:
+			if x {
+				return int64(1)
+			}
+			return int64(0)
+		}
+	case "bytea":
+		switch x := v.(type) {
+		case []byte, nil:
+			return x
+		case string:
+			return []byte(x)
+		}
+	case "text":
+		switch x := v.(type) {
+		case string, nil:
+			return x
+		}
+	}
+	panic(fmt.Sprintf("bulk: %T in a %s column", v, s.types[c]))
 }
 
 // arrays transposes rows into one Postgres array per column.

@@ -69,6 +69,8 @@ PATCHLOG_TEST_SPANNER=spanner://projects/emulator-project/instances/test-instanc
 | Leader: session lock `pg_try_advisory_lock(leaderClass, 0)` on a kept connection | a lease row, `leader_lease`, taken when expired, renewed at each tick and each job step; 60 s | `leaderSpanner` |
 | Shared rate buckets, `rate_draws` (a plpgsql function) | the same algorithm in Go, in one read-write transaction per batch: all buckets read `FOR UPDATE` (which locks a missing key too: a missing bucket is full), requests judged in queue order, changed rows written as `InsertOrUpdate` mutations with the commit: one read and the commit; an aborted batch runs again. The sweep of full buckets has no `SKIP LOCKED`: it deletes in a transaction of its own, and a draw it meets aborts one of them | `drawsSpanner`, `ratebuckets.go` |
 | Group commit | unchanged: one transaction appends a group's entries (mutations), and the log heads it appended stay known under the row's lock | `groupcommit.go` |
+| A write's rows: `INSERT … SELECT FROM unnest(…)` per table | revisions, heads, snapshots and rev_epochs as **mutations** sent with the commit (`spMutate`; heads dropped by key), read back through the transaction's memo; resources' heads moved by one `UPDATE` of `CASE`s (`spMoveHeads`), whose condition catches a concurrent writer | `write.go`, `spanner.go` |
+| Foreign keys (`REFERENCES`) | none (migration 003): each was a hidden index written with every row and a check at commit; the engine keeps the references itself, as on every dialect | `migrations/spanner` |
 | Bulk statements: `unnest` of one array per column | each column's array subscripted by an `unnest` of ordinals, `($1::bigint[])[u.i] … FROM unnest($k::bigint[]) AS u(i)` (no `unnest` of several arrays); a statement without that form (`moveHeads`, `UPDATE … FROM`) runs once per row, its rows sent as **one batch of DML** (one round trip) | `bulk.go`, `spDMLBatch` |
 | `LATERAL`, `WITH RECURSIVE`, window functions, `generate_series` | correlated scalar subqueries, or arrays subscripted by ordinals; a chain of bases read a statement per level; a purge's holders found by name as on Postgres (`purgeHolders`: sealed copies and sealings by `DISTINCT` over their `(name, ns)` index, the holders' chains a level per statement), and level by level from the purged namespace past `purgeHoldersMax` holders (`purgeLevels`); the Postgres-only multi-namespace purge append isn't used | `resolve.go`, `chain.go`, `nspurge.go` |
 | `ON CONFLICT DO NOTHING` without a target | the primary key named (shared with the other dialects); on a secondary index, Spanner refuses a conflict target, so a plain insert, whose race aborts or fails the transaction, which runs again | `engine.go` authors, `blobs.go`, `repurge.go` |
@@ -183,8 +185,8 @@ would change most of it.
 
 ## What is left
 
-- **What the first bench run found** (above): the group's inserts as mutations, the foreign
-  keys, and runs at more processing units.
+- **A second bench run**, with the changes since the first (above), and runs at more processing
+  units.
 - **The rate-bucket sweep** scans `rate_buckets` whole (no `SKIP LOCKED`, and no index on
   fullness); fine for a test, a hot table at scale.
 - **Round trips** left in a write: the namespace's head `UPDATE` (a mutation would hide the new
@@ -227,10 +229,8 @@ No write failed (no 412, 429 or error). Against Postgres's 1,000 a namespace and
 - From 16 namespaces Spanner's CPU is the limit (73–82%), aborts rise (923 a minute), and more
   namespaces only lengthen latency.
 
-Next: run again with `spMoveHeads` and the tailer's index; then the inserts as mutations
-(revisions, heads), which takes knowing what the group's transaction reads back, and dropping
-the foreign keys on Spanner, whose integrity the engine keeps anyway (they are there for
-Postgres and SQLite too).
+Since: `spMoveHeads`, the tailer's index, a write's rows as mutations (revisions, heads,
+snapshots, rev_epochs) and no foreign keys (migration 003); not measured yet.
 
 ## The capacity bench on real Spanner
 

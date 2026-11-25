@@ -586,6 +586,45 @@ func (t *tx) spDMLBatch(q string, args [][]any) int64 {
 	return n
 }
 
+// spMutate buffers rows of s, a bulkInsert, as mutations of op (spanner.
+// Insert, or spanner.InsertOrUpdate for an upsert), sent with the commit
+// (spBuffer): no round trip, where its statement took one of 20–65 ms in a
+// group commit's transaction on Spanner (docs/SPANNER.md, the bench). The
+// transaction's own statements don't read them back, so only rows nothing
+// reads before the commit go this way: revisions (read through the
+// transaction's memo, t.inserted), heads, snapshots and rev_epochs. A
+// unique violation (revisions_res_id_key, a concurrent writer's) fails the
+// commit then, rather than the statement: a write then re-checks
+// (isConflict, recheck.go), a group's writes each go alone.
+func (t *tx) spMutate(s bulkStmt, op func(string, []string, []any) *spanner.Mutation, rows [][]any) {
+	if len(rows) == 0 {
+		return
+	}
+	t.wrote()
+	ms := make([]*spanner.Mutation, len(rows))
+	for i, row := range rows {
+		vals := make([]any, len(row))
+		for c, v := range row {
+			vals[c] = s.mutationValue(c, v)
+		}
+		ms[i] = op(s.table, s.cols, vals)
+	}
+	t.spBuffer(ms)
+}
+
+// spDeleteHeads deletes heads rows by key (delHeads), as mutations.
+func (t *tx) spDeleteHeads(rows [][]any) {
+	if len(rows) == 0 {
+		return
+	}
+	t.wrote()
+	ms := make([]*spanner.Mutation, len(rows))
+	for i, row := range rows {
+		ms[i] = spanner.Delete("heads", spanner.Key{row[0]})
+	}
+	t.spBuffer(ms)
+}
+
 // spMoveHeads is moveHeads on Spanner, whose UPDATE … FROM it lacks: one
 // UPDATE for the rows (up to spMaxArgs's worth), each column a CASE on the
 // row's key. A batch of DML (spDMLBatch) of an UPDATE per row was one round
@@ -599,7 +638,9 @@ func (t *tx) spMoveHeads(rows [][]any) int64 {
 		return 0
 	}
 	t.wrote()
-	per := spMaxArgs / 6
+	// Spanner counts a parameter at each use: a row's key is used six
+	// times, its five values once each.
+	per := spMaxArgs / 11
 	var n int64
 	for len(rows) > 0 {
 		chunk := rows[:min(per, len(rows))]
