@@ -8,10 +8,10 @@ require (
 	github.com/googleapis/go-sql-spanner v1.28.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/klauspost/compress v1.20.2
-	github.com/middle-management/mmmigrate v0.7.1-0.20261124215002-7bc5e8a0c1bd
-	github.com/middle-management/mmmigrate/driver/postgres v0.0.0-20261124215002-7bc5e8a0c1bd
-	github.com/middle-management/mmmigrate/driver/spanner v0.0.0-20261124215002-7bc5e8a0c1bd
-	github.com/middle-management/mmmigrate/driver/sqlite v0.0.0-20261124215002-7bc5e8a0c1bd
+	github.com/middle-management/mmmigrate v0.8.0
+	github.com/middle-management/mmmigrate/driver/postgres v0.0.0-20261124220236-a99538f24d54
+	github.com/middle-management/mmmigrate/driver/spanner v0.0.0-20261124220236-a99538f24d54
+	github.com/middle-management/mmmigrate/driver/sqlite v0.0.0-20261124220236-a99538f24d54
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.47.0

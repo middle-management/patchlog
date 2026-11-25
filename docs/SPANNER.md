@@ -47,7 +47,7 @@ PATCHLOG_TEST_SPANNER=spanner://projects/emulator-project/instances/test-instanc
 
 | Postgres (D.8) | Spanner | Where |
 | --- | --- | --- |
-| Schema, `migrations/postgres` through mmmigrate, transactional DDL under an advisory lock | `migrations/spanner`, one baseline equal to Postgres after 031 and 002 for the hotspots, through mmmigrate's Spanner dialect (`driver/spanner`, unreleased: patchlog pins main's commit): DDL batched outside transactions, a migration's progress kept so a run that died part-way resumes, runs serialised by a lease row (`mmmigrate_lock`), recorded in `mmmigrate_applied` | `internal/dbmigrate` |
+| Schema, `migrations/postgres` through mmmigrate, transactional DDL under an advisory lock | `migrations/spanner`, one baseline equal to Postgres after 031 and 002 for the hotspots, through mmmigrate's Spanner dialect (`driver/spanner`, of mmmigrate v0.8.0; the drivers have no tags of their own, so patchlog pins v0.8.0's commit): DDL batched outside transactions, a migration's progress kept so a run that died part-way resumes, runs serialised by a lease row (`mmmigrate_lock`), recorded in `mmmigrate_applied` | `internal/dbmigrate` |
 | `smallint` flags and codes | `bigint` (no `int2`); still compared with 0 and 1 | baseline |
 | `UNIQUE` constraints | unique indexes; on nullable columns `WHERE col IS NOT NULL`, since Spanner's unique indexes count NULLs equal | baseline |
 | Partial unique indexes `one_first`, `one_ns_first`, `one_config_genesis` | a stored generated column holding the chain's key on its first row only (`CASE WHEN first = 1 THEN res END`), under a null-filtered unique index: Spanner filters partial indexes on `IS NOT NULL` alone | baseline |
@@ -188,8 +188,8 @@ would change most of it.
   fullness); fine for a test, a hot table at scale.
 - **Round trips** left in a write: the namespace's head `UPDATE` (a mutation would hide the new
   head from the transaction's own later reads), and a chain of bases read a statement per level.
-- **mmmigrate**: its Spanner dialect is on main, not released; move to the release once it is
-  out.
+- **mmmigrate's driver tags**: v0.8.0 tags the root module only; the drivers are pinned to its
+  commit by pseudo-version until they carry tags of their own (`driver/spanner/v0.8.0`).
 
 ## The capacity bench on real Spanner
 
