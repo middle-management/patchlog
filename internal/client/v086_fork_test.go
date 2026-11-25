@@ -135,7 +135,8 @@ func TestV086PartlyPlacedChain(t *testing.T) {
 	x := c.E2E(v.priv)
 	w1 := must(x.CreateDocSealed(ctx, "e", "d", map[string]any{"n": 1.0}))
 	must(c.CreateBranch(ctx, "e", client.BranchRequest{Name: "eb"}))
-	ebFirst, _ := must2(c.NSLogPage(ctx, "eb", must(c.NSHead(ctx, "eb")).ID, ""))
+	ebFirst, _, _, err := c.NSLogPage(ctx, "eb", must(c.NSHead(ctx, "eb")).ID, "")
+	must(0, err)
 	must(x.InitKeyring(ctx, "eb"))
 	// A whole-document write, which applies whatever came before it.
 	w2 := must(x.AppendSealed(ctx, "eb", "d", w1.ID, ops(op("replace", "", map[string]any{"n": 5.0}))))

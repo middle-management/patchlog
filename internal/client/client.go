@@ -10,7 +10,15 @@
 //   - Ids are text ids (§3.2). An empty id means "none" (genesis parent,
 //     empty checkpoint).
 //   - Redirects are never followed automatically: head pointers (302) are
-//     returned as typed values read from Location / ETag.
+//     returned as typed values read from Location / ETag. The exception is
+//     a partial reader's (§7.9): its document, raw and blob reads follow
+//     the 302 to their form under its view, and its plain namespace reads
+//     (NSLog, Heads, LongPoll and their pages) read its view's filtered
+//     log and /heads, in a public namespace through the view ViewOf finds
+//     once and the client remembers (auto.go). Those return a FilteredAt
+//     whose Filtered() says the answer isn't chain-verifiable (§10);
+//     WithUnfilteredOnly keeps them at the unfiltered URLs, as verifiers
+//     and followers need.
 //   - JSON bodies are parsed with jsonv (I-JSON, §3.1), so values use the
 //     jsonv model (float64 numbers, map[string]any, []any) and can be
 //     canonicalised and hashed exactly as the server does.
@@ -60,6 +68,11 @@ type Client struct {
 	// levels are the encryption levels learnt per namespace (levels.go),
 	// shared with With copies.
 	levels *levelTable
+	// unfilteredOnly keeps the plain namespace reads at the unfiltered
+	// URLs (WithUnfilteredOnly, auto.go); views are the views those reads
+	// go through in public namespaces, per grant, shared with With copies.
+	unfilteredOnly bool
+	views          *viewTable
 
 	rootMu sync.Mutex
 	root   *Root // GET /, once fetched
@@ -150,6 +163,9 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 	if c.levels == nil {
 		c.levels = &levelTable{}
 	}
+	if c.views == nil {
+		c.views = &viewTable{}
+	}
 	c.hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return c, nil
 }
@@ -158,6 +174,7 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 // different bearer grant. The copy shares the HTTP client.
 func (c *Client) With(opts ...Option) *Client {
 	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth, signer: c.signer, levels: c.levels,
+		unfilteredOnly: c.unfilteredOnly, views: c.views,
 		// Copied, so options appending to them don't write into c's.
 		senders: append([]*ecdh.PublicKey(nil), c.senders...), trusted: append([]*ecdh.PublicKey(nil), c.trusted...)}
 	c.rootMu.Lock()

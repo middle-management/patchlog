@@ -95,7 +95,7 @@ func (im *importer) listing(ctx context.Context, ns string) *listing {
 	l.through = l.after
 	im.listed[ns] = l
 	for i, last := 0, want[len(want)-1]; pages > 0 && l.through < last; pages-- {
-		items, next, err := im.c.HeadsPage(ctx, ns, h.ID, l.through)
+		items, next, _, err := im.c.Unfiltered().HeadsPage(ctx, ns, h.ID, l.through)
 		if client.IsGone(err) {
 			im.listed[ns] = nil
 			return nil

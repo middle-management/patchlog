@@ -56,7 +56,7 @@ func TestV073SuccessorUpTheBaseChain(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		log, err := c.NSLog(ctx, "r7", head.ID, "")
+		log, _, err := c.NSLog(ctx, "r7", head.ID, "")
 		if err != nil {
 			t.Fatal(err)
 		}

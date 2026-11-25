@@ -150,7 +150,7 @@ func (m *mergeResolver) branch(ns string) (*branchLog, error) {
 	b := &branchLog{}
 	h, err := m.c.NSHead(m.ctx, ns)
 	if err == nil {
-		b.entries, err = m.c.NSLog(m.ctx, ns, h.ID, "")
+		b.entries, _, _, err = m.c.nsLog(m.ctx, ns, h.ID, "", false)
 	}
 	if err != nil {
 		if unreadable(err) {

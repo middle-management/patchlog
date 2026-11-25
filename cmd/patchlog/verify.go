@@ -38,7 +38,8 @@ type verifyResult struct {
 }
 
 func (a *verifyCmd) exec(ctx context.Context, out, _ io.Writer) error {
-	c := a.client()
+	// Only the whole log verifies: a partial reader's is filtered (§10).
+	c := a.client().Unfiltered()
 	say := func(format string, args ...any) {
 		if !a.JSON {
 			fmt.Fprintf(out, format+"\n", args...)
@@ -49,6 +50,9 @@ func (a *verifyCmd) exec(ctx context.Context, out, _ io.Writer) error {
 	if errors.As(err, &ve) {
 		say("MISMATCH namespace %s: %v", a.NS, err)
 		return a.report(out, a.NS, a.From, head, 0, nil, 1)
+	}
+	if fe, ok := client.AsFiltered(err); ok {
+		return fmt.Errorf("can't verify %s: this grant reads it filtered, through view %s (§7.9), and a filtered log isn't chain-verifiable (§10); verify with a grant that reads %s unrestricted", a.NS, fe.View, a.NS)
 	}
 	if err != nil {
 		return err
@@ -79,7 +83,7 @@ func (a *verifyCmd) exec(ctx context.Context, out, _ io.Writer) error {
 			}
 		}
 	} else {
-		items, err := c.Heads(ctx, a.NS, head)
+		items, _, err := c.Heads(ctx, a.NS, head)
 		if err != nil {
 			return err
 		}

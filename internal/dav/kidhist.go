@@ -58,7 +58,7 @@ func (s *Server) sharedKeyHistory(ctx context.Context, tk *token, ns string) *ke
 	if !ok || h.probe == "" {
 		return nil
 	}
-	if _, _, err := tk.c.NSLogPage(ctx, ns, h.probe, h.probeSince); err != nil {
+	if _, _, _, err := tk.c.Unfiltered().NSLogPage(ctx, ns, h.probe, h.probeSince); err != nil {
 		return nil
 	}
 	return h
@@ -146,7 +146,7 @@ func (st *reqState) keyHistory(ctx context.Context, ns string, need time.Time) (
 			// No config write since: the entries after it change no key.
 			nh.asOf = maxTime(nh.asOf, need)
 		} else {
-			es, err := tk.c.NSLog(ctx, ns, head.ID, since)
+			es, _, err := tk.c.Unfiltered().NSLog(ctx, ns, head.ID, since)
 			if err != nil {
 				return unread(err)
 			}

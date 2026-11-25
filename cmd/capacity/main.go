@@ -517,7 +517,7 @@ func (r *runner) scans() {
 	pages, after := 0, ""
 	r.heads = r.heads[:0]
 	for {
-		items, next, err := r.w(ns).HeadsPage(r.ctx, ns, head, after)
+		items, next, _, err := r.w(ns).HeadsPage(r.ctx, ns, head, after)
 		if err != nil {
 			fail(err)
 		}
@@ -537,7 +537,7 @@ func (r *runner) scans() {
 	r.entries = r.entries[:0]
 	units := 0
 	for {
-		es, _, err := r.w(ns).NSLogPage(r.ctx, ns, head, since)
+		es, _, _, err := r.w(ns).NSLogPage(r.ctx, ns, head, since)
 		if err != nil {
 			fail(err)
 		}
@@ -617,11 +617,11 @@ func (r *runner) reads() {
 		return err
 	}))
 	r.record("ns_log_page_random", r.measure(8, func() error {
-		_, _, err := r.w(ns).NSLogPage(r.ctx, ns, head, r.entries[rand.IntN(len(r.entries))])
+		_, _, _, err := r.w(ns).NSLogPage(r.ctx, ns, head, r.entries[rand.IntN(len(r.entries))])
 		return err
 	}))
 	r.record("heads_page_random", r.measure(8, func() error {
-		_, _, err := r.w(ns).HeadsPage(r.ctx, ns, head, pick().Resource)
+		_, _, _, err := r.w(ns).HeadsPage(r.ctx, ns, head, pick().Resource)
 		return err
 	}))
 	if r.c.small > 0 {

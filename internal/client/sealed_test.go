@@ -89,11 +89,11 @@ func testSealedTransparent(t *testing.T) {
 	if enc, _ := nd.Value["encryption"].(map[string]any); enc["level"] != "sealed" {
 		t.Fatalf("ns doc %s", nd.Raw)
 	}
-	nl := must(c.NSLog(ctx, "s", h.ID, ""))
+	nl := mustRead(c.NSLog(ctx, "s", h.ID, ""))
 	if len(nl) != 4 || nl[3].Target != ids[2] {
 		t.Fatalf("ns log %+v", nl)
 	}
-	part := must(c.NSLog(ctx, "s", h.ID, nl[1].ID))
+	part := mustRead(c.NSLog(ctx, "s", h.ID, nl[1].ID))
 	if len(part) != 2 || part[0].ID != nl[2].ID {
 		t.Fatalf("ns log range %+v", part)
 	}
@@ -181,7 +181,7 @@ func TestSealedPurged(t *testing.T) {
 	}
 	_, err := c.NSDoc(ctx, "s", head)
 	purged("document", err)
-	_, err = c.NSLog(ctx, "s", head, "")
+	_, _, err = c.NSLog(ctx, "s", head, "")
 	purged("log", err)
 	_, err = c.LongPoll(ctx, "s", "", "")
 	purged("long-poll", err)
@@ -190,7 +190,7 @@ func TestSealedPurged(t *testing.T) {
 	if d := must(c.NSDoc(ctx, "r", heads["r"])); d.Value["frozen"] != true {
 		t.Fatalf("at-rest document %s", d.Raw)
 	}
-	if lg := must(c.NSLog(ctx, "r", heads["r"], "")); lg[len(lg)-1].Kind != "purge-ns" {
+	if lg := mustRead(c.NSLog(ctx, "r", heads["r"], "")); lg[len(lg)-1].Kind != "purge-ns" {
 		t.Fatalf("at-rest log %+v", lg)
 	}
 }
@@ -221,7 +221,7 @@ func TestSealedWrappedAndPerResource(t *testing.T) {
 	if d := must(r.Doc(ctx, "s", "a", a.ID)); d.Value.(map[string]any)["v"] != "a" {
 		t.Fatalf("doc %s", d.Raw)
 	}
-	if nl := must(r.NSLog(ctx, "s", must(r.NSHead(ctx, "s")).ID, "")); len(nl) != 3 {
+	if nl := mustRead(r.NSLog(ctx, "s", must(r.NSHead(ctx, "s")).ID, "")); len(nl) != 3 {
 		t.Fatalf("ns log %+v", nl)
 	}
 

@@ -1482,7 +1482,7 @@ func (ix *Index) atIncludes(ctx context.Context, a *access, ns, at string, mins 
 			continue
 		}
 		done[m.ID] = true
-		if _, _, err := ix.c.NSLogPage(ctx, ns, at, m.ID); err != nil {
+		if _, _, _, err := ix.c.Unfiltered().NSLogPage(ctx, ns, at, m.ID); err != nil {
 			return false
 		}
 	}
@@ -1561,7 +1561,7 @@ func (ix *Index) waitMember(ctx context.Context, ns, minID string, wait time.Dur
 		h, err := ix.c.NSHead(cctx, ns)
 		reached := err == nil && h.ID == minID
 		if err == nil && !reached {
-			_, _, lerr := ix.c.NSLogPage(cctx, ns, h.ID, minID)
+			_, _, _, lerr := ix.c.Unfiltered().NSLogPage(cctx, ns, h.ID, minID)
 			reached = lerr == nil
 		}
 		cancel()
@@ -1619,7 +1619,7 @@ func (ix *Index) waitMin(ctx context.Context, ns, min string, wait time.Duration
 	// range's first page answers that (§7.1 Paging).
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	_, _, err := ix.c.NSLogPage(cctx, ns, cur, min)
+	_, _, _, err := ix.c.Unfiltered().NSLogPage(cctx, ns, cur, min)
 	return err == nil
 }
 

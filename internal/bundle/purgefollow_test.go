@@ -100,7 +100,7 @@ func (d *deployment) status(ns, name string) int {
 func (d *deployment) purgeEntries(ns, name string) []client.NSEntry {
 	d.t.Helper()
 	var out []client.NSEntry
-	for _, en := range must(d.c.NSLog(ctx, ns, must(d.c.NSHead(ctx, ns)).ID, "")) {
+	for _, en := range mustRead(d.c.NSLog(ctx, ns, must(d.c.NSHead(ctx, ns)).ID, "")) {
 		if en.Kind == "purge" && en.Resource == name {
 			out = append(out, en)
 		}

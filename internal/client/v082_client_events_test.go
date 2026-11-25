@@ -49,12 +49,12 @@ func TestV082EventJWEAsRangeRefused(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if lg, err := c.NSLog(ctx, "s", nsID, ""); !errors.Is(err, seal.ErrMismatch) {
+		if lg, _, err := c.NSLog(ctx, "s", nsID, ""); !errors.Is(err, seal.ErrMismatch) {
 			t.Fatalf("%s served as a range: %v %v", what, lg, err)
 		}
 	}
 	body, _ = seal.Seal(kn, "s#1", seal.RangePL("s", "", nsID), arr)
-	if lg, err := c.NSLog(ctx, "s", nsID, ""); err != nil || len(lg) != 1 || lg[0].ID != nsID {
+	if lg, _, err := c.NSLog(ctx, "s", nsID, ""); err != nil || len(lg) != 1 || lg[0].ID != nsID {
 		t.Fatalf("the range: %v %v", lg, err)
 	}
 }

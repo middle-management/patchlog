@@ -146,7 +146,7 @@ func TestLogPagesWithNode(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		es, err := c.With(client.WithKeys(client.NewKeys(nil))).NSLog(ctx, ns, h.ID, "")
+		es, _, err := c.With(client.WithKeys(client.NewKeys(nil))).NSLog(ctx, ns, h.ID, "")
 		if err != nil {
 			t.Fatal(err)
 		}

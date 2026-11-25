@@ -301,7 +301,7 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 	}
 	// Only document changes need a catch-up; the switch itself is a config
 	// entry.
-	newer, err := c.NSLog(ctx, opt.Branch, after.ID, first.BranchAt)
+	newer, _, err := c.Unfiltered().NSLog(ctx, opt.Branch, after.ID, first.BranchAt)
 	if err != nil {
 		return out, err
 	}

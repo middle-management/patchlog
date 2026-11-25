@@ -54,7 +54,7 @@ func TestV074V03SchemaFinalStatus(t *testing.T) {
 	origin := must(w.c.Origin(ctx))
 	head := must(w.c.NSHead(ctx, "matches")).ID
 	var units []follow.Unit
-	for _, e := range must(w.c.NSLog(ctx, "matches", head, "")) {
+	for _, e := range mustRead(w.c.NSLog(ctx, "matches", head, "")) {
 		units = append(units, follow.Unit{Entry: e})
 	}
 	batch := &follow.Batch{Origin: origin, NS: "matches", Units: units, NewCheckpoint: head}

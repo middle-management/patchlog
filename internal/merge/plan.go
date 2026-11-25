@@ -426,7 +426,7 @@ func NewPlan(ctx context.Context, c *client.Client, target, branch string, opt O
 		}
 		p.BranchAt = bh.ID
 	}
-	blog, err := c.NSLog(ctx, branch, p.BranchAt, "")
+	blog, _, err := c.Unfiltered().NSLog(ctx, branch, p.BranchAt, "")
 	if err != nil {
 		return nil, fmt.Errorf("merge: branch %s log: %w", branch, err)
 	}
@@ -581,9 +581,9 @@ func headsAt(log []client.NSEntry, at string) map[string]string {
 
 func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since string) error {
 	p.points, p.ignoredFor = map[string]Pair{}, map[string][]MergeBatch{}
-	tlog, err := p.c.NSLog(ctx, p.Target, p.TargetAt, since)
+	tlog, _, err := p.c.Unfiltered().NSLog(ctx, p.Target, p.TargetAt, since)
 	if client.IsNotFound(err) && since != "" {
-		tlog, err = p.c.NSLog(ctx, p.Target, p.TargetAt, "")
+		tlog, _, err = p.c.Unfiltered().NSLog(ctx, p.Target, p.TargetAt, "")
 	}
 	if err != nil {
 		return fmt.Errorf("merge: target %s log: %w", p.Target, err)

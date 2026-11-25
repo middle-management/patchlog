@@ -19,6 +19,9 @@ func must[T any](v T, err error) T {
 	return v
 }
 
+// mustRead is must for a read that also says whether it was filtered.
+func mustRead[T any](v T, _ client.FilteredAt, err error) T { return must(v, err) }
+
 func rep(path string, v any) []any {
 	return []any{map[string]any{"op": "replace", "path": path, "value": v}}
 }
@@ -152,7 +155,7 @@ func TestVerifyDetectsTampering(t *testing.T) {
 	c := s.Client(t, client.WithAuthor("admin"))
 	populate(t, s, c)
 	head := must(c.NSHead(ctx, "main"))
-	entries := must(c.NSLog(ctx, "main", head.ID, ""))
+	entries := mustRead(c.NSLog(ctx, "main", head.ID, ""))
 	if _, err := verify.VerifyNSChain(entries, ""); err != nil {
 		t.Fatal(err)
 	}

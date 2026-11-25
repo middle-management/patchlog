@@ -37,7 +37,7 @@ func (e *tenv) configOf(ns string) map[string]any {
 // lastEntry is a namespace's newest log entry, opened if it is sealed.
 func (e *tenv) lastEntry(ns string) plclient.NSEntry {
 	e.t.Helper()
-	lg, err := e.keyed().NSLog(context.Background(), ns, e.nsHead(ns), "")
+	lg, _, err := e.keyed().NSLog(context.Background(), ns, e.nsHead(ns), "")
 	if err != nil || len(lg) == 0 {
 		e.t.Fatalf("%s: %v", ns, err)
 	}

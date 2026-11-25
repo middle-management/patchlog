@@ -177,7 +177,7 @@ func TestV073AbandonedNeedsCurrentStarKey(t *testing.T) {
 	abandon(a.admin, "r3")
 	// r4: ops too, but under a grant the base has revoked since.
 	abandon(a.as(a.ops, "user:revoked"), "r4")
-	log := must(a.admin.NSLog(ctx, "r4", must(a.admin.NSHead(ctx, "r4")).ID, ""))
+	log := mustRead(a.admin.NSLog(ctx, "r4", must(a.admin.NSHead(ctx, "r4")).ID, ""))
 	patchConfig(t, a.admin, "matches", op("add", "/revoked", []any{log[len(log)-1].Grant.ID}))
 
 	for _, ns := range []string{"r1", "r2"} {

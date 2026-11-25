@@ -51,8 +51,8 @@ func TestV087BranchGrantWithBaseRules(t *testing.T) {
 	// Nothing lists the branch for li: neither unrestricted nor filtered.
 	at := must(owner.NSHead(ctx, "matches-r7")).ID
 	for what, err := range map[string]error{
-		"heads": func() error { _, err := li.Heads(ctx, "matches-r7", at); return err }(),
-		"log":   func() error { _, err := li.NSLog(ctx, "matches-r7", at, ""); return err }(),
+		"heads": func() error { _, _, err := li.Heads(ctx, "matches-r7", at); return err }(),
+		"log":   func() error { _, _, err := li.NSLog(ctx, "matches-r7", at, ""); return err }(),
 	} {
 		if ae, ok := client.AsAPIError(err); !ok || ae.Status != 403 {
 			t.Fatalf("the branch's %s for li: %v, want 403", what, err)

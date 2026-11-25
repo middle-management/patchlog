@@ -177,7 +177,7 @@ func (ix *Index) ahead(ctx context.Context, ns, head string) bool {
 	}
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	_, _, err = ix.c.NSLogPage(cctx, ns, head, cur)
+	_, _, _, err = ix.c.Unfiltered().NSLogPage(cctx, ns, head, cur)
 	return err == nil
 }
 
@@ -283,7 +283,7 @@ func (ix *Index) copiedKids(ctx context.Context, cfg *grantcheck.Config) (map[st
 	if err != nil {
 		return nil, lacksRead(cfg.Base, fmt.Errorf("the head of %s: %w", cfg.Base, err))
 	}
-	entries, err := ix.c.NSLog(ctx, cfg.Base, bh.ID, cfg.BaseAt)
+	entries, _, err := ix.c.Unfiltered().NSLog(ctx, cfg.Base, bh.ID, cfg.BaseAt)
 	if err != nil {
 		return nil, lacksRead(cfg.Base, fmt.Errorf("the log of %s: %w", cfg.Base, err))
 	}

@@ -26,6 +26,10 @@ import (
 // entries and aren't chain-verifiable: a partial reader learns of
 // branches from Branches, and of changes of its rules by listing /heads
 // again (§10).
+//
+// The plain namespace reads (NSLog, Heads, LongPoll and their pages) read
+// these for a partial reader (auto.go); the calls here read a filtered
+// answer named by a FilteredAt, page by page.
 
 // FilteredAt names a filtered answer (§7.9 URLs): the namespace, the
 // view and at of its URL, and End, the ns_id of NS at at, which answers at
@@ -79,19 +83,20 @@ func (c *Client) filteredRedirect(r *response, ns, tail string, withAt bool) (vi
 }
 
 // FilteredError is the 302 by which an origin sends a partial reader from
-// a namespace's unfiltered long-poll or events to the filtered log of View
-// (§7.9 URLs), which LongPoll and NSEvents don't follow: it isn't
-// chain-verifiable, and its batches hold only visible items (§10). A
-// caller that accepts that reads it with FilteredLongPoll or
-// FilteredNSEvents. It unwraps to the 302's *APIError, so a caller that
-// doesn't is stopped as by any other redirect.
+// a namespace's unfiltered URLs to the filtered form of View (§7.9 URLs),
+// at At for heads and log ranges: the plain reads of a client made
+// WithUnfilteredOnly return it, and NSEvents always does. The filtered
+// log isn't chain-verifiable, and its batches hold only visible items
+// (§10); a caller that accepts that reads it with a client without the
+// option, or with the Filtered* calls. It unwraps to the 302's *APIError,
+// so a caller that doesn't is stopped as by any other redirect.
 type FilteredError struct {
-	NS, View string
-	Err      *APIError
+	NS, View, At string
+	Err          *APIError
 }
 
 func (e *FilteredError) Error() string {
-	return fmt.Sprintf("%v: the filtered log of view %s (§7.9)", e.Err, e.View)
+	return fmt.Sprintf("%v: the log of %s is filtered for this grant, at view %s, and isn't chain-verifiable (§7.9, §10)", e.Err, e.NS, e.View)
 }
 
 func (e *FilteredError) Unwrap() error { return e.Err }
@@ -160,44 +165,6 @@ func endOf(r *response) (string, error) {
 		return "", fmt.Errorf("client: %s: %w (§7.9)", r.path, err)
 	}
 	return end, nil
-}
-
-// FilteredHeadsPage fetches one page of GET /ns/{ns}/rev/{nsID}/heads, as
-// HeadsPrefixPage does, for any reader. To a partial reader the origin
-// answers 302 to the page's filtered form at the current at, which it
-// follows once with the same prefix and after (§7.9 URLs): only the
-// rows visible to the reader, in pages filled to the log page size, with
-// next, the last row returned, on every full page, so the page after the
-// last full one may be empty; a filtered page whose next isn't its last
-// row is an error. fa names the answer; read further pages
-// with FilteredHeadsAt(fa, …). An unrestricted reader gets the unfiltered
-// page, next absent on the last, and fa without View and At.
-func (c *Client) FilteredHeadsPage(ctx context.Context, ns, nsID, prefix, after string) (items []HeadItem, next string, fa FilteredAt, err error) {
-	if err := checkNS(ns); err != nil {
-		return nil, "", fa, err
-	}
-	if err := checkID("namespace revision", nsID); err != nil {
-		return nil, "", fa, err
-	}
-	if err := checkPrefix(ns, prefix); err != nil {
-		return nil, "", fa, err
-	}
-	r, err := c.do(ctx, "GET", "/ns/"+ns+"/rev/"+nsID+"/heads", headsQuery(prefix, after), nil)
-	if err != nil {
-		return nil, "", fa, err
-	}
-	switch r.status {
-	case 200:
-		items, next, err = parseHeads(r, prefix)
-		return items, next, FilteredAt{NS: ns, End: nsID}, err
-	case 302:
-		view, at, err := c.filteredRedirect(r, ns, "heads", true)
-		if err != nil {
-			return nil, "", fa, err
-		}
-		return c.filteredHeads(ctx, FilteredAt{NS: ns, View: view, At: at}, prefix, after)
-	}
-	return nil, "", fa, r.apiError()
 }
 
 // FilteredHeadsAt fetches one page of the filtered /heads fa names
@@ -282,33 +249,22 @@ func checkFilteredHeads(r *response, items []HeadItem, next, after string) error
 	return nil
 }
 
-// FilteredHeads lists, as HeadsPrefix does, every resource whose name
-// starts with prefix as of nsID, for any reader: to a partial reader the
-// rows visible to it at one at (§7.9), which fa names. If the origin
+// filteredHeadsFrom lists the rest of the filtered /heads fa names after
+// its first page, items and next, every row at one at: if the origin
 // moves the listing to another at between pages, as when a namespace of
 // the at is purged, it starts again there, at most a few times.
-func (c *Client) FilteredHeads(ctx context.Context, ns, nsID, prefix string) ([]HeadItem, FilteredAt, error) {
-	items, next, fa, err := c.FilteredHeadsPage(ctx, ns, nsID, prefix, "")
-	if err != nil {
-		return nil, FilteredAt{}, err
-	}
-	if !fa.Filtered() {
-		if next == "" {
-			return items, fa, nil
-		}
-		rest, err := c.headsFrom(ctx, ns, nsID, prefix, next)
-		return append(items, rest...), fa, err
-	}
+func (c *Client) filteredHeadsFrom(ctx context.Context, fa FilteredAt, prefix string, items []HeadItem, next string) ([]HeadItem, FilteredAt, error) {
+	items = append([]HeadItem{}, items...)
 	for restarts := 0; next != ""; {
-		page, n, got, err := c.FilteredHeadsAt(ctx, fa, prefix, next)
+		page, n, got, err := c.filteredHeads(ctx, fa, prefix, next)
 		if err != nil {
 			return nil, FilteredAt{}, err
 		}
 		if got.At != fa.At {
 			if restarts++; restarts > 3 {
-				return nil, FilteredAt{}, fmt.Errorf("client: /ns/%s/view/%s/heads keeps moving to another at (§7.9)", ns, fa.View)
+				return nil, FilteredAt{}, fmt.Errorf("client: /ns/%s/view/%s/heads keeps moving to another at (§7.9)", fa.NS, fa.View)
 			}
-			if page, n, got, err = c.FilteredHeadsAt(ctx, got, prefix, ""); err != nil {
+			if page, n, got, err = c.filteredHeads(ctx, got, prefix, ""); err != nil {
 				return nil, FilteredAt{}, err
 			}
 			items = nil
@@ -318,28 +274,14 @@ func (c *Client) FilteredHeads(ctx context.Context, ns, nsID, prefix string) ([]
 	return items, fa, nil
 }
 
-// headsFrom lists the unfiltered /heads pages of nsID from after on.
-func (c *Client) headsFrom(ctx context.Context, ns, nsID, prefix, after string) ([]HeadItem, error) {
-	var all []HeadItem
-	for after != "" {
-		items, next, err := c.HeadsPrefixPage(ctx, ns, nsID, prefix, after)
-		if err != nil {
-			return nil, err
-		}
-		all, after = append(all, items...), next
-	}
-	return all, nil
-}
-
 // FilteredLog fetches the namespace log after since ("" = from the first
-// entry) as a partial reader reads it (§7.9): GET /ns/{ns}/log, without
-// live, answers 302 to the filtered range at the current at, directly or
-// by way of the unfiltered range /ns/{ns}/rev/{ns_id}/log, and FilteredLog
-// follows it and reads page by page until one lacks X-Log-Next. It returns
-// the visible entries, oldest first, batches with only their visible
-// items, and fa, whose End is the range's end. An unrestricted reader,
-// whom the unfiltered range answers, gets that range as NSLog reads it,
-// and fa without View and At.
+// entry) up to the head, as NSLog does without knowing the head: GET
+// /ns/{ns}/log, without live, answers 302 to the unfiltered range
+// /ns/{ns}/rev/{ns_id}/log or, for a partial reader (§7.9), to its view's
+// filtered range at the current at, directly or by way of the unfiltered
+// one, which it follows, reading page by page until one lacks X-Log-Next.
+// In a public namespace it reads through the grant's view as NSLog does
+// (auto.go). fa is as for NSLog; WithUnfilteredOnly doesn't apply.
 func (c *Client) FilteredLog(ctx context.Context, ns, since string) ([]NSEntry, FilteredAt, error) {
 	if err := checkNS(ns); err != nil {
 		return nil, FilteredAt{}, err
@@ -347,22 +289,26 @@ func (c *Client) FilteredLog(ctx context.Context, ns, since string) ([]NSEntry, 
 	if err := checkOptID("since", since); err != nil {
 		return nil, FilteredAt{}, err
 	}
-	var q url.Values
-	if since != "" {
-		q = url.Values{"since": {since}}
-	}
+	return autoRead(ctx, c, ns, false, func(bool) ([]NSEntry, FilteredAt, bool, error) {
+		return c.headLog(ctx, ns, since)
+	}, func(view string) ([]NSEntry, FilteredAt, error) {
+		return c.FilteredLogAt(ctx, FilteredAt{NS: ns, View: view}, since)
+	})
+}
+
+// headLog is FilteredLog at the unfiltered URLs.
+func (c *Client) headLog(ctx context.Context, ns, since string) ([]NSEntry, FilteredAt, bool, error) {
 	path, end := "/ns/"+ns+"/log", ""
 	for {
-		r, err := c.do(ctx, "GET", path, q, nil)
+		r, err := c.do(ctx, "GET", path, sinceQuery(since), nil)
 		if err != nil {
-			return nil, FilteredAt{}, err
+			return nil, FilteredAt{}, false, err
 		}
 		switch {
 		case r.status == 200 && end != "":
-			es, err := c.NSLog(ctx, ns, end, since)
-			return es, FilteredAt{NS: ns, End: end}, err
+			return c.nsLog(ctx, ns, end, since, true)
 		case r.status != 302:
-			return nil, FilteredAt{}, r.apiError()
+			return nil, FilteredAt{}, false, r.apiError()
 		}
 		loc := c.location(r)
 		if m := unfilteredLogRe.FindStringSubmatch(loc); m != nil && m[1] == ns && end == "" {
@@ -371,16 +317,17 @@ func (c *Client) FilteredLog(ctx context.Context, ns, since string) ([]NSEntry, 
 		}
 		view, at, err := c.filteredRedirect(r, ns, "log", true)
 		if err != nil {
-			return nil, FilteredAt{}, err
+			return nil, FilteredAt{}, false, err
 		}
-		return c.FilteredLogAt(ctx, FilteredAt{NS: ns, View: view, At: at}, since)
+		es, fa, err := c.FilteredLogAt(ctx, FilteredAt{NS: ns, View: view, At: at}, since)
+		return es, fa, false, err
 	}
 }
 
 // FilteredLogAt reads the filtered range fa names after since, every page
-// (§7.9 Log ranges), as FilteredLog does once redirected. Without
-// fa.At it starts at …/view/{view}/log, which the origin redirects to the
-// current at, as under a cookie for /ns/{ns}/view/{view}.
+// (§7.9 Log ranges). Without fa.At it starts at …/view/{view}/log, which
+// the origin redirects to the current at, as under a cookie for
+// /ns/{ns}/view/{view}.
 func (c *Client) FilteredLogAt(ctx context.Context, fa FilteredAt, since string) ([]NSEntry, FilteredAt, error) {
 	if err := checkFilteredAt(fa); err != nil {
 		return nil, FilteredAt{}, err
@@ -390,46 +337,59 @@ func (c *Client) FilteredLogAt(ctx context.Context, fa FilteredAt, since string)
 	}
 	fa.End = ""
 	if fa.At == "" {
-		var q url.Values
-		if since != "" {
-			q = url.Values{"since": {since}}
-		}
-		r, err := c.do(ctx, "GET", filteredPath(fa, "log"), q, nil)
-		if err != nil {
+		var err error
+		if fa, err = c.currentAt(ctx, fa, "log", sinceQuery(since)); err != nil {
 			return nil, FilteredAt{}, err
 		}
-		if r.status != 302 {
-			return nil, FilteredAt{}, r.apiError()
-		}
-		view, at, err := c.filteredRedirect(r, fa.NS, "log", true)
-		if err != nil {
-			return nil, FilteredAt{}, err
-		}
-		if view != fa.View {
-			return nil, FilteredAt{}, fmt.Errorf("client: %s redirects to view %s, not %s (§7.9)", r.path, view, fa.View)
-		}
-		fa.At = at
 	}
-	all := []NSEntry{}
+	page, next, fa, err := c.FilteredLogPage(ctx, fa, since)
+	if err != nil {
+		return nil, FilteredAt{}, err
+	}
+	return c.filteredRange(ctx, fa, next, page)
+}
+
+// currentAt is fa at the current at of its view, which a URL under
+// /ns/{ns}/view/{view} without at, ending in tail, redirects to with q
+// (§7.9 URLs).
+func (c *Client) currentAt(ctx context.Context, fa FilteredAt, tail string, q url.Values) (FilteredAt, error) {
+	r, err := c.do(ctx, "GET", filteredPath(FilteredAt{NS: fa.NS, View: fa.View}, tail), q, nil)
+	if err != nil {
+		return FilteredAt{}, err
+	}
+	if r.status != 302 {
+		return FilteredAt{}, r.apiError()
+	}
+	view, at, err := c.filteredRedirect(r, fa.NS, tail, true)
+	if err != nil {
+		return FilteredAt{}, err
+	}
+	if view != fa.View {
+		return FilteredAt{}, fmt.Errorf("client: %s redirects to view %s, not %s (§7.9)", r.path, view, fa.View)
+	}
+	return FilteredAt{NS: fa.NS, View: view, At: at}, nil
+}
+
+// filteredRange reads the rest of the filtered range fa names after its
+// first page, first and next, every page at fa.End.
+func (c *Client) filteredRange(ctx context.Context, fa FilteredAt, next string, first []NSEntry) ([]NSEntry, FilteredAt, error) {
+	all := append([]NSEntry{}, first...)
 	seen := map[string]bool{}
-	for {
-		page, next, got, err := c.FilteredLogPage(ctx, fa, since)
-		if err != nil {
-			return nil, FilteredAt{}, err
-		}
-		if fa.End != "" && got.End != fa.End {
-			return nil, FilteredAt{}, fmt.Errorf("client: %s: the range's end moved from %s to %s (§7.9)", filteredPath(fa, "log"), fa.End, got.End)
-		}
-		fa = got
-		all = append(all, page...)
-		if next == "" {
-			return all, fa, nil
-		}
+	for next != "" {
 		if seen[next] {
 			return nil, FilteredAt{}, fmt.Errorf("client: %s: X-Log-Next %s repeats", filteredPath(fa, "log"), next)
 		}
-		seen[next], since = true, next
+		seen[next] = true
+		page, n, got, err := c.FilteredLogPage(ctx, fa, next)
+		if err != nil {
+			return nil, FilteredAt{}, err
+		}
+		if got.End != fa.End {
+			return nil, FilteredAt{}, fmt.Errorf("client: %s: the range's end moved from %s to %s (§7.9)", filteredPath(fa, "log"), fa.End, got.End)
+		}
+		all, next = append(all, page...), n
 	}
+	return all, fa, nil
 }
 
 // FilteredLogPage fetches one page of the filtered range fa names after
@@ -490,8 +450,8 @@ func (c *Client) FilteredLogPage(ctx context.Context, fa FilteredAt, since strin
 // key it gives a partial reader (§E.2.3); elsewhere, where /keys is 404
 // not_offered, POST /edge-grants names it in the prefix
 // /ns/{ns}/view/{view} it issues (§C.5.2). Either draws a token from the
-// principal's exchangeRate bucket (§6.6), so a caller reading often keeps
-// the view rather than asking each time; and the exchange is all or
+// principal's exchangeRate bucket (§6.6), so the plain reads ask it once per
+// grant and namespace and remember the answer (auto.go); and the exchange is all or
 // nothing across the namespaces the grant names. It returns "" for a grant
 // that isn't a partial reader there, one that reads ns unrestricted (K_e,
 // a /ns/{ns} prefix) or fixes the names it reads (K_r, /r/{ns}/{name}
@@ -530,53 +490,4 @@ func (c *Client) ViewOf(ctx context.Context, ns string) (string, error) {
 		}
 	}
 	return "", nil
-}
-
-// ViewLog is FilteredLog where a partial reader's unfiltered URLs may not
-// redirect it, as in a public namespace (§7 step 1, v0.90): it finds the
-// grant's view with ViewOf and reads the filtered range there from the
-// current at (FilteredLogAt). A grant that reads ns unrestricted reads
-// the unfiltered range, as FilteredLog gives it.
-func (c *Client) ViewLog(ctx context.Context, ns, since string) ([]NSEntry, FilteredAt, error) {
-	view, err := c.ViewOf(ctx, ns)
-	if err != nil {
-		return nil, FilteredAt{}, err
-	}
-	if view == "" {
-		return c.FilteredLog(ctx, ns, since)
-	}
-	return c.FilteredLogAt(ctx, FilteredAt{NS: ns, View: view}, since)
-}
-
-// ViewHeads lists, as FilteredHeads does, every row whose name starts with
-// prefix, at the view ViewOf finds, from the current at (§7.9 /heads,
-// v0.90). A grant that reads ns unrestricted lists the unfiltered /heads
-// at the namespace head.
-func (c *Client) ViewHeads(ctx context.Context, ns, prefix string) ([]HeadItem, FilteredAt, error) {
-	view, err := c.ViewOf(ctx, ns)
-	if err != nil {
-		return nil, FilteredAt{}, err
-	}
-	if view == "" {
-		h, err := c.NSHead(ctx, ns)
-		if err != nil {
-			return nil, FilteredAt{}, err
-		}
-		return c.FilteredHeads(ctx, ns, h.ID, prefix)
-	}
-	items, next, fa, err := c.FilteredHeadsAt(ctx, FilteredAt{NS: ns, View: view}, prefix, "")
-	if err != nil {
-		return nil, FilteredAt{}, err
-	}
-	for next != "" {
-		page, n, got, err := c.FilteredHeadsAt(ctx, fa, prefix, next)
-		if err != nil {
-			return nil, FilteredAt{}, err
-		}
-		if got.At != fa.At {
-			return nil, FilteredAt{}, fmt.Errorf("client: /ns/%s/view/%s/heads moved to another at between pages (§7.9)", ns, view)
-		}
-		items, next = append(items, page...), n
-	}
-	return items, fa, nil
 }

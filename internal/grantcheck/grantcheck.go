@@ -344,7 +344,7 @@ func (ch *Checker) copiedKeys(ctx context.Context, ns string, cfg *Config) (map[
 	if err != nil {
 		return nil, err
 	}
-	entries, err := ch.c.NSLog(ctx, cfg.Base, bh.ID, cfg.BaseAt)
+	entries, _, err := ch.c.Unfiltered().NSLog(ctx, cfg.Base, bh.ID, cfg.BaseAt)
 	if err != nil {
 		return nil, fmt.Errorf("grantcheck: log of base %s: %w", cfg.Base, err)
 	}

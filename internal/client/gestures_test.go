@@ -68,7 +68,7 @@ func TestGestures(t *testing.T) {
 	if clog[0].Gesture != g3 || clog[0].Undoes != g1 || clog[1].Gesture != g2 || clog[1].Undoes != g1 {
 		t.Fatalf("log of c %+v", clog)
 	}
-	nlog := must(c.NSLog(ctx, "g", br.NSID, ""))
+	nlog := mustRead(c.NSLog(ctx, "g", br.NSID, ""))
 	for _, e := range nlog {
 		switch {
 		case e.Kind == "head" && e.Resource == "b", e.Kind == "config":
@@ -124,7 +124,7 @@ func TestGesturesSealed(t *testing.T) {
 	if len(lg) != 2 || lg[0].Gesture != g || lg[1].Undoes != g || lg[1].Gesture != "" {
 		t.Fatalf("sealed log %+v", lg)
 	}
-	nl := must(c.NSLog(ctx, "s", br.NSID, ""))
+	nl := mustRead(c.NSLog(ctx, "s", br.NSID, ""))
 	if e := nl[len(nl)-2]; e.Gesture != g {
 		t.Fatalf("sealed single write %+v", e)
 	}
@@ -160,7 +160,7 @@ func TestGesturesE2E(t *testing.T) {
 	if len(lg) != 2 || lg[0].Gesture != g || lg[1].Undoes != g {
 		t.Fatalf("e2e log %+v", lg)
 	}
-	nl := must(ac.NSLog(ctx, "e", w1.NSID, w0.NSID))
+	nl := mustRead(ac.NSLog(ctx, "e", w1.NSID, w0.NSID))
 	if len(nl) != 1 || nl[0].Undoes != g {
 		t.Fatalf("e2e namespace log %+v", nl)
 	}

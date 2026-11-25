@@ -18,8 +18,8 @@ import (
 // scenarios 95–97): a consumer filters a public namespace by narrowing
 // its grant with read rules. The unfiltered URLs ignore the grant and
 // never redirect, so the client finds its view (ViewOf: /edge-grants, or
-// /keys where sealed) and reads the filtered log and /heads there
-// (ViewLog, ViewHeads). Head entries carry their revision's schema, by
+// /keys where sealed), once, and its plain reads (NSLog, Heads, LongPoll)
+// read the filtered log and /heads there. Head entries carry their revision's schema, by
 // which the shared log can be filtered on the client too (SchemaHeads).
 //
 //	a1  team a, typed                     visible
@@ -71,8 +71,10 @@ func v090PublicView(t *testing.T, sealed bool) {
 	reader := s.Client(t, client.WithBearer(readerGrant), client.WithKeys(client.NewKeys(nil)))
 
 	if !sealed {
-		// The unfiltered log ignores the grant: no redirect, every entry.
-		es, fa, err := reader.FilteredLog(ctx, "pub", "")
+		// The unfiltered log ignores the grant: no redirect, every entry,
+		// to a reader that asks for the unfiltered log only.
+		strict := reader.With(client.WithUnfilteredOnly())
+		es, fa, err := strict.NSLog(ctx, "pub", must(strict.NSHead(ctx, "pub")).ID, "")
 		if err != nil || fa.Filtered() || !slices.ContainsFunc(es, func(e client.NSEntry) bool { return e.Resource == "b1" }) {
 			t.Fatalf("the unfiltered log to the reader: %v %+v", err, fa)
 		}
@@ -94,9 +96,9 @@ func v090PublicView(t *testing.T, sealed bool) {
 			t.Fatalf("the partial reader's keys: %+v", ka.Keys)
 		}
 	}
-	es, fa, err := reader.ViewLog(ctx, "pub", "")
-	if err != nil || fa.View != view {
-		t.Fatalf("ViewLog: %v %+v (view %s)", err, fa, view)
+	es, fa, err := reader.NSLog(ctx, "pub", must(reader.NSHead(ctx, "pub")).ID, "")
+	if err != nil || fa.View != view || !fa.Filtered() {
+		t.Fatalf("NSLog: %v %+v (view %s)", err, fa, view)
 	}
 	var shown []string
 	for _, e := range es {
@@ -110,9 +112,9 @@ func v090PublicView(t *testing.T, sealed bool) {
 	if want := []string{"a1@" + a1 + ":" + ref, "x@" + x2 + ":"}; !slices.Equal(shown, want) {
 		t.Fatalf("visible heads in the view's range %v, want %v", shown, want)
 	}
-	heads, hfa, err := reader.ViewHeads(ctx, "pub", "")
+	heads, hfa, err := reader.Heads(ctx, "pub", fa.End)
 	if err != nil || hfa.View != view || len(heads) != 2 || heads[0].Resource != "a1" || heads[1].Resource != "x" || heads[1].Target != x2 {
-		t.Fatalf("ViewHeads: %+v %+v %v", heads, hfa, err)
+		t.Fatalf("Heads: %+v %+v %v", heads, hfa, err)
 	}
 
 	// Visible documents open, at their own URLs, which ignore the grant,

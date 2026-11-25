@@ -1040,7 +1040,7 @@ func TestI19SealedServed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ns, err := d.bc.NSLog(ctx, "demo", h.ID, "")
+	ns, _, err := d.bc.NSLog(ctx, "demo", h.ID, "")
 	if err != nil || len(ns) == 0 || ns[0].Kind != "config" {
 		t.Fatalf("the namespace log: %+v %v", ns, err)
 	}

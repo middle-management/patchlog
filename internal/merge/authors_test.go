@@ -47,7 +47,7 @@ func (a *authEnv) merger(k clienttest.Key, sub string) *client.Client {
 
 func (a *authEnv) lastEntry(ns string) client.NSEntry {
 	a.t.Helper()
-	log := must(a.c.NSLog(ctx, ns, must(a.c.NSHead(ctx, ns)).ID, ""))
+	log := mustRead(a.c.NSLog(ctx, ns, must(a.c.NSHead(ctx, ns)).ID, ""))
 	return log[len(log)-1]
 }
 

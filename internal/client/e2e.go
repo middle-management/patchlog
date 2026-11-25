@@ -1527,7 +1527,7 @@ func (x *E2E) ownFork(ctx context.Context, ns, name string) (string, error) {
 		return "", err
 	}
 	// The first page holds the first entry (§7.1 Paging).
-	entries, _, err := x.c.NSLogPage(ctx, ns, h.ID, "")
+	entries, _, _, _, err := x.c.nsLogPage(ctx, ns, h.ID, "", false)
 	if err != nil {
 		return "", err
 	}
@@ -1546,7 +1546,7 @@ func (x *E2E) headAt(ctx context.Context, ns, nsID, name string) (string, error)
 		after = name[:len(name)-size]
 	}
 	for {
-		items, next, err := x.c.HeadsPage(ctx, ns, nsID, after)
+		items, next, _, _, err := x.c.headsPage(ctx, ns, nsID, "", after, false)
 		if err != nil {
 			return "", err
 		}

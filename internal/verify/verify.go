@@ -243,7 +243,7 @@ func Namespace(ctx context.Context, c *client.Client, ns, fromID string) ([]clie
 	if h.ID == fromID {
 		return nil, fromID, nil
 	}
-	entries, err := c.NSLog(ctx, ns, h.ID, fromID)
+	entries, _, err := c.Unfiltered().NSLog(ctx, ns, h.ID, fromID)
 	if err != nil {
 		return nil, "", err
 	}

@@ -38,7 +38,7 @@ func TestMergeCarriesGestures(t *testing.T) {
 	}
 	// The batch entry records them per step (§7.4).
 	nh := must(e.c.NSHead(ctx, "matches"))
-	nl := must(e.c.NSLog(ctx, "matches", nh.ID, ""))
+	nl := mustRead(e.c.NSLog(ctx, "matches", nh.ID, ""))
 	if b := nl[len(nl)-1]; b.Kind != "batch" || len(b.Gestures["derby"]) != 2 || b.Gestures["derby"][1] != (client.StepGesture{Gesture: g2, Undoes: g1}) {
 		t.Fatalf("merge batch %+v", b)
 	}

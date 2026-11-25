@@ -327,7 +327,7 @@ func TestScratchFiles(t *testing.T) {
 	if b := e.expect(e.do("GET", "/docs/.DS_Store", ""), 200, "GET .DS_Store").body; b != "Bud1" {
 		t.Fatalf(".DS_Store %q", b)
 	}
-	heads := must(e.c.Heads(e.ctx, "docs", must(e.c.NSHead(e.ctx, "docs")).ID))
+	heads := mustRead(e.c.Heads(e.ctx, "docs", must(e.c.NSHead(e.ctx, "docs")).ID))
 	if len(heads) != 1 || heads[0].Resource != "x" {
 		t.Fatalf("heads %+v", heads)
 	}
@@ -633,7 +633,7 @@ func TestScratchDirs(t *testing.T) {
 	e.expect(e.do("DELETE", "/.Trash", ""), 204, "DELETE")
 	e.expect(e.do("GET", "/.Trash/folders.501/f", ""), 404, "GET after DELETE")
 	e.expect(e.do("PUT", "/.Trash/f", "x"), 409, "PUT below a deleted directory")
-	if heads := must(e.c.Heads(e.ctx, "docs", must(e.c.NSHead(e.ctx, "docs")).ID)); len(heads) != 1 {
+	if heads := mustRead(e.c.Heads(e.ctx, "docs", must(e.c.NSHead(e.ctx, "docs")).ID)); len(heads) != 1 {
 		t.Fatalf("heads %+v", heads)
 	}
 }

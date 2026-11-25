@@ -14,7 +14,7 @@ import (
 func liveHeadsMatch(t *testing.T, c *client.Client, ns string) int {
 	t.Helper()
 	n := 0
-	for _, it := range must(c.Heads(ctx, ns, must(c.NSHead(ctx, ns)).ID)) {
+	for _, it := range mustRead(c.Heads(ctx, ns, must(c.NSHead(ctx, ns)).ID)) {
 		if it.Kind != "head" {
 			continue
 		}

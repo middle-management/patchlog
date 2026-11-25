@@ -527,7 +527,7 @@ func TestV073P37BranchWithoutKeys(t *testing.T) {
 	x := startSvc(t, c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, untyped: true, noRun: true})
 	origin := must(c.Origin(ctx))
 	h := must(c.NSHead(ctx, "e"))
-	entries := must(c.NSLog(ctx, "e", h.ID, ""))
+	entries := mustRead(c.NSLog(ctx, "e", h.ID, ""))
 	doc := must(c.NSDoc(ctx, "e", h.ID))
 	b := &follow.Batch{Origin: origin, NS: "e", Units: []follow.Unit{{Entry: entries[0], Config: doc}}, NewCheckpoint: h.ID}
 	// The index has no keyring recipient key: e2e is unreadable to it.

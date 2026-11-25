@@ -533,7 +533,7 @@ func (x *relCtx) branches(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		log, err := x.c.NSLog(ctx, br, h.ID, "")
+		log, _, err := x.c.Unfiltered().NSLog(ctx, br, h.ID, "")
 		if client.IsPurged(err) {
 			// Purged since its document was read (§8.5).
 			x.conflict(RCPurged, k, br, "", br+" is purged")
@@ -1158,7 +1158,7 @@ func ApproveRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (
 // entryBefore returns the ns_id before the entry id of ns's chain, which
 // follows since (an ns_id in that chain).
 func entryBefore(ctx context.Context, c *client.Client, ns, id, since string) (string, error) {
-	log, err := c.NSLog(ctx, ns, id, since)
+	log, _, err := c.Unfiltered().NSLog(ctx, ns, id, since)
 	if err != nil {
 		return "", err
 	}
@@ -1844,7 +1844,7 @@ func findBatch(ctx context.Context, c *client.Client, ns string, match func(clie
 	if err != nil {
 		return "", nil, err
 	}
-	log, err := c.NSLog(ctx, ns, h.ID, "")
+	log, _, err := c.Unfiltered().NSLog(ctx, ns, h.ID, "")
 	if err != nil {
 		return "", nil, err
 	}

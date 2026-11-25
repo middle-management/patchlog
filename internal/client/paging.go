@@ -6,6 +6,14 @@ import (
 	"net/url"
 )
 
+// sinceQuery is a log read's query: since, if set.
+func sinceQuery(since string) url.Values {
+	if since == "" {
+		return nil
+	}
+	return url.Values{"since": {since}}
+}
+
 // Paged log ranges (§7.1 Paging).
 //
 // A log range longer than the deployment's log page size answers its first
@@ -24,7 +32,7 @@ import (
 // entry ("" for none). next is the since of the following page, or "" when
 // the page ends at to.
 func (c *Client) logPage(ctx context.Context, path, since, to string, decode func(r *response, end string) (last string, err error)) (next string, err error) {
-	return c.logPageMode(ctx, path, since, to, false, decode)
+	return c.logPageMode(ctx, path, since, to, false, nil, decode)
 }
 
 // filteredLogPage fetches one page of a filtered range (§7.9 Log
@@ -37,17 +45,19 @@ func (c *Client) logPage(ctx context.Context, path, since, to string, decode fun
 // on the last page. X-Log-Next must still be an id, and must move past
 // since.
 func (c *Client) filteredLogPage(ctx context.Context, path, since string, decode func(r *response, end string) (last string, err error)) (next string, err error) {
-	return c.logPageMode(ctx, path, since, "", true, decode)
+	return c.logPageMode(ctx, path, since, "", true, nil, decode)
 }
 
-func (c *Client) logPageMode(ctx context.Context, path, since, to string, filtered bool, decode func(r *response, end string) (last string, err error)) (next string, err error) {
-	var q url.Values
-	if since != "" {
-		q = url.Values{"since": {since}}
-	}
-	r, err := c.do(ctx, "GET", path, q, nil)
+// logPageMode reads one page as logPage or, if filtered, filteredLogPage
+// does; redirected, if set, answers a 302 in decode's place, returning
+// the page's next.
+func (c *Client) logPageMode(ctx context.Context, path, since, to string, filtered bool, redirected func(r *response) (string, error), decode func(r *response, end string) (last string, err error)) (next string, err error) {
+	r, err := c.do(ctx, "GET", path, sinceQuery(since), nil)
 	if err != nil {
 		return "", err
+	}
+	if r.status == 302 && redirected != nil {
+		return redirected(r)
 	}
 	if r.status != 200 {
 		return "", r.apiError()

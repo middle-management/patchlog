@@ -417,7 +417,7 @@ func (n *nsFollower) bootstrapBranch(ctx context.Context) error {
 			}
 		}
 		// The first page holds the first entry (§7.1 Paging).
-		entries, _, err := n.f.c.NSLogPage(ctx, n.ns, h.ID, "")
+		entries, _, _, err := n.f.c.Unfiltered().NSLogPage(ctx, n.ns, h.ID, "")
 		if err != nil {
 			return nil, err
 		}
@@ -449,7 +449,7 @@ func (n *nsFollower) deliverHeads(ctx context.Context, at, after string, genesis
 	}
 	for {
 		v, err := n.f.retryValue(ctx, n.ns, func() (any, error) {
-			items, next, err := n.f.c.HeadsPage(ctx, n.ns, at, after)
+			items, next, _, err := n.f.c.Unfiltered().HeadsPage(ctx, n.ns, at, after)
 			return page{items, next}, err
 		})
 		if client.IsPurged(err) {
@@ -606,7 +606,7 @@ func (n *nsFollower) pageTo(ctx context.Context, head string) error {
 			next    string
 		}
 		v, err := n.f.retryValue(ctx, n.ns, func() (any, error) {
-			es, next, err := n.f.c.NSLogPage(ctx, n.ns, head, n.cur)
+			es, next, _, err := n.f.c.Unfiltered().NSLogPage(ctx, n.ns, head, n.cur)
 			return page{es, next}, err
 		})
 		if err != nil {
@@ -642,7 +642,7 @@ var lastName = strings.Repeat("z", 128)
 // delivers the log up to it first. Any other error is left to following.
 func (n *nsFollower) purgedAtHead(ctx context.Context, head string) error {
 	_, err := n.f.retryValue(ctx, n.ns, func() (any, error) {
-		_, _, err := n.f.c.HeadsPage(ctx, n.ns, head, lastName)
+		_, _, _, err := n.f.c.Unfiltered().HeadsPage(ctx, n.ns, head, lastName)
 		return nil, err
 	})
 	switch {
@@ -663,7 +663,7 @@ func (n *nsFollower) followLongPoll(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		res, err := n.f.c.LongPoll(ctx, n.ns, n.cur, cursor)
+		res, err := n.f.c.Unfiltered().LongPoll(ctx, n.ns, n.cur, cursor)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()

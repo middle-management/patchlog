@@ -17,7 +17,7 @@ import (
 func entryOf(t *testing.T, c *client.Client, ns, id string) client.NSEntry {
 	t.Helper()
 	h := must(c.NSHead(ctx, ns))
-	for _, e := range must(c.NSLog(ctx, ns, h.ID, "")) {
+	for _, e := range mustRead(c.NSLog(ctx, ns, h.ID, "")) {
 		if e.ID == id {
 			return e
 		}

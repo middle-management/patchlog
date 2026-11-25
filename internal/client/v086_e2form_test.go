@@ -109,7 +109,7 @@ func TestV086BaseNSRejectedInEveryDeliveryForm(t *testing.T) {
 			if err := c.NSEvents(ctx, "z", "", func(client.NSEntry) error { got++; return nil }); err != nil {
 				t.Errorf("%s: a namespace event: %v", what, err)
 			}
-			if es, _, err := c.NSLogPage(ctx, "z", nsID, ""); err != nil || len(es) != 1 {
+			if es, _, _, err := c.NSLogPage(ctx, "z", nsID, ""); err != nil || len(es) != 1 {
 				t.Errorf("%s: a namespace range: %+v %v", what, es, err)
 			}
 			if b, err := c.GetBlobRefEpoch(ctx, "z", "d", ref, 1); err != nil || string(b.Data) != string(blob) {
@@ -130,7 +130,7 @@ func TestV086BaseNSRejectedInEveryDeliveryForm(t *testing.T) {
 		if err := c.NSEvents(ctx, "z", "", func(client.NSEntry) error { t.Errorf("%s: a namespace event was delivered", what); return nil }); !errors.Is(err, seal.ErrMismatch) {
 			t.Errorf("%s: a namespace event: %v, want a mismatch", what, err)
 		}
-		if es, _, err := c.NSLogPage(ctx, "z", nsID, ""); !errors.Is(err, seal.ErrMismatch) {
+		if es, _, _, err := c.NSLogPage(ctx, "z", nsID, ""); !errors.Is(err, seal.ErrMismatch) {
 			t.Errorf("%s: a namespace range: %+v %v, want a mismatch", what, es, err)
 		}
 		if b, err := c.GetBlobRefEpoch(ctx, "z", "d", ref, 1); !errors.Is(err, seal.ErrMismatch) {
