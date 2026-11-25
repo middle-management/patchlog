@@ -165,12 +165,11 @@ func (t *tx) lookupResource(name, res string, want *ids.ID, full bool) *nsRow {
 	} else {
 		dest = append(dest, &xseq)
 	}
-	// Spanner has no LATERAL: SQLite's forms, which tx rebinds; a check's
-	// its own (lookupCheckSpanner).
+	// Spanner has no LATERAL: SQLite's forms, which tx rebinds. (A CASE
+	// taking the head's seq when the head is the revision asked for, to
+	// skip the subquery, cost Spanner more CPU, not less: 1.09 ms a check
+	// against 0.65, docs/SPANNER.md, the seventh run.)
 	q := lookupSQL[b2i(full)][b2i(t.e.pg && !t.e.spanner)]
-	if t.e.spanner && !full {
-		q = lookupCheckSpanner
-	}
 	var row *sql.Row
 	if full {
 		row = t.QueryRow(q, res, idArg, name)
@@ -241,27 +240,6 @@ var lookupSQL = func() (q [2][2]string) {
 	q[1][0] = `SELECT ` + common + `, ` + cols("x", revCols) + from + `
 		LEFT JOIN revisions x ON x.seq = (` + byID + `)
 		WHERE n.name = ?`
-	return q
-}()
-
-// lookupCheckSpanner is lookupSQL's check form on Spanner: the seq of the
-// revision with the id asked for is the head's when that is the one asked
-// for, as a write's If-Match mostly is, without its own lookup of
-// revisions_res_id_key; only otherwise the subquery. A write's check is
-// half of Spanner's CPU at load (docs/SPANNER.md, the fifth bench run).
-// Its placeholders are numbered: $1, the id, is used twice.
-var lookupCheckSpanner = func() string {
-	q := lookupSQL[0][0]
-	sub := `(SELECT seq FROM revisions WHERE res = r.res AND id = ? LIMIT 1)`
-	if !strings.Contains(q, sub) {
-		panic("lookupCheckSpanner: lookupSQL changed")
-	}
-	q = strings.Replace(q, sub, `CASE WHEN h.id = $1 THEN h.seq ELSE (SELECT seq FROM revisions WHERE res = r.res AND id = $1 LIMIT 1) END`, 1)
-	q = strings.Replace(q, `r.name = ?`, `r.name = $2`, 1)
-	q = strings.Replace(q, `n.name = ?`, `n.name = $3`, 1)
-	if strings.Contains(q, "?") {
-		panic("lookupCheckSpanner: placeholders left")
-	}
 	return q
 }()
 

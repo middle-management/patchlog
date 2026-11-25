@@ -337,11 +337,12 @@ files `docs/capacity/spanner-gcp-2026-11-25-run5/`):
   metrics are per instance, so this is inferred; Key Visualizer would show it.) Next: steps of
   five minutes (`BUSY=16,32 BUSY_SECS=300`), so splits follow the load before it is measured.
 
-And the
-check made cheaper: its namespace read from the name's index alone (migration 003, the index
-including the columns the check reads, which change once a group), and the seq of the revision
-asked for taken from the head when the head is the one asked for, as a write's If-Match mostly
-is, without a lookup of its own (`lookupCheckSpanner`); not measured yet.
+**The seventh run** (`e76fe2fa`, 1,000 processing units: the check's namespace from the name's
+index, migration 003, and the head's seq for the revision asked for by a `CASE`; files
+`docs/capacity/spanner-gcp-2026-11-25-run7/`): 506, 1,214, 1,691, 2,228, 2,542 and 2,401 a second
+at 1 to 32 namespaces. The index saved its row (4 rows scanned a check, from 5), but the check
+cost more CPU, 1.09 ms against 0.65: Spanner plans the subquery in a `CASE` worse than alone.
+The `CASE` is gone again; the index stays.
 
 ## The capacity bench on real Spanner
 
