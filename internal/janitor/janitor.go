@@ -372,7 +372,7 @@ func (j *Janitor) draftBranches(ctx context.Context, cands []candidate) (map[str
 
 // holdsSchemas reports whether a branch wrote a schema document.
 func (j *Janitor) holdsSchemas(ctx context.Context, ns, at string) (bool, error) {
-	log, err := j.c.NSLog(ctx, ns, at, "")
+	log, _, err := j.c.Unfiltered().NSLog(ctx, ns, at, "")
 	if err != nil {
 		return false, err
 	}
@@ -419,7 +419,7 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 		d.Reason = "not frozen"
 		return d, nil
 	}
-	log, err := j.c.NSLog(ctx, ns, head.ID, "")
+	log, _, err := j.c.Unfiltered().NSLog(ctx, ns, head.ID, "")
 	if client.IsPurged(err) {
 		return purgedSince(d, err), nil
 	}
@@ -933,9 +933,9 @@ func (b *branch) verifyMerged(ctx context.Context) (bool, string, error) {
 	}
 	bref, _ := b.doc["base"].(map[string]any)
 	at, _ := bref["at"].(string)
-	entries, err := b.j.c.NSLog(ctx, b.base, bh, at)
+	entries, _, err := b.j.c.Unfiltered().NSLog(ctx, b.base, bh, at)
 	if client.IsNotFound(err) && at != "" {
-		entries, err = b.j.c.NSLog(ctx, b.base, bh, "")
+		entries, _, err = b.j.c.Unfiltered().NSLog(ctx, b.base, bh, "")
 	}
 	if err != nil {
 		return false, "", err
@@ -1042,7 +1042,7 @@ func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time
 	if i < 0 {
 		return false, "successor " + succ + " is not a branch of " + sbase, nil
 	}
-	entries, err := b.j.c.NSLog(ctx, succ, sh.ID, "")
+	entries, _, err := b.j.c.Unfiltered().NSLog(ctx, succ, sh.ID, "")
 	if client.IsPurged(err) {
 		return false, sealedPurged(succ), nil
 	}
@@ -1226,7 +1226,7 @@ func (b *branch) copiedKids(ctx context.Context, ns, base, at string) (map[strin
 	if err != nil {
 		return nil, err
 	}
-	entries, err := b.j.c.NSLog(ctx, base, bh, at)
+	entries, _, err := b.j.c.Unfiltered().NSLog(ctx, base, bh, at)
 	if err != nil {
 		return nil, fmt.Errorf("janitor: log of %s, the base of %s: %w", base, ns, err)
 	}

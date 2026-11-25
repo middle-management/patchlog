@@ -181,7 +181,7 @@ func writesSchemas(ctx context.Context, c *client.Client, ns string) (bool, erro
 	if err != nil {
 		return false, err
 	}
-	log, err := c.NSLog(ctx, ns, h.ID, "")
+	log, _, err := c.Unfiltered().NSLog(ctx, ns, h.ID, "")
 	if err != nil {
 		return false, err
 	}

@@ -59,7 +59,7 @@ func (f v86RoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { retur
 // v86First is a namespace's first ns_id.
 func v86First(t *testing.T, d *deployment, ns string) string {
 	t.Helper()
-	page, _, err := d.c.NSLogPage(ctx, ns, must(d.c.NSHead(ctx, ns)).ID, "")
+	page, _, _, err := d.c.NSLogPage(ctx, ns, must(d.c.NSHead(ctx, ns)).ID, "")
 	noErr(t, err)
 	if len(page) == 0 {
 		t.Fatalf("namespace %s has no log", ns)
@@ -70,7 +70,7 @@ func v86First(t *testing.T, d *deployment, ns string) string {
 func v86Heads(t *testing.T, d *deployment, ns, at string) map[string]client.HeadItem {
 	t.Helper()
 	m := map[string]client.HeadItem{}
-	for _, it := range must(d.c.Heads(ctx, ns, at)) {
+	for _, it := range mustRead(d.c.Heads(ctx, ns, at)) {
 		m[it.Resource] = it
 	}
 	return m

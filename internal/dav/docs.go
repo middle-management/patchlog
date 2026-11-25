@@ -451,7 +451,7 @@ func (s *Server) liveHeads(ctx context.Context, tk *token, ns string) ([]headDoc
 	if err != nil {
 		return nil, err
 	}
-	items, err := tk.c.Heads(ctx, ns, h.ID)
+	items, _, err := tk.c.Unfiltered().Heads(ctx, ns, h.ID)
 	if err != nil {
 		return nil, err
 	}

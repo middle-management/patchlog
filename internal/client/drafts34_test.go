@@ -111,7 +111,7 @@ func TestForcedEntriesVerify(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	log, err := c.NSLog(ctx, "schemas", h.ID, "")
+	log, _, err := c.NSLog(ctx, "schemas", h.ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}

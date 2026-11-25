@@ -72,9 +72,9 @@ func TestV089SealedPartialReader(t *testing.T) {
 	if want := []string{"a1@" + a1, "x@" + x2}; !slices.Equal(shown, want) {
 		t.Fatalf("visible heads in the range %v, want %v", shown, want)
 	}
-	heads, hfa, err := reader.FilteredHeads(ctx, "s", fa.End, "")
+	heads, hfa, err := reader.HeadsPrefix(ctx, "s", fa.End, "")
 	if err != nil || hfa.View != view || len(heads) != 2 || heads[0].Resource != "a1" || heads[1].Resource != "x" || heads[1].Target != x2 {
-		t.Fatalf("FilteredHeads: %+v %+v %v", heads, hfa, err)
+		t.Fatalf("HeadsPrefix: %+v %+v %v", heads, hfa, err)
 	}
 
 	// The same answers on the wire are JWEs under K_view, with view in pl.
@@ -198,9 +198,9 @@ func TestV089SealedPartialReader(t *testing.T) {
 	}
 
 	// Long-poll: the filtered log from the start, sealed the same way.
-	lp, err := reader.FilteredLongPoll(ctx, "s", view, "", "")
-	if err != nil || len(lp.Entries) == 0 {
-		t.Fatalf("FilteredLongPoll: %+v %v", lp, err)
+	lp, err := reader.LongPoll(ctx, "s", "", "")
+	if err != nil || len(lp.Entries) == 0 || lp.View != view {
+		t.Fatalf("LongPoll: %+v %v", lp, err)
 	}
 
 	// Events: the view's, one JWE each under K_view, and a resource's,

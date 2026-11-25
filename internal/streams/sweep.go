@@ -168,7 +168,7 @@ func (p *Proxy) Sweep(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	items, err := p.c.Heads(ctx, p.opt.NS, h.ID)
+	items, _, err := p.c.Unfiltered().Heads(ctx, p.opt.NS, h.ID)
 	if err != nil {
 		return err
 	}

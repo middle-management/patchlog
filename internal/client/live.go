@@ -23,9 +23,11 @@ type LongPollResult struct {
 	Since   string
 	Cursor  string // X-Cursor, to echo in the next request
 	Timeout bool   // 204: no entry arrived within the interval
-	// View is the view of the filtered log the answer came from (§7.9),
-	// FilteredLongPoll's, "" for LongPoll's unfiltered log.
-	View string
+	// FilteredAt names the log the answer came from: NS, and View, the
+	// view of a partial reader's filtered log (§7.9, auto.go), "" for the
+	// unfiltered log. Filtered() reports the former, whose entries
+	// aren't chain-verifiable (§10). A long-poll has no at.
+	FilteredAt
 }
 
 // LongPoll waits for namespace entries after since (§7.7). Echo the
@@ -37,37 +39,56 @@ type LongPollResult struct {
 // long pause or a clock change, is 400 bad_input (IsBadInput): poll again
 // once without it, as a follower does.
 //
-// A partial reader of a namespace the origin filters (§7.9) is
-// redirected to the filtered log /ns/{ns}/view/{view}/log, which LongPoll
-// doesn't follow: that log isn't chain-verifiable and its batches hold
-// only visible items (§10), so it returns the 302 as a *FilteredError
-// (AsFiltered) naming view, and a caller that accepts a filtered log reads
-// it with FilteredLongPoll.
+// A partial reader (§7.9, auto.go) waits on its view's filtered log
+// instead, /ns/{ns}/view/{view}/log?live=long-poll: redirected there in a
+// namespace that isn't public, through the view the client remembers in a
+// public one. The result says so (Filtered()). Only visible entries
+// answer 200 or end a wait, so an interval with none ends 204, whose
+// X-Namespace-Revision, the newest entry scanned, becomes Since even when
+// it is hidden; a since naming a hidden entry is accepted. Filtered logs
+// carry no branch entries: a follower learns of branches from Branches
+// (§10). WithUnfilteredOnly makes the redirect a *FilteredError.
 func (c *Client) LongPoll(ctx context.Context, ns, since, cursor string) (*LongPollResult, error) {
 	if err := checkNS(ns); err != nil {
 		return nil, err
 	}
-	r, err := c.longPoll(ctx, "/ns/"+ns+"/log", since, cursor, true)
-	if err != nil {
-		return nil, err
-	}
-	if r.status == 302 {
-		return nil, c.filteredError(r, ns, "log")
-	}
-	return c.nsLongPollResult(ctx, ns, "", since, r)
+	res, _, err := autoRead(ctx, c, ns, c.unfilteredOnly, func(follow bool) (*LongPollResult, FilteredAt, bool, error) {
+		r, err := c.longPoll(ctx, "/ns/"+ns+"/log", since, cursor, true)
+		if err != nil {
+			return nil, FilteredAt{}, false, err
+		}
+		if r.status == 302 {
+			view, _, rerr := c.filteredRedirect(r, ns, "log", false)
+			switch {
+			case rerr != nil:
+				return nil, FilteredAt{}, false, r.apiError()
+			case !follow:
+				return nil, FilteredAt{}, false, &FilteredError{NS: ns, View: view, Err: r.apiError()}
+			}
+			res, err := c.viewLongPoll(ctx, ns, view, since, cursor)
+			if err != nil {
+				return nil, FilteredAt{}, false, err
+			}
+			return res, res.FilteredAt, false, nil
+		}
+		res, err := c.nsLongPollResult(ctx, ns, "", since, r)
+		if err != nil {
+			return nil, FilteredAt{}, shared(r), err
+		}
+		return res, res.FilteredAt, shared(r), nil
+	}, func(view string) (*LongPollResult, FilteredAt, error) {
+		res, err := c.viewLongPoll(ctx, ns, view, since, cursor)
+		if err != nil {
+			return nil, FilteredAt{}, err
+		}
+		return res, res.FilteredAt, nil
+	})
+	return res, err
 }
 
-// FilteredLongPoll waits, as LongPoll does, for entries after since in
-// the filtered log of view, /ns/{ns}/view/{view}/log?live=long-poll (§7.9
-// Long-poll, §7.7): only visible entries answer 200 or end a wait, so an
-// interval with none ends 204, whose X-Namespace-Revision, the newest
-// entry scanned, becomes Since even when it is hidden; a since naming a
-// hidden entry is accepted. Filtered logs carry no branch entries: a
-// follower learns of branches from Branches (§10).
-func (c *Client) FilteredLongPoll(ctx context.Context, ns, view, since, cursor string) (*LongPollResult, error) {
-	if err := checkNS(ns); err != nil {
-		return nil, err
-	}
+// viewLongPoll is LongPoll on the filtered log of view, /ns/{ns}/view/
+// {view}/log?live=long-poll (§7.9 Long-poll, §7.7).
+func (c *Client) viewLongPoll(ctx context.Context, ns, view, since, cursor string) (*LongPollResult, error) {
 	if err := checkID("view", view); err != nil {
 		return nil, err
 	}
@@ -82,7 +103,7 @@ func (c *Client) FilteredLongPoll(ctx context.Context, ns, view, since, cursor s
 // since, of the filtered log of view, or the unfiltered one for "".
 func (c *Client) nsLongPollResult(ctx context.Context, ns, view, since string, r *response) (*LongPollResult, error) {
 	var err error
-	res := &LongPollResult{Since: r.header.Get("X-Namespace-Revision"), Cursor: r.header.Get("X-Cursor"), View: view}
+	res := &LongPollResult{Since: r.header.Get("X-Namespace-Revision"), Cursor: r.header.Get("X-Cursor"), FilteredAt: FilteredAt{NS: ns, View: view}}
 	if r.status == 204 {
 		res.Timeout = true
 		if res.Since == "" {
@@ -198,8 +219,9 @@ type Event struct {
 //
 // A partial reader of a namespace the origin filters (§7.9) is
 // redirected to /ns/{ns}/view/{view}/events, which NSEvents doesn't follow, as
-// LongPoll doesn't: it returns the 302 as a *FilteredError naming view, and
-// a caller that accepts a filtered log streams it with FilteredNSEvents.
+// a client made WithUnfilteredOnly's LongPoll doesn't: it returns the 302
+// as a *FilteredError naming view, and a caller that accepts a filtered
+// log streams it with FilteredNSEvents, or long-polls with LongPoll.
 func (c *Client) NSEvents(ctx context.Context, ns, since string, fn func(NSEntry) error) error {
 	if err := checkNS(ns); err != nil {
 		return err
@@ -211,7 +233,7 @@ func (c *Client) NSEvents(ctx context.Context, ns, since string, fn func(NSEntry
 // FilteredNSEvents streams, as NSEvents does, the entries after since of
 // the filtered log of view, /ns/{ns}/view/{view}/events (§7.9 Events, §7.3):
 // only visible entries, judged again with each read check the stream
-// repeats; since may name a hidden entry. As for FilteredLongPoll, branch
+// repeats; since may name a hidden entry. As for a filtered LongPoll, branch
 // entries never appear, and a change of visibility writes no entry (§10).
 func (c *Client) FilteredNSEvents(ctx context.Context, ns, view, since string, fn func(NSEntry) error) error {
 	if err := checkNS(ns); err != nil {

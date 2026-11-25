@@ -167,7 +167,7 @@ func (e *treeEnv) find(ns, folder, name string) map[string]map[string]any {
 	e.t.Helper()
 	h := must(e.c.NSHead(e.ctx, ns))
 	out := map[string]map[string]any{}
-	for _, it := range must(e.c.Heads(e.ctx, ns, h.ID)) {
+	for _, it := range mustRead(e.c.Heads(e.ctx, ns, h.ID)) {
 		if it.Kind != "head" {
 			continue
 		}

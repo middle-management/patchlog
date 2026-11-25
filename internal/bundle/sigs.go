@@ -472,7 +472,7 @@ func (sk *sourceKeys) positions(ctx context.Context, ns string) *nsPositions {
 		p.err = err
 		return p
 	}
-	log, err := sk.c.NSLog(ctx, ns, h.ID, "")
+	log, _, err := sk.c.Unfiltered().NSLog(ctx, ns, h.ID, "")
 	if err != nil {
 		p.err = err
 		return p

@@ -517,7 +517,7 @@ func TestReadGrant(t *testing.T) {
 		t.Fatalf("principal: %+v %v", pi, err)
 	}
 	if _, err := rc.NSHead(e.ctx, nsStreams); err == nil {
-		if _, err := rc.Heads(e.ctx, nsStreams, ""); err == nil {
+		if _, _, err := rc.Heads(e.ctx, nsStreams, ""); err == nil {
 			t.Fatal("the read grant lists the namespace")
 		}
 	}

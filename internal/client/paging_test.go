@@ -32,7 +32,7 @@ func TestLogPages(t *testing.T) {
 		ids = append(ids, w.ID)
 	}
 	h := must(c.NSHead(ctx, "docs"))
-	all := must(c.NSLog(ctx, "docs", h.ID, ""))
+	all := mustRead(c.NSLog(ctx, "docs", h.ID, ""))
 	if len(all) != 6 || all[0].Kind != "config" || all[5].ID != h.ID {
 		t.Fatalf("namespace log %d entries", len(all))
 	}
@@ -45,7 +45,7 @@ func TestLogPages(t *testing.T) {
 	var paged []client.NSEntry
 	since, pages := "", 0
 	for {
-		es, next, err := c.NSLogPage(ctx, "docs", h.ID, since)
+		es, next, _, err := c.NSLogPage(ctx, "docs", h.ID, since)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -63,10 +63,10 @@ func TestLogPages(t *testing.T) {
 		t.Fatalf("%d pages, %d entries", pages, len(paged))
 	}
 	// A range from a since, and one up to an older id.
-	if es := must(c.NSLog(ctx, "docs", all[4].ID, all[0].ID)); len(es) != 4 || es[3].ID != all[4].ID {
+	if es := mustRead(c.NSLog(ctx, "docs", all[4].ID, all[0].ID)); len(es) != 4 || es[3].ID != all[4].ID {
 		t.Fatalf("range %d", len(es))
 	}
-	if es := must(c.NSLog(ctx, "docs", h.ID, h.ID)); len(es) != 0 {
+	if es := mustRead(c.NSLog(ctx, "docs", h.ID, h.ID)); len(es) != 0 {
 		t.Fatalf("empty range %d", len(es))
 	}
 
@@ -151,7 +151,7 @@ func TestLogPagesChecked(t *testing.T) {
 		e2:   {"", []any{nsEntry(e3, e2)}},
 		"zz": {},
 	}
-	if es, err := c.NSLog(ctx, "n", e3, ""); err != nil || len(es) != 3 || es[2].ID != e3 {
+	if es, _, err := c.NSLog(ctx, "n", e3, ""); err != nil || len(es) != 3 || es[2].ID != e3 {
 		t.Fatalf("well-formed pages: %v %v", es, err)
 	}
 	for name, first := range map[string]answer{
@@ -161,7 +161,7 @@ func TestLogPagesChecked(t *testing.T) {
 		"X-Log-Next malformed":  {"1x", []any{nsEntry(e1, "")}},
 	} {
 		pages[""] = first
-		if _, err := c.NSLog(ctx, "n", e3, ""); err == nil {
+		if _, _, err := c.NSLog(ctx, "n", e3, ""); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 		if _, err := c.Log(ctx, "n", "a", e3, ""); err == nil {

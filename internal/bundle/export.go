@@ -296,7 +296,7 @@ func (p *ExportPlan) loadNS(ctx context.Context, ns string) error {
 		return fmt.Errorf("export: namespace %s is e2e (Addendum E.3): a snapshot needs a client holding its keys to seal a new genesis (§G.5.1); export its full history, which carries the ciphertext", ns)
 	}
 	p.Access[ns] = access
-	items, err := p.c.Heads(ctx, ns, h.ID)
+	items, _, err := p.c.Unfiltered().Heads(ctx, ns, h.ID)
 	if err != nil {
 		return fmt.Errorf("export: namespace %s heads: %w", ns, err)
 	}
@@ -458,7 +458,7 @@ func (p *ExportPlan) baseHeads(ctx context.Context, ns string) (map[string]clien
 	}
 	var m map[string]client.HeadItem
 	if _, ok := doc.Value["base"].(map[string]any); ok {
-		page, _, err := p.c.NSLogPage(ctx, ns, p.At[ns], "")
+		page, _, _, err := p.c.Unfiltered().NSLogPage(ctx, ns, p.At[ns], "")
 		if err != nil {
 			return nil, fmt.Errorf("export: the namespace log of branch %s: %w", ns, err)
 		}
@@ -469,7 +469,7 @@ func (p *ExportPlan) baseHeads(ctx context.Context, ns string) (map[string]clien
 		if len(page) == 0 || page[0].Kind != "config" {
 			return nil, fmt.Errorf("export: the namespace log of branch %s does not start with its config genesis, so its foreign parents can't be told from its own /heads (§G.4.1)", ns)
 		}
-		items, err := p.c.Heads(ctx, ns, page[0].ID)
+		items, _, err := p.c.Unfiltered().Heads(ctx, ns, page[0].ID)
 		if err != nil {
 			return nil, fmt.Errorf("export: branch %s as of its first entry %s: %w", ns, page[0].ID, err)
 		}

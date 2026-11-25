@@ -28,7 +28,7 @@ func TestHeadMetaFields(t *testing.T) {
 		b := must(c.Create(ctx, ns, "b", nonced(client.GenesisPatches(map[string]any{}))))
 		bt := must(c.Delete(ctx, ns, "b", b.ID))
 		items := map[string]client.HeadItem{}
-		for _, it := range must(c.Heads(ctx, ns, must(c.NSHead(ctx, ns)).ID)) {
+		for _, it := range mustRead(c.Heads(ctx, ns, must(c.NSHead(ctx, ns)).ID)) {
 			items[it.Resource] = it
 		}
 		d := must(c.Doc(ctx, ns, "a", a.ID))

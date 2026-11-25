@@ -30,6 +30,9 @@ func must[T any](v T, err error) T {
 	return v
 }
 
+// mustRead is must for a read that also says whether it was filtered.
+func mustRead[T any](v T, _ client.FilteredAt, err error) T { return must(v, err) }
+
 const d2020 = "https://json-schema.org/draft/2020-12/schema"
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -505,7 +508,7 @@ func TestBatchIsOneUnit(t *testing.T) {
 
 	// Bring the index to the current head.
 	head := must(w.c.NSHead(ctx, "matches")).ID
-	entries := must(w.c.NSLog(ctx, "matches", head, ""))
+	entries := mustRead(w.c.NSLog(ctx, "matches", head, ""))
 	var units []follow.Unit
 	for _, e := range entries {
 		units = append(units, follow.Unit{Entry: e})
@@ -518,7 +521,7 @@ func TestBatchIsOneUnit(t *testing.T) {
 		{Resource: "a", IfNoneMatch: true, Steps: []client.Step{client.PatchStep(client.GenesisPatches(map[string]any{"$schema": w.match, "title": "alpha"}))}},
 		{Resource: "b", IfNoneMatch: true, Steps: []client.Step{client.PatchStep(client.GenesisPatches(map[string]any{"$schema": w.match, "title": "beta"}))}},
 	}}, false))
-	entries = must(w.c.NSLog(ctx, "matches", br.NSID, head))
+	entries = mustRead(w.c.NSLog(ctx, "matches", br.NSID, head))
 	if len(entries) != 1 || entries[0].Kind != "batch" {
 		t.Fatalf("entries %+v", entries)
 	}

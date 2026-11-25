@@ -798,8 +798,8 @@ func TestV075FilteredPurged(t *testing.T) {
 	expectCode(t, w.get("/ns/matches/view/"+vid+"/log?live=long-poll&since="+purgeNS, li), 410, "purged")
 }
 
-// §7.9 with the client of V75-02: a partial reader's FilteredHeads,
-// FilteredLog and FilteredLongPoll follow this server's redirects and read
+// §7.9 with the client of V75-02: a partial reader's HeadsPrefix,
+// FilteredLog and LongPoll follow this server's redirects and read
 // what is visible; LongPoll names the filtered form without following it.
 func TestV075ClientFiltered(t *testing.T) {
 	t.Parallel()
@@ -811,7 +811,7 @@ func TestV075ClientFiltered(t *testing.T) {
 		t.Fatal(err)
 	}
 	head := w.nsHead("matches", w.admin)
-	items, fa, err := c.FilteredHeads(ctx, "matches", head, "")
+	items, fa, err := c.HeadsPrefix(ctx, "matches", head, "")
 	if err != nil || !fa.Filtered() || fa.End != head {
 		t.Fatalf("FilteredHeads: %v %+v", err, fa)
 	}
@@ -822,7 +822,7 @@ func TestV075ClientFiltered(t *testing.T) {
 	if !reflect.DeepEqual(names, []string{"derby", "shared"}) {
 		t.Fatalf("heads %v", names)
 	}
-	if items, _, err = c.FilteredHeads(ctx, "matches", head, "s"); err != nil || len(items) != 1 || items[0].Resource != "shared" {
+	if items, _, err = c.HeadsPrefix(ctx, "matches", head, "s"); err != nil || len(items) != 1 || items[0].Resource != "shared" {
 		t.Fatalf("FilteredHeads with prefix: %v %v", items, err)
 	}
 	entries, fa, err := c.FilteredLog(ctx, "matches", "")
@@ -836,18 +836,18 @@ func TestV075ClientFiltered(t *testing.T) {
 	if !seen["derby"] || !seen["shared"] || seen["secret"] || seen["opener"] {
 		t.Fatalf("log resources %v", seen)
 	}
-	if _, err := c.LongPoll(ctx, "matches", head, ""); err == nil {
-		t.Fatal("LongPoll followed the filtered form")
+	if _, err := c.With(plclient.WithUnfilteredOnly()).LongPoll(ctx, "matches", head, ""); err == nil {
+		t.Fatal("an unfiltered-only LongPoll followed the filtered form")
 	} else if fe, ok := plclient.AsFiltered(err); !ok || fe.View != fa.View {
 		t.Fatalf("LongPoll: %v", err)
 	}
-	lp, err := c.FilteredLongPoll(ctx, "matches", fa.View, head, "")
-	if err != nil || lp == nil {
-		t.Fatalf("FilteredLongPoll: %+v %v", lp, err)
+	lp, err := c.LongPoll(ctx, "matches", head, "")
+	if err != nil || lp == nil || !lp.Filtered() || lp.View != fa.View {
+		t.Fatalf("LongPoll: %+v %v", lp, err)
 	}
 	// An unrestricted reader's HeadsPrefix.
 	ac, _ := plclient.New(w.srv.URL, plclient.WithHTTPClient(&http.Client{Transport: transport}), plclient.WithBearer(w.admin))
-	all, err := ac.HeadsPrefix(ctx, "matches", head, "s")
+	all, _, err := ac.HeadsPrefix(ctx, "matches", head, "s")
 	if err != nil || len(all) != 2 {
 		t.Fatalf("HeadsPrefix: %v %v", all, err)
 	}

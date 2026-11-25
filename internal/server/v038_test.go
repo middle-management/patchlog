@@ -73,7 +73,7 @@ func TestV038ClientGrantNull(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lg, err := c.NSLog(ctx, "main-b", h.ID, "")
+	lg, _, err := c.NSLog(ctx, "main-b", h.ID, "")
 	if err != nil {
 		t.Fatal(err)
 	}

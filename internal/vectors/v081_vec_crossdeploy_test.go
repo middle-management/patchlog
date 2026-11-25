@@ -86,7 +86,7 @@ func TestV081CrossDeploymentKeSealedFailsClosed(t *testing.T) {
 			return asV0261{rt, "demo", key, kn}
 		}))
 		doc, derr := rc.NSDoc(ctx, "demo", h.ID)
-		log, lerr := rc.NSLog(ctx, "demo", h.ID, "")
+		log, _, lerr := rc.NSLog(ctx, "demo", h.ID, "")
 		if !old {
 			if derr != nil || doc == nil || lerr != nil || len(log) != 1 {
 				t.Fatalf("resealed under K_n: doc %v %v, log %v %v", doc, derr, log, lerr)

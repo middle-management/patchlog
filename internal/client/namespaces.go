@@ -273,19 +273,44 @@ func parseNSLog(body any, path string) ([]NSEntry, error) {
 // NSLog fetches the namespace log after since (exclusive; "" = from the
 // first entry) up to nsID (inclusive), oldest first (immutable), following
 // its pages (§7.1). A since not in the chain is a 404.
-func (c *Client) NSLog(ctx context.Context, ns, nsID, since string) ([]NSEntry, error) {
-	all := []NSEntry{}
-	for {
-		page, next, err := c.NSLogPage(ctx, ns, nsID, since)
+//
+// fa says what was read. For a reader of the whole log it is {NS, End:
+// nsID}. A partial reader (§7.9, auto.go) reads its view's filtered range
+// instead, every page at one at: the visible entries after since, which
+// may name a hidden entry, up to fa.End, the ns_id the origin's current
+// checkpoint is at, which needn't be nsID; fa.Filtered() is then true and
+// the entries aren't chain-verifiable (§10). WithUnfilteredOnly makes
+// that a *FilteredError.
+func (c *Client) NSLog(ctx context.Context, ns, nsID, since string) ([]NSEntry, FilteredAt, error) {
+	return autoRead(ctx, c, ns, c.unfilteredOnly, func(follow bool) ([]NSEntry, FilteredAt, bool, error) {
+		return c.nsLog(ctx, ns, nsID, since, follow)
+	}, func(view string) ([]NSEntry, FilteredAt, error) {
+		return c.FilteredLogAt(ctx, FilteredAt{NS: ns, View: view}, since)
+	})
+}
+
+// nsLog is NSLog at the unfiltered URLs, following a partial reader's
+// redirect if follow, else returning it as a *FilteredError; shared
+// reports whether its first page was an answer a shared cache may keep.
+func (c *Client) nsLog(ctx context.Context, ns, nsID, since string, follow bool) (all []NSEntry, fa FilteredAt, sh bool, err error) {
+	page, next, fa, sh, err := c.nsLogPage(ctx, ns, nsID, since, follow)
+	if err != nil {
+		return nil, FilteredAt{}, sh, err
+	}
+	if fa.Filtered() {
+		all, fa, err = c.filteredRange(ctx, fa, next, page)
+		return all, fa, false, err
+	}
+	all = append([]NSEntry{}, page...)
+	for next != "" {
+		since = next
+		page, next, _, _, err = c.nsLogPage(ctx, ns, nsID, since, false)
 		if err != nil {
-			return nil, err
+			return nil, FilteredAt{}, false, err
 		}
 		all = append(all, page...)
-		if next == "" {
-			return all, nil
-		}
-		since = next
 	}
+	return all, fa, sh, nil
 }
 
 // NSLogPage fetches one page of the namespace log after since up to nsID
@@ -294,17 +319,59 @@ func (c *Client) NSLog(ctx context.Context, ns, nsID, since string) ([]NSEntry, 
 // ends at nsID. A page that ends short of nsID without X-Log-Next is an
 // error. A sealed page is opened as the range [since, its last entry]
 // (§E.2.2).
-func (c *Client) NSLogPage(ctx context.Context, ns, nsID, since string) (entries []NSEntry, next string, err error) {
+//
+// To a partial reader (§7.9, auto.go) it is a page of its view's filtered
+// range at the current at, as FilteredLogPage reads it, which fa names
+// (fa.Filtered()): its visible entries, possibly none, and next, the last
+// entry scanned. A reader that must stay at that at reads on with
+// FilteredLogPage(fa, next); NSLogPage(ns, nsID, next) reads at the
+// current at again. WithUnfilteredOnly makes it a *FilteredError.
+func (c *Client) NSLogPage(ctx context.Context, ns, nsID, since string) (entries []NSEntry, next string, fa FilteredAt, err error) {
+	type page struct {
+		es   []NSEntry
+		next string
+	}
+	p, fa, err := autoRead(ctx, c, ns, c.unfilteredOnly, func(follow bool) (page, FilteredAt, bool, error) {
+		es, next, fa, sh, err := c.nsLogPage(ctx, ns, nsID, since, follow)
+		return page{es, next}, fa, sh, err
+	}, func(view string) (page, FilteredAt, error) {
+		fa, err := c.currentAt(ctx, FilteredAt{NS: ns, View: view}, "log", sinceQuery(since))
+		if err != nil {
+			return page{}, FilteredAt{}, err
+		}
+		es, next, fa, err := c.FilteredLogPage(ctx, fa, since)
+		return page{es, next}, fa, err
+	})
+	return p.es, p.next, fa, err
+}
+
+// nsLogPage is NSLogPage at the unfiltered URL, following a partial
+// reader's redirect if follow, else returning it as a *FilteredError.
+func (c *Client) nsLogPage(ctx context.Context, ns, nsID, since string, follow bool) (entries []NSEntry, next string, fa FilteredAt, sh bool, err error) {
 	if err := checkNS(ns); err != nil {
-		return nil, "", err
+		return nil, "", fa, false, err
 	}
 	if err := checkID("namespace revision", nsID); err != nil {
-		return nil, "", err
+		return nil, "", fa, false, err
 	}
 	if err := checkOptID("since", since); err != nil {
-		return nil, "", err
+		return nil, "", fa, false, err
 	}
-	next, err = c.logPage(ctx, "/ns/"+ns+"/rev/"+nsID+"/log", since, nsID, func(r *response, end string) (string, error) {
+	fa = FilteredAt{NS: ns, End: nsID}
+	redirected := func(r *response) (string, error) {
+		view, at, err := c.filteredRedirect(r, ns, "log", true)
+		switch {
+		case err != nil:
+			return "", r.apiError()
+		case !follow:
+			return "", &FilteredError{NS: ns, View: view, At: at, Err: r.apiError()}
+		}
+		var next string
+		entries, next, fa, err = c.FilteredLogPage(ctx, FilteredAt{NS: ns, View: view, At: at}, since)
+		return next, err
+	}
+	next, err = c.logPageMode(ctx, "/ns/"+ns+"/rev/"+nsID+"/log", since, nsID, false, redirected, func(r *response, end string) (string, error) {
+		sh = shared(r)
 		body := r.value()
 		if isJOSE(r) {
 			v, err := c.openRange(ctx, ns, since, end, string(r.body))
@@ -324,9 +391,9 @@ func (c *Client) NSLogPage(ctx context.Context, ns, nsID, since string) (entries
 		return es[len(es)-1].ID, nil
 	})
 	if err != nil {
-		return nil, "", err
+		return nil, "", FilteredAt{}, sh && !fa.Filtered(), err
 	}
-	return entries, next, nil
+	return entries, next, fa, sh && !fa.Filtered(), nil
 }
 
 // HeadItem is one resource of a /heads listing.
@@ -349,8 +416,9 @@ type HeadItem struct {
 }
 
 // HeadsPage fetches one page of GET /ns/{ns}/rev/{nsID}/heads after the
-// resource name after ("" = first page). next is "" on the last page.
-func (c *Client) HeadsPage(ctx context.Context, ns, nsID, after string) (items []HeadItem, next string, err error) {
+// resource name after ("" = first page). next is "" on the last page. fa
+// is as for HeadsPrefixPage.
+func (c *Client) HeadsPage(ctx context.Context, ns, nsID, after string) (items []HeadItem, next string, fa FilteredAt, err error) {
 	return c.HeadsPrefixPage(ctx, ns, nsID, "", after)
 }
 
@@ -358,48 +426,109 @@ func (c *Client) HeadsPage(ctx context.Context, ns, nsID, after string) (items [
 // resources whose names start with prefix, a resource name (§3.6), or
 // every resource for "". A server before v0.75 refuses the parameter
 // (400, IsBadInput), and a row outside prefix is an error.
-func (c *Client) HeadsPrefixPage(ctx context.Context, ns, nsID, prefix, after string) (items []HeadItem, next string, err error) {
+//
+// fa is {NS, End: nsID} for a reader of every row. A partial reader
+// (§7.9, auto.go) reads its view's filtered /heads at the current at
+// instead, which fa names (fa.Filtered(), End the at's ns_id): only the
+// rows visible to it, in pages filled to the log page size, with next,
+// the last row returned, on every full page, so the page after the last
+// full one may be empty; a filtered page whose next isn't its last row is
+// an error. Read further pages at the same at with FilteredHeadsAt(fa, …).
+// WithUnfilteredOnly makes it a *FilteredError.
+func (c *Client) HeadsPrefixPage(ctx context.Context, ns, nsID, prefix, after string) (items []HeadItem, next string, fa FilteredAt, err error) {
+	type page struct {
+		items []HeadItem
+		next  string
+	}
+	p, fa, err := autoRead(ctx, c, ns, c.unfilteredOnly, func(follow bool) (page, FilteredAt, bool, error) {
+		items, next, fa, sh, err := c.headsPage(ctx, ns, nsID, prefix, after, follow)
+		return page{items, next}, fa, sh, err
+	}, func(view string) (page, FilteredAt, error) {
+		items, next, fa, err := c.filteredHeads(ctx, FilteredAt{NS: ns, View: view}, prefix, after)
+		return page{items, next}, fa, err
+	})
+	return p.items, p.next, fa, err
+}
+
+// headsPage is HeadsPrefixPage at the unfiltered URL, following a partial
+// reader's redirect if follow, else returning it as a *FilteredError.
+func (c *Client) headsPage(ctx context.Context, ns, nsID, prefix, after string, follow bool) (items []HeadItem, next string, fa FilteredAt, sh bool, err error) {
 	if err := checkNS(ns); err != nil {
-		return nil, "", err
+		return nil, "", fa, false, err
 	}
 	if err := checkID("namespace revision", nsID); err != nil {
-		return nil, "", err
+		return nil, "", fa, false, err
 	}
 	if err := checkPrefix(ns, prefix); err != nil {
-		return nil, "", err
+		return nil, "", fa, false, err
 	}
 	r, err := c.do(ctx, "GET", "/ns/"+ns+"/rev/"+nsID+"/heads", headsQuery(prefix, after), nil)
 	if err != nil {
-		return nil, "", err
+		return nil, "", fa, false, err
 	}
-	if r.status != 200 {
-		return nil, "", r.apiError()
+	switch r.status {
+	case 200:
+		items, next, err = parseHeads(r, prefix)
+		return items, next, FilteredAt{NS: ns, End: nsID}, shared(r), err // shared even if err
+	case 302:
+		view, at, err := c.filteredRedirect(r, ns, "heads", true)
+		switch {
+		case err != nil:
+			return nil, "", fa, false, r.apiError()
+		case !follow:
+			return nil, "", fa, false, &FilteredError{NS: ns, View: view, At: at, Err: r.apiError()}
+		}
+		items, next, fa, err = c.filteredHeads(ctx, FilteredAt{NS: ns, View: view, At: at}, prefix, after)
+		return items, next, fa, false, err
 	}
-	return parseHeads(r, prefix)
+	return nil, "", fa, false, r.apiError()
 }
 
 // Heads lists every resource as of nsID (including read-through ones in a
-// branch), iterating all pages.
-func (c *Client) Heads(ctx context.Context, ns, nsID string) ([]HeadItem, error) {
+// branch), iterating all pages; fa is as for HeadsPrefix.
+func (c *Client) Heads(ctx context.Context, ns, nsID string) ([]HeadItem, FilteredAt, error) {
 	return c.HeadsPrefix(ctx, ns, nsID, "")
 }
 
 // HeadsPrefix lists, as Heads does, the resources as of nsID whose names
-// start with prefix (§7.4), iterating all pages.
-func (c *Client) HeadsPrefix(ctx context.Context, ns, nsID, prefix string) ([]HeadItem, error) {
-	var all []HeadItem
-	after := ""
-	for {
-		items, next, err := c.HeadsPrefixPage(ctx, ns, nsID, prefix, after)
+// start with prefix (§7.4), iterating all pages. To a partial reader
+// (§7.9, auto.go) they are the rows visible to it at one at, which fa
+// names (fa.Filtered()); if the origin moves the listing to another at
+// between pages, as when a namespace of the at is purged, it starts again
+// there, at most a few times. WithUnfilteredOnly makes it a
+// *FilteredError.
+func (c *Client) HeadsPrefix(ctx context.Context, ns, nsID, prefix string) ([]HeadItem, FilteredAt, error) {
+	return autoRead(ctx, c, ns, c.unfilteredOnly, func(follow bool) ([]HeadItem, FilteredAt, bool, error) {
+		return c.headsPrefix(ctx, ns, nsID, prefix, follow)
+	}, func(view string) ([]HeadItem, FilteredAt, error) {
+		items, next, fa, err := c.filteredHeads(ctx, FilteredAt{NS: ns, View: view}, prefix, "")
 		if err != nil {
-			return nil, err
+			return nil, FilteredAt{}, err
+		}
+		return c.filteredHeadsFrom(ctx, fa, prefix, items, next)
+	})
+}
+
+// headsPrefix is HeadsPrefix at the unfiltered URLs, following a partial
+// reader's redirect if follow, else returning it as a *FilteredError.
+func (c *Client) headsPrefix(ctx context.Context, ns, nsID, prefix string, follow bool) ([]HeadItem, FilteredAt, bool, error) {
+	items, next, fa, sh, err := c.headsPage(ctx, ns, nsID, prefix, "", follow)
+	if err != nil {
+		return nil, FilteredAt{}, sh, err
+	}
+	if fa.Filtered() {
+		items, fa, err = c.filteredHeadsFrom(ctx, fa, prefix, items, next)
+		return items, fa, false, err
+	}
+	all := append([]HeadItem{}, items...)
+	for next != "" {
+		items, next, _, _, err = c.headsPage(ctx, ns, nsID, prefix, next, false)
+		if err != nil {
+			return nil, FilteredAt{}, false, err
 		}
 		all = append(all, items...)
-		if next == "" {
-			return all, nil
-		}
-		after = next
 	}
+	return all, fa, sh, nil
 }
 
 // checkPrefix checks a /heads prefix: "" for none, else a resource name

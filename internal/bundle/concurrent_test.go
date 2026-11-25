@@ -111,7 +111,7 @@ func heads(t *testing.T, c *client.Client, nss ...string) []string {
 		h := must(c.NSHead(ctx, ns))
 		after := ""
 		for {
-			items, next, err := c.HeadsPage(ctx, ns, h.ID, after)
+			items, next, _, err := c.HeadsPage(ctx, ns, h.ID, after)
 			if err != nil {
 				t.Fatal(err)
 			}

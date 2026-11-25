@@ -53,7 +53,7 @@ func TestV073EntriesVia(t *testing.T) {
 	if !slices.Equal(lg[0].Via, []string{"svc:a", "svc:b"}) || lg[1].Via != nil {
 		t.Errorf("resource entries via %v, %v", lg[0].Via, lg[1].Via)
 	}
-	nl, err := c.NSLog(context.Background(), "n", b, "")
+	nl, _, err := c.NSLog(context.Background(), "n", b, "")
 	if err != nil || len(nl) != 2 {
 		t.Fatalf("namespace log %v, %v", nl, err)
 	}
@@ -71,7 +71,7 @@ func TestV073HeadsPageShapes(t *testing.T) {
 		c := serveJSON(t, func(r *http.Request) any {
 			return map[string]any{key: []any{map[string]any{"resource": want, "kind": "head", "target": nsID}}, "next": want}
 		})
-		items, next, err := c.HeadsPage(context.Background(), "n", nsID, "")
+		items, next, _, err := c.HeadsPage(context.Background(), "n", nsID, "")
 		if err != nil || len(items) != 1 || items[0].Resource != want || next != want {
 			t.Errorf("%s: %v %q %v", key, items, next, err)
 		}

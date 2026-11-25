@@ -22,6 +22,9 @@ func must[T any](v T, err error) T {
 	return v
 }
 
+// mustRead is must for a read that also says whether it was filtered.
+func mustRead[T any](v T, _ client.FilteredAt, err error) T { return must(v, err) }
+
 func noErr(t testing.TB, err error) {
 	t.Helper()
 	if err != nil {
@@ -176,7 +179,7 @@ func testFastForwardReproducesIDs(t *testing.T) {
 	}
 	// The batch entry carries source { ns, at }.
 	nh := must(e.c.NSHead(ctx, "matches"))
-	log := must(e.c.NSLog(ctx, "matches", nh.ID, ""))
+	log := mustRead(e.c.NSLog(ctx, "matches", nh.ID, ""))
 	last := log[len(log)-1]
 	if last.ID != res.NSID || last.Kind != "batch" || last.Source["ns"] != "r7" || last.Source["at"] != p.BranchAt {
 		t.Fatalf("batch entry %+v", last)

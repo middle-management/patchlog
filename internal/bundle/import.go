@@ -806,7 +806,7 @@ func (im *importer) checkUpstreamOrigins(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("import: upstream namespace %s: %w", u, err)
 		}
-		log, err := im.c.NSLog(ctx, u, h.ID, "")
+		log, _, err := im.c.Unfiltered().NSLog(ctx, u, h.ID, "")
 		if err != nil {
 			return fmt.Errorf("import: upstream namespace %s: %w", u, err)
 		}
@@ -2110,7 +2110,7 @@ func (im *importer) mergePoints(ctx context.Context, tns string) (map[string]poi
 	if err != nil {
 		return nil, err
 	}
-	log, err := im.c.NSLog(ctx, tns, h.ID, "")
+	log, _, err := im.c.Unfiltered().NSLog(ctx, tns, h.ID, "")
 	if err != nil {
 		return nil, err
 	}

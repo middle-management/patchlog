@@ -42,7 +42,7 @@ func TestSealedPurged(t *testing.T) {
 
 	must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
 	purged := must(w.PurgeNamespace(ctx, "sec", must(w.NSHead(ctx, "sec")).ID))
-	if _, err := ic.NSLog(ctx, "sec", purged, ""); !client.IsPurged(err) {
+	if _, _, err := ic.NSLog(ctx, "sec", purged, ""); !client.IsPurged(err) {
 		t.Fatalf("the sealed log after the purge: %v", err)
 	}
 	// The index can't read the configuration any more: the core makes the

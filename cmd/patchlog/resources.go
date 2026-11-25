@@ -38,7 +38,7 @@ func (a *lsCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	items, err := c.HeadsPrefix(ctx, a.NS, h.ID, a.Prefix)
+	items, _, err := c.HeadsPrefix(ctx, a.NS, h.ID, a.Prefix)
 	if err != nil {
 		return err
 	}
@@ -701,7 +701,7 @@ func (a *nsPurgeCmd) exec(ctx context.Context, out, errw io.Writer) error {
 		return err
 	}
 	if !a.Yes {
-		items, err := c.Heads(ctx, a.NS, h.ID)
+		items, _, err := c.Heads(ctx, a.NS, h.ID)
 		if err != nil {
 			return err
 		}

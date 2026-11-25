@@ -62,7 +62,7 @@ func TestV081ClientDerivesNamespaceKey(t *testing.T) {
 	if d.Value["read"] != "public" {
 		t.Fatalf("NSDoc %v", d.Value)
 	}
-	lg, err := c.NSLog(ctx, "s", nsID, "")
+	lg, _, err := c.NSLog(ctx, "s", nsID, "")
 	if err != nil || len(lg) != 1 || lg[0].ID != nsID {
 		t.Fatalf("NSLog %v %v", lg, err)
 	}

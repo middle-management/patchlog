@@ -725,7 +725,7 @@ func (ix *Index) refsIncludes(ctx context.Context, st derived.Stored, mins []Min
 		if id == m.ID {
 			continue
 		}
-		if _, _, err := ix.c.NSLogPage(ctx, m.NS, id, m.ID); err != nil {
+		if _, _, _, err := ix.c.Unfiltered().NSLogPage(ctx, m.NS, id, m.ID); err != nil {
 			return false
 		}
 	}

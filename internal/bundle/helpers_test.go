@@ -97,6 +97,9 @@ func must[T any](v T, err error) T {
 	return v
 }
 
+// mustRead is must for a read that also says whether it was filtered.
+func mustRead[T any](v T, _ client.FilteredAt, err error) T { return must(v, err) }
+
 func noErr(t testing.TB, err error) {
 	t.Helper()
 	if err != nil {

@@ -79,7 +79,7 @@ func (a *verifyCmd) exec(ctx context.Context, out, _ io.Writer) error {
 			}
 		}
 	} else {
-		items, err := c.Heads(ctx, a.NS, head)
+		items, _, err := c.Heads(ctx, a.NS, head)
 		if err != nil {
 			return err
 		}

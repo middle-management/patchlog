@@ -113,7 +113,7 @@ func TestConcurrentFetch(t *testing.T) {
 	origin := must(w.c.Origin(ctx))
 	head := must(w.c.NSHead(ctx, "matches")).ID
 	var units []follow.Unit
-	for _, e := range must(w.c.NSLog(ctx, "matches", head, "")) {
+	for _, e := range mustRead(w.c.NSLog(ctx, "matches", head, "")) {
 		units = append(units, follow.Unit{Entry: e})
 	}
 	batch := &follow.Batch{Origin: origin, NS: "matches", Units: units, NewCheckpoint: head}
@@ -196,7 +196,7 @@ func TestFetchConcurrencyShared(t *testing.T) {
 		}
 		head := must(w.c.NSHead(ctx, ns)).ID
 		var units []follow.Unit
-		for _, e := range must(w.c.NSLog(ctx, ns, head, "")) {
+		for _, e := range mustRead(w.c.NSLog(ctx, ns, head, "")) {
 			units = append(units, follow.Unit{Entry: e})
 		}
 		batches[ns] = &follow.Batch{Origin: origin, NS: ns, Units: units, NewCheckpoint: head}

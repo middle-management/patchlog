@@ -529,7 +529,7 @@ func (c *Client) findGesture(ctx context.Context, ns, gesture string, cfg *undoC
 	var since map[string]string
 	if cfg.since != "" {
 		since = map[string]string{}
-		heads, err := c.Heads(ctx, ns, cfg.since)
+		heads, _, _, err := c.headsPrefix(ctx, ns, cfg.since, "", false)
 		if nsUnreadable(err) && c.nsReadErr(ctx, ns) != nil {
 			// The namespace can't be read at all (§C.5), so not as of a
 			// revision either: the since is dropped, and the listing or
@@ -614,7 +614,7 @@ func (c *Client) findGesture(ctx context.Context, ns, gesture string, cfg *undoC
 	if cfg.author != "" {
 		merges = c.newMergeResolver(ctx, ns, h.ID)
 	}
-	log, err := c.NSLog(ctx, ns, h.ID, cfg.since)
+	log, _, _, err := c.nsLog(ctx, ns, h.ID, cfg.since, false)
 	if err != nil {
 		return nil, err // the head answered: a 404 is a since not in the chain
 	}
@@ -1685,7 +1685,7 @@ func (c *Client) scanGestures(ctx context.Context, ns, since string, attribute b
 	if err != nil {
 		return nil, err
 	}
-	log, err := c.NSLog(ctx, ns, h.ID, since)
+	log, _, _, err := c.nsLog(ctx, ns, h.ID, since, false)
 	if err != nil {
 		return nil, err
 	}

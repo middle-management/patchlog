@@ -11,7 +11,7 @@ import (
 func (e *env) headItems(ns string) map[string]client.HeadItem {
 	e.t.Helper()
 	out := map[string]client.HeadItem{}
-	for _, it := range must(e.c.Heads(ctx, ns, must(e.c.NSHead(ctx, ns)).ID)) {
+	for _, it := range mustRead(e.c.Heads(ctx, ns, must(e.c.NSHead(ctx, ns)).ID)) {
 		out[it.Resource] = it
 	}
 	return out

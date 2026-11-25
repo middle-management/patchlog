@@ -29,6 +29,9 @@ func must[T any](v T, err error) T {
 	return v
 }
 
+// mustRead is must for a read that also says whether it was filtered.
+func mustRead[T any](v T, _ client.FilteredAt, err error) T { return must(v, err) }
+
 func TestResourceLifecycle(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -171,7 +174,7 @@ func testNamespaceAPI(t *testing.T) {
 	if doc.Value["read"] != "public" || doc.Config != head.Config {
 		t.Fatalf("ns doc %+v", doc)
 	}
-	lg := must(c.NSLog(ctx, "main", head.ID, ""))
+	lg := mustRead(c.NSLog(ctx, "main", head.ID, ""))
 	if len(lg) != 4 || lg[0].Kind != "config" || lg[1].Kind != "head" || lg[1].Resource != "a" || lg[3].Kind != "batch" {
 		t.Fatalf("ns log %+v", lg)
 	}
@@ -192,7 +195,7 @@ func testNamespaceAPI(t *testing.T) {
 	}
 
 	// Heads (with pagination through all pages).
-	heads := must(c.Heads(ctx, "main", cr.NSID))
+	heads := mustRead(c.Heads(ctx, "main", cr.NSID))
 	if len(heads) != 3 || heads[0].Resource != "a" || heads[0].Target != id2 || heads[1].Kind != "tombstone" {
 		t.Fatalf("heads %+v", heads)
 	}
@@ -212,7 +215,7 @@ func testNamespaceAPI(t *testing.T) {
 		t.Fatalf("branch first entry %s, computed %s", bh.ID, first)
 	}
 	// Read-through heads at the branch's first ns_id.
-	bheads := must(c.Heads(ctx, "rel", first))
+	bheads := mustRead(c.Heads(ctx, "rel", first))
 	if len(bheads) != 3 {
 		t.Fatalf("branch heads %+v", bheads)
 	}

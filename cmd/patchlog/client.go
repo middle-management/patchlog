@@ -712,7 +712,7 @@ func (a *nsLogCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	es, err := c.NSLog(ctx, a.NS, h.ID, a.Since)
+	es, _, err := c.NSLog(ctx, a.NS, h.ID, a.Since)
 	if err != nil {
 		return err
 	}

@@ -28,7 +28,7 @@ func TestFlatMoves(t *testing.T) {
 	}
 	_, doc := e.load("docs", "c")
 	sameJSON(t, doc, map[string]any{"v": 1.0, "list": []any{"x"}})
-	ns := must(e.c.NSLog(e.ctx, "docs", must(e.c.NSHead(e.ctx, "docs")).ID, nsBefore))
+	ns := mustRead(e.c.NSLog(e.ctx, "docs", must(e.c.NSHead(e.ctx, "docs")).ID, nsBefore))
 	if len(ns) != 1 || ns[0].Kind != "batch" {
 		t.Fatalf("not one batch: %+v", ns)
 	}

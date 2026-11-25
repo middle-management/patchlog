@@ -60,7 +60,7 @@ func TestV082ReplayAfterGiveUpTakesTheRest(t *testing.T) {
 	recorded := func() map[string]bool {
 		out := map[string]bool{}
 		h := must(e.c.NSHead(ctx, "r7-b"))
-		for _, en := range must(e.c.NSLog(ctx, "r7-b", h.ID, "")) {
+		for _, en := range mustRead(e.c.NSLog(ctx, "r7-b", h.ID, "")) {
 			if en.Resource != "" {
 				out[en.Resource] = true
 			}
@@ -183,8 +183,8 @@ func TestV082ReleaseBranchGrantFixedToBaseResources(t *testing.T) {
 	// form of it either (§7.9, §F.8).
 	at := must(owner.NSHead(ctx, "matches-r7")).ID
 	for what, err := range map[string]error{
-		"the branch's heads": func() error { _, err := fixed.Heads(ctx, "matches-r7", at); return err }(),
-		"the branch's log":   func() error { _, err := fixed.NSLog(ctx, "matches-r7", at, ""); return err }(),
+		"the branch's heads": func() error { _, _, err := fixed.Heads(ctx, "matches-r7", at); return err }(),
+		"the branch's log":   func() error { _, _, err := fixed.NSLog(ctx, "matches-r7", at, ""); return err }(),
 	} {
 		if ae, ok := client.AsAPIError(err); !ok || ae.Status != 403 {
 			t.Fatalf("%s with the grant fixed to derby: %v, want 403", what, err)
@@ -199,7 +199,7 @@ func TestV082ReleaseBranchGrantFixedToBaseResources(t *testing.T) {
 	if _, d := must2(full.Load(ctx, "matches-r7", "cup")); d == nil || d.Value.(map[string]any)["note"] != "embargoed" {
 		t.Fatalf("the unrestricted reader's cup through the branch: %+v", d)
 	}
-	if hs := must(full.Heads(ctx, "matches-r7", at)); len(hs) != 2 {
+	if hs := mustRead(full.Heads(ctx, "matches-r7", at)); len(hs) != 2 {
 		t.Fatalf("the unrestricted reader's heads of the branch: %+v", hs)
 	}
 }

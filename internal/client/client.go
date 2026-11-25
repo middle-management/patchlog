@@ -60,6 +60,11 @@ type Client struct {
 	// levels are the encryption levels learnt per namespace (levels.go),
 	// shared with With copies.
 	levels *levelTable
+	// unfilteredOnly keeps the plain namespace reads at the unfiltered
+	// URLs (WithUnfilteredOnly, auto.go); views are the views those reads
+	// go through in public namespaces, per grant, shared with With copies.
+	unfilteredOnly bool
+	views          *viewTable
 
 	rootMu sync.Mutex
 	root   *Root // GET /, once fetched
@@ -150,6 +155,9 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 	if c.levels == nil {
 		c.levels = &levelTable{}
 	}
+	if c.views == nil {
+		c.views = &viewTable{}
+	}
 	c.hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return c, nil
 }
@@ -158,6 +166,7 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 // different bearer grant. The copy shares the HTTP client.
 func (c *Client) With(opts ...Option) *Client {
 	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth, signer: c.signer, levels: c.levels,
+		unfilteredOnly: c.unfilteredOnly, views: c.views,
 		// Copied, so options appending to them don't write into c's.
 		senders: append([]*ecdh.PublicKey(nil), c.senders...), trusted: append([]*ecdh.PublicKey(nil), c.trusted...)}
 	c.rootMu.Lock()

@@ -90,7 +90,7 @@ func testHistoryRoundTrip(t *testing.T) {
 	}
 	// Each batch records source { origin, ns, at, bundle, ids }.
 	nh := must(dst.c.NSHead(ctx, "matches"))
-	log := must(dst.c.NSLog(ctx, "matches", nh.ID, ""))
+	log := mustRead(dst.c.NSLog(ctx, "matches", nh.ID, ""))
 	last := log[len(log)-1]
 	src := last.Source
 	if last.Kind != "batch" || src["origin"] != stagingOrigin || src["ns"] != "matches" || src["at"] != sum.Header.At["matches"] ||
