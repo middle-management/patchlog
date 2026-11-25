@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Client: a read-filtering grant is a view
+
+- **The plain namespace reads read a partial reader's view (§7.9).** `NSLog`, `NSLogPage`,
+  `Heads`, `HeadsPage`, `HeadsPrefix`, `HeadsPrefixPage` and `LongPoll` follow a private
+  namespace's redirect to the filtered log and `/heads`, and in a public namespace look the
+  grant's view up with `ViewOf` once per grant and namespace (never without a grant, and not
+  where an answer is marked `private`), remember it, and forget it on a `401`/`403` at its URLs,
+  asking again once. Each now returns a `FilteredAt` (`LongPollResult` embeds it) whose
+  `Filtered()` says the answer isn't chain-verifiable (§10).
+- **`WithUnfilteredOnly`** (and `Client.Unfiltered`) keeps the unfiltered reads: a partial
+  reader's redirect is a `*FilteredError`, now from the log and `/heads` calls too, and a public
+  namespace's unfiltered answer stands. Followers, `verify`, the janitor, bundles, merge, the
+  index, streams, grant checks and WebDAV read through it.
+- `FilteredHeadsPage`, `FilteredHeads`, `ViewLog`, `ViewHeads` and `FilteredLongPoll` are
+  removed: the plain calls cover them.
+- **CLI.** `ls`, `ns log` and `watch` (now a long-poll) read a partial reader's view and say on
+  stderr that the answer is filtered; `verify` refuses a filtered log.
+
 Spec v0.90: filtered reads in public namespaces, and the revision's `schema` on namespace
 log head entries; the answers to the reference's notes on v0.89 and a conformance audit.
 
@@ -11,8 +29,8 @@ log head entries; the answers to the reference's notes on v0.89 and a conformanc
   cached as a private namespace's, and view streams and ranges end with the grant or cookie.
   The exchange gives a public namespace's partial reader its view cookie. In a public sealed
   namespace such a grant gets its view's `K_view` at `/keys` and opens the revisions its rules
-  allow. The client reads a public namespace through a narrowed grant (`ViewOf`, `ViewLog`,
-  `ViewHeads`).
+  allow. The client reads a public namespace through a narrowed grant (`ViewOf`, and the
+  plain reads above).
 - **`schema` on head entries.** A namespace log `head` entry carries its revision's `$schema`,
   unhashed (entry ids and chains are unchanged); absent for tombstones, documents without
   `$schema` and at E3. Entries written before carry none. The client filters a log by schema

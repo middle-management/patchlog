@@ -26,6 +26,10 @@ import (
 // entries and aren't chain-verifiable: a partial reader learns of
 // branches from Branches, and of changes of its rules by listing /heads
 // again (§10).
+//
+// The plain namespace reads (NSLog, Heads, LongPoll and their pages) read
+// these for a partial reader (auto.go); the calls here read a filtered
+// answer named by a FilteredAt, page by page.
 
 // FilteredAt names a filtered answer (§7.9 URLs): the namespace, the
 // view and at of its URL, and End, the ns_id of NS at at, which answers at

@@ -550,16 +550,54 @@ type watchCmd struct {
 
 func (a *watchCmd) run(string) { runClient(a) }
 
+// exec long-polls the namespace log (§7.7): a partial reader's filtered
+// log through its view (§7.9), which it says once on errw.
 func (a *watchCmd) exec(ctx context.Context, out, errw io.Writer) error {
-	return a.client().NSEvents(ctx, a.NS, a.Since, func(e client.NSEntry) error {
-		if a.JSON {
-			b, _ := json.Marshal(e.Raw)
-			_, err := fmt.Fprintln(out, string(b))
+	c := a.client()
+	since, cursor, noted := a.Since, "", false
+	for {
+		res, err := c.LongPoll(ctx, a.NS, since, cursor)
+		switch {
+		case ctx.Err() != nil:
+			return nil
+		case client.IsBadInput(err) && cursor != "":
+			cursor = "" // a cursor too far from the server's: once without (§7.7)
+			continue
+		case client.Transient(err):
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(time.Second):
+			}
+			continue
+		case err != nil:
 			return err
 		}
-		_, err := fmt.Fprintln(out, nsEntryLine(e))
-		return err
-	})
+		if !noted && res.Filtered() {
+			filteredNotice(errw, res.FilteredAt)
+			noted = true
+		}
+		for _, e := range res.Entries {
+			line := nsEntryLine(e)
+			if a.JSON {
+				b, _ := json.Marshal(e.Raw)
+				line = string(b)
+			}
+			if _, err := fmt.Fprintln(out, line); err != nil {
+				return err
+			}
+		}
+		since, cursor = res.Since, res.Cursor
+	}
+}
+
+// filteredNotice says on errw, in one line, that fa is a partial reader's
+// answer, filtered to its view (§7.9): not the whole namespace, and not
+// chain-verifiable (§10).
+func filteredNotice(errw io.Writer, fa client.FilteredAt) {
+	if fa.Filtered() {
+		fmt.Fprintf(errw, "note: namespace %s is filtered for this grant (view %s, §7.9): only what it may read, not chain-verifiable (§10)\n", fa.NS, fa.View)
+	}
 }
 
 // nsCmd is patchlog ns.
@@ -712,10 +750,11 @@ func (a *nsLogCmd) exec(ctx context.Context, out, errw io.Writer) error {
 	if err != nil {
 		return err
 	}
-	es, _, err := c.NSLog(ctx, a.NS, h.ID, a.Since)
+	es, fa, err := c.NSLog(ctx, a.NS, h.ID, a.Since)
 	if err != nil {
 		return err
 	}
+	filteredNotice(errw, fa)
 	for _, e := range es {
 		if a.JSON {
 			b, _ := json.Marshal(e.Raw)

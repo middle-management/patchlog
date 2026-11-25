@@ -59,7 +59,7 @@ and serves immutable, CDN-cacheable revisions.
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
-| Filtered namespace reads: in a private namespace (no branch, v0.78), a reader limited by its grant's rules (a partial reader, §7.9) reads `/heads`, log ranges, long-poll and events filtered to the resources its rules allow, at `/ns/{ns}/g/{gs}/…` pinned to a checkpoint (the namespace's `ns_id`); the gestures listing and the search index filter alike, and `/branches` is `403` to such a reader | §7.9, §A.4 | ✅ (on unless `core.Options.NoFilteredReads`; client `FilteredHeads`, `FilteredLog`, `FilteredLongPoll`, `FilteredNSEvents`) |
+| Filtered namespace reads: in a private namespace (no branch, v0.78), a reader limited by its grant's rules (a partial reader, §7.9) reads `/heads`, log ranges, long-poll and events filtered to the resources its rules allow, at `/ns/{ns}/g/{gs}/…` pinned to a checkpoint (the namespace's `ns_id`); the gestures listing and the search index filter alike, and `/branches` is `403` to such a reader | §7.9, §A.4 | ✅ (on unless `core.Options.NoFilteredReads`; client: the plain `NSLog`, `Heads`, `LongPoll` and their pages read the view, in a public namespace too, and say so in their `FilteredAt`; `WithUnfilteredOnly` keeps the unfiltered reads; `FilteredLog`, `FilteredNSEvents`) |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
 | Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), at most 100 distinct prefixes, drawing on each principal's `exchangeRate` bucket once a request, keys rotated (`--edge-grant-key KID=FILE`, repeatable), withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`), `/ns/{ns}/g/{gs}` for a filtered reader (§7.9); the search index mints its own for its queries, bound to a subject set (`/{ns}/g/{gs}`) | §C.5, §9, §A.4 | ✅ |
 | Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces (`GET /ns/{ns}/principal` tells one that asks) | §C.7, §7.4 | ✅ |
@@ -3431,6 +3431,13 @@ patchlog ns ls [--prefix P] [--json]            # every namespace of the deploym
 
 The destructive commands, without `--yes`, print what they would destroy and exit 1. A deleted
 resource that moved (§8.1) is named in the error: `m/a is deleted (tombstone …); it moved to m/b`.
+
+**A grant with read rules is a view** (§7.9). `ls`, `ns log` and `watch` (a long-poll) with
+such a grant read only what its rules allow, through its view: redirected there in a private
+namespace, looked up once (`/edge-grants`, or `/keys` where sealed) in a public one. They say so
+in one line on stderr (`note: namespace matches is filtered for this grant …`): a filtered log
+isn't chain-verifiable (§10), so `verify` refuses it and asks for a grant that reads the
+namespace unrestricted; in a public namespace it verifies the unfiltered log.
 
 **Encrypted namespaces** (Addendum E). The same commands read and write them: they learn the
 namespace's level and take the encrypted path. `--identity KEY.jwk` (`$PATCHLOG_IDENTITY`) is

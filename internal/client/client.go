@@ -10,7 +10,15 @@
 //   - Ids are text ids (§3.2). An empty id means "none" (genesis parent,
 //     empty checkpoint).
 //   - Redirects are never followed automatically: head pointers (302) are
-//     returned as typed values read from Location / ETag.
+//     returned as typed values read from Location / ETag. The exception is
+//     a partial reader's (§7.9): its document, raw and blob reads follow
+//     the 302 to their form under its view, and its plain namespace reads
+//     (NSLog, Heads, LongPoll and their pages) read its view's filtered
+//     log and /heads, in a public namespace through the view ViewOf finds
+//     once and the client remembers (auto.go). Those return a FilteredAt
+//     whose Filtered() says the answer isn't chain-verifiable (§10);
+//     WithUnfilteredOnly keeps them at the unfiltered URLs, as verifiers
+//     and followers need.
 //   - JSON bodies are parsed with jsonv (I-JSON, §3.1), so values use the
 //     jsonv model (float64 numbers, map[string]any, []any) and can be
 //     canonicalised and hashed exactly as the server does.
