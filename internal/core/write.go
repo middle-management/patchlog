@@ -2208,7 +2208,13 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			dropHeads = append(dropHeads, []any{it.res})
 		}
 	}
-	if t.bulkExec(moveHeads, moves) != int64(len(moves)) {
+	moved := int64(0)
+	if t.e.spanner {
+		moved = t.spMoveHeads(moves)
+	} else {
+		moved = t.bulkExec(moveHeads, moves)
+	}
+	if moved != int64(len(moves)) {
 		panic(errChainRace)
 	}
 	t.bulkExec(upsertHeads, heads)

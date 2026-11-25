@@ -586,6 +586,54 @@ func (t *tx) spDMLBatch(q string, args [][]any) int64 {
 	return n
 }
 
+// spMoveHeads is moveHeads on Spanner, whose UPDATE … FROM it lacks: one
+// UPDATE for the rows (up to spMaxArgs's worth), each column a CASE on the
+// row's key. A batch of DML (spDMLBatch) of an UPDATE per row was one round
+// trip, but Spanner runs a batch's statements one after another: 50 rows
+// took 157 ms, most of a group commit's transaction (docs/SPANNER.md, the
+// bench). Each row of rows is moveHeads's: head, state, snap_revs,
+// snap_bytes, res, old (the head the precondition matched, 0 for none). It
+// returns the rows updated.
+func (t *tx) spMoveHeads(rows [][]any) int64 {
+	if len(rows) == 0 {
+		return 0
+	}
+	t.wrote()
+	per := spMaxArgs / 6
+	var n int64
+	for len(rows) > 0 {
+		chunk := rows[:min(per, len(rows))]
+		rows = rows[len(chunk):]
+		var args []any
+		arg := func(v any) string {
+			args = append(args, v)
+			return "$" + strconv.Itoa(len(args))
+		}
+		keys := make([]string, len(chunk))
+		for i, r := range chunk {
+			keys[i] = arg(r[4])
+		}
+		cases := func(col int) string {
+			var b strings.Builder
+			b.WriteString("CASE res")
+			for i, r := range chunk {
+				b.WriteString(" WHEN " + keys[i] + " THEN " + arg(r[col]))
+			}
+			b.WriteString(" END")
+			return b.String()
+		}
+		q := `UPDATE resources SET head_seq = ` + cases(0) + `, state = ` + cases(1) + `, snap_revs = ` + cases(2) + `, snap_bytes = ` + cases(3) +
+			` WHERE res IN (` + strings.Join(keys, ", ") + `) AND COALESCE(head_seq, 0) = ` + cases(5)
+		t.counted(q)
+		r, err := t.Tx.Exec(q, pgArgs(args, true)...)
+		t.must(err)
+		k, err := r.RowsAffected()
+		t.must(err)
+		n += k
+	}
+	return n
+}
+
 // spNullInt, spNullBytes and spNullString are a nullable argument (nil, or
 // a value) as a mutation's column value.
 func spNullInt(v any) spanner.NullInt64 {

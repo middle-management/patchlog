@@ -183,13 +183,54 @@ would change most of it.
 
 ## What is left
 
-- **A run of `deploy/gcp-spanner.sh`**, and what it finds.
+- **What the first bench run found** (above): the group's inserts as mutations, the foreign
+  keys, and runs at more processing units.
 - **The rate-bucket sweep** scans `rate_buckets` whole (no `SKIP LOCKED`, and no index on
   fullness); fine for a test, a hot table at scale.
 - **Round trips** left in a write: the namespace's head `UPDATE` (a mutation would hide the new
   head from the transaction's own later reads), and a chain of bases read a statement per level.
 - **mmmigrate's driver tags**: v0.8.0 tags the root module only; the drivers are pinned to its
   commit by pseudo-version until they carry tags of their own (`driver/spanner/v0.8.0`).
+
+## The first run on Spanner (2026-11-25)
+
+`deploy/gcp-spanner.sh` with its defaults (regional `europe-west1`, 1,000 processing units; two
+`c3-standard-8` cores, `pool_max_conns=48`, `--group-commit 128`; patchlog `4b2ea033`). Files:
+`docs/capacity/spanner-gcp-2026-11-25/`.
+
+| Busy namespaces | Asked/s | Written/s | Write p50 / p99 | Spanner CPU (high priority) |
+|---|---|---|---|---|
+| 1 | 1,000 | 265 | 373 / 537 ms | 16% |
+| 2 | 2,000 | 445 | 406 / 618 ms | 27% |
+| 4 | 4,000 | 827 | 446 / 1,002 ms | 51% |
+| 8 | 8,000 | 1,230 | 602 / 1,528 ms | 72% |
+| 16 | 16,000 | 1,137 | 1,302 / 4,865 ms | 73% |
+| 32 | 32,000 | 1,645 | 1,550 / 6,277 ms | 82% (all priorities) |
+
+No write failed (no 412, 429 or error). Against Postgres's 1,000 a namespace and 28,070 in all
+(docs/CAPACITY.md), this is far behind. What Spanner's statistics say:
+
+- **A namespace's log is the limit at one namespace.** 800 commits a minute, each transaction
+  63 ms from its first statement to its commit (the commit itself 8 ms), about 20 writes a
+  group: the log is busy one group after another (`namespaces` rows are where the lock waits
+  are). So a namespace takes group size over transaction time, and the transaction's time is
+  its statements' round trips, not Spanner's commit.
+- **`moveHeads` was most of a group's time**: a batch of DML of one `UPDATE` per row (50 a group
+  on average) took 157 ms, as Spanner runs a batch's statements one after another, and 23% of
+  Spanner's CPU. Now one `UPDATE` of `CASE`s (`spMoveHeads`).
+- **The check's read is half of Spanner's CPU**: one per write, a join of namespace, resource and
+  head, 0.8 ms of CPU and 20 ms each. That is the write's own work (D.3), done once.
+- **The tailer read all of `ns_log` at each poll** (16,800 rows scanned, 9% of the CPU): the
+  planner didn't take the sharded index for the `IN` list. Now forced (`FORCE_INDEX`).
+- **The group's inserts were slow**: revisions 43 ms, heads 65 ms, blob refs 20 ms a group. Every
+  table's foreign keys add a hidden index (`IDX_…`) written with each row and a check at commit.
+- From 16 namespaces Spanner's CPU is the limit (73–82%), aborts rise (923 a minute), and more
+  namespaces only lengthen latency.
+
+Next: run again with `spMoveHeads` and the tailer's index; then the inserts as mutations
+(revisions, heads), which takes knowing what the group's transaction reads back, and dropping
+the foreign keys on Spanner, whose integrity the engine keeps anyway (they are there for
+Postgres and SQLite too).
 
 ## The capacity bench on real Spanner
 

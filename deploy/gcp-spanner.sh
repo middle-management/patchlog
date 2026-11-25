@@ -148,6 +148,9 @@ if [ -z "$have_sa" ]; then
   sleep 10 # the account reaches IAM
 fi
 gcloud spanner instances add-iam-policy-binding $INSTANCE --member="serviceAccount:$SA" --role=roles/spanner.databaseUser >/dev/null
+# The Spanner client's own metrics (GFE and attempt latencies), written to
+# Cloud Monitoring.
+gcloud projects add-iam-policy-binding "$PROJECT" --member="serviceAccount:$SA" --role=roles/monitoring.metricWriter --condition=None >/dev/null
 
 # Binaries.
 build=$(mktemp -d)
