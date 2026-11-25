@@ -23,7 +23,9 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
 
-  # The race detector, in its own job so it runs alongside the others.
+  # The race detector, in its own job so it runs alongside the others. Its
+  # packages run in parallel and take 5-10 minutes each under -race on a
+  # hosted runner, so the default 10-minute timeout is raised.
   race:
     runs-on: ubuntu-latest
     steps:
@@ -31,7 +33,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - run: go test -race ./internal/core ./internal/server ./internal/merge ./internal/index
+      - run: go test -race -timeout 30m ./internal/core ./internal/server ./internal/merge ./internal/index
 
   # Every package's tests again, on Postgres (Addendum D.8): each test that
   # opens a store gets a fresh database (internal/pgtest), including the
@@ -87,7 +89,7 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - run: go test -race ./internal/core ./internal/server ./internal/index
+      - run: go test -race -timeout 30m ./internal/core ./internal/server ./internal/index
 
   docker:
     runs-on: ubuntu-latest
