@@ -1,0 +1,13 @@
+12:09:35  namespaces 1: 100 documents each, writing for 60s
+12:10:37  namespaces_1                 {"asked_per_second":1000,"documents":100,"errors":0,"limited_429":0,"max_ms":3181.486,"n":33228,"namespaces":1,"p50_ms":150.383,"p95_ms":218.959,"p99_ms":337.512,"per_second":553.2314199948839,"stale_412":0}
+12:10:39  namespaces 2: 100 documents each, writing for 60s
+12:11:41  namespaces_2                 {"asked_per_second":2000,"documents":200,"errors":0,"limited_429":0,"max_ms":3108.43,"n":72193,"namespaces":2,"p50_ms":152.473,"p95_ms":191.673,"p99_ms":257.185,"per_second":1199.260654293287,"stale_412":0}
+12:11:43  namespaces 4: 100 documents each, writing for 60s
+12:12:46  namespaces_4                 {"asked_per_second":4000,"documents":400,"errors":0,"limited_429":0,"max_ms":4692.262,"n":99035,"namespaces":4,"p50_ms":190.709,"p95_ms":311.942,"p99_ms":2049.376,"per_second":1619.948179393858,"stale_412":0}
+12:12:51  namespaces 8: 100 documents each, writing for 60s
+12:13:55  namespaces_8                 {"asked_per_second":8000,"documents":800,"errors":0,"limited_429":0,"max_ms":6415.286,"n":138723,"namespaces":8,"p50_ms":270.037,"p95_ms":446.371,"p99_ms":3113.409,"per_second":2223.0156598703866,"stale_412":0}
+12:13:59  namespaces 16: 100 documents each, writing for 60s
+12:15:02  namespaces_16                {"asked_per_second":16000,"documents":1600,"errors":0,"limited_429":0,"max_ms":6848.846,"n":155694,"namespaces":16,"p50_ms":374.844,"p95_ms":2802.682,"p99_ms":4812.366,"per_second":2577.6026806816762,"stale_412":0}
+12:15:07  namespaces 32: 100 documents each, writing for 60s
+12:16:10  namespaces_32                {"asked_per_second":32000,"documents":3200,"errors":0,"limited_429":0,"max_ms":8462.529,"n":159831,"namespaces":32,"p50_ms":945.366,"p95_ms":3723.295,"p99_ms":5759.723,"per_second":2641.5003144431025,"stale_412":0}
+12:16:10  total_seconds                397.759391393

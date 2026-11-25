@@ -397,6 +397,10 @@ func (e *Engine) commitGroup(ns string, group []*groupWrite) {
 		if t.locking() {
 			t.sharedNS = group[0].plan.n.id
 		}
+		if t.spannerLocks() {
+			// The namespace's row exclusively, first (nsForResources).
+			t.spLockRow(group[0].plan.n.id)
+		}
 		if h := e.afterWriteLock; h != nil {
 			h(ns)
 		}

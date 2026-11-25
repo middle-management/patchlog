@@ -496,6 +496,10 @@ func (t *tx) lockAll(want map[int32]lockMode) {
 // lockDeps takes a resource write's or batch's locks before its re-check:
 // every namespace its check read shared, its own included (sharedNS).
 func (t *tx) lockDeps(target int64, d *writeDeps) {
+	if t.spannerLocks() {
+		// The target's row exclusively, first (nsForResources).
+		t.spLockRow(target)
+	}
 	want := map[int32]lockMode{lockKey(target): lockShared}
 	for id := range d.ns {
 		want[lockKey(id)] = lockShared

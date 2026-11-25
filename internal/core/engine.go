@@ -1245,8 +1245,18 @@ func (t *tx) nsForWrite(name string) *nsRow {
 // appends to: on Postgres it takes the namespace's lock shared, so writers
 // of other resources run alongside, and the entry is appended under the
 // namespace row's lock (appendNS, pglock.go).
+//
+// On Spanner the row is locked exclusively at once (spLockRow): every
+// writer of the namespace reads it, shared, and then takes it exclusively
+// to append, so two of them holding it shared deadlocked on the upgrade and
+// Spanner aborted one (up to 13% of commits in the third bench run,
+// docs/SPANNER.md). Taken first, they queue on it instead.
 func (t *tx) nsForResources(name string) *nsRow {
-	n := t.nsByNameLocked(name, lockShared)
+	mode := lockShared
+	if t.spannerLocks() {
+		mode = lockExclusive
+	}
+	n := t.nsByNameLocked(name, mode)
 	if n != nil && t.locking() {
 		t.sharedNS = n.id
 	}

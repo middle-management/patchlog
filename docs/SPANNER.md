@@ -249,8 +249,31 @@ No write failed (no 412, 429 or error). Against Postgres's 1,000 a namespace and
   (`spTailSeqs`).
 - The revision and heads inserts, 30 ms each a group, are what the mutations remove.
 
-Since: the tailer's seeks, a write's rows as mutations (revisions, heads, snapshots,
-rev_epochs) and no foreign keys (left out of the baseline); not measured yet.
+**The third run** (`2e692b74`: the tailer's seeks, a write's rows as mutations, no foreign
+keys; files `docs/capacity/spanner-gcp-2026-11-25-run3/`):
+
+| Busy namespaces | Written/s | Write p50 / p99 | Spanner CPU (high priority) |
+|---|---|---|---|
+| 1 | 553 | 150 / 338 ms | 14% |
+| 2 | 1,199 | 152 / 257 ms | 33% |
+| 4 | 1,620 | 191 / 2,049 ms | 44% |
+| 8 | 2,223 | 270 / 3,113 ms | 34% |
+| 16 | 2,578 | 375 / 4,812 ms | 49% |
+| 32 | 2,642 | 945 / 5,760 ms | |
+
+- **Faster at one and two namespaces**: a group's transaction 31–36 ms (38–46), its inserts
+  gone from the statements.
+- **No longer CPU-bound, but aborting**: at 16 and 32 namespaces 1,800–2,200 aborts a minute,
+  13% of commits, Spanner at half its CPU, and nearly all lock waits (3,584 s) on namespaces
+  rows. Every writer of a namespace read its row shared, then took it exclusively to append:
+  two of them holding it shared deadlocked on the upgrade, and Spanner aborted one, after it had
+  moved its heads. Several run at once per namespace (a group, writes on their own path, writes
+  answered alone). Now the row is taken exclusively at once (`nsForResources`, `lockDeps`, a
+  group's transaction), and they queue on it.
+- The tailer's search seeks now (801 rows a poll, from 28,000), but still costs 19 ms of CPU a
+  poll, a fifth of the total.
+
+Since: the target namespace's row locked exclusively first; not measured yet.
 
 ## The capacity bench on real Spanner
 
