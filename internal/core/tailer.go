@@ -223,8 +223,8 @@ func (e *Engine) tailStartSpanner(ctx context.Context) (tailState, error) {
 }
 
 // tailPollSpanner is tailPoll on Spanner: the entries committed after
-// s.from, up to the read timestamp of a read-only transaction, read from
-// each shard of the index by commit timestamp (spShard). Spanner
+// s.from, up to the read timestamp of a read-only transaction, found in
+// each shard of the index by commit timestamp (spShard, spTailSeqs). Spanner
 // has no LATERAL nor jsonb_array_elements: a batch's body is read whole
 // and its items found here.
 func (e *Engine) tailPollSpanner(ctx context.Context, s *tailState) error {
@@ -245,9 +245,8 @@ func (e *Engine) tailPollSpanner(ctx context.Context, s *tailState) error {
 	rows, err := tx.Query(`SELECT n.name, l.kind IN (`+metaKinds+`),
 			CASE WHEN l.kind IN (`+resourceKinds+`) THEN r.name END,
 			CASE WHEN l.kind = `+batchKind+` THEN l.body END
-		FROM ns_log /*@ FORCE_INDEX=ns_log_committed_by_shard */ l JOIN namespaces n ON n.ns = l.ns
-		LEFT JOIN resources r ON r.res = l.res
-		WHERE l.shard IN (`+spShardList+`) AND l.committed > $1`, time.UnixMicro(int64(s.from)).UTC())
+		FROM (`+spTailSeqs+`) k JOIN ns_log l ON l.seq = k.seq JOIN namespaces n ON n.ns = l.ns
+		LEFT JOIN resources r ON r.res = l.res`, time.UnixMicro(int64(s.from)).UTC())
 	if err != nil {
 		return err
 	}

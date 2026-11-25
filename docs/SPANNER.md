@@ -229,8 +229,28 @@ No write failed (no 412, 429 or error). Against Postgres's 1,000 a namespace and
 - From 16 namespaces Spanner's CPU is the limit (73–82%), aborts rise (923 a minute), and more
   namespaces only lengthen latency.
 
-Since: `spMoveHeads`, the tailer's index, a write's rows as mutations (revisions, heads,
-snapshots, rev_epochs) and no foreign keys (migration 003); not measured yet.
+**The second run** (`1290f357`: `spMoveHeads`, the tailer's index hinted; files
+`docs/capacity/spanner-gcp-2026-11-25-run2/`):
+
+| Busy namespaces | Written/s | Write p50 / p99 | Spanner CPU (high priority) |
+|---|---|---|---|
+| 1 | 482 | 192 / 402 ms | 11% |
+| 2 | 847 | 210 / 470 ms | 22% |
+| 4 | 1,536 | 241 / 497 ms | 40% |
+| 8 | 1,809 | 299 / 3,799 ms | 43% |
+| 16 | 3,258 | 428 / 2,282 ms | 82% |
+| 32 | 3,129 | 949 / 4,485 ms | |
+
+- **Twice the first run.** A group's transaction took 38–46 ms at one namespace (63 before);
+  moving its heads one `UPDATE`, 16–22 ms.
+- **The check's read is half of Spanner's CPU** (0.66 ms each, one a write).
+- **The tailer still scanned its whole index** (28,000 rows a poll, 15% of the CPU): the hint
+  made Spanner read the index, not seek into its shards. Now a `UNION ALL` of one seek a shard
+  (`spTailSeqs`).
+- The revision and heads inserts, 30 ms each a group, are what the mutations remove.
+
+Since: the tailer's seeks, a write's rows as mutations (revisions, heads, snapshots,
+rev_epochs) and no foreign keys (migration 003); not measured yet.
 
 ## The capacity bench on real Spanner
 

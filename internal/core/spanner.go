@@ -524,14 +524,18 @@ var (
 // reads each).
 const spShards = 32
 
-// spShardList lists every shard, for the tailer's IN.
-var spShardList = func() string {
+// spTailSeqs is the tailer's search of ns_log_committed_by_shard: the seqs
+// of the entries committed after $1, a seek into each shard, joined by
+// UNION ALL. Asked for shard IN (…) AND committed > $1, Spanner scanned the
+// whole index at every poll, hint or no hint (28,000 rows a poll and 15% of
+// its CPU in the second bench run, docs/SPANNER.md).
+var spTailSeqs = func() string {
 	var b strings.Builder
 	for i := range spShards {
 		if i > 0 {
-			b.WriteString(", ")
+			b.WriteString(" UNION ALL ")
 		}
-		b.WriteString(strconv.Itoa(i))
+		fmt.Fprintf(&b, "SELECT seq FROM ns_log /*@ FORCE_INDEX=ns_log_committed_by_shard */ WHERE shard = %d AND committed > $1", i)
 	}
 	return b.String()
 }()
