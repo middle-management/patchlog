@@ -47,7 +47,7 @@ PATCHLOG_TEST_SPANNER=spanner://projects/emulator-project/instances/test-instanc
 
 | Postgres (D.8) | Spanner | Where |
 | --- | --- | --- |
-| Schema, `migrations/postgres` through mmmigrate, transactional DDL under an advisory lock | `migrations/spanner`, one baseline equal to Postgres after 031 and 002 for the hotspots, through mmmigrate's Spanner dialect (`driver/spanner`, of mmmigrate v0.8.0; the drivers have no tags of their own, so patchlog pins v0.8.0's commit): DDL batched outside transactions, a migration's progress kept so a run that died part-way resumes, runs serialised by a lease row (`mmmigrate_lock`), recorded in `mmmigrate_applied` | `internal/dbmigrate` |
+| Schema, `migrations/postgres` through mmmigrate, transactional DDL under an advisory lock | `migrations/spanner`, one baseline equal to Postgres after 031 but for its foreign keys, and 002 for the hotspots, through mmmigrate's Spanner dialect (`driver/spanner`, of mmmigrate v0.8.0; the drivers have no tags of their own, so patchlog pins v0.8.0's commit): DDL batched outside transactions, a migration's progress kept so a run that died part-way resumes, runs serialised by a lease row (`mmmigrate_lock`), recorded in `mmmigrate_applied` | `internal/dbmigrate` |
 | `smallint` flags and codes | `bigint` (no `int2`); still compared with 0 and 1 | baseline |
 | `UNIQUE` constraints | unique indexes; on nullable columns `WHERE col IS NOT NULL`, since Spanner's unique indexes count NULLs equal | baseline |
 | Partial unique indexes `one_first`, `one_ns_first`, `one_config_genesis` | a stored generated column holding the chain's key on its first row only (`CASE WHEN first = 1 THEN res END`), under a null-filtered unique index: Spanner filters partial indexes on `IS NOT NULL` alone | baseline |
@@ -70,7 +70,7 @@ PATCHLOG_TEST_SPANNER=spanner://projects/emulator-project/instances/test-instanc
 | Shared rate buckets, `rate_draws` (a plpgsql function) | the same algorithm in Go, in one read-write transaction per batch: all buckets read `FOR UPDATE` (which locks a missing key too: a missing bucket is full), requests judged in queue order, changed rows written as `InsertOrUpdate` mutations with the commit: one read and the commit; an aborted batch runs again. The sweep of full buckets has no `SKIP LOCKED`: it deletes in a transaction of its own, and a draw it meets aborts one of them | `drawsSpanner`, `ratebuckets.go` |
 | Group commit | unchanged: one transaction appends a group's entries (mutations), and the log heads it appended stay known under the row's lock | `groupcommit.go` |
 | A write's rows: `INSERT … SELECT FROM unnest(…)` per table | revisions, heads, snapshots and rev_epochs as **mutations** sent with the commit (`spMutate`; heads dropped by key), read back through the transaction's memo; resources' heads moved by one `UPDATE` of `CASE`s (`spMoveHeads`), whose condition catches a concurrent writer | `write.go`, `spanner.go` |
-| Foreign keys (`REFERENCES`) | none (migration 003): each was a hidden index written with every row and a check at commit; the engine keeps the references itself, as on every dialect | `migrations/spanner` |
+| Foreign keys (`REFERENCES`) | none: each would be a hidden index written with every row and a check at commit; the engine keeps the references itself, as on every dialect. Left out of the baseline: a migration can't drop them by name, as Spanner names them by a hash that differs between it and the emulator | `migrations/spanner` |
 | Bulk statements: `unnest` of one array per column | each column's array subscripted by an `unnest` of ordinals, `($1::bigint[])[u.i] … FROM unnest($k::bigint[]) AS u(i)` (no `unnest` of several arrays); a statement without that form (`moveHeads`, `UPDATE … FROM`) runs once per row, its rows sent as **one batch of DML** (one round trip) | `bulk.go`, `spDMLBatch` |
 | `LATERAL`, `WITH RECURSIVE`, window functions, `generate_series` | correlated scalar subqueries, or arrays subscripted by ordinals; a chain of bases read a statement per level; a purge's holders found by name as on Postgres (`purgeHolders`: sealed copies and sealings by `DISTINCT` over their `(name, ns)` index, the holders' chains a level per statement), and level by level from the purged namespace past `purgeHoldersMax` holders (`purgeLevels`); the Postgres-only multi-namespace purge append isn't used | `resolve.go`, `chain.go`, `nspurge.go` |
 | `ON CONFLICT DO NOTHING` without a target | the primary key named (shared with the other dialects); on a secondary index, Spanner refuses a conflict target, so a plain insert, whose race aborts or fails the transaction, which runs again | `engine.go` authors, `blobs.go`, `repurge.go` |
@@ -250,7 +250,7 @@ No write failed (no 412, 429 or error). Against Postgres's 1,000 a namespace and
 - The revision and heads inserts, 30 ms each a group, are what the mutations remove.
 
 Since: the tailer's seeks, a write's rows as mutations (revisions, heads, snapshots,
-rev_epochs) and no foreign keys (migration 003); not measured yet.
+rev_epochs) and no foreign keys (left out of the baseline); not measured yet.
 
 ## The capacity bench on real Spanner
 

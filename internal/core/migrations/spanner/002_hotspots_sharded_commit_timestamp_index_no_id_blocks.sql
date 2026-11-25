@@ -1,7 +1,7 @@
 -- Migration: hotspots: sharded commit-timestamp index, no id_blocks
--- Created: 2026-11-24T18:24:32Z
+-- Created: 2026-11-25T12:00:20Z
 -- Checksum: 3f55a802dc7494a61927877707df508a9bb6d1bf8926fbe05ebad6cfb97cd23d
--- Chain: a175ee55f04917c76a5666a944d4815ddd8c51ce01b3b913427a4ab17a089a99
+-- Chain: f63b36c362bf8aea10bd790c5a20b94b2a0dac62cd32da01386b212a26d3f547
 --
 -- IMPORTANT: Do not modify this file after commit. The checksum above
 -- tracks the integrity of this migration. Any changes will be detected
