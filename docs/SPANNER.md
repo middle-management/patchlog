@@ -352,8 +352,25 @@ hold it, nor Spanner's CPU. A namespace commits 8–16 groups a second, one at a
 transaction 70–120 ms, of about 12 writes, though 100 writers wait on each: writes reach the
 queue slowly, which points at the cores (their CPU, or the Spanner client's), which the bench
 didn't measure. It does now (vmstat on each VM, `vmstat-*.log`). The check's CPU rose with the
-resources' histories within the first steps' minutes, 0.4 to 1.5–1.8 ms (the `CASE`'s subquery,
-likely), and stayed.
+resources' histories within the first steps' minutes, 0.4 to 1.5–1.8 ms, and stayed.
+
+**The ninth run** (`991b1638`, 1,000 processing units, three-minute steps, the `CASE` undone,
+the VMs' CPU recorded; files `docs/capacity/spanner-gcp-2026-11-25-run9/`): 2,763, 2,477 and
+2,547 a second at 8, 16 and 32 namespaces. **The cores were at 14–23% of their CPU**, the loader
+idle, Spanner at half: no machine is the limit.
+
+- **The rate buckets are the queue.** Lock waits on `rate_buckets` rows reach 2,758–3,398 s a
+  minute, some 50 transactions waiting at any time: every write draws on the bench's one
+  principal's bucket and its namespace's, and a draw's transaction holds those rows from its
+  read `FOR UPDATE` to its commit, two round trips, while the other core's batches queue on
+  them. That is a ceiling of the deployment's draws, whatever its namespaces and processing
+  units. Next: the same run with each core's buckets in memory (`CORE_FLAGS=--local-rate-buckets`),
+  to measure what the shared buckets cost.
+- **The check's CPU grows over minutes, not with history alone**: 0.30 to 1.6 ms within three
+  minutes, without the `CASE`, while it scans the same 4–5 rows. The rows it reads, each
+  namespace's and resource's, are rewritten several times a second, and Spanner keeps every
+  version for at least an hour (`version_retention_period`): the newest of thousands costs more
+  to read. Likely, not shown.
 
 ## The capacity bench on real Spanner
 

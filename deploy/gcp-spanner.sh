@@ -24,6 +24,8 @@
 #   LOADGEN_TYPE  c3-standard-8
 #   POOL_CONNS    48, each core's pool_max_conns
 #   GROUP_COMMIT  128, each core's --group-commit
+#   CORE_FLAGS    extra flags for each core's patchlog serve (none), such as
+#                 --local-rate-buckets to take the shared rate buckets out
 #   BUSY          1,2,4,8,16,32 busy namespaces, a step each
 #   BUSY_DOCS     100 documents per namespace
 #   BUSY_RATE     10 writes a second per document
@@ -56,6 +58,7 @@ SERVER_TYPE=${SERVER_TYPE:-c3-standard-8}
 LOADGEN_TYPE=${LOADGEN_TYPE:-c3-standard-8}
 POOL_CONNS=${POOL_CONNS:-48}
 GROUP_COMMIT=${GROUP_COMMIT:-128}
+CORE_FLAGS=${CORE_FLAGS:-}
 BUSY=${BUSY:-1,2,4,8,16,32}
 BUSY_DOCS=${BUSY_DOCS:-100}
 BUSY_RATE=${BUSY_RATE:-10}
@@ -128,7 +131,7 @@ echo "  service account $SA: $([ -n "$have_sa" ] && echo exists || echo 'to make
 echo "  $SERVERS × $SERVER_TYPE core(s) and 1 × $LOADGEN_TYPE loader ($image_family), deleted on exit or after $life_min minutes"
 echo "  core and capacity built from this checkout ($rev, linux/$goarch)"
 echo "  run: $steps steps ($BUSY busy namespaces) of $BUSY_DOCS documents × $BUSY_RATE/s, ${BUSY_SECS}s each (about $run_min minutes);"
-echo "    cores with pool_max_conns=$POOL_CONNS, --group-commit $GROUP_COMMIT; results in $OUT"
+echo "    cores with pool_max_conns=$POOL_CONNS, --group-commit $GROUP_COMMIT${CORE_FLAGS:+ $CORE_FLAGS}; results in $OUT"
 if [ -z "$YES" ]; then
   read -r -p "go ahead? [y/N] " ok
   [ "$ok" = y ] || exit 1
@@ -189,7 +192,7 @@ start_core() { # vm
   ssh_vm "$1" "ulimit -n 1048576 2>/dev/null || true
     nohup vmstat -t 5 > vmstat.log 2>&1 &
     nohup ./patchlog serve --dev --addr :8080 --db '$db' --blob-dir ./blobs --group-commit $GROUP_COMMIT \
-      --max-rate-per-namespace 1e9,1e9 --max-rate-per-resource 1e9,1e9 --max-rate-per-principal 1e9,1e9 > server.log 2>&1 &
+      --max-rate-per-namespace 1e9,1e9 --max-rate-per-resource 1e9,1e9 --max-rate-per-principal 1e9,1e9 $CORE_FLAGS > server.log 2>&1 &
     pid=\$!
     for _ in \$(seq 1 180); do curl -sf -o /dev/null http://127.0.0.1:8080/_health && exit 0; kill -0 \$pid || { tail -20 server.log; exit 1; }; sleep 1; done
     tail -20 server.log; exit 1"

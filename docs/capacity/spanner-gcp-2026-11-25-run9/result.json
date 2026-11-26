@@ -1,0 +1,46 @@
+{
+  "namespaces_16": {
+    "asked_per_second": 16000,
+    "documents": 1600,
+    "errors": 0,
+    "limited_429": 0,
+    "max_ms": 6506.73,
+    "n": 447867,
+    "namespaces": 16,
+    "p50_ms": 546.736,
+    "p95_ms": 1168.005,
+    "p99_ms": 3247.223,
+    "per_second": 2476.9150942608626,
+    "stale_412": 0
+  },
+  "namespaces_32": {
+    "asked_per_second": 32000,
+    "documents": 3200,
+    "errors": 0,
+    "limited_429": 0,
+    "max_ms": 14738.549,
+    "n": 461078,
+    "namespaces": 32,
+    "p50_ms": 972.539,
+    "p95_ms": 3111.615,
+    "p99_ms": 5092.72,
+    "per_second": 2547.3536710682524,
+    "stale_412": 0
+  },
+  "namespaces_8": {
+    "asked_per_second": 8000,
+    "documents": 800,
+    "errors": 0,
+    "limited_429": 0,
+    "max_ms": 3172.485,
+    "n": 498851,
+    "namespaces": 8,
+    "p50_ms": 266.534,
+    "p95_ms": 435.045,
+    "p99_ms": 596.901,
+    "per_second": 2762.5352080213665,
+    "stale_412": 0
+  },
+  "profile": "public",
+  "total_seconds": 553.811996895
+}

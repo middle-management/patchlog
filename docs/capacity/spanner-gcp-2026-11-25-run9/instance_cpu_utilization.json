@@ -1,0 +1,107 @@
+{
+  "timeSeries": [
+    {
+      "metric": {
+        "labels": {
+          "database": "patchlog"
+        },
+        "type": "spanner.googleapis.com/instance/cpu/utilization"
+      },
+      "resource": {
+        "type": "spanner_instance",
+        "labels": {
+          "instance_config": "regional-europe-west1",
+          "location": "europe-west1",
+          "instance_id": "patchlog-bench",
+          "project_id": "patchlog-515810"
+        }
+      },
+      "metricKind": "GAUGE",
+      "valueType": "DOUBLE",
+      "points": [
+        {
+          "interval": {
+            "startTime": "2026-11-25T15:08:19.490Z",
+            "endTime": "2026-11-25T15:08:19.490Z"
+          },
+          "value": {
+            "doubleValue": 1.1487655290480117
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T15:07:19.490Z",
+            "endTime": "2026-11-25T15:07:19.490Z"
+          },
+          "value": {
+            "doubleValue": 1.0165034856339663
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T15:06:19.490Z",
+            "endTime": "2026-11-25T15:06:19.490Z"
+          },
+          "value": {
+            "doubleValue": 1.2037013422471345
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T15:05:19.490Z",
+            "endTime": "2026-11-25T15:05:19.490Z"
+          },
+          "value": {
+            "doubleValue": 1.0053189445112809
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T15:04:19.490Z",
+            "endTime": "2026-11-25T15:04:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.98036200525853023
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T15:03:19.490Z",
+            "endTime": "2026-11-25T15:03:19.490Z"
+          },
+          "value": {
+            "doubleValue": 1.0207436209231546
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T15:02:19.490Z",
+            "endTime": "2026-11-25T15:02:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.61154993907909683
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T15:01:19.490Z",
+            "endTime": "2026-11-25T15:01:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.39792157243946463
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-25T15:00:19.490Z",
+            "endTime": "2026-11-25T15:00:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.04055394638295555
+          }
+        }
+      ]
+    }
+  ],
+  "unit": "10^2.%"
+}
