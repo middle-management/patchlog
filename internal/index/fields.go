@@ -48,9 +48,6 @@ func (q *Query) pathChecks() []pathCheck {
 	for _, s := range q.Sorts {
 		out = append(out, pathCheck{"sort", s.path, "sort"})
 	}
-	for _, r := range q.Ranges {
-		out = append(out, pathCheck{r.name + "[" + r.path + "]", r.path, "sort"})
-	}
 	return out
 }
 

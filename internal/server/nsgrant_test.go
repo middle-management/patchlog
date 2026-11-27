@@ -132,14 +132,9 @@ func TestNSLogGrant(t *testing.T) {
 	expect(t, e.patchNS("sec-b", ops(op("add", "/frozen", true)), f.issuerG), 201)
 	head := e.nsHead("sec-b", f.adminG)
 	expect(t, e.do(req{method: "POST", path: "/ns/sec-b/purge", ifMatch: head, bearer: f.adminG}), 204)
-	// The chain of a purged namespace is still served (§8.5).
-	entries := e.get("/ns/sec-b/rev/"+e.nsHead("sec-b", f.adminG)+"/log", f.adminG).Arr()
-	checkEntries(t, "sec-b", entries, [][3]string{
-		{"config", "user:bob", issuer},
-		{"purge", "user:root", ""},
-		{"config", "user:bob", issuer},
-		{"purge-ns", "user:root", admin},
-	})
+	// The chain of a purged namespace goes with it, grant references
+	// included (§5, §8.5, v0.91).
+	expectCode(t, e.get("/ns/sec-b/rev/"+e.nsHead("sec-b", f.adminG)+"/log", f.adminG), 410, "purged")
 }
 
 // §7.4: a sealed namespace's log ranges (§E.2.2) carry the grant

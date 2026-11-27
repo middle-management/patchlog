@@ -20,6 +20,9 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		if n == nil {
 			return t.absentNSOp(req.NS, req.Cred, force)
 		}
+		if n.purged {
+			return t.purgedNS(n) // before every check (§8.5)
+		}
 		cfg := t.config(n.configSeq)
 		a, operator, aerr := t.purger(n, cfg, req, force)
 		if aerr != nil {
@@ -43,10 +46,6 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 			// failed outright: 422, drawing nothing, a purge being exempt
 			// (§6.6).
 			return ran
-		}
-		// 410 after authorisation, like every write (§6.2).
-		if n.purged {
-			return t.purgedNS(n)
 		}
 		// A purged resource is 410 at step 2.1, before the precondition
 		// (§6.2, §8.3).
@@ -1173,6 +1172,9 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		if n == nil {
 			return t.absentNSOp(req.NS, req.Cred, force)
 		}
+		if n.purged {
+			return t.purgedNS(n) // before every check (§8.5)
+		}
 		cfg := t.config(n.configSeq)
 		a, operator, aerr := t.purger(n, cfg, req, force)
 		if aerr != nil {
@@ -1195,12 +1197,8 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 			// outright: 422, drawing nothing, as a purge is exempt (§6.6).
 			return ran
 		}
-		// In §6.2's order (§8.5): 410 after authorisation, like every
-		// write (step 2.1); not frozen (step 2.4); then the precondition
-		// (step 2.5).
-		if n.purged {
-			return t.purgedNS(n)
-		}
+		// In §6.2's order (§8.5): not frozen (step 2.4), then the
+		// precondition (step 2.5).
 		if !cfg.Frozen {
 			return apiErr(409, "not_frozen")
 		}
@@ -1247,8 +1245,8 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 
 // purgeNSNow purges namespace n, its checks passed (PurgeNamespace), or
 // at Open (purgeRaisedE2E), as author: its content, sealed bytes and epoch
-// keys go, and a purge-ns entry is appended. It
-// returns the entry's ns_id.
+// keys go, a purge-ns entry is appended, and then everything of n but its
+// name and that entry's id (trimPurgedNS). It returns the entry's ns_id.
 func (t *tx) purgeNSNow(n *nsRow, forced bool, author int64) string {
 	t.deleteArchives(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 	t.deleteDEKs(`ns = ?`, n.id)
@@ -1256,26 +1254,112 @@ func (t *tx) purgeNSNow(n *nsRow, forced bool, author int64) string {
 	t.deleteSealed(`ns = ?`, n.id)
 	t.deleteBlobEpochs(`ns = ?`, n.id)
 	t.deleteEpochKeys(n.id)
-	_, err := t.Exec(`UPDATE revisions SET patches = NULL, size = NULL, digest = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
-	t.must(err)
-	_, err = t.Exec(`DELETE FROM heads WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
-	t.must(err)
-	_, err = t.Exec(`DELETE FROM snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
-	t.must(err)
-	_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
-	t.must(err)
+	// Blob bytes kept as files, and shared ones no one else names.
 	t.purgeBlobs(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
-	_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE ns = ?`, statePurged, n.id)
-	t.must(err)
 	t.metaChanged = true
-	_, err = t.Exec(`UPDATE namespaces SET purged = 1 WHERE ns = ?`, n.id)
-	t.must(err)
 	entry := map[string]any{"kind": "purge-ns"}
 	if forced {
 		entry["forced"] = true
 	}
+	// The entry is chained and hashed as any (§3.5): its id is what the
+	// namespace keeps, and what every later request's 410 names.
 	_, nsID := t.appendNS(n, entry, nil, nil, n.configSeq, author)
+	if testLegacyNSPurge {
+		t.legacyPurgedNS(n)
+	} else {
+		t.trimPurgedNS(n, nsID)
+	}
 	t.tags = append(t.tags, "ns:"+n.name)
 	t.flushDocs = true
 	return nsID.String()
+}
+
+// purgedNSTrim is what a namespace purge deletes of namespace ns (§5,
+// §8.5, v0.91), in an order Postgres's foreign keys allow, each statement
+// taking ns as its only argument; the namespace's row stays, with its name
+// and the purge-ns entry's id. Its log, document chain, resources and
+// revisions, their ids and authors, the grant references of its entries
+// and what derives from them all go. Migration
+// 035_purged_namespaces_keep_name_and_purge_id (Postgres; 033_… on
+// SQLite) deletes the same for the namespaces purged before it.
+var purgedNSTrim = []string{
+	`DELETE FROM head_history WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+	`DELETE FROM blob_refs WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+	`DELETE FROM blob_pending WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+	`DELETE FROM blobs WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+	`DELETE FROM blob_bytes WHERE owner IN (SELECT res FROM resources WHERE ns = ?)`,
+	`DELETE FROM snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+	`DELETE FROM e2e_snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+	`DELETE FROM heads WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+	`DELETE FROM archives WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+	`DELETE FROM deks WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+	`DELETE FROM rev_epochs WHERE seq IN (SELECT v.seq FROM revisions v JOIN resources r ON r.res = v.res WHERE r.ns = ?)`,
+	`DELETE FROM revisions WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+	`DELETE FROM resources WHERE ns = ?`,
+	`DELETE FROM ns_grants WHERE ns = ?`,
+	`DELETE FROM ns_log WHERE ns = ?`,
+	`DELETE FROM ns_config WHERE ns = ?`,
+	`DELETE FROM epoch_keys WHERE ns = ?`,
+	`DELETE FROM e2e_epochs WHERE ns = ?`,
+	`DELETE FROM seal_counts WHERE ns = ?`,
+	`DELETE FROM sealed WHERE ns = ?`,
+	`DELETE FROM blob_epochs WHERE ns = ?`,
+	`DELETE FROM rotations_due WHERE ns = ?`,
+	`DELETE FROM purge_follow_waiting WHERE ns = ?`,
+	`DELETE FROM purge_follow_names WHERE ns = ?`,
+	`DELETE FROM purge_follows WHERE ns = ?`,
+	`DELETE FROM filtered_served WHERE ns = (SELECT name FROM namespaces WHERE ns = ?)`,
+	`DELETE FROM filtered_views WHERE ns = (SELECT name FROM namespaces WHERE ns = ?)`,
+	`DELETE FROM filtered_view_exps WHERE ns = (SELECT name FROM namespaces WHERE ns = ?)`,
+}
+
+// testLegacyNSPurge, set by the upgrade test of the migration that trims
+// purged namespaces, purges a namespace as the reference did before v0.91
+// (legacyPurgedNS): its rows stay, its content gone.
+var testLegacyNSPurge bool
+
+// legacyPurgedNS is what a namespace purge kept before v0.91: the
+// namespace document chain, its log, and every resource's ids and parent
+// links, without content.
+func (t *tx) legacyPurgedNS(n *nsRow) {
+	for _, q := range []string{
+		`UPDATE revisions SET patches = NULL, size = NULL, digest = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+		`DELETE FROM heads WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+		`DELETE FROM snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+		`DELETE FROM e2e_snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`,
+		`UPDATE resources SET state = 2, keep = NULL WHERE ns = ?`,
+	} {
+		_, err := t.Exec(q, n.id)
+		t.must(err)
+	}
+	_, err := t.Exec(`UPDATE namespaces SET purged = 1 WHERE ns = ?`, n.id)
+	t.must(err)
+}
+
+// trimPurgedNS deletes everything of namespace n but its name and the id
+// of its purge-ns entry, purge (§5, §8.5, v0.91): a purged namespace's
+// row keeps its name, which stays reserved, purge as head_id, frozen and
+// purged set, and its base and the position it was made at if it is a
+// branch, which are the base's (its branch entry) and place the branch's
+// row in the base's /branches. On Postgres the row records the purging
+// transaction (purged_xid), from which the other instances' tailers wake
+// the namespace's waiters, its log rows being gone (tailer.go).
+func (t *tx) trimPurgedNS(n *nsRow, purge ids.ID) {
+	for _, q := range purgedNSTrim {
+		_, err := t.Exec(q, n.id)
+		t.must(err)
+	}
+	var err error
+	if t.e.pg {
+		_, err = t.Exec(`UPDATE namespaces SET purged = 1, frozen = 1, head_id = ?, head_seq = NULL, config_seq = NULL, base_config_seq = NULL, purged_xid = pg_current_xact_id() WHERE ns = ?`, purge[:], n.id)
+	} else {
+		_, err = t.Exec(`UPDATE namespaces SET purged = 1, frozen = 1, head_id = ?, head_seq = NULL, config_seq = NULL, base_config_seq = NULL WHERE ns = ?`, purge[:], n.id)
+	}
+	t.must(err)
+	t.wrote()
+	delete(t.logHeads, n.id)
+	t.trimmed = true
+	// The second CDN purge is keyed on no entry: the purge-ns entry's
+	// seq is gone, and SQLite may give it to a later entry (repurge.go).
+	t.lastNS = 0
 }

@@ -393,11 +393,10 @@ func entryDigest(key map[string]any, roles map[string]any) string {
 // FilteredRedirect is a partial reader's request at an unfiltered URL,
 // answered 302 to its filtered form (§7.9 URLs): /ns/{NS}/view/{View}/at/{At}/…
 // for ranges, /ns/{NS}/view/{View}/… with At "" for long-poll and events,
-// which the caller clears, and, with Content set, /ns/{NS}/view/{View}
-// followed by Content, a resource's immutable URL (§7.9 Content).
+// which the caller clears. A resource's URLs answer in place (§7.9,
+// v0.91), never redirected under a view.
 type FilteredRedirect struct {
 	NS, View, At string
-	Content      string
 }
 
 func (r *FilteredRedirect) Error() string {

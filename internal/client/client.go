@@ -11,8 +11,8 @@
 //     empty checkpoint).
 //   - Redirects are never followed automatically: head pointers (302) are
 //     returned as typed values read from Location / ETag. The exception is
-//     a partial reader's (§7.9): its document, raw and blob reads follow
-//     the 302 to their form under its view, and its plain namespace reads
+//     a partial reader's (§7.9): its document, raw and blob reads are
+//     answered in place (v0.91), and its plain namespace reads
 //     (NSLog, Heads, LongPoll and their pages) read its view's filtered
 //     log and /heads, in a public namespace through the view ViewOf finds
 //     once and the client remembers (auto.go). Those return a FilteredAt
@@ -432,38 +432,8 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, rq *
 	if err != nil {
 		return nil, err
 	}
-	r := &response{status: res.StatusCode, header: res.Header, body: b, method: method, path: path}
-	if loc, ok := c.viewContent(r, method, path); ok {
-		// A partial reader's read of a resource's immutable URL is
-		// served under its view (§7.9 Content): followed once, on this
-		// origin, with the same credentials and query.
-		return c.do(ctx, method, loc, q, rq)
-	}
-	return r, nil
+	return &response{status: res.StatusCode, header: res.Header, body: b, method: method, path: path}, nil
 }
-
-// viewContent reports whether r, a GET or HEAD of path, is a 302 to the
-// form of path under a view of this origin (§7.9 Content,
-// /ns/{ns}/view/{view}/r/{name}/…, path being /r/{ns}/{name}/…), and
-// returns that path.
-func (c *Client) viewContent(r *response, method, path string) (string, bool) {
-	if r.status != 302 || method != "GET" && method != "HEAD" || !strings.HasPrefix(path, "/r/") {
-		return "", false
-	}
-	segs := strings.SplitN(path, "/", 4) // "", "r", ns, rest
-	if len(segs) != 4 {
-		return "", false
-	}
-	loc := c.location(r)
-	m := viewContentRe.FindStringSubmatch(loc)
-	if m == nil || m[1] != segs[2] || m[2] != "/r/"+segs[3] {
-		return "", false
-	}
-	return loc, true
-}
-
-// viewContentRe is a resource's immutable URL under a view (§7.9 Content).
-var viewContentRe = regexp.MustCompile(`^/ns/([a-z0-9][a-z0-9_-]{0,63})/view/1[a-z2-7]{32}(/r/.+)$`)
 
 // viewPrefixRe is a view's prefix /ns/{ns}/view/{view} (§7.9 URLs).
 var viewPrefixRe = regexp.MustCompile(`^/ns/[a-z0-9][a-z0-9_-]{0,63}/view/1[a-z2-7]{32}`)

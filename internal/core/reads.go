@@ -35,34 +35,37 @@ func nfNS(public bool) *Error {
 	return e
 }
 
-// purgedNS is the 410 of a purged namespace n (§8.5): of every /r/{ns}/…
-// URL, /ns/{ns}/grants/…, /ns/{ns}/gestures/…, /ns/{ns}/keys and /heads at
-// any revision, as soon as the full read check for the URL passes, the
-// grant's rules included, and before any other answer (not_offered and
-// the 404 of an unknown id included); and of every write to it. Code
-// "purged", with head, the ns_id of its purge-ns entry, the log's last.
-// /ns/{ns} and its log stay readable, except in a sealed namespace
-// (sealedPurged).
+// purgedNS is the 410 of a purged namespace n (§8.5, v0.91): of every
+// request to /r/{ns}/… or /ns/{ns} and below, reads and writes alike,
+// whatever the grant, right after the request's own shape (§6.2) and
+// before every step of §7, not_offered and the 404 of an unknown id
+// included. Code "purged", with head, the ns_id of its purge-ns entry,
+// which is all a purged namespace keeps but its name (§5): the namespace
+// row's head_id (trimPurgedNS).
 func (t *tx) purgedNS(n *nsRow) *Error {
-	return apiErr(410, "purged", "head", t.nsLogID(n.headSeq.Int64).String())
+	return apiErr(410, "purged", "head", t.purgeID(n).String())
 }
 
-// purgedRead is purgedNS for a cacheable read, which §9 answers with the
-// long class, as any purge; Public is as for nfNS.
+// purgeID is the id of purged namespace n's purge-ns entry, as its row
+// keeps it (trimPurgedNS).
+func (t *tx) purgeID(n *nsRow) ids.ID {
+	var b []byte
+	t.must(t.QueryRow(`SELECT head_id FROM namespaces WHERE ns = ?`, n.id).Scan(&b))
+	if len(b) == 0 {
+		panic(fmt.Errorf("purged namespace %s keeps no purge-ns id", n.name))
+	}
+	return ids.FromBytes(b)
+}
+
+// purgedRead is purgedNS for a read, which §9 caches as long as any purge,
+// with the public class whatever the namespace's read was (§8.5): the
+// answer is the same for every request, and a purge is no secret (§E.4).
 func (t *tx) purgedRead(n *nsRow) *Error {
 	e := t.purgedNS(n)
-	public := t.cachePublic(n)
+	public := true
 	e.Public = &public
 	return e
 }
-
-// sealedPurged reports a purged namespace whose namespace documents and
-// log ranges are sealed (§E.2.2): the purge destroyed the epoch keys that
-// seal them, so they, events and long-polls included, answer purgedRead
-// rather than in the clear, which would show authors and timing to anyone
-// the keys kept out (§8.5). /ns/{ns} still redirects, to a revision that
-// is 410, and the 410's head tells a consumer of the purge.
-func (t *tx) sealedPurged(n *nsRow) bool { return n.purged && t.isSealedNS(n) }
 
 // listHeads lists every resource of n as of asOf (nil = now), including
 // read-through ones, sorted by name in ascending byte order (§7.4), by Go's
@@ -200,6 +203,9 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		if n.purged {
+			return t.purgedRead(n) // before every check (§8.5)
+		}
 		a, err := t.reader(n, cred, name)
 		if err != nil {
 			return err
@@ -216,9 +222,6 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 		if c, ok := e.rc.headFor(g, ns, name); ok {
 			h, cached = &c, true
 			return nil
-		}
-		if n.purged {
-			return t.purgedRead(n)
 		}
 		h = &Head{Public: t.cachePublic(n)}
 		public = t.config(n.configSeq).Read == "public"
@@ -314,18 +317,10 @@ type Rev struct {
 	SchemaRules string
 }
 
-// ResourceRev serves the document at a revision. A partial reader's
-// request with its grant in Authorization is a *FilteredRedirect to the
-// URL's form under its view (§7.9 Content).
+// ResourceRev serves the document at a revision. A partial reader is
+// answered in place, each revision judged by its rules, never redirected
+// under its view's prefix (§7.9 Answers, v0.91).
 func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
-	return e.resourceRev(ctx, ns, name, id, cred, "/rev/"+id)
-}
-
-// resourceRev is ResourceRev, redirecting a partial reader to its view's
-// form of the URL ending in content after the resource's name, unless
-// content is "" (a read for another URL's answer, as ResourceRaw's of
-// /raw, which stays at its own URL).
-func (e *Engine) resourceRev(ctx context.Context, ns, name, id string, cred Credentials, content string) (*Rev, error) {
 	if c := e.rc.rev(ns, name, id); c != nil && cred.viewed == nil {
 		// A public revision, but under a view prefix, which judges each
 		// revision by the view in a public namespace too (§7.9, v0.90).
@@ -353,6 +348,9 @@ func (e *Engine) resourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		if n.purged {
+			return t.purgedRead(n) // before every check (§8.5)
+		}
 		referrer := false
 		a, aerr := t.reader(n, cred, name)
 		if aerr != nil {
@@ -363,18 +361,7 @@ func (e *Engine) resourceRev(ctx context.Context, ns, name, id string, cred Cred
 			}
 			referrer = true
 		}
-		if !referrer && content != "" {
-			if err := t.contentRedirect(n, cred, a, name, content); err != nil {
-				return err
-			}
-		}
 		byDoc := !referrer && t.readsByDoc(n, a)
-		if n.purged {
-			if byDoc && !t.purgedReadable(a, n, name) {
-				return notFound() // judged with /doc rules set aside (§6.4.1, §8.5)
-			}
-			return t.purgedRead(n)
-		}
 		out = &Rev{Public: t.cachePublic(n), Referrer: referrer}
 		public = t.config(n.configSeq).Read == "public"
 		// Last-Modified and Repr-Digest, judged by the namespace serving
@@ -606,10 +593,6 @@ type Log struct {
 	Horizon   string
 	Archive   string // with Horizon: the archive holding the newest pruned entry, if any
 	Public    bool
-	// Purged is set on a namespace log of a purged namespace, which ends
-	// with its purge-ns entry: a namespace stream ends after it (§7.3,
-	// §8.5).
-	Purged bool
 	// Until is when the credential that admitted the read expires, zero
 	// if none bounds it (admission.go): an event stream ends there at the
 	// latest (§7.3).
@@ -656,17 +639,14 @@ func (e *Engine) resourceLog(ctx context.Context, ns, name, id, since string, li
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		if n.purged {
+			return t.purgedRead(n) // before every check (§8.5)
+		}
 		a, aerr := t.reader(n, cred, name)
 		if aerr != nil {
 			return aerr
 		}
 		byDoc := t.readsByDoc(n, a)
-		if n.purged {
-			if byDoc && !t.purgedReadable(a, n, name) {
-				return notFound() // judged with /doc rules set aside (§6.4.1, §8.5)
-			}
-			return t.purgedRead(n)
-		}
 		if q != nil {
 			q.ok, q.anyone, q.until = standing(t, n, cred, a)
 			if byDoc || t.isSealedNS(n) && t.readsPartially(n, a) {
@@ -874,7 +854,6 @@ type NSInfo struct {
 	Head   string
 	Config string
 	Public bool
-	Purged bool
 	Doc    []byte
 	JWE    string // sealed namespaces (Addendum E.2): the sealed document
 }
@@ -901,6 +880,9 @@ func (e *Engine) namespaceHead(ctx context.Context, ns string, cred Credentials,
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		if n.purged {
+			return t.purgedRead(n) // before every check (§8.5)
+		}
 		if redirect {
 			if _, err := t.nsReaderOrRedirect(n, cred); err != nil {
 				return err
@@ -912,7 +894,6 @@ func (e *Engine) namespaceHead(ctx context.Context, ns string, cred Credentials,
 			Head:   t.nsLogID(n.headSeq.Int64).String(),
 			Config: t.configID(n.configSeq).String(),
 			Public: t.cachePublic(n),
-			Purged: n.purged,
 		}
 		return nil
 	})
@@ -930,12 +911,11 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		if n.purged {
+			return t.purgedRead(n) // before every check (§8.5)
+		}
 		if _, err := t.nsReader(n, cred); err != nil {
 			return err
-		}
-		// At any revision, before the 404 of an unknown one (§8.5).
-		if t.sealedPurged(n) {
-			return t.purgedRead(n)
 		}
 		id, perr := ids.Parse(nsID)
 		if perr != nil {
@@ -1000,6 +980,9 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 	var nsRowID int64
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
+		if n != nil && n.purged {
+			return t.purgedRead(n) // before every check (§8.5)
+		}
 		var a *actor
 		var aerr *Error
 		switch {
@@ -1030,12 +1013,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 				live.decided(t, n, cred, a)
 			}
 		}
-		// Every range, page and event, before the 404 of an id or since
-		// not in the chain (§8.5).
-		if t.sealedPurged(n) {
-			return t.purgedRead(n)
-		}
-		out = &Log{Public: t.cachePublic(n), Purged: n.purged}
+		out = &Log{Public: t.cachePublic(n)}
 		if live == nil || !live.shared {
 			out.Until = t.admittedUntil(n, cred, a)
 		}
@@ -1062,12 +1040,6 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 				return nil
 			}
 			fromSeq = s
-		}
-		// Events and long-poll from a purged namespace's purge-ns entry,
-		// its last, are 410 purged, so a follower can tell the end from a
-		// restart; an immutable range from it stays an empty page (§8.5).
-		if n.purged && resource == "" && (perEntry || live != nil) && since != "" && fromSeq == n.headSeq.Int64 {
-			return t.purgedRead(n)
 		}
 		q := `SELECT ` + t.nsLogCols() + ` FROM ` + nsLogFrom + ` WHERE l.ns = ? AND l.seq > ? AND l.seq <= ? ORDER BY l.seq`
 		args := []any{n.id, fromSeq, toSeq}
@@ -1239,21 +1211,13 @@ func (e *Engine) NamespaceHeadsPrefix(ctx context.Context, ns, nsID, after, pref
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.nsReaderOrRedirect(n, cred); err != nil {
-			// A partial reader's unfiltered /heads of a covered namespace
-			// that is purged is 410 without the 302 (§7.9 Purged
-			// namespaces, §8.5): her read check passed, so the answer is
-			// the one the filtered form would give, and no at is
-			// recorded. A grant that can't be redirected keeps its 403.
-			var fr *FilteredRedirect
-			if n.purged && errors.As(err, &fr) {
-				return t.purgedRead(n)
-			}
-			return err
-		}
-		// At any revision, once its resources are gone (§8.5).
 		if n.purged {
+			// At any revision, whatever the grant, without the 302 a
+			// partial reader would get (§7.9 Purged namespaces, §8.5).
 			return t.purgedRead(n)
+		}
+		if _, err := t.nsReaderOrRedirect(n, cred); err != nil {
+			return err
 		}
 		id, perr := ids.Parse(nsID)
 		seq, ok := t.nsLogSeq(n.id, id)
@@ -1348,6 +1312,9 @@ func (e *Engine) BranchList(ctx context.Context, ns, after string, cred Credenti
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		if n.purged {
+			return t.purgedRead(n) // before every check (§8.5)
+		}
 		_, kind, _, err := t.nsAccess(n, cred)
 		if err != nil {
 			return err
@@ -1355,17 +1322,23 @@ func (e *Engine) BranchList(ctx context.Context, ns, after string, cred Credenti
 		if kind == accessPartial {
 			return forbidden("a partial reader's grant doesn't read the branches of " + ns + ": filtered reads cover no branch (§7.9)")
 		}
-		if n.purged {
-			return t.purgedRead(n)
-		}
 		out = &Branches{List: []map[string]any{}, Public: t.cachePublic(n)}
 		limit, bound := e.opt.Maximums.LogPageSize, plainBound(after)
 		local := t.branchesAfter(n, bound, false, limit+1)
 		for len(out.List) < limit && len(local) > 0 {
 			b := local[0]
 			local = local[1:]
+			m := map[string]any{"name": b.name, "at": t.nsLogID(b.baseAt.Int64).String()}
+			if b.purged {
+				// Only what a purged namespace keeps, and the base's own
+				// branch entry (§5, §7.4, v0.91).
+				m["frozen"], m["purged"] = true, true
+				out.List = append(out.List, m)
+				out.Next = b.name
+				continue
+			}
 			cfg := t.config(b.configSeq)
-			m := map[string]any{"name": b.name, "at": t.nsLogID(b.baseAt.Int64).String(), "frozen": cfg.Frozen, "purged": b.purged}
+			m["frozen"], m["purged"] = cfg.Frozen, false
 			if cfg.Successor != "" {
 				m["successor"] = cfg.Successor
 			}

@@ -1,6 +1,6 @@
 # Patch Log — Services
 
-Status: draft v0.90 · 2026-11-24. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.91 · 2026-11-27. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Services that follow namespaces through the protocol's public API and answer queries over them:
 
@@ -25,7 +25,7 @@ A search service for typed documents: a namespace consumer (§10) with its own p
   2.  Without `$schema`, remove the resource's rows.
   3.  A schema document (`$schema` a dialect URL, §6.1) is indexed against the dialect's meta-schema: `schema=` with the dialect URL lists schema documents, and the revision paths of `$ref`s at schema positions, fragment dropped, are its references (§A.2).
   4.  Otherwise fetch the pinned schema revision and index the annotated fields and references (§A.2). A schema revision answering a `4xx` other than `408` and `429`, or that the service lacks keys to open (§6.1, §E.2.3), leaves the document indexed as untyped. A schema or key fetch that fails transiently (transport error, `5xx`, `408`, `429`) is retried.
-- `tombstone` or `purge` → remove the resource's rows. `purge`, or a `config` entry on which §9 purges `ns:{ns}` → purge `idx:{ns}` from the service's own cache and drop kept results (§A.4), serving or keeping none computed from what was read before it, as any result of `{ns}`, its scores and counts included, may derive from what it removes.
+- `tombstone` or `purge` → remove the resource's rows, and `purge-ns`, or a `410` `purged` standing for it (§10), the namespace's, keeping only that it is purged (§A.4). `purge`, `purge-ns`, or a `config` entry on which §9 purges `ns:{ns}` → purge `idx:{ns}` from the service's own cache and drop kept results (§A.4), serving or keeping none computed from what was read before it, as any result of `{ns}`, its scores and counts included, may derive from what it removes.
 - Store the checkpoint in the same transaction as the index writes.
 
 ## A.2 What gets indexed: `x-index`
@@ -69,7 +69,7 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
 
 - **Unavailable namespaces.** A query of a namespace that is:
   - unfollowed, a branch whose bases' namespace logs it doesn't all follow (§C.4 Keys follow the base), or a sealed or end-to-end one whose keys the service lacks (§E.2.6: `/keys` answers it a `4xx` other than `408` and `429`, or gives none it can unwrap): `404`, at its exchange too, which mints no cookie and answers `404` only where no other refusal is `401` or `403` (§C.5.2 All or nothing), also where the service learns this only during the read check;
-  - purged: `410` (`purged`), once the read check passes against the last namespace document the service read;
+  - purged: `410` (`purged`), whatever the grant, as at the origin (§8.5);
   - followed, without a checkpoint yet: once the reader's grant verifies, `503`, `no-store`, with `code: "behind"` and `Retry-After` (§A.5).
 
 - `schema` filters by an exact `$schema` reference, or by a schema's resource path `/r/{ns}/{name}` to match all its revisions.
@@ -96,7 +96,7 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
     - For a namespace read only in part, `at` and its `ns_id` show when it changed (§C.6).
     - Hits from sealed and end-to-end namespaces are sealed per entry (§E.2.6), never as a whole response.
   - **Coverage.** It includes branch previews (§F.8). It leaves out namespaces not yet reached, purged ones, and sealed or end-to-end ones whose keys it lacks.
-    - Only a reader who may see none of the namespaces gets `401` or `403`, or, where every namespace its grant names is purged and the grant verifies in each, `410` as §C.5.2 gives it.
+    - Only a reader who may see none of the namespaces gets `401` or `403`, or, where every namespace its grant names is purged, `410` as §C.5.2 gives it.
     - If the service can't read the namespace document of one the grant names, the answer is `502`.
     - Any other whose document it can't read is left out, as one the reader can't see.
   - It is tagged `idx:{ns}` for every namespace in `at`, and `r:{ns}/{name}` per hit, with base tags as §9 allows.

@@ -14,8 +14,9 @@ import (
 
 // Behaviour new in v0.32.
 
-// §7.8: a purged namespace is 410 after authorisation, like a purged
-// resource.
+// §7.8, §8.5 (v0.91): a purged namespace's upload is 410 before all of §7.8's
+// checks, whatever the grant (after authorisation until v0.91, as a
+// purged resource's still is).
 func TestBlobUploadPurgedNamespaceAfterAuth(t *testing.T) {
 	t.Parallel()
 	f := newAuthFixture(t, nil, withBlobTuning)
@@ -28,8 +29,8 @@ func TestBlobUploadPurgedNamespaceAfterAuth(t *testing.T) {
 	expect(t, e.do(req{method: "POST", path: "/ns/gone/purge", ifMatch: e.nsHead("gone", admin), bearer: admin}), 204)
 	data := []byte("late")
 	bid := blobID("text/plain", "", data)
-	expectCode(t, e.putBlobAs("gone", "a", bid, "text/plain", "", data), 401, "unauthenticated")
-	expectCode(t, e.putBlobAs("gone", "a", bid, "text/plain", "", data, reader), 403, "forbidden")
+	expectCode(t, e.putBlobAs("gone", "a", bid, "text/plain", "", data), 410, "purged")
+	expectCode(t, e.putBlobAs("gone", "a", bid, "text/plain", "", data, reader), 410, "purged")
 	expectCode(t, e.putBlobAs("gone", "a", bid, "text/plain", "", data, admin), 410, "purged")
 }
 

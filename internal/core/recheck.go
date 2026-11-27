@@ -182,7 +182,7 @@ func (t *tx) recheckIn(p *writePlan, d *writeDeps, nss map[int64]*nsRow) (*nsRow
 	var bs *batchSource
 	if p.isBatch && p.source != nil {
 		var err *Error
-		if _, bs, err = t.checkSource(p.req, p.source); err != nil {
+		if _, bs, err = t.checkSource(p.req, p.source, target, p.a, p.st); err != nil {
 			return nil, false
 		}
 	}

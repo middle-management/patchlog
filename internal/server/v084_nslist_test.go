@@ -118,7 +118,7 @@ func TestV084NamespacesScenario75(t *testing.T) {
 	if got, want := rowNames(rows), []string{"matches", "matches-next", "old"}; !reflect.DeepEqual(got, want) || next != "" {
 		t.Fatalf("namespaces %v next %q, want %v", got, next, want)
 	}
-	if r := rowOf(t, rows, "old"); r["purged"] != true || r["frozen"] != true {
+	if r := rowOf(t, rows, "old"); r["purged"] != true || r["frozen"] != true || len(r) != 3 {
 		t.Fatalf("purged row %v", r)
 	}
 	if r := rowOf(t, rows, "matches-next"); r["purged"] != false || r["base"].(map[string]any)["ns"] != "matches" {
@@ -558,7 +558,7 @@ func TestV084NamespacesRows(t *testing.T) {
 	}
 	stamp := func(tm time.Time) string { return tm.UTC().Format("2006-01-02T15:04:05.000Z") }
 	want := []map[string]any{
-		{"name": "gone", "created": stamp(t0.Add(3 * time.Minute)), "frozen": true, "purged": true},
+		{"name": "gone", "frozen": true, "purged": true}, // all it keeps (§5, §7.4, v0.91)
 		{"name": "icy", "created": stamp(t0.Add(time.Minute)), "frozen": true, "purged": false},
 		{"name": "plain", "created": stamp(t0), "frozen": false, "purged": false},
 		{"name": "plain-b", "created": stamp(branched), "base": map[string]any{"ns": "plain", "at": at}, "frozen": true, "purged": false},
@@ -611,14 +611,15 @@ func TestV084NamespacesRows(t *testing.T) {
 		}
 	}
 
-	// Unfreezing shows; a purged branch stays listed, with its base.
+	// Unfreezing shows; a purged branch stays listed, with only what it
+	// keeps (§5, §7.4, v0.91: no created or base).
 	expect(t, e.patchNS("icy", ops(op("replace", "/frozen", false)), ""), 201)
 	e.purgeDev("plain-bb")
 	rows, _ = e.nsPage("")
 	if r := rowOf(t, rows, "icy"); r["frozen"] != false {
 		t.Fatalf("unfrozen row %v", r)
 	}
-	if r := rowOf(t, rows, "plain-bb"); r["purged"] != true || r["frozen"] != true || !reflect.DeepEqual(r["base"], want[4]["base"]) || r["created"] != want[4]["created"] {
+	if r := rowOf(t, rows, "plain-bb"); r["purged"] != true || r["frozen"] != true || len(r) != 3 {
 		t.Fatalf("purged branch row %v", r)
 	}
 	if got := rowNames(rows); !reflect.DeepEqual(got, []string{"gone", "icy", "plain", "plain-b", "plain-bb"}) {

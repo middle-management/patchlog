@@ -99,11 +99,6 @@ func (e *Engine) filteredLiveLog(ctx context.Context, ns, view, since string, li
 		if aerr != nil {
 			return aerr
 		}
-		if t.fromPurgeEntry(n, since) || t.sealedPurged(n) {
-			// A sealed namespace's keys go with its purge: 410, as its
-			// unfiltered live reads answer (§8.5).
-			return t.purgedRead(n)
-		}
 		fv, info, until = v, filteredInfo(v), t.credUntil(cred, v.a)
 		return nil
 	})
@@ -119,6 +114,9 @@ func (e *Engine) filteredLiveLog(ctx context.Context, ns, view, since string, li
 			n := t.nsByName(ns)
 			if n == nil || n.id != fv.fs.n.id {
 				return notFound()
+			}
+			if n.purged {
+				return t.purgedRead(n) // since the read above (§8.5)
 			}
 			lg = t.filteredRange(n, fv, since, fv.cp.seq, limit)
 			if len(lg.Entries) > 0 {
@@ -158,6 +156,9 @@ func (e *Engine) filteredLiveLog(ctx context.Context, ns, view, since string, li
 				n := t.nsByName(ns)
 				if n == nil || n.id != fv.fs.n.id {
 					return notFound()
+				}
+				if n.purged {
+					return t.purgedRead(n) // since the read above (§8.5)
 				}
 				lg = t.filteredRange(n, fv, since, fv.cp.seq, limit)
 				if len(lg.Entries) > 0 {

@@ -312,7 +312,7 @@ func TestV073SealedETagNamesEpoch(t *testing.T) {
 }
 
 // §7.4, §8.5 (RH-19, BBD-10): once the namespace is purged, /branches is
-// 410 purged with head, after the unrestricted-read check, in the long
+// 410 purged with head, whatever the grant since v0.91, in the long
 // class with the namespace's tag.
 func TestV073BranchesOfPurgedNamespace(t *testing.T) {
 	t.Parallel()
@@ -332,11 +332,10 @@ func TestV073BranchesOfPurgedNamespace(t *testing.T) {
 	if r.H.Get("Cache-Tag") != "ns:sec" {
 		t.Errorf("Cache-Tag %q", r.H.Get("Cache-Tag"))
 	}
-	// Without unrestricted read, the read check answers first, as for a
-	// namespace that isn't purged.
+	// Without unrestricted read too: 410 before any read check (v0.91).
 	limited := e.grant(f.issuer, "user:l", []string{"sec"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
-	if r := e.get("/ns/sec/branches", limited); r.Code != 403 {
-		t.Errorf("limited reader: %d %s, want the read check's 403 (v0.74)", r.Code, r.Body)
+	if r := e.get("/ns/sec/branches", limited); r.Code != 410 {
+		t.Errorf("limited reader: %d %s, want 410", r.Code, r.Body)
 	}
 	// A public namespace's 410 is cached long.
 	p := newEnv(t)

@@ -70,7 +70,7 @@ func TestV047BranchPublicBase(t *testing.T) {
 // v0.47 §8.5: once a namespace is purged, every /r/{ns}/… URL,
 // /ns/{ns}/grants/…, /ns/{ns}/gestures/… and /heads at any revision answer
 // 410 "purged", reads with the long cache class (§9) but the no-store
-// ones; /ns/{ns} and its log stay readable.
+// ones; since v0.91 /ns/{ns} and its log too, nothing of them being left.
 func TestV047PurgedNamespace(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -99,12 +99,11 @@ func TestV047PurgedNamespace(t *testing.T) {
 	}
 	expectCode(t, e.write("PATCH", "p", "a", a0, ops(op("add", "/x", 1.0))), 410, "purged")
 	expectCode(t, e.putBlobAs("p", "a", bid, "text/plain", "", []byte("x")), 410, "purged")
-	lg := e.get("/ns/p/rev/" + head + "/log").Arr()
-	if k := lg[len(lg)-1].(map[string]any)["kind"]; k != "purge-ns" {
-		t.Fatalf("last entry %v", k)
-	}
+	expectPurged(t, e.get("/ns/p/rev/"+head+"/log"), head)
+	expectPurged(t, e.get("/ns/p"), head)
 
-	// /heads answers 410 after the read check.
+	// /heads answers 410 whatever the grant (v0.91; after the read check
+	// until then).
 	f := newAuthFixture(t, nil)
 	ae := f.tenv
 	ae.create("sec", "a", map[string]any{}, f.adminG)
@@ -113,8 +112,8 @@ func TestV047PurgedNamespace(t *testing.T) {
 	heads := "/ns/sec/rev/" + ae.nsHead("sec", f.adminG) + "/heads"
 	fixed := ae.grant(f.issuer, "user:x", []string{"sec"}, []string{"read"},
 		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
-	expect(t, ae.get(heads), 401)
-	expect(t, ae.get(heads, fixed), 403)
+	expectCode(t, ae.get(heads), 410, "purged")
+	expectCode(t, ae.get(heads, fixed), 410, "purged")
 	expectCode(t, ae.get(heads, f.adminG), 410, "purged")
 	expectCode(t, ae.get("/r/sec/a", fixed), 410, "purged")
 }
@@ -199,14 +198,15 @@ func TestV047OperatorGrantOrder(t *testing.T) {
 	expectCode(t, forced("/r/nope/a/purge", a, opG("other")), 403, "forbidden")
 	expectCode(t, forced("/ns/nope/purge", a, opG("other")), 403, "forbidden")
 	expectCode(t, forced("/r/sec/a/purge", a, opG("other")), 403, "forbidden")
-	// A purged namespace: 410 for the forced purges it authorises.
+	// A purged namespace: 410 for the forced purges.
 	expect(t, e.patchNS("sec", ops(op("add", "/frozen", true)), f.adminG), 201)
 	expect(t, e.do(req{method: "POST", path: "/ns/sec/purge", ifMatch: e.nsHead("sec", f.adminG), bearer: f.adminG}), 204)
 	expectCode(t, forced("/r/sec/a/purge", a, opG("sec")), 410, "purged")
 	expectCode(t, forced("/ns/sec/purge", e.nsHead("sec", f.adminG), opG("sec")), 410, "purged")
-	expectCode(t, forced("/r/sec/a/purge", a, opG("other")), 403, "forbidden")
-	expectCode(t, e.purge("sec", "a", a, opG("sec")), 401, "unauthenticated")
-	expectCode(t, e.get("/ns/sec", opG("sec")), 401, "unauthenticated")
+	// Whatever the grant, before the ns check (v0.91).
+	expectCode(t, forced("/r/sec/a/purge", a, opG("other")), 410, "purged")
+	expectCode(t, e.purge("sec", "a", a, opG("sec")), 410, "purged")
+	expectCode(t, e.get("/ns/sec", opG("sec")), 410, "purged")
 }
 
 // v0.47 §C.4 "Keys follow the base": a kid the base adds hides the

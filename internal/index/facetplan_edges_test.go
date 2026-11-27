@@ -105,10 +105,6 @@ func randomQueryExt(r *rand.Rand) url.Values {
 		v.Set("after", fmt.Sprint([]int{999, 1000, 1001, 16383, 16384, 20000}[r.IntN(6)]))
 	}
 	if r.IntN(10) == 0 {
-		v.Add("ge[/s]", "-1")
-		v.Add("le[/s]", "100")
-	}
-	if r.IntN(10) == 0 {
 		v.Set("schema", "/r/schemas/")
 	}
 	// after is a position with q or sort, else a resource name (§A.4):
@@ -258,11 +254,11 @@ func TestDriverThresholds(t *testing.T) {
 		// Without q or sort, after is a resource name (§A.4); with sort, a
 		// position.
 		for _, extra := range []string{"", "&sort=/n", "&counts=/st,/k", "&after=d000980&limit=20", "&after=d000981&limit=20", "&after=d016380&limit=4",
-			"&after=d016400&limit=1", "&sort=/n&after=980&limit=20", "&sort=/n&after=16400&limit=1", "&facet[/st]=s3", "&ge[/n]=50"} {
+			"&after=d016400&limit=1", "&sort=/n&after=980&limit=20", "&sort=/n&after=16400&limit=1", "&facet[/st]=s3"} {
 			cases = append(cases, c{"big", "facet[/k]=" + v + extra})
 		}
 	}
-	cases = append(cases, c{"big", "counts=/st&limit=1"}, c{"big", "ge[/n]=100&counts=/k"}, c{"big", "ge[/n]=100&sort=-/n&counts=/k"})
+	cases = append(cases, c{"big", "counts=/st&limit=1"}, c{"big", "sort=-/n&counts=/k"})
 	for _, cs := range cases {
 		v, err := url.ParseQuery(cs.q)
 		if err != nil {

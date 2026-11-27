@@ -128,7 +128,11 @@ func (w *v75x) put(ns, name string, doc map[string]any) {
 
 func (w *v75x) head(ns string) string {
 	w.t.Helper()
-	return must(w.admin.NSHead(context.Background(), ns)).ID
+	h, err := w.admin.NSHead(context.Background(), ns)
+	if ae, ok := client.AsAPIError(err); ok && client.IsPurged(err) {
+		return ae.Head() // all a purged namespace keeps (§5)
+	}
+	return must(h, err).ID
 }
 
 // reader is reader-01's grant for sub in groups, with the reader role,

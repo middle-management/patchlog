@@ -296,9 +296,15 @@ type Engine struct {
 	schemaScans atomic.Int64
 	cfgMu       sync.Mutex
 	cfgCache    map[int64]*Config
-	stmts       stmtCache
-	rc          readCache
-	bearers     grantCache
+	// trims counts the namespace purges this engine committed, which
+	// delete rows (trimPurgedNS): on SQLite a row's seq may be given again
+	// once the rows above it are gone, so a cache keyed by seq or res is
+	// flushed after such a commit, and a transaction that began before it
+	// caches nothing more (tx.trimGen, cacheable).
+	trims   atomic.Int64
+	stmts   stmtCache
+	rc      readCache
+	bearers grantCache
 	// liveReads shares long-poll reads of a namespace log among their
 	// waiters (live.go), and liveDone keeps their recent answers;
 	// liveJoins counts the reads asked of them, and liveShared those made.
@@ -646,7 +652,7 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.90"
+const SpecVersion = "0.91"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a
@@ -757,6 +763,11 @@ type tx struct {
 	// appended: what a CDN purge it sends is keyed on (repurge.go).
 	lastNS    int64
 	flushDocs bool
+	// trimmed marks a write that deleted a purged namespace's rows
+	// (trimPurgedNS), and trimGen is Engine.trims as the transaction
+	// began (cacheable).
+	trimmed bool
+	trimGen int64
 	// metaChanged marks a write that changes what reads may return beyond
 	// a namespace's log: its configuration, or a purge (readcache.go).
 	metaChanged bool
@@ -895,6 +906,7 @@ type docPut struct {
 // markServed has committed, so that the answer is read from a snapshot
 // taken after the mark (markServed).
 func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
+	defer func() { err = asUnavailable(err) }()
 	budget, _ := ctx.Value(readBudgetKey{}).(*writeMeter)
 	var spent rules.Meter
 	var charged map[*actor]bool
@@ -944,7 +956,9 @@ func (e *Engine) markServed(ctx context.Context, ns string) error {
 		return nil
 	}
 	err := e.update(context.WithoutCancel(ctx), func(t *tx) error {
-		t.nsByName(ns) // its lock, shared (pglock.go)
+		if n := t.nsByName(ns); n == nil || n.purged { // its lock, shared (pglock.go)
+			return nil // a purged namespace keeps nothing of it (§5)
+		}
 		_, err := t.Exec(`INSERT INTO filtered_served (ns) VALUES (?) ON CONFLICT (ns) DO NOTHING`, ns)
 		return err
 	})
@@ -967,7 +981,13 @@ func (e *Engine) read1(ctx context.Context, f func(t *tx) error) (err error) {
 	if h := e.onReadTx; h != nil {
 		h()
 	}
+	gen := e.trims.Load() // before the snapshot (cacheable)
 	sqlTx, err := e.db.BeginTx(ctx, opts)
+	if err == nil && testStorageFault != nil {
+		if err = testStorageFault(); err != nil {
+			sqlTx.Rollback()
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -978,7 +998,7 @@ func (e *Engine) read1(ctx context.Context, f func(t *tx) error) (err error) {
 		}
 		err = ctxErr(ctx, err)
 	}()
-	return f(&tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now()})
+	return f(&tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), trimGen: gen})
 }
 
 // ctxErr reports a failure after ctx ended as the context's error: database/sql
@@ -1004,6 +1024,7 @@ func panicErr(p any) error {
 // panic (t.must) rolls back and is returned as an error, so a failed write
 // never leaves its transaction, and the connection, open.
 func (e *Engine) update(ctx context.Context, f func(t *tx) error) (err error) {
+	defer func() { err = asUnavailable(err) }()
 	ctx, span := e.dbSpan(ctx, "core.db.update")
 	defer func() { endDBSpan(span, err) }()
 	rotate, err := e.update1(ctx, f)
@@ -1041,6 +1062,7 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 // locks of want (Postgres), and the log locks of logs at its first append.
 func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[int32]lockMode, logs map[int32]bool) (rotate []string, err error) {
 	var sqlTx *sql.Tx
+	gen := e.trims.Load() // before the snapshot (cacheable)
 	if c := e.commits; c != nil && committingGroup(ctx) && c.take() {
 		// A group commit's transaction, on a connection no check queues
 		// for (commitPool); on the main pool if none opens (the server's
@@ -1057,7 +1079,7 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 			return nil, err
 		}
 	}
-	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}, wake: map[string]map[string]bool{}}
+	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}, wake: map[string]map[string]bool{}, trimGen: gen}
 	committing := false
 	defer func() {
 		if p := recover(); p != nil {
@@ -1118,6 +1140,16 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 		return nil, err
 	}
 	e.removeFiles(t.dropFiles)
+	if t.trimmed {
+		// Rows are gone whose seqs and res SQLite may give again: what is
+		// cached by them goes, and no transaction older than this commit
+		// caches more (cacheable).
+		e.trims.Add(1)
+		e.cfgMu.Lock()
+		e.cfgCache = map[int64]*Config{}
+		e.cfgMu.Unlock()
+		e.deks.flush()
+	}
 	// Caches, CDN purges and live readers learn of a write only once it has
 	// committed.
 	e.invalidate(inv, false)
@@ -1404,11 +1436,19 @@ func (t *tx) config(seq int64) *Config {
 	if err != nil {
 		panic(fmt.Errorf("stored namespace document %d is invalid: %w", seq, err))
 	}
-	t.e.cfgMu.Lock()
-	t.e.cfgCache[seq] = c
-	t.e.cfgMu.Unlock()
+	if t.cacheable() {
+		t.e.cfgMu.Lock()
+		t.e.cfgCache[seq] = c
+		t.e.cfgMu.Unlock()
+	}
 	return c
 }
+
+// cacheable reports whether what t reads may be cached by seq or res
+// across transactions: no namespace purge has committed since t began, so
+// no row it reads is one a purge deleted whose seq a later row may take
+// (Engine.trims).
+func (t *tx) cacheable() bool { return t.trimGen == t.e.trims.Load() }
 
 func (t *tx) configID(seq int64) ids.ID {
 	var b []byte

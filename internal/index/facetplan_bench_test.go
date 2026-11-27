@@ -43,7 +43,6 @@ var benchShapes = []struct{ name, query string }{
 	{"facet+facet", "facet[/accountId]=acct-123&facet[/status]=open&limit=100"},
 	{"facet+schema", "facet[/accountId]=acct-123&schema=/r/schemas/item&limit=100"},
 	{"facet+text", "facet[/accountId]=acct-123&q=alpha&limit=100"},
-	{"range", "ge[/createdAt]=2026-12-29T00:00:00Z&limit=100"},
 	{"facet+counts", "facet[/accountId]=acct-123&counts=/status&counts=/tags&limit=100"},
 	{"ref", "ref=/r/accounts/acct-123&limit=100"},
 	{"listing", "limit=100"},

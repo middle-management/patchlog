@@ -9,7 +9,10 @@ import (
 )
 
 // The tailer (Postgres, Addendum D.8): how an instance learns of the
-// commits of every instance, its own included.
+// commits of every instance, its own included. A namespace purge deletes
+// the namespace's log, its purge-ns entry included (§5, §8.5, v0.91):
+// the namespace's row records the purging transaction instead
+// (purged_xid), read here as an entry that concerns the whole namespace.
 //
 // Every TailInterval it reads, in one REPEATABLE READ snapshot:
 //
@@ -103,7 +106,10 @@ func (e *Engine) tailPoll(ctx context.Context, s *tailState) error {
 			FROM ns_log l JOIN namespaces n ON n.ns = l.ns
 			LEFT JOIN resources r ON r.res = l.res
 			LEFT JOIN LATERAL jsonb_array_elements(CASE WHEN l.kind = `+batchKind+` THEN l.body::jsonb->'entries' END) e ON true
-			WHERE l.xid >= $1::text::xid8 AND l.xid < $2::text::xid8`,
+			WHERE l.xid >= $1::text::xid8 AND l.xid < $2::text::xid8
+			UNION ALL
+			SELECT n.name, true, NULL FROM namespaces n
+			WHERE n.purged_xid >= $1::text::xid8 AND n.purged_xid < $2::text::xid8`,
 			strconv.FormatUint(s.from, 10), xmin)
 		if err != nil {
 			return err

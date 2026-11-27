@@ -154,6 +154,11 @@ func (s *svc) caughtUp(ns string) string {
 	var head string
 	waitFor(s.t, "index of "+ns+" to catch up", func() bool {
 		h, err := s.core.NSHead(context.Background(), ns)
+		if ae, ok := client.AsAPIError(err); ok && client.IsPurged(err) {
+			// All a purged namespace keeps is its purge-ns id (§5).
+			head = ae.Head()
+			return s.ix.Checkpoint(ns) == head
+		}
 		if err != nil {
 			return false
 		}
@@ -330,16 +335,18 @@ func testTypedQueries(t *testing.T, noFTS bool) {
 	s.expect("/matches?facet[/tags]=local&facet[/status]=planned", "final")
 	s.expect("/matches?facet[/players/id]=p3", "cup")
 	s.expect("/matches?facet[/live]=true", "cup")
-	// Sort and ranges (numbers typed; strings as UTF-8 bytes, without
-	// date-time normalisation since v0.73, §A.2).
+	// Sort (numbers typed; strings as UTF-8 bytes, without date-time
+	// normalisation since v0.73, §A.2).
 	s.expect("/matches?sort=-/attendance", "final", "derby", "cup", "notes")
 	s.expect("/matches?sort=/kickoff&facet[/status]=planned", "final", "cup")
 	s.expect("/matches?sort=/kickoff", "derby", "final", "cup", "notes")
-	s.expect("/matches?gt[/attendance]=9000", "derby", "final")
-	s.expect("/matches?ge[/attendance]=9000&lt[/attendance]=42000", "cup")
-	s.expect("/matches?ge[/kickoff]=2026-10-05T11:30:00%2B02:00&sort=/kickoff", "cup")
-	s.expect("/matches?ge[/kickoff]=2026-10-05T09&sort=/kickoff", "final", "cup")
-	s.expect("/matches?lt[/kickoff]=2026-10-05T00:00:00Z", "derby")
+	// The range filters (gt, ge, lt, le) stay out of the spec (v0.91): a
+	// parameter the service doesn't define, 400 (§A.4 Canonical URLs).
+	for _, q := range []string{"gt[/attendance]=9000", "ge[/kickoff]=2026-10-05T09", "lt[/kickoff]=x", "le[/attendance]=1"} {
+		if r := s.answerOf("/matches?"+q, ""); r.status != 400 || r.body["code"] != "bad_input" {
+			t.Errorf("%s: %d %v, want 400", q, r.status, r.body)
+		}
+	}
 	// Schema: exact revision or all revisions (prefix).
 	s.expect("/matches?schema="+w.match, "cup", "derby")
 	s.expect("/matches?schema="+w.match2, "final")

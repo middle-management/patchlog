@@ -35,16 +35,16 @@ func (e *Engine) ResourceRaw(ctx context.Context, ns, name, id string, cred Cred
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		if n.purged {
+			return t.purgedRead(n) // before every check (§8.5)
+		}
 		a, err := t.reader(n, cred, name)
 		if err != nil {
 			return err
 		}
 		byDoc := t.readsByDoc(n, a)
-		if byDoc && (n.purged && !t.purgedReadable(a, n, name) || t.nsLevel(n) >= levelE2E) {
+		if byDoc && t.nsLevel(n) >= levelE2E {
 			return notFound() // judged with a null document (§6.4.1)
-		}
-		if n.purged {
-			return t.purgedRead(n)
 		}
 		out.Public = t.cachePublic(n)
 		if t.nsLevel(n) >= levelSealed {
@@ -75,18 +75,16 @@ func (e *Engine) ResourceRaw(ctx context.Context, ns, name, id string, cred Cred
 	if err != nil {
 		return nil, err
 	}
-	// …/rev/{id}/raw of a partial reader is served under its view; /raw
-	// names no revision and stays at its own URL (§7.9 Content).
-	content := "/rev/" + id + "/raw"
+	// A partial reader is answered in place (§7.9 Content, v0.91).
 	if id == "" {
 		h, err := e.ResourceHead(ctx, ns, name, cred)
 		if err != nil || h.State != Live {
 			out.Head = h
 			return out, err
 		}
-		out.Head, id, content = h, h.Head, ""
+		out.Head, id = h, h.Head
 	}
-	rev, err := e.resourceRev(ctx, ns, name, id, cred, content)
+	rev, err := e.ResourceRev(ctx, ns, name, id, cred)
 	if err != nil {
 		return nil, err
 	}

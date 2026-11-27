@@ -97,11 +97,6 @@ func TestV088PurgedResourceGoneToDocReader(t *testing.T) {
 	for _, p := range []string{"/r/matches/secret", "/r/matches/secret/rev/" + h, "/r/matches/secret/log", "/r/matches/secret/raw",
 		"/r/matches/secret/blob/" + bid, "/r/matches/secret/blob/" + bid + "/e/1", "/r/matches/secret/log?live=long-poll", "/r/matches/secret/events"} {
 		r := w.v87Get(p, li)
-		if r.Code == 302 && p != "/r/matches/secret" {
-			// A partial reader's immutable URL is served under its view
-			// (§7.9 Content), and answered there as its own form.
-			r = w.v87Follow(r, li)
-		}
 		if r.Code != 410 {
 			t.Errorf("GET %s by a /doc reader after the purge: %d %s, want 410 (§8.3, rules on /doc set aside)", p, r.Code, r.Body)
 		}

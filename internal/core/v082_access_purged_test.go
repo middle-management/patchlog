@@ -24,13 +24,12 @@ func v82accessPurgedHeads(w *v75World, vid, at string, cred Credentials) [3]int 
 	return out
 }
 
-// Conformance 124: covered matches is purged. li's grant in Authorization
-// at another subject set's /view/{view}/heads is 403, not 410, with or without
-// at; at her own it is 410. An unrestricted reader's grant is 403 at every
-// view, as at a live namespace's filtered URLs (§7.9 Partial reader),
-// where v0.27.0 answered 410; its 410 is at the unfiltered /heads. A
-// cookie is judged as its view's: 410 at its own, 403 at another, and a
-// /ns/matches cookie as that view's cookie would be.
+// Conformance 124, as v0.91 answers it: covered matches is purged, and
+// every request at its filtered /heads, with or without at, is 410
+// purged, whatever the grant or cookie, another subject set's view and no
+// credentials included (§8.5, §7.9 Purged namespaces; Filtered reads
+// scenario 17). Until v0.91 the URL's read check came first, its view
+// included, and answered 403 or 401 where it refused.
 func TestV082AccessPurgedFilteredHeadsReadCheck(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -61,16 +60,16 @@ func TestV082AccessPurgedFilteredHeadsReadCheck(t *testing.T) {
 		want int
 	}{
 		"li at her own vid":                         {liView, li, 410},
-		"li at another subject set":                 {boView, li, 403},
-		"bo at li's":                                {liView, bo, 403},
-		"an unrestricted grant at li's vid":         {liView, w.admin, 403},
-		"an unrestricted grant at another":          {boView, w.admin, 403},
+		"li at another subject set":                 {boView, li, 410},
+		"bo at li's":                                {liView, bo, 410},
+		"an unrestricted grant at li's vid":         {liView, w.admin, 410},
+		"an unrestricted grant at another":          {boView, w.admin, 410},
 		"li's cookie at her vid":                    {liView, liCookie, 410},
-		"li's cookie at another":                    {boView, liCookie, 403},
-		"a cookie for a vid nothing is kept for":    {boView, boCookie, 401},
+		"li's cookie at another":                    {boView, liCookie, 410},
+		"a cookie for a vid nothing is kept for":    {boView, boCookie, 410},
 		"a /ns/matches cookie at li's vid":          {liView, nsCookie, 410},
 		"a /ns/matches cookie at a vid without row": {boView, nsCookie, 410},
-		"no credentials":                            {liView, Credentials{}, 401},
+		"no credentials":                            {liView, Credentials{}, 410},
 	} {
 		if got := v82accessPurgedHeads(w, c.vid, red.At, c.cred); got != all(c.want) {
 			t.Errorf("%s: %v (without at, at an at, at an at not answered), want %d", name, got, c.want)

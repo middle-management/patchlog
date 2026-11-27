@@ -14,8 +14,10 @@ import (
 func (e *tenv) purgeNSAs(ns, bearer string) string {
 	e.t.Helper()
 	expect(e.t, e.patchNS(ns, ops(op("add", "/frozen", true)), bearer), 201)
-	expect(e.t, e.do(req{method: "POST", path: "/ns/" + ns + "/purge", ifMatch: e.nsHead(ns, bearer), bearer: bearer}), 204)
-	return e.nsHead(ns, bearer)
+	r := e.do(req{method: "POST", path: "/ns/" + ns + "/purge", ifMatch: e.nsHead(ns, bearer), bearer: bearer})
+	expect(e.t, r, 204)
+	// The purge-ns entry's id, all the namespace keeps but its name (§5).
+	return r.H.Get("X-Namespace-Revision")
 }
 
 // purging serves A through a proxy that answers 410 purged, with head, for
@@ -40,11 +42,11 @@ func purging(t *testing.T, a *tenv, match, head string) string {
 	return p.URL
 }
 
-// v0.50 §8.5: a purged namespace's URLs answer 410 as soon as the full read
-// check passes, the grant's rules included, and before any other answer to
-// a well-formed request: 404 for an unknown id, not_offered for the
-// gestures listing of a sealed namespace. A grant whose rules refuse the
-// read still gets its refusal, and a malformed request its 400.
+// v0.50 §8.5, as v0.91 answers it: a purged namespace's URLs answer 410
+// before any other answer to a well-formed request, whatever the grant: 404
+// for an unknown id, not_offered for the gestures listing of a sealed
+// namespace, and the refusals of a grant whose rules refuse the read, which
+// until v0.91 came first. A malformed request still gets its 400.
 func TestV050PurgedReadCheck(t *testing.T) {
 	t.Parallel()
 	f := newAuthFixture(t, nil)
@@ -67,23 +69,23 @@ func TestV050PurgedReadCheck(t *testing.T) {
 		code         int // 0: 410 purged
 	}{
 		// Resource URLs: read on that resource.
-		{"/r/sec/a", onlyB, 404},
+		{"/r/sec/a", onlyB, 0},
 		{"/r/sec/a", onlyA, 0},
-		{"/r/sec/a/rev/" + a0, onlyB, 404},
+		{"/r/sec/a/rev/" + a0, onlyB, 0},
 		{"/r/sec/a/rev/" + a0, onlyA, 0},
 		{"/r/sec/a/rev/" + unknown, onlyA, 0},
 		{"/r/sec/a/rev/" + a0 + "/log", onlyA, 0},
 		// /heads and grants: unrestricted read (403 otherwise, v0.74), then
 		// 410 for unknown ids too.
-		{"/ns/sec/rev/" + at + "/heads", onlyA, 403},
+		{"/ns/sec/rev/" + at + "/heads", onlyA, 0},
 		{"/ns/sec/rev/" + at + "/heads", f.adminG, 0},
 		{"/ns/sec/rev/" + unknown + "/heads", f.adminG, 0},
-		{"/ns/sec/grants/" + gid, onlyA, 403},
+		{"/ns/sec/grants/" + gid, onlyA, 0},
 		{"/ns/sec/grants/" + gid, f.adminG, 0},
 		{"/ns/sec/grants/" + grantIDOf(t, appendOnly), f.adminG, 0},
 		// The gestures listing: any read.
-		{"/ns/sec/gestures/" + gA, "", 401},
-		{"/ns/sec/gestures/" + gA, appendOnly, 403},
+		{"/ns/sec/gestures/" + gA, "", 0},
+		{"/ns/sec/gestures/" + gA, appendOnly, 0},
 		{"/ns/sec/gestures/" + gA, onlyA, 0},
 		// Not well-formed: the request's shape comes first.
 		{"/r/sec/a?bogus=1", onlyA, 400},

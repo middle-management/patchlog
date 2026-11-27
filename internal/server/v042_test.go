@@ -211,7 +211,7 @@ func TestV042Grants(t *testing.T) {
 		t.Fatalf("e2e grant %v %s", r.H, r.Body)
 	}
 
-	// Purged: 410 after the read check.
+	// Purged: 410 whatever the grant (v0.91; after the read check before).
 	a := newAuthFixture(t, nil)
 	ag := a.tenv
 	ag.create("sec", "a", map[string]any{}, a.issuerG)
@@ -220,7 +220,7 @@ func TestV042Grants(t *testing.T) {
 	expect(t, ag.patchNS("sec", ops(op("add", "/frozen", true)), a.adminG), 201)
 	expect(t, ag.do(req{method: "POST", path: "/ns/sec/purge", ifMatch: ag.nsHead("sec", a.adminG), bearer: a.adminG}), 204)
 	expectCode(t, ag.get("/ns/sec/grants/"+igid, a.adminG), 410, "purged")
-	expect(t, ag.get("/ns/sec/grants/"+igid), 401)
+	expectCode(t, ag.get("/ns/sec/grants/"+igid), 410, "purged")
 }
 
 // §C.4 (v0.42): a key past its until authorises nothing, judged against

@@ -43,11 +43,13 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -411,6 +413,16 @@ func (e *Engine) applyFollowed(ctx context.Context, k followKey, po PurgeOrigin,
 				return err
 			}
 		}
+		if en.Kind == "purge-ns" {
+			// Later import batches naming it are 410 (followedPurgeOf).
+			if err := e.update(ctx, func(t *tx) error {
+				_, err := t.Exec(`INSERT INTO purged_sources (origin, src_ns, head) VALUES (?,?,?) ON CONFLICT DO NOTHING`, k.origin, k.srcNS, en.ID)
+				t.must(err)
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
 		if done != nil {
 			if err := done(en.ID); err != nil {
 				return err
@@ -614,4 +626,39 @@ func (e *Engine) purgeFollowLoop(interval time.Duration) {
 			cancel()
 		}
 	}
+}
+
+// followedPurgeOf is the 410 of an import batch into n whose source, m,
+// names a namespace of another deployment whose purge-ns, or the 410
+// standing for it, this deployment has followed (§G.1, v0.91; FED-26):
+// "a later batch that counts and names that namespace in source is 410
+// (purged), as for a local one", so content purged there isn't created
+// again here from a bundle exported before. A batch counts as recordImport
+// would record it: an import batch (a bundle and an origin), the origin
+// trusted, a's principal one of its importers, and a's grant able to purge
+// at least one of the names the batch writes (mayPurgeAll). The purges
+// followed are kept by origin and source namespace, for the deployment
+// (purged_sources), whichever of its namespaces followed them. nil for
+// any other batch, which is recorded as asserted.
+func (t *tx) followedPurgeOf(m map[string]any, n *nsRow, a *actor, st []*itemState) *Error {
+	origin, _ := m["origin"].(string)
+	srcNS, _ := m["ns"].(string)
+	if _, imported := m["bundle"]; !imported || origin == "" || a == nil || len(st) == 0 {
+		return nil
+	}
+	po, trusted := t.e.opt.FollowPurges.Origins[origin]
+	if !trusted || !slices.Contains(po.Importers, a.id()) {
+		return nil
+	}
+	var head string
+	err := t.QueryRow(`SELECT head FROM purged_sources WHERE origin = ? AND src_ns = ?`, origin, srcNS).Scan(&head)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	t.must(err)
+	if len(t.mayPurgeAll(n, a, st)) == 0 {
+		return nil
+	}
+	return apiErr(410, "purged", "ns", srcNS, "head", head, "message",
+		"source.ns was purged at "+origin+", and this deployment has followed that purge (§G.1)")
 }

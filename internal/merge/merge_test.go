@@ -582,6 +582,8 @@ func testPurges(t *testing.T) {
 	must(p.Apply(ctx))
 	must(merge.Freeze(ctx, e.c, "r7", must(e.c.NSHead(ctx, "matches")).ID))
 	must(e.c.PurgeNamespace(ctx, "r7", must(e.c.NSHead(ctx, "r7")).ID))
-	p = e.plan("matches", "r7", merge.Options{})
-	wantClasses(t, p, map[string]merge.Class{"derby": merge.Purged, "cup": merge.Purged})
+	// Nothing of the purged branch is left to plan from (§5, §8.5, v0.91).
+	if _, err := merge.NewPlan(ctx, e.c, "matches", "r7", merge.Options{}); !client.IsPurged(err) {
+		t.Fatalf("a plan of a purged branch: %v, want its 410", err)
+	}
 }

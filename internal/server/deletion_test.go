@@ -176,14 +176,13 @@ func TestPurgeNamespace(t *testing.T) {
 	expect(t, e.do(req{method: "POST", path: "/ns/old/purge", author: "admin"}), 428)
 	expect(t, nspurge("old"), 204)
 
-	// Afterwards: every /r/old/... is 410; /ns/old and its log stay readable.
+	// Afterwards: every /r/old/... and /ns/old/... is 410, nothing of it
+	// left but its name and its purge-ns id (§5, v0.91).
 	expect(t, e.get("/r/old/a"), 410)
 	expect(t, e.get("/r/old/a/rev/"+a), 410)
 	expect(t, e.get("/r/old/nothing"), 410)
-	if k := lastOf(e.nsKinds("old")); k != "purge-ns" {
-		t.Fatalf("old log %v", e.nsKinds("old"))
-	}
-	expect(t, e.get("/ns/old/rev/"+e.nsHead("old")), 200)
+	expect(t, e.get("/ns/old"), 410)
+	expect(t, e.get("/ns/old/rev/"+e.nsHead("old")), 410)
 	// Writes are 410; the name stays reserved; no branches from it.
 	expect(t, e.write("PATCH", "old", "a", a, []any{}), 410)
 	expect(t, e.write("PATCH", "old", "z", "", addRoot(map[string]any{})), 410)

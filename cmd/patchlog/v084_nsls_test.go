@@ -43,7 +43,8 @@ func TestNSLs(t *testing.T) {
 	}
 	created := f.s.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	for n, want := range map[string]string{"a0": "live", "icy": "frozen", "old": "purged", "m-b": "live"} {
-		if r := rows[n]; r[0] != want || r[1] != created {
+		// A purged namespace's row has no created (§5, §7.4, v0.91).
+		if r := rows[n]; r[0] != want || r[1] != created && !(n == "old" && r[1] == "-") {
 			t.Errorf("%s: %v", n, r)
 		}
 	}

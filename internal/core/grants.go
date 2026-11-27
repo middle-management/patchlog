@@ -69,13 +69,13 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		if n.purged {
+			return t.purgedRead(n) // before every check (§8.5)
+		}
 		if _, err := t.nsReader(n, cred); err != nil {
 			return err
 		}
 		public := t.cachePublic(n)
-		if n.purged {
-			return t.purgedRead(n)
-		}
 		id, perr := ids.Parse(gid)
 		if perr != nil || !t.recordsGrant(n, id) {
 			return nfNS(public)

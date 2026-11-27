@@ -227,9 +227,11 @@ func TestV073SupersededNeedsTrustedBatch(t *testing.T) {
 	}
 }
 
-// §F.6 superseded (v0.65): a successor purged after the branch was frozen
-// still verifies, from its log, which the purge leaves readable (§8.5). One
-// purged before the freeze doesn't.
+// §F.6 superseded (v0.65, v0.91): a successor purged after the branch was
+// frozen still verifies, from what the janitor read of it while it was
+// live, after the freeze: the purge leaves nothing of it to read (§5,
+// §8.5). One purged before the freeze, which the janitor never read live
+// after it, doesn't.
 func TestV073SupersededBySuccessorPurgedLater(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, nil)
@@ -243,8 +245,14 @@ func TestV073SupersededBySuccessorPurgedLater(t *testing.T) {
 		must(e.c.PurgeNamespace(ctx, ns, must(e.c.NSHead(ctx, ns)).ID))
 	}
 
-	// r7: switched to r7-b, which is purged a minute later.
+	// r7: switched to r7-b, which the janitor reads within the cleanup
+	// period, and which is purged a minute later.
 	must(merge.Rebase(ctx, e.c, merge.RebaseOptions{Branch: "r7", New: "r7-b", Switch: true}))
+	e.s.Clock.Advance(time.Minute)
+	j := janitor.New(e.c, janitor.Options{Now: e.s.Now})
+	if d := must(j.Check(ctx, "matches", "r7")); d.Action != janitor.ActionKeep || d.Claim != "superseded" {
+		t.Fatalf("r7 within its cleanup period: %+v", d)
+	}
 	e.s.Clock.Advance(time.Minute)
 	purge("r7-b")
 	// r8: replayed into r8-b and named its successor, which is purged a
@@ -256,16 +264,16 @@ func TestV073SupersededBySuccessorPurgedLater(t *testing.T) {
 	e.config("r8", op("add", "/frozen", true))
 
 	e.s.Clock.Advance(2 * day)
-	ds := e.sweep(false)
-	if d := ds["r7"]; d.Action != janitor.ActionPurged || d.Claim != "superseded" {
+	if d := must(j.Check(ctx, "matches", "r7")); d.Action != janitor.ActionPurged || d.Claim != "superseded" {
 		t.Fatalf("r7 %+v", d)
 	}
-	wantKeep(t, ds["r8"], "superseded claim not verified: successor r8-b was purged at ")
-	wantKeep(t, ds["r8"], "before the branch was frozen")
+	wantKeep(t, must(j.Check(ctx, "matches", "r8")), "superseded claim not verified: successor r8-b is purged")
+	wantKeep(t, must(j.Check(ctx, "matches", "r8")), "verify by hand")
 }
 
-// §F.6 superseded, §8.5: a sealed successor's purge makes its log 410, so
-// the branch can't be verified as superseded and is left for a manual purge.
+// §F.6 superseded, §8.5: a successor's purge, sealed here, leaves nothing of
+// it to read, so a branch whose successor the janitor never read live can't
+// be verified as superseded and is left for a manual purge.
 func TestV073SealedSuccessorPurgedVerifiedByHand(t *testing.T) {
 	t.Parallel()
 	ks := must(keystore.New(keystore.Generate()))
@@ -282,7 +290,7 @@ func TestV073SealedSuccessorPurgedVerifiedByHand(t *testing.T) {
 	e.config("r7-b", op("add", "/frozen", true))
 	must(c.PurgeNamespace(ctx, "r7-b", must(c.NSHead(ctx, "r7-b")).ID))
 	s.Clock.Advance(2 * day)
-	wantKeep(t, e.sweep(false)["r7"], "sealed successor purged: verify by hand")
+	wantKeep(t, e.sweep(false)["r7"], "successor purged: verify by hand")
 }
 
 // §F.6 closing rule (v0.67), a security fix: in the merged and superseded
@@ -431,6 +439,6 @@ func TestV073PurgedSuccessorStarKeyGrant(t *testing.T) {
 		patchConfig(t, a.admin, ns, op("add", "/frozen", true))
 		must(a.admin.PurgeNamespace(ctx, ns, must(a.admin.NSHead(ctx, ns)).ID))
 	}
-	wantKeep(t, a.check(t, "matches", "r7", 2*day), "can't be read since r7-b was purged (§8.5), and the janitor didn't read it before the purge, so its key can't be checked: verify by hand")
-	wantKeep(t, a.check(t, "matches", "r9", 2*day), "can't be read since r9-b was purged (§8.5), and the janitor didn't read it before the purge, so its key can't be checked: verify by hand")
+	wantKeep(t, a.check(t, "matches", "r7", 2*day), "and the janitor didn't read it before the purge")
+	wantKeep(t, a.check(t, "matches", "r9", 2*day), "and the janitor didn't read it before the purge")
 }

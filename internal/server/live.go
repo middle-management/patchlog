@@ -482,12 +482,6 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 			sseEntry(w, e["kind"].(string), lg, i)
 			since = e["id"].(string)
 		}
-		if lg.Purged && !lg.More {
-			// The namespace is purged and its purge-ns entry, the log's
-			// last, is sent: the stream ends (§7.3, §8.5). A stream from
-			// that entry was 410 purged before it started.
-			return
-		}
 		keepAlive := false
 		if !lg.More {
 			select {

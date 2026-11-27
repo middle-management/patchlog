@@ -176,6 +176,11 @@ func (t *tx) pageNamespaces(after, prefix string, limit int) *NamespacesPage {
 	}
 	docs := t.listedDocs(seqs)
 	for _, r := range page {
+		if r.purged {
+			// Only what a purged namespace keeps (§5, §7.4, v0.91).
+			out.Items = append(out.Items, map[string]any{"name": r.name, "frozen": true, "purged": true})
+			continue
+		}
 		d := docs[r.cfg.Int64]
 		m := map[string]any{"name": r.name, "frozen": d.frozen, "purged": r.purged}
 		if r.created.Valid {

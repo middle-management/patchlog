@@ -176,11 +176,11 @@ func TestV082AccessNowRoleReadsNothing(t *testing.T) {
 	}
 }
 
-// §C.2 item 5, §8.5 (ACC-2): the /now refusal is the read check's own
-// answer, so it comes before a purged namespace's 410: 404 at a resource's
-// URLs and 403 elsewhere, POST /keys and the filtered URLs included, where
-// a grant that passes the read check gets the 410. GET /ns/{ns}/principal
-// evaluates no rule.
+// §C.2 item 5, §8.5 (ACC-2), as v0.91 answers it: a purged namespace's
+// 410 comes before every read check, so a grant with a rule on /now gets
+// it too, at a resource's URLs, /heads, the gestures listing, POST /keys,
+// /principal and the filtered URLs, where until v0.91 the /now refusal
+// (404 or 403) came first.
 func TestV082AccessNowBeforePurged(t *testing.T) {
 	t.Parallel()
 	w := newV75s(t, v75sOpts{})
@@ -213,18 +213,17 @@ func TestV082AccessNowBeforePurged(t *testing.T) {
 			t.Errorf("%s for a reader: %d %s, want %d", c.path, r.Code, r.Body, c.good)
 		}
 		for name, g := range map[string]string{"a block rule on /now": now, "a block rule on the envelope": env, "an unrestricted reader's /now rule": nowAdmin} {
-			r := w.get(c.path, g)
-			if r.Code != c.grant || strings.Contains(r.String(), "purged") || strings.Contains(r.String(), head) {
-				t.Errorf("%s with %s: %d %s, want %d before the 410", c.path, name, r.Code, r.Body, c.grant)
+			if r := w.get(c.path, g); r.Code != 410 || r.Str("head") != head {
+				t.Errorf("%s with %s: %d %s, want 410 (v0.91)", c.path, name, r.Code, r.Body)
 			}
 		}
 	}
 	for name, g := range map[string]string{"a block rule on /now": now, "an unrestricted reader's /now rule": nowAdmin} {
-		if r := w.do(req{method: "POST", path: "/ns/matches/keys", body: map[string]any{}, bearer: g}); r.Code != 403 {
-			t.Errorf("POST /keys with %s: %d %s, want 403", name, r.Code, r.Body)
+		if r := w.do(req{method: "POST", path: "/ns/matches/keys", body: map[string]any{}, bearer: g}); r.Code != 410 {
+			t.Errorf("POST /keys with %s: %d %s, want 410", name, r.Code, r.Body)
 		}
-		if r := w.get("/ns/matches/principal", g); r.Code == 403 || r.Code == 404 {
-			t.Errorf("/principal with %s: %d %s: it evaluates no rule", name, r.Code, r.Body)
+		if r := w.get("/ns/matches/principal", g); r.Code != 410 {
+			t.Errorf("/principal with %s: %d %s, want 410", name, r.Code, r.Body)
 		}
 	}
 }
@@ -240,11 +239,10 @@ func v82accessPurge(t *testing.T, w *v75s) string {
 	return w.nsHead("matches", w.admin)
 }
 
-// Conformance 124, second half, over HTTP (ACC-8b): covered matches is
-// purged. li's grant at another subject set's /view/{view}/heads is 403, not
-// 410; at her own, 410. An unrestricted reader's grant is 403 at the
-// filtered URLs, as at a live namespace's, and 410 at the unfiltered
-// /heads. None of the 403s shows the purge.
+// Conformance 124, second half, over HTTP (ACC-8b), as v0.91 answers it
+// (Filtered reads scenario 17): covered matches is purged, and every
+// request at its filtered /heads is 410, at her own view or another's,
+// unrestricted or not, without credentials too.
 func TestV082AccessPurgedFilteredHeads(t *testing.T) {
 	t.Parallel()
 	w := newV75s(t, v75sOpts{})
@@ -261,11 +259,12 @@ func TestV082AccessPurgedFilteredHeads(t *testing.T) {
 		want             int
 	}{
 		{"li at her own vid", li, liView, 410},
-		{"li at another subject set's", li, boView, 403},
-		{"bo at li's", bo, liView, 403},
-		{"an unrestricted reader at li's vid", w.admin, liView, 403},
-		{"an unrestricted reader at bo's vid", w.admin, boView, 403},
-		{"no credentials", "", liView, 401},
+		// Whatever the grant (v0.91): none of these was 410 before.
+		{"li at another subject set's", li, boView, 410},
+		{"bo at li's", bo, liView, 410},
+		{"an unrestricted reader at li's vid", w.admin, liView, 410},
+		{"an unrestricted reader at bo's vid", w.admin, boView, 410},
+		{"no credentials", "", liView, 410},
 	} {
 		for _, path := range []string{"/ns/matches/view/" + c.vid + "/heads", "/ns/matches/view/" + c.vid + "/at/" + at + "/heads"} {
 			r := w.get(path, c.bearer)

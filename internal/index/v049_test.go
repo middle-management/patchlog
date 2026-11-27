@@ -13,8 +13,9 @@ import (
 )
 
 // TestPurgedAfterReadCheck (§8.5, §12): a purged namespace answers 410
-// purged with head, its purge-ns entry, after the read check, as the
-// core's URLs of it do.
+// purged with head, its purge-ns entry, as the core's URLs of it do; since
+// v0.91 whatever the grant, before any read check (the name stays from
+// when it came after it).
 func TestPurgedAfterReadCheck(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -34,9 +35,10 @@ func TestPurgedAfterReadCheck(t *testing.T) {
 	must(root.PatchConfig(ctx, "sec", must(root.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
 	purged := must(root.PurgeNamespace(ctx, "sec", must(root.NSHead(ctx, "sec")).ID))
 	waitFor(t, "the purge", func() bool { return x.ix.Checkpoint("sec") == purged })
+	// Whatever the grant (v0.91): 401 and 403 until then.
 	for tok, want := range map[string]int{
-		"": 401, "garbage": 401,
-		issuer.Grant(t, s.Now(), "user:bob", []string{"other"}, []string{"read"}): 403,
+		"": 410, "garbage": 410,
+		issuer.Grant(t, s.Now(), "user:bob", []string{"other"}, []string{"read"}): 410,
 	} {
 		if r := x.raw("/sec?q=x", tok); r.status != want {
 			t.Errorf("token %.10q: %d %v, want %d", tok, r.status, r.body, want)

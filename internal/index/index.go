@@ -924,6 +924,12 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO ns_state (ns, purged) VALUES (?, 1) ON CONFLICT (ns) DO UPDATE SET purged = 1`, b.NS); err != nil {
 			return err
 		}
+		// Keeping only that it is purged (§A.4, v0.91): the ids of its log
+		// the index saw go with its rows, but the checkpoint at its
+		// purge-ns id.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM seen WHERE ns = ? AND ns_id <> ?`, b.NS, b.NewCheckpoint); err != nil {
+			return err
+		}
 	}
 	// §A.1, §A.4: a purge, of a resource or of the namespace, purges
 	// idx:{ns}, which every result of the namespace carries: results page

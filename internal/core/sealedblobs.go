@@ -272,20 +272,20 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		if n.purged {
+			return t.purgedRead(n) // before every check (§8.5)
+		}
 		a, aerr := t.reader(n, cred, name)
 		if aerr != nil {
 			return aerr
 		}
 		byDoc := t.readsByDoc(n, a)
 		if byDoc && !t.sealedBlobReadable(a, n, name) {
-			// A purged namespace or resource is judged with its rules on
-			// /doc set aside (§8.3, §8.5); a sealed one's content by the
-			// revisions of the epoch asked, below (v0.89); any other with
-			// a null document (§6.4.1).
+			// A purged resource is judged with its rules on /doc set
+			// aside (§8.3); a sealed one's content by the revisions of the
+			// epoch asked, below (v0.89); any other with a null document
+			// (§6.4.1).
 			return notFound()
-		}
-		if n.purged {
-			return t.purgedRead(n)
 		}
 		out = &Blob{Public: t.cachePublic(n)}
 		bid, perr := ids.Parse(bidText)

@@ -419,6 +419,13 @@ func (e *tenv) configID(ns string, bearer ...string) string {
 func (e *tenv) nsHead(ns string, bearer ...string) string {
 	e.t.Helper()
 	r := e.get("/ns/"+ns, bearer...)
+	if r.Code == 410 {
+		// A purged namespace keeps only its purge-ns entry's id, which
+		// its 410 names as head (§5, §8.5, v0.91).
+		if h, _ := r.Obj()["head"].(string); h != "" {
+			return h
+		}
+	}
 	expect(e.t, r, 302)
 	return strings.Trim(r.H.Get("ETag"), `"`)
 }

@@ -28,6 +28,11 @@ func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
 			return t.authorize(a, "config", "")
 		}
 	}
+	if n.purged {
+		// Nothing is left to judge a grant with (§8.5): the 412 of its
+		// reserved name, which is no secret (§E.4).
+		return nil
+	}
 	cfg := t.config(n.configSeq)
 	a, err := t.authenticate(n.name, n, cfg, req.Cred, nil)
 	if err != nil {
@@ -141,6 +146,11 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if base == nil {
 		return nil, t.absentNS(req.NS, req.Cred)
 	}
+	if base.purged {
+		// Branching from it is a write to it: 410 before every check
+		// (§6.2, §8.5).
+		return nil, t.purgedNS(base)
+	}
 	bcfg := t.config(base.configSeq)
 	a, aerr := t.authenticate(base.name, base, bcfg, req.Cred, nil)
 	if aerr != nil {
@@ -167,11 +177,6 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	}
 	if err := t.rateLimit(base, bcfg, a, nil, 1); err != nil {
 		return nil, err
-	}
-	// 410 after authorisation and the rate limits, like every write to a
-	// purged namespace (§6.2, §8.5).
-	if base.purged {
-		return nil, t.purgedNS(base)
 	}
 	// Step 2: the precondition. A branch requires If-None-Match: * (§7.6);
 	// 428 comes after authorisation (§6.2).

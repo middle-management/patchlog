@@ -378,3 +378,45 @@ func TestPurgesFollowOnlyNamedImporters(t *testing.T) {
 		t.Fatalf("purge entries %+v", es)
 	}
 }
+
+// v0.91 §G.1 (CONFORMANCE Federation scenario 43): once the deployment has
+// applied an origin's purge-ns, or the 410 standing for it, a later import
+// batch that counts and names that namespace in its source is 410 purged,
+// so a bundle exported before the purge doesn't create its content again
+// here, in any namespace. A batch that doesn't count, by another principal,
+// is recorded as asserted.
+func TestPurgesFollowRefusesReimport(t *testing.T) {
+	src := newDeployment(t, stagingOrigin)
+	src.ns("matches", nil)
+	src.create("matches", "derby", map[string]any{"title": "Derby"})
+	at := must(src.c.NSHead(ctx, "matches")).ID
+	b := exportBundle(t, src, bundle.ExportOptions{Select: []string{"matches"}})
+	dst := follower(t, &tagPurger{}, src)
+	importB(t, dst, b, bundle.ImportOptions{})
+	src.purgeNS("matches")
+	dst.follow()
+	if st := dst.status("matches", "derby"); st != 410 {
+		t.Fatalf("derby after the origin's purge-ns: %d, want 410", st)
+	}
+	dst.ns("copy", nil)
+	batch := func(c *client.Client, ns, name string) error {
+		_, err := c.Batch(ctx, ns, client.BatchRequest{
+			Items:  []client.BatchItem{{Resource: name, IfNoneMatch: true, Steps: []client.Step{{Patches: ops(op("add", "", map[string]any{"title": "Derby"}))}}}},
+			Source: map[string]any{"origin": stagingOrigin, "ns": "matches", "at": at, "bundle": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		}, false)
+		return err
+	}
+	for _, ns := range []string{"matches", "copy"} {
+		err := batch(dst.c, ns, "derby-again")
+		ae, _ := client.AsAPIError(err)
+		if !client.IsPurged(err) || ae.Body["ns"] != "matches" {
+			t.Fatalf("an import naming the purged origin namespace, into %s: %v, want 410 purged naming matches", ns, err)
+		}
+	}
+	// Bob isn't the origin's importer: his batch doesn't count, and is
+	// recorded as asserted.
+	bob := dst.c.With(client.WithAuthor("bob"))
+	if err := batch(bob, "copy", "bobs"); err != nil {
+		t.Fatalf("a batch that doesn't count: %v", err)
+	}
+}

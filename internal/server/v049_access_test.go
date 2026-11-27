@@ -188,10 +188,10 @@ func TestV049EdgeGrantsAuthDisabled(t *testing.T) {
 	expectCode(t, e.do(req{method: "DELETE", path: "/edge-grants"}), 400, "bad_input")
 }
 
-// v0.49 §C.5: issuance answers all or nothing, and decides a purged
-// namespace last: 401 if any namespace would be 401, else 403 if any would
-// be 403, and 410 purged only when every one refused is purged and the
-// grant verifies and may read there. v0.50 §C.5, §12: the 410 names in ns
+// v0.49 §C.5: issuance answers all or nothing: 401 if any namespace would
+// be 401, else 403 if any would be 403, and 410 purged only when every one
+// refused is purged; since v0.91 whether or not the grant would verify or
+// read there, as nothing is left to judge it with (Access scenario 63). v0.50 §C.5, §12: the 410 names in ns
 // and head the first refused namespace in the grant's root block.
 func TestV049EdgeGrantsPurged(t *testing.T) {
 	t.Parallel()
@@ -221,11 +221,12 @@ func TestV049EdgeGrantsPurged(t *testing.T) {
 		{"both purged, other order", e.grant(f.issuer, "user:bob", []string{"p2", "p1"}, read), 410, "p2"},
 		{"one issues", e.grant(f.issuer, "user:bob", []string{"p1", "sec"}, read), 410, "p1"},
 		{"one issues first", e.grant(f.issuer, "user:bob", []string{"sec", "p2"}, read), 410, "p2"},
-		{"no read", e.grant(f.issuer, "user:bob", []string{"p1"}, []string{"append"}), 403, ""},
-		{"a rule on /now", e.grant(f.issuer, "user:bob", []string{"p1"}, read, now), 403, ""},
+		// Whatever the grant, as no key is left to judge it with (v0.91).
+		{"no read", e.grant(f.issuer, "user:bob", []string{"p1"}, []string{"append"}), 410, "p1"},
+		{"a rule on /now", e.grant(f.issuer, "user:bob", []string{"p1"}, read, now), 410, "p1"},
 		{"another refuses", e.grant(f.issuer, "user:bob", []string{"p1", "sec2"}, []string{"append"}), 403, ""},
 		{"one missing", e.grant(f.issuer, "user:bob", []string{"p1", "nope"}, read), 401, ""},
-		{"doesn't verify", e.grant(newKey("issuer"), "user:bob", []string{"p1"}, read), 401, ""},
+		{"doesn't verify", e.grant(newKey("issuer"), "user:bob", []string{"p1"}, read), 410, "p1"},
 	} {
 		r := e.do(req{method: "POST", path: "/edge-grants", bearer: c.g})
 		if r.Code != c.status || c.status == 410 && (r.Str("code") != "purged" || r.Str("ns") != c.ns || r.Str("head") != heads[c.ns]) {

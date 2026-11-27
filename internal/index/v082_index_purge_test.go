@@ -25,9 +25,11 @@ import (
 // and the status of a read under it then: change, if set, is a patch of
 // the namespace's document that ends it.
 func v82Hows(change map[string]any) map[string]int {
-	hows := map[string]int{"holds": 410, "no row": 403, "no entry": 403}
+	// 410 whatever the cookie (v0.91): the index keeps only that the
+	// namespace is purged, nothing to judge a cookie against.
+	hows := map[string]int{"holds": 410, "no row": 410, "no entry": 410}
 	if change != nil {
-		hows["key changed"] = 403
+		hows["key changed"] = 410
 	}
 	return hows
 }
@@ -49,10 +51,11 @@ func v82Plant(t *testing.T, x *svc, how string) {
 }
 
 // TestV082EndedCookiePurged: cookies of reads:docs (whole) and of
-// reads:docs:scope:{digest} (scope), whose namespace's document the core
-// still serves once it is purged: each is judged by it as before the
-// purge. An anonymous request, and a grant by a key docs never had, are
-// 401 throughout.
+// reads:docs:scope:{digest} (scope): since v0.91 every one is 410 once docs
+// is purged, whatever its records say, and so are an anonymous request and
+// a grant by a key docs never had, the index keeping nothing to judge them
+// with (§A.4 Unavailable namespaces). Until then each was judged by the
+// document the core still served.
 func TestV082EndedCookiePurged(t *testing.T) {
 	t.Parallel()
 	stranger := clienttest.NewKey("stranger")
@@ -79,10 +82,10 @@ func TestV082EndedCookiePurged(t *testing.T) {
 				head := must(purger.PurgeNamespace(ctx, "docs", must(d.w.NSHead(ctx, "docs")).ID))
 				d.x.caughtUp("docs")
 				d.x.ix.ExpireGrantChecks()
-				if anon, _ := p37Follow(t, d.x, paths[0], nil, ""); anon.status != 401 {
+				if anon, _ := p37Follow(t, d.x, paths[0], nil, ""); anon.status != 410 {
 					t.Errorf("an anonymous request: %d %v", anon.status, anon.body)
 				}
-				if r := p37Do(t, d.x, "GET", "/docs?q=word", stranger.Grant(t, d.s.Now(), "user:x", []string{"docs"}, []string{"read"}), "", nil, ""); r.status != 401 {
+				if r := p37Do(t, d.x, "GET", "/docs?q=word", stranger.Grant(t, d.s.Now(), "user:x", []string{"docs"}, []string{"read"}), "", nil, ""); r.status != 410 {
 					t.Errorf("a grant by an unknown key: %d %v", r.status, r.body)
 				}
 				got, _ := p37Follow(t, d.x, paths[0], cookies, "")

@@ -833,6 +833,9 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		if n.purged {
+			return t.purgedNS(n) // before every check (§8.5)
+		}
 		cfg := t.config(n.configSeq)
 		// Refused as /principal is, in a public namespace too (§7): 401
 		// without a usable grant, 403 for one that doesn't name the
@@ -855,11 +858,6 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			if _, refused := t.keysReadScope(a); refused {
 				return forbidden("the grant's rules refuse every read in " + ns)
 			}
-			// 410 once the read check passes, as every URL of a
-			// purged namespace (§8.5).
-			if n.purged {
-				return t.purgedNS(n)
-			}
 			keys, err := t.keysE2E(n, cfg, a, kr)
 			if err != nil {
 				return err
@@ -867,14 +865,11 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			ans = &KeysAnswer{Keys: keys, Epoch: cfg.Epoch, Level: levelNames[cfg.level], Pad: cfg.Pad}
 			return nil
 		}
-		// §E.2.3's test is part of the read check, so it comes before a
-		// purged namespace's 410 and not_offered (§8.5).
+		// §E.2.3's test is part of the read check, so it comes before
+		// not_offered.
 		names, perResource, view, serr := t.keysScope(n, a, kr)
 		if serr != nil {
 			return serr
-		}
-		if n.purged {
-			return t.purgedNS(n)
 		}
 		if cfg.level != levelSealed {
 			return apiErr(404, "not_offered", "message", "the namespace is not sealed: there are no keys, and nothing to seal (§E.2.3)")

@@ -41,7 +41,8 @@ func TestReviewGateOrderNS(t *testing.T) {
 		expectCode(t, e.do(q), 401, "unauthenticated")
 	}
 
-	// A valid grant without the verb: 403, before a purged namespace's 410.
+	// A valid grant without the verb: 410 too, before every check (v0.91;
+	// 403 before then).
 	expect(t, e.patchNS("sec", ops(op("add", "/frozen", true)), f.adminG), 201)
 	expect(t, e.do(req{method: "POST", path: "/ns/sec/purge", ifMatch: e.nsHead("sec", f.adminG), bearer: f.adminG}), 204)
 	reader := e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read"})
@@ -57,17 +58,7 @@ func TestReviewGateOrderNS(t *testing.T) {
 	}
 	for _, q := range purged {
 		q.bearer = reader
-		r := e.do(q)
-		expect(t, r, 403)
-		if q.path == "/ns/sec/batch" {
-			// A batch reports its failing items under code "batch" (§7.5).
-			items, _ := r.Obj()["items"].([]any)
-			if len(items) != 1 || items[0].(map[string]any)["code"] != "forbidden" {
-				t.Fatalf("batch report %s", r.Body)
-			}
-		} else if r.Str("code") != "forbidden" {
-			t.Fatalf("%s %s: %s", q.method, q.path, r.Body)
-		}
+		expectCode(t, e.do(q), 410, "purged")
 	}
 	// An authorising grant reaches the 410 "purged" of every write to a
 	// purged namespace (§8.5).

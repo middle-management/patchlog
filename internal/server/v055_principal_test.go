@@ -238,10 +238,14 @@ func TestV055PrincipalWriterSettings(t *testing.T) {
 		t.Fatalf("old %v", w)
 	}
 
-	// Purged: 410 purged with head once the grant verifies, never cached.
+	// Purged: 410 purged with head whatever the grant, never cached
+	// (v0.91; once the grant verified until then).
 	e.mkNS("p", doc(map[string]any{"frozen": true}))
 	expect(t, e.do(req{method: "POST", path: "/ns/p/purge", ifMatch: e.nsHead("p", g("p")), bearer: g("p")}), 204)
-	expectCode(t, e.principalOf("p", ""), 401, "unauthenticated")
+	expectCode(t, e.principalOf("p", ""), 410, "purged")
+	if cc := e.principalOf("p", "").H.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("Cache-Control %q", cc)
+	}
 	r := e.principalOf("p", e.grant(k, "user:z", []string{"p"}, []string{"append"}))
 	expectCode(t, r, 410, "purged")
 	if r.Str("head") == "" {

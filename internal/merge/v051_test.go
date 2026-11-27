@@ -12,9 +12,8 @@ import (
 )
 
 // A listed branch that is purged is a "purged" conflict (§F.9 Merging),
-// sealed or not: a sealed branch's document and log are 410 purged once
-// it is purged (§8.5), and that 410 is how the planner learns of it,
-// where at rest only the branch's document still reads.
+// sealed or not: a branch's document and log are 410 purged once it is
+// purged (§8.5, v0.91), and that 410 is how the planner learns of it.
 func TestReleaseSealedPurged(t *testing.T) {
 	t.Parallel()
 	for _, level := range []string{"at-rest", "sealed"} {
@@ -36,8 +35,9 @@ func TestReleaseSealedPurged(t *testing.T) {
 			must(release.Write(ctx, c, ref, "", &release.Doc{Name: "r1", Branches: map[string]release.Branch{"matches": {NS: "matches-r1"}}}))
 
 			must(c.PatchConfig(ctx, "matches-r1", must(c.NSHead(ctx, "matches-r1")).Config, []any{op("add", "/frozen", true)}))
-			must(c.PurgeNamespace(ctx, "matches-r1", must(c.NSHead(ctx, "matches-r1")).ID))
-			if _, err := c.NSDoc(ctx, "matches-r1", must(c.NSHead(ctx, "matches-r1")).ID); client.IsPurged(err) != (level == "sealed") {
+			id := must(c.PurgeNamespace(ctx, "matches-r1", must(c.NSHead(ctx, "matches-r1")).ID))
+			// At rest too since v0.91: nothing of it is left (§5, §8.5).
+			if _, err := c.NSDoc(ctx, "matches-r1", id); !client.IsPurged(err) {
 				t.Fatalf("the purged branch's document: %v", err)
 			}
 
@@ -45,16 +45,12 @@ func TestReleaseSealedPurged(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// At rest, the purge's freeze is reported too.
 			purged := false
 			for _, x := range rp.Conflicts {
 				purged = purged || x.Kind == merge.RCPurged && x.NS == "matches-r1"
 			}
 			if !purged {
 				t.Fatalf("conflicts %+v, want matches-r1 purged", rp.Conflicts)
-			}
-			if level != "sealed" {
-				return
 			}
 			// Merges and rebases of it have no log to classify.
 			if _, err := merge.NewPlan(ctx, c, "matches", "matches-r1", merge.Options{}); !client.IsPurged(err) {

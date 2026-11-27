@@ -75,12 +75,12 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		if n.purged {
+			return t.purgedRead(n) // before every check (§8.5)
+		}
 		a, err := t.anyReader(n, cred)
 		if err != nil {
 			return err
-		}
-		if n.purged {
-			return t.purgedNS(n)
 		}
 		if t.nsLevel(n) >= levelSealed {
 			return apiErr(404, "not_offered", "message", "gestures aren't listed in sealed or end-to-end namespaces: their logs carry them (§7.4)")

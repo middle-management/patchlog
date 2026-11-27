@@ -11,9 +11,7 @@ import (
 
 // §7.4, §8.5 (RH-19): a purged namespace's /branches is 410. A Check of a
 // purged branch whose claim verifies reports it already purged instead of
-// failing on its dependents' listing, and a successor whose base is purged
-// doesn't verify, with that as the reason, instead of failing on the
-// base's listing.
+// failing on its dependents' listing, also once its base is purged.
 func TestV073JanitorPurgedBranchListings(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, nil)
@@ -41,10 +39,12 @@ func TestV073JanitorPurgedBranchListings(t *testing.T) {
 		t.Fatalf("decision %+v, want keep, already purged", d)
 	}
 
+	// Its base purged too: still already purged, nothing of either being
+	// left to check (§5, v0.91).
 	purge("matches")
 	d, err = j.Check(ctx, "matches", "r7")
 	if err != nil {
 		t.Fatalf("Check with the successor's base purged: %v", err)
 	}
-	wantKeep(t, d, "superseded claim not verified: the successor's base matches is purged")
+	wantKeep(t, d, "already purged")
 }

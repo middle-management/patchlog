@@ -175,6 +175,12 @@ func (e *Engine) recordFilteredView(ctx context.Context, r *viewRecord) error {
 		t.noLock++
 		n := t.nsByName(r.ns)
 		t.noLock--
+		if n != nil && n.purged {
+			// Purged since the exchange read it (§8.5).
+			pe := t.purgedNS(n)
+			pe.Body["ns"] = n.name
+			return pe
+		}
 		shares := t.viewShares(n, r)
 		// The latest second at or before r.exp that is free, or whose
 		// row this exchange can share. Another instance may take a free

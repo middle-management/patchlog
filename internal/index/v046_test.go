@@ -71,7 +71,6 @@ func TestSortFacetArrayAndFields(t *testing.T) {
 	// Both kinds from one array.
 	x.expect("/items?facet[/rank]=2", "a")
 	x.expect("/items?sort=-/rank", "c", "a", "b")
-	x.expect("/items?ge[/rank]=2&sort=/rank", "a", "c")
 	x.expect("/items?q=second", "b")
 
 	// Hits carry facet and sort values; text only when asked for.

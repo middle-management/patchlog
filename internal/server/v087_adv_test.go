@@ -161,7 +161,7 @@ func TestV087HiddenSchemaUnavailable(t *testing.T) {
 	writer := w.grant(w.k, "user:w", []string{"matches"}, []string{"read", "create", "append"}, map[string]any{"rules": []any{rule}})
 	sch := w.v87Doc("matches", "sch", map[string]any{"$schema": dialect, "properties": map[string]any{"pin": map[string]any{"enum": []any{"SECRET-PIN-42"}}}})
 	ref := "/r/matches/sch/rev/" + sch
-	expect(t, w.v87Follow(w.get(ref, writer), writer), 404)
+	expect(t, w.get(ref, writer), 404)
 	bad := w.do(req{method: "PATCH", path: "/r/matches/d1", ifNoneMatch: "*", body: addRoot(map[string]any{"$schema": ref, "team": "a", "pin": "guess"}), bearer: writer})
 	good := w.do(req{method: "PATCH", path: "/r/matches/d2", ifNoneMatch: "*", body: addRoot(map[string]any{"$schema": ref, "team": "a", "pin": "SECRET-PIN-42"}), bearer: writer})
 	for _, r := range []*resp{bad, good} {

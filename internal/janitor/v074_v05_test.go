@@ -57,7 +57,7 @@ func TestV074SupersededGrantReadBeforePurge(t *testing.T) {
 		must(a.admin.PurgeNamespace(ctx, ns, must(a.admin.NSHead(ctx, ns)).ID))
 	}
 	after = 2 * day
-	wantKeep(t, must(j.Check(ctx, "matches", "r7")), "can't be read since r7-b was purged (§8.5), and the janitor didn't read it before the purge")
+	wantKeep(t, must(j.Check(ctx, "matches", "r7")), "and the janitor didn't read it before the purge")
 	if d := must(j.Check(ctx, "matches", "r8")); d.Action != janitor.ActionPurged || d.Claim != "superseded" {
 		t.Fatalf("r8 after the purge: %+v", d)
 	}

@@ -173,8 +173,6 @@ func TestPlans(t *testing.T) {
 		"facet[/accountId]=acct-12&facet[/status]=open&facet[/kind]=item",
 		"facet[/accountId]=acct-12&schema=/r/schemas/item&counts=/status",
 		"facet[/kind]=item&facet[/region]=region-07&sort=-/createdAt",
-		"ge[/createdAt]=2026-12-29T00:00:00Z",
-		"ge[/score]=995&lt[/score]=999",
 		"ref=/r/accounts/acct-12",
 		"facet[/kind]=item&ref=/r/accounts/acct-12",
 		"facet[/id]=id-1&facet[/id]=id-2&after=1&limit=1",
@@ -396,11 +394,6 @@ func randomQuery(r *rand.Rand) url.Values {
 			}
 		}
 	}
-	ranges := [][2]string{{"ge[/s]", "3"}, {"lt[/s]", "2.5"}, {"gt[/t]", "b"}, {"le[/t]", "2026-10-04T18:00:00Z"}, {"ge[/u]", "2"}, {"lt[/u]", "c"}, {"gt[/zz]", "1"}}
-	for range r.IntN(3) {
-		x := ranges[r.IntN(len(ranges))]
-		v.Add(x[0], x[1])
-	}
 	var sorts []string
 	for range r.IntN(3) {
 		s := []string{"/s", "/t", "/u", "/a"}[r.IntN(4)]
@@ -575,17 +568,6 @@ func oldCandidateSQL(fts bool, ns string, q *Query) (string, []any) {
 			args = append(args, v)
 		}
 		sb.WriteString(`))`)
-	}
-	for _, r := range q.Ranges {
-		sb.WriteString(` AND EXISTS (SELECT 1 FROM "sort" r WHERE r.ns = d.ns AND r.resource = d.resource AND r.path = ? AND `)
-		args = append(args, r.path)
-		if r.num {
-			fmt.Fprintf(&sb, `typeof(r.value) IN ('integer', 'real') AND r.value %s ?)`, r.op)
-			args = append(args, r.f)
-		} else {
-			fmt.Fprintf(&sb, `typeof(r.value) = 'text' AND r.value %s ?)`, r.op)
-			args = append(args, r.s)
-		}
 	}
 	sb.WriteString(` ORDER BY `)
 	for i, s := range q.Sorts {
