@@ -101,7 +101,11 @@ func (e *env) sweep(dry bool) map[string]janitor.Decision {
 func (e *env) purged(ns string) bool {
 	e.t.Helper()
 	parent := "matches"
-	h := must(e.c.NSHead(ctx, ns))
+	h, err := e.c.NSHead(ctx, ns)
+	if client.IsPurged(err) {
+		return true // nothing of it is left but its name (§5, §8.5)
+	}
+	must(h, err)
 	d := must(e.c.NSDoc(ctx, ns, h.ID))
 	if b, ok := d.Value["base"].(map[string]any); ok {
 		parent = b["ns"].(string)

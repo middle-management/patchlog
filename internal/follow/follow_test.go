@@ -85,11 +85,16 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 func checkpointIs(t *testing.T, cp follow.Checkpoint, c *client.Client, ns string) func() bool {
 	return func() bool {
 		h, err := c.NSHead(context.Background(), ns)
-		if err != nil {
+		want := ""
+		if ae, ok := client.AsAPIError(err); ok && client.IsPurged(err) {
+			want = ae.Head() // all a purged namespace keeps (§5, §8.5)
+		} else if err != nil {
 			return false
+		} else {
+			want = h.ID
 		}
 		got, _ := cp.Load(context.Background(), clienttest.Origin, ns)
-		return got == h.ID
+		return got == want
 	}
 }
 
@@ -297,7 +302,8 @@ func TestRootErrors(t *testing.T) {
 	if err := follow.New(c, "main", cp2, rec).Run(ctx); !errors.Is(err, follow.ErrPurged) {
 		t.Fatalf("purged: %v", err)
 	}
-	if k := rec.kinds("main"); fmt.Sprint(k) != "[config config purge-ns]" {
+	// Its log is gone (v0.91): the 410 stands in for the purge-ns entry.
+	if k := rec.kinds("main"); fmt.Sprint(k) != "[purge-ns]" {
 		t.Fatalf("kinds %v", k)
 	}
 }
@@ -305,11 +311,10 @@ func TestRootErrors(t *testing.T) {
 // TestPurgedSinceHead: a follower whose checkpoint is the head it reads
 // when it starts checks for a purge with /heads (§8.5), and the purge may
 // come in between, after a freeze (§8.5, not_frozen): the 410 then names a
-// purge-ns entry past the checkpoint. The entries up to it come from the
-// log, which still serves them, so the freeze is applied and reported as
-// Frozen, the purge-ns entry last, not skipped by a synthetic purge-ns unit
-// at the 410's head (the race behind TestBranchDiscovery's "states"
-// timeouts under load).
+// purge-ns entry past the checkpoint. Since v0.91 the log is gone with the
+// namespace, so the 410's head stands in for the purge-ns entry, reported
+// as Frozen and Purged together (purgedState); until then the entries up
+// to it came from the log.
 func TestPurgedSinceHead(t *testing.T) {
 	t.Parallel()
 	for _, mode := range []string{"long-poll", "sse"} {
@@ -379,12 +384,14 @@ func testPurgedSinceHead(t *testing.T, mode string) {
 	if !errors.Is(err, follow.ErrPurged) {
 		t.Fatalf("Run: %v", err)
 	}
-	if k := rec.kinds("main"); fmt.Sprint(k) != "[config purge-ns]" {
-		t.Fatalf("kinds %v, want the freeze and the purge-ns entry from the log", k)
+	// The log is gone with the namespace (v0.91): the 410's head stands in
+	// for the purge-ns entry, after the checkpoint, not as a snapshot.
+	if k := rec.kinds("main"); fmt.Sprint(k) != "[purge-ns]" {
+		t.Fatalf("kinds %v, want the purge-ns entry the 410 stands in for", k)
 	}
 	for _, b := range rec.snapshot() {
-		if b.Snapshot || b.Units[0].Synthetic {
-			t.Fatalf("batch %+v isn't from the log", b)
+		if b.Snapshot || !b.Units[0].Synthetic {
+			t.Fatalf("batch %+v", b)
 		}
 	}
 	if got := must(cp.Load(ctx, clienttest.Origin, "main")); got != purged {
@@ -472,11 +479,11 @@ func testSnapshotOfPurged(t *testing.T, withHead bool) {
 	if len(states) != 1 || !states[0].Purged {
 		t.Errorf("states %+v", states)
 	}
-	// /ns/main is read for the head to start from, and again only after a
-	// 410 without head.
+	// /ns/main is read for the head to start from, which is its 410 with
+	// the purge-ns id (v0.91), whatever /heads answers.
 	mu.Lock()
 	defer mu.Unlock()
-	if want := map[bool]int{true: 1, false: 2}[withHead]; nsReads != want {
+	if want := 1; nsReads != want {
 		t.Errorf("/ns/main read %d times, want %d", nsReads, want)
 	}
 }

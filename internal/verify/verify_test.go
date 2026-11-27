@@ -94,13 +94,10 @@ func TestVerifyGenuineChains(t *testing.T) {
 	if r, h, err := verify.Namespace(ctx, c, "main", head); err != nil || h != head || len(r) != 0 {
 		t.Fatalf("at head: %v", err)
 	}
-	// The branch's own chain, including config, frozen config and purge-ns.
-	bentries, _, err := verify.Namespace(ctx, c, "rel", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if bentries[len(bentries)-1].Kind != "purge-ns" || bentries[0].Kind != "config" {
-		t.Fatalf("branch log %+v", bentries)
+	// The purged branch's chain is gone with it (§5, §8.5, v0.91): 410
+	// purged, its head the purge-ns entry, which is all that is left.
+	if _, _, err := verify.Namespace(ctx, c, "rel", ""); !client.IsPurged(err) {
+		t.Fatalf("the purged branch's chain: %v", err)
 	}
 
 	// Resource logs, from genesis and from a trusted revision; document check.

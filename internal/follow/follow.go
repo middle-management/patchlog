@@ -366,6 +366,11 @@ func (n *nsFollower) startBranch(ctx context.Context, name string, entry *client
 // bootstrapSnapshot delivers the /heads listing at the current head.
 func (n *nsFollower) bootstrapSnapshot(ctx context.Context) error {
 	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.NSHead(ctx, n.ns) })
+	if client.IsPurged(err) {
+		// Nothing of it is left to list (§5, §8.5): the 410 stands in for
+		// its purge-ns entry (§10).
+		return n.logPurged(ctx, err)
+	}
 	if err != nil {
 		return err
 	}
@@ -575,6 +580,11 @@ func purgedState(ns string) State { return State{NS: ns, Frozen: true, Purged: t
 // checkpoint advanced, before the next is fetched.
 func (n *nsFollower) catchUp(ctx context.Context) error {
 	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.NSHead(ctx, n.ns) })
+	if client.IsPurged(err) {
+		// A purged namespace keeps no log (§5, §8.5): the 410's head
+		// stands in for its purge-ns entry (§10).
+		return n.logPurged(ctx, err)
+	}
 	if err != nil {
 		return err
 	}

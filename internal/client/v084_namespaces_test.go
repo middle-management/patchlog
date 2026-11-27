@@ -73,12 +73,13 @@ func TestV084Namespaces(t *testing.T) {
 	}
 	created := s.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	for _, r := range rows {
-		if r.Created != created || r.Raw["name"] != r.Name {
+		if r.Created != created && !r.Purged || r.Raw["name"] != r.Name {
 			t.Fatalf("row %+v", r)
 		}
 		switch r.Name {
 		case "old":
-			if !r.Purged || !r.Frozen || r.Base != nil {
+			// Only what a purged namespace keeps (§5, §7.4, v0.91).
+			if !r.Purged || !r.Frozen || r.Base != nil || r.Created != "" || len(r.Raw) != 3 {
 				t.Fatalf("purged row %+v", r)
 			}
 		case "matches-next":

@@ -181,6 +181,49 @@ type Janitor struct {
 	seen    map[seenKey]*list.Element
 	order   list.List // of seenGrant, most recently used first
 	seenCap int
+	// held is what a superseded check read of each successor while it was
+	// live, the last time it did (heldSucc): once a successor is purged it
+	// keeps nothing but its name and purge-ns id (§5, §8.5, v0.91), and the
+	// check counts only with what this janitor read before the purge
+	// (§F.6). At most seenCap successors, any one dropped when full.
+	held map[string]*heldSucc
+}
+
+// heldSucc is a successor as a superseded check read it while it was live:
+// its head and namespace document there, its base, whether that base
+// listed it among its branches, its log up to the head, and when it was
+// read, by the janitor's clock.
+type heldSucc struct {
+	head    string
+	doc     map[string]any
+	base    string
+	listed  bool
+	entries []client.NSEntry
+	readAt  time.Time
+}
+
+// hold keeps what a superseded check read of a live successor.
+func (j *Janitor) hold(succ string, h *heldSucc) {
+	j.seenMu.Lock()
+	defer j.seenMu.Unlock()
+	if j.held == nil {
+		j.held = map[string]*heldSucc{}
+	}
+	if _, ok := j.held[succ]; !ok && len(j.held) >= j.seenCap {
+		for k := range j.held {
+			delete(j.held, k)
+			break
+		}
+	}
+	j.held[succ] = h
+}
+
+// heldOf is what a superseded check last read of succ while it was live.
+func (j *Janitor) heldOf(succ string) (*heldSucc, bool) {
+	j.seenMu.Lock()
+	defer j.seenMu.Unlock()
+	h, ok := j.held[succ]
+	return h, ok
 }
 
 // maxSeen is the default bound of Janitor.seen.
@@ -400,6 +443,10 @@ func (j *Janitor) holdsSchemas(ctx context.Context, ns, at string) (bool, error)
 func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) {
 	d := Decision{NS: ns, Base: base, Action: ActionKeep}
 	head, err := j.c.NSHead(ctx, ns)
+	if client.IsPurged(err) {
+		// Nothing of it is left but its name and purge-ns id (§5, §8.5).
+		return purgedSince(d, err), nil
+	}
 	if err != nil {
 		return d, err
 	}
@@ -952,11 +999,51 @@ func (b *branch) verifyMerged(ctx context.Context) (bool, string, error) {
 	return b.covered(ctx, b.base, entries, listed, "a principal in the base's merge.authors", disabled)
 }
 
-// sealedPurged is the reason a branch whose successor is a purged sealed
-// namespace is kept: the purge made the successor's log 410 (§8.5), so its
-// batches can't be checked, and the branch needs a manual purge.
-func sealedPurged(succ string) string {
-	return "successor " + succ + " is purged and sealed, so its log answers 410 (§8.5): sealed successor purged: verify by hand"
+// readSucc reads a live successor at head for a superseded check, and
+// holds what it read (Janitor.hold): its document there, its base, whether
+// that base lists it, and its log. why is set where the successor stopped
+// being readable meanwhile (purged since its head was read).
+func (b *branch) readSucc(ctx context.Context, succ, head string) (*heldSucc, string, error) {
+	h := &heldSucc{head: head, readAt: b.j.opt.Now()}
+	sdoc, err := b.j.c.NSDoc(ctx, succ, head)
+	if client.IsPurged(err) {
+		return nil, unheldPurged(succ), nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	h.doc = sdoc.Value
+	sref, _ := sdoc.Value["base"].(map[string]any)
+	h.base, _ = sref["ns"].(string)
+	if h.base != "" {
+		brs, err := b.j.c.Branches(ctx, h.base)
+		if client.IsPurged(err) {
+			// A purged namespace's /branches is 410 (§7.4, §8.5).
+			return nil, "the successor's base " + h.base + " is purged", nil
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		i := slices.IndexFunc(brs, func(br client.Branch) bool { return br.Name == succ })
+		h.listed = i >= 0 && !brs[i].Purged
+	}
+	h.entries, _, err = b.j.c.Unfiltered().NSLog(ctx, succ, head, "")
+	if client.IsPurged(err) {
+		return nil, unheldPurged(succ), nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	b.j.hold(succ, h)
+	return h, "", nil
+}
+
+// unheldPurged is the reason a branch whose successor is purged is kept
+// when this janitor holds nothing it read of the successor before the
+// purge: the purge left only its name and purge-ns id (§5, §8.5), so its
+// batches can't be checked, and the branch needs a manual purge (§F.6).
+func unheldPurged(succ string) string {
+	return "successor " + succ + " is purged, which leaves nothing of it to read (§5, §8.5), and the janitor didn't read it before the purge: successor purged: verify by hand"
 }
 
 // baseChain returns the branch's bases in this deployment, its base first
@@ -984,9 +1071,10 @@ func (b *branch) baseChain(ctx context.Context) ([]string, error) {
 //     exists, isn't purged, and is a branch of the branch's base or of a
 //     namespace further up its base chain in this deployment, listed as
 //     such in that namespace's branches. A successor purged after the
-//     branch was frozen (frozeAt) still counts, checked from its log,
-//     which the purge leaves readable, except a sealed one, whose log the
-//     purge makes 410: the branch is then kept for a manual purge;
+//     branch was frozen (frozeAt) still counts, checked from what this
+//     janitor read of it while it was live, after the freeze (heldSucc):
+//     the purge leaves nothing of it to read (§5, §8.5, v0.91). Without
+//     such a read the branch is kept for a manual purge;
 //   - its log has a batch without origin whose source.ns is the branch,
 //     whose source.at is in the branch's chain, and whose recorded grant
 //     has a root sub and kid in the base's current merge.authors or
@@ -1002,67 +1090,50 @@ func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time
 	if succ == b.ns {
 		return false, "the successor is the branch itself", nil
 	}
+	var held *heldSucc
 	sh, err := b.j.c.NSHead(ctx, succ)
-	if client.IsNotFound(err) {
+	switch {
+	case client.IsNotFound(err):
 		return false, "successor " + succ + " doesn't exist", nil
-	}
-	if err != nil {
+	case client.IsPurged(err):
+		// Purged: only what this janitor read before the purge counts, and
+		// only where that read came after the branch was frozen, so that
+		// the purge did too (§F.6).
+		h, ok := b.j.heldOf(succ)
+		if !ok {
+			return false, unheldPurged(succ), nil
+		}
+		if h.readAt.Before(frozeAt) {
+			return false, fmt.Sprintf("successor %s is purged, and the janitor last read it at %s, before the branch was frozen at %s, so the purge can't be placed after the freeze: verify by hand",
+				succ, h.readAt.UTC().Format(time.RFC3339Nano), frozeAt.UTC().Format(time.RFC3339Nano)), nil
+		}
+		held = h
+	case err != nil:
 		return false, "", err
 	}
-	sdoc, err := b.j.c.NSDoc(ctx, succ, sh.ID)
-	if client.IsPurged(err) {
-		// A sealed successor's document, once it is purged (§8.5).
-		return false, sealedPurged(succ), nil
+	var entries []client.NSEntry
+	if held == nil {
+		h, why, err := b.readSucc(ctx, succ, sh.ID)
+		if err != nil || why != "" {
+			return false, why, err
+		}
+		held = h
 	}
-	if err != nil {
-		return false, "", err
-	}
-	b.docs[succ] = nsAt{sh.ID, sdoc.Value}
-	sref, _ := sdoc.Value["base"].(map[string]any)
-	sbase, _ := sref["ns"].(string)
-	if sbase == "" {
+	b.docs[succ] = nsAt{held.head, held.doc}
+	if held.base == "" {
 		return false, "successor " + succ + " is not a branch (§7.4)", nil
 	}
 	chain, err := b.baseChain(ctx)
 	if err != nil {
 		return false, "", err
 	}
-	if !slices.Contains(chain, sbase) {
-		return false, fmt.Sprintf("successor %s is a branch of %s, not of a namespace in the branch's base chain (%s, §7.4)", succ, sbase, strings.Join(chain, ", ")), nil
+	if !slices.Contains(chain, held.base) {
+		return false, fmt.Sprintf("successor %s is a branch of %s, not of a namespace in the branch's base chain (%s, §7.4)", succ, held.base, strings.Join(chain, ", ")), nil
 	}
-	brs, err := b.j.c.Branches(ctx, sbase)
-	if client.IsPurged(err) {
-		// A purged namespace's /branches is 410 (§7.4, §8.5).
-		return false, "the successor's base " + sbase + " is purged", nil
+	if !held.listed {
+		return false, "successor " + succ + " is not a branch of " + held.base, nil
 	}
-	if err != nil {
-		return false, "", err
-	}
-	i := slices.IndexFunc(brs, func(br client.Branch) bool { return br.Name == succ })
-	if i < 0 {
-		return false, "successor " + succ + " is not a branch of " + sbase, nil
-	}
-	entries, _, err := b.j.c.Unfiltered().NSLog(ctx, succ, sh.ID, "")
-	if client.IsPurged(err) {
-		return false, sealedPurged(succ), nil
-	}
-	if err != nil {
-		return false, "", err
-	}
-	if brs[i].Purged {
-		// Its log stays readable, the purge-ns entry its last (§8.5).
-		var purgedAt time.Time
-		if n := len(entries); n > 0 && entries[n-1].Kind == "purge-ns" {
-			purgedAt, _ = time.Parse(time.RFC3339Nano, entries[n-1].Created)
-		}
-		if purgedAt.IsZero() {
-			return false, "successor " + succ + " is purged, but its log has no purge-ns entry to date the purge by", nil
-		}
-		if !purgedAt.After(frozeAt) {
-			return false, fmt.Sprintf("successor %s was purged at %s, before the branch was frozen at %s", succ,
-				purgedAt.UTC().Format(time.RFC3339Nano), frozeAt.UTC().Format(time.RFC3339Nano)), nil
-		}
-	}
+	entries = held.entries
 	_, bdoc, err := b.head(ctx, b.base)
 	if err != nil {
 		return false, "", err
@@ -1470,6 +1541,12 @@ func (j *Janitor) Run(ctx context.Context) error {
 	var seed func(ns string) error
 	seed = func(ns string) error {
 		h, err := j.c.NSHead(ctx, ns)
+		if ae, ok := client.AsAPIError(err); ok && client.IsPurged(err) {
+			// All a purged namespace keeps is its purge-ns id (§5, §8.5):
+			// its follower starts there, and ends at once.
+			cp.Save(origin, ns, ae.Head())
+			return nil
+		}
 		if err != nil {
 			return err
 		}
