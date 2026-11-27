@@ -1,146 +1,127 @@
 # Reference-implementation notes for the spec writer
 
-`docs/SPEC.md` mirrors the canonical specification, now at **v0.90**, with `docs/SERVICES.md` and
+`docs/SPEC.md` mirrors the canonical specification, now at **v0.91**, with `docs/SERVICES.md` and
 `docs/TOOLS.md`, split from it in v0.80. This file collects what the reference does that the text
-doesn't yet describe. Open notes come in one list, from implementing v0.90; cite them as
-"v0.90 Open n". v0.90 answered the v0.89 list ("v0.89 Open n", 17 notes): what it settled is
-under "Settled in v0.90", and what it left open is rewritten in the new list, marked "was v0.89
-Open n". v0.88 answered the v0.87 list (Settled in v0.88, 59 notes and three reference gaps),
+doesn't yet describe. Open notes come in one list, from implementing v0.91; cite them as
+"v0.91 Open n". v0.91 answered the v0.90 list ("v0.90 Open n", 13 notes) and the first of the
+storage-bounds questions: what it settled is under "Settled in v0.91", and what it left open is
+rewritten in the new list, marked "was v0.90 Open n". v0.90 answered the v0.89 list (Settled in
+v0.90, 17 notes), v0.88 the v0.87 list (Settled in v0.88, 59 notes and three reference gaps),
 v0.87 the v0.86 list (Settled in v0.87), v0.86 the v0.85
 list (Settled in v0.86) and the four questions of the branch-limit report
 (docs/capacity/branches/report.md), v0.85 the v0.82 list (Settled in v0.85), v0.82 the v0.81 list
 (Settled in v0.82), the v0.77 list was answered in v0.78 to v0.81 (Settled in v0.81), and earlier
 lists before it.
 
-## Open from v0.90
+## Open from v0.91
 
-From implementing v0.90 (branch `spec-v090`). Numbered afresh; cite these as "v0.90 Open n". Each
+From implementing v0.91 (branch `spec-v091`). Numbered afresh; cite these as "v0.91 Open n". Each
 entry gives the section, what the reference does now (the conservative reading where it had a
-choice) and the question. Notes from v0.89 that v0.90 leaves open are carried in place, by
-subject, marked "was v0.89 Open n" and cut to what remains, with their references moved to v0.90's
-sections; v0.90 counts all 17 answered, so each says what is left. The order is: public views and
-their refusals (1–2), keys and sealing at `sealed` (3–4), the namespace log, caches and
-redirects (5–7), budgets (8), services and federation (9–12) and documents (13). Where the
-reference does less than the text says, that is under Reference gaps, after the list. Sections are
-SPEC.md's unless TOOLS.md is named; Addendum A and §E.2.6 are in SERVICES.md. Scenario numbers
-repeat across CONFORMANCE's groups: "Encryption scenario n" is one under "Encryption levels and
-epochs", "Filtered reads scenario n" one under "Filtered reads (§7.9)".
+choice) and the question. Notes from v0.90 that v0.91 leaves open are carried in place, by
+subject, marked "was v0.90 Open n" and cut to what remains; v0.91 counts all 13 answered, so each
+says what is left. The order is: purged namespaces (1–5), storage hooks (6), keys and sealing at
+`sealed` (7), the namespace log and caches (8–9) and services (10). Where the reference does
+less than the text says, that is under Reference gaps, after the list. Sections are SPEC.md's
+unless TOOLS.md is named; Addendum A and §E.2.6 are in SERVICES.md. Scenario numbers repeat
+across CONFORMANCE's groups: "Filtered reads scenario n" is one under "Filtered reads (§7.9)",
+"Protection scenario n" one under "Protection: content moving between namespaces", "Grant scope
+scenario n" one under "Grant scope".
 
-13 are open: 8 from this version's work and 5 carried.
+10 are open: 6 from this version's work and 4 carried.
 
-1. **How a consumer of a public namespace learns its view** (§7.9 Where, `view`, §7 step 1, §C.5.2,
-   §E.2.3, Filtered reads scenarios 95, 96). "Only URLs under a view prefix take it; every other
-   read ignores it (§7 step 1), so none redirects to a filtered form", and a `view` is a hash of
-   the grant's `subjects`, which a client has no cause to compute. The reference never redirects a
-   grant at a public namespace's unfiltered URLs, so its client asks for its view: `POST
-   /ns/{ns}/keys` in a sealed namespace, and the edge exchange (§C.5.2) otherwise, each drawing
-   `exchangeRate`. *Question:* should §7.9 Where name how a consumer of a public namespace learns
-   its view, and say that learning it costs an exchange or key request?
+1. **What "authorship" a namespace purge removes** (§5 "no chain, entry, author, grant reference,
+   id or parent link", §8.5, the v0.91 change log "its log, document chain, resource ids, keys and
+   authorship go"). The reference deletes every row of the namespace, so no entry, revision or
+   document of it names an author or a grant any more (migration
+   `035_purged_namespaces_keep_name_and_purge_id`, `033_…` on SQLite, for namespaces purged
+   before). It keeps the deployment-wide dictionaries those rows pointed into: `authors` (an
+   author's name, by number) and `grants` (a stored grant, its blocks and root `sub` included),
+   whose rows other namespaces may share and which nothing indexes by namespace, so a name or
+   grant only the purged namespace used stays there, referenced by nothing. *Question:* does §5's
+   "author" cover such a dictionary row, so that one no other namespace refers to must go too,
+   or only the namespace's references to it?
 
-2. **Refusals at a public namespace's view URLs** (§7 step 1 to 3, §7.9 Where and Unrestricted
-   readers, Filtered reads scenario 95). §7 now keeps steps 2 and 3 for "reads under a view
-   prefix", so there a grant that doesn't cover the namespace is `403` (§7 step 2), where the
-   reference answered `401`, and the same grant at the unfiltered URLs is `200`, ignored. A
-   `/ns/{ns}` cookie at a view URL reads every revision, unrestricted, its answers `private,
-   no-store` (§7.9), in a public namespace as in a private one. *Question:* is that split, `200`
-   unprefixed and `403` under the prefix for one grant, meant; and does the cookie's reading
-   hold in a public namespace?
+2. **A purged branch's base and position** (§5, §7.4 `/branches`, HTTP-31, CONFORMANCE scenario
+   109). A purged branch's row in its base's `/branches` has "`at` (from the base's `branch`
+   entry)". To find that entry and list the row by name under the base, the reference keeps, in
+   the purged branch's own namespace row, its base and the position it was made at, beside its
+   name and purge-ns id; nothing of it is served but that row. *Question:* are a branch's base and
+   `at`, which the base's own log records, within what §5 lets a purged namespace keep, or should
+   the base's `branch` entry be found otherwise (by the name in its body)?
 
-3. **A partial reader at `sealed` whose rules name only `/resource`** (§7.9 Partial reader, §E.2.3,
-   §E.2.2 table; was v0.89 Open 7). A grant whose read rules "refer to `/resource` without fixing
-   it", with none on `/doc`, is a partial reader and gets "only the `K_view` of its own `view`
-   (§E.2.1)", never a `K_r` or the `K_log` of an entry. v0.90 doesn't touch this. The reference
-   serves its resource log, long-poll and events through the filtered path, sealed for its view,
-   as it does a reader with `/doc` rules, though each revision of a name its rules allow is
-   visible. *Question:* is the filtered form the only one such a reader gets at `sealed`, and
-   should §7.9 or §E.2.3 say so?
+3. **The refusal of a re-import after a followed purge-ns** (§G.1 Purges follow imports, §7.5,
+   FED-26, Protection scenario 43). "Once it has applied a `purge-ns` or its `410`, a later batch
+   that counts and names that namespace in `source` is `410` (`purged`)". The reference records
+   each followed purge-ns by origin and source namespace for the deployment (`purged_sources`),
+   whichever of its namespaces followed it, so a counting batch into any namespace is refused,
+   with `ns` the source namespace and `head` the origin's purge-ns id; it keeps that record when
+   the following namespace is purged itself. A batch "counts" as one the follow would record: an
+   import batch (`bundle` and `origin`), from a trusted origin, whose `author` is one of its
+   importers, under a grant that may `purge` at least one of the names it writes, judged at step
+   4 before the items' own checks. A batch by another principal, or under a grant that may purge
+   none of its names, is recorded as asserted and re-creates the content, which nothing follows.
+   *Question:* is the refusal per deployment or per following namespace, and should a batch that
+   doesn't count be refused too, as it re-creates what the origin purged?
 
-4. **Sealings from an earlier draft** (§1 earlier drafts, CONF-6, §E.2.2 Stored once, §E.2.1,
-   Encryption scenario 83; was v0.89 Open 8). Scenario 83 now has such content "refused or
-   discarded", or "served as stored", opening only to a `K_r` or `K_e` holder. The reference
-   discards the blob sealings of an earlier draft when it starts, and re-seals a resource's stored
-   rows on their next read, under the epoch their `kid` names; §E.2.2 has sealed bytes "produced
-   once, stored, and served identically forever". *Question:* does "a deployment may refuse or
-   discard such data" allow converting a row instead, so that the same `ETag` (`"{id}.{e}"`) then
-   names other bytes?
+4. **Rows that SQLite may number again** (§5, §8.5; not observable). A purge-ns now deletes the
+   rows of the namespace's last entries, so a later row may take a deleted row's seq on SQLite
+   (whose integer keys reuse the largest freed one). The reference keys no stored record on a
+   deleted entry's seq (the second CDN purge of the purge-ns goes unkeyed, `cdn_repurge`) and
+   flushes its caches keyed by seq or resource (namespace documents, data keys) after such a
+   purge, a read that began before it caching nothing more. Recorded for implementers rather than
+   as a question: §5 could note that a namespace purge frees numbers a deployment may give again.
 
-5. **`schema` on a head entry at E3** (§7.4 Entries, §8.3 Limits of purge, Filtered reads scenario
-   97). `schema` is "absent where it has none and at E3", "recorded when the entry is written".
-   The reference stores it whatever the level and leaves it out when it serves the entry if the
-   namespace's current level is E3, reading "at E3" as the level now, not the level at the write
-   (levels never go down, §7.1), so an entry written at E2 loses its hint once the namespace is
-   E3. A batch entry records a per-resource map of them, and each is placed on its head item when
-   the entry is served. *Question:* is the current level meant; and should §7.4 say that a batch
-   keeps one `schema` per resource, though `schema` is on "a `head` entry, a batch's included"?
+5. **The index's `410` cache class** (SERVICES §A.4 Unavailable namespaces, §8.5, Filtered reads
+   scenario 101). A purged namespace's query is "`410` (`purged`), whatever the grant, as at the
+   origin", where the origin caches a read's `410` long and publicly. The reference's index answers
+   it `no-store`, as its other refusals, purging `idx:{ns}` with the drop. *Question:* is "as at
+   the origin" meant to cover the cache class too?
 
-6. **What "once a view has been served" is** (§8.3 CDN, §7.9 URLs and Cost, Filtered reads
-   scenario 89; from v0.89 Open 9). A purge clears `ns:{ns}` "once a view of the namespace has been
-   served". The reference records service of a view durably, in a new table, at admission, bearer
-   reads included. An archive restore still clears `ns:{ns}` once a view is recorded, though
-   "archive restores ... needn't clear them" and scenario 89 needs none. *Question:* is admission
-   what "served" means; and is a restore's clearing harmless, or to be dropped?
+6. **What `unavailable` covers** (§5, §12.1, Grant scope scenario 111; Storage 4 and 6 below).
+   The reference has no storage tier beyond its database and blob files, so it answers `503`
+   (`unavailable`, `Retry-After: 5`, `no-store`) where the database itself can't be reached: a
+   connection that can't be opened or is lost, from the transaction's start to any statement in
+   it, for every request (a typed error, `core.UnavailableError`, that any future tier returns
+   too); before v0.91 those were `500`. It never ends a log page early (§7.1 Paging): its pages
+   end only at their bounds. *Question:* is a database outage the "storage the answer needs can't
+   be reached for now" §5 means, so that `500` is kept for faults that waiting won't mend?
 
-7. **A blob's own URL for a partial reader** (§7.9 Content, §E.2.2 Epochs, Filtered reads scenario
-   92). Scenario 92 has li's grant at the unprefixed `GET /r/matches/x/blob/{B}` answered `302` to
-   `…/blob/{B}/e/3`. The reference redirects a partial reader's grant there to the view prefix
-   first, `/ns/{ns}/view/{view}/r/matches/x/blob/{B}`, whose `302` names the epoch as §7.9 Content
-   has the prefixed form do ("the `302` naming the latest such `e`"). *Question:* is the scenario's direct `302` to `/e/{e}` required, or may
-   the redirect go through the prefix?
+7. **Sealings from an earlier draft** (§1 earlier drafts, CONF-6, §E.2.2 Stored once, §E.2.1,
+   Encryption scenario 83; was v0.90 Open 4). Unchanged in v0.91. The reference discards the blob
+   sealings of an earlier draft when it starts, and re-seals a resource's stored rows on their
+   next read, under the epoch their `kid` names; §E.2.2 has sealed bytes "produced once, stored,
+   and served identically forever". *Question:* does "a deployment may refuse or discard such
+   data" allow converting a row instead, so that the same `ETag` (`"{id}.{e}"`) then names other
+   bytes?
 
-8. **Which checks share a long-poll's budget** (§6.6 Validation work, §7.9 Long-poll, Filtered
-   reads scenario 101, §7.1). §6.6 gives a long-poll "one for its whole wait, shared by every check
-   it makes", and also "each revision judged for a filtered read (§7.9)" a budget; scenario 101
-   has each hidden revision at `/ns/{ns}/view/{view}/log` judged with its own. A partial reader's
-   long-poll at a resource's own URL (`/r/{ns}/{name}/log`) is a filtered read there as well, and
-   the reference gives each revision's `/doc` judgment there its own budget, as at the view URL. *Question:* is that the reading of
-   "shared by every check it makes", and should §6.6 or §7.9 Long-poll name the resource URLs?
+8. **`schema` on a head entry at E3** (§7.4 Entries, §8.3 Limits of purge, HTTP-82; was v0.90
+   Open 5). v0.91 adds that `schema` is a hint a verifying consumer checks, and that entries
+   written before it lack it, but keeps "absent where it has none and at E3". The reference
+   stores it whatever the level and leaves it out when it serves the entry if the namespace's
+   current level is E3, and a batch entry records a per-resource map of them, each placed on its
+   head item when served. *Question:* is the current level meant; and should §7.4 say that a batch
+   keeps one `schema` per resource?
 
-9. **The index's unfollowed namespaces at an exchange** (SERVICES §A.4 Unavailable namespaces,
-   Coverage, §C.5.2 All or nothing, Filtered reads scenario 91; from v0.89 Open 13). (1) §A.4
-   has an exchange for an unfollowed namespace answer `404` "only where no other refusal is `401`
-   or `403`". The reference answers `404` for an exchange whose grants name only unfollowed
-   namespaces, or purged and unfollowed ones, where it answered `403`. (2) A branch indexed without its base answers
-   `404` to every query, a public branch's included, not only an exchange. (3) The index doesn't
-   prefer a free second to a live cookie's for `exp`: two live cookies for a prefix usually
-   share one, which "live ones may share" allows. *Question:* for (1), is a purged namespace
-   among the "other refusal"; for (2), is every query, a public one too, meant?
+9. **What "once a view has been served" is** (§8.3 CDN, §7.9 URLs and Cost, Filtered reads
+    scenario 89; was v0.90 Open 6). Unchanged in v0.91. The reference records service of a view
+    durably, at admission, bearer reads included, and an archive restore still clears `ns:{ns}`
+    once a view is recorded, though "archive restores ... needn't clear them". *Question:* is
+    admission what "served" means; and is a restore's clearing harmless, or to be dropped?
 
-10. **An oversized grant at `/_refs`** (§A.4, §C.4 Operator grants, §7 step 1; was v0.89 Open 11).
-    It has an operator grant ignored at `/_refs` (§C.4) and says nothing of an oversized one. At
-    `/_refs` of an index that also follows private namespaces an oversized grant is still `413`,
-    while an anonymous request gets the public hits. *Question:* is the `413` right where the
-    answer would otherwise be the public hits?
-
-11. **The index's range filters** (§A.4; was v0.89 Open 12). `gt`, `ge`, `lt` and `le` with a `sort`
-    mark remain the reference's own, against Canonical URLs' "A parameter the service doesn't
-    define, or a non-repeatable one given twice, is `400` (§7)". *Propose:* specify or drop them.
-
-12. **Import batches recorded before the importer was** (§G.1 Purges follow imports, FED-28;
-    from v0.89 Open 13). §G.1 now has "only import batches by such a principal count, whenever
-    written", and FED-28 one by a principal named later counting. The reference's
-    `purge_follow_names` gained an importer in a migration; batches recorded before it follow
-    nothing until they are imported again, and their follow state isn't rebuilt from the
-    batches' authors. *Question:* is rebuilding it from the authors expected of a deployment that
-    upgrades, or does "whenever written" leave batches whose importer was never recorded out?
-
-13. **An undefined member an earlier draft stored** (§7.4 Versions, §1; was v0.89 Open 14).
-    "As a config write does" still names no exemption, and §1 says only that a deployment "may
-    refuse or discard such data". The reference lets a config write keep such a member
-    unchanged, so a namespace written before an upgrade can be frozen or rotated. *Question:* may
-    a write keep it, or must it be `422` until removed?
+10. **A branch indexed without its base** (SERVICES §A.4 Unavailable namespaces, Coverage, §C.4
+    Keys follow the base; was v0.90 Open 9 (2)). The reference answers `404` to every query of a
+    branch whose bases' logs it doesn't all follow, a public branch's included, not only at an
+    exchange. v0.91 settles the exchange's order (AUTH-22: `404` "only where no other refusal is
+    `401` or `403`") and leaves this. *Question:* is every query, a public one too, meant?
 
 ## Open from the storage-bounds work
 
 From the "bounding log storage" suggestions (branch `storage-bounds`; measurements in
 docs/capacity/storage/README.md, the deep-cursor review in docs/capacity/storage/deep-cursor-review.md).
-Numbered on their own; cite them as "Storage n". They are not in the count above.
+Numbered on their own; cite them as "Storage n". They are not in the count above. v0.91
+answers 1, 5, 7 and 9 (Settled in v0.91); 2, 3, 4, 6, 8 and 10 stay, as they were.
 
-1. **A batch whose local `source` names a purged namespace** (§8.3, §7.4 `source`; the purged-
-   namespace suggestion, option (a)). Purged namespaces keep only a name record. *Question:* does
-   such a batch answer `410 purged` or `422 source`? The reference waits on this before trimming
-   purged namespaces' rows.
-
-2. **The body of a single write's head entry** (§3.5, §7.4). The reference now stores no body for a
+2. **The body of a single write's head entry** (§3.5, §7.4). The reference stores no body for a
    single write's head and tombstone entries and rebuilds it on read, but only where the rebuild is
    byte-identical to the canonical body at write time, so it can't drift. *Question:* may the spec
    say outright that such an entry's body is exactly `{kind, resource, target}`, so an
@@ -149,23 +130,18 @@ Numbered on their own; cite them as "Storage n". They are not in the count above
 3. **`via` and `author` on a single write's entry** (§7.4). They repeat the target revision's own.
    *Question:* may they be stated as equal to it, so they can be derived too?
 
-4. **Which tables a deep cursor may move** (§8.6 "never pruned"). *Question:* may the namespace log
-   itself move to object storage, or only revision payloads?
+4. **Which tables a deep cursor may move** (§8.6 "never pruned"). v0.91's paging hook (a page "MAY
+   end earlier, such as where storage divides the log") lets a log range be read from more than
+   one store, and `unavailable` covers one out of reach. *Question:* may the namespace log itself
+   move to object storage, or only revision payloads?
 
-5. **A `503 unavailable` for history in object storage** (§5 "nothing observable changes").
-   *Question:* which requests may answer it, if any?
+6. **The retry lookup's reach** (§7.2). It covers the whole log, and v0.91 lets it answer `503` only
+   while storage can't be reached. *Question:* may it be bounded to the retry window, answering
+   writes beyond it as new ones?
 
-6. **The retry lookup's reach** (§7.2). It covers the whole log. *Question:* may it be bounded to
-   the retry window, or answer `503` beyond it?
-
-7. **Pages ending early** (§7.1). CDN-cached and sealed ranges are keyed `since:id`. *Question:*
-   may a page end at a segment boundary short of its limit?
-
-8. **A lazy purge** (§8.3). *Question:* may a purge answer once it has destroyed the keys, with the
-   rewrite done later, as archives already allow?
-
-9. **Branch creation at an old `at`, and `/heads?at=`.** *Question:* may these answer `503` when
-   the history they need is in object storage?
+8. **A lazy purge** (§8.3, §8.5). v0.91 has a namespace purge keep only its name and purge-ns id,
+   which the reference does in the purge's own transaction. *Question:* may a purge answer once it
+   has destroyed the keys, with the rewrite done later, as archives already allow?
 
 10. **Deep cursor against prune and archive** (§8.6). Prune plus archive already moves history to
     object storage. *Question:* what does a deep cursor add that the spec should name, rather than
@@ -173,18 +149,103 @@ Numbered on their own; cite them as "Storage n". They are not in the count above
 
 ## Reference gaps
 
-Where the reference does less than v0.90 says, or computes something the text defines otherwise.
+Where the reference does less than v0.91 says, or computes something the text defines otherwise.
 They are not questions, so the count above leaves them out; each is the implementation's to
-close. Gaps 1 and 2 of the v0.87 list, the cookie death at the index over all read roles and the
-`/_refs` view over `{ns}:{v}`, are implemented and closed (Settled in v0.88).
+close.
 
-1. **Trees** (TOOLS §H.2, §H.5, §H.6, §H.7; was v0.87 Reference gap 3; the questions on Addendum H,
-   v0.89 Open 16 and 17, are settled in v0.90). The reference doesn't do what the text says in
-   four places: the delete-then-write restore (§H.6) in trees creates a new document, where it
-   restores in the flat view; a folder moved to another namespace (§H.5) is `403`; the
-   case-variant exceptions of §H.2 Siblings are not implemented; and sealed and end-to-end trees
-   aren't offered (§H.7), a sealed tree's `/doc` rules reading with a view key there as v0.90
-   has it.
+1. **Trees** (TOOLS §H.2, §H.5, §H.6, §H.7; was v0.87 Reference gap 3). The reference doesn't do
+   what the text says in four places: the delete-then-write restore (§H.6) in trees creates a new
+   document, where it restores in the flat view; a folder moved to another namespace (§H.5) is
+   `403`; the case-variant exceptions of §H.2 Siblings are not implemented; and sealed and
+   end-to-end trees aren't offered (§H.7), a sealed tree's `/doc` rules reading with a view key
+   there as v0.90 has it.
+
+2. **Follow state for import batches recorded before the importer was** (§G.1, FED-28, Protection
+   scenario 41; was v0.90 Open 12). The follow names an import batch wrote are recorded as it
+   commits, with its principal and judged under its grant then (`purge_follow_names`); those
+   recorded before migration `029_purge_follows_by_importer` (`031_…` on Postgres) were dropped,
+   and the reference doesn't rebuild them from the batches' authors, so such batches follow
+   nothing. Rebuilding would judge each stored grant under the namespace document in force at
+   its entry; discarding the batches' content, the text's other choice, isn't offered either.
+
+3. **A `410` read through a mirror** (TOOLS §G.2 Verification, §10, FED-1, Grant scope scenario
+   112). "Such a consumer confirms a `410` (`purged`), which carries nothing to verify, at the
+   origin before dropping anything". The reference's consumers (`follow`, `verify`, the index,
+   the janitor) read from the URL they are given and have no notion of an origin behind it: one
+   pointed at a mirror or a CDN acts on its `410` alone.
+
+4. **A grant's request-shape errors at a purged namespace** (§6.2, §7, §8.5 Answers afterwards,
+   GATE-1, DEL-9). The `410` "comes right after request-shape errors (§6.2)", and GATE-1 counts
+   "a grant's request-shape `401`s of §C.2 item 1" among them, as it does `413` for `grantSize`
+   and `rulesPerGrant`. The reference answers the `410` once a request's URL, query, headers and
+   body are checked, as soon as the namespace's row is read, before it decodes the grant, which
+   it decodes against the namespace (its `ns` blocks and keys): a malformed bearer, or one over
+   `rulesPerGrant`, at a purged namespace gets the `410`, where the text has its `401` or `413`
+   first. Closing it takes a decode of the bearer that needs no namespace before the `410`.
+
+## Settled in v0.91
+
+v0.91 answers the 13 notes open from v0.90, the first storage-bounds question and three more of
+them by its storage hooks, and makes a purged namespace keep only its name and purge-ns id. Its
+change log names six of the notes' answers; the rest were found by reading the v0.91 text and
+CONFORMANCE against it, and where a clause or scenario settles a note, the bullet quotes it. "n"
+below means v0.90 Open n. By the reference's reading 9 are settled, note 9 leaves a part, and 3
+stay open (4, 5, 6), rewritten above and marked "was v0.90 Open n". Carried, as v0.90 → v0.91:
+4 → 7, 5 → 8, 6 → 9, 9 (2) → 10. Note 12's question is settled and leaves Reference gap 2.
+
+- **1** (how a consumer of a public namespace learns its view): §7.9 Where: "its holder learns its
+  `view` from an exchange's `prefixes` (Edge grants) or, where sealed, from `/keys` (§E.2.3)";
+  HTTP-83. The reference's client does both.
+- **2** (refusals at a public namespace's view URLs): Filtered reads scenario 98: a grant whose
+  `ns` doesn't name `matches`, "at her prefix → `403`, never `401`, and at
+  `/ns/matches/rev/{ns_id}/heads` → `200`, unfiltered, the grant ignored"; scenario 99: "a
+  `/ns/matches` cookie at li's view's … `/heads` → `200`, every revision, `private, no-store`,
+  sealed under `K_n` with `keys` `[]`". The reference answers scenario 98 so
+  (`TestV091PublicViewFromExchange`), and scenario 99 as v0.90 Open 2 described its cookie path;
+  that one isn't tested again here.
+- **3** (a partial reader at `sealed` whose rules name only `/resource`): Filtered reads scenario
+  100: `/keys` gives "its `K_view` only, never a `K_r`", and the resource log is "a JWE under that
+  `K_view`, never the stored entry JWEs": what v0.90 Open 3 described the reference doing, not
+  tested again here.
+- **7** (a blob's own URL for a partial reader): §7.9 URLs: "A resource's URLs answer in place
+  (Answers)"; HTTP-76: "At its unprefixed URLs a resource answers a partial reader in place, never
+  redirected under the prefix"; scenario 92. The reference no longer redirects a partial reader's
+  grant at a revision, `/raw` or blob URL to the view prefix: each answers in place, the blob's
+  `302` naming the latest epoch of a revision the grant may read.
+- **8** (which checks share a long-poll's budget): §6.6: "each revision judged for a filtered read
+  (§7.9), at a resource's URLs too"; scenarios 94 and 101. As the reference does.
+- **9** (the index's unfollowed namespaces at an exchange): (1) SERVICES §A.4: `404` "at its
+  exchange too, which mints no cookie and answers `404` only where no other refusal is `401` or
+  `403` (AUTH-22)": a purge's `410` is no such refusal, as the reference has it. (3) needed no
+  answer. (2), every query of a branch indexed without its base, is v0.91 Open 10.
+- **10** (an oversized grant at `/_refs`): Grant scope scenario 14: `413` (`rulesPerGrant`) at "any
+  request that doesn't ignore it (§7), an index's `GET /_refs` included, where it would otherwise
+  get the public hits", as the reference answers.
+- **11** (the index's range filters): the v0.91 change log: "The index's range filters stay out of
+  the spec", and SERVICES §A.4 Canonical URLs: "A parameter the service doesn't define … is `400`".
+  The reference drops `gt`, `ge`, `lt` and `le`: they are `400` (`bad_input`, unknown parameter)
+  like any other.
+- **12** (import batches recorded before the importer was): §G.1: "only import batches whose
+  `author` is such a principal count (§7.2), whenever written, under a grant that could `purge`
+  the names they write when written"; FED-28: "the principal being the batch's `author` (§7.2),
+  not a record kept at import"; Protection scenario 41: such batches are followed (SHOULD), or
+  "a deployment that can't rebuild the follow state may discard the batches' content instead".
+  The reference does neither for batches recorded before its importer column: Reference gap 2.
+- **13** (an undefined member an earlier draft stored): §7.4 Versions: "A config write may still
+  keep unchanged one that an earlier draft stored (Reading this spec)"; HTTP-35. As the reference
+  does.
+- **Storage 1** (a batch whose local `source` names a purged namespace): §7.5: "A local
+  `source.ns` that is purged is `410` (`purged`, with `ns` and `head`, §8.5) for any caller, at
+  step 4 of §6.2"; HTTP-47, Protection scenario 42. The reference answers so, and has trimmed
+  purged namespaces to their name and purge-ns id, which this question held up.
+- **Storage 5** (a `503 unavailable` for history in object storage): §12.1: "`unavailable` | 503 |
+  Storage the answer needs can't be reached for now (§5). `Retry-After` is set, and
+  `Cache-Control: no-store`", for any request; what the reference counts as such is v0.91 Open 6.
+- **Storage 7** (pages ending early): §7.1 Paging: a page "MAY end earlier, such as where storage
+  divides the log, only where the same URL always ends at the same entry, as ranges are
+  immutable (§9)"; scenario 110. The reference's pages end only at their bounds.
+- **Storage 9** (branch creation at an old `at`, and `/heads?at=`): §5's `503` covers any request
+  whose storage can't be reached, these among them.
 
 ## Settled in v0.90
 

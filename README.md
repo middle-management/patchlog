@@ -54,7 +54,7 @@ and serves immutable, CDN-cacheable revisions.
 | Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`, bounded by entries and by `logPageBytes`) | §6.2, §7.1–§7.2 | ✅ (`serve --log-page-size`, `--log-page-bytes`; see [Design notes](#design-notes)) |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
 | Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name, `?prefix=`), `/branches` (paged: `?after={key}`, `{ branches, next? }`, byte order of name; local branches only since v0.87) | §7.4 | ✅ |
-| `GET /ns?after={name}`: the deployment's namespaces for operators, branches and purged namespaces included, as `{ name, created, base?, frozen, purged }` in byte order of name, paged by `logPageSize`, with `?prefix=`; answered only to an operator grant whose blocks name `"*"`, that carries no roles, and whose blocks list `config` where they carry `can` and carry no rule (`403`, `401`, `403` in that order, a key-scope failure being `403`), or to anyone under `serve --dev` | §7.4, §C.4 (v0.84, v0.85) | ✅ (`client.Namespaces`, `patchlog ns ls`; see [Grants](#grants)) |
+| `GET /ns?after={name}`: the deployment's namespaces for operators, branches and purged namespaces included, as `{ name, created, base?, frozen, purged }` (a purged one's `{ name, frozen, purged }`, v0.91) in byte order of name, paged by `logPageSize`, with `?prefix=`; answered only to an operator grant whose blocks name `"*"`, that carries no roles, and whose blocks list `config` where they carry `can` and carry no rule (`403`, `401`, `403` in that order, a key-scope failure being `403`), or to anyone under `serve --dev` | §7.4, §C.4 (v0.84, v0.85) | ✅ (`client.Namespaces`, `patchlog ns ls`; see [Grants](#grants)) |
 | Files and sync clients: `Last-Modified`, `Repr-Digest` and `If-Modified-Since` on `…/rev/{id}`, and `created`, `size` and `digest` on `/heads` entries, outside E2 and E3; raw documents at `…/raw`; moves recorded as `$successor`, named by the head's `410`; whole-document appends up to `documentSize` | §6.2, §6.6, §7.1, §7.4, §7.8, §8.1 | ✅ (see [Files and sync clients](#files-and-sync-clients-71-74-78-81)) |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
@@ -400,12 +400,11 @@ principal, for every name fixed (§2.1 Qualifying role). Roles are alternatives,
 role that tests `/resource` never qualifies, even next to blocks that fix it. The answer is all
 or nothing across every grant: if any namespace a grant names doesn't exist, is purged or
 refuses it, no cookie is set, and the request is `401` if any namespace's answer is, else `403`.
-A purged namespace is decided last, once the grant verifies and may read there, so the answer is
-`410 purged` only if every refusal is a purge, with `ns` and `head` naming the first one refused
-in the order of the grants and their root blocks (v0.50). A purged namespace §7.9 doesn't
-cover answers its filtered URLs, `/ns/{ns}/g/{gs}/…`, as any other uncovered one: `401` without
-a grant that verifies there or a cookie, else `403`, its `/heads` and its live reads from the
-`purge-ns` entry included (v0.85; those were `410` before). Only then, once nothing is refused, is
+A purged namespace is refused whether or not the grant would verify there (v0.91), so the
+answer is `410 purged` only if every refusal is a purge, with `ns` and `head` naming the first
+one refused in the order of the grants and their root blocks (v0.50). Every filtered URL of a
+purged namespace, covered by §7.9 or not, is `410` too, whatever the grant or cookie (v0.91).
+Only then, once nothing is refused, is
 an exchange that would issue more than 100 distinct prefixes `400 bad_input` (v0.51; up to
 v0.50, more than 100 names were `403`): prefixes several grants give count once, and a
 namespace-wide grant counts two per namespace, `/r/{ns}` and `/ns/{ns}`. That `400` is a
@@ -1114,8 +1113,8 @@ forwarded, cookies and the service's CORS headers dropped, redirects rewritten u
 `502` while unreachable) at `/playground/index/`. One index serves several namespaces, so there is
 one URL; it waits up to two minutes for an answer, since a `?min=` query waits for the index to
 catch up. The tab picks a namespace (the ones the index's `/_status` lists, or any name), takes `q`
-and, under "Filters", the `schema`, facet and range filters (`/league=cup`, `/kickoff>=2026-10-10`,
-or the raw `facet[/league]=cup`), `sort` and `counts` (paths comma-separated, each sent as one
+and, under "Filters", the `schema` and facet filters (`/league=cup`, or the raw
+`facet[/league]=cup`), `sort` and `counts` (paths comma-separated, each sent as one
 parameter) and `limit`, and shows each hit's resource,
 `$schema`, score, facets and revision, with the checkpoint (`at`) the index redirected the query to
 (the browser follows that redirect through the proxy). A resource name opens in the Resource tab;
@@ -1374,7 +1373,7 @@ is printed on stderr as `--at AT --after TOKEN`, and `--all` follows the pages i
   value, as UTF-8 bytes, and every byte but letters, digits and `-._~` percent-encoded in
   uppercase hex (a space is `%20`, never `+`). An `at` URL is answered `200` only in that form,
   and redirected to it otherwise. Repeatable parameters (`min`,
-  `facet[…]`, range filters) are sets (v0.51): sorted, a value given twice kept once.
+  `facet[…]`) are sets (v0.51): sorted, a value given twice kept once.
   A parameter that may not repeat, given twice, is `400`, and a multi-key sort is one parameter
   with comma-separated keys, `sort=-/kickoff,/title`, as `counts=/league,/round` and `fields`
   are (F-I2 default: a JSON Pointer token with a comma can't be named there).
@@ -1399,8 +1398,8 @@ is printed on stderr as `--at AT --after TOKEN`, and `--all` follows the pages i
   name; with `q` and no `sort`, by score. A document sorts by its least value at a path, in
   either direction (F-I6 default): numbers, then strings by UTF-8 bytes (no date-time
   normalisation), then booleans, missing last; hits show every value at a sort path. The
-  `gt`/`ge`/`lt`/`le` range extensions, which the spec doesn't define, need a `sort` mark and
-  compare the least value, strings as bytes. `schema=` matches an exact `$schema`, or
+  `gt`/`ge`/`lt`/`le` range extensions are gone (v0.91: they stay out of the spec, so they are
+  `400` as any parameter the service doesn't define, §A.4). `schema=` matches an exact `$schema`, or
   `/r/{ns}/{name}` for its revisions; no other prefix matches.
 - A sealed or end-to-end namespace whose keys the index lacks is `404`, like one it doesn't
   follow, and a `min` naming it is `400`; one whose keys it can't fetch yet is `503 behind`
@@ -1647,7 +1646,9 @@ patchlog janitor --ns matches                     # purge merged/superseded/aban
   config entry or, at E3, the keyring (§F.6, v0.76): a branch whose only own entries are
   config-only batches or are for resources purged in it counts as merged, and a config-only
   batch after `source.at` doesn't fail `merged` or `superseded`. A purged namespace's `/branches` is `410` (§7.4, §8.5): the janitor and namespace
-  followers take it as having no branches. An entry with `"grant": null`
+  followers take it as having no branches. A successor purged after the branch was frozen counts
+  only with what the janitor read of it while it was live, after the freeze (v0.91: the purge
+  leaves nothing to read); otherwise the branch is kept for a manual purge. An entry with `"grant": null`
   counts, on its author alone for `merged` and `superseded` and as a `*`-key write for
   `abandoned`, only while `GET /` says `"auth": "disabled"` (asked on each check, so a janitor
   notices a restart with grants); entries without `grant` count for no one. Cleanup is opt-in:
@@ -2035,8 +2036,8 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -H 'Content-T
   resource), by default for every name it fixes; a requested name it doesn't fix or may not read
   is `403`, and `"resources": []` asks for none (§E.2.3, v0.73). Any other `read` grant, such as
   one whose role rules merely refer to `/resource` without an unrestricted role that passes, is
-  `403`. A purged namespace answers `410 purged`, with `head`, only after all of that (§8.5),
-  and a namespace that isn't sealed `404 not_offered`, which tells a limited writer there's
+  `403`. A purged namespace answers `410 purged`, with `head`, before all of that (§8.5,
+  v0.91), and a namespace that isn't sealed `404 not_offered`, which tells a limited writer there's
   nothing to seal (v0.51; it was `422`). Epochs run from the one in force at the latest `nbf`
   among all the grant's blocks, a narrowing block's included (without any `nbf`, the current
   epoch only: a grant that needs older epochs needs an `nbf`), up to the current one;
@@ -3539,7 +3540,7 @@ namespace document asks of it (see [Design notes](#design-notes)).
   unknown, pruned, purged and tombstoned ids and heads answer as the document URL does (a
   tombstoned head's `410` with `tombstone`, `last` and `successor`). In sealed and e2e
   namespaces, the e2e keyring included, both are `404 not_offered` after the read check, cached
-  as the document URL (a level is never lowered); a purged namespace's `410`, and a purged
+  as the document URL (a level is never lowered); a purged namespace's `410` (before the read check, v0.91), and a purged
   resource's (v0.73), come first (§7.1, §8.3, §8.5). The read check is the document's, so
   per-resource grants and edge grants for `/r/{ns}/{name}` cover both URLs; a `schemaReads`
   referrer opens only revision paths. The Go
@@ -3683,26 +3684,27 @@ step 6, and a role that counts for read must pass all its rules against a read e
 read does, so a role whose rule reads `/doc` or `/writes` no longer lets its grant branch or
 register a namespace it can't read (§C.2 item 2, v0.73).
 
-A purged namespace (§8.5, §12) answers `410` with `code: "purged"` and `head`, the `ns_id` of
-its `purge-ns` entry, which is the log's last (v0.49), so a consumer needn't re-read
-`/ns/{ns}`: on `/r/{ns}/…`, `/ns/{ns}/grants/…`, `/ns/{ns}/gestures/…` (sealed and e2e
-namespaces included), `POST /ns/{ns}/keys` and `/heads` at any revision, as soon as the full
-read check passes, the grant's rules included, and before any other answer to a well-formed
-request (`not_offered` and the `404` of an unknown id included; v0.50); and on every write,
-after authorisation and rate limits and before any other check: resource writes, batches (one
-with a config change after its items' authorisation), blob uploads and copies, purges, prunes,
-config writes, namespace purges and branching from it. `/ns/{ns}`
-and its log stay readable, and the log's `purge-ns` entry says what happened, except in a
-sealed namespace (v0.51): the purge destroys the epoch keys that seal its namespace documents
-and log, so `/ns/{ns}/rev/{id}`, `/ns/{ns}/rev/{id}/log`, long-polls, `/ns/{ns}/events` and a
-resource's events answer `410 purged` with `head` too, after the read check and at any id or
-`since`, rather than in the clear. In any purged namespace, events and long-polls from its
-`purge-ns` entry (`since` or `Last-Event-ID` naming it) answer `410 purged` with `head`, rather
-than an empty stream or `204` (§8.5, v0.74); the immutable `/rev/{id}/log` range is unchanged.
-`GET /ns/{ns}` still redirects, to the purge's revision,
-which is `410`, and its `head` is how a consumer learns of the purge. The name stays
-reserved: creating a namespace or branch under it is `412`, also a retry of the request that
-created a branch since purged.
+A purged namespace (§5, §8.5, §12; v0.91) keeps only its name, which stays reserved, and the
+id of its `purge-ns` entry: its log, namespace documents, resources and revisions, their ids,
+authors and grant references, blobs, keys and sealed bytes all go in the purge's transaction
+(migration `035_purged_namespaces_keep_name_and_purge_id`, `033_…` on SQLite, deletes the same
+for namespaces purged before it). Every request to `/r/{ns}/…` or `/ns/{ns}` and below, reads and
+writes, logs, events, long-polls, `/principal`, `/keys`, filtered URLs and blob uploads included,
+answers `410` with `code: "purged"` and `head`, that id, whatever the grant (none, an expired or
+unknown-key grant, one for another namespace, an operator's), right after the request's own
+shape (URL, query, headers, body) and before any other answer, `not_offered` and the `404` of an
+unknown id included. A read's `410` is cached as long and publicly, whatever the namespace's
+`read` was (`no-store` where the URL always is); a purge is no secret (§E.4). The `410` stands in
+for the `purge-ns` entry for consumers (`follow`, the index, the janitor) and followed purges
+(§10, §G.1): a namespace stream ends with or without the event. Creating a namespace or a branch
+under the name is `412`, also a retry of the request that created a branch since purged. A
+purged namespace's `GET /ns` row is `{ name, frozen: true, purged: true }`, and a purged branch's
+row in its base's `/branches` `{ name, at, frozen: true, purged: true }`, `at` from the base's
+`branch` entry. A batch whose local `source.ns` is purged is `410` (`purged`, `ns`, `head`) for
+any caller, dry runs too, at step 4, after the batch limits (§7.5); its idempotent retry, first
+recorded before the purge, still answers. Until v0.91 the namespace's documents and log stayed
+readable after a purge (but in a sealed namespace), and its other URLs answered `410` only after
+the read check.
 
 `maxTtl` is judged on the root block alone, `exp − max(now, nbf)`.
 

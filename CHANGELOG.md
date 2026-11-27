@@ -46,6 +46,52 @@ bodies as served, wire bytes and vectors are the same.
   docs/capacity/storage. Single writes measured about as fast as before (Postgres 770 → 820–960
   writes a second, SQLite 1,250 → 1,330–1,400, 30,000 writes over HTTP on an idle host).
 
+Spec v0.91: a purged namespace keeps only its name and its `purge-ns` id, two storage hooks,
+and the answers to the reference's 13 notes on v0.90.
+
+- **Purged namespaces keep only their name and `purge-ns` id (§5, §8.5).** A namespace purge
+  deletes, in its own transaction, the namespace's log, documents, resources and revisions, their
+  ids, authors and grant references, its blobs, keys, sealed bytes, follow state and view
+  records; its row keeps the name, which stays reserved, the `purge-ns` id and, for a branch, the
+  base and position its base's `/branches` row needs. Every request to `/r/{ns}/…` or `/ns/{ns}`
+  and below is then `410` (`purged`, `head` the `purge-ns` id) whatever the grant, right after the
+  request's own shape and before every other check, reads cached long and publicly (`no-store`
+  where the URL always is); only creating a namespace or branch under the name is `412`. Until
+  v0.91 the log and documents stayed readable (but in a sealed namespace) and the other URLs
+  answered `410` only after the read check, writes after authorisation and the rate limits.
+  `GET /ns` rows of a purged namespace are `{ name, frozen, purged }`, a purged branch's
+  `/branches` row `{ name, at, frozen, purged }`. The edge exchange gives `410` for a grant
+  whose refused namespaces are all purged, whether or not it would verify there.
+  **Upgrading:** migration `033_purged_namespaces_keep_name_and_purge_id` on SQLite, `035_…` on
+  Postgres, deletes the rows of the namespaces purged before it, copying their `purge-ns` id into
+  the namespace row first: one pass over each table's rows of purged namespaces. On Postgres it
+  adds `namespaces.purged_xid`, from which other instances' tailers learn of a purge whose log
+  rows are gone.
+- **Batches naming a purged source (§7.5, §G.1).** A batch whose local `source.ns` is purged is
+  `410` (`purged`, with `ns` and `head`) for any caller, dry runs too, at step 4; its idempotent
+  retry, recorded before the purge, still answers. A deployment that has followed an origin's
+  `purge-ns`, or the `410` standing for it, refuses a later import batch that counts and names
+  that origin namespace (`410`, recorded per origin and source namespace in the new table
+  `purged_sources`).
+- **`unavailable` (§5, §12.1).** Storage that can't be reached for now is `503` (`unavailable`,
+  `Retry-After: 5`, `no-store`), not `500`: the database's connection failures, and
+  `core.UnavailableError` for any tier that returns it.
+- **A resource's URLs answer a partial reader in place (§7.9).** A partial reader's grant at
+  `/r/{ns}/{name}/rev/{id}`, its `/raw` and `…/blob/{bid}` is no longer redirected under its view's
+  prefix: each answers there, a sealed blob's `302` going straight to the latest epoch of a
+  revision the grant may read.
+- **Consumers.** `follow` takes a `410` at `GET /ns/{ns}` as the `purge-ns` entry (the log is
+  gone), as it did a sealed log's; the janitor checks a successor purged after a branch was frozen
+  with what it read of the successor while it was live, after the freeze, and keeps the branch for
+  a manual purge otherwise; `merge` and `verify` report a purged branch's `410`.
+- **Index.** A purged namespace's queries, `/_refs` and exchanges answer `410` whatever the grant
+  or cookie (§A.4), the index keeping only that it is purged. The `gt`, `ge`, `lt` and `le` range
+  filters are gone: they stay out of the spec (v0.91), so they are `400` as any parameter the
+  service doesn't define. The playground's search filters take facets only.
+- **SQLite numbers.** A namespace purge frees the seqs of the namespace's last rows, which SQLite
+  may give again: the namespace-document and data-key caches are flushed after such a purge, and
+  a read that began before it caches nothing more; its second CDN purge is keyed on no entry.
+
 ## v0.34.0
 
 ### Client: a read-filtering grant is a view
