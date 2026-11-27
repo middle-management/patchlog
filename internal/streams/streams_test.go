@@ -235,13 +235,24 @@ func TestRequestKey(t *testing.T) {
 func TestUpstreamErrors(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, envOpt{options: func(o *streams.Options) {
-		// A second allowed upstream nobody listens at.
+		// A second allowed upstream that hangs up on every connection.
+		// The listener stays open, so no parallel test's server can take
+		// its port, as one could a closed listener's.
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() { ln.Close() })
+		go func() {
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				c.Close()
+			}
+		}()
 		o.Upstreams = append(o.Upstreams, "http://"+ln.Addr().String())
-		ln.Close()
 	}})
 	e.up.set(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
