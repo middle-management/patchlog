@@ -1,6 +1,6 @@
 # Patch Log — Tools
 
-Status: draft v0.90 · 2026-11-24. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
+Status: draft v0.91 · 2026-11-27. A companion to the [Patch Log specification](SPEC.md), versioned with it. Changes are listed there and in [CHANGELOG.md](CHANGELOG.md).
 
 **Scope.** Clients and tools that use the protocol's public API. A server needs nothing from this document.
 
@@ -188,7 +188,7 @@ A merge is **one batch into the base**, built from the branch's changes:
 - **Configuration is never merged implicitly.** A config change meant for the base goes in the batch's `config`.
 - **Squash** replaces a resource's steps with one set of the same effect, losing per-set history and `test` ops. Replaying is the default.
 - **Authorisation.** The batch is checked in the base under the merger's grant: the merger needs the base's verbs for every item, and the base's rules apply.
-- **Attribution.** Merged revisions, fast-forwarded or replayed, record the merger as author; the original authors stay in the branch's log (§8.5), and their signatures stay verifiable in the branch revisions `source` points at until the branch is purged (§F.6). The merger MAY carry each source revision's `gesture` and `undoes` in its steps (§7.5); squashing loses them. Where signatures are required, the merger signs its own steps (§C.3.1).
+- **Attribution.** Merged revisions, fast-forwarded or replayed, record the merger as author; the original authors stay in the branch's log, and their signatures verifiable in the branch revisions `source` points at, until the branch is purged (§8.5, §F.6). The merger MAY carry each source revision's `gesture` and `undoes` in its steps (§7.5); squashing loses them. Where signatures are required, the merger signs its own steps (§C.3.1).
 
 ## F.4 Stacked branches
 
@@ -216,7 +216,7 @@ To bring `release-7` up to date with `matches`:
 |--------|--------------------------------------------------------------------|---------------|
 | Live   | a working branch                                                   | —             |
 | Frozen | merged (`merged`) or superseded (`successor`), readable for review | yes: unfreeze |
-| Purged | content gone, as in §8.5; name reserved                            | no            |
+| Purged | all gone but the reserved name and `purge-ns` id (§8.5)            | no            |
 
 - **Cleanup** is data in the branch's namespace document (`cleanup`, §12.3), which the core doesn't enforce. Without it, the janitor never purges the branch.
 
@@ -372,7 +372,7 @@ The rest of Addendum G is in [SPEC.md](SPEC.md): its principles (§G.1), the bun
 A consumer in another network or organisation works as in §10, plus:
 
 - **Checkpoint.** It stores `(origin, ns, ns_id)`.
-- **Verification.** Revisions are verified through their log (`/r/{ns}/{name}/rev/{id}/log`), by recomputing ids back to a revision already verified, and the namespace chain entry by entry from the checkpoint (below a pruning horizon, §8.6). A consumer SHOULD verify, and MUST when it fetches through a cache or mirror it doesn't control.
+- **Verification.** Revisions are verified through their log (`/r/{ns}/{name}/rev/{id}/log`), by recomputing ids back to a revision already verified, and the namespace chain entry by entry from the checkpoint (below a pruning horizon, §8.6). A consumer SHOULD verify, and MUST when it fetches through a cache or mirror it doesn't control. Such a consumer confirms a `410` (`purged`), which carries nothing to verify, at the origin before dropping anything (§10).
 - **Access.** Public namespaces need nothing; private ones need a `read` grant from the source deployment, and the consumer then holds a copy (§G.1).
 
 ### G.4.2 Selection and dependencies
