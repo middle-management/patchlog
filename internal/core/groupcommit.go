@@ -143,6 +143,12 @@ type groupWrite struct {
 	isBatch bool
 	plan    *writePlan
 	deps    *writeDeps
+	// drawn, when set, sends the outcome of the write's rate draws, still
+	// running when it queued (checkDrawing); the worker waits for it
+	// before taking the write into a transaction, and a refusal is drawErr,
+	// the write's answer.
+	drawn   <-chan error
+	drawErr error
 	// Set by the worker before done is closed: the write's result, or
 	// alone if it must be answered on its own (above).
 	res   *WriteResult
@@ -245,14 +251,14 @@ func (e *Engine) writeGrouped(ctx context.Context, req Request, items []Item, so
 		}
 	}()
 
-	plan, deps, res, err := e.checkOutside(ctx, req, items, source, isBatch, false)
+	plan, deps, res, drawn, err := e.checkDrawing(ctx, req, items, source, isBatch, false, e.spanner)
 	if err != nil || res != nil {
 		return res, err
 	}
 	if h := e.opt.BeforeWriteLock; h != nil {
 		h()
 	}
-	w := &groupWrite{ctx: ctx, req: req, items: items, source: source, isBatch: isBatch, plan: plan, deps: deps, done: make(chan struct{})}
+	w := &groupWrite{ctx: ctx, req: req, items: items, source: source, isBatch: isBatch, plan: plan, deps: deps, drawn: drawn, done: make(chan struct{})}
 	g.mu.Lock()
 	checking = false
 	s.checking--
@@ -275,6 +281,9 @@ func (e *Engine) writeGrouped(ctx context.Context, req Request, items []Item, so
 		// In a group already: it commits or not, and is cancelled once all
 		// of its writes are. Its outcome is this write's.
 		<-w.done
+	}
+	if w.drawErr != nil {
+		return nil, w.drawErr
 	}
 	if w.alone {
 		g.alone.Add(1)
@@ -378,6 +387,9 @@ func (e *Engine) groupWorker(ns string, s *nsGroup) {
 		}
 		group := s.take(n)
 		g.mu.Unlock()
+		if group = awaitDraws(group); len(group) == 0 {
+			continue
+		}
 		end := e.spTurn(s)
 		e.commitGroup(ns, group)
 		end()
@@ -385,6 +397,26 @@ func (e *Engine) groupWorker(ns string, s *nsGroup) {
 			close(w.done)
 		}
 	}
+}
+
+// awaitDraws waits for the rate draws of a group's writes still drawing
+// (checkDrawing), answers those refused, and returns the others. They
+// were drawing while the group before them committed, so most are done.
+func awaitDraws(group []*groupWrite) []*groupWrite {
+	out := group[:0]
+	for _, w := range group {
+		if w.drawn != nil {
+			if err := <-w.drawn; err != nil {
+				w.drawErr = err
+				close(w.done)
+				continue
+			}
+			w.drawn = nil
+		}
+		out = append(out, w)
+	}
+	clear(group[len(out):])
+	return out
 }
 
 // groupRuns bounds how often a group's transaction runs again after

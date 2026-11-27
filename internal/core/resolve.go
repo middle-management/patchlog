@@ -147,6 +147,16 @@ func (t *tx) memoByID(k revIDKey, r *revRow) {
 // A namespace read through a base isn't helped below its own row (resolve
 // reads the base's rows as before), but costs no more.
 func (t *tx) lookupResource(name, res string, want *ids.ID, full bool) *nsRow {
+	var gen uint64
+	cache := t.e.spanner && !t.write && !full
+	if cache {
+		if t.nsCache {
+			if n, ok := t.lookupCached(name, res, want); ok {
+				return n
+			}
+		}
+		gen = t.e.nsc.generation()
+	}
 	var idArg any
 	if want != nil {
 		idArg = want[:]
@@ -183,6 +193,9 @@ func (t *tx) lookupResource(name, res string, want *ids.ID, full bool) *nsRow {
 	}
 	t.must(err)
 	n.configSeq = cfg.Int64
+	if cache {
+		t.e.nsc.put(n, gen, t.now)
+	}
 	r := nr.row()
 	t.memoRes(resKey{n.id, res}, r)
 	if h := hr.row(); h != nil {

@@ -154,9 +154,15 @@ func (t *tx) recheckIn(p *writePlan, d *writeDeps, nss map[int64]*nsRow) (*nsRow
 	for _, id := range d.order {
 		cur := nss[id]
 		if cur == nil {
+			if t.e.spanner {
+				t.e.nsc.drop(d.ns[id].name)
+			}
 			return nil, false
 		}
 		if !sameNS(d.ns[id], cur) {
+			if t.e.spanner {
+				t.e.nsc.drop(d.ns[id].name)
+			}
 			return nil, false
 		}
 		if id == p.n.id {
@@ -228,11 +234,28 @@ func (e *Engine) writeOptimistic(ctx context.Context, req Request, items []Item,
 // as before. Only a check that stopped at a bucket known empty
 // (errDrawFirst) runs again, once its draw admits it, not drawing again.
 func (e *Engine) checkOutside(ctx context.Context, req Request, items []Item, source any, isBatch, rateDrawn bool) (*writePlan, *writeDeps, *WriteResult, error) {
+	plan, deps, res, _, err := e.checkDrawing(ctx, req, items, source, isBatch, rateDrawn, false)
+	return plan, deps, res, err
+}
+
+// checkDrawing is checkOutside, and with async, for a write that passed
+// its check, the draws on the store's rate buckets run while the write
+// queues for its group, the outcome sent on drawn (nil when there were
+// none). The write must not commit before an outcome of nil: that is the
+// group worker's wait (awaitDraws). On Spanner a draw is a transaction of
+// two round trips on rows every write of a principal locks, and a
+// namespace's group waits its turn for longer than that (docs/SPANNER.md).
+func (e *Engine) checkDrawing(ctx context.Context, req Request, items []Item, source any, isBatch, rateDrawn, async bool) (*writePlan, *writeDeps, *WriteResult, <-chan error, error) {
+	// A check may read namespace rows from the engine's cache on Spanner
+	// (spnscache.go): if one that did refuses or answers, it runs again
+	// without, so a stale row never decides a write.
+	useCache := e.spanner
 	for {
 		var plan *writePlan
 		var deps *writeDeps
 		var res *WriteResult
 		var later *drawLater
+		cached := false
 		var now time.Time
 		// Whether the check drew its tokens: from the engine's own buckets
 		// at once, so a check run again (readOne) doesn't draw them twice;
@@ -245,6 +268,8 @@ func (e *Engine) checkOutside(ctx context.Context, req Request, items []Item, so
 		err := e.readOne(ctx, req.NS, func(t *tx) error {
 			t.deps = newWriteDeps()
 			deps = t.deps
+			t.nsCache = useCache
+			defer func() { cached = t.nsCached }()
 			if later != nil {
 				drawn = false
 			}
@@ -259,12 +284,29 @@ func (e *Engine) checkOutside(ctx context.Context, req Request, items []Item, so
 			plan, res = p, r
 			return err
 		})
+		if cached && (err != nil || res != nil) && ctx.Err() == nil {
+			// Its draws were only recorded (later), and the run again
+			// records them afresh; the engine's own buckets it drew from
+			// once (drawn).
+			useCache = false
+			if drawn && later == nil {
+				rateDrawn = true
+			}
+			continue
+		}
+		if async && err == nil && res == nil && later != nil && len(later.draws) > 0 && !later.first && ctx.Err() == nil {
+			// Passed: drawn while the write queues (checkDrawing).
+			e.packPlan(plan)
+			out := make(chan error, 1)
+			go func(l *drawLater) { out <- e.drawAfter(ctx, now, l) }(later)
+			return plan, deps, nil, out, nil
+		}
 		// Drawn whatever the check found after its draw, an internal
 		// error too, as inside the transaction, unless the request is
 		// gone.
 		if later != nil && len(later.draws) > 0 && ctx.Err() == nil {
 			if derr := e.drawAfter(ctx, now, later); derr != nil {
-				return nil, nil, nil, derr
+				return nil, nil, nil, nil, derr
 			}
 			if later.first {
 				// Admitted after all: the whole check, its tokens drawn.
@@ -277,7 +319,7 @@ func (e *Engine) checkOutside(ctx context.Context, req Request, items []Item, so
 			// After the read transaction too: compressing is CPU only.
 			e.packPlan(plan)
 		}
-		return plan, deps, res, err
+		return plan, deps, res, nil, err
 	}
 }
 

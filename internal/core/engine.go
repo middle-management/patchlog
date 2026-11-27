@@ -257,11 +257,14 @@ type Engine struct {
 	spanner     bool
 	spSeqs      *seqGen
 	leaseHolder string
-	opt         Options
-	mu          sync.Mutex // serialises write transactions
-	blobs       blobStore
-	validator   *schema.Validator
-	validated   validatedDocs // revisions this engine found valid (validateStep)
+	// nsc are, on Spanner, the namespace rows writes' checks read
+	// (spnscache.go).
+	nsc       nsCache
+	opt       Options
+	mu        sync.Mutex // serialises write transactions
+	blobs     blobStore
+	validator *schema.Validator
+	validated validatedDocs // revisions this engine found valid (validateStep)
 	// How many typed documents step 5 validated in full, and by their
 	// changes (ValidationCounts).
 	validatedFull, validatedChange atomic.Int64
@@ -752,6 +755,9 @@ type tx struct {
 	// deps, when set, records what a write's check phase read that a
 	// concurrent write could change (D.3 re-check).
 	deps *writeDeps
+	// nsCache lets a write's check on Spanner read namespace rows from
+	// the engine's nsc, and nsCached records that it did (spnscache.go).
+	nsCache, nsCached bool
 	// schemas are the schema paths resolved in this transaction, per
 	// writer (loadSchema).
 	schemas map[schemaKey]schemaLoaded
@@ -1136,6 +1142,9 @@ func (e *Engine) invalidate(inv invalidation, seen bool) {
 	}
 	if inv.flushEpochKeys {
 		e.ekeys.flush()
+	}
+	if inv.meta && e.spanner {
+		e.nsc.flush()
 	}
 	if inv.flushDEKs {
 		e.deks.flush()
