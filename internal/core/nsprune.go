@@ -55,6 +55,9 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
 		}
+		if n.purged {
+			return t.purgedNS(n) // before every check (§8.5)
+		}
 		cfg := t.config(n.configSeq)
 		a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
 		if aerr != nil {
@@ -70,11 +73,7 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		if err := t.rateLimit(n, cfg, a, []string{name}, 1); err != nil {
 			return err
 		}
-		// 410 after authorisation and the rate limits, like every write
-		// (§6.2 step 2.1, §8.5); then a purged resource's 410 (§8.3).
-		if n.purged {
-			return t.purgedNS(n)
-		}
+		// A purged resource's 410 (§8.3).
 		v := t.resolve(n, name, nil)
 		if v.state == Purged {
 			return gone()

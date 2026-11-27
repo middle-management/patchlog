@@ -337,17 +337,16 @@ func TestV076OriginUncoveredFiltered401(t *testing.T) {
 	}
 }
 
-// §7.9 Purged covered namespaces (v0.85, scenario 141): only a purged
-// namespace this section covers answers its filtered URLs as §8.5 answers
-// their unfiltered forms. One it doesn't cover answers every one of them
-// as any other uncovered namespace does, 401 without a grant that
-// verifies there or a cookie, else 403, never 410: its /heads, at an at
-// or without, and long-poll and events from the purge-ns entry included,
-// which were 410 before v0.85, as its unfiltered /heads still is.
+// §7.9 Purged namespaces, §8.5 (v0.91): a purged namespace, covered by
+// §7.9 or not, answers 410 at every one of its URLs, filtered or not,
+// whatever the grant, without credentials too. From v0.85 to v0.90 one
+// §7.9 doesn't cover answered its filtered URLs 401 or 403, as any
+// uncovered namespace.
 func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
 	ctx := context.Background()
+	purges := map[string]string{}
 	for _, ns := range []string{"pub", "priv"} {
 		read := "grant"
 		if ns == "pub" {
@@ -357,9 +356,11 @@ func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
 		w.admin = w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:r", "ns": []any{ns}, "can": []any{"config", "read"}})
 		w.patchConfig(ns, map[string]any{"op": "add", "path": "/frozen", "value": true})
 		op := w.cred(w.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{ns}, "can": []any{"purge-ns"}})
-		if _, err := w.e.PurgeNamespace(ctx, Request{NS: ns, Cred: op}, w.head(ns), true); err != nil {
+		id, err := w.e.PurgeNamespace(ctx, Request{NS: ns, Cred: op}, w.head(ns), true)
+		if err != nil {
 			t.Fatal(err)
 		}
+		purges[ns] = id
 	}
 	vid := grantcheck.ViewID([]string{"group:editors"})
 	reader := func(ns string) Credentials {
@@ -370,13 +371,13 @@ func TestV076OriginPurgedUncoveredFiltered(t *testing.T) {
 		cred       Credentials
 		heads, log int // the unfiltered /heads; every filtered form
 	}{
-		{"public, no credentials", "pub", Credentials{}, 410, 401},
-		{"public, a grant that verifies there", "pub", reader("pub"), 410, 403},
-		{"private, no credentials", "priv", Credentials{}, 401, 401},
-		{"private, a grant that reads there", "priv", reader("priv"), 410, 403},
+		{"public, no credentials", "pub", Credentials{}, 410, 410},
+		{"public, a grant that verifies there", "pub", reader("pub"), 410, 410},
+		{"private, no credentials", "priv", Credentials{}, 410, 410},
+		{"private, a grant that reads there", "priv", reader("priv"), 410, 410},
 	} {
 		w.admin = w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:r", "ns": []any{c.ns}, "can": []any{"read"}})
-		purge := w.head(c.ns)
+		purge := purges[c.ns]
 		_, uerr := w.e.NamespaceHeads(ctx, c.ns, purge, "", c.cred)
 		if v75Status(uerr) != c.heads {
 			t.Fatalf("%s: unfiltered /heads %v, want %d", c.name, uerr, c.heads)

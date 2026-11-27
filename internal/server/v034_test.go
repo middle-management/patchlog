@@ -225,12 +225,15 @@ func TestV034ForcedNamespacePurge(t *testing.T) {
 	expect(t, e.patchNS("schemas-r7", ops(op("add", "/frozen", true)), ""), 201)
 	head := e.nsHead("schemas-r7")
 	expectCode(t, e.do(req{method: "POST", path: "/ns/schemas-r7/purge", ifMatch: head, author: "admin"}), 409, "in_use")
-	expect(t, e.do(req{method: "POST", path: "/ns/schemas-r7/purge?force=1", ifMatch: head, author: "admin"}), 204)
-	lg := e.get("/ns/schemas-r7/rev/" + e.nsHead("schemas-r7") + "/log?since=" + head).Arr()
-	en := lg[0].(map[string]any)
-	if en["kind"] != "purge-ns" || en["forced"] != true || en["id"] != hashID(t, head, canonical(map[string]any{"kind": "purge-ns", "forced": true})) {
-		t.Fatalf("forced purge-ns entry %v", en)
+	r := e.do(req{method: "POST", path: "/ns/schemas-r7/purge?force=1", ifMatch: head, author: "admin"})
+	expect(t, r, 204)
+	// The entry itself is gone with the namespace (§5, v0.91); its id,
+	// which every later 410 names, is over its body, forced: true.
+	id := r.H.Get("X-Namespace-Revision")
+	if id != hashID(t, head, canonical(map[string]any{"kind": "purge-ns", "forced": true})) {
+		t.Fatalf("forced purge-ns entry %s", id)
 	}
+	expectPurged(t, e.get("/ns/schemas-r7"), id)
 }
 
 // D.8 (v0.34): blob uploads hold their namespace's lock only shared; an

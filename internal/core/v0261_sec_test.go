@@ -11,10 +11,13 @@ import (
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
-// Security review of v0.26.0: a covered purged namespace's filtered /heads
-// (FilteredCurrent, FilteredHeads after purgedHeadsCheck) must answer a
-// reader owed 401/403 as the same namespace unpurged does: no 410 that
-// shows the purge (or the namespace) to someone the read check refuses.
+// Security review of v0.26.0, as v0.91 answers it: a covered purged
+// namespace's filtered /heads (FilteredCurrent, FilteredHeads) answers
+// 410 purged to every request, whatever the grant or cookie and whatever
+// the live namespace would answer, before any read check: a purge, unlike
+// existence, is no secret, and no key is left to verify a grant with
+// (§8.5, §7.9 Purged namespaces, §E.4). Until v0.91 a reader owed 401/403
+// got that answer, never the 410.
 func TestV0261FilteredPurgedHeadsDifferential(t *testing.T) {
 	ctx := context.Background()
 	type world struct {
@@ -80,8 +83,8 @@ func TestV0261FilteredPurgedHeadsDifferential(t *testing.T) {
 				ep := call(purged, purged.creds[who], g(purged), purged.at)
 				sl, sp := v75Status(el), v75Status(ep)
 				t.Logf("%-8s %-11s vid=%s: live %d, purged %d", cn, who, viewKind, sl, sp)
-				if sp == 410 {
-					t.Errorf("%s %s with %s's vid: purged answers 410 (%v), the live namespace %d (%v)", cn, who, viewKind, ep, sl, el)
+				if sp != 410 || v75Code(ep) != "purged" {
+					t.Errorf("%s %s with %s's vid: purged answers %d (%v), want 410 purged; the live namespace %d (%v)", cn, who, viewKind, sp, ep, sl, el)
 				}
 			}
 		}

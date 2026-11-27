@@ -201,9 +201,8 @@ func TestV081AccessNowKeysE3Public(t *testing.T) {
 
 // §C.2 item 5, §7.9 Partial reader (ACCESS-2): a grant with a block
 // rule on /now is no partial reader. At an unfiltered URL of covered
-// matches it is 403 at once, never a 302 to a filtered URL; and on a
-// purged matches its gestures listing is 403, not the 410 of a read that
-// passed the check.
+// matches it is 403 at once, never a 302 to a filtered URL; on a purged
+// matches its gestures listing is 410, whatever the grant (v0.91).
 func TestV081AccessNowNoPartialReader(t *testing.T) {
 	t.Parallel()
 	w := newV75s(t, v75sOpts{})
@@ -220,7 +219,7 @@ func TestV081AccessNowNoPartialReader(t *testing.T) {
 		"exp": w.clock.Now().Add(time.Hour).Format(time.RFC3339)})
 	expect(t, w.patchNS("matches", ops(op("add", "/frozen", true)), w.admin), 201)
 	expect(t, w.do(req{method: "POST", path: "/ns/matches/purge?force=1", ifMatch: w.nsHead("matches", w.admin), bearer: opg}), 204)
-	expectCode(t, w.get("/ns/matches/gestures/"+gA, now), 403, "forbidden")
+	expectCode(t, w.get("/ns/matches/gestures/"+gA, now), 410, "purged")
 	expectCode(t, w.get("/ns/matches/gestures/"+gA, w.li()), 410, "purged")
 }
 

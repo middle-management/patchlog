@@ -28,17 +28,10 @@ func (w *v75s) v87Doc(ns, name string, doc map[string]any) string {
 	return w.put(ns, name, doc)
 }
 
-// v87Follow follows a 302 with the same grant.
-func (w *v75s) v87Follow(r *resp, bearer string) *resp {
-	w.t.Helper()
-	expect(w.t, r, 302)
-	return w.get(r.H.Get("Location"), bearer)
-}
-
 // RUL-8 / AUTH-31: doc in read envelopes. A grant whose block rule tests
 // /doc/team reads, at a resource's URLs, only the revisions whose
 // documents pass: the head for /r/{ns}/{name}, that revision for
-// /rev/{id} (under its view, a partial reader's), a tombstone's deleted
+// /rev/{id} (in place, v0.91), a tombstone's deleted
 // document, a blob's referencing documents; pruned and never judged,
 // null.
 func TestV087DocEnvelopes(t *testing.T) {
@@ -52,10 +45,10 @@ func TestV087DocEnvelopes(t *testing.T) {
 	// The head says b: a read-rule failure, 404.
 	expect(t, w.get("/r/matches/x", g), 404)
 	// /rev/{id}: under the view, that revision's document decides.
-	if r := w.v87Follow(w.get("/r/matches/x/rev/"+a1, g), g); r.Code != 200 || !strings.Contains(string(r.Body), `"a"`) {
+	if r := w.get("/r/matches/x/rev/"+a1, g); r.Code != 200 || !strings.Contains(string(r.Body), `"a"`) {
 		t.Fatalf("x at a1 under the view: %d %s", r.Code, r.Body)
 	}
-	expect(t, w.v87Follow(w.get("/r/matches/x/rev/"+b2, g), g), 404)
+	expect(t, w.get("/r/matches/x/rev/"+b2, g), 404)
 
 	// A tombstone's read envelope carries the document it deleted.
 	w.v87Doc("matches", "y", map[string]any{"team": "a"})
@@ -72,14 +65,14 @@ func TestV087DocEnvelopes(t *testing.T) {
 	p2 := w.v87Doc("matches", "p", map[string]any{"team": "a", "v": 2.0})
 	q1 := w.v87Doc("matches", "q", map[string]any{"team": "a"})
 	q2 := w.v87Doc("matches", "q", map[string]any{"team": "a", "v": 2.0})
-	expect(t, w.v87Follow(w.get("/r/matches/p/rev/"+p1, g), g), 200)
+	expect(t, w.get("/r/matches/p/rev/"+p1, g), 200)
 	w.clock.Advance(10 * time.Minute)
 	expect(t, w.prune("matches", "p", map[string]any{"horizon": p2}, adminP), 200)
 	expect(t, w.prune("matches", "q", map[string]any{"horizon": q2}, adminP), 200)
-	if r := w.v87Follow(w.get("/r/matches/p/rev/"+p1, g), g); r.Code != 410 || !strings.Contains(string(r.Body), "pruned") {
+	if r := w.get("/r/matches/p/rev/"+p1, g); r.Code != 410 || !strings.Contains(string(r.Body), "pruned") {
 		t.Fatalf("a judged revision once pruned: %d %s, want 410 pruned", r.Code, r.Body)
 	}
-	expect(t, w.v87Follow(w.get("/r/matches/q/rev/"+q1, g), g), 404)
+	expect(t, w.get("/r/matches/q/rev/"+q1, g), 404)
 
 	// A blob: readable where a stored document referencing it passes,
 	// else as the head.
@@ -88,14 +81,14 @@ func TestV087DocEnvelopes(t *testing.T) {
 	ref := map[string]any{"$blob": bid, "type": "text/plain", "size": float64(len(data))}
 	w.v87Doc("matches", "f", map[string]any{"team": "a", "file": ref})
 	w.v87Doc("matches", "f", map[string]any{"team": "b", "file": ref})
-	if r := w.v87Follow(w.get("/r/matches/f/blob/"+bid, g), g); r.Code != 200 || string(r.Body) != "hello" {
+	if r := w.get("/r/matches/f/blob/"+bid, g); r.Code != 200 || string(r.Body) != "hello" {
 		t.Fatalf("a blob a visible revision references: %d %s", r.Code, r.Body)
 	}
 	bid2 := w.upload("matches", "h", "text/plain", []byte("other"), w.admin)
 	ref2 := map[string]any{"$blob": bid2, "type": "text/plain", "size": 5.0}
 	w.v87Doc("matches", "h", map[string]any{"team": "b", "file": ref2})
 	w.v87Doc("matches", "h", map[string]any{"team": "a"})
-	expect(t, w.v87Follow(w.get("/r/matches/h/blob/"+bid2, g), g), 404)
+	expect(t, w.get("/r/matches/h/blob/"+bid2, g), 404)
 	// Blob-From: a copy from h takes nothing only hidden revisions
 	// reference.
 	if r := w.copyBlob("matches", "x", bid2, "/r/matches/h/blob/"+bid2, "", g); r.Code != 404 && r.Code != 403 {
@@ -222,13 +215,13 @@ func TestV087RouteTable(t *testing.T) {
 	table := map[string]want{
 		"/{$}":                                       filtered, // the root
 		"/r/{ns}/{name}":                             {codes: []int{302}, loc: "/r/matches/doc/rev/"},
-		"/r/{ns}/{name}/rev/{id}":                    redirect,
+		"/r/{ns}/{name}/rev/{id}":                    filtered, // in place (v0.91)
 		"/r/{ns}/{name}/rev/{id}/log":                filtered,
 		"/r/{ns}/{name}/raw":                         {codes: []int{404}},
-		"/r/{ns}/{name}/rev/{id}/raw":                redirect,
+		"/r/{ns}/{name}/rev/{id}/raw":                {codes: []int{404}}, // in place (v0.91): not a raw document
 		"/r/{ns}/{name}/log":                         filtered,
 		"/r/{ns}/{name}/events":                      filtered,
-		"/r/{ns}/{name}/blob/{bid}":                  redirect,
+		"/r/{ns}/{name}/blob/{bid}":                  filtered, // in place (v0.91)
 		"/r/{ns}/{name}/blob/{bid}/e/{e}":            {codes: []int{404}},
 		"/ns":                                        refused,
 		"/ns/{ns}":                                   {codes: []int{302}, loc: "/ns/matches/rev/"},

@@ -2,8 +2,6 @@ package core
 
 import (
 	"context"
-
-	"github.com/middle-management/patchlog/internal/ids"
 )
 
 // The read paths of filtered namespace reads (§7.9 Answers, URLs): a
@@ -62,6 +60,11 @@ func (t *tx) filteredOpen(ns string, cred Credentials) (*nsRow, *fscope, error) 
 	if n == nil {
 		return nil, nil, t.absentNS(ns, cred)
 	}
+	if n.purged {
+		// Covered or not, whatever the grant or cookie (§7.9 Purged
+		// namespaces, §8.5, v0.91).
+		return nil, nil, t.purgedRead(n)
+	}
 	fs := t.filteredScope(n)
 	if fs == nil {
 		if _, _, _, err := t.nsAccess(n, cred); err != nil {
@@ -74,20 +77,6 @@ func (t *tx) filteredOpen(ns string, cred Credentials) (*nsRow, *fscope, error) 
 		return nil, nil, forbidden(ns + " isn't read filtered here (§7.9 Where)")
 	}
 	return n, fs, nil
-}
-
-// fromPurgeEntry reports whether since names purged n's purge-ns entry,
-// the log's last: events and long-poll from it are 410 (§8.5).
-func (t *tx) fromPurgeEntry(n *nsRow, since string) bool {
-	if !n.purged || since == "" {
-		return false
-	}
-	id, err := ids.Parse(since)
-	if err != nil {
-		return false
-	}
-	s, ok := t.nsLogSeq(n.id, id)
-	return ok && s == n.headSeq.Int64
 }
 
 // grantVerifiesIn reports whether the grant in Authorization verifies in
@@ -148,16 +137,9 @@ func (t *tx) filteredCurrentRedirect(n *nsRow, fs *fscope, view string, cred Cre
 // staying readable. It never returns nil.
 func (e *Engine) FilteredCurrent(ctx context.Context, ns, view, suffix string, cred Credentials) error {
 	return e.read(ctx, func(t *tx) error {
-		heads := suffix == "/heads"
 		n, fs, err := t.filteredOpen(ns, cred)
 		if err != nil {
 			return err
-		}
-		if heads && n.purged {
-			if aerr := t.purgedHeadsCheck(n, fs, view, t.filteredCurrent(fs), cred); aerr != nil {
-				return aerr
-			}
-			return t.purgedRead(n)
 		}
 		return t.filteredCurrentRedirect(n, fs, view, cred)
 	})
@@ -180,13 +162,9 @@ func (e *Engine) FilteredHeads(ctx context.Context, ns, view, at, after, prefix 
 		}
 	}()
 	err = e.read(ctx, func(t *tx) error {
-		n, fv, cp, err := t.filteredHeadsView(ns, view, at, cred)
+		n, fv, err := t.filteredAtView(ns, view, at, cred)
 		if err != nil {
 			return err
-		}
-		if n.purged {
-			info = &FilteredInfo{View: view, At: cp.at}
-			return t.purgedRead(n)
 		}
 		info = filteredInfo(fv)
 		asOf := fv.CP().seq
@@ -213,53 +191,6 @@ func (e *Engine) FilteredHeads(ctx context.Context, ns, view, at, after, prefix 
 	return page, info, err
 }
 
-// filteredHeadsView is filteredAtView for /heads, except that a purged
-// namespace's request at an at filteredAt can't answer is judged at the
-// current checkpoint instead of redirected there, so that it answers 410
-// as soon as the read check passes, as the unfiltered /heads of a purged
-// namespace does at any revision (§8.5, §7.9 Purged namespaces). Log
-// ranges keep the redirect: a purged namespace's range stays readable. For
-// a purged namespace it returns the checkpoint judged at and no view: the
-// read check is purgedHeadsCheck's, and the answer 410.
-func (t *tx) filteredHeadsView(ns, view, at string, cred Credentials) (*nsRow, *fview, *fcp, error) {
-	n, fs, err := t.filteredOpen(ns, cred)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	cp, ok := t.filteredAt(fs, at)
-	if !ok {
-		if !n.purged {
-			return nil, nil, nil, t.filteredCurrentRedirect(n, fs, view, cred)
-		}
-		cp = t.filteredCurrent(fs)
-	}
-	if n.purged {
-		if aerr := t.purgedHeadsCheck(n, fs, view, cp, cred); aerr != nil {
-			return nil, nil, nil, aerr
-		}
-		return n, nil, cp, nil
-	}
-	fv, aerr := t.filteredAdmit(n, fs, view, cp, cred)
-	if aerr != nil {
-		return nil, nil, nil, aerr
-	}
-	return n, fv, cp, nil
-}
-
-// purgedHeadsCheck is the read check of a filtered /heads of purged
-// covered n at cp, which then answers 410 purged: the URL's own, its view
-// included (§7.9 Purged namespaces: "once the URL's read check passes,
-// its view included"), so filteredAdmit's, as for a live namespace. A
-// partial reader's grant passes at its own view and is 403 at another, a
-// cookie is judged as that view's, and a grant that reads n unrestricted is
-// 403 here as at any filtered URL (§7.9 Partial reader: "At filtered
-// ones their grant in Authorization is 403"): its 410 is at the
-// unfiltered /heads. Before v0.82 such a grant passed at any view.
-func (t *tx) purgedHeadsCheck(n *nsRow, fs *fscope, view string, cp *fcp, cred Credentials) *Error {
-	_, err := t.filteredAdmit(n, fs, view, cp, cred)
-	return err
-}
-
 // headShown reports whether /heads lists name, as v resolves it, to fv
 // (§7.9 /heads): a live head where its revision is visible, a tombstone
 // where the document it deleted is, a purge where its entry is shown.
@@ -268,27 +199,4 @@ func (t *tx) headShown(fv *fview, name string, v *view) bool {
 		return fv.purgeShown(name)
 	}
 	return fv.visible(t, name, v.head)
-}
-
-// contentRedirect is the redirect of a partial reader's request, with its
-// grant in Authorization, at a resource's immutable URL, the one ending
-// in content after its name (/rev/{id}, /rev/{id}/raw, /blob/{bid}), to
-// its form under the reader's view (§7.9 Content, URLs): a
-// *FilteredRedirect, or nil for any other request, which the URL serves
-// itself. Heads stay at their own URLs.
-func (t *tx) contentRedirect(n *nsRow, cred Credentials, a *actor, name, content string) error {
-	if cred.viewed != nil || cred.Bearer == "" || a == nil || a.verified == nil || n.purged {
-		// A purged namespace's URLs answer 410 without the 302, as its
-		// /heads does (§7.9 Purged namespaces, §8.5).
-		return nil
-	}
-	fs := t.filteredScope(n)
-	if fs == nil || t.readsNS(n, t.config(n.configSeq), a, false) || !t.partialReader(a) {
-		return nil
-	}
-	fv, err := t.grantView(fs, t.filteredCurrent(fs), a)
-	if err != nil {
-		return err
-	}
-	return &FilteredRedirect{NS: n.name, View: fv.view, Content: "/r/" + name + content}
 }

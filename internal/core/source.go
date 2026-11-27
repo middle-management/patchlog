@@ -9,8 +9,11 @@ import "github.com/middle-management/patchlog/internal/ids"
 // other caller's local source is recorded unchecked and makes no blobs
 // available, so the check reveals nothing about a namespace it can't read.
 // A source.origin that is this deployment's own is 422 source for any
-// caller.
-func (t *tx) checkSource(req Request, v any) (any, *batchSource, *Error) {
+// caller. A local source.ns that is purged is 410 purged, with ns and
+// head, for any caller (§7.5, §8.5, v0.91), and so is another
+// deployment's whose purge-ns this deployment has followed, for a batch
+// that counts there (followedPurgeOf, §G.1).
+func (t *tx) checkSource(req Request, v any, n *nsRow, a *actor, st []*itemState) (any, *batchSource, *Error) {
 	m, ok := v.(map[string]any)
 	if !ok {
 		return nil, nil, invalid("source must be an object")
@@ -32,10 +35,18 @@ func (t *tx) checkSource(req Request, v any) (any, *batchSource, *Error) {
 			// For any caller: it reveals nothing (§7.5, §12.1).
 			return nil, nil, apiErr(422, "source", "message", "source.origin is this deployment's own")
 		}
+		if pe := t.followedPurgeOf(m, n, a, st); pe != nil {
+			return nil, nil, pe
+		}
 		return m, nil, nil // another deployment's blobs are uploaded
 	}
 	sn := t.nsByName(ns)
-	if sn == nil || sn.purged || !t.sourceUnrestricted(sn, req) {
+	if sn != nil && sn.purged {
+		pe := t.purgedNS(sn)
+		pe.Body["ns"] = ns
+		return nil, nil, pe
+	}
+	if sn == nil || !t.sourceUnrestricted(sn, req) {
 		return m, nil, nil
 	}
 	id, err := ids.Parse(at)

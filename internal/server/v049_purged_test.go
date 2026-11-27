@@ -22,16 +22,18 @@ func (e *tenv) nsPurge(ns string) string {
 	expect(e.t, e.patchNS(ns, ops(op("add", "/frozen", true)), ""), 201)
 	r := e.do(req{method: "POST", path: "/ns/" + ns + "/purge", ifMatch: e.nsHead(ns), author: "admin"})
 	expect(e.t, r, 204)
-	head := e.nsHead(ns)
-	if lastOf(e.nsKinds(ns)) != "purge-ns" {
-		e.t.Fatalf("log %v", e.nsKinds(ns))
-	}
+	head := r.H.Get("X-Namespace-Revision")
+	// All it keeps but its name, which every request's 410 names (§5,
+	// §8.5, v0.91).
+	expectPurged(e.t, e.get("/ns/"+ns), head)
 	return head
 }
 
-// v0.49 §8.5, §6.2: the 410 comes after authorisation and the rate limits,
-// those of a batch's items and config change included, and /ns/{ns}/keys
-// answers it after its read check.
+// v0.91 §8.5: the 410 comes before every check of §6.2 and §7, whatever
+// the grant: a batch's items aren't authorised, its config change draws no
+// rate token, and /ns/{ns}/keys answers it before its read check. Until
+// v0.91 it came after authorisation and the rate limits, and after
+// /keys' read check.
 func TestV049PurgedGateOrder(t *testing.T) {
 	t.Parallel()
 	f := newAuthFixture(t, map[string]any{"limits": map[string]any{
@@ -39,49 +41,37 @@ func TestV049PurgedGateOrder(t *testing.T) {
 	e := f.tenv
 	e.create("sec", "a", map[string]any{}, f.adminG)
 	expect(t, e.patchNS("sec", ops(op("add", "/frozen", true)), f.adminG), 201)
-	expect(t, e.do(req{method: "POST", path: "/ns/sec/purge", ifMatch: e.nsHead("sec", f.adminG), bearer: f.adminG}), 204)
-	head := e.nsHead("sec", f.adminG)
+	cfg := e.configID("sec", f.adminG)
+	pr := e.do(req{method: "POST", path: "/ns/sec/purge", ifMatch: e.nsHead("sec", f.adminG), bearer: f.adminG})
+	expect(t, pr, 204)
+	head := pr.H.Get("X-Namespace-Revision")
 	change := func(who string, items ...any) *resp {
 		body := map[string]any{"config": map[string]any{
-			"ifMatch": e.configID("sec", f.adminG), "patches": ops(op("add", "/x-note", "n"))}}
+			"ifMatch": cfg, "patches": ops(op("add", "/x-note", "n"))}}
 		if len(items) > 0 {
 			body["items"] = items
 		}
 		return e.batchReq("sec", body, who)
 	}
-
-	// A batch's items are authorised before the 410, with its config
-	// change: a grant that may change the configuration but not create
-	// gets the 403 of its item.
 	configOnly := e.grant(f.issuer, "user:c", []string{"sec"}, []string{"read", "config"})
-	r := change(configOnly, map[string]any{"resource": "z", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}})
-	expect(t, r, 403)
-	if items, _ := r.Obj()["items"].([]any); len(items) != 1 || items[0].(map[string]any)["code"] != "forbidden" {
-		t.Fatalf("batch report %s", r.Body)
-	}
-	// The config change draws its token before the 410: the next is 429.
+	expectPurged(t, change(configOnly, map[string]any{"resource": "z", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}), head)
+	// No token drawn: never a 429.
 	expectPurged(t, change(f.issuerG), head)
-	expectCode(t, change(f.issuerG), 429, "rate")
+	expectPurged(t, change(f.issuerG), head)
 
-	// /ns/{ns}/keys: 401 without a grant, 403 without read (v0.74), 403 for a read
-	// grant whose rules refuse an unrestricted read (§E.2.3), then 410:
-	// the purge shows only to a grant that passes the read check.
 	keys := func(bearer string) *resp { return e.do(req{method: "POST", path: "/ns/sec/keys", bearer: bearer}) }
-	expectCode(t, keys(""), 401, "unauthenticated")
-	expectCode(t, keys(e.grant(f.issuer, "user:w", []string{"sec"}, []string{"append"})), 403, "forbidden")
-	expectCode(t, keys(e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "append"}, refusesReads)), 403, "forbidden")
+	expectPurged(t, keys(""), head)
+	expectPurged(t, keys(e.grant(f.issuer, "user:w", []string{"sec"}, []string{"append"})), head)
+	expectPurged(t, keys(e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "append"}, refusesReads)), head)
 	expectPurged(t, keys(f.adminG), head)
-	if e.nsHead("sec", f.adminG) != head {
-		t.Fatal("an entry followed purge-ns")
-	}
 }
 
 // refusesReads is a grant's rules passing appends only.
 var refusesReads = map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/action", "value": "append"}}}
 
 // v0.49 §8.5: in sealed and end-to-end namespaces too, /ns/{ns}/keys and
-// the gestures listing, which a live one doesn't offer, answer 410 after
-// the read check, a grant's rules included.
+// the gestures listing, which a live one doesn't offer, answer 410; since
+// v0.91 whatever the grant, before the read check.
 func TestV049PurgedEncrypted(t *testing.T) {
 	t.Parallel()
 	e := newSealedEnv(t)
@@ -98,7 +88,7 @@ func TestV049PurgedEncrypted(t *testing.T) {
 	expect(t, f.do(req{method: "POST", path: "/ns/e/purge", ifMatch: f.nsHead("e", f.adminG), bearer: f.adminG}), 204)
 	head = f.nsHead("e", f.adminG)
 	keys := func(bearer string) *resp { return f.do(req{method: "POST", path: "/ns/e/keys", bearer: bearer}) }
-	expectCode(t, keys(f.grant(f.writer, "user:r", []string{"e"}, []string{"read", "append"}, refusesReads)), 403, "forbidden") // §E.2.3, v0.74
+	expectPurged(t, keys(f.grant(f.writer, "user:r", []string{"e"}, []string{"read", "append"}, refusesReads)), head) // before §E.2.3's test (v0.91)
 	expectPurged(t, keys(f.readerG), head)
 }
 
@@ -173,8 +163,8 @@ func TestV049PurgedSkipped(t *testing.T) {
 // idempotent-retry lookup included: resource writes, batches (config-only
 // too), blob uploads and copies, purges, prunes, config writes, branching
 // and remote registration. Every such 410, and those of its URLs
-// (/ns/{ns}/keys among them), carries head, the purge-ns entry, which
-// stays the log's last; /ns/{ns} and its log stay readable.
+// (/ns/{ns}/keys among them), carries head, the purge-ns entry, all the
+// namespace keeps but its name (v0.91).
 func TestV049PurgedWrites(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -187,7 +177,7 @@ func TestV049PurgedWrites(t *testing.T) {
 	cfg := e.configID("p")
 	at := e.nsHead("p")
 	head := e.nsPurge("p")
-	cfg2 := e.configID("p")
+	cfg2 := cfg // nothing of p's documents is left to name (§5)
 
 	batch := func(body map[string]any) req {
 		return req{method: "POST", path: "/ns/p/batch", body: body, author: "alice"}
@@ -232,8 +222,6 @@ func TestV049PurgedWrites(t *testing.T) {
 	}
 	expectPurged(t, e.do(req{method: "POST", path: "/ns/p/keys"}), head)
 
-	// Nothing followed the purge-ns entry; /ns/{ns} and its log still read.
-	if e.nsHead("p") != head || e.configID("p") != cfg2 || lastOf(e.nsKinds("p")) != "purge-ns" {
-		t.Fatalf("log after the refused writes %v", e.nsKinds("p"))
-	}
+	// Nothing followed the purge-ns entry: /ns/{ns} is 410 with its id.
+	expectPurged(t, e.get("/ns/p"), head)
 }

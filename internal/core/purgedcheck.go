@@ -1,8 +1,7 @@
 package core
 
-// purgedReadable is the read check of a purged resource's 410, or of a
-// purged namespace's, at a resource's URL (§8.3 Responses, §8.5, §6.4.1
-// read, v0.88): a's rules with those that refer to /doc set aside, alls
+// purgedReadable is the read check of a purged resource's 410 at a
+// resource's URL (§8.3 Responses, §6.4.1 read, v0.88): a's rules with those that refer to /doc set aside, alls
 // flattened (judge.byNameOnly), since doc is null there and would
 // otherwise fail every such rule. A reader whose rules fail only for want
 // of doc so gets the 410; one whose other rules refuse the name gets the
@@ -46,11 +45,8 @@ func (t *tx) tagFilteredRanges(n *nsRow) {
 
 // headReadable is the read check of the head URL of name in n for a
 // reader judged per revision (readsByDoc): the head's own read envelope
-// (§C.2 item 5), or, for a purged resource or namespace, purgedReadable.
+// (§C.2 item 5), or, for a purged resource, purgedReadable.
 func (t *tx) headReadable(a *actor, n *nsRow, name string) bool {
-	if n.purged {
-		return t.purgedReadable(a, n, name)
-	}
 	v := t.resolve(n, name, nil)
 	if v.state == Purged {
 		return t.purgedReadable(a, n, name)
@@ -59,11 +55,11 @@ func (t *tx) headReadable(a *actor, n *nsRow, name string) bool {
 }
 
 // sealedBlobReadable is the read check of a sealed blob's epoch URL for a
-// reader judged per revision: a purged namespace's or resource's with its
-// rules on /doc set aside (purgedReadable), a sealed namespace's by the
+// reader judged per revision: a purged resource's with its rules on /doc
+// set aside (purgedReadable), a sealed namespace's by the
 // revisions of the epoch asked (v0.89), any other with a null document.
 func (t *tx) sealedBlobReadable(a *actor, n *nsRow, name string) bool {
-	if n.purged || t.resolve(n, name, nil).state == Purged {
+	if t.resolve(n, name, nil).state == Purged {
 		return t.purgedReadable(a, n, name)
 	}
 	if t.isSealedNS(n) {

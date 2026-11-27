@@ -40,6 +40,11 @@ func (e *Engine) Principal(ctx context.Context, ns string, cred Credentials) (*P
 		if n == nil {
 			return t.absentNSOp(ns, cred, true)
 		}
+		if n.purged {
+			// Whatever the grant, before verification (§8.5), and never
+			// cached, as no answer here is.
+			return t.purgedNS(n)
+		}
 		cfg := t.config(n.configSeq)
 		var a *actor
 		if !t.e.opt.AuthDisabled {
@@ -59,9 +64,6 @@ func (e *Engine) Principal(ctx context.Context, ns string, cred Credentials) (*P
 				// ran out don't match (§C.4, §6.6).
 				return forbidden("attrs not allowed by the key's scope: their check takes more than validationSteps steps (§6.6)")
 			}
-		}
-		if n.purged {
-			return t.purgedNS(n)
 		}
 		var v *grant.Verified
 		if a != nil {

@@ -358,6 +358,15 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 	if n == nil {
 		return nil, t.absentNS(ns, cred)
 	}
+	if n.purged {
+		// Whether or not the grant would verify there: nothing is left to
+		// verify it with (§8.5, §C.5.2, v0.91). Its 410 names the
+		// namespace, since a request may name several (§12), and counts
+		// only where no other refusal is 401 or 403 (All or nothing).
+		pe := t.purgedNS(n)
+		pe.Body["ns"] = ns
+		return nil, pe
+	}
 	cfg := t.config(n.configSeq)
 	a, err := t.verifyGrant(g, ns, n, cfg, nil)
 	if err != nil {
@@ -430,14 +439,6 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 		// The exchange's budget of validationSteps ran out along the
 		// way: it fails as a whole (§6.6).
 		return nil, forbidden("the grant's rules take more than validationSteps steps for this exchange, which fails it (§6.6): " + ns)
-	}
-	// A purged namespace is decided last, once the grant verifies and may
-	// read there, as its URLs answer 410 after the read check (§8.5). Its
-	// 410 names the namespace, since a request may name several (§12).
-	if n.purged {
-		pe := t.purgedNS(n)
-		pe.Body["ns"] = ns
-		return nil, pe
 	}
 	return &edgeIssue{names: names, bucket: a.exchangeBucket()}, nil
 }

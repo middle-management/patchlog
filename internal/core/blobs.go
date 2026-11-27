@@ -783,6 +783,10 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 	if n == nil {
 		return nil, t.absentNS(req.NS, req.Cred)
 	}
+	if n.purged {
+		// Before all of §7.8's checks, whatever the grant (§8.5).
+		return nil, t.purgedNS(n)
+	}
 	cfg := t.config(n.configSeq)
 	a, err := t.authenticate(n.name, n, cfg, req.Cred, nil)
 	if err != nil {
@@ -831,13 +835,10 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 			return nil, err
 		}
 	}
-	// 2. A purged namespace or resource, after authorisation and the rate
-	// limits (§7.8); between them, a resource whose source was raised to a
-	// level this server lacks (502 upstream, §1, §12.1), as at step 2.1 of
-	// a write.
-	if n.purged {
-		return nil, t.purgedNS(n)
-	}
+	// 2. A purged resource, after authorisation and the rate limits
+	// (§7.8); between them, a resource whose source was raised to a level
+	// this server lacks (502 upstream, §1, §12.1), as at step 2.1 of a
+	// write.
 	if t.resolve(n, name, nil).state == Purged {
 		return nil, gone()
 	}
@@ -1215,20 +1216,17 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		if n.purged {
+			return t.purgedRead(n) // before every check (§8.5)
+		}
+		// A partial reader is answered in place, a sealed blob's 302
+		// naming the latest epoch of a revision it may read, never
+		// redirected under its view's prefix (§7.9 Content, v0.91).
 		a, err := t.reader(n, cred, name)
 		if err != nil {
 			return err
 		}
-		if err := t.contentRedirect(n, cred, a, name, "/blob/"+bidText); err != nil {
-			return err
-		}
 		byDoc := t.readsByDoc(n, a)
-		if n.purged {
-			if byDoc && !t.purgedReadable(a, n, name) {
-				return notFound() // judged with /doc rules set aside (§6.4.1, §8.5)
-			}
-			return t.purgedRead(n)
-		}
 		out = &Blob{Public: t.cachePublic(n)}
 		bid, perr := ids.Parse(bidText)
 		if perr != nil {

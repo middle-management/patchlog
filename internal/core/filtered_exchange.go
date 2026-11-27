@@ -37,11 +37,6 @@ func (t *tx) filteredEdgeGrant(n *nsRow, fs *fscope, a *actor, exp time.Time) (*
 	if err != nil {
 		return nil, err
 	}
-	if n.purged {
-		pe := t.purgedNS(n)
-		pe.Body["ns"] = n.name
-		return nil, pe
-	}
 	until := t.now.Add(maxEdgeTTL)
 	if !exp.IsZero() && exp.Before(until) {
 		until = exp

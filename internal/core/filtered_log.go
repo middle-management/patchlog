@@ -135,7 +135,7 @@ const filteredLogChunk = 256
 func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit int) *Log {
 	// Cached as a private namespace's, a public one's too (§7.9 Where,
 	// §9, v0.90).
-	out := &Log{Purged: n.purged && n.headSeq.Valid && toSeq == n.headSeq.Int64}
+	out := &Log{}
 	var fromSeq int64
 	if since != "" {
 		id, err := ids.Parse(since)
@@ -363,11 +363,6 @@ func (e *Engine) FilteredLog(ctx context.Context, ns, view, at, since string, li
 			return err
 		}
 		info = filteredInfo(fv)
-		if t.sealedPurged(n) {
-			// Its keys are gone with it: 410, as its unfiltered range
-			// answers (§8.5).
-			return t.purgedRead(n)
-		}
 		lg = t.filteredRange(n, fv, since, fv.CP().seq, limit)
 		lg.Until = t.credUntil(cred, fv.a)
 		// In a sealed namespace, one JWE under the view's K_view (§E.2.2).

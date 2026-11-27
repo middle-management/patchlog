@@ -127,8 +127,12 @@ func TestV090BBlobEpochsOfReadableRevisions(t *testing.T) {
 		t.Fatalf("admin: %+v %v, want 302 to epoch 2", b, err)
 	}
 	li := advDocReader(w)
-	// Her grant at the blob's own URL is sent to its form under her view
-	// (contentRedirect), which sends her to v1's epoch.
+	// Her grant at the blob's own URL is answered in place: sent straight
+	// to v1's epoch, never through her view's prefix (v0.91, Filtered reads
+	// 92), as the prefixed form is.
+	if b, err := w.e.OpenBlob(ctx, "matches", "derby", bid, li); err != nil || b.Status != 302 || b.Epoch != 1 {
+		t.Fatalf("li at the unprefixed URL: %+v %v, want 302 to epoch 1", b, err)
+	}
 	_, view := v89Key(t, w, li)
 	vc, err := w.e.ViewCredentials(ctx, "matches", view, li)
 	if err != nil {
@@ -148,11 +152,10 @@ func TestV090BBlobEpochsOfReadableRevisions(t *testing.T) {
 	}
 }
 
-// v0.90 §8.5 ("The full read check of the first row is ... a partial
-// reader passing at /heads (§7.9)"): once matches is purged, li, a partial
-// reader who lacks unrestricted read, passes the read check of its
-// /heads and gets 410, as at her view's URLs; a grant that may not read
-// matches still gets 403.
+// §8.5 (v0.91: "whatever the grant"): once matches is purged, li, a
+// partial reader who lacks unrestricted read, gets 410 at its /heads, as
+// at her view's URLs, and so does a grant that may not read matches,
+// which v0.90 answered 403.
 func TestV090BPartialReaderPurgedHeads(t *testing.T) {
 	t.Parallel()
 	w := newV75World(t, v75Opts{})
@@ -168,8 +171,8 @@ func TestV090BPartialReaderPurgedHeads(t *testing.T) {
 		t.Fatalf("li at the purged namespace's /heads: %v, want 410", err)
 	}
 	writer := w.cred(w.kPriv, map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"matches"}, "can": []any{"create"}})
-	if _, err := w.e.NamespaceHeads(ctx, "matches", head, "", writer); v75Status(err) != 403 {
-		t.Fatalf("a grant without read at the purged namespace's /heads: %v, want 403", err)
+	if _, err := w.e.NamespaceHeads(ctx, "matches", head, "", writer); v75Status(err) != 410 {
+		t.Fatalf("a grant without read at the purged namespace's /heads: %v, want 410", err)
 	}
 }
 

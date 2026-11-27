@@ -260,7 +260,9 @@ func (t *tx) dek(res int64, create bool) []byte {
 	if err != nil {
 		panic(err)
 	}
-	t.e.deks.put(res, k)
+	if t.cacheable() {
+		t.e.deks.put(res, k)
+	}
 	return k
 }
 

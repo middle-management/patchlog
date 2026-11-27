@@ -31,6 +31,24 @@ func privateNoStore(w http.ResponseWriter) {
 	edge.NoStore(w.Header())
 }
 
+// writePurged answers err if it is the 410 of a purged namespace ns
+// (§8.5): at a view's URLs as at every other, cached as long with the
+// public class whatever the namespace's read was, never as a filtered
+// answer, as no grant or cookie decides it. It returns false for any
+// other error.
+func (s *Server) writePurged(w http.ResponseWriter, r *http.Request, err error, ns string) bool {
+	var ae *core.Error
+	if !errors.As(err, &ae) || ae.Status != 410 || ae.Body["code"] != "purged" || ae.Public == nil {
+		return false
+	}
+	h := w.Header()
+	h.Set("Cache-Control", ccLong)
+	h.Set("Cache-Tag", "ns:"+ns)
+	h.Set("Surrogate-Key", "ns:"+ns)
+	writeJSON(w, ae.Status, ae.Body)
+	return true
+}
+
 // writeFilteredRedirect answers err if it is a *core.FilteredRedirect: 302
 // to /ns/{ns}/view/{view}/at/{at}{suffix}, or without /at/{at} for
 // long-poll and events, with q as its query, or to /ns/{ns}/view/{view}
@@ -128,6 +146,9 @@ func (s *Server) viewContent(serve http.HandlerFunc) http.HandlerFunc {
 		}
 		cred, err := s.e.ViewCredentials(r.Context(), ns, view, creds(r))
 		if err != nil {
+			if s.writePurged(w, r, err, ns) {
+				return
+			}
 			privateNoStore(w)
 			writeErr(w, err)
 			return
@@ -160,7 +181,7 @@ func (s *Server) filteredCurrent(w http.ResponseWriter, r *http.Request, suffix 
 		return
 	}
 	err := s.e.FilteredCurrent(r.Context(), ns, view, suffix, creds(r))
-	if s.writeFilteredRedirect(w, err, suffix, q) {
+	if s.writeFilteredRedirect(w, err, suffix, q) || s.writePurged(w, r, err, ns) {
 		return
 	}
 	privateNoStore(w)
@@ -197,7 +218,7 @@ func (s *Server) viewHeads(w http.ResponseWriter, r *http.Request) {
 	}
 	page, info, err := s.e.FilteredHeads(r.Context(), ns, view, at, q.Get("after"), prefix, creds(r))
 	if err != nil {
-		if s.writeFilteredRedirect(w, err, "/heads", keep(q, "after", "prefix")) {
+		if s.writeFilteredRedirect(w, err, "/heads", keep(q, "after", "prefix")) || s.writePurged(w, r, err, ns) {
 			return
 		}
 		setFilteredAt(w, info)
@@ -237,7 +258,7 @@ func (s *Server) viewLog(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	lg, info, err := s.e.FilteredLog(r.Context(), ns, view, at, q.Get("since"), s.e.Limits().LogPageSize, creds(r))
 	if err != nil {
-		if s.writeFilteredRedirect(w, err, "/log", keep(q, "since")) {
+		if s.writeFilteredRedirect(w, err, "/log", keep(q, "since")) || s.writePurged(w, r, err, ns) {
 			return
 		}
 		writeErr(w, err)
@@ -401,6 +422,9 @@ func (s *Server) viewEvents(w http.ResponseWriter, r *http.Request) {
 	wait := s.e.Wait(ns)
 	lg, _, err := s.e.FilteredEventLog(r.Context(), ns, view, since, page, cred)
 	if err != nil {
+		if s.writePurged(w, r, err, ns) {
+			return
+		}
 		writeErr(w, err)
 		return
 	}
@@ -416,11 +440,6 @@ func (s *Server) viewEvents(w http.ResponseWriter, r *http.Request) {
 			sseEntry(w, e["kind"].(string), lg, i)
 		}
 		since = lg.Last
-		if lg.Purged && !lg.More {
-			// The purge-ns entry, always shown, is sent: the stream ends
-			// (§7.3, §8.5).
-			return
-		}
 		keepAlive := false
 		if !lg.More {
 			select {

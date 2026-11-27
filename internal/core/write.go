@@ -455,6 +455,13 @@ func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (bound, batchS
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
 		}
+		if n.purged {
+			// Its 410 comes after the body's own shape (§6.2, §8.5), from
+			// the batch: the deployment's maximum bounds what is read.
+			size := t.e.opt.Maximums.BatchSize
+			bound, batchSize = 4*max(size, t.e.opt.Maximums.DocumentSize), size
+			return nil
+		}
 		cur := t.config(n.configSeq)
 		a, aerr := t.authenticate(n.name, n, cur, req.Cred, nil)
 		if aerr != nil {
@@ -536,6 +543,11 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	if n == nil {
 		return nil, nil, t.absentNS(req.NS, req.Cred)
+	}
+	// A purged namespace is 410 for any write, whatever the grant, before
+	// every step of §6.2 (§8.5, v0.91): nothing of it is left to check.
+	if n.purged {
+		return nil, nil, t.purgedNS(n)
 	}
 	if h := t.e.afterWriteLock; h != nil && t.write && cc == nil {
 		// The whole gate runs in the write lock (writeLocked).
@@ -831,12 +843,6 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			}
 		}
 	}
-	// A purged namespace is 410 after authorisation and the rate limits,
-	// a config change's included (§6.2 step 2, §8.5), before step 2.
-	if n.purged {
-		return nil, nil, t.purgedNS(n)
-	}
-
 	// Step 2: precondition — idempotent retry, settling the verb, frozen,
 	// the precondition. The retry lookup doesn't apply to a purged
 	// resource, nor to one a branch answers 502 upstream for: the answer is
@@ -971,7 +977,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	var bs *batchSource
 	if isBatch && source != nil {
 		var err *Error
-		src, bs, err = t.checkSource(req, source)
+		src, bs, err = t.checkSource(req, source, n, a, st)
 		if err != nil {
 			return nil, nil, err
 		}

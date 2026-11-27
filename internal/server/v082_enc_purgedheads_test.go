@@ -23,9 +23,8 @@ func v82encFilteredLog(w *v75s, bearer string) (vid, at string) {
 
 // ACC-8a (SERVICES §7.9 Purged namespaces, SPEC §8.5; scenario 124):
 // a partial reader's unfiltered /heads of a covered namespace that is
-// purged is 410 purged, with head, at once: no 302 and no Location. The read check comes first: without a grant 401, and
-// a grant whose read is refused 403, neither with head. The unfiltered
-// log of the purged namespace still redirects.
+// purged is 410 purged, with head, at once: no 302 and no Location, and
+// since v0.91 whatever the grant, before any read check.
 func TestV082PurgedHeadsPartialReader410(t *testing.T) {
 	t.Parallel()
 	w := newV75s(t, v75sOpts{})
@@ -55,22 +54,15 @@ func TestV082PurgedHeadsPartialReader410(t *testing.T) {
 			t.Fatalf("/heads at %s: partial %v %s, unrestricted %v %s", id, r.H, r.Body, u.H, u.Body)
 		}
 	}
-	// The read check first.
-	if r := w.get("/ns/matches/rev/"+purgeNS+"/heads", ""); r.Code != 401 || r.Obj()["head"] != nil {
-		t.Fatalf("without a grant: %d %s", r.Code, r.Body)
-	}
+	// Whatever the grant: none, another namespace's, one with a rule on
+	// /now, which until v0.91 got the read check's 401 or 403 first.
 	other := w.grant(w.k, "user:x", []string{"cat-season"}, []string{"read"})
-	if r := w.get("/ns/matches/rev/"+purgeNS+"/heads", other); r.Code != 403 || r.Obj()["head"] != nil {
-		t.Fatalf("a grant of another namespace: %d %s", r.Code, r.Body)
-	}
-	// A partial reader's grant that fails every read (a block rule on
-	// /now, §C.2 item 5): its 403, never the 410.
 	now := w.li(map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}}})
-	if r := w.get("/ns/matches/rev/"+purgeNS+"/heads", now); r.Code != 403 || r.Obj()["head"] != nil || r.H.Get("Location") != "" {
-		t.Fatalf("a grant with a /now rule: %d %s", r.Code, r.Body)
+	for name, g := range map[string]string{"no grant": "", "another namespace's": other, "a /now rule": now} {
+		if r := w.get("/ns/matches/rev/"+purgeNS+"/heads", g); r.Code != 410 || r.Str("head") != purgeNS || r.H.Get("Location") != "" {
+			t.Fatalf("%s: %d %s", name, r.Code, r.Body)
+		}
 	}
-	// The unfiltered log still redirects, and the filtered /heads it
-	// leads to answers the same 410.
-	vid, at := v82encFilteredLog(w, li)
-	expectCode(t, w.get("/ns/matches/view/"+vid+"/at/"+at+"/heads", li), 410, "purged")
+	// The unfiltered log, which redirected until v0.91, is 410 too.
+	expectCode(t, w.get("/ns/matches/log", li), 410, "purged")
 }

@@ -493,8 +493,9 @@ func TestV073P28SealedResourcePurgePruneEvents(t *testing.T) {
 	p28Ends(t, "after purge", ch, 5*time.Second)
 }
 
-// §7.3, §8.5 (RH-35): a namespace stream ends after emitting its purge-ns
-// event, and one whose since names that entry is 410 purged (v0.74).
+// §7.3, §8.5 (RH-35; v0.91): a namespace purge ends a namespace stream,
+// after its purge-ns event or without it, as the log is gone with it; a
+// stream asked for afterwards, from any since, is 410 purged.
 func TestV073P28NamespaceStreamEndsAtPurge(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -503,21 +504,16 @@ func TestV073P28NamespaceStreamEndsAtPurge(t *testing.T) {
 	before := e.nsHead("docs")
 	_, ch := e.p28SSE("/ns/docs/events?since="+before, nil)
 	purgeNS := e.nsPurge("docs")
-	if ev := p28Next(t, ch); ev.event != "config" {
-		t.Fatalf("freeze %+v", ev)
+	for {
+		ev, ok := <-ch
+		if !ok {
+			break // the end, with or without the events before it
+		}
+		if ev.event != "config" && (ev.event != "purge-ns" || p28ID(ev) != purgeNS) {
+			t.Fatalf("event %+v", ev)
+		}
 	}
-	if ev := p28Next(t, ch); ev.event != "purge-ns" || p28ID(ev) != purgeNS {
-		t.Fatalf("purge-ns %+v", ev)
-	}
-	p28Ends(t, "after purge-ns", ch, 5*time.Second)
-
-	// Replayed: the purge-ns event, then the end.
-	_, ch = e.p28SSE("/ns/docs/events?since="+before, nil)
-	p28Next(t, ch)
-	if ev := p28Next(t, ch); ev.event != "purge-ns" {
-		t.Fatalf("replayed purge-ns %+v", ev)
-	}
-	p28Ends(t, "after the replayed purge-ns", ch, 5*time.Second)
+	expectPurged(t, e.get("/ns/docs/events?since="+before), purgeNS)
 
 	// since names the purge-ns entry: 410 purged (v0.74, §8.5).
 	expectPurged(t, e.get("/ns/docs/events?since="+purgeNS), purgeNS)

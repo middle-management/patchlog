@@ -764,38 +764,33 @@ func TestV075BranchesPartial(t *testing.T) {
 	}
 }
 
-// §7.9 Purged namespaces, §8.5: filtered /heads are 410 after
-// admission; the range stays readable and ends with purge-ns; events and
-// long-poll from purge-ns are 410.
+// §7.9 Purged namespaces, §8.5 (v0.91): every filtered URL of a purged
+// namespace is 410, the range and events and long-poll from any since
+// included, which until v0.91 stayed readable up to the purge-ns entry.
 func TestV075FilteredPurged(t *testing.T) {
 	t.Parallel()
 	w := newV75s(t, v75sOpts{})
 	w.seed([]string{"derby"}, nil, []string{"derby"})
 	li := w.li()
 	from := w.nsHead("matches", w.admin)
+	vid, at := w.filtered(li)
 	opg := mint(t, w.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"matches"}, "can": []any{"purge-ns"},
 		"exp": w.clock.Now().Add(time.Hour).Format(time.RFC3339)})
 	expect(t, w.patchNS("matches", ops(op("add", "/frozen", true)), w.admin), 201)
 	expect(t, w.do(req{method: "POST", path: "/ns/matches/purge?force=1", ifMatch: w.nsHead("matches", w.admin), bearer: opg}), 204)
 	purgeNS := w.nsHead("matches", w.admin)
-	// Her unfiltered /heads is 410 directly since v0.82 (ACC-8a); the
-	// unfiltered log still redirects to her view.
 	expectCode(t, w.get("/ns/matches/rev/"+purgeNS+"/heads", li), 410, "purged")
-	vid, at := v82encFilteredLog(w, li)
 	r := w.get("/ns/matches/view/"+vid+"/at/"+at+"/heads", li)
 	expectCode(t, r, 410, "purged")
-	// As the unfiltered /heads' 410, tagged as filtered answers are.
+	// As the unfiltered /heads' 410, tagged with the namespace.
 	u := w.get("/ns/matches/rev/"+purgeNS+"/heads", w.admin)
 	expectCode(t, u, 410, "purged")
 	if r.H.Get("Cache-Control") != u.H.Get("Cache-Control") || !strings.Contains(r.H.Get("Cache-Tag"), "ns:matches") {
 		t.Fatalf("410 headers %v, unfiltered %v", r.H, u.H)
 	}
-	entries, _ := w.readRange(vid, at, from, li)
-	if len(entries) == 0 || entries[len(entries)-1]["kind"] != "purge-ns" || entries[len(entries)-1]["id"] != purgeNS {
-		t.Fatalf("range %v", entries)
-	}
-	expectCode(t, w.get("/ns/matches/view/"+vid+"/events?since="+purgeNS, li), 410, "purged")
-	expectCode(t, w.get("/ns/matches/view/"+vid+"/log?live=long-poll&since="+purgeNS, li), 410, "purged")
+	expectCode(t, w.get("/ns/matches/view/"+vid+"/at/"+at+"/log?since="+from, li), 410, "purged")
+	expectCode(t, w.get("/ns/matches/view/"+vid+"/events?since="+from, li), 410, "purged")
+	expectCode(t, w.get("/ns/matches/view/"+vid+"/log?live=long-poll&since="+from, li), 410, "purged")
 }
 
 // §7.9 with the client of V75-02: a partial reader's HeadsPrefix,

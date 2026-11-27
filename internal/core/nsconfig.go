@@ -94,17 +94,6 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 			*t.rateDrawn = true
 		}
 	}
-	// A purged namespace is 410 after authorisation and the rate limits
-	// (§6.2 step 2, §8.5), before the retry lookup and the precondition. A
-	// batch answers it itself, once its items are authorised too
-	// (checkItems), so its plan keeps the configuration in force.
-	if n.purged {
-		if inBatch {
-			p.cfg = cur
-			return p, nil
-		}
-		return nil, t.purgedNS(n)
-	}
 	// Step 2: idempotent retry, then the precondition. Config writes are
 	// allowed in frozen namespaces.
 	if !inBatch && p.expected != nil {
@@ -713,6 +702,9 @@ func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 				return err
 			}
 			return apiErr(412, "stale", "message", "the name is taken")
+		}
+		if n.purged {
+			return t.purgedNS(n) // before every check (§8.5)
 		}
 		cur := t.config(n.configSeq)
 		a, aerr := t.authenticate(n.name, n, cur, req.Cred, nil)

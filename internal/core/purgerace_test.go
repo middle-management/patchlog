@@ -77,7 +77,8 @@ func TestPGPurgeSkipsBranchPurgedMeanwhile(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(kinds) == 0 || kinds[len(kinds)-1] != 5 {
+	// The purge-ns left no log (§5, v0.91): any row is one that followed.
+	if len(kinds) != 0 {
 		t.Fatalf("mb's log kinds %v: an entry followed purge-ns", kinds)
 	}
 }

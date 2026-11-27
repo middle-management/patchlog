@@ -88,12 +88,16 @@ func (g *loneGate) went(ns string) {
 // readOne is read for a read that is usually a single statement, which on
 // Postgres runs without a transaction (above). f may run twice, so it
 // sets everything it hands out afresh.
-func (e *Engine) readOne(ctx context.Context, ns string, f func(t *tx) error) error {
+func (e *Engine) readOne(ctx context.Context, ns string, f func(t *tx) error) (err error) {
+	defer func() { err = asUnavailable(err) }()
+	if testStorageFault != nil {
+		return e.read(ctx, f)
+	}
 	if !e.pg || e.noLone || !e.lone.try(ns) {
 		return e.read(ctx, f)
 	}
 	var judged []judgedRow
-	err := e.readAlone(ctx, func(t *tx) error {
+	err = e.readAlone(ctx, func(t *tx) error {
 		defer func() { judged = t.judged }()
 		return f(t)
 	})
@@ -118,7 +122,7 @@ func (e *Engine) readAlone(ctx context.Context, f func(t *tx) error) (err error)
 		}
 		endDBSpan(span, err)
 	}()
-	t := &tx{ctx: ctx, e: e, now: e.now(), solo: true}
+	t := &tx{ctx: ctx, e: e, now: e.now(), solo: true, trimGen: e.trims.Load()}
 	defer func() {
 		if p := recover(); p != nil {
 			err = panicErr(p)

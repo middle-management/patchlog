@@ -253,6 +253,15 @@ func (w *v75World) inTx(f func(t *tx)) {
 	}
 }
 
+// v75Code is the code of an *Error's body, "" for anything else.
+func v75Code(err error) string {
+	if e, ok := err.(*Error); ok && e != nil {
+		c, _ := e.Body["code"].(string)
+		return c
+	}
+	return ""
+}
+
 func v75Status(err error) int {
 	if e, ok := err.(*Error); ok && e != nil {
 		return e.Status

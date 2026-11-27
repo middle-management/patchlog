@@ -120,9 +120,9 @@ func TestV073P26ForceNeedsPower(t *testing.T) {
 	expect(t, e.patchNS("fpb", ops(op("add", "/frozen", true)), sg), 201)
 	expectCode(t, e.forcePurge("/ns/fpb/purge", e.nsHead("fpb", sg), pg), 403, "forbidden")
 	expect(t, e.forcePurge("/ns/fpb/purge", e.nsHead("fpb", sg), sg), 204)
-	// And before the purged namespace's 410.
-	expectCode(t, e.forcePurge("/ns/fpb/purge", "", pg), 403, "forbidden")
-	expectCode(t, e.forcePurge("/r/fpb/w/purge", w, pg), 403, "forbidden")
+	// The purged namespace's 410 comes first (v0.91; the 403 until then).
+	expectCode(t, e.forcePurge("/ns/fpb/purge", "", pg), 410, "purged")
+	expectCode(t, e.forcePurge("/r/fpb/w/purge", w, pg), 410, "purged")
 	expectCode(t, e.do(req{method: "POST", path: "/ns/fpb/purge", bearer: pg}), 410, "purged")
 }
 
