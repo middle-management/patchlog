@@ -113,7 +113,7 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 		if t.QueryRow(`SELECT seq FROM ns_config WHERE ns = ? AND id = ?`, n.id, p.expected[:]).Scan(&seq) == nil {
 			// The entry that wrote it: the first in force with it, a
 			// config entry or a batch with a config change (§7.4).
-			t.QueryRow(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, n.id, seq).Scan(&nsSeq)
+			nsSeq = t.firstUnder(n.id, seq)
 		}
 		// By the same principal: the same root sub and kid (§7.2).
 		if nsSeq.Valid && t.samePrincipal(nsSeq.Int64, a, t.actorID(a)) {

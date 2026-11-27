@@ -253,6 +253,9 @@ type Engine struct {
 	// revisions name them by number (entrybody.go); false only on a
 	// database migrated up to an earlier migration, in tests.
 	refs bool
+	// firsts: the schema has ns_grants and ns_config.first_seq in place
+	// of ns_log_by_grant and ns_log_ns_config (entrybody.go).
+	firsts bool
 	// seals are the sealing counts this instance took (sealcount.go).
 	seals     sealCounter
 	db        *sql.DB
@@ -501,6 +504,12 @@ func Open(opt Options) (*Engine, error) {
 	if rows, err := db.Query(`SELECT grant_ref FROM ns_log WHERE 1 = 0`); err == nil {
 		rows.Close()
 		e.refs = true
+	}
+	// ns_grants and ns_config.first_seq (entrybody.go) are migration
+	// 032's (SQLite), 034's (Postgres).
+	if rows, err := db.Query(`SELECT first_seq FROM ns_grants WHERE 1 = 0`); err == nil {
+		rows.Close()
+		e.firsts = true
 	}
 	e.refsCache.MaxEntries = 65536
 	e.viewHeld.MaxEntries = 65536

@@ -1484,12 +1484,12 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		// query at a time.
 		rows.Close()
 	} else if cp != nil {
-		var cseq, s int64
+		var cseq int64
 		if t.QueryRow(`SELECT seq FROM ns_config WHERE ns = ? AND id = ?`, n.id, cp.expected[:]).Scan(&cseq) != nil {
 			return nil
 		}
-		if t.QueryRow(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, n.id, cseq).Scan(&s) == nil && s != 0 {
-			cands = append(cands, s)
+		if f := t.firstUnder(n.id, cseq); f.Valid && f.Int64 != 0 {
+			cands = append(cands, f.Int64)
 		}
 	}
 	var match []byte

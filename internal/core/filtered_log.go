@@ -34,6 +34,7 @@ type nsLogRow struct {
 	meta    sql.NullString
 	via     sql.NullString
 	target  sql.NullInt64  // the revision a single entry moves to, a prune's horizon
+	derived bool           // its body and created rebuilt (entrybody.go)
 	m       map[string]any // body, parsed
 }
 
@@ -42,7 +43,7 @@ func (t *tx) scanNSLogRow(rows *sql.Rows) nsLogRow {
 	var r nsLogRow
 	var d derived
 	t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta, &r.via, &r.target, &d.kind, &d.name, &d.id, &d.created))
-	t.rebuild(&d, &r.body, &r.created, r.id, r.prev)
+	r.derived = t.rebuild(&d, &r.body, &r.created, r.id)
 	r.m = jsonv.MustParse([]byte(r.body)).(map[string]any)
 	return r
 }
@@ -158,6 +159,7 @@ func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit
 		}
 		t.must(rows.Err())
 		rows.Close()
+		t.checkRebuilt(rs)
 		if len(rs) == 0 {
 			break
 		}

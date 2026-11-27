@@ -234,11 +234,7 @@ func TestPurgeOrder(t *testing.T) {
 			var d derived
 			var created int64
 			t.must(rows.Scan(&n, &seq, &id, &prev, &body, &headSeq, &headID, &d.kind, &d.name, &d.id, &d.created))
-			var ps *int64
-			if prev.Valid {
-				ps = &prev.Int64
-			}
-			t.rebuild(&d, &body, &created, id, ps)
+			t.rebuild(&d, &body, &created, id)
 			if n != ns {
 				check()
 				ns, last, lastSeq = n, nil, 0

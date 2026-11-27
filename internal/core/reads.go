@@ -1097,6 +1097,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			rs = append(rs, r)
 		}
 		rows.Close()
+		t.checkRebuilt(rs)
 		out.Status = 200
 		out.Last = since
 		// An entry's prev is the row before it in the page, but for the

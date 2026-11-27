@@ -25,6 +25,26 @@ bodies as served, wire bytes and vectors are the same.
   `ALTER TABLE`s on `ns_log` and `revisions` change only the catalog, but adding the identity
   column rewrites `grants` and creating the index `ns_log_by_grant_ref` reads all of `ns_log`
   while holding off writes to it: minutes on a table of hundreds of millions of rows.
+- **Rare lookups off ns_log's per-write indexes** (migrations `032_ns_log_first_entries_by_grant_and_config`
+  on SQLite, `034_…` on Postgres). `ns_log_by_grant` (and the item above's `ns_log_by_grant_ref`)
+  served one question, the first entry of a namespace recording a grant (`GET
+  /ns/{ns}/grants/{gid}`, archive candidates, sealing a grant), and `ns_log_ns_config` one other,
+  the first entry under a configuration (idempotent retries of config writes and batches). A
+  table `ns_grants (grant_ref, ns) → first_seq` and a column `ns_config.first_seq` answer them,
+  each row written once by a trigger as the first such entry is inserted, and the indexes are
+  dropped. SQLite 337 → 309 bytes per write, Postgres 802 → 720 (indexes 438 → 356).
+  `revisions_by_id` stays: see docs/capacity/storage.
+  **Upgrading:** the migration fills both from the entries there are, one pass over `ns_log`
+  (and on Postgres an update of every `ns_config` row), then drops the indexes; on Postgres it
+  holds off writes for that pass. A database upgraded from before both migrations builds
+  `ns_log_by_grant_ref` only for this one to drop it.
+- **Not changed: Postgres column types and order, and `head_history`.** Laying `ns_log` and
+  `revisions` out 8 → 4 → 2 → varlena with `integer` namespaces, authors and grant numbers would
+  save about 32 bytes per write (15 and 17 a row, measured; the indexes don't shrink), but only
+  by copying both tables under an exclusive lock; serving `head_history` for single writes from a
+  partial index of `ns_log` would rewrite a dozen statements as unions. Measured and argued in
+  docs/capacity/storage. Single writes measured about as fast as before (Postgres 770 → 820–960
+  writes a second, SQLite 1,250 → 1,330–1,400, 30,000 writes over HTTP on an idle host).
 
 ## v0.34.0
 

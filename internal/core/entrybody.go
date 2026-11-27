@@ -111,28 +111,46 @@ type derived struct {
 	created sql.NullInt64
 }
 
-// rebuild fills a derived entry's body and created from d. Under
-// PATCHLOG_TEST_VALIDATE_BOTH the body is checked against the entry's id,
-// that of the entry before it (prevSeq) read again.
-func (t *tx) rebuild(d *derived, body *string, created *int64, id []byte, prevSeq *int64) {
+// rebuild fills a derived entry's body and created from d, and reports
+// whether it was derived (checkRebuilt).
+func (t *tx) rebuild(d *derived, body *string, created *int64, id []byte) bool {
 	if *body != "" {
-		return
+		return false
 	}
 	if !d.name.Valid || d.id == nil || !d.created.Valid {
 		panic(fmt.Errorf("namespace entry %s has no body and nothing to rebuild it from", ids.FromBytes(id)))
 	}
 	*body = string(entryBody(d.kind, d.name.String, ids.FromBytes(d.id)))
 	*created = d.created.Int64
-	if validateBoth {
+	return true
+}
+
+// checkRebuilt checks, under PATCHLOG_TEST_VALIDATE_BOTH, that each derived
+// entry of rs, a log page read in order with its rows closed, hashes to its
+// id after the entry before it, read again unless it is in rs.
+func (t *tx) checkRebuilt(rs []nsLogRow) {
+	if !validateBoth {
+		return
+	}
+	known := map[int64][]byte{}
+	for _, r := range rs {
+		known[r.seq] = r.id
+	}
+	for _, r := range rs {
+		if !r.derived {
+			continue
+		}
 		var prev *ids.ID
-		if prevSeq != nil {
-			var b []byte
-			t.must(t.uncounted(`SELECT id FROM ns_log WHERE seq = ?`, *prevSeq).Scan(&b))
+		if r.prev != nil {
+			b, ok := known[*r.prev]
+			if !ok {
+				t.must(t.uncounted(`SELECT id FROM ns_log WHERE seq = ?`, *r.prev).Scan(&b))
+			}
 			p := ids.FromBytes(b)
 			prev = &p
 		}
-		if ids.Hash(prev, []byte(*body)) != ids.FromBytes(id) {
-			panic(fmt.Errorf("namespace entry %s: the rebuilt body %s doesn't hash to its id", ids.FromBytes(id), *body))
+		if ids.Hash(prev, []byte(r.body)) != ids.FromBytes(r.id) {
+			panic(fmt.Errorf("namespace entry %s: the rebuilt body %s doesn't hash to its id", ids.FromBytes(r.id), r.body))
 		}
 	}
 }
@@ -150,13 +168,20 @@ func (t *tx) firstGrantEntry(id []byte, ns int64, bound sql.NullInt64) (string, 
 	if !t.e.refs {
 		return `(SELECT MIN(seq) FROM ns_log WHERE grant_id = ? AND ns = ?` + upto + `)`, args
 	}
+	if t.e.firsts {
+		if bound.Valid {
+			upto = ` AND f.first_seq <= ?`
+		}
+		return `(SELECT f.first_seq FROM ns_grants f WHERE f.grant_ref = (SELECT ref FROM grants WHERE id = ?) AND f.ns = ?` + upto + `)`, args
+	}
 	args = append(args, args...)
 	return `(SELECT MIN(s) FROM (SELECT MIN(seq) AS s FROM ns_log WHERE grant_id = ? AND ns = ?` + upto + `
 		UNION ALL SELECT MIN(seq) FROM ns_log WHERE grant_ref = (SELECT ref FROM grants WHERE id = ?) AND ns = ?` + upto + `) fg)`, args
 }
 
 // checkDerived checks every derived entry stored: its body rebuilt hashes,
-// after the id of the entry before it, to its id (§3.5). Close runs it
+// after the id of the entry before it, to its id (§3.5); and that
+// ns_config.first_seq and ns_grants hold what the entries give. Close runs it
 // under PATCHLOG_TEST_VALIDATE_BOTH, so every test's entries are checked.
 // A database it can't read is no failure of the check's.
 func (e *Engine) checkDerived(ctx context.Context) error {
@@ -172,7 +197,8 @@ func (e *Engine) checkDerived(ctx context.Context) error {
 		if err := rows.Scan(&id, &prev, &d.kind, &d.name, &d.id, &d.created); err != nil {
 			return nil
 		}
-		if !d.name.Valid || d.id == nil || !d.created.Valid {
+		// created doesn't enter the hash (a test may spoil it).
+		if !d.name.Valid || d.id == nil {
 			return fmt.Errorf("derived namespace entry %s has nothing to rebuild it from", ids.FromBytes(id))
 		}
 		var p *ids.ID
@@ -184,5 +210,48 @@ func (e *Engine) checkDerived(ctx context.Context) error {
 			return fmt.Errorf("derived namespace entry %s: the rebuilt body %s doesn't hash to its id", ids.FromBytes(id), body)
 		}
 	}
+	rows.Close()
+	if !e.firsts {
+		return nil
+	}
+	// The rows written once in place of indexes, against the entries.
+	for _, q := range []string{
+		`SELECT COUNT(*) FROM ns_config c WHERE c.first_seq IS DISTINCT FROM (SELECT MIN(l.seq) FROM ns_log l WHERE l.ns = c.ns AND l.config_seq = c.seq)`,
+		`SELECT COUNT(*) FROM (SELECT COALESCE(l.grant_ref, g.ref) AS ref, l.ns, MIN(l.seq) AS s FROM ns_log l LEFT JOIN grants g ON g.id = l.grant_id
+			WHERE l.grant_id IS NOT NULL OR l.grant_ref IS NOT NULL GROUP BY COALESCE(l.grant_ref, g.ref), l.ns) w
+			FULL JOIN ns_grants f ON f.grant_ref = w.ref AND f.ns = w.ns WHERE f.first_seq IS DISTINCT FROM w.s`,
+	} {
+		var bad int
+		if err := e.db.QueryRowContext(ctx, q).Scan(&bad); err != nil {
+			return nil
+		}
+		if bad != 0 {
+			return fmt.Errorf("%d rows differ from the entries: %s", bad, q)
+		}
+	}
 	return nil
+}
+
+// firstUnder is the first entry of namespace ns under configuration row
+// cseq, the entry that wrote it (§7.4), NULL for none: ns_config.first_seq
+// (migration 032 in SQLite, 034 in Postgres), which a trigger sets as the
+// entry is inserted. Under PATCHLOG_TEST_VALIDATE_BOTH it is checked
+// against the entries themselves.
+func (t *tx) firstUnder(ns, cseq int64) sql.NullInt64 {
+	var seq sql.NullInt64
+	if !t.e.firsts {
+		t.QueryRow(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, ns, cseq).Scan(&seq)
+		return seq
+	}
+	if err := t.QueryRow(`SELECT first_seq FROM ns_config WHERE seq = ? AND ns = ?`, cseq, ns).Scan(&seq); err != nil {
+		return sql.NullInt64{}
+	}
+	if validateBoth {
+		var want sql.NullInt64
+		t.must(t.uncounted(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, ns, cseq).Scan(&want))
+		if want != seq {
+			panic(fmt.Errorf("namespace %d, configuration %d: first_seq %v, its first entry %v", ns, cseq, seq, want))
+		}
+	}
+	return seq
 }
