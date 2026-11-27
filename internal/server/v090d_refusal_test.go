@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -51,6 +52,13 @@ func TestV090DLongPollRevokedMidWaitIsRefused(t *testing.T) {
 	// change (which commits to the namespace and so wakes it).
 	poll := func(g string, change func()) *resp {
 		t.Helper()
+		// On Postgres the tailer's wake-ups for earlier commits (the
+		// probe's create, the last poll's change) would wake the wait
+		// before change commits; its second read check would then run
+		// out of the budget, a 204, as it should.
+		if err := e.e.SyncTail(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 		fetches.Store(0)
 		cur := waitCursor(t, newLiveClock(interval, resourceLogPath("sec", "quiet")), 10*time.Second)
 		done := make(chan *resp, 1)
