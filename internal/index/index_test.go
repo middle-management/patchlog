@@ -154,6 +154,11 @@ func (s *svc) caughtUp(ns string) string {
 	var head string
 	waitFor(s.t, "index of "+ns+" to catch up", func() bool {
 		h, err := s.core.NSHead(context.Background(), ns)
+		if ae, ok := client.AsAPIError(err); ok && client.IsPurged(err) {
+			// All a purged namespace keeps is its purge-ns id (§5).
+			head = ae.Head()
+			return s.ix.Checkpoint(ns) == head
+		}
 		if err != nil {
 			return false
 		}

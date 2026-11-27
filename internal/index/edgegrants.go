@@ -1617,35 +1617,6 @@ func (ix *Index) refsCookieReader(ctx context.Context, r *http.Request, reached 
 	return rd, true, nil
 }
 
-// purgedRead is the read check of a request of purged namespace ns, whose
-// document the core answered 410 purged (cfgErr): with a grant, or none,
-// the core's (grantcheck.PurgedRead); under one of the service's edge
-// grants for ns's view, which the service knows, it passes, and
-// the head is cfgErr's (§8.5).
-func (ix *Index) purgedRead(ctx context.Context, ns string, r *http.Request, cfgErr error) (string, error) {
-	if cl := ix.edgeClaims(r); cl != nil {
-		if cns, _, ok := edgeView(cl.Prefix); ok && cns == ns {
-			subs, known := ix.edge.Subjects(ctx, cl.Prefix)
-			if !known || len(subs) != 1 {
-				return "", errUnknownSet
-			}
-			// Its keys can't be judged again (keysHold): a cookie
-			// recorded with none, or with one that never held, is 403.
-			recorded, err := ix.viewKeysAt(ctx, subs[0], cl.Exp)
-			if err == nil {
-				err = purgedKeysHold(recorded)
-			}
-			if err != nil {
-				return "", err
-			}
-			if ae, ok := client.AsAPIError(cfgErr); ok && ae.Head() != "" {
-				return ae.Head(), nil
-			}
-		}
-	}
-	return ix.checker.PurgedRead(ctx, ns, bearer(r))
-}
-
 // serveEdgeGrants is /edge-grants on the service's origin: POST issues,
 // DELETE withdraws. Either is no-store. Without EdgeGrants, both are 404
 // not_offered.
@@ -1988,19 +1959,21 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 			fail(err)
 			continue
 		}
+		if purged {
+			// Its queries answer 410 whatever the grant (§8.5, v0.91):
+			// left out, and judged by purgedOnly below.
+			continue
+		}
 		cfg, err := ix.checker.Config(ctx, ns)
 		if client.IsPurged(err) {
-			if _, err = ix.checker.PurgedRead(ctx, ns, token); err != nil {
-				fail(err)
-			}
-			continue
+			continue // purged at the origin since: as above
 		}
 		if err != nil {
 			fail(err)
 			continue
 		}
 		public := ix.publicFor(ctx, ns, cfg)
-		if public && !purged {
+		if public {
 			continue
 		}
 		v, err := ix.checker.Verify(ctx, ns, token)
@@ -2018,11 +1991,6 @@ func (ix *Index) exchangeGrant(ctx context.Context, token string, reached map[st
 				fail(err)
 				continue
 			}
-		}
-		if purged {
-			// Its queries answer 410 once the read check passes (§8.5):
-			// left out, and judged by purgedOnly below.
-			continue
 		}
 		exp := ix.opt.EdgeGrants.Lifetime(now, grantExp(v))
 		if ex.bucket == "" {
@@ -2110,13 +2078,13 @@ func (ix *Index) basesUnfollowed(ctx context.Context, ns string) bool {
 
 // purgedOnly is the purge an exchange, or /_refs, answers 410 for a grant
 // left with nothing to read (§A.4 Coverage: "where every namespace its
-// grant names is purged and the grant verifies in each, 410 as §C.5.2
-// gives it"; §C.5.2: "410 only when every namespace refused is purged and
-// the grant verifies in each"), the first in the order its root block
-// names them; nil unless every namespace g names is one the service
-// follows, whose keys it doesn't lack, that is purged, and whose read
-// check token passes (the core's PurgedRead for one whose document is
-// 410, else Verify and grantAccess, as its queries' read check). A grant
+// grant names is purged, 410 as §C.5.2 gives it"; §C.5.2: "410 only when
+// every namespace refused is purged"), the first in the order its root
+// block names them; nil unless every namespace g names is one the service
+// follows, whose keys it doesn't lack, and that is purged, here or at the
+// origin. Whether the grant would verify there doesn't matter: nothing is
+// left to judge it with (§8.5, v0.91; until then the read check had to
+// pass in each). A grant
 // naming "*" in every block that names namespaces names no set of them,
 // and never qualifies; nor does one naming a namespace the service
 // doesn't follow, or one it can't read.
@@ -2145,22 +2113,14 @@ func (ix *Index) purgedOnly(ctx context.Context, token string, g *grant.Grant) *
 		if err != nil {
 			return nil
 		}
-		_, cerr := ix.checker.Config(ctx, ns)
-		switch {
-		case client.IsPurged(cerr):
-			if head, err = ix.checker.PurgedRead(ctx, ns, token); err != nil {
+		if !purged {
+			// Purged at the origin, not yet here: its 410's head.
+			_, cerr := ix.checker.Config(ctx, ns)
+			ae, ok := client.AsAPIError(cerr)
+			if !ok || !client.IsPurged(cerr) || ae.Head() == "" {
 				return nil
 			}
-		case cerr != nil, !purged:
-			return nil
-		default:
-			v, err := ix.checker.Verify(ctx, ns, token)
-			if err != nil {
-				return nil
-			}
-			if _, err := ix.grantAccess(ctx, ns, v); err != nil {
-				return nil
-			}
+			head = ae.Head()
 		}
 		if first == nil {
 			first = &purgedNS{ns: ns, head: head}

@@ -45,8 +45,8 @@ func TestSealedPurged(t *testing.T) {
 	if _, _, err := ic.NSLog(ctx, "sec", purged, ""); !client.IsPurged(err) {
 		t.Fatalf("the sealed log after the purge: %v", err)
 	}
-	// The index can't read the configuration any more: the core makes the
-	// read check, and answers the 410 only to a grant that passes it.
+	// The index can't read the configuration any more, nor need it: a
+	// purged namespace answers 410 whatever the grant (§8.5, v0.91).
 	reader := k.Grant(t, s.Now(), "user:r", []string{"sec"}, []string{"read"})
 	writer := k.Grant(t, s.Now(), "user:n", []string{"sec"}, []string{"create"})
 	// A grant that reads one resource passes the index's read check too,
@@ -60,14 +60,13 @@ func TestSealedPurged(t *testing.T) {
 				t.Errorf("%s: %d %v", name, r.status, r.body)
 			}
 		}
-		for tok, want := range map[string]int{"": 401, writer: 403} {
+		for tok, want := range map[string]int{"": 410, writer: 410} {
 			if r := x.raw("/sec?q=secret", tok); r.status != want {
 				t.Errorf("%s: token %.10q: %d %v, want %d", name, tok, r.status, r.body, want)
 			}
 		}
 		// Left out of /_refs, as any purged namespace; a grant naming it
-		// alone, which verifies there, is 410 there (v0.77, §A.4
-		// Coverage).
+		// alone is 410 there (v0.77, §A.4 Coverage).
 		if r := x.raw("/_refs?to=%2Fr%2Fsec%2Fa", reader); r.status != 410 || r.body["ns"] != "sec" || r.body["head"] != purged {
 			t.Errorf("%s: /_refs: %d %v", name, r.status, r.body)
 		}

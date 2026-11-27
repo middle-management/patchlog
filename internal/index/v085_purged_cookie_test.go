@@ -20,11 +20,11 @@ import (
 // document the service read"), for a sealed namespace, whose document is
 // 410 too once it is purged, so that nothing but what the index read
 // before judges a cookie. The index has applied a change to the key
-// behind a reader's cookie, and sec is then purged: a query under that
-// cookie is 403, with no head, not 410; under a cookie exchanged after
-// the change, which still passes, it is 410 purged with the purge's
-// head. Before v0.85 the first got the 410 too, no read under it having
-// come between the change and the purge.
+// behind a reader's cookie, and sec is then purged: since v0.91 a query
+// under either cookie, the one the change ended and one exchanged after
+// it, is 410 purged with the purge's head, whatever the cookie (§A.4
+// Unavailable namespaces: "whatever the grant, as at the origin"). From
+// v0.85 to v0.90 the first was 403.
 func TestV085EndedCookieSealedPurged(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -79,8 +79,9 @@ func TestV085EndedCookieSealedPurged(t *testing.T) {
 	purged := must(w.PurgeNamespace(ctx, "sec", must(w.NSHead(ctx, "sec")).ID))
 	waitFor(t, "the purge", func() bool { return x.ix.Checkpoint("sec") == purged })
 	x.ix.ExpireGrantChecks()
-	if got, _ := p37Follow(t, x, path, before, ""); got.status != 403 || got.body["head"] != nil {
-		t.Errorf("under the cookie the key's change ended, once sec is purged: %d %v, want 403", got.status, got.body)
+	// Whatever the cookie (v0.91): 403 for this one until then.
+	if got, _ := p37Follow(t, x, path, before, ""); got.status != 410 || got.body["head"] != purged {
+		t.Errorf("under the cookie the key's change ended, once sec is purged: %d %v, want 410", got.status, got.body)
 	}
 	if got, _ := p37Follow(t, x, path, after, ""); got.status != 410 || got.body["code"] != "purged" || got.body["head"] != purged {
 		t.Errorf("under the cookie that still passes, once sec is purged: %d %v, want 410 purged", got.status, got.body)

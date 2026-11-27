@@ -476,6 +476,13 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, vid, ns, at strin
 		writeQueryErr(w, err)
 		return
 	}
+	// A purged namespace is 410 purged, with head, whatever the grant, as at
+	// the origin (§8.5, §A.4, v0.91): nothing is left to judge a grant
+	// against, and the index keeps only that it is purged. Its malformed
+	// mins are 400 first, a request-shape error.
+	if ix.servePurged(w, r, ns, bad) {
+		return
+	}
 	a, err := ix.access(ctx, ns, r)
 	if bad != nil {
 		// Malformed mins are 400 whoever asks, as before the read check;
@@ -487,14 +494,10 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, vid, ns, at strin
 		writeMinErr(w, bad)
 		return
 	}
-	if client.IsPurged(err) {
-		// A purged sealed namespace's document is 410 too (§8.5): the
-		// core makes the read check before answering it, as below.
-		var head string
-		if head, err = ix.purgedRead(ctx, ns, r, err); err == nil {
-			writePurged(w, head)
-			return
-		}
+	if ae, ok := client.AsAPIError(err); ok && client.IsPurged(err) {
+		// Purged at the origin since: its 410, whatever the grant (§8.5).
+		writePurged(w, ae.Head())
+		return
 	}
 	if err != nil && follow.LacksKey(ctx, err) && ix.lacksKeys(ctx, ns) {
 		// Its document is sealed under keys the index lacks as configured
@@ -827,13 +830,13 @@ func (ix *Index) afterPurge(w http.ResponseWriter, r *http.Request, ns string, v
 		delete(rv, "after")
 	}
 	for range 2 {
+		if ix.servePurged(w, r, ns, nil) {
+			return
+		}
 		a, err := ix.access(ctx, ns, r)
-		if client.IsPurged(err) {
-			var head string
-			if head, err = ix.purgedRead(ctx, ns, r, err); err == nil {
-				writePurged(w, head)
-				return
-			}
+		if ae, ok := client.AsAPIError(err); ok && client.IsPurged(err) {
+			writePurged(w, ae.Head())
+			return
 		}
 		if err != nil {
 			ix.writeAccessErr(w, "access check for "+ns, err, "cannot read the namespace configuration")
@@ -1658,6 +1661,23 @@ func writeQueryErr(w http.ResponseWriter, err error) {
 		return
 	}
 	writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
+}
+
+// servePurged answers a query of ns if ns is purged, as the index has
+// committed it: 410 purged with head, whatever the grant, before any read
+// check (§8.5, §A.4 Unavailable namespaces, v0.91), or bad, a malformed
+// min's 400, first. It reports whether it answered.
+func (ix *Index) servePurged(w http.ResponseWriter, r *http.Request, ns string, bad *MinError) bool {
+	head, purged, err := ix.committed(r.Context(), ns)
+	if err != nil || !purged {
+		return false // the checkpoint's error is answered where it is read
+	}
+	if bad != nil {
+		writeMinErr(w, bad)
+		return true
+	}
+	writePurged(w, head)
+	return true
 }
 
 // writePurged answers 410 purged with head, the namespace's purge-ns entry,

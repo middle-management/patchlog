@@ -228,7 +228,12 @@ func TestReferenceQueries(t *testing.T) {
 	cfg := must(c.NSHead(ctx, "pages")).Config
 	must(c.PatchConfig(ctx, "pages", cfg, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
 	must(c.PurgeNamespace(ctx, "pages", must(c.NSHead(ctx, "pages")).ID))
-	waitFor(t, "purge-ns", func() bool { return y.raw("/pages", "").status == 410 })
+	// The core answers 410 at once (§8.5); the index drops the rows as its
+	// follower applies the purge, the 410 standing for its purge-ns entry.
+	y.caughtUp("pages")
+	if st := y.raw("/pages", "").status; st != 410 {
+		t.Errorf("/pages after the purge-ns: %d", st)
+	}
 	if n := y.ix.CountRows("pages"); n != 0 {
 		t.Errorf("%d rows left after purge-ns", n)
 	}
