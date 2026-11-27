@@ -487,7 +487,7 @@ func (t *tx) rev(seq int64) *revRow {
 
 // revIn is rev for a revision known to be resource res's: by its key on
 // Spanner, where revisions are interleaved in resources (res, seq), rather
-// than through revisions_seq_key and back to the row.
+// than through revisions_by_seq and back to the row.
 func (t *tx) revIn(res, seq int64) *revRow {
 	if r, ok := t.memo.rev[seq]; ok {
 		return &r

@@ -257,6 +257,8 @@ type Engine struct {
 	spanner     bool
 	spSeqs      *seqGen
 	leaseHolder string
+	// slots is, on Spanner, the lease of the instance's slot in its ids.
+	slots *slotLease
 	// nsc are, on Spanner, the namespace rows writes' checks read
 	// (spnscache.go).
 	nsc       nsCache
@@ -500,6 +502,11 @@ func Open(opt Options) (*Engine, error) {
 	if spanner {
 		e.leaseHolder = newLeaseHolder()
 		e.spSeqs = &seqGen{}
+		// Before any id is taken: the instance's slot in them (spslots.go).
+		if e.slots, err = openSlotLease(context.Background(), db, e.leaseHolder, e.spSeqs); err != nil {
+			db.Close()
+			return nil, err
+		}
 	}
 	e.refsCache.MaxEntries = 65536
 	e.viewHeld.MaxEntries = 65536
@@ -571,6 +578,13 @@ func Open(opt Options) (*Engine, error) {
 		e.bg.Add(1)
 		go e.tailLoop(s)
 	}
+	if e.slots != nil {
+		e.bg.Add(1)
+		go func() {
+			defer e.bg.Done()
+			e.slots.loop(e.stop)
+		}()
+	}
 	if opt.RetentionInterval > 0 {
 		e.bg.Add(1)
 		go e.retentionLoop(opt.RetentionInterval)
@@ -615,6 +629,7 @@ func (e *Engine) Close() error {
 	e.closeOnce.Do(func() { close(e.stop) })
 	e.bg.Wait()
 	e.resign()
+	e.slots.release()
 	e.stmts.close()
 	err := e.db.Close()
 	e.comp.close()

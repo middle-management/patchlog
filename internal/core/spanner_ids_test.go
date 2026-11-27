@@ -17,8 +17,8 @@ func TestSeqGen(t *testing.T) {
 		t.Fatalf("first id %d in bucket %d, the chain's is %d", first[0], spBucket(first[0]), b)
 	}
 	for i := 1; i < len(first); i++ {
-		if first[i] != first[i-1]+1 {
-			t.Fatalf("ids of one take not consecutive: %v", first)
+		if first[i] <= first[i-1] {
+			t.Fatalf("ids of one take not ascending: %v", first)
 		}
 	}
 	// A head far ahead (another instance's clock): the next is above it.
@@ -48,6 +48,34 @@ func TestSeqGen(t *testing.T) {
 		})
 	}
 	wg.Wait()
+}
+
+// Two instances, in slots of their own, never take one id, whichever's
+// head each goes on from (spslots.go).
+func TestSeqGenSlots(t *testing.T) {
+	a, b := &seqGen{slot: 3}, &seqGen{slot: 40}
+	chain := int64(rand.Uint64() >> 1)
+	seen := map[int64]string{}
+	head := int64(0)
+	for i := range 20000 {
+		g, name := a, "a"
+		if i%3 == 0 {
+			g, name = b, "b"
+		}
+		for _, v := range g.take(chain, head, 1+i%3) {
+			if v <= head {
+				t.Fatalf("id %d not above head %d", v, head)
+			}
+			if who, dup := seen[v]; dup {
+				t.Fatalf("id %d taken by %s and %s", v, who, name)
+			}
+			seen[v] = name
+			if s := (v >> spSlotCount) & (spSlots - 1); s != g.slot {
+				t.Fatalf("id %d of %s in slot %d, want %d", v, name, s, g.slot)
+			}
+			head = v
+		}
+	}
 }
 
 // The tailer's shards and the id buckets cover every key.

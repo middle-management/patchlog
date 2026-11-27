@@ -69,24 +69,31 @@ import (
 // ns_config), which the rest of the chain keeps: those keys are
 // bit-reversed identities, whose top bits are spread evenly, so the
 // inserts spread over 256 points of each table's key range, one per
-// bucket, and Spanner splits the load between them. Within a bucket ids
-// grow with time, and an instance's count, one for all buckets, orders
-// those it takes in one millisecond, starting at a random point, so the low
-// bits order an instance's ids across chains too (spWriteOrder). An id is
-// also always above its chain's head, read under the row's lock
-// (logHeadOf), so ids grow along a chain whatever the clocks of the
-// instances that append to it. Two instances can take one id in the same
-// bucket and millisecond, rarely: the second to commit fails on the
-// table's primary key, a unique violation of no chain (isConflict), and
-// runs again (retryable) with a new one. Ids are not dense, nor ordered
-// across chains by their seqs: the least needn't be the deployment's first
-// entry, which is read by commit timestamp instead (operatorkeys.go,
-// archive.go).
+// bucket, and Spanner splits the load between them. The count is
+//
+//	slot (6 bits) | count (8 bits)
+//
+// where the slot is the instance's, leased (spslots.go), so no two
+// instances ever take one id: revisions, keyed (res, seq), need no unique
+// index on seq to refuse a second (revisions_by_seq). Within a bucket an
+// instance's ids grow with time, and its count, one for all buckets,
+// orders those it takes in one millisecond, starting at a random point, so
+// the low bits order an instance's ids across chains too (spWriteOrder);
+// past 256 in a millisecond it borrows the next. An id is also always
+// above its chain's head, read under the row's lock (logHeadOf), so ids
+// grow along a chain whatever the clocks of the instances that append to
+// it: the least of the instance's slot above it. Ids are not dense, nor
+// ordered across chains by their seqs: the least needn't be the
+// deployment's first entry, which is read by commit timestamp instead
+// (operatorkeys.go, archive.go).
 const (
 	spBucketBits = 8
-	spCountBits  = 14
+	spSlotBits   = 6
+	spSlotCount  = 8 // the count's own bits, below the slot
+	spCountBits  = spSlotBits + spSlotCount
 	spLowBits    = 63 - spBucketBits
 	spLowMask    = 1<<spLowBits - 1
+	spSlots      = 1 << spSlotBits
 )
 
 // spEpoch is the zero of the ids' milliseconds: 41 bits of them last until
@@ -95,23 +102,48 @@ var spEpoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli()
 
 // seqGen hands out an engine's chain-ordered ids on Spanner (above).
 type seqGen struct {
-	mu   sync.Mutex
-	last int64 // the low bits of the last id taken, in any bucket
+	mu sync.Mutex
+	// slot is the instance's (spslots.go), and last the last id taken, in
+	// any bucket, as a step (ms<<spSlotCount | count) of the slot's.
+	slot, last int64
+	// lease, when set, is the slot's lease, which an id may be taken under
+	// only while it is valid (spslots.go); unset in tests of the ids.
+	lease *slotLease
 }
 
 // spOrderMod is 2^55: an id modulo it is its low bits (spWriteOrder).
 const spOrderMod = int64(1) << spLowBits
 
 // spWriteOrder is the order in which an id was taken across chains: its
-// low bits, the time and the count. Ids of one chain share a bucket, so it
-// orders them as their seqs do; across chains, it orders them by the
-// millisecond they were taken in, which seqs don't. (Ties across chains
-// are ordered by seq.) Only for an order the deployment's writes must keep
-// across resources (Gestures).
+// low bits, the time, the slot and the count. Ids of one chain share a
+// bucket, so it orders them as their seqs do; across chains, it orders an
+// instance's by the millisecond they were taken in, which seqs don't. (Ties
+// across chains are ordered by seq.) Only for an order the deployment's
+// writes must keep across resources (Gestures).
 func spWriteOrder(seq int64) int64 { return seq & spLowMask }
 
 // spBucket is the bucket of a chain's key: its top 8 bits of 63.
 func spBucket(chain int64) int64 { return int64(uint64(chain)>>spLowBits) & (1<<spBucketBits - 1) }
+
+// spStepID is the id of step c of slot in bucket b.
+func spStepID(b, slot, c int64) int64 {
+	return b<<spLowBits | (c>>spSlotCount)<<spCountBits | slot<<spSlotCount | c&(1<<spSlotCount-1)
+}
+
+// spStepAbove is the least step of slot whose id is above id, in id's
+// bucket.
+func spStepAbove(slot, id int64) int64 {
+	low := id & spLowMask
+	ms, s, c := low>>spCountBits, (low>>spSlotCount)&(spSlots-1), low&(1<<spSlotCount-1)
+	switch {
+	case s < slot:
+		return ms << spSlotCount
+	case s == slot:
+		return ms<<spSlotCount | c + 1
+	default:
+		return (ms + 1) << spSlotCount
+	}
+}
 
 // take returns n ascending ids for chain, each above above (its head; 0 for
 // none). They are in the bucket of the head, or of chain's key for a chain
@@ -123,25 +155,30 @@ func (g *seqGen) take(chain, above int64, n int) []int64 {
 		b = spBucket(above)
 	}
 	g.mu.Lock()
-	low := (time.Now().UnixMilli() - spEpoch) << spCountBits
-	if g.last >= low {
-		low = g.last + 1
+	if err := g.lease.check(); err != nil {
+		g.mu.Unlock()
+		panic(err)
+	}
+	slot := g.slot
+	c := (time.Now().UnixMilli() - spEpoch) << spSlotCount
+	if g.last >= c {
+		c = g.last + 1
 	} else {
-		low += mrand.Int64N(1 << (spCountBits - 1))
+		c += mrand.Int64N(1 << (spSlotCount - 1))
 	}
-	v := b<<spLowBits | low
-	if v <= above {
-		v = above + 1
+	if above > 0 {
+		c = max(c, spStepAbove(slot, above))
 	}
-	if spBucket(v+int64(n)-1) != b {
+	end := c + int64(n) - 1
+	if end>>spSlotCount >= 1<<(spLowBits-spCountBits) {
 		g.mu.Unlock()
 		panic(fmt.Errorf("no ids left above %d in bucket %d", above, b))
 	}
-	g.last = max(g.last, (v+int64(n)-1)&spLowMask)
+	g.last = max(g.last, end)
 	g.mu.Unlock()
 	out := make([]int64, n)
 	for i := range out {
-		out[i] = v + int64(i)
+		out[i] = spStepID(b, slot, c+int64(i))
 	}
 	return out
 }
