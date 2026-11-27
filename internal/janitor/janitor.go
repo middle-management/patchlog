@@ -182,24 +182,26 @@ type Janitor struct {
 	order   list.List // of seenGrant, most recently used first
 	seenCap int
 	// held is what a superseded check read of each successor while it was
-	// live, the last time it did (heldSucc): once a successor is purged it
+	// live, by branch and successor, the last time it did (heldSucc): once
+	// a successor is purged it
 	// keeps nothing but its name and purge-ns id (§5, §8.5, v0.91), and the
 	// check counts only with what this janitor read before the purge
 	// (§F.6). At most seenCap successors, any one dropped when full.
 	held map[string]*heldSucc
 }
 
-// heldSucc is a successor as a superseded check read it while it was live:
-// its head and namespace document there, its base, whether that base
-// listed it among its branches, its log up to the head, and when it was
-// read, by the janitor's clock.
+// heldSucc is a successor as a superseded check of a branch read it while
+// it was live: its head and namespace document there, its base, whether
+// that base listed it among its branches, its log up to the head, and the
+// branch's freeze the check was made under (frozeAt, as the branch's log
+// dates it), which the read came after.
 type heldSucc struct {
 	head    string
 	doc     map[string]any
 	base    string
 	listed  bool
 	entries []client.NSEntry
-	readAt  time.Time
+	frozeAt time.Time
 }
 
 // hold keeps what a superseded check read of a live successor.
@@ -1003,8 +1005,8 @@ func (b *branch) verifyMerged(ctx context.Context) (bool, string, error) {
 // holds what it read (Janitor.hold): its document there, its base, whether
 // that base lists it, and its log. why is set where the successor stopped
 // being readable meanwhile (purged since its head was read).
-func (b *branch) readSucc(ctx context.Context, succ, head string) (*heldSucc, string, error) {
-	h := &heldSucc{head: head, readAt: b.j.opt.Now()}
+func (b *branch) readSucc(ctx context.Context, succ, head string, frozeAt time.Time) (*heldSucc, string, error) {
+	h := &heldSucc{head: head, frozeAt: frozeAt}
 	sdoc, err := b.j.c.NSDoc(ctx, succ, head)
 	if client.IsPurged(err) {
 		return nil, unheldPurged(succ), nil
@@ -1034,7 +1036,7 @@ func (b *branch) readSucc(ctx context.Context, succ, head string) (*heldSucc, st
 	if err != nil {
 		return nil, "", err
 	}
-	b.j.hold(succ, h)
+	b.j.hold(b.ns+"\x00"+succ, h)
 	return h, "", nil
 }
 
@@ -1072,7 +1074,8 @@ func (b *branch) baseChain(ctx context.Context) ([]string, error) {
 //     namespace further up its base chain in this deployment, listed as
 //     such in that namespace's branches. A successor purged after the
 //     branch was frozen (frozeAt) still counts, checked from what this
-//     janitor read of it while it was live, after the freeze (heldSucc):
+//     janitor read of it while it was live, under the same freeze of the
+//     branch (heldSucc):
 //     the purge leaves nothing of it to read (§5, §8.5, v0.91). Without
 //     such a read the branch is kept for a manual purge;
 //   - its log has a batch without origin whose source.ns is the branch,
@@ -1099,13 +1102,15 @@ func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time
 		// Purged: only what this janitor read before the purge counts, and
 		// only where that read came after the branch was frozen, so that
 		// the purge did too (§F.6).
-		h, ok := b.j.heldOf(succ)
+		h, ok := b.j.heldOf(b.ns + "\x00" + succ)
 		if !ok {
 			return false, unheldPurged(succ), nil
 		}
-		if h.readAt.Before(frozeAt) {
-			return false, fmt.Sprintf("successor %s is purged, and the janitor last read it at %s, before the branch was frozen at %s, so the purge can't be placed after the freeze: verify by hand",
-				succ, h.readAt.UTC().Format(time.RFC3339Nano), frozeAt.UTC().Format(time.RFC3339Nano)), nil
+		if !h.frozeAt.Equal(frozeAt) {
+			// Read under another freeze of the branch, an earlier one:
+			// the purge can't be placed after this one.
+			return false, fmt.Sprintf("successor %s is purged, and the janitor last read it under the branch's freeze of %s, not the current one of %s, so the purge can't be placed after it: verify by hand",
+				succ, h.frozeAt.UTC().Format(time.RFC3339Nano), frozeAt.UTC().Format(time.RFC3339Nano)), nil
 		}
 		held = h
 	case err != nil:
@@ -1113,7 +1118,7 @@ func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time
 	}
 	var entries []client.NSEntry
 	if held == nil {
-		h, why, err := b.readSucc(ctx, succ, sh.ID)
+		h, why, err := b.readSucc(ctx, succ, sh.ID, frozeAt)
 		if err != nil || why != "" {
 			return false, why, err
 		}
