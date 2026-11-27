@@ -370,7 +370,24 @@ idle, Spanner at half: no machine is the limit.
   minutes, without the `CASE`, while it scans the same 4–5 rows. The rows it reads, each
   namespace's and resource's, are rewritten several times a second, and Spanner keeps every
   version for at least an hour (`version_retention_period`): the newest of thousands costs more
-  to read. Likely, not shown.
+  to read. Likely, not shown. (Wrong: the tenth run shows splits, below.)
+
+**The tenth run, each core's rate buckets in memory** (`340bc9a2`, `--local-rate-buckets`; files
+`docs/capacity/spanner-gcp-2026-11-26-run10-local-buckets/`): 3,390, 3,201 and 2,676 a second at
+8, 16 and 32 namespaces, 20–30% above the ninth: **the shared buckets cost that much, but are
+not the ceiling.** Groups grew to about 45 writes (from 12), each transaction 100–190 ms, one at
+a time per namespace; the cores at 16% of their CPU, Spanner from 48% to 94%.
+
+- **The check's cost is splits.** Until 12:15 it made no remote calls and cost 0.3–0.5 ms of
+  CPU; from 12:16, once Spanner had split the tables under the load, every check made 3 remote
+  calls and cost 1.5–1.75 ms. It reads four rows in four places (the namespace by its name's
+  index, the resource, its head revision, the revision asked for by `revisions_res_id_key`),
+  and once those are on different splits each is a call to another server. That is the check's
+  rise in the eighth and ninth runs too, and it is what a deployment at load costs: at 32
+  namespaces the check is most of Spanner's CPU again.
+- The fix is co-location: rows a check reads together in one split, by interleaving (a
+  revision's rows in its resource's, keyed `(res, seq)`), or fewer of them (the namespace's row
+  from the engine's memory, re-checked in the group's transaction as now).
 
 ## The capacity bench on real Spanner
 
