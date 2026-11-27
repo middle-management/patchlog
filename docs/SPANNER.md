@@ -412,6 +412,23 @@ namespaces, 96–104% from 16 on; the cores at 18%.
 - Next: interleave revisions in resources (`(res, seq)`) so the check's three rows are one
   split's; then the tailer's poll.
 
+**The twelfth run, revisions interleaved in resources** (`023a0f2b`, migration 004; files
+`docs/capacity/spanner-gcp-2026-11-27-run12-interleaved/`): 3,141, 3,295 and 2,824 a second at 8,
+16 and 32 namespaces, against the eleventh's 3,446, 2,963 and 3,620. Spanner at 105% from the
+32-namespace step's first minute; the cores at 12–19%.
+
+- **The check got cheaper, as meant**: 0.52 ms of CPU against 0.65, 0.11 remote calls against
+  0.52, 6.6 ms against 11.7. The tailer's poll too: 20 ms of CPU against 28. Spanner's query CPU
+  a write, all statements, fell from 1.04 to 0.94 ms.
+- **But Spanner's CPU a write rose** about a fifth (its utilisation summed over the loaded
+  minutes, per write: 0.42 against 0.35), so the writes' commits cost more than the queries saved.
+  The likely cause is `revisions_seq_key`: a revision's insert now also writes an index entry
+  outside its resource's split, unique, so checked at commit. It can't simply stop being unique:
+  two instances may take the same id (above, the ids), and the index's uniqueness is what refuses
+  the second, as the table's key did.
+- Runs vary by 10–15% with when Spanner splits (at 16 namespaces this one was the faster), so
+  one run each doesn't settle it.
+
 ## The capacity bench on real Spanner
 
 `deploy/gcp-spanner.sh` (header: settings, what it makes, `cleanup`) runs the D.8 comparison on

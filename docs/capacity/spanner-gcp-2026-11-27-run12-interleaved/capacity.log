@@ -1,0 +1,7 @@
+12:01:15  namespaces 8: 100 documents each, writing for 180s
+12:04:17  namespaces_8                 {"asked_per_second":8000,"documents":800,"errors":0,"limited_429":0,"max_ms":2567.917,"n":565963,"namespaces":8,"p50_ms":221.444,"p95_ms":443.151,"p99_ms":614.276,"per_second":3141.213760637309,"stale_412":0}
+12:04:18  namespaces 16: 100 documents each, writing for 180s
+12:07:21  namespaces_16                {"asked_per_second":16000,"documents":1600,"errors":0,"limited_429":0,"max_ms":3261.713,"n":594537,"namespaces":16,"p50_ms":396.812,"p95_ms":1061.441,"p99_ms":1737.778,"per_second":3295.493702985668,"stale_412":0}
+12:07:23  namespaces 32: 100 documents each, writing for 180s
+12:10:26  namespaces_32                {"asked_per_second":32000,"documents":3200,"errors":0,"limited_429":0,"max_ms":7455.139,"n":510311,"namespaces":32,"p50_ms":987.143,"p95_ms":2381.23,"p99_ms":3115.423,"per_second":2823.9063449097325,"stale_412":0}
+12:10:26  total_seconds                552.025019358

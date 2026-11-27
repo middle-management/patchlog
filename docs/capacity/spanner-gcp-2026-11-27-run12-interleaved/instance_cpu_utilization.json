@@ -1,0 +1,116 @@
+{
+  "timeSeries": [
+    {
+      "metric": {
+        "labels": {
+          "database": "patchlog"
+        },
+        "type": "spanner.googleapis.com/instance/cpu/utilization"
+      },
+      "resource": {
+        "type": "spanner_instance",
+        "labels": {
+          "location": "europe-west1",
+          "project_id": "patchlog-515810",
+          "instance_id": "patchlog-bench",
+          "instance_config": "regional-europe-west1"
+        }
+      },
+      "metricKind": "GAUGE",
+      "valueType": "DOUBLE",
+      "points": [
+        {
+          "interval": {
+            "startTime": "2026-11-27T12:10:19.490Z",
+            "endTime": "2026-11-27T12:10:19.490Z"
+          },
+          "value": {
+            "doubleValue": 1.052946172442079
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-27T12:09:19.490Z",
+            "endTime": "2026-11-27T12:09:19.490Z"
+          },
+          "value": {
+            "doubleValue": 1.0461610661313556
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-27T12:08:19.490Z",
+            "endTime": "2026-11-27T12:08:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.67016893377185616
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-27T12:07:19.490Z",
+            "endTime": "2026-11-27T12:07:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.84464140060834025
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-27T12:06:19.490Z",
+            "endTime": "2026-11-27T12:06:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.91869739901030356
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-27T12:05:19.490Z",
+            "endTime": "2026-11-27T12:05:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.59890919603703963
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-27T12:04:19.490Z",
+            "endTime": "2026-11-27T12:04:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.8013585597644155
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-27T12:03:19.490Z",
+            "endTime": "2026-11-27T12:03:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.60324931756255973
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-27T12:02:19.490Z",
+            "endTime": "2026-11-27T12:02:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.51520342712602174
+          }
+        },
+        {
+          "interval": {
+            "startTime": "2026-11-27T12:01:19.490Z",
+            "endTime": "2026-11-27T12:01:19.490Z"
+          },
+          "value": {
+            "doubleValue": 0.03582243452115802
+          }
+        }
+      ]
+    }
+  ],
+  "unit": "10^2.%"
+}
