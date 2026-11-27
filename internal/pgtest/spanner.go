@@ -195,7 +195,8 @@ func emptySpanner(raw string) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	// Children first, by the foreign keys, in one transaction.
+	// Children first, by the foreign keys and interleaving, in one
+	// transaction.
 	refs := map[string][]string{} // table -> the tables referencing it
 	rows, err = db.QueryContext(ctx, `SELECT tc.table_name, ccu.table_name FROM information_schema.table_constraints tc
 		JOIN information_schema.constraint_table_usage ccu ON ccu.constraint_name = tc.constraint_name
@@ -212,6 +213,24 @@ func emptySpanner(raw string) error {
 		if child != parent {
 			refs[parent] = append(refs[parent], child)
 		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// And interleaved tables, whose parent's rows can't go before theirs.
+	rows, err = db.QueryContext(ctx, `SELECT table_name, parent_table_name FROM information_schema.tables
+		WHERE table_schema = 'public' AND parent_table_name IS NOT NULL`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var child, parent string
+		if err := rows.Scan(&child, &parent); err != nil {
+			rows.Close()
+			return err
+		}
+		refs[parent] = append(refs[parent], child)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {

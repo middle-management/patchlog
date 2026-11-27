@@ -104,7 +104,7 @@ func (t *tx) revByID(res int64, id ids.ID) *revRow {
 	var r *revRow
 	if seq, ok := t.memo.idSeq[k]; ok {
 		// Found by lookupResource, which read only its seq.
-		r = t.rev(seq)
+		r = t.revIn(res, seq)
 	} else {
 		var err error
 		r, err = scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, res, id[:]))
@@ -242,7 +242,7 @@ var lookupSQL = func() (q [2][2]string) {
 	common := cols("n", nsCols) + ", " + cols("r", resCols) + ", " + cols("h", revCols)
 	from := ` FROM namespaces n
 		LEFT JOIN resources r ON r.ns = n.ns AND r.name = ?
-		LEFT JOIN revisions h ON h.seq = r.head_seq`
+		LEFT JOIN revisions h ON h.res = r.res AND h.seq = r.head_seq`
 	byID := `SELECT seq FROM revisions WHERE res = r.res AND id = ? LIMIT 1`
 	for pg := 0; pg < 2; pg++ {
 		q[0][pg] = `SELECT ` + common + `, (` + byID + `)` + from + ` WHERE n.name = ?`
@@ -251,7 +251,7 @@ var lookupSQL = func() (q [2][2]string) {
 		LEFT JOIN LATERAL (SELECT ` + revCols + ` FROM revisions WHERE res = r.res AND id = ? LIMIT 1) x ON true
 		WHERE n.name = ?`
 	q[1][0] = `SELECT ` + common + `, ` + cols("x", revCols) + from + `
-		LEFT JOIN revisions x ON x.seq = (` + byID + `)
+		LEFT JOIN revisions x ON x.res = r.res AND x.seq = (` + byID + `)
 		WHERE n.name = ?`
 	return q
 }()
@@ -485,6 +485,25 @@ func (t *tx) rev(seq int64) *revRow {
 	return r
 }
 
+// revIn is rev for a revision known to be resource res's: by its key on
+// Spanner, where revisions are interleaved in resources (res, seq), rather
+// than through revisions_seq_key and back to the row.
+func (t *tx) revIn(res, seq int64) *revRow {
+	if r, ok := t.memo.rev[seq]; ok {
+		return &r
+	}
+	if r, ok := t.ownRevs[seq]; ok {
+		return &r
+	}
+	r, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND seq = ?`, res, seq))
+	if errors.Is(err, sql.ErrNoRows) {
+		return t.rev(seq)
+	}
+	t.must(err)
+	t.memoRev(r)
+	return r
+}
+
 // revID returns a revision's id, which never changes once inserted.
 func (t *tx) revID(seq int64) ids.ID {
 	if id, ok := t.revIDs[seq]; ok {
@@ -539,7 +558,7 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 		if r.state == statePurged && asOf == nil {
 			v.state, v.src = Purged, r
 			if r.headSeq.Valid {
-				v.head = t.rev(r.headSeq.Int64)
+				v.head = t.revIn(r.id, r.headSeq.Int64)
 			}
 			t.memoView(v)
 			return v
@@ -562,7 +581,7 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 		}
 		if found {
 			v.src = r
-			v.head = t.rev(headSeq)
+			v.head = t.revIn(r.id, headSeq)
 			switch {
 			case r.state == statePurged:
 				v.state = Purged

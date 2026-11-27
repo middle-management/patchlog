@@ -145,6 +145,6 @@ var lookupCachedSQL = func() string {
 	}
 	return `SELECT ` + cols("r", resCols) + `, ` + cols("h", revCols) +
 		`, (SELECT seq FROM revisions WHERE res = r.res AND id = ? LIMIT 1)
-		FROM resources r LEFT JOIN revisions h ON h.seq = r.head_seq
+		FROM resources r LEFT JOIN revisions h ON h.res = r.res AND h.seq = r.head_seq
 		WHERE r.ns = ? AND r.name = ?`
 }()
