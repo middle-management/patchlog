@@ -129,6 +129,48 @@ epochs", "Filtered reads scenario n" one under "Filtered reads (§7.9)".
     unchanged, so a namespace written before an upgrade can be frozen or rotated. *Question:* may
     a write keep it, or must it be `422` until removed?
 
+## Open from the storage-bounds work
+
+From the "bounding log storage" suggestions (branch `storage-bounds`; measurements in
+docs/capacity/storage/README.md, the deep-cursor review in docs/capacity/storage/deep-cursor-review.md).
+Numbered on their own; cite them as "Storage n". They are not in the count above.
+
+1. **A batch whose local `source` names a purged namespace** (§8.3, §7.4 `source`; the purged-
+   namespace suggestion, option (a)). Purged namespaces keep only a name record. *Question:* does
+   such a batch answer `410 purged` or `422 source`? The reference waits on this before trimming
+   purged namespaces' rows.
+
+2. **The body of a single write's head entry** (§3.5, §7.4). The reference now stores no body for a
+   single write's head and tombstone entries and rebuilds it on read, but only where the rebuild is
+   byte-identical to the canonical body at write time, so it can't drift. *Question:* may the spec
+   say outright that such an entry's body is exactly `{kind, resource, target}`, so an
+   implementation can derive it without that guard?
+
+3. **`via` and `author` on a single write's entry** (§7.4). They repeat the target revision's own.
+   *Question:* may they be stated as equal to it, so they can be derived too?
+
+4. **Which tables a deep cursor may move** (§8.6 "never pruned"). *Question:* may the namespace log
+   itself move to object storage, or only revision payloads?
+
+5. **A `503 unavailable` for history in object storage** (§5 "nothing observable changes").
+   *Question:* which requests may answer it, if any?
+
+6. **The retry lookup's reach** (§7.2). It covers the whole log. *Question:* may it be bounded to
+   the retry window, or answer `503` beyond it?
+
+7. **Pages ending early** (§7.1). CDN-cached and sealed ranges are keyed `since:id`. *Question:*
+   may a page end at a segment boundary short of its limit?
+
+8. **A lazy purge** (§8.3). *Question:* may a purge answer once it has destroyed the keys, with the
+   rewrite done later, as archives already allow?
+
+9. **Branch creation at an old `at`, and `/heads?at=`.** *Question:* may these answer `503` when
+   the history they need is in object storage?
+
+10. **Deep cursor against prune and archive** (§8.6). Prune plus archive already moves history to
+    object storage. *Question:* what does a deep cursor add that the spec should name, rather than
+    extending prune and archive?
+
 ## Reference gaps
 
 Where the reference does less than v0.90 says, or computes something the text defines otherwise.

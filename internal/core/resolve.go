@@ -107,7 +107,7 @@ func (t *tx) revByID(res int64, id ids.ID) *revRow {
 		r = t.rev(seq)
 	} else {
 		var err error
-		r, err = scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, res, id[:]))
+		r, err = scanRev(t.QueryRow(`SELECT `+t.revCols()+` FROM revisions WHERE res = ? AND id = ?`, res, id[:]))
 		if errors.Is(err, sql.ErrNoRows) {
 			r = nil
 		} else {
@@ -165,7 +165,7 @@ func (t *tx) lookupResource(name, res string, want *ids.ID, full bool) *nsRow {
 	} else {
 		dest = append(dest, &xseq)
 	}
-	q := lookupSQL[b2i(full)][b2i(t.e.pg)]
+	q := lookupSQL[b2i(t.e.refs)][b2i(full)][b2i(t.e.pg)]
 	var row *sql.Row
 	if full {
 		row = t.QueryRow(q, res, idArg, name)
@@ -214,7 +214,9 @@ func b2i(b bool) int {
 // id (x, its seq or its row), the last three possibly NULL. That revision
 // is at most one row, as revByID's QueryRow: LATERAL on Postgres, a scalar
 // subquery in SQLite (which has no LATERAL).
-var lookupSQL = func() (q [2][2]string) {
+var lookupSQL = [2][2][2]string{lookupSQLOf(false), lookupSQLOf(true)}
+
+func lookupSQLOf(refs bool) (q [2][2]string) {
 	cols := func(alias, list string) string {
 		var out []string
 		for _, c := range strings.Split(list, ",") {
@@ -222,7 +224,7 @@ var lookupSQL = func() (q [2][2]string) {
 		}
 		return strings.Join(out, ", ")
 	}
-	common := cols("n", nsCols) + ", " + cols("r", resCols) + ", " + cols("h", revCols)
+	common := cols("n", nsCols) + ", " + cols("r", resCols) + ", " + revColsOf(refs, "h")
 	from := ` FROM namespaces n
 		LEFT JOIN resources r ON r.ns = n.ns AND r.name = ?
 		LEFT JOIN revisions h ON h.seq = r.head_seq`
@@ -230,14 +232,14 @@ var lookupSQL = func() (q [2][2]string) {
 	for pg := 0; pg < 2; pg++ {
 		q[0][pg] = `SELECT ` + common + `, (` + byID + `)` + from + ` WHERE n.name = ?`
 	}
-	q[1][1] = `SELECT ` + common + `, ` + cols("x", revCols) + from + `
-		LEFT JOIN LATERAL (SELECT ` + revCols + ` FROM revisions WHERE res = r.res AND id = ? LIMIT 1) x ON true
+	q[1][1] = `SELECT ` + common + `, ` + cols("x", revNames) + from + `
+		LEFT JOIN LATERAL (SELECT ` + revColsOf(refs, "revisions") + ` FROM revisions WHERE res = r.res AND id = ? LIMIT 1) x ON true
 		WHERE n.name = ?`
-	q[1][0] = `SELECT ` + common + `, ` + cols("x", revCols) + from + `
+	q[1][0] = `SELECT ` + common + `, ` + revColsOf(refs, "x") + from + `
 		LEFT JOIN revisions x ON x.seq = (` + byID + `)
 		WHERE n.name = ?`
 	return q
-}()
+}
 
 // nullRes scans a resources row that may be all NULL (an outer join).
 type nullRes struct {
@@ -403,7 +405,7 @@ func (t *tx) prefetchRevs(seqs []int64) {
 	if len(want) == 0 {
 		return
 	}
-	rows, err := t.Query(`SELECT `+revCols+` FROM revisions WHERE `+t.e.inArray("seq", "bigint"), t.e.arrayArg(want))
+	rows, err := t.Query(`SELECT `+t.revCols()+` FROM revisions WHERE `+t.e.inArray("seq", "bigint"), t.e.arrayArg(want))
 	t.must(err)
 	if t.memo.rev == nil {
 		t.memo.rev = map[int64]revRow{}
@@ -442,7 +444,27 @@ type revRow struct {
 	digest []byte
 }
 
-const revCols = `seq, res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, created, gesture, undoes, size, digest`
+// revNames are the columns scanRev reads, revColsOf them as selected from
+// revisions row a (the grant id either column records, grantIDOf, as
+// grant_id), and revCols as selected from revisions unaliased.
+const revNames = `seq, res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, created, gesture, undoes, size, digest`
+
+func revColsOf(refs bool, a string) string {
+	var out []string
+	for _, c := range strings.Split(revNames, ",") {
+		c = strings.TrimSpace(c)
+		if c == "grant_id" {
+			out = append(out, grantIDOf(refs, a)+` AS grant_id`)
+			continue
+		}
+		out = append(out, a+"."+c)
+	}
+	return strings.Join(out, ", ")
+}
+
+var revColsBy = [2]string{revColsOf(false, "revisions"), revColsOf(true, "revisions")}
+
+func (t *tx) revCols() string { return revColsBy[b2i(t.e.refs)] }
 
 func scanRev(row interface{ Scan(...any) error }) (*revRow, error) {
 	r := &revRow{}
@@ -459,7 +481,7 @@ func (t *tx) rev(seq int64) *revRow {
 	if r, ok := t.ownRevs[seq]; ok {
 		return &r
 	}
-	r, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE seq = ?`, seq))
+	r, err := scanRev(t.QueryRow(`SELECT `+t.revCols()+` FROM revisions WHERE seq = ?`, seq))
 	t.must(err)
 	t.memoRev(r)
 	return r
@@ -637,7 +659,7 @@ func (t *tx) findInAncestry(head *revRow, id ids.ID) *revRow {
 // the index of its segment, or nil and -1.
 func (t *tx) locate(segs []segment, id ids.ID) (int, *revRow) {
 	for i, s := range segs {
-		r, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ? AND seq <= ?`, s.res, id[:], s.max))
+		r, err := scanRev(t.QueryRow(`SELECT `+t.revCols()+` FROM revisions WHERE res = ? AND id = ? AND seq <= ?`, s.res, id[:], s.max))
 		if err == nil {
 			return i, r
 		}
@@ -967,7 +989,7 @@ func (t *tx) logBetween(to *revRow, since *ids.ID, limit, maxBytes int, served f
 		if i == k {
 			from = lo
 		}
-		q := `SELECT ` + revCols + ` FROM revisions WHERE res = ? AND seq > ? AND seq <= ? ORDER BY seq`
+		q := `SELECT ` + t.revCols() + ` FROM revisions WHERE res = ? AND seq > ? AND seq <= ? ORDER BY seq`
 		args := []any{segs[i].res, from, segs[i].max}
 		if limit > 0 {
 			q += ` LIMIT ?`

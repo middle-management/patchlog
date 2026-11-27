@@ -1069,7 +1069,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		if n.purged && resource == "" && (perEntry || live != nil) && since != "" && fromSeq == n.headSeq.Int64 {
 			return t.purgedRead(n)
 		}
-		q := `SELECT ` + nsLogCols + ` FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
+		q := `SELECT ` + t.nsLogCols() + ` FROM ` + nsLogFrom + ` WHERE l.ns = ? AND l.seq > ? AND l.seq <= ? ORDER BY l.seq`
 		args := []any{n.id, fromSeq, toSeq}
 		if limit > 0 {
 			q += ` LIMIT ?`
@@ -1097,6 +1097,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			rs = append(rs, r)
 		}
 		rows.Close()
+		t.checkRebuilt(rs)
 		out.Status = 200
 		out.Last = since
 		// An entry's prev is the row before it in the page, but for the

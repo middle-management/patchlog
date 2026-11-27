@@ -208,7 +208,7 @@ func (t *tx) snapshotKid(n *nsRow, cfg *Config, h *revRow) (int, string) {
 		// Newest first, a few rows at a time: no query runs while rows
 		// are open (Postgres).
 		for max := seg.max; found == nil; {
-			rows, err := t.Query(`SELECT `+revCols+` FROM revisions WHERE res = ? AND seq <= ? ORDER BY seq DESC LIMIT 16`, seg.res, max)
+			rows, err := t.Query(`SELECT `+t.revCols()+` FROM revisions WHERE res = ? AND seq <= ? ORDER BY seq DESC LIMIT 16`, seg.res, max)
 			t.must(err)
 			var page []*revRow
 			for rows.Next() {
@@ -555,7 +555,7 @@ func (t *tx) epochNow(b *nsRow) int {
 // epochs. A base at at that isn't e2e gives none.
 func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
 	var cseq, created int64
-	if err := t.QueryRow(`SELECT config_seq, created FROM ns_log WHERE seq = ?`, at).Scan(&cseq, &created); err != nil {
+	if err := t.QueryRow(`SELECT l.config_seq, `+nsLogCreated+` FROM ns_log l WHERE l.seq = ?`, at).Scan(&cseq, &created); err != nil {
 		return nil
 	}
 	acfg := t.config(cseq)

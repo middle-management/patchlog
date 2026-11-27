@@ -231,7 +231,7 @@ func docStmts(qs map[string]int) int {
 	n := 0
 	for q, c := range qs {
 		if strings.HasPrefix(q, "SELECT res, doc FROM heads WHERE") || strings.HasPrefix(q, "SELECT res, doc FROM snapshots WHERE") ||
-			strings.HasPrefix(q, "SELECT "+revCols+" FROM revisions WHERE seq = ?") {
+			strings.HasPrefix(q, "SELECT "+revColsBy[1]+" FROM revisions WHERE seq = ?") {
 			n += c
 		}
 	}

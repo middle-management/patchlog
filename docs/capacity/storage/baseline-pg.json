@@ -1,0 +1,214 @@
+{
+  "profile": "grants",
+  "storage": {
+    "bytes_per_write": 949.7,
+    "method": "VACUUM FULL ANALYZE, then pg_relation_size of each table (main fork), its TOAST table and each index",
+    "objects": {
+      "head_history": {
+        "bytes": 10436608,
+        "bytes_per_write": 52.2,
+        "kind": "table",
+        "table": "head_history"
+      },
+      "head_history_pkey": {
+        "bytes": 6324224,
+        "bytes_per_write": 31.6,
+        "kind": "index",
+        "table": "head_history"
+      },
+      "heads": {
+        "bytes": 114688,
+        "bytes_per_write": 0.6,
+        "kind": "table",
+        "table": "heads"
+      },
+      "heads_pkey": {
+        "bytes": 32768,
+        "bytes_per_write": 0.2,
+        "kind": "index",
+        "table": "heads"
+      },
+      "heads_seq": {
+        "bytes": 32768,
+        "bytes_per_write": 0.2,
+        "kind": "index",
+        "table": "heads"
+      },
+      "ns_log": {
+        "bytes": 51453952,
+        "bytes_per_write": 257.3,
+        "kind": "table",
+        "table": "ns_log"
+      },
+      "ns_log_by_grant": {
+        "bytes": 11878400,
+        "bytes_per_write": 59.4,
+        "kind": "index",
+        "table": "ns_log"
+      },
+      "ns_log_ns_config": {
+        "bytes": 8175616,
+        "bytes_per_write": 40.9,
+        "kind": "index",
+        "table": "ns_log"
+      },
+      "ns_log_ns_id_key": {
+        "bytes": 10002432,
+        "bytes_per_write": 50,
+        "kind": "index",
+        "table": "ns_log"
+      },
+      "ns_log_ns_prev_seq_key": {
+        "bytes": 6348800,
+        "bytes_per_write": 31.7,
+        "kind": "index",
+        "table": "ns_log"
+      },
+      "ns_log_ns_seq": {
+        "bytes": 6348800,
+        "bytes_per_write": 31.7,
+        "kind": "index",
+        "table": "ns_log"
+      },
+      "ns_log_pkey": {
+        "bytes": 4521984,
+        "bytes_per_write": 22.6,
+        "kind": "index",
+        "table": "ns_log"
+      },
+      "ns_log_xid": {
+        "bytes": 2031616,
+        "bytes_per_write": 10.2,
+        "kind": "index",
+        "table": "ns_log"
+      },
+      "one_first": {
+        "bytes": 32768,
+        "bytes_per_write": 0.2,
+        "kind": "index",
+        "table": "revisions"
+      },
+      "rate_buckets": {
+        "bytes": 40960,
+        "bytes_per_write": 0.2,
+        "kind": "table",
+        "table": "rate_buckets"
+      },
+      "rate_buckets_pkey": {
+        "bytes": 32768,
+        "bytes_per_write": 0.2,
+        "kind": "index",
+        "table": "rate_buckets"
+      },
+      "resources": {
+        "bytes": 106496,
+        "bytes_per_write": 0.5,
+        "kind": "table",
+        "table": "resources"
+      },
+      "resources_name": {
+        "bytes": 40960,
+        "bytes_per_write": 0.2,
+        "kind": "index",
+        "table": "resources"
+      },
+      "resources_ns_name_c": {
+        "bytes": 40960,
+        "bytes_per_write": 0.2,
+        "kind": "index",
+        "table": "resources"
+      },
+      "resources_ns_name_key": {
+        "bytes": 40960,
+        "bytes_per_write": 0.2,
+        "kind": "index",
+        "table": "resources"
+      },
+      "resources_pkey": {
+        "bytes": 32768,
+        "bytes_per_write": 0.2,
+        "kind": "index",
+        "table": "resources"
+      },
+      "revisions": {
+        "bytes": 36446208,
+        "bytes_per_write": 182.2,
+        "kind": "table",
+        "table": "revisions"
+      },
+      "revisions_by_id": {
+        "bytes": 8142848,
+        "bytes_per_write": 40.7,
+        "kind": "index",
+        "table": "revisions"
+      },
+      "revisions_pkey": {
+        "bytes": 4505600,
+        "bytes_per_write": 22.5,
+        "kind": "index",
+        "table": "revisions"
+      },
+      "revisions_res_id_key": {
+        "bytes": 9961472,
+        "bytes_per_write": 49.8,
+        "kind": "index",
+        "table": "revisions"
+      },
+      "revisions_res_parent_seq_key": {
+        "bytes": 6324224,
+        "bytes_per_write": 31.6,
+        "kind": "index",
+        "table": "revisions"
+      },
+      "revisions_res_seq": {
+        "bytes": 6324224,
+        "bytes_per_write": 31.6,
+        "kind": "index",
+        "table": "revisions"
+      },
+      "snapshots": {
+        "bytes": 81920,
+        "bytes_per_write": 0.4,
+        "kind": "table",
+        "table": "snapshots"
+      },
+      "snapshots_pkey": {
+        "bytes": 32768,
+        "bytes_per_write": 0.2,
+        "kind": "index",
+        "table": "snapshots"
+      },
+      "snapshots_res": {
+        "bytes": 40960,
+        "bytes_per_write": 0.2,
+        "kind": "index",
+        "table": "snapshots"
+      }
+    },
+    "prune_seconds": 87.556320848,
+    "resources": 1000,
+    "rows": {
+      "grants": 2,
+      "head_history": 200000,
+      "ns_config": 1,
+      "ns_log": 201001,
+      "resources": 1000,
+      "revisions": 200000,
+      "revisions_patches_null": 199000
+    },
+    "store": "postgres",
+    "tables_per_write": {
+      "head_history": 83.8,
+      "heads": 0.9,
+      "ns_log": 503.8,
+      "rate_buckets": 0.4,
+      "resources": 1.3,
+      "revisions": 358.7,
+      "snapshots": 0.8
+    },
+    "write_seconds": 291.559979343,
+    "writes": 200000,
+    "writes_per_second": 685.9652015708025
+  },
+  "total_seconds": 694.826108262
+}

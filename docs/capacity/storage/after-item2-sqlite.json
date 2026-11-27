@@ -1,0 +1,141 @@
+{
+  "profile": "grants",
+  "storage": {
+    "bytes_per_write": 308.7,
+    "method": "VACUUM INTO a copy, then SUM(pgsize) FROM dbstat by object",
+    "objects": {
+      "head_history": {
+        "bytes": 2928640,
+        "bytes_per_write": 14.6,
+        "kind": "table",
+        "table": "head_history"
+      },
+      "heads": {
+        "bytes": 40960,
+        "bytes_per_write": 0.2,
+        "kind": "table",
+        "table": "heads"
+      },
+      "heads_seq": {
+        "bytes": 12288,
+        "bytes_per_write": 0.1,
+        "kind": "index",
+        "table": "heads"
+      },
+      "ns_log": {
+        "bytes": 10735616,
+        "bytes_per_write": 53.7,
+        "kind": "table",
+        "table": "ns_log"
+      },
+      "ns_log_ns_seq": {
+        "bytes": 2564096,
+        "bytes_per_write": 12.8,
+        "kind": "index",
+        "table": "ns_log"
+      },
+      "one_first": {
+        "bytes": 12288,
+        "bytes_per_write": 0.1,
+        "kind": "index",
+        "table": "revisions"
+      },
+      "resources": {
+        "bytes": 32768,
+        "bytes_per_write": 0.2,
+        "kind": "table",
+        "table": "resources"
+      },
+      "resources_name": {
+        "bytes": 16384,
+        "bytes_per_write": 0.1,
+        "kind": "index",
+        "table": "resources"
+      },
+      "revisions": {
+        "bytes": 18657280,
+        "bytes_per_write": 93.3,
+        "kind": "table",
+        "table": "revisions"
+      },
+      "revisions_by_id": {
+        "bytes": 5816320,
+        "bytes_per_write": 29.1,
+        "kind": "index",
+        "table": "revisions"
+      },
+      "revisions_res_seq": {
+        "bytes": 2928640,
+        "bytes_per_write": 14.6,
+        "kind": "index",
+        "table": "revisions"
+      },
+      "snapshots": {
+        "bytes": 40960,
+        "bytes_per_write": 0.2,
+        "kind": "table",
+        "table": "snapshots"
+      },
+      "snapshots_res": {
+        "bytes": 16384,
+        "bytes_per_write": 0.1,
+        "kind": "index",
+        "table": "snapshots"
+      },
+      "sqlite_autoindex_ns_log_1": {
+        "bytes": 6041600,
+        "bytes_per_write": 30.2,
+        "kind": "index",
+        "table": "ns_log"
+      },
+      "sqlite_autoindex_ns_log_2": {
+        "bytes": 2564096,
+        "bytes_per_write": 12.8,
+        "kind": "index",
+        "table": "ns_log"
+      },
+      "sqlite_autoindex_resources_1": {
+        "bytes": 16384,
+        "bytes_per_write": 0.1,
+        "kind": "index",
+        "table": "resources"
+      },
+      "sqlite_autoindex_revisions_1": {
+        "bytes": 6385664,
+        "bytes_per_write": 31.9,
+        "kind": "index",
+        "table": "revisions"
+      },
+      "sqlite_autoindex_revisions_2": {
+        "bytes": 2924544,
+        "bytes_per_write": 14.6,
+        "kind": "index",
+        "table": "revisions"
+      }
+    },
+    "prune_seconds": 13.848024243,
+    "resources": 1000,
+    "rows": {
+      "grants": 2,
+      "head_history": 200000,
+      "ns_config": 1,
+      "ns_log": 201001,
+      "resources": 1000,
+      "revisions": 200000,
+      "revisions_patches_null": 199000
+    },
+    "store": "sqlite",
+    "tables_per_write": {
+      "head_history": 14.6,
+      "heads": 0.3,
+      "ns_log": 109.5,
+      "resources": 0.3,
+      "revisions": 183.6,
+      "snapshots": 0.3
+    },
+    "write_seconds": 372.861803109,
+    "writes": 200000,
+    "writes_per_second": 536.3917632011593
+  },
+  "total_seconds": 697.706899742
+}

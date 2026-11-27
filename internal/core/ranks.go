@@ -29,7 +29,7 @@ func targetRank(cfg *Config) int {
 func (t *tx) samePrincipal(seq int64, a *actor, author int64) bool {
 	var au int64
 	var gid []byte
-	t.must(t.QueryRow(`SELECT author, grant_id FROM ns_log WHERE seq = ?`, seq).Scan(&au, &gid))
+	t.must(t.QueryRow(`SELECT l.author, `+t.grantIDOf("l")+` FROM ns_log l WHERE l.seq = ?`, seq).Scan(&au, &gid))
 	if au != author {
 		return false
 	}

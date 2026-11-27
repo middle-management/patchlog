@@ -82,6 +82,13 @@ func (s *schemaEnv) legacyRow(ns, name string, doc any) string {
 	id := ids.Revision(nil, canon)
 	err := s.e.update(context.Background(), func(t *tx) error {
 		res := t.resource(t.nsByName(ns).id, name)
+		// The entry naming the placeholder keeps its body, as hashed: a
+		// derived one (entrybody.go) would be rebuilt with the new id.
+		if _, err := t.Exec(`UPDATE ns_log SET body = ?, created = (SELECT created FROM revisions WHERE res = ? AND id = ?)
+			WHERE res = ? AND target_seq = (SELECT seq FROM revisions WHERE res = ? AND id = ?) AND (body IS NULL OR body = '')`,
+			string(entryBody(nsKindCode("head"), name, pid)), res.id, pid[:], res.id, res.id, pid[:]); err != nil {
+			return err
+		}
 		if _, err := t.Exec(`UPDATE revisions SET id = ?, patches = ?, rules = NULL, size = NULL, digest = NULL WHERE res = ? AND id = ?`,
 			id[:], t.putPatches(res.id, id, canon, nil), res.id, pid[:]); err != nil {
 			return err

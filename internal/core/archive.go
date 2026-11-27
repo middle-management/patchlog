@@ -198,7 +198,7 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 		after := fromSeq - 1
 		for {
 			// Batches, so no query is open while yield writes.
-			rows, err := t.Query(`SELECT `+revCols+` FROM revisions WHERE res = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT 256`, res, after, lastSeq)
+			rows, err := t.Query(`SELECT `+t.revCols()+` FROM revisions WHERE res = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT 256`, res, after, lastSeq)
 			if err != nil {
 				return err
 			}
@@ -318,12 +318,8 @@ func (t *tx) archiveGrant(n *nsRow, gid ids.ID, created time.Time) *ArchiveGrant
 	}
 	for i := len(chain) - 1; i >= 0; i-- {
 		var seq, cfg, entryCreated int64
-		var err error
-		if chain[i].bound.Valid {
-			err = t.QueryRow(`SELECT seq, config_seq, created FROM ns_log WHERE grant_id = ? AND ns = ? AND seq <= ? ORDER BY seq LIMIT 1`, gid[:], chain[i].n.id, chain[i].bound.Int64).Scan(&seq, &cfg, &entryCreated)
-		} else {
-			err = t.QueryRow(`SELECT seq, config_seq, created FROM ns_log WHERE grant_id = ? AND ns = ? ORDER BY seq LIMIT 1`, gid[:], chain[i].n.id).Scan(&seq, &cfg, &entryCreated)
-		}
+		first, args := t.firstGrantEntry(gid[:], chain[i].n.id, chain[i].bound)
+		err := t.QueryRow(`SELECT l.seq, l.config_seq, `+nsLogCreated+` FROM ns_log l WHERE l.seq = `+first, args...).Scan(&seq, &cfg, &entryCreated)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
@@ -375,7 +371,7 @@ func (t *tx) operatorKeysAt(created time.Time) []ArchiveCandidateKey {
 			// In force from the deployment's first namespace entry, as
 			// Engine.OperatorKeyHistory publishes it.
 			var ms sql.NullInt64
-			t.must(t.QueryRow(`SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms))
+			t.must(t.QueryRow(`SELECT MIN(` + nsLogCreated + `) FROM ns_log l WHERE l.seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms))
 			first = t.e.started
 			if ms.Valid {
 				first = time.UnixMilli(ms.Int64).UTC()
@@ -607,7 +603,7 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 				out.Skipped++
 				return nil
 			}
-			row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, id[:]))
+			row, err := scanRev(t.QueryRow(`SELECT `+t.revCols()+` FROM revisions WHERE res = ? AND id = ?`, own.id, id[:]))
 			if errors.Is(err, sql.ErrNoRows) {
 				out.Skipped++
 				return nil

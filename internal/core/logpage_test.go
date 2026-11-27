@@ -160,10 +160,13 @@ func TestLogPageBrokenChain(t *testing.T) {
 	}
 }
 
-// A namespace log page and the config-retry lookup read ns_log through
-// their own indexes, not the whole namespace or table (ns_log_ns_seq,
-// ns_log_ns_config). Planned on SQLite, whose planner doesn't depend on
-// statistics; on Postgres the indexes exist, the plan depends on the data.
+// A namespace log page reads ns_log through its own index, not the whole
+// namespace or table (ns_log_ns_seq), and the config-retry and grant
+// lookups read the rows written once in place of indexes of ns_log
+// (ns_config.first_seq, ns_grants; entrybody.go) by their keys. Planned on
+// SQLite, whose planner doesn't depend on statistics; on Postgres the
+// index exists and the ones replaced don't, the plan depends on the data
+// (TestPGFirstsPlans).
 func TestNSLogQueriesUseIndexes(t *testing.T) {
 	t.Parallel()
 	e, err := Open(Options{Path: pgtest.FreshDB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1,
@@ -174,17 +177,19 @@ func TestNSLogQueriesUseIndexes(t *testing.T) {
 	defer e.Close()
 	if e.pg {
 		var n int
-		if err := e.db.QueryRow(`SELECT count(*) FROM pg_indexes WHERE tablename = 'ns_log' AND indexname IN ('ns_log_ns_seq', 'ns_log_ns_config')`).Scan(&n); err != nil {
+		if err := e.db.QueryRow(`SELECT count(*) FROM pg_indexes WHERE tablename = 'ns_log' AND indexname IN ('ns_log_ns_seq', 'ns_log_ns_config', 'ns_log_by_grant', 'ns_log_by_grant_ref')`).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
-		if n != 2 {
-			t.Fatalf("ns_log indexes: %d of 2", n)
+		if n != 1 {
+			t.Fatalf("ns_log indexes: %d, want ns_log_ns_seq alone", n)
 		}
 		return
 	}
 	for _, c := range []struct{ q, index string }{
 		{`SELECT seq, id, prev_seq, body FROM ns_log WHERE ns = 1 AND seq > 0 AND seq <= 100 ORDER BY seq LIMIT 10`, "ns_log_ns_seq"},
-		{`SELECT MIN(seq) FROM ns_log WHERE ns = 1 AND config_seq = 1`, "ns_log_ns_config"},
+		{`SELECT ` + nsLogColsBy[1] + ` FROM ` + nsLogFrom + ` WHERE l.ns = 1 AND l.seq > 0 AND l.seq <= 100 ORDER BY l.seq LIMIT 10`, "ns_log_ns_seq"},
+		{`SELECT first_seq FROM ns_config WHERE seq = 1 AND ns = 1`, "INTEGER PRIMARY KEY"},
+		{`SELECT f.first_seq FROM ns_grants f WHERE f.grant_ref = (SELECT ref FROM grants WHERE id = x'00') AND f.ns = 1`, "PRIMARY KEY (grant_ref=? AND ns=?)"},
 	} {
 		rows, err := e.db.Query(`EXPLAIN QUERY PLAN ` + c.q)
 		if err != nil {

@@ -127,8 +127,9 @@ func write(e *Engine, ns, name, ifMatch string, n int) (*WriteResult, error) {
 // body (§3.5). It returns the transaction id of each entry, by entry id.
 func checkChain(t *testing.T, e *Engine, ns string) map[string]string {
 	t.Helper()
-	rows, err := e.db.QueryContext(context.Background(), `SELECT seq, id, prev_seq, body, xid::text FROM ns_log
-		WHERE ns = (SELECT ns FROM namespaces WHERE name = $1) ORDER BY seq`, ns)
+	// A derived entry's body is rebuilt as reads do (entrybody.go).
+	rows, err := e.db.QueryContext(context.Background(), `SELECT l.seq, l.id, l.prev_seq, COALESCE(l.body, ''), l.xid::text, `+derivedCols+` FROM ns_log l`+derivedJoins+`
+		WHERE l.ns = (SELECT ns FROM namespaces WHERE name = $1) ORDER BY l.seq`, ns)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,8 +142,12 @@ func checkChain(t *testing.T, e *Engine, ns string) map[string]string {
 		var id []byte
 		var ps *int64
 		var body, xid string
-		if err := rows.Scan(&seq, &id, &ps, &body, &xid); err != nil {
+		var d derived
+		if err := rows.Scan(&seq, &id, &ps, &body, &xid, &d.kind, &d.name, &d.id, &d.created); err != nil {
 			t.Fatal(err)
+		}
+		if body == "" {
+			body = string(entryBody(d.kind, d.name.String, ids.FromBytes(d.id)))
 		}
 		if (prev == nil) != (ps == nil) || ps != nil && *ps != prevSeq {
 			t.Fatalf("entry %d follows %v, want %d", seq, ps, prevSeq)
@@ -1134,7 +1139,7 @@ func TestPGGroupCommitKidPerWrite(t *testing.T) {
 	for i, r := range res {
 		var kid string
 		id, _ := ids.Parse(r.NSID)
-		if err := e.db.QueryRow(`SELECT g.root_kid FROM ns_log l JOIN grants g ON g.id = l.grant_id WHERE l.id = $1`, id[:]).Scan(&kid); err != nil {
+		if err := e.db.QueryRow(`SELECT g.root_kid FROM ns_log l JOIN grants g ON g.id = l.grant_id OR g.ref = l.grant_ref WHERE l.id = $1`, id[:]).Scan(&kid); err != nil {
 			t.Fatal(err)
 		}
 		if want := []string{"k1", "k2"}[i]; kid != want {

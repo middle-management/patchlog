@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+### Storage: what a pruned write leaves behind
+
+Each write leaves a skeleton for good once its patch set is pruned: a `revisions` row, an
+`ns_log` row, a `head_history` row and their index entries. `cmd/capacity -only storage`
+measures it (docs/capacity/storage: 200,000 writes over 1,000 resources under one grant, pruned
+to their heads; bytes per write by table and index). Nothing a client sees changes: entry ids,
+bodies as served, wire bytes and vectors are the same.
+
+- **Derived namespace entries and grants by number** (migrations `031_ns_log_derived_bodies_and_grant_refs`
+  on SQLite, `033_…` on Postgres). A single write's `head` or `tombstone` entry is stored
+  without its body and created time: a read rebuilds `{ kind, resource, target }` from the
+  entry's kind, its resource's name and its target's id, byte for byte as hashed (§3.5), and
+  takes the revision's created time, written in the same transaction. An entry is stored so
+  only when that rebuild gives exactly its canonical bytes; batch, config, branch, prune, purge
+  and purge-ns entries keep theirs. Stored grants get a number (`grants.ref`), which new
+  `ns_log` and `revisions` rows record in place of the 20-byte grant id. SQLite 485 → 337 bytes
+  per write (`ns_log` 164 → 54, `revisions` 111 → 93, the grant index 34 → 15); Postgres 950 →
+  802 (`ns_log` 257 → 142, `revisions` 182 → 167, the grant index 59 → 41).
+  **Upgrading:** nothing is rewritten, so rows written before keep their bodies and grant ids
+  (reads take either) and only new writes are smaller. On Postgres the migration's
+  `ALTER TABLE`s on `ns_log` and `revisions` change only the catalog, but adding the identity
+  column rewrites `grants` and creating the index `ns_log_by_grant_ref` reads all of `ns_log`
+  while holding off writes to it: minutes on a table of hundreds of millions of rows.
+- **Rare lookups off ns_log's per-write indexes** (migrations `032_ns_log_first_entries_by_grant_and_config`
+  on SQLite, `034_…` on Postgres). `ns_log_by_grant` (and the item above's `ns_log_by_grant_ref`)
+  served one question, the first entry of a namespace recording a grant (`GET
+  /ns/{ns}/grants/{gid}`, archive candidates, sealing a grant), and `ns_log_ns_config` one other,
+  the first entry under a configuration (idempotent retries of config writes and batches). A
+  table `ns_grants (grant_ref, ns) → first_seq` and a column `ns_config.first_seq` answer them,
+  each row written once by a trigger as the first such entry is inserted, and the indexes are
+  dropped. SQLite 337 → 309 bytes per write, Postgres 802 → 720 (indexes 438 → 356).
+  `revisions_by_id` stays: see docs/capacity/storage.
+  **Upgrading:** the migration fills both from the entries there are, one pass over `ns_log`
+  (and on Postgres an update of every `ns_config` row), then drops the indexes; on Postgres it
+  holds off writes for that pass. A database upgraded from before both migrations builds
+  `ns_log_by_grant_ref` only for this one to drop it.
+- **Not changed: Postgres column types and order, and `head_history`.** Laying `ns_log` and
+  `revisions` out 8 → 4 → 2 → varlena with `integer` namespaces, authors and grant numbers would
+  save about 32 bytes per write (15 and 17 a row, measured; the indexes don't shrink), but only
+  by copying both tables under an exclusive lock; serving `head_history` for single writes from a
+  partial index of `ns_log` would rewrite a dozen statements as unions. Measured and argued in
+  docs/capacity/storage. Single writes measured about as fast as before (Postgres 770 → 820–960
+  writes a second, SQLite 1,250 → 1,330–1,400, 30,000 writes over HTTP on an idle host).
+
 ## v0.34.0
 
 ### Client: a read-filtering grant is a view

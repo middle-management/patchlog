@@ -542,8 +542,8 @@ func (t *tx) appendTogether(ws []*groupWrite) {
 	for i, w := range ws {
 		a := w.plan.a
 		authors[i] = t.actorID(a)
-		grantID := t.storeGrant(a.grant, t.nsLevel(n) >= levelAtRest)
-		wr := writtenBy(a, authors[i], grantID)
+		grantID, grantRef := t.storeGrant(a.grant, t.nsLevel(n) >= levelAtRest)
+		wr := writtenBy(a, authors[i], grantID, grantRef)
 		for _, s := range w.plan.st {
 			st, by = append(st, s), append(by, wr)
 		}
