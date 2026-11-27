@@ -51,9 +51,8 @@ func (s *Server) writePurged(w http.ResponseWriter, r *http.Request, err error, 
 
 // writeFilteredRedirect answers err if it is a *core.FilteredRedirect: 302
 // to /ns/{ns}/view/{view}/at/{at}{suffix}, or without /at/{at} for
-// long-poll and events, with q as its query, or to /ns/{ns}/view/{view}
-// followed by a resource's immutable URL (§7.9 Content), private,
-// no-store and varying by Authorization, which decided it for an
+// long-poll and events, with q as its query, private, no-store and
+// varying by Authorization, which decided it for an
 // unfiltered URL (§7.9 URLs). It returns false for any other error.
 func (s *Server) writeFilteredRedirect(w http.ResponseWriter, err error, suffix string, q url.Values) bool {
 	var fr *core.FilteredRedirect
@@ -62,8 +61,6 @@ func (s *Server) writeFilteredRedirect(w http.ResponseWriter, err error, suffix 
 	}
 	loc := "/ns/" + fr.NS + "/view/" + fr.View
 	switch {
-	case fr.Content != "":
-		loc += fr.Content
 	case fr.At != "":
 		loc += "/at/" + fr.At + suffix
 	default:
@@ -422,10 +419,7 @@ func (s *Server) viewEvents(w http.ResponseWriter, r *http.Request) {
 	wait := s.e.Wait(ns)
 	lg, _, err := s.e.FilteredEventLog(r.Context(), ns, view, since, page, cred)
 	if err != nil {
-		if s.writePurged(w, r, err, ns) {
-			return
-		}
-		writeErr(w, err)
+		writeErr(w, err) // a stream's, no-store, a purge's 410 too
 		return
 	}
 	if lg.Status != 200 {

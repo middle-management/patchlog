@@ -2,6 +2,8 @@ package server
 
 import (
 	"encoding/json"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -42,47 +44,69 @@ func TestV091PurgedNamespaceEveryRoute(t *testing.T) {
 	}
 	bid := rev // any id in text form
 	patch := ops(op("add", "/n", 2))
-	routes := []req{
-		{method: "GET", path: "/r/old/derby"},
-		{method: "PATCH", path: "/r/old/derby", ifMatch: rev, body: patch, ct: jsonPatchType},
-		{method: "DELETE", path: "/r/old/derby", ifMatch: rev},
-		{method: "GET", path: "/r/old/derby/rev/" + rev},
-		{method: "GET", path: "/r/old/derby/rev/" + rev + "/log"},
-		{method: "GET", path: "/r/old/derby/raw"},
-		{method: "GET", path: "/r/old/derby/rev/" + rev + "/raw"},
-		{method: "GET", path: "/r/old/derby/log?since=" + rev + "&live=long-poll"},
-		{method: "GET", path: "/r/old/derby/events"},
-		{method: "POST", path: "/r/old/derby/purge", ifMatch: rev},
-		{method: "POST", path: "/r/old/derby/prune", body: map[string]any{"horizon": rev}},
-		{method: "PUT", path: "/r/old/derby/blob/" + bid, raw: "x", ct: "text/plain"},
-		{method: "GET", path: "/r/old/derby/blob/" + bid},
-		{method: "GET", path: "/r/old/derby/blob/" + bid + "/e/1"},
-		{method: "GET", path: "/ns/old"},
-		{method: "PATCH", path: "/ns/old", ifMatch: at, body: patch, ct: jsonPatchType},
-		{method: "GET", path: "/ns/old/rev/" + head},
-		{method: "GET", path: "/ns/old/rev/" + at + "/log"},
-		{method: "GET", path: "/ns/old/rev/" + head + "/heads"},
-		{method: "GET", path: "/ns/old/log?since=" + at + "&live=long-poll"},
-		{method: "GET", path: "/ns/old/events"},
-		{method: "GET", path: "/ns/old/view/" + head + "/at/" + at + "/heads"},
-		{method: "GET", path: "/ns/old/view/" + head + "/at/" + at + "/log"},
-		{method: "GET", path: "/ns/old/view/" + head + "/heads"},
-		{method: "GET", path: "/ns/old/view/" + head + "/log"},
-		{method: "GET", path: "/ns/old/view/" + head + "/events"},
-		{method: "GET", path: "/ns/old/view/" + head + "/r/derby/rev/" + rev},
-		{method: "GET", path: "/ns/old/view/" + head + "/r/derby/blob/" + bid},
-		{method: "GET", path: "/ns/old/gestures/" + strings.Repeat("a", 26)},
-		{method: "GET", path: "/ns/old/principal"},
-		{method: "GET", path: "/ns/old/grants/" + head},
-		{method: "GET", path: "/ns/old/branches"},
-		{method: "POST", path: "/ns/old/branches", ifNoneMatch: "*", body: map[string]any{"name": "old-b"}},
-		{method: "POST", path: "/ns/old/batch", body: map[string]any{"items": []any{map[string]any{"resource": "x", "ifNoneMatch": "*", "steps": []any{ops(op("add", "", map[string]any{}))}}}}},
-		{method: "POST", path: "/ns/old/purge", ifMatch: head},
-		{method: "POST", path: "/ns/old/keys", body: map[string]any{}},
+	// Each route the server registers under /r/{ns} or /ns/{ns}, by
+	// pattern, the URLs that are no-store whatever they answer marked.
+	type route struct {
+		pattern string
+		noStore bool
+		q       req
 	}
-	for _, rq := range routes {
+	routes := []route{
+		{"GET /r/{ns}/{name}", false, req{method: "GET", path: "/r/old/derby"}},
+		{"PATCH /r/{ns}/{name}", true, req{method: "PATCH", path: "/r/old/derby", ifMatch: rev, body: patch, ct: jsonPatchType}},
+		{"DELETE /r/{ns}/{name}", true, req{method: "DELETE", path: "/r/old/derby", ifMatch: rev}},
+		{"GET /r/{ns}/{name}/rev/{id}", false, req{method: "GET", path: "/r/old/derby/rev/" + rev}},
+		{"GET /r/{ns}/{name}/rev/{id}/log", false, req{method: "GET", path: "/r/old/derby/rev/" + rev + "/log"}},
+		{"GET /r/{ns}/{name}/raw", false, req{method: "GET", path: "/r/old/derby/raw"}},
+		{"GET /r/{ns}/{name}/rev/{id}/raw", false, req{method: "GET", path: "/r/old/derby/rev/" + rev + "/raw"}},
+		{"GET /r/{ns}/{name}/log", false, req{method: "GET", path: "/r/old/derby/log?since=" + rev + "&live=long-poll"}},
+		{"GET /r/{ns}/{name}/events", true, req{method: "GET", path: "/r/old/derby/events"}},
+		{"POST /r/{ns}/{name}/purge", true, req{method: "POST", path: "/r/old/derby/purge", ifMatch: rev}},
+		{"POST /r/{ns}/{name}/prune", true, req{method: "POST", path: "/r/old/derby/prune", body: map[string]any{"horizon": rev}}},
+		{"PUT /r/{ns}/{name}/blob/{bid}", true, req{method: "PUT", path: "/r/old/derby/blob/" + bid, raw: "x", ct: "text/plain"}},
+		{"GET /r/{ns}/{name}/blob/{bid}", false, req{method: "GET", path: "/r/old/derby/blob/" + bid}},
+		{"GET /r/{ns}/{name}/blob/{bid}/e/{e}", false, req{method: "GET", path: "/r/old/derby/blob/" + bid + "/e/1"}},
+		{"GET /ns/{ns}", false, req{method: "GET", path: "/ns/old"}},
+		{"PATCH /ns/{ns}", true, req{method: "PATCH", path: "/ns/old", ifMatch: at, body: patch, ct: jsonPatchType}},
+		{"GET /ns/{ns}/rev/{id}", false, req{method: "GET", path: "/ns/old/rev/" + head}},
+		{"GET /ns/{ns}/rev/{id}/log", false, req{method: "GET", path: "/ns/old/rev/" + at + "/log"}},
+		{"GET /ns/{ns}/rev/{id}/heads", false, req{method: "GET", path: "/ns/old/rev/" + head + "/heads"}},
+		{"GET /ns/{ns}/log", false, req{method: "GET", path: "/ns/old/log?since=" + at + "&live=long-poll"}},
+		{"GET /ns/{ns}/events", true, req{method: "GET", path: "/ns/old/events"}},
+		{"GET /ns/{ns}/view/{view}/at/{at}/heads", false, req{method: "GET", path: "/ns/old/view/" + head + "/at/" + at + "/heads"}},
+		{"GET /ns/{ns}/view/{view}/at/{at}/log", false, req{method: "GET", path: "/ns/old/view/" + head + "/at/" + at + "/log"}},
+		{"GET /ns/{ns}/view/{view}/heads", false, req{method: "GET", path: "/ns/old/view/" + head + "/heads"}},
+		{"GET /ns/{ns}/view/{view}/log", false, req{method: "GET", path: "/ns/old/view/" + head + "/log"}},
+		{"GET /ns/{ns}/view/{view}/events", true, req{method: "GET", path: "/ns/old/view/" + head + "/events"}},
+		{"GET /ns/{ns}/view/{view}/r/{name}/rev/{id}", false, req{method: "GET", path: "/ns/old/view/" + head + "/r/derby/rev/" + rev}},
+		{"GET /ns/{ns}/view/{view}/r/{name}/blob/{bid}", false, req{method: "GET", path: "/ns/old/view/" + head + "/r/derby/blob/" + bid}},
+		{"GET /ns/{ns}/gestures/{gesture}", true, req{method: "GET", path: "/ns/old/gestures/" + strings.Repeat("a", 26)}},
+		{"GET /ns/{ns}/principal", true, req{method: "GET", path: "/ns/old/principal"}},
+		{"GET /ns/{ns}/grants/{gid}", false, req{method: "GET", path: "/ns/old/grants/" + head}},
+		{"GET /ns/{ns}/branches", false, req{method: "GET", path: "/ns/old/branches"}},
+		{"POST /ns/{ns}/branches", true, req{method: "POST", path: "/ns/old/branches", ifNoneMatch: "*", body: map[string]any{"name": "old-b"}}},
+		{"POST /ns/{ns}/batch", true, req{method: "POST", path: "/ns/old/batch", body: map[string]any{"items": []any{map[string]any{"resource": "x", "ifNoneMatch": "*", "steps": []any{ops(op("add", "", map[string]any{}))}}}}}},
+		{"POST /ns/{ns}/purge", true, req{method: "POST", path: "/ns/old/purge", ifMatch: head}},
+		{"POST /ns/{ns}/keys", true, req{method: "POST", path: "/ns/old/keys", body: map[string]any{}}},
+		{"GET /ns/{ns}/view/{view}/r/{name}/rev/{id}/raw", false, req{method: "GET", path: "/ns/old/view/" + head + "/r/derby/rev/" + rev + "/raw"}},
+		{"GET /ns/{ns}/view/{view}/r/{name}/blob/{bid}/e/{e}", false, req{method: "GET", path: "/ns/old/view/" + head + "/r/derby/blob/" + bid + "/e/1"}},
+	}
+	listed := map[string]bool{}
+	for _, rt := range routes {
+		listed[rt.pattern] = true
+	}
+	src, err := os.ReadFile("server.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range regexp.MustCompile(`HandleFunc\("([A-Z]+ /(?:r|ns)/\{ns\}[^"]*)"`).FindAllStringSubmatch(string(src), -1) {
+		if !listed[m[1]] {
+			t.Errorf("route %s isn't swept: add it", m[1])
+		}
+	}
+	for _, rt := range routes {
 		for who, bearer := range creds {
-			q := rq
+			q := rt.q
 			q.bearer = bearer
 			if bearer == "" {
 				q.author = "x"
@@ -97,11 +121,14 @@ func TestV091PurgedNamespaceEveryRoute(t *testing.T) {
 			if body["code"] != "purged" || body["head"] != head {
 				t.Errorf("%s %s (%s): %s, want purged with head %s", q.method, q.path, who, got.Body, head)
 			}
-			if q.method == "GET" {
-				cc := got.H.Get("Cache-Control")
-				if cc != "no-store" && cc != ccLong {
-					t.Errorf("%s %s (%s): Cache-Control %q, want %q or no-store", q.method, q.path, who, cc, ccLong)
+			cc := got.H.Get("Cache-Control")
+			switch {
+			case rt.noStore || q.method != "GET":
+				if cc != "no-store" {
+					t.Errorf("%s %s (%s): Cache-Control %q, want no-store", q.method, q.path, who, cc)
 				}
+			case cc != ccLong || !strings.Contains(got.H.Get("Cache-Tag"), "ns:old"):
+				t.Errorf("%s %s (%s): Cache-Control %q, Cache-Tag %q, want %q and ns:old", q.method, q.path, who, cc, got.H.Get("Cache-Tag"), ccLong)
 			}
 		}
 	}

@@ -7,26 +7,18 @@ import (
 	"testing"
 )
 
-// §7.9 Content: a partial reader's read of a resource's immutable URL is
-// a 302 to its form under the reader's view, which the client follows
-// once, on the same origin, with the same grant; any other 302 is the
-// caller's.
-func TestV087FollowsViewContent(t *testing.T) {
+// §7.9 (v0.91): a resource's URLs answer a partial reader in place, so the
+// client follows no redirect of a document read: a 302 under a view is the
+// caller's, as any other.
+func TestV087FollowsNoViewContent(t *testing.T) {
 	view := "1" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	id := "1" + "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	other := "1" + "cccccccccccccccccccccccccccccccc"
-	var auth []string
 	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		auth = append(auth, r.Header.Get("Authorization"))
 		switch r.URL.Path {
 		case "/r/m/d/rev/" + id:
 			http.Redirect(w, r, "/ns/m/view/"+view+"/r/d/rev/"+id, 302)
 		case "/ns/m/view/" + view + "/r/d/rev/" + id:
-			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"team":"a"}`))
-		case "/r/m/d/rev/" + other:
-			// Somewhere else: never followed.
-			http.Redirect(w, r, "/ns/m/view/"+view+"/r/x/rev/"+other, 302)
+			t.Error("the redirect under the view was followed")
 		default:
 			http.NotFound(w, r)
 		}
@@ -36,17 +28,8 @@ func TestV087FollowsViewContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d, err := c.Doc(context.Background(), "m", "d", id)
-	if err != nil || string(d.Raw) != `{"team":"a"}` {
-		t.Fatalf("Doc under the view: %+v %v", d, err)
-	}
-	for _, a := range auth {
-		if a != "Bearer tok" {
-			t.Fatalf("Authorization %q", a)
-		}
-	}
-	if _, err := c.Doc(context.Background(), "m", "d", other); err == nil {
-		t.Fatal("a redirect to another resource was followed")
+	if _, err := c.Doc(context.Background(), "m", "d", id); err == nil {
+		t.Fatal("a 302 read as the document")
 	}
 }
 

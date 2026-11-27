@@ -83,6 +83,10 @@ func (s *Server) nsHead(w http.ResponseWriter, r *http.Request) {
 	}
 	info, err := s.e.NamespaceHead(r.Context(), ns, creds(r))
 	if err != nil {
+		// A purged namespace's 410, cached long (§8.5, §9).
+		if s.writeErrShort(w, r, err, "ns:"+ns) {
+			return
+		}
 		writeErr(w, err)
 		return
 	}

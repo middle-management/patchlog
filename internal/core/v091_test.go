@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/pgtest"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Spec v0.91: a purged namespace keeps only its name and the id of its
@@ -39,6 +41,8 @@ func v091Rows(t *testing.T, e *Engine, ns string) map[string]int {
 		"blobs":         `res IN (SELECT res FROM resources WHERE ns = ?)`,
 		"blob_refs":     `res IN (SELECT res FROM resources WHERE ns = ?)`,
 		"epoch_keys":    `ns = ?`,
+		"e2e_epochs":    `ns = ?`,
+		"rev_epochs":    `seq IN (SELECT v.seq FROM revisions v JOIN resources r ON r.res = v.res WHERE r.ns = ?)`,
 		"sealed":        `ns = ?`,
 		"rotations_due": `ns = ?`,
 	} {
@@ -337,11 +341,15 @@ func TestV091PurgedNamespacesTrimmedOnUpgrade(t *testing.T) {
 		before = 32 // SQLite: 032_…
 	}
 	blobs := t.TempDir()
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
 	opts := func() Options {
 		lim := DefaultLimits()
 		fast := Rate{1e9, 1e9}
 		lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-		return Options{Path: path, BlobDir: blobs, AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1, Limits: lim, Purger: discardPurger{}}
+		return Options{Path: path, BlobDir: blobs, AuthDisabled: true, RetentionInterval: -1, BlobSweepInterval: -1, Limits: lim, Purger: discardPurger{}, KeyStore: ks}
 	}
 	ctx := context.Background()
 	o := opts()
@@ -351,6 +359,19 @@ func TestV091PurgedNamespacesTrimmedOnUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	testLegacyNSPurge = true
+	t.Cleanup(func() { testLegacyNSPurge = false })
+	// A sealed namespace, whose read seals its revision (rev_epochs,
+	// sealed), as an old purge left them.
+	mkNS(t, old, "sec", map[string]any{"encryption": map[string]any{"level": "sealed"}})
+	r := who
+	r.NS = "sec"
+	sres, err := old.WriteResource(ctx, r, Item{Resource: "a", IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"n": 1.0}}, map[string]any{"op": "add", "path": "/$nonce", "value": seal.NewNonce()}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rev, err := old.ResourceRev(ctx, "sec", "a", sres.Items[0].IDs[0], Credentials{}); err != nil || rev.Status != 200 || rev.JWE == "" {
+		t.Fatalf("sec/a sealed: %+v %v", rev, err)
+	}
 	mkNS(t, old, "old", map[string]any{})
 	if _, err := put(old, "old", "a", "", 1); err != nil {
 		t.Fatal(err)
@@ -363,7 +384,6 @@ func TestV091PurgedNamespacesTrimmedOnUpgrade(t *testing.T) {
 	if _, err := put(old, "docs", "y", "", 1); err != nil {
 		t.Fatal(err)
 	}
-	r := who
 	r.NS = "docs"
 	if _, err := old.CreateBranch(ctx, r, BranchRequest{Name: "d-1", IfNoneMatch: true}); err != nil {
 		t.Fatal(err)
@@ -374,11 +394,14 @@ func TestV091PurgedNamespacesTrimmedOnUpgrade(t *testing.T) {
 	if _, err := old.Purge(ctx, r, "x", x, false); err != nil {
 		t.Fatal(err)
 	}
-	heads := map[string]string{"d-1": v091PurgeNS(t, old, "d-1"), "old": v091PurgeNS(t, old, "old")}
+	heads := map[string]string{"d-1": v091PurgeNS(t, old, "d-1"), "old": v091PurgeNS(t, old, "old"), "sec": v091PurgeNS(t, old, "sec")}
 	testLegacyNSPurge = false
 	// Before the migration the rows are there.
 	if n := v091Rows(t, old, "d-1"); n["ns_log"] == 0 || n["revisions"] == 0 || n["head_history"] == 0 {
 		t.Fatalf("the legacy purge kept no rows: %v", n)
+	}
+	if n := v091Rows(t, old, "sec"); n["rev_epochs"] == 0 || n["ns_config"] == 0 {
+		t.Fatalf("the legacy purge of sec kept no rows: %v", n)
 	}
 	if err := old.Close(); err != nil {
 		t.Fatal(err)
@@ -458,4 +481,31 @@ func TestPGPurgeNSWakesOtherInstance(t *testing.T) {
 	}
 	_, err = b.NamespaceEvents(context.Background(), "n", "", 10, Credentials{})
 	v091Gone(t, "the other instance's read", err, head)
+}
+
+// §8.5, §7.7 (v0.91): a long-poll's kept answers and its pass don't outlive
+// a namespace purge: the same since with the same pass, which before the
+// purge shared a kept page, is 410 after it.
+func TestV091LongPollPassAfterPurge(t *testing.T) {
+	t.Parallel()
+	e := openInstance(t, pgtest.DB(t), t.TempDir())
+	ctx := context.Background()
+	mkNS(t, e, "n", map[string]any{"read": "public"})
+	before, err := e.NamespaceHead(ctx, "n", Credentials{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := put(e, "n", "r", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	lg, pass, err := e.NamespaceLiveLog(ctx, "n", before.Head, 10, Credentials{}, nil)
+	if err != nil || len(lg.Entries) != 1 {
+		t.Fatalf("first poll: %+v %v", lg, err)
+	}
+	if lg, _, err = e.NamespaceLiveLog(ctx, "n", before.Head, 10, Credentials{}, pass); err != nil || len(lg.Entries) != 1 {
+		t.Fatalf("with its pass: %+v %v", lg, err)
+	}
+	head := v091PurgeNS(t, e, "n")
+	_, _, err = e.NamespaceLiveLog(ctx, "n", before.Head, 10, Credentials{}, pass)
+	v091Gone(t, "the same poll with its pass after the purge", err, head)
 }
