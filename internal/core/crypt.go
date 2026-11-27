@@ -366,21 +366,58 @@ func (t *tx) openValue(res int64, raw string, aad func() []byte) []byte {
 // stored in plaintext earlier is encrypted then. The root block's sub and
 // kid are stored in plaintext next to it (root, nil when they are already
 // stored), so serving grant references never needs the key store (§7.4).
-func (t *tx) storeGrantBlocks(id, blocks []byte, root *grantRoot, encrypt bool) {
+func (t *tx) storeGrantBlocks(id, blocks []byte, root *grantRoot, encrypt bool) (ref int64) {
 	var sub, kid any
 	if root != nil {
 		sub, kid = root.sub, root.kid
 	}
-	if !encrypt {
-		_, err := t.Exec(`INSERT INTO grants (id, blocks, root_sub, root_kid) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`, id, t.e.blobArg(blocks), sub, kid)
+	if !t.e.refs {
+		// A schema from before grants.ref (tests).
+		if !encrypt {
+			_, err := t.Exec(`INSERT INTO grants (id, blocks, root_sub, root_kid) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`, id, t.e.blobArg(blocks), sub, kid)
+			t.must(err)
+			return 0
+		}
+	} else if !encrypt {
+		// One statement whether or not the grant is stored already, which
+		// answers its number (grants.ref) either way.
+		var err error
+		if t.e.pg {
+			// Inserted only if absent, so a grant stored already draws no
+			// number; a concurrent insert of it wins the race, and its row
+			// is read.
+			err = t.QueryRow(`WITH s AS (SELECT ref FROM grants WHERE id = $1::bytea),
+				i AS (INSERT INTO grants (id, blocks, root_sub, root_kid) SELECT $1::bytea, $2::bytea, $3::text, $4::text WHERE NOT EXISTS (SELECT 1 FROM s) ON CONFLICT DO NOTHING RETURNING ref)
+				SELECT ref FROM s UNION ALL SELECT ref FROM i`, id, t.e.blobArg(blocks), sub, kid).Scan(&ref)
+			if errors.Is(err, sql.ErrNoRows) {
+				err = t.QueryRow(`SELECT ref FROM grants WHERE id = ?`, id).Scan(&ref)
+			}
+		} else {
+			// SQLite has one writer: the next number is free.
+			err = t.QueryRow(`INSERT INTO grants (id, blocks, root_sub, root_kid, ref) VALUES (?, ?, ?, ?, (SELECT COALESCE(MAX(ref), 0) + 1 FROM grants))
+				ON CONFLICT (id) DO UPDATE SET ref = grants.ref RETURNING ref`, id, t.e.blobArg(blocks), sub, kid).Scan(&ref)
+		}
 		t.must(err)
-		return
+		return ref
 	}
 	var cur string
-	err := t.QueryRow(`SELECT blocks FROM grants WHERE id = ?`, id).Scan(&cur)
+	var cref sql.NullInt64
+	var err error
+	if t.e.refs {
+		err = t.QueryRow(`SELECT blocks, ref FROM grants WHERE id = ?`, id).Scan(&cur, &cref)
+	} else {
+		err = t.QueryRow(`SELECT blocks FROM grants WHERE id = ?`, id).Scan(&cur)
+	}
+	ref = cref.Int64
 	switch {
-	case errors.Is(err, sql.ErrNoRows):
+	case errors.Is(err, sql.ErrNoRows) && !t.e.refs:
 		_, err = t.Exec(`INSERT INTO grants (id, blocks, root_sub, root_kid) VALUES (?, ?, ?, ?)`, id, sealRow(t.dek(grantsDEK, true), grantAAD(id), blocks), sub, kid)
+	case errors.Is(err, sql.ErrNoRows):
+		next := `(SELECT COALESCE(MAX(ref), 0) + 1 FROM grants)`
+		if t.e.pg {
+			next = `DEFAULT`
+		}
+		err = t.QueryRow(`INSERT INTO grants (id, blocks, root_sub, root_kid, ref) VALUES (?, ?, ?, ?, `+next+`) RETURNING ref`, id, sealRow(t.dek(grantsDEK, true), grantAAD(id), blocks), sub, kid).Scan(&ref)
 	case err == nil && !isSealed(cur):
 		if root == nil {
 			// A row from before root_sub that the migration couldn't
@@ -393,6 +430,7 @@ func (t *tx) storeGrantBlocks(id, blocks []byte, root *grantRoot, encrypt bool) 
 			sealRow(t.dek(grantsDEK, true), grantAAD(id), []byte(cur)), sub, kid, id)
 	}
 	t.must(err)
+	return ref
 }
 
 // --- turning encryption on ----------------------------------------------------
@@ -425,8 +463,14 @@ func (t *tx) encryptNamespace(n *nsRow) {
 			t.encryptResource(res)
 		}
 		var grants [][]byte
-		rows, err = t.Query(`SELECT grant_id FROM revisions WHERE grant_id IS NOT NULL AND res IN (SELECT res FROM resources WHERE ns = ?)
-			UNION SELECT grant_id FROM ns_log WHERE grant_id IS NOT NULL AND ns = ?`, ns, ns)
+		recorded := func(a string) string {
+			if t.e.refs {
+				return `(` + a + `.grant_id IS NOT NULL OR ` + a + `.grant_ref IS NOT NULL)`
+			}
+			return a + `.grant_id IS NOT NULL`
+		}
+		rows, err = t.Query(`SELECT `+t.grantIDOf("r")+` FROM revisions r WHERE `+recorded("r")+` AND r.res IN (SELECT res FROM resources WHERE ns = ?)
+			UNION SELECT `+t.grantIDOf("l")+` FROM ns_log l WHERE `+recorded("l")+` AND l.ns = ?`, ns, ns)
 		t.must(err)
 		for rows.Next() {
 			var g []byte

@@ -51,8 +51,11 @@ and the bytes per write don't depend on the count beyond the B-trees' fill).
 | File | Code |
 |---|---|
 | `baseline-{sqlite,pg}.json` | the storage layout before this work (v0.34.0) |
+| `after-item1-{sqlite,pg}.json` | derived `ns_log` bodies and created times, grants by number |
 
-| Store | Bytes per write | Tables | Indexes |
+| Run | Bytes per write | Tables | Indexes |
 |---|---|---|---|
-| SQLite | 485 | 291 (`ns_log` 164, `revisions` 111, `head_history` 15) | 194 |
-| Postgres | 950 | 493 (`ns_log` 257, `revisions` 182, `head_history` 52) | 456 |
+| SQLite baseline | 485 | 291 (`ns_log` 164, `revisions` 111, `head_history` 15) | 194 |
+| SQLite after item 1 | 337 | 162 (`ns_log` 54, `revisions` 93, `head_history` 15) | 175 |
+| Postgres baseline | 950 | 493 (`ns_log` 257, `revisions` 182, `head_history` 52) | 456 |
+| Postgres after item 1 | 802 | 364 (`ns_log` 142, `revisions` 167, `head_history` 52) | 438 |

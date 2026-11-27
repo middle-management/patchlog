@@ -123,11 +123,11 @@ func (t *tx) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
 	}
 	if !j.reseal { // else fixed by the row stored before v0.81
 		e = t.config(n.configSeq).Epoch
-		var seq int64
-		if err := t.QueryRow(`SELECT seq FROM ns_log WHERE grant_id = ? AND ns = ? ORDER BY seq LIMIT 1`, id[:], n.id).Scan(&seq); err == nil {
-			e = t.entryEpoch(n, seq)
-		} else if !errors.Is(err, sql.ErrNoRows) {
-			t.must(err)
+		var seq sql.NullInt64
+		first, args := t.firstGrantEntry(id[:], n.id, sql.NullInt64{})
+		t.must(t.QueryRow(`SELECT `+first, args...).Scan(&seq))
+		if seq.Valid {
+			e = t.entryEpoch(n, seq.Int64)
 		}
 	}
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.namespaceKey(n, e), seal.GrantPL(n.name, id.String()), plain()
@@ -140,15 +140,10 @@ func (t *tx) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
 func (t *tx) recordsGrant(n *nsRow, id ids.ID) bool {
 	var bound sql.NullInt64 // the namespace's own entries: all of them
 	for cur := n; cur != nil; {
-		var found bool
-		var err error
-		if bound.Valid {
-			err = t.QueryRow(`SELECT EXISTS (SELECT 1 FROM ns_log WHERE grant_id = ? AND ns = ? AND seq <= ?)`, id[:], cur.id, bound.Int64).Scan(&found)
-		} else {
-			err = t.QueryRow(`SELECT EXISTS (SELECT 1 FROM ns_log WHERE grant_id = ? AND ns = ?)`, id[:], cur.id).Scan(&found)
-		}
-		t.must(err)
-		if found {
+		var seq sql.NullInt64
+		first, args := t.firstGrantEntry(id[:], cur.id, bound)
+		t.must(t.QueryRow(`SELECT `+first, args...).Scan(&seq))
+		if seq.Valid {
 			return true
 		}
 		if !cur.base.Valid {

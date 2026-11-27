@@ -461,7 +461,7 @@ func (t *tx) purgePlan(n *nsRow, name string) *purgePlan {
 		}
 	}
 	if len(seqs) > 0 {
-		rows, err = t.Query(`SELECT `+strings.Replace(revCols, " patches,", " CAST(NULL AS text),", 1)+` FROM revisions WHERE `+t.e.inArray("seq", "bigint"), t.e.arrayArg(seqs))
+		rows, err = t.Query(`SELECT `+strings.Replace(t.revCols(), " revisions.patches,", " CAST(NULL AS text),", 1)+` FROM revisions WHERE `+t.e.inArray("seq", "bigint"), t.e.arrayArg(seqs))
 		t.must(err)
 		if t.memo.rev == nil {
 			t.memo.rev = map[int64]revRow{}

@@ -10,8 +10,16 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
-// nsLogCols are the ns_log columns a namespace log page reads (scanNSLogRow).
-const nsLogCols = `seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures, via, target_seq`
+// nsLogCols are the columns a namespace log page reads (scanNSLogRow) from
+// nsLogFrom, ns_log row l and what rebuilds a derived entry (entrybody.go).
+var nsLogColsBy = [2]string{
+	`l.seq, l.id, l.prev_seq, COALESCE(l.body, ''), l.author, COALESCE(l.created, 0), ` + grantIDOf(false, "l") + `, l.no_auth, l.gestures, l.via, l.target_seq, ` + derivedCols,
+	`l.seq, l.id, l.prev_seq, COALESCE(l.body, ''), l.author, COALESCE(l.created, 0), ` + grantIDOf(true, "l") + `, l.no_auth, l.gestures, l.via, l.target_seq, ` + derivedCols,
+}
+
+func (t *tx) nsLogCols() string { return nsLogColsBy[b2i(t.e.refs)] }
+
+const nsLogFrom = `ns_log l` + derivedJoins
 
 // nsLogRow is an ns_log row as a log page reads it.
 type nsLogRow struct {
@@ -32,7 +40,9 @@ type nsLogRow struct {
 // scanNSLogRow scans the row nsLogCols selects, its body parsed.
 func (t *tx) scanNSLogRow(rows *sql.Rows) nsLogRow {
 	var r nsLogRow
-	t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta, &r.via, &r.target))
+	var d derived
+	t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta, &r.via, &r.target, &d.kind, &d.name, &d.id, &d.created))
+	t.rebuild(&d, &r.body, &r.created, r.id, r.prev)
 	r.m = jsonv.MustParse([]byte(r.body)).(map[string]any)
 	return r
 }
@@ -138,7 +148,7 @@ func (t *tx) filteredRange(n *nsRow, fv *fview, since string, toSeq int64, limit
 	out.Status, out.Last = 200, since
 	scanned, units := 0, 0
 	at := fromSeq
-	q := `SELECT ` + nsLogCols + ` FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq LIMIT ?`
+	q := `SELECT ` + t.nsLogCols() + ` FROM ` + nsLogFrom + ` WHERE l.ns = ? AND l.seq > ? AND l.seq <= ? ORDER BY l.seq LIMIT ?`
 	for at < toSeq {
 		rows, err := t.Query(q, n.id, at, toSeq, filteredLogChunk)
 		t.must(err)

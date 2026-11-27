@@ -249,6 +249,10 @@ func (logPurger) PurgeTags(tags []string) { log.Printf("cdn purge %v", tags) }
 
 // Engine is the patch-log service.
 type Engine struct {
+	// refs: the schema numbers grants (grants.ref) and has ns_log and
+	// revisions name them by number (entrybody.go); false only on a
+	// database migrated up to an earlier migration, in tests.
+	refs bool
 	// seals are the sealing counts this instance took (sealcount.go).
 	seals     sealCounter
 	db        *sql.DB
@@ -491,6 +495,13 @@ func Open(opt Options) (*Engine, error) {
 		stop:       make(chan struct{}),
 		started:    opt.Now().UTC(),
 	}
+	// Grant references by number and derived entries (entrybody.go) need
+	// the columns migration 031 (SQLite), 033 (Postgres) adds: a test may
+	// open an engine on a database migrated only up to an earlier one.
+	if rows, err := db.Query(`SELECT grant_ref FROM ns_log WHERE 1 = 0`); err == nil {
+		rows.Close()
+		e.refs = true
+	}
 	e.refsCache.MaxEntries = 65536
 	e.viewHeld.MaxEntries = 65536
 	e.rc.maxBytes = opt.ReadCacheBytes
@@ -606,6 +617,13 @@ func (e *Engine) Close() error {
 	e.bg.Wait()
 	e.resign()
 	e.stmts.close()
+	if validateBoth {
+		// The oracle of derived entries (entrybody.go), over every entry
+		// the engine's database holds.
+		if err := e.checkDerived(context.Background()); err != nil {
+			panic(err)
+		}
+	}
 	err := e.db.Close()
 	e.comp.close()
 	e.rate.close()
@@ -794,7 +812,7 @@ type tx struct {
 	// record the grant's id (§5, §7.4, §C.3), unless serverWrites > 0,
 	// while the transaction writes entries of its own, such as propagated
 	// purges (§8.3), which record none. storedGrants are the grants stored
-	// in it, and whether encrypted (storeGrant).
+	// in it, whether encrypted and their numbers (storeGrant).
 	grants       map[int64]*grant.Grant
 	serverWrites int
 	// unauth are the authors of requests made in this transaction while
@@ -802,7 +820,7 @@ type tx struct {
 	// record "grant": null (ns_log.no_auth, §1, §7.4), unless serverWrites
 	// > 0, so the server's own entries still record no grant at all.
 	unauth       map[int64]bool
-	storedGrants map[ids.ID]bool
+	storedGrants map[ids.ID]storedGrant
 	// Encryption at rest (crypt.go): data keys created in this
 	// transaction (cached once committed), whether a purge destroyed keys,
 	// and resources' levels.
@@ -1435,11 +1453,21 @@ func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targ
 	body := jsonv.Canonical(entry)
 	gestures := metaColumn(meta)
 	kind := nsKindCode(entry["kind"].(string))
-	var grantID, via any
+	storedBody, created := t.storedEntry(entry, body, res, targetSeq)
+	// An entry without a grant names no grant column: grant_id, NULL
+	// either way.
+	var grantRef, via any
+	grantCol := "grant_id"
 	if g := t.grants[author]; g != nil && t.serverWrites == 0 {
 		// Encrypted if the configuration in force after the entry
 		// encrypts at rest: a namespace's first entry has none before it.
-		grantID = t.storeGrant(g, t.config(configSeq).level >= levelAtRest)
+		var id []byte
+		id, grantRef = t.storeGrant(g, t.config(configSeq).level >= levelAtRest)
+		if t.e.refs {
+			grantCol = "grant_ref"
+		} else {
+			grantRef = id
+		}
 		via = grantVia(g)
 	}
 	noAuth := t.noAuth(author)
@@ -1459,16 +1487,16 @@ func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targ
 		// One statement: the entry, the namespace's head and the heads it
 		// moves, so the log lock is held for a single round trip and the
 		// commit.
-		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures, via)
+		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, `+grantCol+`, no_auth, gestures, via)
 				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq),
 			u AS (UPDATE namespaces SET head_seq = (SELECT seq FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
 			h AS (INSERT INTO head_history (res, ns_seq, target_seq) SELECT v.res, l.seq, v.target FROM l, unnest(?::bigint[], ?::bigint[]) AS v(res, target))
 			SELECT seq FROM l`,
-			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth, gestures, via,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), storedBody, configSeq, author, created, grantRef, noAuth, gestures, via,
 			id[:], configSeq, n.id, rs, ts)
 	} else {
-		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures, via) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
-			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth, gestures, via)
+		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, `+grantCol+`, no_auth, gestures, via) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), storedBody, configSeq, author, created, grantRef, noAuth, gestures, via)
 		_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, head_id = ?, config_seq = ? WHERE ns = ?`, seq, id[:], configSeq, n.id)
 		t.must(err)
 		for _, h := range hist {
@@ -1592,15 +1620,20 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	}
 	k := len(as)
 	t.reserveEntries(n, configSeq, int64(k))
-	bodies := make([]string, k)
+	bodies, stored := make([][]byte, k), make([]*string, k)
 	kinds, authors := make([]int64, k), make([]int64, k)
+	created := make([]*int64, k)
 	res, targets := make([]*int64, k), make([]*int64, k)
-	grantIDs := make([][]byte, k)
+	grantRefs := make([]*int64, k)
 	noAuth := make([]*int64, k)
 	gestures, vias := make([]*string, k), make([]*string, k)
 	var hord, hres, htarget []int64
 	for i, a := range as {
-		bodies[i] = string(jsonv.Canonical(a.entry))
+		bodies[i] = jsonv.Canonical(a.entry)
+		if sb, sc := t.storedEntry(a.entry, bodies[i], a.res, a.target); sb != nil {
+			b, c := sb.(string), sc.(int64)
+			stored[i], created[i] = &b, &c
+		}
 		if g, ok := metaColumn(a.meta).(string); ok {
 			gestures[i] = &g
 		}
@@ -1608,7 +1641,8 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 		authors[i], res[i], targets[i] = a.author, a.res, a.target
 		if a.grant != nil && t.serverWrites == 0 {
 			// Each entry its own grant (§7.4): one author may write under several.
-			grantIDs[i] = t.storeGrant(a.grant, t.config(configSeq).level >= levelAtRest)
+			_, ref := t.storeGrant(a.grant, t.config(configSeq).level >= levelAtRest)
+			grantRefs[i] = &ref
 			if v, ok := grantVia(a.grant).(string); ok {
 				vias[i] = &v
 			}
@@ -1626,24 +1660,24 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	out := make([]ids.ID, k)
 	idBytes := make([][]byte, k)
 	for i := range as {
-		out[i] = ids.Hash(prev, []byte(bodies[i]))
+		out[i] = ids.Hash(prev, bodies[i])
 		idBytes[i] = out[i][:]
 		prev = &out[i]
 	}
 	t.wrote()
-	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::bytea[], ?::smallint[], ?::text[], ?::text[])
-				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, grant_id, no_auth, gestures, via, ord)),
+	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::bigint[], ?::bigint[], ?::smallint[], ?::text[], ?::text[])
+				WITH ORDINALITY AS v(id, kind, res, target_seq, body, created, author, grant_ref, no_auth, gestures, via, ord)),
 			r AS MATERIALIZED (SELECT nextval(pg_get_serial_sequence('ns_log', 'seq')) AS seq FROM generate_series(1, ?::int)),
 			s AS (SELECT seq, row_number() OVER (ORDER BY seq) AS ord FROM r),
 			c AS (SELECT v.*, s.seq, COALESCE(lag(s.seq) OVER (ORDER BY v.ord), ?::bigint) AS prev_seq FROM v JOIN s USING (ord)),
-			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures, via)
-				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, ?, grant_id, no_auth, gestures, via FROM c ORDER BY ord RETURNING seq),
+			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_ref, no_auth, gestures, via)
+				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, created, grant_ref, no_auth, gestures, via FROM c ORDER BY ord RETURNING seq),
 			u AS (UPDATE namespaces SET head_seq = (SELECT max(seq) FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
 			h AS (INSERT INTO head_history (res, ns_seq, target_seq)
 				SELECT x.res, c.seq, x.target FROM unnest(?::bigint[], ?::bigint[], ?::bigint[]) AS x(ord, res, target) JOIN c USING (ord))
 			SELECT seq FROM c ORDER BY ord`,
-		idBytes, kinds, res, targets, bodies, authors, grantIDs, noAuth, gestures, vias, k, prevSeq,
-		n.id, configSeq, t.now.UnixMilli(), idBytes[k-1], configSeq, n.id, hord, hres, htarget)
+		idBytes, kinds, res, targets, stored, created, authors, grantRefs, noAuth, gestures, vias, k, prevSeq,
+		n.id, configSeq, idBytes[k-1], configSeq, n.id, hord, hres, htarget)
 	t.must(err)
 	var seqs []int64
 	for rows.Next() {

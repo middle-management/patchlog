@@ -143,7 +143,7 @@ func (e *Engine) firstEntryTime(ctx context.Context) (time.Time, error) {
 	}
 	var ms sql.NullInt64
 	err := e.read(ctx, func(t *tx) error {
-		return t.QueryRow(`SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms)
+		return t.QueryRow(`SELECT MIN(` + nsLogCreated + `) FROM ns_log l WHERE l.seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms)
 	})
 	if err != nil {
 		return time.Time{}, err

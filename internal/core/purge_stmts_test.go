@@ -215,7 +215,7 @@ func TestPurgeOrder(t *testing.T) {
 	// entry's id covers the one before it (§3.5), and the namespace's head
 	// is its last.
 	if err := e.read(ctx, func(t *tx) error {
-		rows, err := t.Query(`SELECT l.ns, l.seq, l.id, l.prev_seq, l.body, n.head_seq, n.head_id FROM ns_log l JOIN namespaces n ON n.ns = l.ns ORDER BY l.ns, l.seq`)
+		rows, err := t.Query(`SELECT l.ns, l.seq, l.id, l.prev_seq, COALESCE(l.body, ''), n.head_seq, n.head_id, ` + derivedCols + ` FROM ns_log l JOIN namespaces n ON n.ns = l.ns` + derivedJoins + ` ORDER BY l.ns, l.seq`)
 		t.must(err)
 		defer rows.Close()
 		var ns, lastSeq int64
@@ -231,7 +231,14 @@ func TestPurgeOrder(t *testing.T) {
 			var prev, headSeq sql.NullInt64
 			var id, headID []byte
 			var body string
-			t.must(rows.Scan(&n, &seq, &id, &prev, &body, &headSeq, &headID))
+			var d derived
+			var created int64
+			t.must(rows.Scan(&n, &seq, &id, &prev, &body, &headSeq, &headID, &d.kind, &d.name, &d.id, &d.created))
+			var ps *int64
+			if prev.Valid {
+				ps = &prev.Int64
+			}
+			t.rebuild(&d, &body, &created, id, ps)
 			if n != ns {
 				check()
 				ns, last, lastSeq = n, nil, 0

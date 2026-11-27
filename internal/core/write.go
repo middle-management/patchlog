@@ -1118,8 +1118,8 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 		result.ConfigID = cplan.id.String()
 	}
 	// After the config change, which may have turned encryption on.
-	grantID := t.storeGrant(a.grant, t.nsLevel(n) >= levelAtRest)
-	inserted := t.insertItems(n, p.st, a, author, grantID)
+	grantID, grantRef := t.storeGrant(a.grant, t.nsLevel(n) >= levelAtRest)
+	inserted := t.insertItems(n, p.st, a, author, grantID, grantRef)
 	// The namespace entry last: on Postgres it is appended under the
 	// namespace row's lock, held until commit (appendNS).
 	na := t.planEntry(p, author, entries, inserted)
@@ -1496,7 +1496,7 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 	for _, seq := range cands {
 		var id, gid []byte
 		var body string
-		if t.QueryRow(`SELECT id, body, grant_id FROM ns_log WHERE seq = ? AND ns = ? AND kind = ? AND author = ?`, seq, n.id, nsKindCode("batch"), author).Scan(&id, &body, &gid) != nil {
+		if t.QueryRow(`SELECT l.id, l.body, `+t.grantIDOf("l")+` FROM ns_log l WHERE l.seq = ? AND l.ns = ? AND l.kind = ? AND l.author = ?`, seq, n.id, nsKindCode("batch"), author).Scan(&id, &body, &gid) != nil {
 			continue
 		}
 		if !t.sameRoot(gid, a) {
@@ -1905,31 +1905,46 @@ func entryGrant(a *actor, author int64) *grant.Grant {
 }
 
 // storeGrant records the non-bearer form of a grant (§C.3), encrypted at
-// rest if encrypt is set (§E.1), and returns its id (nil for no grant). A
-// grant is stored once per transaction, and again only to encrypt it.
-func (t *tx) storeGrant(g *grant.Grant, encrypt bool) []byte {
+// rest if encrypt is set (§E.1), and returns its id (nil for no grant) and
+// number (grants.ref), which the rows written under it record. A grant is
+// stored once per transaction, and again only to encrypt it.
+func (t *tx) storeGrant(g *grant.Grant, encrypt bool) ([]byte, int64) {
 	if g == nil {
-		return nil
+		return nil, 0
 	}
 	id := g.ID()
-	if enc, ok := t.storedGrants[id]; !ok || (encrypt && !enc) {
+	if s, ok := t.storedGrants[id]; !ok || (encrypt && !s.enc) {
 		var root *grantRoot
 		if len(g.Blocks) > 0 {
 			root = &grantRoot{sub: g.Blocks[0].Sub, kid: g.Blocks[0].Kid}
 		}
-		t.storeGrantBlocks(id[:], g.Stored(), root, encrypt)
+		ref := t.storeGrantBlocks(id[:], g.Stored(), root, encrypt)
 		if t.storedGrants == nil {
-			t.storedGrants = map[ids.ID]bool{}
+			t.storedGrants = map[ids.ID]storedGrant{}
 		}
-		t.storedGrants[id] = encrypt
+		if ref == 0 {
+			ref = s.ref
+		}
+		t.storedGrants[id] = storedGrant{enc: encrypt, ref: ref}
 	}
-	return id[:]
+	return id[:], t.storedGrants[id].ref
+}
+
+// storedGrant is a grant this transaction stored: whether encrypted, and
+// its number (grants.ref).
+type storedGrant struct {
+	enc bool
+	ref int64
 }
 
 // The statements of step 7 (bulk.go).
 var (
 	insResources = bulkInsert("resources", "ns bigint, name text", "RETURNING res, name")
 	insRevisions = bulkInsert("revisions", "res bigint, id bytea, parent_seq bigint, first smallint, kind smallint, patches bytea, author bigint, "+
+		"via text, grant_ref bigint, signature text, schema_ref text, created bigint, gesture text, undoes text, size bigint, digest bytea, rules smallint", "RETURNING seq, res")
+	// insRevisionsByID is insRevisions on a schema from before grant
+	// references by number (Engine.refs).
+	insRevisionsByID = bulkInsert("revisions", "res bigint, id bytea, parent_seq bigint, first smallint, kind smallint, patches bytea, author bigint, "+
 		"via text, grant_id bytea, signature text, schema_ref text, created bigint, gesture text, undoes text, size bigint, digest bytea, rules smallint", "RETURNING seq, res")
 	insRevEpochs = bulkInsert("rev_epochs", "seq bigint, epoch bigint", "")
 	insSnapshots = bulkInsert("snapshots", "seq bigint, res bigint, doc bytea", "ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc")
@@ -1957,8 +1972,8 @@ var (
 // Rows go in resource order: two batches writing some of the same
 // resources at once (Postgres, pglock.go) then wait for each other's rows
 // in that order, never in a cycle.
-func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, grantID []byte) []histRow {
-	by := writtenBy(a, author, grantID)
+func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, grantID []byte, grantRef int64) []histRow {
+	by := writtenBy(a, author, grantID, grantRef)
 	ws := make([]writer, len(st))
 	for i := range ws {
 		ws[i] = by
@@ -1971,10 +1986,16 @@ type writer struct {
 	author  int64
 	via     any // the principal's delegation chain, canonical JSON, or nil
 	grantID []byte
+	// grantRef numbers the grant in grants (grants.ref), which the rows
+	// record; nil for none.
+	grantRef any
 }
 
-func writtenBy(a *actor, author int64, grantID []byte) writer {
+func writtenBy(a *actor, author int64, grantID []byte, grantRef int64) writer {
 	w := writer{author: author, grantID: grantID}
+	if grantID != nil {
+		w.grantRef = grantRef
+	}
 	if len(a.principal.Via) > 0 {
 		w.via = string(jsonv.Canonical(jsonv.FromGo(a.principal.Via)))
 	}
@@ -2111,13 +2132,24 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 				sz, sum := headMeta(step.docCanon)
 				size, digest = sz, sum
 			}
-			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, it.author, it.via, it.grantID, sig, typed, t.now.UnixMilli(), gesture, undoes, size, digest, step.rulesColumn()})
+			grant := it.grantRef
+			if !t.e.refs {
+				grant = nil
+				if it.grantID != nil {
+					grant = it.grantID
+				}
+			}
+			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, it.author, it.via, grant, sig, typed, t.now.UnixMilli(), gesture, undoes, size, digest, step.rulesColumn()})
 			stepItems = append(stepItems, it)
 		}
 		if len(rows) == 0 {
 			break
 		}
-		t.bulkQuery(insRevisions, rows, func(rs *sql.Rows) {
+		ins := insRevisions
+		if !t.e.refs {
+			ins = insRevisionsByID
+		}
+		t.bulkQuery(ins, rows, func(rs *sql.Rows) {
 			var seq, res int64
 			t.must(rs.Scan(&seq, &res))
 			byRes[res].last = seq

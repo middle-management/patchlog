@@ -78,9 +78,9 @@ func (r *runner) storage() {
 		go func() {
 			defer wg.Done()
 			// Each document names its resource, so no two resources' chains share
-	// revision ids (they are per resource, §3.3) as identical documents
-	// and patches would make them.
-	// Worker k writes the resources i ≡ k (mod workers) in turn, so
+			// revision ids (they are per resource, §3.3) as identical documents
+			// and patches would make them.
+			// Worker k writes the resources i ≡ k (mod workers) in turn, so
 			// no two writers race for one resource.
 			count := n / R
 			// The first n % R resources get one write more.
