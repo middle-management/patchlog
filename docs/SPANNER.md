@@ -390,6 +390,27 @@ a time per namespace; the cores at 16% of their CPU, Spanner from 48% to 94%.
   revision's rows in its resource's, keyed `(res, seq)`), or fewer of them (the namespace's row
   from the engine's memory, re-checked in the group's transaction as now).
 
+**The eleventh run, the check's namespace row cached and the draw overlapped** (`cc1b6634`,
+shared rate buckets; files `docs/capacity/spanner-gcp-2026-11-27-run11/`): 3,446, 2,963 and
+3,620 a second at 8, 16 and 32 namespaces, 25%, 20% and 42% above the ninth (2,763, 2,477,
+2,547), as fast as the tenth with each core's buckets in memory (3,390, 3,201, 2,676), and faster
+at 32. No errors, 412s or 429s. **Spanner is now the limit**: its CPU at 51–67% at 8
+namespaces, 96–104% from 16 on; the cores at 18%.
+
+- **The check without the namespace**: 1.73 million checks read from a cached row (`lookupCached`),
+  0.65 ms of CPU and 0.52 remote calls each; 90,000 read it (cache misses, the first after each
+  flush), 1.5 ms and 2.59 calls, as every check did in the tenth run. The check is still 60% of
+  Spanner's CPU: the resource, its head and the revision asked for are three rows, and the half
+  call left is them on different splits.
+- **The draws off the write's path**: lock waits on `rate_buckets` fell from 2,758–3,398 s a
+  minute to about 840 (8,320 s in the run's ten minutes, nearly all on the bench's one
+  principal's bucket), and they no longer delay the write: its draw runs while it waits for its
+  group.
+- **The tailer's poll is 13% of Spanner's CPU**: 8,700 polls, 28 ms of CPU each, every entry
+  since the last joined to its namespace and resource.
+- Next: interleave revisions in resources (`(res, seq)`) so the check's three rows are one
+  split's; then the tailer's poll.
+
 ## The capacity bench on real Spanner
 
 `deploy/gcp-spanner.sh` (header: settings, what it makes, `cleanup`) runs the D.8 comparison on
