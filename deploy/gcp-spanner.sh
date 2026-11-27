@@ -194,8 +194,10 @@ start_core() { # vm
     nohup ./patchlog serve --dev --addr :8080 --db '$db' --blob-dir ./blobs --group-commit $GROUP_COMMIT \
       --max-rate-per-namespace 1e9,1e9 --max-rate-per-resource 1e9,1e9 --max-rate-per-principal 1e9,1e9 $CORE_FLAGS > server.log 2>&1 &
     pid=\$!
-    for _ in \$(seq 1 180); do curl -sf -o /dev/null http://127.0.0.1:8080/_health && exit 0; kill -0 \$pid || { tail -20 server.log; exit 1; }; sleep 1; done
-    tail -20 server.log; exit 1"
+    # The first migrates a new database: each schema change takes
+    # half a minute or more on Spanner, and there are several.
+    for _ in \$(seq 1 900); do curl -sf -o /dev/null http://127.0.0.1:8080/_health && exit 0; kill -0 \$pid || { tail -20 server.log; exit 1; }; sleep 1; done
+    echo 'not up after 15 minutes:'; tail -20 server.log; exit 1"
 }
 start_core "$NAME-core-1"
 urls="http://$(ip_of "$NAME-core-1"):8080"
