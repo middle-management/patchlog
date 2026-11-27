@@ -3361,16 +3361,16 @@ function renderSrRyw() {
     : h('span', { class: 'muted small' }, ns ? `no write to ${ns} made in this page yet: write something in the Resource tab` : 'pick a namespace'));
 }
 
-/* srFilters turns the filter lines into query parameters: raw (facet[/league]=cup, ge[/kickoff]=2026-10-10)
- * or short (/league=cup, /kickoff>=2026-10-10). */
+/* srFilters turns the filter lines into query parameters: raw (facet[/league]=cup) or short (/league=cup).
+ * The index's range filters are gone (spec v0.91: they stay out of the spec). */
 function srFilters(text) {
-  const out = [], ops = { '>=': 'ge', '>': 'gt', '<=': 'le', '<': 'lt', '=': 'facet' };
+  const out = [];
   for (const line of text.split('\n').map((l) => l.trim()).filter(Boolean)) {
-    const m = /^(\/[^=<>]*)(>=|<=|>|<|=)(.*)$/.exec(line);
-    if (m) { out.push([`${ops[m[2]]}[${m[1]}]`, m[3].trim()]); continue; }
+    const m = /^(\/[^=]*)=(.*)$/.exec(line);
+    if (m) { out.push([`facet[${m[1]}]`, m[2].trim()]); continue; }
     const i = line.indexOf('=');
     if (i > 0) out.push([line.slice(0, i).trim(), line.slice(i + 1).trim()]);
-    else throw new Error(`filter "${line}": want /path=value, /path>=value or facet[/path]=value`);
+    else throw new Error(`filter "${line}": want /path=value or facet[/path]=value`);
   }
   return out;
 }

@@ -46,7 +46,7 @@ func TestSchemaIndexedBy(t *testing.T) {
 		}
 	}
 	ctx := context.Background()
-	for _, s := range []string{"facet[/a]=x&ref=/r/t/one&ge[/s]=1&counts=/a", "facet[/a]=x&facet[/b]=y&lt[/t]=b"} {
+	for _, s := range []string{"facet[/a]=x&ref=/r/t/one&counts=/a", "facet[/a]=x&facet[/b]=y"} {
 		v, _ := url.ParseQuery(s)
 		q, err := ParseQuery(v)
 		if err != nil {

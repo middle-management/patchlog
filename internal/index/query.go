@@ -31,9 +31,6 @@ import (
 //	                    %23entry) only those naming that entry
 //	facet[/path]=v      exact match on an x-index "facet" field, by the value's string form
 //	                    (§A.2); repeated values of one path are ORed, different paths ANDed
-//	gt|ge|lt|le[/path]=v range filter (an extension) on an x-index "sort" field, on each
-//	                    document's least value: a number compares with numbers, anything
-//	                    else with strings, as UTF-8 bytes
 //	sort=/a,-/b         order by "sort" fields, keys comma-separated, - for descending
 //	                    (once, §A.5): each document by its least value at the path, numbers
 //	                    before strings before booleans, missing values last in either
@@ -52,7 +49,7 @@ import (
 //
 // A fields path that no schema indexed in the namespace for a document the
 // reader may see marks with x-index, a facet or counts path none of them
-// marks facet, or a sort (or range) path none of them marks sort, is 400
+// marks facet, or a sort path none of them marks sort, is 400
 // (§A.4, checkFields). A hit carries its facet and sort values, and the
 // requested fields, each as "<path>": [values]; a path it has no values at
 // is left out of it. "next" is the after of the following page, absent on
@@ -63,7 +60,6 @@ type Query struct {
 	Schema string
 	Ref    *RefFilter
 	Facets map[string][]string // path -> values (ORed)
-	Ranges []rangeFilter
 	Sorts  []sortKey
 	Counts []string
 	Fields []string
@@ -168,20 +164,10 @@ func ParseMin(s string) (MinRef, error) {
 	return m, nil
 }
 
-type rangeFilter struct {
-	name     string // gt, ge, lt or le
-	op, path string
-	num      bool
-	f        float64
-	s        string
-}
-
 type sortKey struct {
 	path string
 	desc bool
 }
-
-var rangeOps = map[string]string{"gt": ">", "ge": ">=", "lt": "<", "le": "<="}
 
 // bracket splits "facet[/a/b]" into ("facet", "/a/b").
 func bracket(k string) (string, string, bool) {
@@ -304,33 +290,16 @@ func ParseQuery(v url.Values) (*Query, error) {
 			if err := validPath(path); err != nil {
 				return nil, fmt.Errorf("%s: %v", k, err)
 			}
-			switch {
-			case name == "facet":
-				q.Facets[path] = append(q.Facets[path], vals...)
-			case rangeOps[name] != "":
-				for _, s := range vals {
-					// Strings compare as stored: as UTF-8 bytes, with
-					// no date-time normalisation (§A.2).
-					rf := rangeFilter{name: name, op: rangeOps[name], path: path}
-					if f, err := strconv.ParseFloat(s, 64); err == nil {
-						rf.num, rf.f = true, f
-					} else {
-						rf.s = s
-					}
-					q.Ranges = append(q.Ranges, rf)
-				}
-			default:
+			// Only facet[…]: the range filters gt, ge, lt and le the
+			// reference once offered stay out of the spec (v0.91), so
+			// they are parameters it doesn't define, 400 (§A.4
+			// Canonical URLs).
+			if name != "facet" {
 				return nil, fmt.Errorf("unknown parameter %q", k)
 			}
+			q.Facets[path] = append(q.Facets[path], vals...)
 		}
 	}
-	sort.Slice(q.Ranges, func(i, j int) bool {
-		a, b := q.Ranges[i], q.Ranges[j]
-		if a.path != b.path {
-			return a.path < b.path
-		}
-		return a.op < b.op
-	})
 	q.Q = v.Get("q")
 	q.words = words(q.Q)
 	if strings.TrimSpace(q.Q) != "" && len(q.words) == 0 {
@@ -512,24 +481,6 @@ func (q *Query) filters() []filter {
 			// against the list, instead of one seek per value.
 			f.test = `f.path = ? AND +f.value IN (` + in.String() + `)`
 		}
-		fs = append(fs, f)
-	}
-	// The ranges on one path are one filter: a document has one sort value
-	// per path, its least, and on the query index they bound one range.
-	for i := 0; i < len(q.Ranges); {
-		f := filter{table: `"sort"`, a: "r", idx: "sort_q", pk: "sqlite_autoindex_sort_1", args: []any{q.Ranges[i].path}}
-		cond := `r.path = ?`
-		for j := i; i < len(q.Ranges) && q.Ranges[i].path == q.Ranges[j].path; i++ {
-			r := q.Ranges[i]
-			if r.num {
-				cond += ` AND typeof(r.value) IN ('integer', 'real') AND r.value ` + r.op + ` ?`
-				f.args = append(f.args, r.f)
-			} else {
-				cond += ` AND typeof(r.value) = 'text' AND r.value ` + r.op + ` ?`
-				f.args = append(f.args, r.s)
-			}
-		}
-		f.cond = cond
 		fs = append(fs, f)
 	}
 	return fs

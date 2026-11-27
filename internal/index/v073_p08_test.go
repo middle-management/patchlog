@@ -304,14 +304,14 @@ func TestV073PathKinds(t *testing.T) {
 	for q, param := range map[string]string{
 		"facet[/plain]=x": "facet[/plain]", "facet[/s]=x": "facet[/s]", "facet[/t]=x": "facet[/t]",
 		"counts=/s": "counts", "counts=/t": "counts", "sort=/f": "sort", "sort=/t": "sort", "sort=/s,-/f": "sort",
-		"fields=/plain": "fields", "gt[/f]=1": "gt[/f]",
+		"fields=/plain": "fields",
 	} {
 		r := x.answerOf("/items?"+q, "")
 		if msg, _ := r.body["message"].(string); r.status != 400 || r.body["code"] != "bad_input" || !strings.HasPrefix(msg, param+": ") {
 			t.Errorf("%s: %d %v", q, r.status, r.body)
 		}
 	}
-	for _, q := range []string{"facet[/f]=x", "facet[/fs]=x", "counts=/fs", "sort=/s,-/fs", "fields=/t,/f,/s", "ge[/s]=1"} {
+	for _, q := range []string{"facet[/f]=x", "facet[/fs]=x", "counts=/fs", "sort=/s,-/fs", "fields=/t,/f,/s"} {
 		if r := x.answerOf("/items?"+q, ""); r.status != 200 || len(r.body["hits"].([]any)) != 1 {
 			t.Errorf("%s: %d %v", q, r.status, r.body)
 		}
