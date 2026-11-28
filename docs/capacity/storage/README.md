@@ -269,17 +269,22 @@ smaller than the unique ones (39 MB where 63 MB, at 1,000,000 writes), but still
 the reads start about 1.35 times later. Where the old indexes had just outgrown memory and the
 new ones less so (1,000,000 writes), a write reads 1.2 pages where it read 2.05 and logs 6.7 KiB
 where 8.5; at 2,000,000 and 3,000,000, where both are well outside, 5–8% fewer reads and 13–14%
-less WAL. Latency is the same within the runs' noise (p50 0.5 ms lower after at 250,000, 0.1–0.4
-ms higher from 1,000,000 up; the single-write benchmarks of the next paragraph show none). On SQLite
+less WAL. Latency didn't improve: p50 is 0.5 ms lower after at 250,000 but 0.1–0.4 ms higher
+from 1,000,000 up, and p95 0.4–1.0 ms higher there (as in a discarded first series, with the
+row-level triggers), which may be the triggers' cost, a PL/pgSQL call per insert statement, two
+per write; the single-write benchmarks of the next paragraph show no difference. On SQLite
 25–35% fewer reads at 1,000,000, 9% at 4,000,000.
 
 **Kept for the bytes.** 36 bytes a write on Postgres (720 → 683, 5%) and 24 on SQLite (309 → 284,
 8%), about 110 GB and 75 GB a year at 100 writes a second, and those are bytes of the indexes
 every write inserts into at random, the ones that must fit in memory for writes not to read:
 the step comes at a third more writes. The costs: a trigger per insert statement on Postgres
-(1,000-item batches within 0–10% of before, single writes the same, `BenchmarkBatch1000` and
-`BenchmarkAppendsOneNamespace`), one per row in SQLite (+6% on a 1,000-item batch), and a
-migration that rewrites `ns_log` and `revisions` on SQLite.
+(`BenchmarkBatch1000`, 1,000 creates in one batch, on an idle host: before 179–211 ms, after
+203–275 ms in alternating runs, and the same build with its triggers dropped 169–195 ms against
+185–201 with them, so 5–25%; single writes the same, `BenchmarkAppendsOneNamespace` 1 and 8
+writers 150–215 and 530–710 writes a second either way), one per row in SQLite (+6% on the
+batch, single writes the same), and a migration that rewrites `ns_log` and `revisions` on
+SQLite.
 
 The next lever is `revisions_by_id (id)`, as big (41 bytes a write) and as random, over every
 resource: the same key, `(key)` with the whole id compared, would cut it to about 22 bytes.
@@ -309,11 +314,13 @@ but indexes on `(ns, key)` and `(res, key)`, the key the id's first 8 bytes (mig
   whole id is compared as `+id`, which no index answers: with statistics the planner otherwise
   takes `revisions_by_id (id)`, as selective but over every resource's revisions, where the key
   index's page is the one the write then inserts into. `TestIDKeyPlans` checks every one of these
-  statements, and the triggers' probes, on a resource of 20,000 revisions and a namespace of
-  20,000 entries, before and after `ANALYZE`, on both stores: all take `revisions_res_id8` or
-  `ns_log_ns_id8` (gesture paging may take the gesture's own partial indexes, as selective).
-  `docRules` and `copyRows` (drafts, purge checks, schema reads) look revisions up by id across
-  resources and keep using `revisions_by_id`, unchanged.
+  statements, and the probes of SQLite's triggers and of the update triggers, on a resource of
+  20,000 revisions and a namespace of 20,000 entries, before and after `ANALYZE`, on both
+  stores: all take `revisions_res_id8` or `ns_log_ns_id8` (gesture paging may take the
+  gesture's own partial indexes, as selective). `docRules` and `copyRows` (drafts, purge
+  checks, schema reads) look revisions up by id across resources and keep `revisions_by_id`,
+  which the test checks too. The Postgres insert triggers' join is left no plan but the index
+  by its function's settings.
 - **The whole id stays unique in its namespace and in its resource.** A trigger of each table
   checks it through the key index and fails as the constraint did: on Postgres an `AFTER INSERT …
   FOR EACH STATEMENT` trigger joins the statement's inserted rows (its transition table) to the
@@ -327,14 +334,17 @@ but indexes on `(ns, key)` and `(res, key)`, the key the id's first 8 bytes (mig
   sequential scan, and kept it as they grew (a 1,000-item batch took 1–1.3 s instead of 0.2 s);
   the statement trigger's function allows the planner nothing but the index (`enable_seqscan`,
   `enable_hashjoin`, `enable_mergejoin` off for its one query).
-- **Concurrency.** SQLite writes are serialised, so the check is exact. On Postgres two
-  concurrent inserts of one id can't see each other's uncommitted row, as they could through a
-  unique index. Every row a write inserts has a parent (`revisions.parent_seq`,
-  `ns_log.prev_seq`) or is the resource's or namespace's first (`one_first`, `one_ns_first`), and
-  an id is the hash of its parent's id (§3.3, §3.5): two rows with one id in one chain have one
-  parent, so the second still fails, on `(res, parent_seq)`, `(ns, prev_seq)` or the first's
-  index, as a lost race. A row with neither a parent nor `first = 1`, which no write makes, would
-  have no such backstop.
+- **Concurrency.** SQLite writes are serialised, so the check is exact. On Postgres a trigger
+  can't see another transaction's uncommitted row, as a unique index's insert could. The engine
+  never gives it one to miss: a namespace's entries are appended under its log lock
+  (`pg_advisory_xact_lock`, pglock.go), held to the commit, so the next appender's check sees
+  the last one's row; and every write of a resource either inserts the resource's row (unique
+  `(ns, name)`) or moves its head from the one its precondition matched (`moveHeads`, `WHERE
+  head_seq = old`), so two writes of one resource can't both commit, whatever ids they insert
+  (the loser gets a unique violation or `errChainRace`, a lost race). An id being the hash of
+  its parent's (§3.3, §3.5), two rows with one id in one chain would also have one parent, which
+  `(res, parent_seq)` and `(ns, prev_seq)` refuse. Rows inserted by hand, outside a write, have
+  only the trigger.
 - **Collisions.** `TestIDKeyCollision` (both stores) puts decoy rows into a resource and a
   namespace, sharing the first 8 bytes of the revision and entry ids a write is about to make;
   the write succeeds with its own ids, its retry replays it, `revByID` and `nsLogSeq` find each

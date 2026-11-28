@@ -54,8 +54,9 @@ bodies as served, wire bytes and vectors are the same.
   write makes went 3.4 → 14.8 KiB, and p50 stayed at 8 ms, commit-bound on a disk that reads in
   0.2–0.35 ms. The smaller indexes move that step out by about a third (1.2 reads a write at
   1,000,000 where 2.05, 13–21% less WAL), not away: they are still random-keyed, and so is
-  `revisions_by_id`, unchanged. Kept for the bytes. Postgres 1,000-item batches measured within
-  0–10% of before, single writes the same; SQLite 1,000-item batches 6% slower.
+  `revisions_by_id`, unchanged; latency didn't improve (p50 and p95 0.1–1.0 ms higher from
+  1,000,000 up, possibly the triggers). Kept for the bytes. Postgres 1,000-item batches measured
+  5–25% slower, single writes the same; SQLite 1,000-item batches 6% slower.
   **Upgrading:** on Postgres the migration builds the two indexes (one read of each table,
   holding writes off for as long) and drops the constraints; on SQLite, where a table
   constraint's index can't be dropped, it rebuilds `ns_log` and `revisions` (copied aside and
