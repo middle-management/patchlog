@@ -246,7 +246,9 @@ func (r *runner) cliffPreloadPG(conn *sql.Conn, s cliffState, N int64, t0 time.T
 	must(conn.ExecContext(r.ctx, `SET session_replication_role = origin`))
 	must(conn.ExecContext(r.ctx, `SELECT setval(pg_get_serial_sequence('revisions', 'seq'), (SELECT MAX(seq) FROM revisions))`))
 	must(conn.ExecContext(r.ctx, `SELECT setval(pg_get_serial_sequence('ns_log', 'seq'), (SELECT MAX(seq) FROM ns_log))`))
-	must(conn.ExecContext(r.ctx, `ANALYZE`))
+	// Vacuumed now, so autovacuum doesn't scan the new rows during the
+	// paced load.
+	must(conn.ExecContext(r.ctx, `VACUUM ANALYZE`))
 	must(conn.ExecContext(r.ctx, `CHECKPOINT`))
 }
 
@@ -447,9 +449,6 @@ func (r *runner) cliffPaced() {
 		names, heads = append(names, n), append(heads, ids.FromBytes(id).String())
 	}
 	rows.Close()
-	var counts struct{ revs, entries int64 }
-	must(0, db.QueryRowContext(r.ctx, `SELECT COUNT(*) FROM revisions`).Scan(&counts.revs))
-	must(0, db.QueryRowContext(r.ctx, `SELECT COUNT(*) FROM ns_log`).Scan(&counts.entries))
 	var sizes map[string]int64
 	if r.cliffPG() {
 		sizes = r.cliffSizes(db) // the catalog only: no data pages read
@@ -537,6 +536,11 @@ func (r *runner) cliffPaced() {
 	if !r.cliffPG() {
 		sizes = r.cliffSizes(db)
 	}
+	// Counted last: a count reads the tables, which would have filled the
+	// cache the load measures.
+	var counts struct{ revs, entries int64 }
+	must(0, db.QueryRowContext(r.ctx, `SELECT COUNT(*) FROM revisions`).Scan(&counts.revs))
+	must(0, db.QueryRowContext(r.ctx, `SELECT COUNT(*) FROM ns_log`).Scan(&counts.entries))
 	var all, warm []float64
 	buckets := []any{}
 	per := map[int][]float64{}
