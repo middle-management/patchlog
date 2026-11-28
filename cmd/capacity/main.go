@@ -75,6 +75,9 @@ type config struct {
 	storageDB                                                          string
 	storageWrites, storageResources                                    int
 	storageWait                                                        time.Duration
+	cliffDB, cliffStep, cliffDisk, cliffCgroup, cliffLabel             string
+	cliffWrites, cliffResources, cliffSeconds                          int
+	cliffRate                                                          float64
 }
 
 // args are the harness's flags (go-arg), copied into config.
@@ -100,7 +103,7 @@ type args struct {
 	SingleSecs     int           `arg:"--single-seconds" default:"15" help:"seconds each single-document write measurement runs"`
 	SingleRate     float64       `arg:"--single-rate" help:"single-document measurements: writes a second (and burst) the namespace allows per resource, per principal and in all, in place of the defaults (10, 50 and 500 a second); the core needs --max-rate-per-resource, --max-rate-per-principal and --max-rate-per-namespace raised to it"`
 	BackoffMax     time.Duration `arg:"--single-backoff-max" help:"single-document measurements: the longest wait of the client's backoff after lost races (default: the client's, 16ms)"`
-	Only           string        `arg:"--only" help:"run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live, resource-live; branches and storage run only when named"`
+	Only           string        `arg:"--only" help:"run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, single, live, resource-live; branches, storage and cliff run only when named"`
 	BranchCount    int           `arg:"--branch-count" default:"100" help:"branches phase: live branches of the base"`
 	BranchFrozen   int           `arg:"--branch-frozen" help:"branches phase: frozen branches of the base besides the live ones"`
 	BranchChildren int           `arg:"--branch-children" help:"branches phase: branches under each live branch"`
@@ -115,6 +118,15 @@ type args struct {
 	StorageWrites  int           `arg:"--storage-writes" default:"1000000" help:"storage phase: single-resource writes, pruned to the heads before measuring"`
 	StorageRes     int           `arg:"--storage-resources" default:"1000" help:"storage phase: resources the writes are spread over"`
 	StorageWait    time.Duration `arg:"--storage-wait" default:"5m10s" help:"storage phase: how long to wait after the last write before pruning (a prune keeps what the namespace's retryWindow, at least 5 minutes, protects)"`
+	CliffDB        string        `arg:"--cliff-db" help:"cliff phase: the core's --db (a SQLite path or a Postgres URL), loaded and read by the harness"`
+	CliffStep      string        `arg:"--cliff-step" help:"cliff phase: setup (through the API: the namespace and its resources), preload (the core stopped: --cliff-writes pruned writes straight into the database) or paced (through the API: the paced load, measured)"`
+	CliffWrites    int           `arg:"--cliff-writes" default:"1000000" help:"cliff phase, preload: writes to load"`
+	CliffRes       int           `arg:"--cliff-resources" default:"1000" help:"cliff phase, setup: resources the writes are spread over"`
+	CliffRate      float64       `arg:"--cliff-rate" default:"100" help:"cliff phase, paced: appends a second"`
+	CliffSeconds   int           `arg:"--cliff-seconds" default:"150" help:"cliff phase, paced: seconds the load runs"`
+	CliffDisk      string        `arg:"--cliff-disk" default:"vda" help:"cliff phase, paced: the block device (/proc/diskstats) whose reads to report"`
+	CliffCgroup    string        `arg:"--cliff-cgroup" help:"cliff phase, paced: the database container's memory cgroup directory, to report its page cache and RSS"`
+	CliffLabel     string        `arg:"--cliff-label" help:"cliff phase, paced: a label recorded with the results (the memory setup, the schema)"`
 }
 
 func (args) Description() string {
@@ -150,6 +162,8 @@ func main() {
 		resWriters:  a.ResWriters,
 		resSecs:     a.ResSecs,
 		storageDB:   a.StorageDB, storageWrites: a.StorageWrites, storageResources: a.StorageRes, storageWait: a.StorageWait,
+		cliffDB: a.CliffDB, cliffStep: a.CliffStep, cliffWrites: a.CliffWrites, cliffResources: a.CliffRes, cliffRate: a.CliffRate,
+		cliffSeconds: a.CliffSeconds, cliffDisk: a.CliffDisk, cliffCgroup: a.CliffCgroup, cliffLabel: a.CliffLabel,
 		only:        a.Only,
 		branchCount: a.BranchCount, branchFrozen: a.BranchFrozen, branchChildren: a.BranchChildren,
 		branchDocs: a.BranchDocs, branchDepth: a.BranchDepth, purgeListen: a.PurgeListen, purgeRuns: a.PurgeRuns,
@@ -358,6 +372,9 @@ func (r *runner) run() {
 	}
 	if r.c.only != "" && on("storage") {
 		r.storage()
+	}
+	if r.c.only != "" && on("cliff") {
+		r.cliff()
 	}
 	for k, pid := range r.pids() {
 		b, err := os.ReadFile("/proc/" + pid + "/status")
