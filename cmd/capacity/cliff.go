@@ -248,7 +248,7 @@ func (r *runner) cliffPreloadPG(conn *sql.Conn, s cliffState, N int64, t0 time.T
 	must(conn.ExecContext(r.ctx, `SELECT setval(pg_get_serial_sequence('ns_log', 'seq'), (SELECT MAX(seq) FROM ns_log))`))
 	// Vacuumed now, so autovacuum doesn't scan the new rows during the
 	// paced load.
-	must(conn.ExecContext(r.ctx, `VACUUM ANALYZE`))
+	must(conn.ExecContext(r.ctx, `VACUUM (PARALLEL 0, ANALYZE)`)) // no parallel workers: a container's /dev/shm is small
 	must(conn.ExecContext(r.ctx, `CHECKPOINT`))
 }
 
