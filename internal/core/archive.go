@@ -603,7 +603,8 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 				out.Skipped++
 				return nil
 			}
-			row, err := scanRev(t.QueryRow(`SELECT `+t.revCols()+` FROM revisions WHERE res = ? AND id = ?`, own.id, id[:]))
+			k, b := t.e.idArgs(id[:])
+			row, err := scanRev(t.QueryRow(`SELECT `+t.revCols()+` FROM revisions WHERE res = ? AND `+t.e.idIs("id"), own.id, k, b))
 			if errors.Is(err, sql.ErrNoRows) {
 				out.Skipped++
 				return nil

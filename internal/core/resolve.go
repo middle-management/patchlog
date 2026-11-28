@@ -107,7 +107,8 @@ func (t *tx) revByID(res int64, id ids.ID) *revRow {
 		r = t.rev(seq)
 	} else {
 		var err error
-		r, err = scanRev(t.QueryRow(`SELECT `+t.revCols()+` FROM revisions WHERE res = ? AND id = ?`, res, id[:]))
+		key, b := t.e.idArgs(id[:])
+		r, err = scanRev(t.QueryRow(`SELECT `+t.revCols()+` FROM revisions WHERE res = ? AND `+t.e.idIs("id"), res, key, b))
 		if errors.Is(err, sql.ErrNoRows) {
 			r = nil
 		} else {
@@ -147,9 +148,9 @@ func (t *tx) memoByID(k revIDKey, r *revRow) {
 // A namespace read through a base isn't helped below its own row (resolve
 // reads the base's rows as before), but costs no more.
 func (t *tx) lookupResource(name, res string, want *ids.ID, full bool) *nsRow {
-	var idArg any
+	var idKey, idArg any
 	if want != nil {
-		idArg = want[:]
+		idKey, idArg = t.e.idArgs(want[:])
 	}
 	var nr nullRes
 	var hr, xr nullRev
@@ -168,10 +169,10 @@ func (t *tx) lookupResource(name, res string, want *ids.ID, full bool) *nsRow {
 	q := lookupSQL[b2i(t.e.refs)][b2i(full)][b2i(t.e.pg)]
 	var row *sql.Row
 	if full {
-		row = t.QueryRow(q, res, idArg, name)
+		row = t.QueryRow(q, res, idKey, idArg, name)
 	} else {
 		// The seq's subquery comes first, in the columns.
-		row = t.QueryRow(q, idArg, res, name)
+		row = t.QueryRow(q, idKey, idArg, res, name)
 	}
 	err := row.Scan(dest...)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -228,15 +229,17 @@ func lookupSQLOf(refs bool) (q [2][2]string) {
 	from := ` FROM namespaces n
 		LEFT JOIN resources r ON r.ns = n.ns AND r.name = ?
 		LEFT JOIN revisions h ON h.seq = r.head_seq`
-	byID := `SELECT seq FROM revisions WHERE res = r.res AND id = ? LIMIT 1`
+	byID := func(pg bool) string {
+		return `SELECT seq FROM revisions WHERE res = r.res AND ` + idIsSQL(pg, "id") + ` LIMIT 1`
+	}
 	for pg := 0; pg < 2; pg++ {
-		q[0][pg] = `SELECT ` + common + `, (` + byID + `)` + from + ` WHERE n.name = ?`
+		q[0][pg] = `SELECT ` + common + `, (` + byID(pg == 1) + `)` + from + ` WHERE n.name = ?`
 	}
 	q[1][1] = `SELECT ` + common + `, ` + cols("x", revNames) + from + `
-		LEFT JOIN LATERAL (SELECT ` + revColsOf(refs, "revisions") + ` FROM revisions WHERE res = r.res AND id = ? LIMIT 1) x ON true
+		LEFT JOIN LATERAL (SELECT ` + revColsOf(refs, "revisions") + ` FROM revisions WHERE res = r.res AND ` + idIsSQL(true, "id") + ` LIMIT 1) x ON true
 		WHERE n.name = ?`
 	q[1][0] = `SELECT ` + common + `, ` + revColsOf(refs, "x") + from + `
-		LEFT JOIN revisions x ON x.seq = (` + byID + `)
+		LEFT JOIN revisions x ON x.seq = (` + byID(false) + `)
 		WHERE n.name = ?`
 	return q
 }
@@ -659,7 +662,8 @@ func (t *tx) findInAncestry(head *revRow, id ids.ID) *revRow {
 // the index of its segment, or nil and -1.
 func (t *tx) locate(segs []segment, id ids.ID) (int, *revRow) {
 	for i, s := range segs {
-		r, err := scanRev(t.QueryRow(`SELECT `+t.revCols()+` FROM revisions WHERE res = ? AND id = ? AND seq <= ?`, s.res, id[:], s.max))
+		k, b := t.e.idArgs(id[:])
+		r, err := scanRev(t.QueryRow(`SELECT `+t.revCols()+` FROM revisions WHERE res = ? AND `+t.e.idIs("id")+` AND seq <= ?`, s.res, k, b, s.max))
 		if err == nil {
 			return i, r
 		}

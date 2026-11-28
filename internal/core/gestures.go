@@ -116,8 +116,9 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 			if r == nil || r.state == statePurged {
 				return notFound()
 			}
-			if err := t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND id = ? AND (gesture = ? OR undoes = ?)`,
-				r.id, afterID[:], gesture, gesture).Scan(&after); err != nil {
+			k, b := t.e.idArgs(afterID[:])
+			if err := t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND `+t.e.idIs("id")+` AND (gesture = ? OR undoes = ?)`,
+				r.id, k, b, gesture, gesture).Scan(&after); err != nil {
 				return notFound()
 			}
 			if visible != nil && !visible(afterName, after) {

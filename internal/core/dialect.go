@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"strconv"
@@ -82,6 +83,64 @@ func rebind(q string) string {
 	s := b.String()
 	rebinds.Store(q, s)
 	return s
+}
+
+// Entry and revision ids are found by their first 8 bytes (docs/capacity/
+// storage/README.md, "The memory cliff"): ns_log and revisions are indexed
+// on (ns, idKey(id)) and (res, idKey(id)), not on the whole 20-byte id,
+// and a lookup compares the whole id on the rows the index finds, so ids
+// sharing a prefix in one namespace or resource are told apart. A trigger
+// of each table (migration 036 on Postgres, 034 on SQLite) keeps the whole
+// id unique in its namespace or resource, through the same index, as the
+// unique constraints it replaced did. The key is an expression index, so
+// it costs no column and no insert sets it: on Postgres a bigint (the
+// bytes big-endian, two's complement), 24 bytes an index entry where (ns,
+// id) took 40; in SQLite the 8 bytes as a BLOB.
+
+// idKeySQL is the indexed key of the id column col.
+func idKeySQL(pg bool, col string) string {
+	if pg {
+		return `('x' || encode(substr(` + col + `, 1, 8), 'hex'))::bit(64)::bigint`
+	}
+	return `substr(` + col + `, 1, 8)`
+}
+
+// idKeyArg is idKeySQL's value for id: nil for a nil id.
+func idKeyArg(pg bool, id []byte) any {
+	if id == nil {
+		return nil
+	}
+	if pg {
+		return int64(binary.BigEndian.Uint64(id[:8]))
+	}
+	return id[:8]
+}
+
+// idIs is the condition that the id column col is the argument, by its
+// key and then whole: it takes the arguments idArgs returns, in order.
+func (e *Engine) idIs(col string) string { return idIsSQL(e.pg, col) }
+
+// In SQLite the whole id is compared as +col, which no index answers: with
+// statistics the planner would rather take revisions_by_id (id), as
+// selective but over every resource's revisions, so a write's retry lookup
+// would read a page of it where the key index's page is the one the write
+// then inserts into.
+func idIsSQL(pg bool, col string) string {
+	if pg {
+		return idKeySQL(pg, col) + ` = ? AND ` + col + ` = ?`
+	}
+	return idKeySQL(pg, col) + ` = ? AND +` + col + ` = ?`
+}
+
+// idArgs are idIs's arguments for id.
+func (e *Engine) idArgs(id []byte) (any, any) { return idKeyArg(e.pg, id), nilBytes(id) }
+
+// nilBytes is b, or an untyped nil for a nil b (a NULL argument).
+func nilBytes(b []byte) any {
+	if b == nil {
+		return nil
+	}
+	return b
 }
 
 // pgArgs converts arguments Postgres won't take as they are: bools go into
@@ -175,7 +234,10 @@ func isConflict(err error) bool {
 		return false
 	}
 	switch se.Code() {
-	case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
+	// SQLITE_CONSTRAINT_TRIGGER: the triggers keeping ids unique in a
+	// namespace and a resource (idKeySQL) raise the message the unique
+	// constraints they replaced did.
+	case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY, sqlite3.SQLITE_CONSTRAINT_TRIGGER:
 	default:
 		return false
 	}

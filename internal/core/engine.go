@@ -1465,7 +1465,8 @@ func (t *tx) nsLogID(seq int64) ids.ID {
 // nsLogSeq finds an ns_log entry of a namespace by id.
 func (t *tx) nsLogSeq(ns int64, id ids.ID) (int64, bool) {
 	var seq int64
-	err := t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND id = ?`, ns, id[:]).Scan(&seq)
+	k, b := t.e.idArgs(id[:])
+	err := t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND `+t.e.idIs("id"), ns, k, b).Scan(&seq)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false
 	}
