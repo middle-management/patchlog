@@ -11,10 +11,11 @@
 # pg: CONTAINER is the Postgres container PG names, started with the memory
 # limit MEM (docker run --memory=MEM --memory-swap=MEM); the load runs with
 # the limit raised to LOADMEM (default 2g), and the container is restarted
-# under MEM with the host's page cache dropped (so this runs as root)
-# before the paced load. sqlite: the core runs in a container (alpine,
-# --network host) limited to MEM for the paced load, its database in a
-# temporary directory (DIR to keep it elsewhere).
+# under MEM with the host's page cache dropped (so this runs as root) and
+# every table and index read once (pg_prewarm) before the paced load. sqlite: the core runs in a container (alpine,
+# --network host) limited to MEM for the paced load, which reads the
+# database file once before it, its database in a temporary directory (DIR
+# to keep it elsewhere).
 #
 # RATE (100) writes a second for DURATION seconds (150); LABEL is recorded with the
 # results; PORT (18191) is the core's; BIN, a directory holding patchlog
@@ -60,6 +61,13 @@ pg)
 	docker restart "$ctr" >/dev/null
 	cold
 	for i in $(seq 100); do psql "$PG" -qc 'SELECT 1' >/dev/null 2>&1 && break; sleep 0.3; done
+	# Every table, then every index, read once (largest first): the cache
+	# holds what the memory allows, as it would on a server that has run.
+	psql "$db" -qAt -c 'CREATE EXTENSION IF NOT EXISTS pg_prewarm' \
+		-c "SELECT COUNT(pg_prewarm(oid, 'read')) FROM (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = current_schema() AND c.relkind = 'r' ORDER BY pg_relation_size(c.oid) DESC) x" \
+		-c "SELECT COUNT(pg_prewarm(oid, 'read')) FROM (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE n.nspname = current_schema() AND c.relkind = 'i' ORDER BY pg_relation_size(c.oid) DESC) x" >/dev/null
 	serve "$db"
 	cap --cliff-step paced --cliff-rate "${RATE:-100}" --cliff-seconds "${DURATION:-150}" --cliff-label "${LABEL:-}" \
 		--cliff-cgroup "/sys/fs/cgroup/memory/docker/$(docker inspect -f '{{.Id}}' "$ctr")" --json "$out"
@@ -77,6 +85,9 @@ sqlite)
 	docker run -d --name plx-cliff-core --memory "$mem" --memory-swap "$mem" --network host -v "$dir:$dir" alpine:3.22 \
 		"$dir/patchlog" serve --addr ":$port" --origin "http://localhost:$port" --db "$db" --operator-key "$pub" $flags >/dev/null
 	for i in $(seq 100); do curl -sf "http://localhost:$port/" >/dev/null && break; sleep 0.2; done
+	# The database read once, in the container: its cache holds what the
+	# memory allows.
+	docker exec plx-cliff-core cat "$db" >/dev/null
 	cap --cliff-step paced --cliff-rate "${RATE:-100}" --cliff-seconds "${DURATION:-150}" --cliff-label "${LABEL:-}" \
 		--cliff-cgroup "/sys/fs/cgroup/memory/docker/$(docker inspect -f '{{.Id}}' plx-cliff-core)" --json "$out"
 	docker rm -f plx-cliff-core >/dev/null

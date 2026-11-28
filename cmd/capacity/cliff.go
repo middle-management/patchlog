@@ -46,14 +46,16 @@ import (
 //     --cliff-seconds, open loop (each starts at its scheduled time,
 //     whatever the ones before took, and its latency counts from then), each
 //     to a resource picked at random among those with no write in flight.
-//     It reports the latency in all and per 10-second bucket, the size of
+//     It reports the latency in all, after the first 30 seconds and per
+//     10-second bucket, the size of
 //     every index of the tables a write touches, and the reads the database
 //     did during the load: on Postgres pg_statio_user_indexes / _tables
 //     (blocks read, i.e. missed in shared_buffers, against hit), pg_stat_io
 //     (reads and their time, which tells the OS page cache from the disk)
 //     and the WAL written; on both, the host's block-device reads
 //     (/proc/diskstats, --cliff-disk) and, with --cliff-cgroup, the page
-//     cache and RSS of the database's container.
+//     cache and RSS of the database's container; each in all and for the
+//     writes after the first 30 seconds (io_per_write_after_30s).
 
 const cliffNS = "cap-cliff"
 
@@ -461,9 +463,17 @@ func (r *runner) cliffPaced() {
 	var errs sync.Map
 	var skipped atomic.Int64
 	before := r.cliffSnapshot(db)
+	// The counters again once the first 30 seconds' writes are scheduled,
+	// for the reads of the rest (a cold start's are in the first).
+	warmup := min(int(30*rate), total)
+	var mid cliffStats
+	midDone := make(chan struct{})
 	t0 := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < total; i++ {
+		if i == warmup {
+			go func() { mid = r.cliffSnapshot(db); close(midDone) }()
+		}
 		at := t0.Add(time.Duration(float64(i) / rate * float64(time.Second)))
 		if d := time.Until(at); d > 0 {
 			time.Sleep(d)
@@ -501,20 +511,29 @@ func (r *runner) cliffPaced() {
 	}
 	wg.Wait()
 	wall := time.Since(t0)
+	if warmup < total {
+		<-midDone
+	} else {
+		mid = before
+	}
 	// Backends report their I/O counters when idle, at most every second
 	// and at least every ten.
 	time.Sleep(12 * time.Second)
 	after := r.cliffSnapshot(db)
-	delta := map[string]float64{}
-	for k, v := range after {
-		if strings.HasPrefix(k, "cgroup_") {
-			delta[k] = round1(v)
-			continue
+	diff := func(from cliffStats) map[string]float64 {
+		delta := map[string]float64{}
+		for k, v := range after {
+			if strings.HasPrefix(k, "cgroup_") {
+				delta[k] = round1(v)
+				continue
+			}
+			if d := v - from[k]; d != 0 {
+				delta[k] = d
+			}
 		}
-		if d := v - before[k]; d != 0 {
-			delta[k] = d
-		}
+		return delta
 	}
+	delta, warmDelta := diff(before), diff(mid)
 	if !r.cliffPG() {
 		sizes = r.cliffSizes(db)
 	}
@@ -540,31 +559,35 @@ func (r *runner) cliffPaced() {
 	errOut := map[string]int64{}
 	errs.Range(func(k, v any) bool { errOut[k.(string)] = v.(*atomic.Int64).Load(); return true })
 	written := len(all)
-	byWrite := map[string]float64{}
-	n := float64(written)
-	for k, v := range delta {
-		if strings.HasPrefix(k, "cgroup_") || n == 0 {
-			continue
+	per1 := func(delta map[string]float64, n float64) map[string]float64 {
+		out := map[string]float64{}
+		for k, v := range delta {
+			if strings.HasPrefix(k, "cgroup_") || n == 0 {
+				continue
+			}
+			out[k] = round1(v/n*1000) / 1000
 		}
-		byWrite[k] = round1(v/n*1000) / 1000
+		return out
 	}
 	r.record("cliff", map[string]any{
-		"store":             map[bool]string{true: "postgres", false: "sqlite"}[r.cliffPG()],
-		"label":             r.c.cliffLabel,
-		"revisions":         counts.revs,
-		"ns_log_entries":    counts.entries,
-		"resources":         len(names),
-		"rate":              rate,
-		"seconds":           secs,
-		"wall_seconds":      wall.Seconds(),
-		"written":           written,
-		"skipped":           skipped.Load(),
-		"errors":            errOut,
-		"latency":           latSummary(all),
-		"latency_after_30s": latSummary(warm),
-		"buckets":           buckets,
-		"sizes":             sizes,
-		"io":                delta,
-		"io_per_write":      byWrite,
+		"store":                  map[bool]string{true: "postgres", false: "sqlite"}[r.cliffPG()],
+		"label":                  r.c.cliffLabel,
+		"revisions":              counts.revs,
+		"ns_log_entries":         counts.entries,
+		"resources":              len(names),
+		"rate":                   rate,
+		"seconds":                secs,
+		"wall_seconds":           wall.Seconds(),
+		"written":                written,
+		"skipped":                skipped.Load(),
+		"errors":                 errOut,
+		"latency":                latSummary(all),
+		"latency_after_30s":      latSummary(warm),
+		"buckets":                buckets,
+		"sizes":                  sizes,
+		"io":                     delta,
+		"io_per_write":           per1(delta, float64(written)),
+		"io_after_30s":           warmDelta,
+		"io_per_write_after_30s": per1(warmDelta, float64(len(warm))),
 	})
 }
