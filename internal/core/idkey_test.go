@@ -148,6 +148,23 @@ func TestIDKeyCollision(t *testing.T) {
 			t.Errorf("a second %s with one id: %v, want a unique violation (isConflict)", c.what, dup)
 		}
 	}
+	// One insert of two rows with one new id: refused too (on Postgres the
+	// check runs once per statement, over the rows it inserted).
+	fresh := append([]byte(nil), rev[:]...)
+	fresh[0] ^= 0xff
+	var twice error
+	e.update(ctx, func(t *tx) error {
+		q := `INSERT INTO revisions (res, id, first, kind, author, created)
+			SELECT res, ?, 0, kind, author, created FROM revisions WHERE res = ? ORDER BY seq LIMIT 2`
+		if t.e.pg {
+			q = rebind(q)
+		}
+		_, twice = t.Tx.Exec(q, fresh, resX)
+		return errIDKeyDone
+	})
+	if twice == nil || !isConflict(twice) {
+		t.Errorf("two new revisions with one id in one statement: %v, want a unique violation", twice)
+	}
 	// Another resource or namespace may hold the same id (§3.3).
 	if err := e.update(ctx, func(t *tx) error {
 		var other int64
