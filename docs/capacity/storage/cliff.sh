@@ -17,7 +17,9 @@
 # temporary directory (DIR to keep it elsewhere).
 #
 # RATE (100) writes a second for DURATION seconds (150); LABEL is recorded with the
-# results; PORT (18191) is the core's.
+# results; PORT (18191) is the core's; BIN, a directory holding patchlog
+# (built with CGO_ENABLED=0, for the alpine container) and capacity, is
+# used in place of building them from the working tree.
 set -eu
 store=$1 out=$2 writes=$3
 mem=${MEM:-256m} loadmem=${LOADMEM:-2g} port=${PORT:-18191}
@@ -25,8 +27,12 @@ dir=${DIR:-$(mktemp -d)}
 mkdir -p "$dir"
 core=
 trap 'if [ -n "$core" ]; then kill $core 2>/dev/null || true; fi; docker rm -f plx-cliff-core >/dev/null 2>&1 || true; wait 2>/dev/null || true' EXIT
-CGO_ENABLED=0 go build -o "$dir/patchlog" ./cmd/patchlog
-go build -o "$dir/capacity" ./cmd/capacity
+if [ -n "${BIN:-}" ]; then # binaries built before, e.g. of another commit
+	cp "$BIN/patchlog" "$BIN/capacity" "$dir/"
+else
+	CGO_ENABLED=0 go build -o "$dir/patchlog" ./cmd/patchlog
+	go build -o "$dir/capacity" ./cmd/capacity
+fi
 keys=$("$dir/patchlog" keygen)
 pub=$(echo "$keys" | awk '/^public/ {print $2}')
 priv=$(echo "$keys" | awk '/^private/ {print $2}')
