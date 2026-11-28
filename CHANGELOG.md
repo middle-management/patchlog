@@ -38,6 +38,29 @@ bodies as served, wire bytes and vectors are the same.
   (and on Postgres an update of every `ns_config` row), then drops the indexes; on Postgres it
   holds off writes for that pass. A database upgraded from before both migrations builds
   `ns_log_by_grant_ref` only for this one to drop it.
+- **Ids found by their first 8 bytes** (migrations `034_ids_found_by_their_first_8_bytes` on
+  SQLite, `036_…` on Postgres). `ns_log`'s unique `(ns, id)` and `revisions`' unique `(res, id)`,
+  on the whole 20-byte hash, become indexes on `(ns, key)` and `(res, key)`, the key an expression
+  of the id's first 8 bytes (a `bigint` on Postgres, an 8-byte BLOB in SQLite); every lookup by
+  id compares the key, then the whole id, so ids sharing a prefix are told apart. A trigger of
+  each table keeps the whole id unique in its namespace and resource through the new index and
+  fails as the constraint did (on Postgres once per insert statement, over its rows). SQLite 309
+  → 284 bytes per write (the two indexes 30 → 18 and 32 → 20), Postgres 720 → 683 (50 → 32 each).
+  The worry behind it, that inserts into these randomly-keyed indexes would slow writes once
+  they outgrow memory, held for reads but not for latency where it was measured (docs/capacity/
+  storage, "The memory cliff", `cmd/capacity -only cliff`, `cliff.sh`): with 256 MB for Postgres
+  and its cache, a paced 100 writes a second read about 0 pages a write at 250,000 loaded writes
+  and 2.0–2.8 from 1,000,000 to 3,000,000 (the three hash-keyed indexes 174–517 MB), the WAL a
+  write makes went 3.4 → 14.8 KiB, and p50 stayed at 8 ms, commit-bound on a disk that reads in
+  0.2–0.35 ms. The smaller indexes move that step out by about a third (1.2 reads a write at
+  1,000,000 where 2.05, 13–21% less WAL), not away: they are still random-keyed, and so is
+  `revisions_by_id`, unchanged. Kept for the bytes. Postgres 1,000-item batches measured within
+  0–10% of before, single writes the same; SQLite 1,000-item batches 6% slower.
+  **Upgrading:** on Postgres the migration builds the two indexes (one read of each table,
+  holding writes off for as long) and drops the constraints; on SQLite, where a table
+  constraint's index can't be dropped, it rebuilds `ns_log` and `revisions` (copied aside and
+  back, every seq kept): a rewrite of the two largest tables. Stop instances of earlier versions
+  first: on the new schema they would find an entry by id by scanning its namespace's entries.
 - **Not changed: Postgres column types and order, and `head_history`.** Laying `ns_log` and
   `revisions` out 8 → 4 → 2 → varlena with `integer` namespaces, authors and grant numbers would
   save about 32 bytes per write (15 and 17 a row, measured; the indexes don't shrink), but only

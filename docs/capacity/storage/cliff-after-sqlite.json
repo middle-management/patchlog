@@ -1,0 +1,661 @@
+{
+  "host": "4 vCPUs, the core, the harness and the database on the same host",
+  "load": "1,000 resources in one namespace (cap-cliff), the preloaded writes round-robin over them (pruned skeletons, random 20-byte ids), then 100 appends a second for 150 s through the HTTP API, open loop, each to a random resource with no write in flight; latency and I/O counted for the writes after the first 30 s (latency_after_30s, io_per_write_after_30s)",
+  "points": [
+    {
+      "buckets": [
+        {
+          "from_s": 0,
+          "max_ms": 31.77,
+          "mean_ms": 3.6,
+          "n": 1000,
+          "p50_ms": 2.77,
+          "p95_ms": 7.31,
+          "p99_ms": 24.4
+        },
+        {
+          "from_s": 10,
+          "max_ms": 104.88,
+          "mean_ms": 4.18,
+          "n": 1000,
+          "p50_ms": 2.74,
+          "p95_ms": 11.36,
+          "p99_ms": 29.48
+        },
+        {
+          "from_s": 20,
+          "max_ms": 81.77,
+          "mean_ms": 3.91,
+          "n": 1000,
+          "p50_ms": 2.66,
+          "p95_ms": 10.49,
+          "p99_ms": 30.74
+        },
+        {
+          "from_s": 30,
+          "max_ms": 35.99,
+          "mean_ms": 3.57,
+          "n": 1000,
+          "p50_ms": 2.72,
+          "p95_ms": 8.01,
+          "p99_ms": 26.13
+        },
+        {
+          "from_s": 40,
+          "max_ms": 30.35,
+          "mean_ms": 3.46,
+          "n": 1000,
+          "p50_ms": 2.67,
+          "p95_ms": 6.72,
+          "p99_ms": 25.06
+        },
+        {
+          "from_s": 50,
+          "max_ms": 29.59,
+          "mean_ms": 3.36,
+          "n": 1000,
+          "p50_ms": 2.64,
+          "p95_ms": 6.28,
+          "p99_ms": 23.87
+        },
+        {
+          "from_s": 60,
+          "max_ms": 105.26,
+          "mean_ms": 4.07,
+          "n": 1000,
+          "p50_ms": 2.69,
+          "p95_ms": 7.06,
+          "p99_ms": 33.65
+        },
+        {
+          "from_s": 70,
+          "max_ms": 30.93,
+          "mean_ms": 3.41,
+          "n": 1000,
+          "p50_ms": 2.67,
+          "p95_ms": 6.33,
+          "p99_ms": 25.23
+        },
+        {
+          "from_s": 80,
+          "max_ms": 89.11,
+          "mean_ms": 4.31,
+          "n": 1000,
+          "p50_ms": 2.72,
+          "p95_ms": 15.3,
+          "p99_ms": 37.21
+        },
+        {
+          "from_s": 90,
+          "max_ms": 34.65,
+          "mean_ms": 3.73,
+          "n": 1000,
+          "p50_ms": 2.66,
+          "p95_ms": 9.58,
+          "p99_ms": 24.84
+        },
+        {
+          "from_s": 100,
+          "max_ms": 57.62,
+          "mean_ms": 4,
+          "n": 1000,
+          "p50_ms": 2.69,
+          "p95_ms": 13.68,
+          "p99_ms": 28.55
+        },
+        {
+          "from_s": 110,
+          "max_ms": 26.96,
+          "mean_ms": 3.39,
+          "n": 1000,
+          "p50_ms": 2.54,
+          "p95_ms": 6.79,
+          "p99_ms": 24.6
+        },
+        {
+          "from_s": 120,
+          "max_ms": 36.89,
+          "mean_ms": 3.51,
+          "n": 1000,
+          "p50_ms": 2.64,
+          "p95_ms": 7.19,
+          "p99_ms": 24.79
+        },
+        {
+          "from_s": 130,
+          "max_ms": 75.9,
+          "mean_ms": 3.92,
+          "n": 1000,
+          "p50_ms": 2.66,
+          "p95_ms": 13.49,
+          "p99_ms": 27.97
+        },
+        {
+          "from_s": 140,
+          "max_ms": 80.43,
+          "mean_ms": 3.81,
+          "n": 1000,
+          "p50_ms": 2.62,
+          "p95_ms": 8.42,
+          "p99_ms": 27.04
+        }
+      ],
+      "errors": {},
+      "io": {
+        "cgroup_total_cache_mb": 218.3,
+        "cgroup_total_rss_mb": 30,
+        "disk_read_bytes": 94191616,
+        "disk_read_ms": 5066,
+        "disk_reads": 13650,
+        "disk_write_bytes": 1547751424,
+        "disk_writes": 116822
+      },
+      "io_after_30s": {
+        "cgroup_total_cache_mb": 218.3,
+        "cgroup_total_rss_mb": 30,
+        "disk_read_bytes": 51507200,
+        "disk_read_ms": 4290,
+        "disk_reads": 9158,
+        "disk_write_bytes": 1239441408,
+        "disk_writes": 93572
+      },
+      "io_per_write": {
+        "disk_read_bytes": 6279.4411,
+        "disk_read_ms": 0.3377,
+        "disk_reads": 0.91,
+        "disk_write_bytes": 103183.4283,
+        "disk_writes": 7.7881
+      },
+      "io_per_write_after_30s": {
+        "disk_read_bytes": 4292.2667,
+        "disk_read_ms": 0.3575,
+        "disk_reads": 0.7632000000000001,
+        "disk_write_bytes": 103286.784,
+        "disk_writes": 7.7977
+      },
+      "label": "after sqlite 256m",
+      "latency": {
+        "max_ms": 105.26,
+        "mean_ms": 3.75,
+        "n": 15000,
+        "p50_ms": 2.67,
+        "p95_ms": 8.13,
+        "p99_ms": 25.74
+      },
+      "latency_after_30s": {
+        "max_ms": 105.26,
+        "mean_ms": 3.71,
+        "n": 12000,
+        "p50_ms": 2.66,
+        "p95_ms": 8.13,
+        "p99_ms": 25.67
+      },
+      "ns_log_entries": 1017001,
+      "preloaded_writes": 1000000,
+      "rate": 100,
+      "resources": 1000,
+      "revisions": 1017000,
+      "seconds": 150,
+      "sizes": {
+        "database": 307568640,
+        "head_history": 17248256,
+        "ns_log": 54087680,
+        "ns_log_ns_id8": 20226048,
+        "ns_log_ns_seq": 15093760,
+        "one_first": 16384,
+        "one_ns_first": 4096,
+        "revisions": 95711232,
+        "revisions_by_gesture": 4096,
+        "revisions_by_id": 32722944,
+        "revisions_by_undoes": 4096,
+        "revisions_res_id8": 22372352,
+        "revisions_res_seq": 17281024,
+        "revisions_schema_ref": 4096,
+        "sqlite_autoindex_ns_log_1": 15093760,
+        "sqlite_autoindex_revisions_1": 17211392
+      },
+      "skipped": 0,
+      "store": "sqlite",
+      "wall_seconds": 150.014745177,
+      "written": 15000
+    },
+    {
+      "buckets": [
+        {
+          "from_s": 0,
+          "max_ms": 80.2,
+          "mean_ms": 4.1,
+          "n": 1000,
+          "p50_ms": 3.06,
+          "p95_ms": 7.43,
+          "p99_ms": 25.14
+        },
+        {
+          "from_s": 10,
+          "max_ms": 250.37,
+          "mean_ms": 7.05,
+          "n": 1000,
+          "p50_ms": 2.97,
+          "p95_ms": 16.29,
+          "p99_ms": 171.91
+        },
+        {
+          "from_s": 20,
+          "max_ms": 30.52,
+          "mean_ms": 3.67,
+          "n": 1000,
+          "p50_ms": 2.92,
+          "p95_ms": 5.88,
+          "p99_ms": 23.37
+        },
+        {
+          "from_s": 30,
+          "max_ms": 73.28,
+          "mean_ms": 4.01,
+          "n": 1000,
+          "p50_ms": 2.91,
+          "p95_ms": 8.84,
+          "p99_ms": 27.04
+        },
+        {
+          "from_s": 40,
+          "max_ms": 59.41,
+          "mean_ms": 3.78,
+          "n": 1000,
+          "p50_ms": 2.87,
+          "p95_ms": 7.07,
+          "p99_ms": 26.5
+        },
+        {
+          "from_s": 50,
+          "max_ms": 29.56,
+          "mean_ms": 3.69,
+          "n": 1000,
+          "p50_ms": 2.95,
+          "p95_ms": 6.31,
+          "p99_ms": 24.25
+        },
+        {
+          "from_s": 60,
+          "max_ms": 35.91,
+          "mean_ms": 3.9,
+          "n": 1000,
+          "p50_ms": 3.04,
+          "p95_ms": 7.76,
+          "p99_ms": 25.29
+        },
+        {
+          "from_s": 70,
+          "max_ms": 29.19,
+          "mean_ms": 3.83,
+          "n": 1000,
+          "p50_ms": 3.02,
+          "p95_ms": 7.91,
+          "p99_ms": 24.94
+        },
+        {
+          "from_s": 80,
+          "max_ms": 34.1,
+          "mean_ms": 3.79,
+          "n": 1000,
+          "p50_ms": 2.93,
+          "p95_ms": 8.04,
+          "p99_ms": 25.47
+        },
+        {
+          "from_s": 90,
+          "max_ms": 136.43,
+          "mean_ms": 4.81,
+          "n": 1000,
+          "p50_ms": 2.95,
+          "p95_ms": 14.56,
+          "p99_ms": 51.3
+        },
+        {
+          "from_s": 100,
+          "max_ms": 37.91,
+          "mean_ms": 3.79,
+          "n": 1000,
+          "p50_ms": 2.93,
+          "p95_ms": 7.66,
+          "p99_ms": 25.83
+        },
+        {
+          "from_s": 110,
+          "max_ms": 34.85,
+          "mean_ms": 3.81,
+          "n": 1000,
+          "p50_ms": 3.03,
+          "p95_ms": 7.18,
+          "p99_ms": 24.81
+        },
+        {
+          "from_s": 120,
+          "max_ms": 50.92,
+          "mean_ms": 4.13,
+          "n": 1000,
+          "p50_ms": 3.09,
+          "p95_ms": 8.68,
+          "p99_ms": 25.76
+        },
+        {
+          "from_s": 130,
+          "max_ms": 179.2,
+          "mean_ms": 5.67,
+          "n": 1000,
+          "p50_ms": 3.08,
+          "p95_ms": 14.66,
+          "p99_ms": 104.02
+        },
+        {
+          "from_s": 140,
+          "max_ms": 274.66,
+          "mean_ms": 10.11,
+          "n": 1000,
+          "p50_ms": 3.21,
+          "p95_ms": 32.87,
+          "p99_ms": 190.52
+        }
+      ],
+      "errors": {},
+      "io": {
+        "cgroup_total_cache_mb": 209.1,
+        "cgroup_total_rss_mb": 37.6,
+        "disk_read_bytes": 206413824,
+        "disk_read_ms": 14946,
+        "disk_reads": 41157,
+        "disk_write_bytes": 1532121088,
+        "disk_writes": 115252
+      },
+      "io_after_30s": {
+        "cgroup_total_cache_mb": 209.1,
+        "cgroup_total_rss_mb": 37.6,
+        "disk_read_bytes": 138833920,
+        "disk_read_ms": 11770,
+        "disk_reads": 31170,
+        "disk_write_bytes": 1224278016,
+        "disk_writes": 92035
+      },
+      "io_per_write": {
+        "disk_read_bytes": 13760.9216,
+        "disk_read_ms": 0.9964,
+        "disk_reads": 2.7438000000000002,
+        "disk_write_bytes": 102141.40590000001,
+        "disk_writes": 7.6835
+      },
+      "io_per_write_after_30s": {
+        "disk_read_bytes": 11569.4933,
+        "disk_read_ms": 0.9808,
+        "disk_reads": 2.5975,
+        "disk_write_bytes": 102023.168,
+        "disk_writes": 7.6696
+      },
+      "label": "after sqlite 256m",
+      "latency": {
+        "max_ms": 274.66,
+        "mean_ms": 4.67,
+        "n": 15000,
+        "p50_ms": 3,
+        "p95_ms": 9.72,
+        "p99_ms": 29.47
+      },
+      "latency_after_30s": {
+        "max_ms": 274.66,
+        "mean_ms": 4.61,
+        "n": 12000,
+        "p50_ms": 3,
+        "p95_ms": 10.03,
+        "p99_ms": 29.12
+      },
+      "ns_log_entries": 4017001,
+      "preloaded_writes": 4000000,
+      "rate": 100,
+      "resources": 1000,
+      "revisions": 4017000,
+      "seconds": 150,
+      "sizes": {
+        "database": 1217896448,
+        "head_history": 68157440,
+        "ns_log": 216428544,
+        "ns_log_ns_id8": 79654912,
+        "ns_log_ns_seq": 59826176,
+        "one_first": 16384,
+        "one_ns_first": 4096,
+        "revisions": 379207680,
+        "revisions_by_gesture": 4096,
+        "revisions_by_id": 129470464,
+        "revisions_by_undoes": 4096,
+        "revisions_res_id8": 88363008,
+        "revisions_res_seq": 68268032,
+        "revisions_schema_ref": 4096,
+        "sqlite_autoindex_ns_log_1": 59826176,
+        "sqlite_autoindex_revisions_1": 68169728
+      },
+      "skipped": 0,
+      "store": "sqlite",
+      "wall_seconds": 149.99302388,
+      "written": 15000
+    },
+    {
+      "buckets": [
+        {
+          "from_s": 0,
+          "max_ms": 34.55,
+          "mean_ms": 3.58,
+          "n": 1000,
+          "p50_ms": 2.8,
+          "p95_ms": 7.44,
+          "p99_ms": 23.54
+        },
+        {
+          "from_s": 10,
+          "max_ms": 33.81,
+          "mean_ms": 3.6,
+          "n": 1000,
+          "p50_ms": 2.79,
+          "p95_ms": 6.78,
+          "p99_ms": 24.85
+        },
+        {
+          "from_s": 20,
+          "max_ms": 36.97,
+          "mean_ms": 3.64,
+          "n": 1000,
+          "p50_ms": 2.75,
+          "p95_ms": 7.55,
+          "p99_ms": 26.39
+        },
+        {
+          "from_s": 30,
+          "max_ms": 29.68,
+          "mean_ms": 3.44,
+          "n": 1000,
+          "p50_ms": 2.7,
+          "p95_ms": 6.16,
+          "p99_ms": 23.76
+        },
+        {
+          "from_s": 40,
+          "max_ms": 26.92,
+          "mean_ms": 3.33,
+          "n": 1000,
+          "p50_ms": 2.69,
+          "p95_ms": 5.58,
+          "p99_ms": 23.17
+        },
+        {
+          "from_s": 50,
+          "max_ms": 29.87,
+          "mean_ms": 3.27,
+          "n": 1000,
+          "p50_ms": 2.63,
+          "p95_ms": 5.18,
+          "p99_ms": 22.9
+        },
+        {
+          "from_s": 60,
+          "max_ms": 67.55,
+          "mean_ms": 3.51,
+          "n": 1000,
+          "p50_ms": 2.62,
+          "p95_ms": 6.51,
+          "p99_ms": 23.85
+        },
+        {
+          "from_s": 70,
+          "max_ms": 35.13,
+          "mean_ms": 3.29,
+          "n": 1000,
+          "p50_ms": 2.61,
+          "p95_ms": 5.34,
+          "p99_ms": 22.93
+        },
+        {
+          "from_s": 80,
+          "max_ms": 28.77,
+          "mean_ms": 3.27,
+          "n": 1000,
+          "p50_ms": 2.6,
+          "p95_ms": 5.56,
+          "p99_ms": 23.62
+        },
+        {
+          "from_s": 90,
+          "max_ms": 28.74,
+          "mean_ms": 3.3,
+          "n": 1000,
+          "p50_ms": 2.62,
+          "p95_ms": 5.59,
+          "p99_ms": 22.69
+        },
+        {
+          "from_s": 100,
+          "max_ms": 31.57,
+          "mean_ms": 3.33,
+          "n": 1000,
+          "p50_ms": 2.66,
+          "p95_ms": 5.5,
+          "p99_ms": 22.94
+        },
+        {
+          "from_s": 110,
+          "max_ms": 27.73,
+          "mean_ms": 3.29,
+          "n": 1000,
+          "p50_ms": 2.64,
+          "p95_ms": 5.43,
+          "p99_ms": 22.97
+        },
+        {
+          "from_s": 120,
+          "max_ms": 30.77,
+          "mean_ms": 3.33,
+          "n": 1000,
+          "p50_ms": 2.64,
+          "p95_ms": 5.81,
+          "p99_ms": 23.75
+        },
+        {
+          "from_s": 130,
+          "max_ms": 26.16,
+          "mean_ms": 3.32,
+          "n": 1000,
+          "p50_ms": 2.68,
+          "p95_ms": 5.85,
+          "p99_ms": 23.34
+        },
+        {
+          "from_s": 140,
+          "max_ms": 29.5,
+          "mean_ms": 3.47,
+          "n": 1000,
+          "p50_ms": 2.78,
+          "p95_ms": 5.95,
+          "p99_ms": 23.71
+        }
+      ],
+      "errors": {},
+      "io": {
+        "cgroup_total_cache_mb": 217.9,
+        "cgroup_total_rss_mb": 31,
+        "disk_read_bytes": 90968064,
+        "disk_read_ms": 2646,
+        "disk_reads": 13481,
+        "disk_write_bytes": 1546428416,
+        "disk_writes": 115529
+      },
+      "io_after_30s": {
+        "cgroup_total_cache_mb": 217.9,
+        "cgroup_total_rss_mb": 31,
+        "disk_read_bytes": 49860608,
+        "disk_read_ms": 1866,
+        "disk_reads": 9158,
+        "disk_write_bytes": 1238261760,
+        "disk_writes": 92504
+      },
+      "io_per_write": {
+        "disk_read_bytes": 6064.5376,
+        "disk_read_ms": 0.1764,
+        "disk_reads": 0.8987,
+        "disk_write_bytes": 103095.2277,
+        "disk_writes": 7.701899999999999
+      },
+      "io_per_write_after_30s": {
+        "disk_read_bytes": 4155.0507,
+        "disk_read_ms": 0.1555,
+        "disk_reads": 0.7632000000000001,
+        "disk_write_bytes": 103188.48,
+        "disk_writes": 7.708699999999999
+      },
+      "label": "rep-after sqlite 256m",
+      "latency": {
+        "max_ms": 67.55,
+        "mean_ms": 3.4,
+        "n": 15000,
+        "p50_ms": 2.68,
+        "p95_ms": 5.89,
+        "p99_ms": 23.54
+      },
+      "latency_after_30s": {
+        "max_ms": 67.55,
+        "mean_ms": 3.35,
+        "n": 12000,
+        "p50_ms": 2.65,
+        "p95_ms": 5.6,
+        "p99_ms": 23.29
+      },
+      "ns_log_entries": 1017001,
+      "preloaded_writes": 1000000,
+      "rate": 100,
+      "repeat": true,
+      "resources": 1000,
+      "revisions": 1017000,
+      "seconds": 150,
+      "sizes": {
+        "database": 307576832,
+        "head_history": 17350656,
+        "ns_log": 54087680,
+        "ns_log_ns_id8": 20246528,
+        "ns_log_ns_seq": 15093760,
+        "one_first": 16384,
+        "one_ns_first": 4096,
+        "revisions": 95711232,
+        "revisions_by_gesture": 4096,
+        "revisions_by_id": 32727040,
+        "revisions_by_undoes": 4096,
+        "revisions_res_id8": 22351872,
+        "revisions_res_seq": 17235968,
+        "revisions_schema_ref": 4096,
+        "sqlite_autoindex_ns_log_1": 15093760,
+        "sqlite_autoindex_revisions_1": 17162240
+      },
+      "skipped": 0,
+      "store": "sqlite",
+      "wall_seconds": 149.992948172,
+      "written": 15000
+    }
+  ],
+  "runner": "docs/capacity/storage/cliff.sh",
+  "schema": "ids found by their first 8 bytes (migrations 034 SQLite / 036 Postgres)",
+  "setup": "the core in an alpine container: --memory=256m --memory-swap=256m (page cache included), SQLite's default cache_size (2 MB a connection); the database file read once in the container before the load"
+}
