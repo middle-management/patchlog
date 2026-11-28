@@ -248,18 +248,26 @@ func TestIDKeyPlans(t *testing.T) {
 			}
 		}
 		kr, ir := idKeyArg(pg, h[:]), h[:]
+		// A revision of one resource by id: on Postgres the planner may
+		// also take revisions_by_id (id), as selective, depending on the
+		// statistics; the write inserts into both, so either page is one
+		// it reads anyway. SQLite compares +id (idIsSQL) and takes the key.
+		resRev := "revisions_res_id8"
+		if pg {
+			resRev = "revisions_res_id8|revisions_by_id"
+		}
 		type plan struct {
 			what, q, want string
 			args          []any
 		}
 		plans := []plan{
 			{"nsLogSeq", `SELECT seq FROM ns_log WHERE ns = ? AND ` + idIsSQL(pg, "id"), "ns_log_ns_id8", []any{n.id, kr, ir}},
-			{"revByID", `SELECT ` + tx.revCols() + ` FROM revisions WHERE res = ? AND ` + idIsSQL(pg, "id"), "revisions_res_id8", []any{res, kr, ir}},
-			{"locate", `SELECT ` + tx.revCols() + ` FROM revisions WHERE res = ? AND ` + idIsSQL(pg, "id") + ` AND seq <= ?`, "revisions_res_id8", []any{res, kr, ir, int64(1 << 40)}},
+			{"revByID", `SELECT ` + tx.revCols() + ` FROM revisions WHERE res = ? AND ` + idIsSQL(pg, "id"), resRev, []any{res, kr, ir}},
+			{"locate", `SELECT ` + tx.revCols() + ` FROM revisions WHERE res = ? AND ` + idIsSQL(pg, "id") + ` AND seq <= ?`, resRev, []any{res, kr, ir, int64(1 << 40)}},
 			// Or by the gesture's own indexes, as selective.
 			{"gestures", `SELECT seq FROM revisions WHERE res = ? AND ` + idIsSQL(pg, "id") + ` AND (gesture = ? OR undoes = ?)`, "revisions_res_id8|revisions_by_gesture", []any{res, kr, ir, "g", "g"}},
-			{"lookupResource (seq)", lookupSQL[b2i(e.refs)][0][b2i(pg)], "revisions_res_id8", []any{kr, ir, "x", "n"}},
-			{"lookupResource (row)", lookupSQL[b2i(e.refs)][1][b2i(pg)], "revisions_res_id8", []any{"x", kr, ir, "n"}},
+			{"lookupResource (seq)", lookupSQL[b2i(e.refs)][0][b2i(pg)], resRev, []any{kr, ir, "x", "n"}},
+			{"lookupResource (row)", lookupSQL[b2i(e.refs)][1][b2i(pg)], resRev, []any{"x", kr, ir, "n"}},
 			// Across resources, by the whole id (drafts.go copyRows,
 			// schemaload.go docRules): revisions_by_id, which stays.
 			{"copyRows", `SELECT r.seq, s.ns, s.res, s.state FROM revisions r JOIN resources s ON s.res = r.res

@@ -120,11 +120,11 @@ func idKeyArg(pg bool, id []byte) any {
 // key and then whole: it takes the arguments idArgs returns, in order.
 func (e *Engine) idIs(col string) string { return idIsSQL(e.pg, col) }
 
-// In SQLite the whole id is compared as +col, which no index answers: with
-// statistics the planner would rather take revisions_by_id (id), as
-// selective but over every resource's revisions, so a write's retry lookup
-// would read a page of it where the key index's page is the one the write
-// then inserts into.
+// In SQLite the whole id is compared as +col, which no index answers, so
+// the lookup takes the key index whatever the statistics, which otherwise
+// tip it to revisions_by_id (id). Either is as selective, and a write
+// inserts into both; one plan is simpler to check (TestIDKeyPlans). On
+// Postgres the planner takes either.
 func idIsSQL(pg bool, col string) string {
 	if pg {
 		return idKeySQL(pg, col) + ` = ? AND ` + col + ` = ?`

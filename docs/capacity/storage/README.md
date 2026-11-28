@@ -311,13 +311,13 @@ but indexes on `(ns, key)` and `(res, key)`, the key the id's first 8 bytes (mig
   changed: `nsLogSeq` (log paging and retries), `revByID` and the retry lookups of
   `lookupResource` (a write's idempotent-retry check, §7.2), `locate` (reads and as-of reads down
   an ancestry, branches' bases included), archive restores and gesture paging. In SQLite the
-  whole id is compared as `+id`, which no index answers: with statistics the planner otherwise
-  takes `revisions_by_id (id)`, as selective but over every resource's revisions, where the key
-  index's page is the one the write then inserts into. `TestIDKeyPlans` checks every one of these
+  whole id is compared as `+id`, which no index answers, so the planner takes the key index
+  whatever the statistics (which otherwise tip it to `revisions_by_id (id)`; either is as
+  selective, and the write inserts into both). On Postgres it takes either. `TestIDKeyPlans` checks every one of these
   statements, and the probes of SQLite's triggers and of the update triggers, on a resource of
   20,000 revisions and a namespace of 20,000 entries, before and after `ANALYZE`, on both
-  stores: all take `revisions_res_id8` or `ns_log_ns_id8` (gesture paging may take the
-  gesture's own partial indexes, as selective). `docRules` and `copyRows` (drafts, purge
+  stores: all take `revisions_res_id8` or `ns_log_ns_id8` (on Postgres a revision's may take
+  `revisions_by_id`, gesture paging the gesture's own partial indexes, as selective). `docRules` and `copyRows` (drafts, purge
   checks, schema reads) look revisions up by id across resources and keep `revisions_by_id`,
   which the test checks too. The Postgres insert triggers' join is left no plan but the index
   by its function's settings.
