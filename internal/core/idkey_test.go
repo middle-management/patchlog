@@ -148,6 +148,20 @@ func TestIDKeyCollision(t *testing.T) {
 			t.Errorf("a second %s with one id: %v, want a unique violation (isConflict)", c.what, dup)
 		}
 	}
+	// On Postgres, an entry inserted as appendNS inserts it, in a
+	// data-modifying WITH, with an id the namespace holds: refused.
+	if e.pg {
+		var viaWith error
+		e.update(ctx, func(t *tx) error {
+			var seq int64
+			viaWith = t.Tx.QueryRow(rebind(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, body, config_seq, author, created)
+				SELECT ns, ?, -3, kind, '{}', config_seq, author, 0 FROM ns_log WHERE ns = ? AND prev_seq IS NULL RETURNING seq) SELECT seq FROM l`), entry[:], nsA).Scan(&seq)
+			return errIDKeyDone
+		})
+		if viaWith == nil || !isConflict(viaWith) {
+			t.Errorf("an entry with an id the namespace holds, inserted in a WITH: %v, want a unique violation", viaWith)
+		}
+	}
 	// One insert of two rows with one new id: refused too (on Postgres the
 	// check runs once per statement, over the rows it inserted).
 	fresh := append([]byte(nil), rev[:]...)
@@ -246,7 +260,16 @@ func TestIDKeyPlans(t *testing.T) {
 			{"gestures", `SELECT seq FROM revisions WHERE res = ? AND ` + idIsSQL(pg, "id") + ` AND (gesture = ? OR undoes = ?)`, "revisions_res_id8|revisions_by_gesture", []any{res, kr, ir, "g", "g"}},
 			{"lookupResource (seq)", lookupSQL[b2i(e.refs)][0][b2i(pg)], "revisions_res_id8", []any{kr, ir, "x", "n"}},
 			{"lookupResource (row)", lookupSQL[b2i(e.refs)][1][b2i(pg)], "revisions_res_id8", []any{"x", kr, ir, "n"}},
-			// The triggers' probes (migrations).
+			// Across resources, by the whole id (drafts.go copyRows,
+			// schemaload.go docRules): revisions_by_id, which stays.
+			{"copyRows", `SELECT r.seq, s.ns, s.res, s.state FROM revisions r JOIN resources s ON s.res = r.res
+				WHERE r.id = ? AND s.name = ? AND r.kind = 0 ORDER BY s.ns, r.seq`, "revisions_by_id", []any{ir, "x"}},
+			{"docRules", `SELECT COUNT(*), MIN(COALESCE(r.rules, 0)) FROM revisions r JOIN resources s ON s.res = r.res
+				WHERE r.id = ? AND r.kind = 0 AND ` + tx.e.inArray("s.ns", "bigint"), "revisions_by_id", []any{ir, tx.e.arrayArg([]int64{n.id})}},
+			// The SQLite triggers' probes, and the Postgres update triggers'
+			// (the Postgres insert triggers join the inserted rows to the
+			// table by the same condition, with nothing but the index left
+			// to the planner).
 			{"ns_log_id_unique", `SELECT 1 FROM ns_log WHERE ns = ? AND ` + key("id") + ` = ` + key(param) + ` AND ` + idCol + ` = ?`, "ns_log_ns_id8", []any{n.id, ir, ir}},
 			{"revisions_id_unique", `SELECT 1 FROM revisions WHERE res = ? AND ` + key("id") + ` = ` + key(param) + ` AND ` + idCol + ` = ?`, "revisions_res_id8", []any{res, ir, ir}},
 		}
