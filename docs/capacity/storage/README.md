@@ -272,19 +272,20 @@ where 8.5; at 2,000,000 and 3,000,000, where both are well outside, 5–8% fewer
 less WAL. Latency didn't improve: p50 is 0.5 ms lower after at 250,000 but 0.1–0.4 ms higher
 from 1,000,000 up, and p95 0.4–1.0 ms higher there (as in a discarded first series, with the
 row-level triggers), which may be the triggers' cost, a PL/pgSQL call per insert statement, two
-per write; the single-write benchmarks of the next paragraph show no difference. On SQLite
+per write; the single-write benchmarks of the next paragraph show no difference. (The "after"
+points ran with the statement trigger's first form, a join, cached as the final one is.) On SQLite
 25–35% fewer reads at 1,000,000, 9% at 4,000,000.
 
 **Kept for the bytes.** 36 bytes a write on Postgres (720 → 683, 5%) and 24 on SQLite (309 → 284,
 8%), about 110 GB and 75 GB a year at 100 writes a second, and those are bytes of the indexes
 every write inserts into at random, the ones that must fit in memory for writes not to read:
-the step comes at a third more writes. The costs: a trigger per insert statement on Postgres
-(`BenchmarkBatch1000`, 1,000 creates in one batch, on an idle host: before 179–211 ms, after
-203–275 ms in alternating runs, and the same build with its triggers dropped 169–195 ms against
-185–201 with them, so 5–25%; single writes the same, `BenchmarkAppendsOneNamespace` 1 and 8
-writers 150–215 and 530–710 writes a second either way), one per row in SQLite (+6% on the
-batch, single writes the same), and a migration that rewrites `ns_log` and `revisions` on
-SQLite.
+the step comes at a third more writes. The costs: a trigger per insert statement on Postgres,
+within run-to-run noise in the benchmarks on an idle host, alternating with 97aa259 (before /
+after: `BenchmarkWrite` 5.3–5.7 / 5.4–5.7 ms, `BenchmarkAppendsOneNamespace` 1 writer 171–214 /
+194–210 writes a second, 8 writers 608–712 / 570–690, `BenchmarkBatch1000` 186–263 / 185–250 ms
+a batch of 1,000 creates); one per row in SQLite (+6% on the batch, single writes the same); a
+migration that rewrites `ns_log` and `revisions` on SQLite; and plans that rest on statistics
+where a unique index told the planner "one row" (above).
 
 The next lever is `revisions_by_id (id)`, as big (41 bytes a write) and as random, over every
 resource: the same key, `(key)` with the whole id compared, would cut it to about 22 bytes.
@@ -323,17 +324,20 @@ but indexes on `(ns, key)` and `(res, key)`, the key the id's first 8 bytes (mig
   by its function's settings.
 - **The whole id stays unique in its namespace and in its resource.** A trigger of each table
   checks it through the key index and fails as the constraint did: on Postgres an `AFTER INSERT …
-  FOR EACH STATEMENT` trigger joins the statement's inserted rows (its transition table) to the
-  table by key and id, one pass per statement (a batch's thousand revisions in one join), and
-  raises `unique_violation` on the same table and constraint name (`revisions_res_id_key`,
-  `ns_log_ns_id_key`), so `isConflict` tells a lost race as before; in SQLite a `BEFORE INSERT`
-  trigger raises `UNIQUE constraint failed: revisions.res, revisions.id` as
-  `SQLITE_CONSTRAINT_TRIGGER`, which `isConflict` now takes. Both check `UPDATE OF` the key
-  columns too, which nothing does. A first version checked each row before it went in, in a
-  row-level Postgres trigger: its function cached a plan made while the tables were small, a
-  sequential scan, and kept it as they grew (a 1,000-item batch took 1–1.3 s instead of 0.2 s);
-  the statement trigger's function allows the planner nothing but the index (`enable_seqscan`,
-  `enable_hashjoin`, `enable_mergejoin` off for its one query).
+  FOR EACH STATEMENT` trigger probes the key index for each row the statement inserted (its
+  transition table, a `LATERAL` subquery with a `LIMIT`, so the planner can't turn the join the
+  other way round, and nothing but index scans allowed), one call per statement (a batch's
+  thousand revisions in one pass), and raises `unique_violation` on the same table and
+  constraint name (`revisions_res_id_key`, `ns_log_ns_id_key`), so `isConflict` tells a lost race
+  as before; in SQLite a `BEFORE INSERT` trigger raises `UNIQUE constraint failed: revisions.res,
+  revisions.id` as `SQLITE_CONSTRAINT_TRIGGER`, which `isConflict` now takes. Both check `UPDATE
+  OF` the key columns too, which nothing does. The Postgres function's plan is cached per
+  session until the table's statistics change; made on a table never analyzed and nearly empty
+  it may take another `(res)` or `(ns)` index with the key as a filter (the costs tie there),
+  which then grows with the table until autovacuum's first `ANALYZE` of it replaces the plan.
+  Two forms that didn't work: a row-level `BEFORE INSERT` trigger, whose cached plan scanned
+  sequentially as the table grew (a 1,000-item batch took 1–1.3 s instead of 0.2 s), and
+  planning the probe afresh each statement (`EXECUTE`), about a millisecond a write.
 - **Concurrency.** SQLite writes are serialised, so the check is exact. On Postgres a trigger
   can't see another transaction's uncommitted row, as a unique index's insert could. The engine
   never gives it one to miss: a namespace's entries are appended under its log lock
