@@ -242,6 +242,12 @@ func TestIDKeyPlans(t *testing.T) {
 				SELECT l.ns, randomblob(20), 1000000 + i, 0, '{}', l.config_seq, l.author, 0 FROM ns_log l, g WHERE l.seq = (SELECT MAX(seq) FROM ns_log)`,
 			}
 		}
+		// The statistics autovacuum would have taken by now: without them
+		// the Postgres triggers' plan, cached while the tables were nearly
+		// empty, may filter a whole (res) index (the migration).
+		if _, err := tx.Tx.Exec(`ANALYZE`); err != nil {
+			t.Fatal(err)
+		}
 		for _, q := range fill {
 			if _, err := tx.Tx.Exec(q); err != nil {
 				t.Fatalf("%s: %v", q, err)

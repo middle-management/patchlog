@@ -1,7 +1,7 @@
 -- Migration: ids found by their first 8 bytes
--- Created: 2026-11-28T09:02:17Z
--- Checksum: d91f874b7f9764ca792ce94e7a98c550142e739c161ca6443c9329ccf769eef0
--- Chain: 61a7703a1310b613897fa43d3e63ec86eee8c636d3660c71ca0add2a6297e528
+-- Created: 2026-11-28T09:13:59Z
+-- Checksum: e3d5263b85502d862b8b0e6a508b53e65353645aad660dfc409cd3205487ee0e
+-- Chain: 4abb4625716b228b20df33b80932d5ca39e98f59b256cea3521dab7baad19285
 --
 -- IMPORTANT: Do not modify this file after commit. The checksum above
 -- tracks the integrity of this migration. Any changes will be detected
@@ -32,19 +32,21 @@ CREATE INDEX IF NOT EXISTS revisions_res_id8 ON revisions (res, (('x' || encode(
 -- Per statement, over the rows it inserted (a bulk insert's thousand
 -- rows in one pass): each row probes the key index, a LATERAL subquery
 -- with a LIMIT, which the planner can't turn into a join the other way
--- round. The query is planned afresh for each statement (EXECUTE), from
--- the table's size then: a plan cached by the function would keep what
--- it chose while the table was small, a scan of a whole index with the
--- key as a filter, as the table grew. Nothing but an index is allowed.
+-- round, and nothing but an index is allowed. The function's plan is
+-- cached per session until the table's statistics change: one made on a
+-- table never analyzed and nearly empty may take another index on (ns)
+-- or (res) with the key as a filter, which costs as much there and grows
+-- with the table, until autovacuum's first ANALYZE of it replaces the
+-- plan (planning it afresh each time, with EXECUTE, cost a millisecond a
+-- write).
 CREATE OR REPLACE FUNCTION ns_log_id_unique() RETURNS trigger LANGUAGE plpgsql
   SET enable_seqscan = off SET enable_hashjoin = off SET enable_mergejoin = off AS $$
-DECLARE d record; found_rows bigint;
+DECLARE d record;
 BEGIN
-  EXECUTE 'SELECT n.ns, n.id FROM ns_log_new n, LATERAL (SELECT 1 FROM ns_log x WHERE x.ns = n.ns
-    AND (''x'' || encode(substr(x.id, 1, 8), ''hex''))::bit(64)::bigint = (''x'' || encode(substr(n.id, 1, 8), ''hex''))::bit(64)::bigint
-    AND x.id = n.id AND x.seq <> n.seq LIMIT 1) y LIMIT 1' INTO d;
-  GET DIAGNOSTICS found_rows = ROW_COUNT;
-  IF found_rows > 0 THEN
+  SELECT n.ns, n.id INTO d FROM ns_log_new n, LATERAL (SELECT 1 FROM ns_log x WHERE x.ns = n.ns
+    AND ('x' || encode(substr(x.id, 1, 8), 'hex'))::bit(64)::bigint = ('x' || encode(substr(n.id, 1, 8), 'hex'))::bit(64)::bigint
+    AND x.id = n.id AND x.seq <> n.seq LIMIT 1) y LIMIT 1;
+  IF FOUND THEN
     RAISE EXCEPTION 'duplicate key value violates unique constraint "ns_log_ns_id_key"'
       USING ERRCODE = 'unique_violation', TABLE = 'ns_log', CONSTRAINT = 'ns_log_ns_id_key',
         DETAIL = format('Key (ns, id)=(%s, %s) already exists.', d.ns, d.id);
@@ -72,19 +74,21 @@ CREATE TRIGGER ns_log_id_unique_update BEFORE UPDATE OF ns, id ON ns_log FOR EAC
 -- Per statement, over the rows it inserted (a bulk insert's thousand
 -- rows in one pass): each row probes the key index, a LATERAL subquery
 -- with a LIMIT, which the planner can't turn into a join the other way
--- round. The query is planned afresh for each statement (EXECUTE), from
--- the table's size then: a plan cached by the function would keep what
--- it chose while the table was small, a scan of a whole index with the
--- key as a filter, as the table grew. Nothing but an index is allowed.
+-- round, and nothing but an index is allowed. The function's plan is
+-- cached per session until the table's statistics change: one made on a
+-- table never analyzed and nearly empty may take another index on (ns)
+-- or (res) with the key as a filter, which costs as much there and grows
+-- with the table, until autovacuum's first ANALYZE of it replaces the
+-- plan (planning it afresh each time, with EXECUTE, cost a millisecond a
+-- write).
 CREATE OR REPLACE FUNCTION revisions_id_unique() RETURNS trigger LANGUAGE plpgsql
   SET enable_seqscan = off SET enable_hashjoin = off SET enable_mergejoin = off AS $$
-DECLARE d record; found_rows bigint;
+DECLARE d record;
 BEGIN
-  EXECUTE 'SELECT n.res, n.id FROM revisions_new n, LATERAL (SELECT 1 FROM revisions x WHERE x.res = n.res
-    AND (''x'' || encode(substr(x.id, 1, 8), ''hex''))::bit(64)::bigint = (''x'' || encode(substr(n.id, 1, 8), ''hex''))::bit(64)::bigint
-    AND x.id = n.id AND x.seq <> n.seq LIMIT 1) y LIMIT 1' INTO d;
-  GET DIAGNOSTICS found_rows = ROW_COUNT;
-  IF found_rows > 0 THEN
+  SELECT n.res, n.id INTO d FROM revisions_new n, LATERAL (SELECT 1 FROM revisions x WHERE x.res = n.res
+    AND ('x' || encode(substr(x.id, 1, 8), 'hex'))::bit(64)::bigint = ('x' || encode(substr(n.id, 1, 8), 'hex'))::bit(64)::bigint
+    AND x.id = n.id AND x.seq <> n.seq LIMIT 1) y LIMIT 1;
+  IF FOUND THEN
     RAISE EXCEPTION 'duplicate key value violates unique constraint "revisions_res_id_key"'
       USING ERRCODE = 'unique_violation', TABLE = 'revisions', CONSTRAINT = 'revisions_res_id_key',
         DETAIL = format('Key (res, id)=(%s, %s) already exists.', d.res, d.id);
